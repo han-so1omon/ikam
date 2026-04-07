@@ -1,0 +1,14 @@
+{
+  "generated": "2026-02-05",
+  "leaders": {
+    "COO": "Erica Shaw",
+    "SupplyChain": "Victor Chen",
+    "Quality": "Amina Patel",
+    "Finance": "Jonah Brooks"
+  },
+  "plants": [
+    "Plant A",
+    "Plant B",
+    "Plant C"
+  ]
+}

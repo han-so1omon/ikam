@@ -1,0 +1,47 @@
+{
+  "schema_version": "0.1",
+  "title": "Client Intake",
+  "fields": [
+    {
+      "id": "legal_name",
+      "type": "string",
+      "required": true
+    },
+    {
+      "id": "preferred_name",
+      "type": "string",
+      "required": false
+    },
+    {
+      "id": "codename",
+      "type": "string",
+      "required": true
+    },
+    {
+      "id": "sponsor",
+      "type": "string",
+      "required": true
+    },
+    {
+      "id": "problem_statement",
+      "type": "string",
+      "required": true
+    },
+    {
+      "id": "success_metrics",
+      "type": "array",
+      "required": false,
+      "items": {
+        "type": "string"
+      }
+    },
+    {
+      "id": "data_sources",
+      "type": "array",
+      "required": false,
+      "items": {
+        "type": "string"
+      }
+    }
+  ]
+}

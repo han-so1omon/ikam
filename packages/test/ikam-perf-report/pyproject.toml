@@ -1,0 +1,25 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ikam-perf-report"
+version = "0.1.0"
+description = "IKAM performance reporting API"
+requires-python = ">=3.11"
+dependencies = [
+  "fastapi",
+  "psycopg[binary]",
+  "psycopg-pool",
+  "uvicorn",
+  "pdfplumber",
+]
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+markers = [
+  "slow: marks tests as slow (require Docker Postgres or model loading)",
+]
+
+[tool.setuptools.packages.find]
+include = ["ikam_perf_report*"]

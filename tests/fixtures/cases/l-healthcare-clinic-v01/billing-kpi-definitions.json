@@ -1,0 +1,21 @@
+{
+  "version": "2026-01-15",
+  "kpis": [
+    {
+      "name": "No-show (rev cycle)",
+      "definition": "includes late-cancels"
+    },
+    {
+      "name": "No-show (ops dashboard)",
+      "definition": "excludes late-cancels"
+    },
+    {
+      "name": "Wait time (Clinic A)",
+      "definition": "door-to-doc"
+    },
+    {
+      "name": "Wait time (exec)",
+      "definition": "arrival-to-departure"
+    }
+  ]
+}

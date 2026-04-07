@@ -1,0 +1,23 @@
+{
+  "generated": "2026-02-05",
+  "vendors": [
+    {
+      "id": "V001",
+      "name": "SageCo Candles",
+      "category": "candles",
+      "risk": "lead time"
+    },
+    {
+      "id": "V002",
+      "name": "PaperRill Stationery",
+      "category": "stationery",
+      "risk": "low"
+    },
+    {
+      "id": "V003",
+      "name": "TerraCeram",
+      "category": "ceramics",
+      "risk": "breakage"
+    }
+  ]
+}

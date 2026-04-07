@@ -1,0 +1,17 @@
+{
+  "version": "2026-01-31",
+  "kpis": [
+    {
+      "name": "Billable hours",
+      "definition": "hours invoiced after write-offs"
+    },
+    {
+      "name": "Delivered hours",
+      "definition": "timesheet hours logged"
+    },
+    {
+      "name": "Write-off",
+      "definition": "hours removed from invoice"
+    }
+  ]
+}

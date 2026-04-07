@@ -1,0 +1,23 @@
+{
+  "generated": "2026-02-05",
+  "vendors": [
+    {
+      "id": "V001",
+      "name": "GreatLakes Steel",
+      "category": "steel",
+      "risk": "lead time"
+    },
+    {
+      "id": "V002",
+      "name": "Midwest Plating",
+      "category": "plating",
+      "risk": "quality"
+    },
+    {
+      "id": "V003",
+      "name": "RiverPack",
+      "category": "packaging",
+      "risk": "low"
+    }
+  ]
+}

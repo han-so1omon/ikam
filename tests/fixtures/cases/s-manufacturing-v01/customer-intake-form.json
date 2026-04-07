@@ -1,0 +1,25 @@
+{
+  "schema_version": "0.1",
+  "title": "Customer Intake",
+  "fields": [
+    {
+      "id": "company",
+      "type": "string",
+      "required": true
+    },
+    {
+      "id": "contact_email",
+      "type": "string"
+    },
+    {
+      "id": "part_description",
+      "type": "string",
+      "required": true
+    },
+    {
+      "id": "quantity",
+      "type": "integer",
+      "required": true
+    }
+  ]
+}

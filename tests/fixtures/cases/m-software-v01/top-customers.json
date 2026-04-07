@@ -1,0 +1,13 @@
+{
+  "generated": "2026-02-05",
+  "customers": [
+    {
+      "account": "Bayline Logistics",
+      "segment": "logistics"
+    },
+    {
+      "account": "JuniperPay",
+      "segment": "fintech"
+    }
+  ]
+}

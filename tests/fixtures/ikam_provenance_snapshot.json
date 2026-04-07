@@ -1,0 +1,20 @@
+{
+  "artifact_id": "71565d75-034c-452f-9d92-cd6d6746e5bf",
+  "derivations": [
+    {
+      "id": "der-1",
+      "type": "compose",
+      "inputs": ["frag-l1-1", "frag-l0-2"],
+      "output": "frag-l2-1"
+    }
+  ],
+  "events": [
+    {
+      "id": "ev-1",
+      "type": "create",
+      "timestamp": "2024-10-01T00:00:00Z",
+      "actor": "test-user@fixtures",
+      "details": "Initial artifact creation"
+    }
+  ]
+}

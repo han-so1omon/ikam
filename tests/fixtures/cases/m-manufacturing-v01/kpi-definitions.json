@@ -1,0 +1,17 @@
+{
+  "version": "2026-02-01",
+  "kpis": [
+    {
+      "name": "Scrap (ops)",
+      "definition": "scrap incl rework"
+    },
+    {
+      "name": "Scrap (QA)",
+      "definition": "true scrap only"
+    },
+    {
+      "name": "OTD (customer)",
+      "definition": "on-time if first shipment arrives"
+    }
+  ]
+}

@@ -1,0 +1,25 @@
+{
+  "version": "2026-01-20",
+  "kpis": [
+    {
+      "name": "OTD (customer)",
+      "definition": "On-time if first shipment arrives by requested date",
+      "notes": "May hide partial shipment delays"
+    },
+    {
+      "name": "OTD (internal)",
+      "definition": "On-time if full order completed by requested date",
+      "notes": "Stricter"
+    },
+    {
+      "name": "Scrap rate (ops)",
+      "definition": "Scrap incl rework / total parts",
+      "notes": "Includes rework as scrap"
+    },
+    {
+      "name": "Scrap rate (QA)",
+      "definition": "True scrap only / total parts",
+      "notes": "Excludes rework"
+    }
+  ]
+}

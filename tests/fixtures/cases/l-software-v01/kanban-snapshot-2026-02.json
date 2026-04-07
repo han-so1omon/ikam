@@ -1,0 +1,19 @@
+{
+  "snapshot_date": "2026-02-19",
+  "board": "Platform",
+  "columns": {
+    "Backlog": [
+      "FABLE-101",
+      "FABLE-120"
+    ],
+    "In Progress": [
+      "QUEUE-55"
+    ],
+    "Review": [
+      "FABLE-132"
+    ],
+    "Done": [
+      "REL-2025Q4-8"
+    ]
+  }
+}

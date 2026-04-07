@@ -1,0 +1,7 @@
+CASE s-construction-v01
+TOTAL expected=40 present=40 missing=0
+- diagrams: 8/8 present (missing 0)
+- logos: 4/4 present (missing 0)
+- people: 10/10 present (missing 0)
+- site: 12/12 present (missing 0)
+- social: 6/6 present (missing 0)

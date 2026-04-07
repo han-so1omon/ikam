@@ -1,0 +1,17 @@
+{
+  "version": "2026-03-10",
+  "kpis": [
+    {
+      "name": "Savings (exec)",
+      "definition": "annualized gross run-rate"
+    },
+    {
+      "name": "Savings (finance)",
+      "definition": "net savings after one-time costs"
+    },
+    {
+      "name": "Phase 1 complete",
+      "definition": "milestone date per re-baselined plan"
+    }
+  ]
+}

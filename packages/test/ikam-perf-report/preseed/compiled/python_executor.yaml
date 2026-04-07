@@ -1,0 +1,22 @@
+graph_id: modelado/projects/canonical/executors
+fragments:
+- name: exec_python_config
+  fragment_id: 17db1034-4769-5fa2-8bae-c3ba2e50bd9a
+  cas_id: 8c281cf759b1907b333922c4ca68df344d12a4b55abb45a21243e85835acb9e6
+  mime_type: application/vnd.ikam.ir.structured-data+yaml
+  value:
+    ir_profile: StructuredDataIR
+    endpoint: http://ikam-executor-sidecar:8000
+    type: sidecar
+    protocol: http
+    _fragment_id: 17db1034-4769-5fa2-8bae-c3ba2e50bd9a
+- name: exec_python_claim
+  fragment_id: d36721fc-f93e-5999-a10a-4f0c5a698f37
+  cas_id: 4ebdd09078675f82e216eda7c43a26e9fabe2c2bf9af06706417f8dd36bc9598
+  mime_type: application/vnd.ikam.ir.proposition+yaml
+  value:
+    ir_profile: PropositionIR
+    subject: 17db1034-4769-5fa2-8bae-c3ba2e50bd9a
+    predicate: acts_as
+    object: executor/python
+    _fragment_id: d36721fc-f93e-5999-a10a-4f0c5a698f37

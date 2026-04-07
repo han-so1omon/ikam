@@ -1,0 +1,20 @@
+{
+  "generated": "2026-02-05",
+  "customers": [
+    {
+      "account": "Evergreen Ledger",
+      "aka": [
+        "Evergreen Financial"
+      ],
+      "segment": "fintech"
+    },
+    {
+      "account": "Harborline Health Services",
+      "segment": "health services"
+    },
+    {
+      "account": "Cascadia Freight Ops",
+      "segment": "logistics"
+    }
+  ]
+}

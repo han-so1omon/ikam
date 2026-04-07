@@ -1,0 +1,17 @@
+{
+  "generated": "2026-02-05",
+  "vendors": [
+    {
+      "id": "V001",
+      "name": "Midwest Resin Co.",
+      "category": "resin",
+      "lead_time_days": 14
+    },
+    {
+      "id": "V002",
+      "name": "Columbus Packaging",
+      "category": "boxes",
+      "lead_time_days": 7
+    }
+  ]
+}

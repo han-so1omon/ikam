@@ -1,0 +1,24 @@
+graph_id: modelado/projects/canonical/operators
+fragments:
+- name: op_parse_claims_expr
+  fragment_id: 773da82d-e6d0-5c12-8657-7fe44f9720e7
+  cas_id: 20120514e81051db78785acaed22a9ba1680724ace451ac6fee9ab84f3397923
+  mime_type: application/vnd.ikam.ir.expression+yaml
+  value:
+    ir_profile: ExpressionIR
+    language: python
+    module: modelado.executors.omni_parser
+    entrypoint: run
+    operator_id: modelado/operators/claims
+    expected_profile: StructuredDataIR
+    _fragment_id: 773da82d-e6d0-5c12-8657-7fe44f9720e7
+- name: op_parse_claims_exec_link
+  fragment_id: 41034ef7-6dd7-5eeb-b435-764f565375d1
+  cas_id: 15ac707942236216a8ee5c9e0c7453f7a12df4d81155352f0e424cb35c442c59
+  mime_type: application/vnd.ikam.ir.proposition+yaml
+  value:
+    ir_profile: PropositionIR
+    subject: 773da82d-e6d0-5c12-8657-7fe44f9720e7
+    predicate: executed_by
+    object: 89700dc4-a82f-55a9-b94c-fb90987e2be6
+    _fragment_id: 41034ef7-6dd7-5eeb-b435-764f565375d1

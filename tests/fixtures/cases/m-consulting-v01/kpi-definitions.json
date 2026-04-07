@@ -1,0 +1,20 @@
+{
+  "version": "2025-08-20",
+  "kpis": [
+    {
+      "name": "Booked revenue",
+      "definition": "Signed SOW value",
+      "source": "CRM + signed PDFs"
+    },
+    {
+      "name": "Recognized revenue",
+      "definition": "Revenue recognized by month per finance close",
+      "source": "Finance workbook"
+    },
+    {
+      "name": "Utilization %",
+      "definition": "Billable hours / total available hours",
+      "source": "Timesheets + staffing plan"
+    }
+  ]
+}

@@ -1,0 +1,21 @@
+{
+  "version": "2026-02-01",
+  "kpis": [
+    {
+      "name": "No-show (ops)",
+      "definition": "excludes late cancels"
+    },
+    {
+      "name": "No-show (sites)",
+      "definition": "includes late cancels <24h"
+    },
+    {
+      "name": "Collections (finance)",
+      "definition": "incl catch-up"
+    },
+    {
+      "name": "Collections (billing)",
+      "definition": "excl catch-up"
+    }
+  ]
+}

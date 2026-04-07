@@ -1,0 +1,20 @@
+{
+  "version": "2026-02-01",
+  "kpis": [
+    {
+      "name": "ARR (board)",
+      "definition": "Annualized recurring revenue incl annual prepaid until renewal date",
+      "notes": "Optimistic"
+    },
+    {
+      "name": "ARR (finance)",
+      "definition": "Annualized recurring revenue excluding churned annual prepaid",
+      "notes": "Conservative"
+    },
+    {
+      "name": "NRR",
+      "definition": "Net revenue retention",
+      "notes": "Definition varies by product add-ons"
+    }
+  ]
+}

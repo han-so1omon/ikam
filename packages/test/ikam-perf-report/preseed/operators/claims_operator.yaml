@@ -1,0 +1,19 @@
+graph_id: "modelado/projects/canonical/operators"
+fragments:
+  - name: "op_parse_claims_expr"
+    mime_type: "application/vnd.ikam.ir.expression+yaml"
+    value:
+      ir_profile: "ExpressionIR"
+      language: "python"
+      module: "modelado.executors.omni_parser"
+      entrypoint: "run"
+      operator_id: "modelado/operators/claims"
+      expected_profile: "StructuredDataIR"
+
+  - name: "op_parse_claims_exec_link"
+    mime_type: "application/vnd.ikam.ir.proposition+yaml"
+    value:
+      ir_profile: "PropositionIR"
+      subject: "${ref:op_parse_claims_expr}"
+      predicate: "executed_by"
+      object: "${ref:exec_ml_config}"

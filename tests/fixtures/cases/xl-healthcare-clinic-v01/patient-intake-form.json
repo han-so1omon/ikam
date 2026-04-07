@@ -1,0 +1,32 @@
+{
+  "schema_version": "0.2",
+  "title": "Patient Intake",
+  "fields": [
+    {
+      "id": "full_name",
+      "type": "string",
+      "required": true
+    },
+    {
+      "id": "dob",
+      "type": "date",
+      "required": true
+    },
+    {
+      "id": "insurance",
+      "type": "string"
+    },
+    {
+      "id": "primary_reason",
+      "type": "string"
+    },
+    {
+      "id": "consents",
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    }
+  ],
+  "notes": "Use synthetic data only in benchmarks; avoid PHI in sample fills."
+}

@@ -1,0 +1,24 @@
+{
+  "schema_version": "0.1",
+  "title": "Owner Change Request",
+  "fields": [
+    {
+      "id": "project",
+      "type": "string",
+      "required": true
+    },
+    {
+      "id": "description",
+      "type": "string",
+      "required": true
+    },
+    {
+      "id": "cost_impact",
+      "type": "number"
+    },
+    {
+      "id": "schedule_impact_days",
+      "type": "integer"
+    }
+  ]
+}

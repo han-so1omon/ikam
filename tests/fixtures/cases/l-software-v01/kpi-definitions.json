@@ -1,0 +1,13 @@
+{
+  "version": "2026-02-20",
+  "kpis": [
+    {
+      "name": "Active accounts (CS)",
+      "definition": "accounts with >N weekly actions"
+    },
+    {
+      "name": "Billable accounts (Finance)",
+      "definition": "accounts with active subscription"
+    }
+  ]
+}

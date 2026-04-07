@@ -1,0 +1,70 @@
+# Page snapshot
+
+```yaml
+- generic [ref=e3]:
+  - complementary "Perf report workspaces" [ref=e4]:
+    - generic [ref=e5]:
+      - generic [ref=e6]: IKAM
+      - generic [ref=e7]: Perf
+      - heading "IKAM Performance Report" [level=1] [ref=e8]
+    - navigation [ref=e9]:
+      - button "Runs" [ref=e10] [cursor=pointer]:
+        - generic [ref=e11]: ▦
+        - generic [ref=e12]: Runs
+      - button "Graph" [ref=e13] [cursor=pointer]:
+        - generic [ref=e14]: ◎
+        - generic [ref=e15]: Graph
+      - button "Merge" [ref=e16] [cursor=pointer]:
+        - generic [ref=e17]: ⇄
+        - generic [ref=e18]: Merge
+      - button "History" [ref=e19] [cursor=pointer]:
+        - generic [ref=e20]: ◷
+        - generic [ref=e21]: History
+      - button "Wiki" [ref=e22] [cursor=pointer]:
+        - generic [ref=e23]: ✎
+        - generic [ref=e24]: Wiki
+      - button "Registry" [ref=e25] [cursor=pointer]:
+        - generic [ref=e26]: 📋
+        - generic [ref=e27]: Registry
+    - generic [ref=e28]:
+      - generic [ref=e29]: "Profile: ikam-perf-report"
+      - generic [ref=e30]: "Source: http://ikam-perf-report-api:8040"
+  - main [ref=e31]:
+    - generic [ref=e32]:
+      - heading "Runs Workspace" [level=2] [ref=e33]
+      - paragraph [ref=e34]: "Source: /benchmarks/cases, /benchmarks/run, /benchmarks/runs"
+      - generic [ref=e35]: "Error: Failed to fetch"
+      - generic [ref=e36]: No runs yet
+      - generic [ref=e37]:
+        - generic [ref=e38]:
+          - generic [ref=e39]:
+            - heading "Run" [level=3] [ref=e40]
+            - paragraph [ref=e41]: Run a case with an oracle fixture to see evaluation results
+          - generic [ref=e45]: No cases available
+        - generic [ref=e46]:
+          - generic [ref=e47]:
+            - generic [ref=e48]:
+              - generic [ref=e49]: "Pipeline:"
+              - combobox "Pipeline:" [ref=e50] [cursor=pointer]:
+                - option "Loading pipelines..." [selected]
+            - generic [ref=e51]:
+              - generic [ref=e52]:
+                - checkbox "Reset before run" [checked] [ref=e53]
+                - generic [ref=e54]: Reset before run
+              - button "Run Pipeline" [disabled] [ref=e55]
+          - generic [ref=e56]:
+            - button "Autonomous" [disabled] [ref=e57]
+            - button "Manual" [disabled] [ref=e58]
+            - button "Pause" [disabled] [ref=e59]
+            - button "Resume" [disabled] [ref=e60]
+            - button "Next Step" [disabled] [ref=e61]
+        - generic [ref=e63]:
+          - heading "Debug Step Stream" [level=4] [ref=e64]
+          - generic [ref=e65]:
+            - button "List" [ref=e66]
+            - button "Graph" [ref=e67]
+        - generic [ref=e68]:
+          - heading "Selected Step Detail" [level=4] [ref=e69]
+          - paragraph [ref=e70]: Select a debug step to view details.
+        - generic [ref=e71]: Select a run to view evaluation
+```

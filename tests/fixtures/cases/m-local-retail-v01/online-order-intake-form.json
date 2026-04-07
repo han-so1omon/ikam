@@ -1,0 +1,26 @@
+{
+  "schema_version": "0.1",
+  "title": "Online Order Intake",
+  "fields": [
+    {
+      "id": "order_id",
+      "type": "string",
+      "required": true
+    },
+    {
+      "id": "customer_email",
+      "type": "string"
+    },
+    {
+      "id": "items",
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    {
+      "id": "ship_by",
+      "type": "date"
+    }
+  ]
+}

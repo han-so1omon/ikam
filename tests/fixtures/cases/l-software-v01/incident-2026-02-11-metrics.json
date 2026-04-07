@@ -1,0 +1,9 @@
+{
+  "incident_id": "INC-2026-02-11",
+  "signals": {
+    "third_party_latency_ms_p95": 180,
+    "queue_depth_max": 420000,
+    "consumer_lag_seconds_max": 3600
+  },
+  "notes": "Metrics show queue depth/consumer lag as dominant driver; third-party latency secondary."
+}

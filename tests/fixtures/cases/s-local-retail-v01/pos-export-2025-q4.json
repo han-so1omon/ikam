@@ -1,0 +1,57 @@
+{
+  "source": "Square",
+  "exported_at": "2026-01-03T09:12:00-08:00",
+  "period": {
+    "start": "2025-10-01",
+    "end": "2025-12-31"
+  },
+  "notes": [
+    "Export excludes some manual returns processed off-register during 2025-12-14 to 2025-12-20.",
+    "Tips not included."
+  ],
+  "summary": {
+    "gross_sales": 312450,
+    "discounts": 7800,
+    "refunds_processed_in_pos": 9650,
+    "net_sales": 295000
+  },
+  "transactions_sample": [
+    {
+      "id": "T-10001",
+      "date": "2025-10-03",
+      "channel": "in_store",
+      "total_amount": 64.5,
+      "items": [
+        "Sea Salt Dark Chocolate",
+        "Smoked Chili Hot Sauce"
+      ]
+    },
+    {
+      "id": "T-10888",
+      "date": "2025-11-18",
+      "channel": "in_store",
+      "total_amount": 42.0,
+      "items": [
+        "Almond Apricot Jam (8oz)"
+      ]
+    },
+    {
+      "id": "T-12002",
+      "date": "2025-12-05",
+      "channel": "online",
+      "total_amount": 118.0,
+      "items": [
+        "Classic Gift Bundle"
+      ],
+      "ship_to": "San Jose, CA"
+    },
+    {
+      "id": "T-12990",
+      "date": "2025-12-19",
+      "channel": "in_store",
+      "total_amount": 0.0,
+      "items": [],
+      "note": "Peak week: some returns handled manually, not in POS"
+    }
+  ]
+}

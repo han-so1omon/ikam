@@ -1,0 +1,78 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "interacciones"
+version = "0.1.0"
+description = "Universal interaction and graph execution system for multi-agent coordination"
+readme = "README.md"
+requires-python = ">=3.11"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [
+    {name = "Narraciones Team"}
+]
+keywords = ["agents", "graph", "workflow", "interaction", "coordination"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+]
+
+dependencies = [
+    "pydantic>=2.0.0",
+    "python-dateutil>=2.8.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0.0",
+    "pytest-asyncio>=0.21.0",
+    "mypy>=1.0.0",
+    "black>=23.0.0",
+    "ruff>=0.1.0",
+]
+postgres = [
+    "asyncpg>=0.29.0",
+]
+kafka = [
+    "aiokafka>=0.10.0",
+    "confluent-kafka[schema-registry]>=2.0.0",
+    "fastavro>=1.8.0",
+]
+llm = [
+    "openai>=1.0.0",
+    "anthropic>=0.7.0",
+]
+all = [
+    "interacciones[postgres,kafka,llm]",
+]
+
+[project.urls]
+Homepage = "https://github.com/han-so1omon/narraciones"
+Documentation = "https://github.com/han-so1omon/narraciones/tree/main/packages/interacciones"
+Repository = "https://github.com/han-so1omon/narraciones"
+
+[tool.setuptools.packages.find]
+where = ["graph/src"]
+
+[tool.pytest.ini_options]
+testpaths = ["graph/tests"]
+asyncio_mode = "auto"
+
+[tool.mypy]
+python_version = "3.11"
+warn_return_any = true
+warn_unused_configs = true
+disallow_untyped_defs = true
+
+[tool.black]
+line-length = 100
+target-version = ['py311']
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"

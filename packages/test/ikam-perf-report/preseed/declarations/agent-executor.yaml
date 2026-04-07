@@ -1,0 +1,24 @@
+executor_id: executor://agent-env-primary
+executor_kind: agent-executor
+capabilities:
+  - agent.parse_review
+  - agent.semantic_judgment
+  - agent.elicitation_request
+policy_support:
+  - approval_mode
+  - sandbox_mode
+  - latency_tier
+transport:
+  kind: redpanda
+  request_topic: execution.requests
+  result_topic: execution.results
+runtime:
+  kind: docker
+  image: ikam/agent-env:local
+  sandbox_profile: restricted
+concurrency:
+  max_inflight: 2
+batching:
+  max_batch_size: 1
+health:
+  readiness_path: /health

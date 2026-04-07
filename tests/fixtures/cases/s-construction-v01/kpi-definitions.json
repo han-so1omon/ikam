@@ -1,0 +1,13 @@
+{
+  "version": "2026-01-05",
+  "kpis": [
+    {
+      "name": "Gross margin",
+      "definition": "(Contract - costs) / contract"
+    },
+    {
+      "name": "Schedule variance",
+      "definition": "actual milestone date - planned milestone date"
+    }
+  ]
+}

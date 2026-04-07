@@ -1,0 +1,25 @@
+{
+  "schema_version": "0.2",
+  "title": "Patient Intake",
+  "fields": [
+    {
+      "id": "full_name",
+      "type": "string",
+      "required": true
+    },
+    {
+      "id": "dob",
+      "type": "date",
+      "required": true
+    },
+    {
+      "id": "insurance",
+      "type": "string"
+    },
+    {
+      "id": "reason",
+      "type": "string"
+    }
+  ],
+  "notes": "Synthetic only; avoid PHI in benchmark fills."
+}

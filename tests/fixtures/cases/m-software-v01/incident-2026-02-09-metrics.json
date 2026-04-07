@@ -1,0 +1,9 @@
+{
+  "incident_id": "INC-2026-02-09",
+  "signals": {
+    "vendor_latency_ms_p95": 160,
+    "queue_depth_max": 310000,
+    "worker_lag_seconds_max": 2400
+  },
+  "notes": "Metrics suggest internal backlog/worker lag was dominant; vendor latency secondary."
+}

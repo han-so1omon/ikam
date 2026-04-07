@@ -1,0 +1,85 @@
+{
+  "schema_version": "0.2",
+  "title": "Corporate Gift Order Intake",
+  "fields": [
+    {
+      "id": "company_name",
+      "type": "string",
+      "required": true
+    },
+    {
+      "id": "contact_name",
+      "type": "string",
+      "required": true
+    },
+    {
+      "id": "contact_email",
+      "type": "string",
+      "required": true
+    },
+    {
+      "id": "invoice_required",
+      "type": "boolean",
+      "required": false,
+      "default": true
+    },
+    {
+      "id": "desired_delivery_date",
+      "type": "date",
+      "required": true
+    },
+    {
+      "id": "bundle_tier",
+      "type": "enum",
+      "required": true,
+      "values": [
+        "mini",
+        "classic",
+        "deluxe"
+      ]
+    },
+    {
+      "id": "quantity",
+      "type": "integer",
+      "required": true,
+      "min": 1
+    },
+    {
+      "id": "shipping",
+      "type": "enum",
+      "required": true,
+      "values": [
+        "pickup",
+        "local_delivery",
+        "ship"
+      ],
+      "notes": "Shipping currently limited (CA/nearby)."
+    },
+    {
+      "id": "addresses",
+      "type": "array",
+      "required": false,
+      "items": {
+        "type": "object",
+        "fields": [
+          {
+            "id": "name"
+          },
+          {
+            "id": "address"
+          }
+        ]
+      }
+    },
+    {
+      "id": "custom_note",
+      "type": "string",
+      "required": false
+    },
+    {
+      "id": "budget_per_bundle",
+      "type": "number",
+      "required": false
+    }
+  ]
+}

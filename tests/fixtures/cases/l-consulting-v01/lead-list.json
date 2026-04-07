@@ -1,0 +1,18 @@
+{
+  "generated": "2026-02-05",
+  "leads": [
+    {
+      "account": "Ironclad Industries",
+      "codename": "IRONCLAD",
+      "stage": "Proposal",
+      "amount": 650000,
+      "notes": "Partner says verbally won"
+    },
+    {
+      "account": "Lakefront Packaging",
+      "codename": "FOIL",
+      "stage": "Discovery",
+      "amount": 420000
+    }
+  ]
+}

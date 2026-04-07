@@ -1,0 +1,7 @@
+CASE m-software-v01
+TOTAL expected=58 present=58 missing=0
+- diagrams: 12/12 present (missing 0)
+- logos: 6/6 present (missing 0)
+- people: 18/18 present (missing 0)
+- product-ui: 16/16 present (missing 0)
+- social: 6/6 present (missing 0)

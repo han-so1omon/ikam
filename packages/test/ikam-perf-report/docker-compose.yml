@@ -1,0 +1,365 @@
+services:
+  ikam-perf-report-postgres:
+    image: ankane/pgvector:latest
+    environment:
+      - POSTGRES_DB=ikam_perf_report
+      - POSTGRES_USER=narraciones
+      - POSTGRES_PASSWORD=narraciones
+    ports:
+      - "${IKAM_PERF_REPORT_POSTGRES_PORT:-55432}:5432"
+    volumes:
+      - ikam_perf_report_postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "pg_isready -h 127.0.0.1 -U $${POSTGRES_USER} -d $${POSTGRES_DB} || exit 1",
+        ]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+      start_period: 10s
+
+  ikam-perf-report-minio:
+    image: minio/minio:RELEASE.2024-09-22T00-33-43Z
+    environment:
+      - MINIO_ROOT_USER=narraciones
+      - MINIO_ROOT_PASSWORD=narracionespass
+    command: server /data --console-address :9001
+    ports:
+      - "${IKAM_PERF_REPORT_MINIO_PORT:-19000}:9000"
+      - "${IKAM_PERF_REPORT_MINIO_CONSOLE_PORT:-19001}:9001"
+    volumes:
+      - ikam_perf_report_minio_data:/data
+
+  ikam-perf-report-hugegraph:
+    image: hugegraph/hugegraph:1.5.0
+    ports:
+      - "${IKAM_PERF_REPORT_HUGEGRAPH_PORT:-28080}:8080"
+    volumes:
+      - ikam_perf_report_hugegraph_data:/hugegraph/data
+    command:
+      [
+        "/bin/bash",
+        "-lc",
+        'set -euo pipefail; cd /hugegraph-server; DOCKER_FOLDER=./docker; mkdir -p "$${DOCKER_FOLDER}"; INIT_FLAG_FILE=init_complete; if [ ! -f "$${DOCKER_FOLDER}/$${INIT_FLAG_FILE}" ]; then ./bin/wait-storage.sh; if [ -z "$${PASSWORD:-}" ]; then echo ''init hugegraph with non-auth mode''; ./bin/init-store.sh; else echo ''init hugegraph with auth mode''; ./bin/enable-auth.sh; echo "$${PASSWORD}" | ./bin/init-store.sh; fi; touch "$${DOCKER_FOLDER}/$${INIT_FLAG_FILE}"; else echo ''Hugegraph Initialization already done. Skipping re-init...''; fi; exec ./bin/hugegraph-server.sh conf/gremlin-server.yaml conf/rest-server.properties true "$${JAVA_OPTS:-}"',
+      ]
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8080/graphs"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 20s
+    restart: unless-stopped
+
+  redpanda:
+    image: redpandadata/redpanda:v23.3.15
+    command:
+      - redpanda start
+      - --overprovisioned
+      - --smp=1
+      - --memory=1G
+      - --reserve-memory=0M
+      - --node-id=0
+      - --check=false
+      - --kafka-addr=PLAINTEXT://0.0.0.0:9092,OUTSIDE://0.0.0.0:19092
+      - --advertise-kafka-addr=PLAINTEXT://redpanda:9092,OUTSIDE://127.0.0.1:19092
+      - --pandaproxy-addr=0.0.0.0:8082
+      - --advertise-pandaproxy-addr=redpanda:8082
+      - --mode=dev-container
+    ports:
+      - "${IKAM_PERF_REPORT_REDPANDA_PORT:-19092}:19092"
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "rpk cluster info --brokers 127.0.0.1:9092 >/dev/null 2>&1",
+        ]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+      start_period: 10s
+
+  kafka-init:
+    image: redpandadata/redpanda:v23.3.15
+    environment:
+      - KAFKA_BOOTSTRAP_SERVERS=redpanda:9092
+    depends_on:
+      redpanda:
+        condition: service_healthy
+    restart: "no"
+    entrypoint: []
+    command:
+      - /bin/sh
+      - -exc
+      - |
+        brokers="$${KAFKA_BOOTSTRAP_SERVERS}"
+        ready=0
+        i=0
+        while [ "$${i}" -lt 60 ]; do
+          if rpk cluster info --brokers "$${brokers}" >/dev/null 2>&1; then
+            ready=1
+            break
+          fi
+          i=$$((i + 1))
+          sleep 2
+        done
+        if [ "$${ready}" != "1" ]; then
+          exit 1
+        fi
+        for topic in \
+          execution.requests \
+          workflow.events \
+          execution.progress \
+          execution.results
+        do
+          rpk topic create "$${topic}" --brokers "$${brokers}" -p 1 -r 1 >/dev/null 2>&1 || true
+        done
+
+  mcp-ikam:
+    image: python:3.11-slim
+    working_dir: /app
+    command: >-
+      sh -lc "pip install -e '/app/packages/ikam[chunking]' &&
+      pip install -e '/app/packages/modelado[documents,postgres]' &&
+      pip install 'psycopg[binary]>=3.1.0' &&
+      pip install -e /app/packages/mcp-ikam &&
+      python3 -m uvicorn mcp_ikam.server_http:app --host 0.0.0.0 --port 18081 --reload --reload-dir /app/packages"
+    volumes:
+      - ../../../packages:/app/packages:delegated
+    env_file:
+      - ./.env
+    environment:
+      - OPENAI_MODEL=${OPENAI_MODEL:-gpt-4o-mini}
+    ports:
+      - "${IKAM_MCP_IKAM_PORT:-18081}:18081"
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "python3",
+          "-c",
+          "import urllib.request; urllib.request.urlopen('http://127.0.0.1:18081/health', timeout=2).read()",
+        ]
+      interval: 10s
+      timeout: 5s
+      retries: 20
+      start_period: 10s
+
+  ikam-executor-sidecar:
+    image: python:3.11-slim
+    working_dir: /app
+    command: >-
+      sh -lc "pip install -e /app/packages/test/ikam-perf-report &&
+      pip install -e '/app/packages/ikam[chunking]' &&
+      pip install -e '/app/packages/modelado[documents,postgres]' &&
+      uvicorn modelado.executors.sidecar:app --host 0.0.0.0 --port 8000 --reload --reload-dir /app/packages"
+    volumes:
+      - ../../../packages:/app/packages:delegated
+    env_file:
+      - ./.env
+    ports:
+      - "${IKAM_EXECUTOR_SIDECAR_PORT:-18000}:8000"
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "python3",
+          "-c",
+          "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=2).read()",
+        ]
+      interval: 10s
+      timeout: 5s
+      retries: 20
+      start_period: 10s
+
+  ikam-python-executor-runtime:
+    image: python:3.11-slim
+    working_dir: /app
+    command: >-
+      sh -lc "pip install -e /app/packages/test/ikam-perf-report &&
+      pip install -e '/app/packages/ikam[chunking]' &&
+      pip install -e '/app/packages/interacciones[kafka]' &&
+      pip install -e '/app/packages/modelado[documents,postgres]' &&
+      export PYTHONPATH=/app/packages/interacciones/executors:/app/packages/interacciones/schemas/src:/app/packages/interacciones/graph/src:/app/packages/test/ikam-perf-report &&
+      python3 -m python_executor_entry"
+    volumes:
+      - ../../../packages:/app/packages:delegated
+    env_file:
+      - ./.env
+    environment:
+      - KAFKA_BOOTSTRAP_SERVERS=redpanda:9092
+      - IKAM_EXECUTOR_HANDLERS_MODULE=ikam_perf_report.executor_handlers
+      - IKAM_EXECUTOR_HANDLERS_ATTR=PYTHON_EXECUTOR_HANDLERS
+      - IKAM_EXECUTOR_ID=executor://python-primary
+      - IKAM_EXECUTOR_CONSUMER_GROUP_ID=python-executor-group
+    depends_on:
+      kafka-init:
+        condition: service_completed_successfully
+      redpanda:
+        condition: service_healthy
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "PYTHONPATH=/app/packages/interacciones/executors:/app/packages/interacciones/schemas/src:/app/packages/interacciones/graph/src:/app/packages/test/ikam-perf-report python3 -c \"import importlib; importlib.import_module('python_executor_entry')\"",
+        ]
+      interval: 10s
+      timeout: 5s
+      retries: 20
+      start_period: 10s
+
+  ikam-ml-executor-runtime:
+    image: python:3.11-slim
+    working_dir: /app
+    command: >-
+      sh -lc "pip install -e /app/packages/test/ikam-perf-report &&
+      pip install -e '/app/packages/ikam[chunking]' &&
+      pip install -e '/app/packages/interacciones[kafka]' &&
+      pip install -e '/app/packages/modelado[documents,postgres]' &&
+      export PYTHONPATH=/app/packages/interacciones/executors:/app/packages/interacciones/schemas/src:/app/packages/interacciones/graph/src:/app/packages/test/ikam-perf-report &&
+      python3 -m ml_executor_entry"
+    volumes:
+      - ../../../packages:/app/packages:delegated
+    env_file:
+      - ./.env
+    environment:
+      - KAFKA_BOOTSTRAP_SERVERS=redpanda:9092
+      - IKAM_EXECUTOR_HANDLERS_MODULE=ikam_perf_report.executor_handlers
+      - IKAM_EXECUTOR_HANDLERS_ATTR=ML_EXECUTOR_HANDLERS
+      - IKAM_EXECUTOR_ID=executor://ml-primary
+      - IKAM_EXECUTOR_CONSUMER_GROUP_ID=ml-executor-group
+    depends_on:
+      kafka-init:
+        condition: service_completed_successfully
+      redpanda:
+        condition: service_healthy
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "PYTHONPATH=/app/packages/interacciones/executors:/app/packages/interacciones/schemas/src:/app/packages/interacciones/graph/src:/app/packages/test/ikam-perf-report python3 -c \"import importlib; importlib.import_module('ml_executor_entry')\"",
+        ]
+      interval: 10s
+      timeout: 5s
+      retries: 20
+      start_period: 10s
+
+  ikam-agent-executor-runtime:
+    image: python:3.11-slim
+    working_dir: /app
+    command: >-
+      sh -lc "pip install -e '/app/packages/modelado[documents,postgres]' &&
+      pip install -e /app/packages/mcp-ikam &&
+      python3 /app/packages/mcp-ikam/agent_sandbox/entrypoint.py"
+    volumes:
+      - ../../../packages:/app/packages:delegated
+    env_file:
+      - ./.env
+    environment:
+      - IKAM_AGENT_EXECUTOR_ID=executor://agent-env-primary
+
+  ikam-perf-report-init:
+    image: python:3.11-slim
+    working_dir: /app
+    command: >-
+      sh -lc "pip install -e '/app/packages/ikam[chunking]' &&
+      pip install -e '/app/packages/interacciones[kafka]' &&
+      pip install -e '/app/packages/modelado[documents,postgres]' &&
+      pip install -e /app/packages/test/ikam-perf-report &&
+      export PYTHONPATH=/app/packages/ikam/src:/app/packages/modelado/src:/app/packages/interacciones/schemas/src:/app/packages/interacciones/graph/src:/app/packages/interacciones/workflow/src:/app/packages/test/ikam-perf-report &&
+      python -c \"from modelado.db import ensure_schema; from modelado.plans.preload import default_preseed_root, preload_fixtures; ensure_schema(); preload_fixtures(default_preseed_root()); print('ikam-perf-report init complete')\""
+    environment:
+      - DATABASE_URL=postgresql://narraciones:narraciones@ikam-perf-report-postgres:5432/ikam_perf_report
+    env_file:
+      - ./.env
+    volumes:
+      - ../../../packages:/app/packages:delegated
+      - ../../../tests/fixtures/cases:/app/tests/fixtures/cases:ro
+    depends_on:
+      ikam-perf-report-postgres:
+        condition: service_healthy
+    restart: "no"
+
+  ikam-perf-report-api:
+    image: python:3.11-slim
+    working_dir: /app
+    command: >-
+      sh -lc "pip install -e '/app/packages/ikam[chunking]' &&
+      pip install -e '/app/packages/interacciones[kafka]' &&
+      pip install -e '/app/packages/modelado[documents,postgres]' &&
+      pip install -e /app/packages/test/ikam-perf-report &&
+      export PYTHONPATH=/app/packages/interacciones/schemas/src:/app/packages/interacciones/graph/src:/app/packages/interacciones/workflow/src &&
+      uvicorn ikam_perf_report.main:app --host 0.0.0.0 --port 8040 --reload --reload-dir /app/packages --reload-dir /app/tests/fixtures/cases"
+    environment:
+      - DATABASE_URL=postgresql://narraciones:narraciones@ikam-perf-report-postgres:5432/ikam_perf_report
+      - HUGEGRAPH_URL=http://ikam-perf-report-hugegraph:8080
+      - HUGEGRAPH_GRAPH=hugegraph
+      - NARRACIONES_STORAGE_ENDPOINT=ikam-perf-report-minio:9000
+      - NARRACIONES_STORAGE_ACCESS_KEY=narraciones
+      - NARRACIONES_STORAGE_SECRET_KEY=narracionespass
+      - NARRACIONES_STORAGE_BUCKET=ikam-perf-report
+      - NARRACIONES_STORAGE_SECURE=0
+      - IKAM_CASES_ROOT=/app/tests/fixtures/cases
+      - IKAM_ASYNC_NEXT_STEP=1
+      - IKAM_PERF_REPORT_TEST_MODE=1
+      - IKAM_ALLOW_DEBUG_INJECTION=1
+      - IKAM_MCP_MAP_URL=http://mcp-ikam:18081
+      - IKAM_MCP_MAP_TIMEOUT_SECONDS=${IKAM_MCP_MAP_TIMEOUT_SECONDS:-90}
+      - IKAM_EXECUTOR_SIDECAR_URL=http://ikam-executor-sidecar:8000
+    env_file:
+      - ./.env
+    volumes:
+      - ../../../packages:/app/packages:delegated
+      - ../../../tests/fixtures/cases:/app/tests/fixtures/cases:ro
+    ports:
+      - "${IKAM_PERF_REPORT_API_PORT:-8040}:8040"
+    depends_on:
+      ikam-perf-report-init:
+        condition: service_completed_successfully
+      ikam-perf-report-postgres:
+        condition: service_healthy
+      ikam-perf-report-minio:
+        condition: service_started
+      ikam-perf-report-hugegraph:
+        condition: service_healthy
+      mcp-ikam:
+        condition: service_healthy
+      ikam-executor-sidecar:
+        condition: service_healthy
+
+  ikam-graph-viewer:
+    image: node:22-alpine
+    working_dir: /app/packages/ikam-graph-viewer
+    command: sh -lc "export VITE_OPENAI_MODEL=\"${OPENAI_MODEL:-gpt-4o-mini}\"; if [ -f package-lock.json ]; then npm ci; else npm install; fi && npm run dev -- --host 0.0.0.0 --strictPort --port 5179"
+    environment:
+      - VITE_API_BASE_URL=http://ikam-perf-report-api:8040
+    volumes:
+      - ../../../packages/ikam-graph-viewer:/app/packages/ikam-graph-viewer:delegated
+      - ikam_graph_viewer_node_modules:/app/packages/ikam-graph-viewer/node_modules
+    ports:
+      - "${IKAM_GRAPH_VIEWER_PORT:-5179}:5179"
+    depends_on:
+      ikam-perf-report-api:
+        condition: service_started
+
+  stagehand-tester:
+    image: mcr.microsoft.com/playwright:v1.58.2-noble
+    working_dir: /app/packages/test/ikam-perf-report/stagehand
+    environment:
+      - IKAM_STAGEHAND_API_URL=http://ikam-perf-report-api:8040
+      - IKAM_STAGEHAND_VIEWER_URL=http://ikam-graph-viewer:5179
+    env_file:
+      - ./.env
+    volumes:
+      - ../../../:/app:delegated
+    command: sh -lc "npm install && npx playwright install chromium --with-deps && npx playwright install-deps && xvfb-run npm test"
+    depends_on:
+      ikam-graph-viewer:
+        condition: service_started
+
+volumes:
+  ikam_perf_report_postgres_data:
+  ikam_perf_report_minio_data:
+  ikam_perf_report_hugegraph_data:
+  ikam_graph_viewer_node_modules:

@@ -1,0 +1,6 @@
+CASE l-consulting-v01
+TOTAL expected=64 present=64 missing=0
+- diagrams: 18/18 present (missing 0)
+- logos: 6/6 present (missing 0)
+- people: 22/22 present (missing 0)
+- social: 18/18 present (missing 0)

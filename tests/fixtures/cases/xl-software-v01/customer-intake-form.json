@@ -1,0 +1,35 @@
+{
+  "schema_version": "0.1",
+  "title": "Customer Intake",
+  "fields": [
+    {
+      "id": "legal_name",
+      "type": "string",
+      "required": true
+    },
+    {
+      "id": "preferred_name",
+      "type": "string",
+      "required": false
+    },
+    {
+      "id": "industry",
+      "type": "string",
+      "required": true
+    },
+    {
+      "id": "kpis_in_scope",
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    {
+      "id": "data_sources",
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    }
+  ]
+}

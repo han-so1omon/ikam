@@ -1,0 +1,7 @@
+CASE m-healthcare-clinic-v01
+TOTAL expected=48 present=48 missing=0
+- clinics: 8/8 present (missing 0)
+- diagrams: 10/10 present (missing 0)
+- logos: 6/6 present (missing 0)
+- people: 18/18 present (missing 0)
+- social: 6/6 present (missing 0)

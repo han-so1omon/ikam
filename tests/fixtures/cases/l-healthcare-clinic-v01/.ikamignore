@@ -1,0 +1,17 @@
+# macOS
+.DS_Store
+
+# Python
+*.py
+*.pyc
+__pycache__/
+
+# Virtualenvs
+.venv/
+
+# Notes
+idea.md
+
+# Fixtures
+oracle.json
+prompts.jsonl

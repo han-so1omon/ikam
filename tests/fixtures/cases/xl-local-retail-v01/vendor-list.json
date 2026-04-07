@@ -1,0 +1,23 @@
+{
+  "generated": "2026-02-05",
+  "vendors": [
+    {
+      "id": "V001",
+      "name": "BayHarvest Produce",
+      "category": "produce",
+      "risk": "seasonal"
+    },
+    {
+      "id": "V002",
+      "name": "GoldenCrust Bakery",
+      "category": "bakery",
+      "risk": "capacity"
+    },
+    {
+      "id": "V003",
+      "name": "NorthCoast Dairy",
+      "category": "dairy",
+      "risk": "low"
+    }
+  ]
+}

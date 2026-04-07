@@ -1,0 +1,23 @@
+executor_id: executor://ml-primary
+executor_kind: ml-executor
+capabilities:
+  - ml.embed
+  - ml.rerank
+  - ml.extract_entities_relationships
+  - ml.extract_claims
+policy_support:
+  - latency_tier
+  - gpu_tier
+transport:
+  kind: redpanda
+  request_topic: execution.requests
+  result_topic: execution.results
+runtime:
+  framework: pytorch
+  device: cuda
+concurrency:
+  max_inflight: 2
+batching:
+  max_batch_size: 64
+health:
+  readiness_path: /health
