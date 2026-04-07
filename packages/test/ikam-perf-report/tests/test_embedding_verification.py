@@ -30,7 +30,7 @@ from modelado.core.execution_scope import DefaultExecutionScope
 from ikam_perf_report.benchmarks.store import STORE
 from ikam_perf_report.main import app
 
-_DB_URL = "postgresql://narraciones:narraciones@localhost:55432/ikam_perf_report"
+_DB_URL = "postgresql://user:pass@localhost:55432/ikam_perf_report"
 
 
 def _db_available() -> bool:

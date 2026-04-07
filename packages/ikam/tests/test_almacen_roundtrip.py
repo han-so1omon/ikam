@@ -26,7 +26,7 @@ postgres = pytest.importorskip("ikam.almacen.postgres")
 # Use test database or skip if not configured
 TEST_DB_URL = os.getenv(
     "TEST_DATABASE_URL",
-    "postgresql://narraciones:narraciones@localhost:5432/narraciones"
+    "postgresql://user:pass@localhost:5432/app"
 )
 
 

@@ -33,7 +33,7 @@ The round-trip test suite validates IKAM's mathematical guarantees:
 export PYTHONPATH=packages/ikam/src:packages/modelado/src
 
 # Run with test database
-TEST_DATABASE_URL=postgresql://narraciones:narraciones@localhost:5432/narraciones \
+TEST_DATABASE_URL="postgresql://user:pass@localhost:5432/app" \
   pytest packages/ikam/tests/test_graph_roundtrip.py -v
 
 # Run integration tests
@@ -44,11 +44,11 @@ pytest packages/modelado/tests/test_graph_roundtrip_integration.py -v
 ```bash
 # Apply migration first
 python scripts/database/apply_ikam_graph_migration.py \
-  --database-url postgresql://narraciones:narraciones@localhost:5432/narraciones
+  --database-url "$DATABASE_URL"
 
 # Run all IKAM tests
 RUN_IKAM_TESTS=1 \
-  TEST_DATABASE_URL=postgresql://narraciones:narraciones@localhost:5432/narraciones \
+  TEST_DATABASE_URL="postgresql://user:pass@localhost:5432/app" \
   pytest packages/ikam/tests/ -v
 ```
 

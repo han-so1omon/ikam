@@ -23,7 +23,7 @@ from sqlalchemy.exc import IntegrityError
 _raw_database_url = (
     os.getenv("TEST_DATABASE_URL")
     or os.getenv("PYTEST_DATABASE_URL")
-    or "postgresql://narraciones:narraciones@localhost:5432/narraciones"
+    or "postgresql://user:pass@localhost:5432/app"
 )
 
 # Prefer psycopg (v3) driver to avoid implicit psycopg2 dependency.

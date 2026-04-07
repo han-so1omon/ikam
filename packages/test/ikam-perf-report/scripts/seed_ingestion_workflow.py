@@ -19,8 +19,8 @@ from modelado.plans.persistence import persist_petri_net
 from modelado.plans.ingestion_net import create_ingestion_net_definition
 from modelado.plans.schema import PetriNetArc
 
-# Default points at local docker-compose postgres service
-DEFAULT_DATABASE_URL = "postgresql://narraciones:narraciones@localhost:5432/narraciones"
+# Default is a placeholder local Postgres DSN; prefer DATABASE_URL in practice
+DEFAULT_DATABASE_URL = "postgresql://user:pass@localhost:5432/app"
 
 LOGGER = logging.getLogger("seed-ingestion-net")
 

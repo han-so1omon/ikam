@@ -71,7 +71,7 @@ from ikam.almacen.postgres import PostgresBackend
 
 # Initialize backend
 backend = PostgresBackend(
-    "postgresql://narraciones:narraciones@localhost:5432/narraciones",
+    os.getenv("DATABASE_URL", "postgresql://user:pass@localhost:5432/app"),
     auto_initialize=True,  # Creates schema if needed
 )
 

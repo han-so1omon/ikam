@@ -855,7 +855,7 @@ def main():
     # Configuration
     db_url = os.getenv(
         "TEST_DATABASE_URL",
-        "postgresql://narraciones:narraciones@localhost:5432/narraciones"
+        "postgresql://user:pass@localhost:5432/app"
     )
     
     print(f"\n📊 Database: {db_url}")

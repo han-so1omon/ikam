@@ -56,7 +56,7 @@ def db_connection():
         "PYTEST_DATABASE_URL",
         os.getenv(
             "TEST_DATABASE_URL",
-            "postgresql://narraciones:narraciones@postgres:5432/narraciones"
+            "postgresql://user:pass@postgres:5432/app"
         )
     )
     conn = psycopg.connect(database_url)

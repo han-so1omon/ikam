@@ -546,7 +546,7 @@ def test_candidate_search_handler_uses_pgvector_hnsw():
     import asyncio
     import psycopg
 
-    db_url = "postgresql://narraciones:narraciones@localhost:55432/ikam_perf_report"
+    db_url = "postgresql://user:pass@localhost:55432/ikam_perf_report"
 
     # Check DB connectivity — skip if unavailable
     try:

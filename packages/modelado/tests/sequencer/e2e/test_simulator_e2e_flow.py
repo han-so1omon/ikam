@@ -71,7 +71,7 @@ def db_connection():
         "TEST_DATABASE_URL",
         os.getenv(
             "PYTEST_DATABASE_URL",
-            "postgresql://narraciones:narraciones@postgres:5432/narraciones"
+            "postgresql://user:pass@postgres:5432/app"
         )
     )
     conn = psycopg.connect(database_url)
@@ -347,4 +347,3 @@ class TestSimulatorE2EFlow:
 
 
 # Performance target: All E2E tests should complete in <5s each (p95 latency)
-
