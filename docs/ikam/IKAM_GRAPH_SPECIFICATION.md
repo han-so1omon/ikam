@@ -526,7 +526,7 @@ def get_derivations_for_artifact(conn, artifact_id: str) -> dict[str, list[Deriv
 **Usage:**
 ```bash
 python scripts/database/apply_ikam_graph_migration.py \
-  --database-url postgresql://narraciones:narraciones@localhost:5432/narraciones
+  --database-url "$DATABASE_URL"
 ```
 
 ### Backfill uploaded_files
@@ -543,12 +543,12 @@ python scripts/database/apply_ikam_graph_migration.py \
 ```bash
 # Dry-run (preview only)
 python scripts/database/backfill_uploaded_files_to_ikam.py \
-  --database-url postgresql://narraciones:narraciones@localhost:5432/narraciones \
+  --database-url "$DATABASE_URL" \
   --dry-run
 
 # Actual migration
 python scripts/database/backfill_uploaded_files_to_ikam.py \
-  --database-url postgresql://narraciones:narraciones@localhost:5432/narraciones
+  --database-url "$DATABASE_URL"
 ```
 
 **Validation:**
@@ -584,7 +584,7 @@ SELECT kind, COUNT(*) FROM ikam_artifacts GROUP BY kind;
 cd /path/to/narraciones-de-economicos
 source .venv/bin/activate
 export PYTHONPATH=packages/ikam/src:packages/modelado/src
-export TEST_DATABASE_URL=postgresql://narraciones:narraciones@localhost:5432/narraciones
+export TEST_DATABASE_URL="postgresql://user:pass@localhost:5432/app"
 pytest -v packages/ikam/tests/test_graph_roundtrip.py
 ```
 

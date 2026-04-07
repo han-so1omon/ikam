@@ -25,7 +25,7 @@ pytestmark = pytest.mark.skipif(
 @pytest.fixture
 async def db_pool():
     """Create asyncpg pool for testing."""
-    database_url = os.getenv("TEST_DATABASE_URL", "postgresql://narraciones:narraciones@localhost:5432/narraciones")
+    database_url = os.getenv("TEST_DATABASE_URL", "postgresql://user:pass@localhost:5432/app")
     pool = await asyncpg.create_pool(database_url, min_size=1, max_size=2)
     
     # Ensure schema exists

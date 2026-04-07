@@ -160,7 +160,7 @@ def _get_pool() -> ConnectionPool:
             "DATABASE_URL",
             os.getenv(
                 "NARRACIONES_DB",
-                "postgresql://narraciones:narraciones@localhost:5432/narraciones"
+                "postgresql://user:pass@localhost:5432/app"
             )
         )
         max_size = int(

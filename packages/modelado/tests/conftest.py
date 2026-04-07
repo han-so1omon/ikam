@@ -46,7 +46,7 @@ def postgresql() -> _PostgresqlFixture:
         os.getenv("PYTEST_DATABASE_URL")
         or os.getenv("TEST_DATABASE_URL")
         or os.getenv("DATABASE_URL")
-        or "postgresql://narraciones:narraciones@localhost:5432/narraciones"
+        or "postgresql://user:pass@localhost:5432/app"
     )
     parsed = urlparse(database_url)
 
@@ -71,7 +71,7 @@ def db_connection():
         os.getenv("PYTEST_DATABASE_URL")
         or os.getenv("TEST_DATABASE_URL")
         or os.getenv("DATABASE_URL")
-        or "postgresql://narraciones:narraciones@localhost:5432/narraciones"
+        or "postgresql://user:pass@localhost:5432/app"
     )
     ensure_schema()
     with psycopg.connect(db_url, row_factory=dict_row) as cx:

@@ -239,7 +239,7 @@ See `scripts/ikam/ikam_demo_three_outputs.py` for a runnable example showing:
 ```bash
 PYTHONPATH=packages/ikam/src \
 python scripts/ikam/ikam_demo_three_outputs.py \
-  --db postgresql://narraciones:narraciones@localhost:5432/narraciones
+  --db "$DATABASE_URL"
 ```
 
 ### Integration with Modelado
@@ -289,7 +289,7 @@ pytest packages/ikam/tests/ -v
 
 # Run E2E pipeline tests (requires Postgres)
 PYTHONPATH=packages/ikam/src \
-  TEST_DATABASE_URL=postgresql://narraciones:narraciones@localhost:5432/narraciones \
+  TEST_DATABASE_URL="postgresql://user:pass@localhost:5432/app" \
   pytest packages/ikam/tests/test_e2e_ikam_pipeline.py -v
 ```
 

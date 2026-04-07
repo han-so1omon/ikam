@@ -2014,7 +2014,7 @@ def test_all_10_steps_emit_details_in_metrics() -> None:
     import os
     import psycopg
 
-    db_url = "postgresql://narraciones:narraciones@localhost:55432/ikam_perf_report"
+    db_url = "postgresql://user:pass@localhost:55432/ikam_perf_report"
     try:
         with psycopg.connect(db_url, connect_timeout=3) as conn:
             conn.execute("SELECT 1")
@@ -2110,7 +2110,7 @@ def test_inject_verify_fail_causes_real_verify_handler_to_fail_with_drift_at() -
     import os
     import psycopg
 
-    db_url = "postgresql://narraciones:narraciones@localhost:55432/ikam_perf_report"
+    db_url = "postgresql://user:pass@localhost:55432/ikam_perf_report"
     try:
         with psycopg.connect(db_url, connect_timeout=3) as conn:
             conn.execute("SELECT 1")
@@ -2259,7 +2259,7 @@ def test_retry_loop_reenters_at_drift_point_on_verify_fail() -> None:
     import os
     import psycopg
 
-    db_url = "postgresql://narraciones:narraciones@localhost:55432/ikam_perf_report"
+    db_url = "postgresql://user:pass@localhost:55432/ikam_perf_report"
     try:
         with psycopg.connect(db_url, connect_timeout=3) as conn:
             conn.execute("SELECT 1")
@@ -2421,7 +2421,7 @@ def test_retry_budget_exhausted_terminates_run() -> None:
     import os
     import psycopg
 
-    db_url = "postgresql://narraciones:narraciones@localhost:55432/ikam_perf_report"
+    db_url = "postgresql://user:pass@localhost:55432/ikam_perf_report"
     try:
         with psycopg.connect(db_url, connect_timeout=3) as conn:
             conn.execute("SELECT 1")
@@ -8562,7 +8562,7 @@ def test_resume_runs_all_remaining_steps_to_completion() -> None:
     import os
     import psycopg
 
-    db_url = "postgresql://narraciones:narraciones@localhost:55432/ikam_perf_report"
+    db_url = "postgresql://user:pass@localhost:55432/ikam_perf_report"
     try:
         with psycopg.connect(db_url, connect_timeout=3) as conn:
             conn.execute("SELECT 1")

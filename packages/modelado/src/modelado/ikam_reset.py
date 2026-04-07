@@ -57,7 +57,7 @@ def reset_ikam_graph_state(project_ids: list[str] | None = None) -> dict[str, An
 def _postgres_url() -> str:
     return os.getenv(
         "DATABASE_URL",
-        os.getenv("NARRACIONES_DB", "postgresql://narraciones:narraciones@localhost:5432/narraciones"),
+        os.getenv("NARRACIONES_DB", "postgresql://user:pass@localhost:5432/app"),
     )
 
 

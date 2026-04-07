@@ -31,7 +31,7 @@ def test_connection(tmp_path):
     import os
     db_url = os.getenv("PYTEST_DATABASE_URL") or os.getenv(
         "DATABASE_URL",
-        "postgresql://narraciones:narraciones@localhost:5432/narraciones",
+        "postgresql://user:pass@localhost:5432/app",
     )
     
     with psycopg.connect(db_url) as conn:
