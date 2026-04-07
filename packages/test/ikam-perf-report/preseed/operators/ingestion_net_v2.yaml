@@ -1,0 +1,242 @@
+graph_id: "modelado/projects/canonical/nets"
+fragments:
+  - name: "net.ingestion.place.artifacts_ready"
+    mime_type: "application/vnd.ikam.ir.structured-data+yaml"
+    value:
+      ir_profile: "StructuredDataIR"
+      kind: "place"
+      label: "Artifacts Ready"
+
+  - name: "net.ingestion.place.fragments_lifted"
+    mime_type: "application/vnd.ikam.ir.structured-data+yaml"
+    value:
+      ir_profile: "StructuredDataIR"
+      kind: "place"
+      label: "Fragments Lifted"
+
+  - name: "net.ingestion.place.documents_loaded"
+    mime_type: "application/vnd.ikam.ir.structured-data+yaml"
+    value:
+      ir_profile: "StructuredDataIR"
+      kind: "place"
+      label: "Documents Loaded"
+
+  - name: "net.ingestion.place.chunks_parsed"
+    mime_type: "application/vnd.ikam.ir.structured-data+yaml"
+    value:
+      ir_profile: "StructuredDataIR"
+      kind: "place"
+      label: "Chunks Parsed"
+
+  - name: "net.ingestion.place.entities_and_relationships_parsed"
+    mime_type: "application/vnd.ikam.ir.structured-data+yaml"
+    value:
+      ir_profile: "StructuredDataIR"
+      kind: "place"
+      label: "Entities And Relationships Parsed"
+
+  - name: "net.ingestion.place.claims_parsed"
+    mime_type: "application/vnd.ikam.ir.structured-data+yaml"
+    value:
+      ir_profile: "StructuredDataIR"
+      kind: "place"
+      label: "Claims Parsed"
+
+  - name: "net.ingestion.transition.parse_artifacts"
+    mime_type: "application/vnd.ikam.ir.structured-data+yaml"
+    value:
+      ir_profile: "StructuredDataIR"
+      kind: "transition"
+      label: "Parse Artifacts"
+
+  - name: "net.ingestion.transition.lift_fragments"
+    mime_type: "application/vnd.ikam.ir.structured-data+yaml"
+    value:
+      ir_profile: "StructuredDataIR"
+      kind: "transition"
+      label: "Lift Fragments"
+
+  - name: "net.ingestion.transition.load_documents"
+    mime_type: "application/vnd.ikam.ir.structured-data+yaml"
+    value:
+      ir_profile: "StructuredDataIR"
+      kind: "transition"
+      label: "Load Documents"
+
+  - name: "net.ingestion.transition.parse_chunk"
+    mime_type: "application/vnd.ikam.ir.structured-data+yaml"
+    value:
+      ir_profile: "StructuredDataIR"
+      kind: "transition"
+      label: "Parse Chunk"
+
+  - name: "net.ingestion.transition.parse_entities_and_relationships"
+    mime_type: "application/vnd.ikam.ir.structured-data+yaml"
+    value:
+      ir_profile: "StructuredDataIR"
+      kind: "transition"
+      label: "Parse Entities And Relationships"
+
+  - name: "net.ingestion.transition.parse_claims"
+    mime_type: "application/vnd.ikam.ir.structured-data+yaml"
+    value:
+      ir_profile: "StructuredDataIR"
+      kind: "transition"
+      label: "Parse Claims"
+
+  - name: "net.ingestion.arc.artifacts_to_parse"
+    mime_type: "application/vnd.ikam.ir.proposition+yaml"
+    value:
+      ir_profile: "PropositionIR"
+      subject: "${ref:net.ingestion.place.artifacts_ready}"
+      predicate: "provides_input_to"
+      object: "${ref:net.ingestion.transition.parse_artifacts}"
+
+  - name: "net.ingestion.arc.parse_to_lift"
+    mime_type: "application/vnd.ikam.ir.proposition+yaml"
+    value:
+      ir_profile: "PropositionIR"
+      subject: "${ref:net.ingestion.transition.parse_artifacts}"
+      predicate: "provides_input_to"
+      object: "${ref:net.ingestion.transition.lift_fragments}"
+
+  - name: "net.ingestion.arc.lift_to_fragments_ready"
+    mime_type: "application/vnd.ikam.ir.proposition+yaml"
+    value:
+      ir_profile: "PropositionIR"
+      subject: "${ref:net.ingestion.transition.lift_fragments}"
+      predicate: "outputs_to"
+      object: "${ref:net.ingestion.place.fragments_lifted}"
+
+  - name: "net.ingestion.link.parse_artifacts_exec"
+    mime_type: "application/vnd.ikam.ir.proposition+yaml"
+    value:
+      ir_profile: "PropositionIR"
+      subject: "${ref:net.ingestion.transition.parse_artifacts}"
+      predicate: "executed_by_operator"
+      object: "${ref:op_parse_artifacts_expr}"
+
+  - name: "net.ingestion.link.lift_fragments_exec"
+    mime_type: "application/vnd.ikam.ir.proposition+yaml"
+    value:
+      ir_profile: "PropositionIR"
+      subject: "${ref:net.ingestion.transition.lift_fragments}"
+      predicate: "executed_by_operator"
+      object: "${ref:op_lift_fragments_expr}"
+
+  - name: "net.ingestion.arc.artifacts_to_load_documents"
+    mime_type: "application/vnd.ikam.ir.proposition+yaml"
+    value:
+      ir_profile: "PropositionIR"
+      subject: "${ref:net.ingestion.place.artifacts_ready}"
+      predicate: "provides_input_to"
+      object: "${ref:net.ingestion.transition.load_documents}"
+
+  - name: "net.ingestion.arc.load_documents_to_documents_loaded"
+    mime_type: "application/vnd.ikam.ir.proposition+yaml"
+    value:
+      ir_profile: "PropositionIR"
+      subject: "${ref:net.ingestion.transition.load_documents}"
+      predicate: "outputs_to"
+      object: "${ref:net.ingestion.place.documents_loaded}"
+
+  - name: "net.ingestion.arc.documents_loaded_to_parse_chunk"
+    mime_type: "application/vnd.ikam.ir.proposition+yaml"
+    value:
+      ir_profile: "PropositionIR"
+      subject: "${ref:net.ingestion.place.documents_loaded}"
+      predicate: "provides_input_to"
+      object: "${ref:net.ingestion.transition.parse_chunk}"
+
+  - name: "net.ingestion.arc.parse_chunk_to_chunks_parsed"
+    mime_type: "application/vnd.ikam.ir.proposition+yaml"
+    value:
+      ir_profile: "PropositionIR"
+      subject: "${ref:net.ingestion.transition.parse_chunk}"
+      predicate: "outputs_to"
+      object: "${ref:net.ingestion.place.chunks_parsed}"
+
+  - name: "net.ingestion.arc.chunks_parsed_to_parse_entities_and_relationships"
+    mime_type: "application/vnd.ikam.ir.proposition+yaml"
+    value:
+      ir_profile: "PropositionIR"
+      subject: "${ref:net.ingestion.place.chunks_parsed}"
+      predicate: "provides_input_to"
+      object: "${ref:net.ingestion.transition.parse_entities_and_relationships}"
+
+  - name: "net.ingestion.arc.parse_entities_and_relationships_to_entities_and_relationships_parsed"
+    mime_type: "application/vnd.ikam.ir.proposition+yaml"
+    value:
+      ir_profile: "PropositionIR"
+      subject: "${ref:net.ingestion.transition.parse_entities_and_relationships}"
+      predicate: "outputs_to"
+      object: "${ref:net.ingestion.place.entities_and_relationships_parsed}"
+
+  - name: "net.ingestion.arc.entities_and_relationships_parsed_to_parse_claims"
+    mime_type: "application/vnd.ikam.ir.proposition+yaml"
+    value:
+      ir_profile: "PropositionIR"
+      subject: "${ref:net.ingestion.place.entities_and_relationships_parsed}"
+      predicate: "provides_input_to"
+      object: "${ref:net.ingestion.transition.parse_claims}"
+
+  - name: "net.ingestion.arc.parse_claims_to_claims_parsed"
+    mime_type: "application/vnd.ikam.ir.proposition+yaml"
+    value:
+      ir_profile: "PropositionIR"
+      subject: "${ref:net.ingestion.transition.parse_claims}"
+      predicate: "outputs_to"
+      object: "${ref:net.ingestion.place.claims_parsed}"
+
+  - name: "net.ingestion.link.load_documents_exec"
+    mime_type: "application/vnd.ikam.ir.proposition+yaml"
+    value:
+      ir_profile: "PropositionIR"
+      subject: "${ref:net.ingestion.transition.load_documents}"
+      predicate: "executed_by_operator"
+      object: "${ref:op_load_documents_expr}"
+
+  - name: "net.ingestion.link.parse_chunk_exec"
+    mime_type: "application/vnd.ikam.ir.proposition+yaml"
+    value:
+      ir_profile: "PropositionIR"
+      subject: "${ref:net.ingestion.transition.parse_chunk}"
+      predicate: "executed_by_operator"
+      object: "${ref:op_parse_chunk_expr}"
+
+  - name: "net.ingestion.link.parse_entities_and_relationships_exec"
+    mime_type: "application/vnd.ikam.ir.proposition+yaml"
+    value:
+      ir_profile: "PropositionIR"
+      subject: "${ref:net.ingestion.transition.parse_entities_and_relationships}"
+      predicate: "executed_by_operator"
+      object: "${ref:op_parse_entities_and_relationships_expr}"
+
+  - name: "net.ingestion.link.parse_claims_exec"
+    mime_type: "application/vnd.ikam.ir.proposition+yaml"
+    value:
+      ir_profile: "PropositionIR"
+      subject: "${ref:net.ingestion.transition.parse_claims}"
+      predicate: "executed_by_operator"
+      object: "${ref:op_parse_claims_expr}"
+
+  - name: "net.ingestion.head"
+    mime_type: "application/vnd.ikam.ir.structured-data+yaml"
+    value:
+      ir_profile: "StructuredDataIR"
+      profile: "petri_net"
+      name: "canonical_ingestion"
+      places:
+        artifacts_ready: "${ref:net.ingestion.place.artifacts_ready}"
+        documents_loaded: "${ref:net.ingestion.place.documents_loaded}"
+        chunks_parsed: "${ref:net.ingestion.place.chunks_parsed}"
+        entities_and_relationships_parsed: "${ref:net.ingestion.place.entities_and_relationships_parsed}"
+        claims_parsed: "${ref:net.ingestion.place.claims_parsed}"
+        fragments_lifted: "${ref:net.ingestion.place.fragments_lifted}"
+      transitions:
+        load_documents: "${ref:net.ingestion.transition.load_documents}"
+        parse_chunk: "${ref:net.ingestion.transition.parse_chunk}"
+        parse_entities_and_relationships: "${ref:net.ingestion.transition.parse_entities_and_relationships}"
+        parse_claims: "${ref:net.ingestion.transition.parse_claims}"
+        parse_artifacts: "${ref:net.ingestion.transition.parse_artifacts}"
+        lift_fragments: "${ref:net.ingestion.transition.lift_fragments}"

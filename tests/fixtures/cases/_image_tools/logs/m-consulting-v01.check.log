@@ -1,0 +1,6 @@
+CASE m-consulting-v01
+TOTAL expected=60 present=60 missing=0
+- diagram: 12/12 present (missing 0)
+- logo: 6/6 present (missing 0)
+- peopl: 18/18 present (missing 0)
+- socia: 24/24 present (missing 0)

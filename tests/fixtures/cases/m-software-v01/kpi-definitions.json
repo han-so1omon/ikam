@@ -1,0 +1,17 @@
+{
+  "version": "2026-02-21",
+  "kpis": [
+    {
+      "name": "Active accounts (CS)",
+      "definition": "accounts with weekly engagement"
+    },
+    {
+      "name": "Weekly active users (Product)",
+      "definition": "users with >=1 action in 7 days"
+    },
+    {
+      "name": "Billable accounts (Finance)",
+      "definition": "accounts with active subscription"
+    }
+  ]
+}

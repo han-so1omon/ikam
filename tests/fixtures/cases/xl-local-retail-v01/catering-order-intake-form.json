@@ -1,0 +1,39 @@
+{
+  "schema_version": "0.2",
+  "title": "Catering Order Intake",
+  "fields": [
+    {
+      "id": "company_name",
+      "type": "string",
+      "required": true
+    },
+    {
+      "id": "contact_email",
+      "type": "string",
+      "required": true
+    },
+    {
+      "id": "event_date",
+      "type": "date",
+      "required": true
+    },
+    {
+      "id": "headcount",
+      "type": "integer",
+      "required": true
+    },
+    {
+      "id": "dietary_notes",
+      "type": "string"
+    },
+    {
+      "id": "delivery",
+      "type": "enum",
+      "values": [
+        "pickup",
+        "delivery"
+      ],
+      "required": true
+    }
+  ]
+}

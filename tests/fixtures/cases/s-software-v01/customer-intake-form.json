@@ -1,0 +1,19 @@
+{
+  "schema_version": "0.1",
+  "title": "Customer Intake",
+  "fields": [
+    {
+      "id": "business_name",
+      "type": "string",
+      "required": true
+    },
+    {
+      "id": "industry",
+      "type": "string"
+    },
+    {
+      "id": "webhook_url",
+      "type": "string"
+    }
+  ]
+}

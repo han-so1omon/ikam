@@ -1,0 +1,44 @@
+[build-system]
+requires = ["setuptools>=65", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ikam"
+version = "0.1.0"
+description = "IKAM (Integrated Knowledge & Artifacts Model) core models for Narraciones"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [ { name = "Narraciones" } ]
+requires-python = ">=3.11"
+dependencies = [
+  "pydantic>=2.7",
+  "typer>=0.9.0",
+  "pyyaml>=6.0",
+  "blake3>=0.4",
+]
+
+[project.scripts]
+ikam = "ikam.cli:app"
+
+[project.optional-dependencies]
+# Almacén storage backends
+postgres = [
+  "psycopg[binary]>=3.1",
+  "blake3>=0.4",
+]
+
+# Document chunking
+chunking = [
+  "openpyxl>=3.1",
+  "python-pptx>=0.6",
+  "pdfplumber>=0.11",
+]
+
+# Full almacén support (all backends + chunking)
+almacen = [
+  "ikam[postgres,chunking]",
+]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+include = ["ikam*"]

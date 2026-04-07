@@ -1,0 +1,53 @@
+
+> ikam-perf-report-stagehand@1.0.0 test
+> playwright test
+
+
+Running 1 test using 1 worker
+
+[1A[2K[1/1] [chromium] › tests/ingestion.spec.ts:18:7 › IKAM Ingestion Performance Report › User Journey: s-local-retail-v01 Ingestion Step-Through
+[1A[2K[chromium] › tests/ingestion.spec.ts:18:7 › IKAM Ingestion Performance Report › User Journey: s-local-retail-v01 Ingestion Step-Through
+2026-03-02T04:25:00.172Z::[stagehand:init] launching local browser {"headless":{"value":"true","type":"boolean"}}
+
+[1A[2K2026-03-02T04:25:00.846Z::[stagehand:init] local browser started successfully. 
+
+[1A[2KStarting ingestion journey for case: s-local-retail-v01
+
+[1A[2KNavigating to http://localhost:5179
+
+[1A[2KFinished waiting
+
+[1A[2K  1) [chromium] › tests/ingestion.spec.ts:18:7 › IKAM Ingestion Performance Report › User Journey: s-local-retail-v01 Ingestion Step-Through 
+
+    Error: No LLM API key or LLM Client configured. An LLM API key or a custom LLM Client is required to use act, extract, or observe.
+
+       at ../src/journeys/ingestion.ts:22
+
+      20 |   }
+      21 |
+    > 22 |   await stagehand.page.act({ action: `Type "${caseId}" into the case search box, then find "${caseId}" in the case list and click its checkbox. Ensure it is checked.` });
+         |                        ^
+      23 |   
+      24 |   // Ensure "Reset before run" is checked if we want a clean state
+      25 |   await stagehand.page.act({ action: 'Ensure the "Reset before run" checkbox is checked' });
+        at Proxy.act (/Users/Shared/p/ingenierias-lentas/narraciones-de-economicos/packages/test/ikam-perf-report/stagehand/node_modules/@browserbasehq/stagehand/dist/index.js:3704:23)
+        at runIngestionJourney (/Users/Shared/p/ingenierias-lentas/narraciones-de-economicos/packages/test/ikam-perf-report/stagehand/src/journeys/ingestion.ts:22:24)
+        at /Users/Shared/p/ingenierias-lentas/narraciones-de-economicos/packages/test/ikam-perf-report/stagehand/tests/ingestion.spec.ts:21:20
+
+    attachment #1: screenshot (image/png) ──────────────────────────────────────────────────────────
+    test-results/ingestion-IKAM-Ingestion-P-6f1a8--v01-Ingestion-Step-Through-chromium/test-failed-2.png
+    ────────────────────────────────────────────────────────────────────────────────────────────────
+
+    attachment #2: screenshot (image/png) ──────────────────────────────────────────────────────────
+    test-results/ingestion-IKAM-Ingestion-P-6f1a8--v01-Ingestion-Step-Through-chromium/test-failed-1.png
+    ────────────────────────────────────────────────────────────────────────────────────────────────
+
+    attachment #3: video (video/webm) ──────────────────────────────────────────────────────────────
+    test-results/ingestion-IKAM-Ingestion-P-6f1a8--v01-Ingestion-Step-Through-chromium/video.webm
+    ────────────────────────────────────────────────────────────────────────────────────────────────
+
+    Error Context: test-results/ingestion-IKAM-Ingestion-P-6f1a8--v01-Ingestion-Step-Through-chromium/error-context.md
+
+
+[1A[2K  1 failed
+    [chromium] › tests/ingestion.spec.ts:18:7 › IKAM Ingestion Performance Report › User Journey: s-local-retail-v01 Ingestion Step-Through 

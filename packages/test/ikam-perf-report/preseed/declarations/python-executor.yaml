@@ -1,0 +1,23 @@
+executor_id: executor://python-primary
+executor_kind: python-executor
+capabilities:
+  - python.chunk
+  - python.transform
+  - python.load_documents
+  - python.chunk_documents
+policy_support:
+  - latency_tier
+  - cost_tier
+transport:
+  kind: redpanda
+  request_topic: execution.requests
+  result_topic: execution.results
+runtime:
+  language: python
+  version: "3.11"
+concurrency:
+  max_inflight: 4
+batching:
+  max_batch_size: 16
+health:
+  readiness_path: /health

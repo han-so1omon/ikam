@@ -1,0 +1,16 @@
+{
+  "artifact_id": "71565d75-034c-452f-9d92-cd6d6746e5bf",
+  "project_id": "e2e-project",
+  "fragments": {
+    "L0": [
+      "frag-l0-1",
+      "frag-l0-2"
+    ],
+    "L1": [
+      "frag-l1-1"
+    ],
+    "L2": [
+      "frag-l2-1"
+    ]
+  }
+}

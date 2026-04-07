@@ -1,0 +1,10 @@
+{
+  "incident_id": "INC-2026-01-17",
+  "signals": {
+    "vendor_latency_ms_p95": 240,
+    "queue_depth_max": 980000,
+    "consumer_lag_seconds_max": 7400,
+    "internal_processing_errors": 0.02
+  },
+  "notes": "Metrics suggest backlog depth and consumer lag were primary drivers; vendor latency was secondary."
+}

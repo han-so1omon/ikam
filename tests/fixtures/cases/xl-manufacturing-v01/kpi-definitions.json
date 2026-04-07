@@ -1,0 +1,29 @@
+{
+  "version": "2026-02-01",
+  "kpis": [
+    {
+      "name": "OEE (plant)",
+      "definition": "availability excludes planned maintenance"
+    },
+    {
+      "name": "OEE (finance)",
+      "definition": "availability includes planned maintenance"
+    },
+    {
+      "name": "Scrap (ops)",
+      "definition": "scrap incl rework"
+    },
+    {
+      "name": "Scrap (QA)",
+      "definition": "true scrap only"
+    },
+    {
+      "name": "OTD (customer)",
+      "definition": "on-time if first shipment arrives"
+    },
+    {
+      "name": "OTD (internal)",
+      "definition": "on-time if full order complete"
+    }
+  ]
+}

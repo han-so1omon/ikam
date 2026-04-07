@@ -1,0 +1,13 @@
+{
+  "generated": "2026-02-05",
+  "customers": [
+    {
+      "account": "Pinegrove HVAC",
+      "plan": "Team"
+    },
+    {
+      "account": "Cobalt Dental",
+      "plan": "Starter (legacy addendum)"
+    }
+  ]
+}

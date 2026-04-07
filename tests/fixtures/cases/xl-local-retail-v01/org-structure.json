@@ -1,0 +1,18 @@
+{
+  "generated": "2026-02-05",
+  "roles": {
+    "COO": "Camille Torres",
+    "CFO": "Jonah Feld",
+    "Marketing": "Imani Brooks",
+    "SupplyChain": "Wes Park",
+    "HR": "Hana Kim",
+    "Stores": [
+      "Priya",
+      "Marco",
+      "Elena",
+      "Devon",
+      "Sam",
+      "Tori"
+    ]
+  }
+}

@@ -1,0 +1,19 @@
+{
+  "snapshot_date": "2026-02-18",
+  "board": "Platform",
+  "columns": {
+    "Backlog": [
+      "GARNET-101",
+      "GARNET-120"
+    ],
+    "In Progress": [
+      "QUEUE-33"
+    ],
+    "Review": [
+      "GARNET-132"
+    ],
+    "Done": [
+      "REL-2025Q4-4"
+    ]
+  }
+}

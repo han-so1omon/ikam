@@ -1,0 +1,17 @@
+graph_id: "modelado/projects/canonical/executors"
+fragments:
+  - name: "exec_python_config"
+    mime_type: "application/vnd.ikam.ir.structured-data+yaml"
+    value:
+      ir_profile: "StructuredDataIR"
+      endpoint: "http://ikam-executor-sidecar:8000"
+      type: "sidecar"
+      protocol: "http"
+
+  - name: "exec_python_claim"
+    mime_type: "application/vnd.ikam.ir.proposition+yaml"
+    value:
+      ir_profile: "PropositionIR"
+      subject: "${ref:exec_python_config}"
+      predicate: "acts_as"
+      object: "executor/python"

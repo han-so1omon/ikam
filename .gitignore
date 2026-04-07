@@ -1,0 +1,9 @@
+**/.venv/
+**/__pycache__/
+**/*.pyc
+**/.DS_Store
+**/*.egg-info/
+packages/test/ikam-perf-report/reports/
+node_modules/
+dist/
+coverage/

@@ -1,0 +1,61 @@
+profile: agent_spec
+artifact_kind: ikam_agent_spec
+logical_name: parse-review-agent
+title: Parse Review Agent
+description: >
+  Reviews MCP-generated structural maps for semantic plausibility, coverage,
+  and first-pass acceptance, then emits an interacciones elicitation.
+executor:
+  executor_id: executor://agent-env-primary
+  executor_kind: agent-executor
+  sandbox_mode: restricted
+operation:
+  names:
+    - map.conceptual.lift.surface_fragments
+  stage: parse_review
+  produces:
+    - agent_review
+    - elicitation_request
+approval:
+  mode_default: human_required
+  auto_resolve_on_accept: false
+  create_elicitation_on:
+    - accept
+    - warn
+    - reject
+content:
+  file: support/agents/parse-review-agent.md
+  mime_type: text/markdown
+  content_role: agent_summary
+skills:
+  allow:
+    - parse_review
+    - semantic_validation
+    - elicitation_drafting
+tools:
+  allow:
+    - artifact.preview
+    - mcp.trace.read
+    - registry.lookup
+    - map.summary.read
+  deny:
+    - filesystem.write
+    - network.open
+    - process.spawn
+output_contract:
+  decision_enum:
+    - accept
+    - warn
+    - reject
+  required_fields:
+    - decision
+    - confidence
+    - findings
+    - suggested_repairs
+    - elicitation_summary
+    - elicitation_details
+publish:
+  - registry: agent_specs
+    key: parse-review-agent
+    title: Parse Review Agent
+    goal: Judge semantic map quality and emit elicitation decisions

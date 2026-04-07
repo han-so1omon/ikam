@@ -1,0 +1,13 @@
+{
+  "generated": "2026-02-05",
+  "customers": [
+    {
+      "account": "Spokane HVAC Supply",
+      "segment": "distributor"
+    },
+    {
+      "account": "Pine River Equipment",
+      "segment": "OEM"
+    }
+  ]
+}

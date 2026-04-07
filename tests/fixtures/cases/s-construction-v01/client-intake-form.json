@@ -1,0 +1,35 @@
+{
+  "schema_version": "0.1",
+  "title": "Client Intake",
+  "fields": [
+    {
+      "id": "client_name",
+      "type": "string",
+      "required": true
+    },
+    {
+      "id": "project_address",
+      "type": "string",
+      "required": true
+    },
+    {
+      "id": "project_type",
+      "type": "enum",
+      "values": [
+        "ADU",
+        "Kitchen",
+        "Bath",
+        "TI"
+      ],
+      "required": true
+    },
+    {
+      "id": "target_start",
+      "type": "date"
+    },
+    {
+      "id": "budget_range",
+      "type": "string"
+    }
+  ]
+}

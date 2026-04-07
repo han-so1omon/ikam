@@ -1,0 +1,27 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "interacciones-workflow"
+version = "0.1.0"
+description = "Reusable workflow template loading and compilation helpers"
+requires-python = ">=3.11"
+license = {text = "MIT"}
+dependencies = [
+    "interacciones-schemas>=0.1.0",
+    "pydantic>=2.0",
+    "pyyaml>=6.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.4",
+]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src", "../schemas/src"]

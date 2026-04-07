@@ -1,0 +1,24 @@
+{
+  "schema_version": "0.1",
+  "title": "Patient Intake",
+  "fields": [
+    {
+      "id": "preferred_name",
+      "type": "string"
+    },
+    {
+      "id": "dob",
+      "type": "date",
+      "required": true
+    },
+    {
+      "id": "insurance",
+      "type": "string"
+    },
+    {
+      "id": "reason_for_visit",
+      "type": "string",
+      "required": true
+    }
+  ]
+}

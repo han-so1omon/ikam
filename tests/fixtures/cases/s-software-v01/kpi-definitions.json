@@ -1,0 +1,17 @@
+{
+  "version": "2026-02-02",
+  "kpis": [
+    {
+      "name": "Churn (support)",
+      "definition": "cancellations in period"
+    },
+    {
+      "name": "Churn (finance)",
+      "definition": "net revenue churn incl downgrades"
+    },
+    {
+      "name": "Active",
+      "definition": "account has >=1 routed request in 30 days"
+    }
+  ]
+}

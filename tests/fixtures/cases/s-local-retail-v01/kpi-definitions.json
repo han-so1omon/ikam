@@ -1,0 +1,29 @@
+{
+  "version": "2026-02-01",
+  "currency": "USD",
+  "kpis": [
+    {
+      "name": "Revenue (POS)",
+      "description": "Gross sales captured by Square POS exports.",
+      "formula": "sum(transactions.total_amount) - sum(transactions.refunds_processed_in_pos)",
+      "notes": "May exclude manual returns/adjustments during peak weeks."
+    },
+    {
+      "name": "Revenue (Bookkeeping)",
+      "description": "Revenue recognized in quarterly close by North Ledger LLC.",
+      "formula": "revenue_accounts_total_for_period",
+      "notes": "May include manual adjustments and accrual timing."
+    },
+    {
+      "name": "Gross Margin %",
+      "description": "Blended gross margin across channels.",
+      "formula": "(revenue - cogs) / revenue",
+      "notes": "Target stated as 52% in strategy doc; projections use 48% assumption."
+    },
+    {
+      "name": "AOV",
+      "description": "Average order value (POS).",
+      "formula": "Revenue (POS) / count(orders)"
+    }
+  ]
+}

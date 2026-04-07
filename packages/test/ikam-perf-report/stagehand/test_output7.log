@@ -1,0 +1,56 @@
+
+> ikam-perf-report-stagehand@1.0.0 test
+> playwright test
+
+
+Running 1 test using 1 worker
+
+[1A[2K[1/1] [chromium] › tests/ingestion.spec.ts:18:7 › IKAM Ingestion Performance Report › User Journey: s-local-retail-v01 Ingestion Step-Through
+[1A[2K[chromium] › tests/ingestion.spec.ts:18:7 › IKAM Ingestion Performance Report › User Journey: s-local-retail-v01 Ingestion Step-Through
+2026-03-02T04:22:48.424Z::[stagehand:init] launching local browser {"headless":{"value":"true","type":"boolean"}}
+
+[1A[2K2026-03-02T04:22:49.140Z::[stagehand:init] local browser started successfully. 
+
+[1A[2KStarting ingestion journey for case: s-local-retail-v01
+
+[1A[2K  1) [chromium] › tests/ingestion.spec.ts:18:7 › IKAM Ingestion Performance Report › User Journey: s-local-retail-v01 Ingestion Step-Through 
+
+    Error: Act handler not initialized
+
+       at ../src/journeys/ingestion.ts:20
+
+      18 |   }
+      19 |
+    > 20 |   await stagehand.act({ action: `Type "${caseId}" into the case search box, then find "${caseId}" in the case list and click its checkbox. Ensure it is checked.` });
+         |                   ^
+      21 |   
+      22 |   // Ensure "Reset before run" is checked if we want a clean state
+      23 |   await stagehand.act({ action: 'Ensure the "Reset before run" checkbox is checked' });
+        at _StagehandPage.<anonymous> (/Users/Shared/p/ingenierias-lentas/narraciones-de-economicos/packages/test/ikam-perf-report/stagehand/node_modules/@browserbasehq/stagehand/dist/index.js:3894:15)
+        at /Users/Shared/p/ingenierias-lentas/narraciones-de-economicos/packages/test/ikam-perf-report/stagehand/node_modules/@browserbasehq/stagehand/dist/index.js:76:61
+        at __async (/Users/Shared/p/ingenierias-lentas/narraciones-de-economicos/packages/test/ikam-perf-report/stagehand/node_modules/@browserbasehq/stagehand/dist/index.js:60:10)
+        at _StagehandPage.act (/Users/Shared/p/ingenierias-lentas/narraciones-de-economicos/packages/test/ikam-perf-report/stagehand/node_modules/@browserbasehq/stagehand/dist/index.js:3892:12)
+        at Stagehand.<anonymous> (/Users/Shared/p/ingenierias-lentas/narraciones-de-economicos/packages/test/ikam-perf-report/stagehand/node_modules/@browserbasehq/stagehand/dist/index.js:6381:39)
+        at /Users/Shared/p/ingenierias-lentas/narraciones-de-economicos/packages/test/ikam-perf-report/stagehand/node_modules/@browserbasehq/stagehand/dist/index.js:76:61
+        at __async (/Users/Shared/p/ingenierias-lentas/narraciones-de-economicos/packages/test/ikam-perf-report/stagehand/node_modules/@browserbasehq/stagehand/dist/index.js:60:10)
+        at Stagehand.act (/Users/Shared/p/ingenierias-lentas/narraciones-de-economicos/packages/test/ikam-perf-report/stagehand/node_modules/@browserbasehq/stagehand/dist/index.js:6380:12)
+        at runIngestionJourney (/Users/Shared/p/ingenierias-lentas/narraciones-de-economicos/packages/test/ikam-perf-report/stagehand/src/journeys/ingestion.ts:20:19)
+        at /Users/Shared/p/ingenierias-lentas/narraciones-de-economicos/packages/test/ikam-perf-report/stagehand/tests/ingestion.spec.ts:21:20
+
+    attachment #1: screenshot (image/png) ──────────────────────────────────────────────────────────
+    test-results/ingestion-IKAM-Ingestion-P-6f1a8--v01-Ingestion-Step-Through-chromium/test-failed-2.png
+    ────────────────────────────────────────────────────────────────────────────────────────────────
+
+    attachment #2: screenshot (image/png) ──────────────────────────────────────────────────────────
+    test-results/ingestion-IKAM-Ingestion-P-6f1a8--v01-Ingestion-Step-Through-chromium/test-failed-1.png
+    ────────────────────────────────────────────────────────────────────────────────────────────────
+
+    attachment #3: video (video/webm) ──────────────────────────────────────────────────────────────
+    test-results/ingestion-IKAM-Ingestion-P-6f1a8--v01-Ingestion-Step-Through-chromium/video.webm
+    ────────────────────────────────────────────────────────────────────────────────────────────────
+
+    Error Context: test-results/ingestion-IKAM-Ingestion-P-6f1a8--v01-Ingestion-Step-Through-chromium/error-context.md
+
+
+[1A[2K  1 failed
+    [chromium] › tests/ingestion.spec.ts:18:7 › IKAM Ingestion Performance Report › User Journey: s-local-retail-v01 Ingestion Step-Through 

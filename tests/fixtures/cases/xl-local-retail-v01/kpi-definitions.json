@@ -1,0 +1,25 @@
+{
+  "version": "2026-02-01",
+  "kpis": [
+    {
+      "name": "Revenue (ops)",
+      "definition": "gross sales",
+      "notes": "includes voids until reconciled"
+    },
+    {
+      "name": "Revenue (finance)",
+      "definition": "net sales",
+      "notes": "excludes returns/voids"
+    },
+    {
+      "name": "Waste (commissary)",
+      "definition": "waste minus rework savings",
+      "notes": "optimistic"
+    },
+    {
+      "name": "Shrink/Waste (finance)",
+      "definition": "shrink + waste per inventory adjustment",
+      "notes": "conservative"
+    }
+  ]
+}

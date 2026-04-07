@@ -1,0 +1,20 @@
+{
+  "generated": "2026-02-05",
+  "vendors": [
+    {
+      "id": "V001",
+      "name": "Oakline Ceramics",
+      "category": "ceramics"
+    },
+    {
+      "id": "V002",
+      "name": "BlueHarbor Textiles",
+      "category": "textiles"
+    },
+    {
+      "id": "V003",
+      "name": "Candlecraft Co.",
+      "category": "candles"
+    }
+  ]
+}

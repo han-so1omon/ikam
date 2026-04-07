@@ -1,0 +1,303 @@
+graph_id: modelado/projects/canonical/nets
+fragments:
+- name: net.ingestion.place.artifacts_ready
+  fragment_id: b27394dd-6060-504a-8612-3047ba7deff9
+  cas_id: 0b280edc4ae2fc3ba6f64a94b39f9966956a07f0d696b42a16a4ce175c51ecc3
+  mime_type: application/vnd.ikam.ir.structured-data+yaml
+  value:
+    ir_profile: StructuredDataIR
+    kind: place
+    label: Artifacts Ready
+    _fragment_id: b27394dd-6060-504a-8612-3047ba7deff9
+- name: net.ingestion.place.fragments_lifted
+  fragment_id: 69e36443-50e3-5d97-a834-be18358b657a
+  cas_id: 8cad2cd57b813b2c89cb76bd7db59df67ce1604a10d537b63ad03b83c8c09e6f
+  mime_type: application/vnd.ikam.ir.structured-data+yaml
+  value:
+    ir_profile: StructuredDataIR
+    kind: place
+    label: Fragments Lifted
+    _fragment_id: 69e36443-50e3-5d97-a834-be18358b657a
+- name: net.ingestion.place.documents_loaded
+  fragment_id: 9a03056d-4ce9-5a48-a5e4-360c108bc542
+  cas_id: c83a10b84b88de12fea4234bb70fc82aab13126b756014ccca0c29b7681c785a
+  mime_type: application/vnd.ikam.ir.structured-data+yaml
+  value:
+    ir_profile: StructuredDataIR
+    kind: place
+    label: Documents Loaded
+    _fragment_id: 9a03056d-4ce9-5a48-a5e4-360c108bc542
+- name: net.ingestion.place.chunks_parsed
+  fragment_id: 2e8f5aa7-282b-548c-9426-4df82f870f1d
+  cas_id: ee45522f54e6f01baa94721521906c4f401913a8b19df167825f05b7795f133e
+  mime_type: application/vnd.ikam.ir.structured-data+yaml
+  value:
+    ir_profile: StructuredDataIR
+    kind: place
+    label: Chunks Parsed
+    _fragment_id: 2e8f5aa7-282b-548c-9426-4df82f870f1d
+- name: net.ingestion.place.entities_and_relationships_parsed
+  fragment_id: f9967ade-9fb5-59ce-ba47-31427b534c05
+  cas_id: 3caa5352f0140f3d33fe3514f92b5bd3f005ef751c37e92d9b3f06ba18adb92a
+  mime_type: application/vnd.ikam.ir.structured-data+yaml
+  value:
+    ir_profile: StructuredDataIR
+    kind: place
+    label: Entities And Relationships Parsed
+    _fragment_id: f9967ade-9fb5-59ce-ba47-31427b534c05
+- name: net.ingestion.place.claims_parsed
+  fragment_id: f648f7af-2d1a-54ef-9f9f-8871025441b0
+  cas_id: 9b80248d62b67e915c82091d586652a5cfe565fd60ab911c7e259a4ba10c595e
+  mime_type: application/vnd.ikam.ir.structured-data+yaml
+  value:
+    ir_profile: StructuredDataIR
+    kind: place
+    label: Claims Parsed
+    _fragment_id: f648f7af-2d1a-54ef-9f9f-8871025441b0
+- name: net.ingestion.transition.parse_artifacts
+  fragment_id: 84eae66f-e354-5d90-a0f0-12a32284c7b7
+  cas_id: 4f4542ac66f82557ece273417084bad298d496116431c09077e132e3a60d5e6e
+  mime_type: application/vnd.ikam.ir.structured-data+yaml
+  value:
+    ir_profile: StructuredDataIR
+    kind: transition
+    label: Parse Artifacts
+    _fragment_id: 84eae66f-e354-5d90-a0f0-12a32284c7b7
+- name: net.ingestion.transition.lift_fragments
+  fragment_id: 7e79b4ce-6b9f-5169-bdf5-84fa45d3f4f6
+  cas_id: 1a8019462020f0e74c177d868bfcbbb9c61adfbc9566b4ace2ae6da99ef01be8
+  mime_type: application/vnd.ikam.ir.structured-data+yaml
+  value:
+    ir_profile: StructuredDataIR
+    kind: transition
+    label: Lift Fragments
+    _fragment_id: 7e79b4ce-6b9f-5169-bdf5-84fa45d3f4f6
+- name: net.ingestion.transition.load_documents
+  fragment_id: a59d09a4-6521-5b76-910c-708ca69593a9
+  cas_id: df015f0426486e97854abc673610086fae3ba2ad09e90405ad21b0f001dc67bc
+  mime_type: application/vnd.ikam.ir.structured-data+yaml
+  value:
+    ir_profile: StructuredDataIR
+    kind: transition
+    label: Load Documents
+    _fragment_id: a59d09a4-6521-5b76-910c-708ca69593a9
+- name: net.ingestion.transition.parse_chunk
+  fragment_id: f7059adc-c831-5735-b737-52259f7ba396
+  cas_id: eb61a79a635a643ebdcafc027000d2fce6b9dfb6c91dbd6f3fbf3e5d144fc856
+  mime_type: application/vnd.ikam.ir.structured-data+yaml
+  value:
+    ir_profile: StructuredDataIR
+    kind: transition
+    label: Parse Chunk
+    _fragment_id: f7059adc-c831-5735-b737-52259f7ba396
+- name: net.ingestion.transition.parse_entities_and_relationships
+  fragment_id: fc3138cf-2a14-5da9-a5b0-292d801e669c
+  cas_id: ae82549d46f61957bf6f0f6d09f9dad2d9f854cae0683c32aa8b34dbff71f91c
+  mime_type: application/vnd.ikam.ir.structured-data+yaml
+  value:
+    ir_profile: StructuredDataIR
+    kind: transition
+    label: Parse Entities And Relationships
+    _fragment_id: fc3138cf-2a14-5da9-a5b0-292d801e669c
+- name: net.ingestion.transition.parse_claims
+  fragment_id: 6ab7bce3-5e26-523b-b1f7-f272f6070336
+  cas_id: 2f4fe6a0dc8f04e97425c8494e25b05cd59c7dd7ab3787c123597d90d23655e0
+  mime_type: application/vnd.ikam.ir.structured-data+yaml
+  value:
+    ir_profile: StructuredDataIR
+    kind: transition
+    label: Parse Claims
+    _fragment_id: 6ab7bce3-5e26-523b-b1f7-f272f6070336
+- name: net.ingestion.arc.artifacts_to_parse
+  fragment_id: 80e27d24-9f4d-5d1f-893f-d019e6b1a59e
+  cas_id: 06510b1d28db79870f70898fa425029720ca48ca0153d9bede6a04c15fcd9091
+  mime_type: application/vnd.ikam.ir.proposition+yaml
+  value:
+    ir_profile: PropositionIR
+    subject: b27394dd-6060-504a-8612-3047ba7deff9
+    predicate: provides_input_to
+    object: 84eae66f-e354-5d90-a0f0-12a32284c7b7
+    _fragment_id: 80e27d24-9f4d-5d1f-893f-d019e6b1a59e
+- name: net.ingestion.arc.parse_to_lift
+  fragment_id: b2f7f957-a120-5fac-bd2d-5b3e28effac8
+  cas_id: 893cad46009a41ed9e0f1d58644a1d6d96c11fbac3988589564f01ba91740206
+  mime_type: application/vnd.ikam.ir.proposition+yaml
+  value:
+    ir_profile: PropositionIR
+    subject: 84eae66f-e354-5d90-a0f0-12a32284c7b7
+    predicate: provides_input_to
+    object: 7e79b4ce-6b9f-5169-bdf5-84fa45d3f4f6
+    _fragment_id: b2f7f957-a120-5fac-bd2d-5b3e28effac8
+- name: net.ingestion.arc.lift_to_fragments_ready
+  fragment_id: 73496127-5edc-5be2-b63a-77c53e966ef5
+  cas_id: 3b21692c6e39d9fd454e298c04e9744a5aa76cdcd95d42cf94b4b520593b57f9
+  mime_type: application/vnd.ikam.ir.proposition+yaml
+  value:
+    ir_profile: PropositionIR
+    subject: 7e79b4ce-6b9f-5169-bdf5-84fa45d3f4f6
+    predicate: outputs_to
+    object: 69e36443-50e3-5d97-a834-be18358b657a
+    _fragment_id: 73496127-5edc-5be2-b63a-77c53e966ef5
+- name: net.ingestion.link.parse_artifacts_exec
+  fragment_id: 955102dc-51c5-53f0-9eca-4e943328d191
+  cas_id: a21f9b678cdfab5f22001a20044a7cca547f60f0dbc9fc45967766167acbe12e
+  mime_type: application/vnd.ikam.ir.proposition+yaml
+  value:
+    ir_profile: PropositionIR
+    subject: 84eae66f-e354-5d90-a0f0-12a32284c7b7
+    predicate: executed_by_operator
+    object: 4e3075ee-9570-5326-af90-ad8b50b08f1d
+    _fragment_id: 955102dc-51c5-53f0-9eca-4e943328d191
+- name: net.ingestion.link.lift_fragments_exec
+  fragment_id: 3fb37cff-d019-5908-8cdc-cf8fc3137ec3
+  cas_id: 54fd2275ff1df1b3b489749813bb788dc8dcc08cef5fac4acb2e432d0100a105
+  mime_type: application/vnd.ikam.ir.proposition+yaml
+  value:
+    ir_profile: PropositionIR
+    subject: 7e79b4ce-6b9f-5169-bdf5-84fa45d3f4f6
+    predicate: executed_by_operator
+    object: 1cfe3cb5-dfb2-5390-b234-78db6d24d506
+    _fragment_id: 3fb37cff-d019-5908-8cdc-cf8fc3137ec3
+- name: net.ingestion.arc.artifacts_to_load_documents
+  fragment_id: d3c3825d-d0e5-58c4-badf-50b84b8e3555
+  cas_id: 245d66f305a69ed391889e532befddf0dfbdc9494bcc99030447ab615263206d
+  mime_type: application/vnd.ikam.ir.proposition+yaml
+  value:
+    ir_profile: PropositionIR
+    subject: b27394dd-6060-504a-8612-3047ba7deff9
+    predicate: provides_input_to
+    object: a59d09a4-6521-5b76-910c-708ca69593a9
+    _fragment_id: d3c3825d-d0e5-58c4-badf-50b84b8e3555
+- name: net.ingestion.arc.load_documents_to_documents_loaded
+  fragment_id: 55748783-81ab-5327-98c6-bb47bacada54
+  cas_id: ddfb4b87a30e547fa4734018320fe0236144b2926b1b522c4e604bbb40787bfe
+  mime_type: application/vnd.ikam.ir.proposition+yaml
+  value:
+    ir_profile: PropositionIR
+    subject: a59d09a4-6521-5b76-910c-708ca69593a9
+    predicate: outputs_to
+    object: 9a03056d-4ce9-5a48-a5e4-360c108bc542
+    _fragment_id: 55748783-81ab-5327-98c6-bb47bacada54
+- name: net.ingestion.arc.documents_loaded_to_parse_chunk
+  fragment_id: 8c5d6e94-4ddf-5d3a-9c49-7ac3fc07f62d
+  cas_id: 13b102c18a7588b769186e59ee6c642a3114784f8c272fc5d32e150a6221803b
+  mime_type: application/vnd.ikam.ir.proposition+yaml
+  value:
+    ir_profile: PropositionIR
+    subject: 9a03056d-4ce9-5a48-a5e4-360c108bc542
+    predicate: provides_input_to
+    object: f7059adc-c831-5735-b737-52259f7ba396
+    _fragment_id: 8c5d6e94-4ddf-5d3a-9c49-7ac3fc07f62d
+- name: net.ingestion.arc.parse_chunk_to_chunks_parsed
+  fragment_id: 46bbb1d0-a99f-5265-9012-7b2f2ae5b37d
+  cas_id: 43dd185d35353e159ab52b128c123777336d499508d52b5a18e1f74e19fa7294
+  mime_type: application/vnd.ikam.ir.proposition+yaml
+  value:
+    ir_profile: PropositionIR
+    subject: f7059adc-c831-5735-b737-52259f7ba396
+    predicate: outputs_to
+    object: 2e8f5aa7-282b-548c-9426-4df82f870f1d
+    _fragment_id: 46bbb1d0-a99f-5265-9012-7b2f2ae5b37d
+- name: net.ingestion.arc.chunks_parsed_to_parse_entities_and_relationships
+  fragment_id: fd06381f-5ab2-5065-8066-b1d1f9afac8a
+  cas_id: a052077c3c7d3328e8d4e76702e66ac875a6e87375880b35de7ccae17b2dd422
+  mime_type: application/vnd.ikam.ir.proposition+yaml
+  value:
+    ir_profile: PropositionIR
+    subject: 2e8f5aa7-282b-548c-9426-4df82f870f1d
+    predicate: provides_input_to
+    object: fc3138cf-2a14-5da9-a5b0-292d801e669c
+    _fragment_id: fd06381f-5ab2-5065-8066-b1d1f9afac8a
+- name: net.ingestion.arc.parse_entities_and_relationships_to_entities_and_relationships_parsed
+  fragment_id: 14506b2d-54bf-51e7-b452-007757e1d5d4
+  cas_id: 6c5712b14729525108f26e5ae73ac3e2f798cbf4632e9ec73b8b3cd4084e1cb8
+  mime_type: application/vnd.ikam.ir.proposition+yaml
+  value:
+    ir_profile: PropositionIR
+    subject: fc3138cf-2a14-5da9-a5b0-292d801e669c
+    predicate: outputs_to
+    object: f9967ade-9fb5-59ce-ba47-31427b534c05
+    _fragment_id: 14506b2d-54bf-51e7-b452-007757e1d5d4
+- name: net.ingestion.arc.entities_and_relationships_parsed_to_parse_claims
+  fragment_id: 76070593-f340-5e38-bd21-5b4e15f7201e
+  cas_id: 2ac240f014c7f681efa23df2ea9d7774a2e7f841262db36c0153009c04781be2
+  mime_type: application/vnd.ikam.ir.proposition+yaml
+  value:
+    ir_profile: PropositionIR
+    subject: f9967ade-9fb5-59ce-ba47-31427b534c05
+    predicate: provides_input_to
+    object: 6ab7bce3-5e26-523b-b1f7-f272f6070336
+    _fragment_id: 76070593-f340-5e38-bd21-5b4e15f7201e
+- name: net.ingestion.arc.parse_claims_to_claims_parsed
+  fragment_id: 58a7bf29-8e04-54f2-bc9f-0bad12c14aeb
+  cas_id: 48e1e4507ad4d724965d48a9aef4c769a0b5fcf9638fc848b4367c4c3eb94928
+  mime_type: application/vnd.ikam.ir.proposition+yaml
+  value:
+    ir_profile: PropositionIR
+    subject: 6ab7bce3-5e26-523b-b1f7-f272f6070336
+    predicate: outputs_to
+    object: f648f7af-2d1a-54ef-9f9f-8871025441b0
+    _fragment_id: 58a7bf29-8e04-54f2-bc9f-0bad12c14aeb
+- name: net.ingestion.link.load_documents_exec
+  fragment_id: 3fbfd667-f5fc-51ef-a840-595dd276c9f7
+  cas_id: 1465b7a415ff400ce91a72723525dd72e1b1e0a9113490ac7ab6e3ce3e8aa95f
+  mime_type: application/vnd.ikam.ir.proposition+yaml
+  value:
+    ir_profile: PropositionIR
+    subject: a59d09a4-6521-5b76-910c-708ca69593a9
+    predicate: executed_by_operator
+    object: 24f19013-3759-5991-a148-39076da4284e
+    _fragment_id: 3fbfd667-f5fc-51ef-a840-595dd276c9f7
+- name: net.ingestion.link.parse_chunk_exec
+  fragment_id: 70dfaa24-c945-5707-9dcd-ea1421f111f7
+  cas_id: 0bbf63ca8f64c995e983ca0c8eef83fec7b23ad5c000ccb62a4f1b7632828ecf
+  mime_type: application/vnd.ikam.ir.proposition+yaml
+  value:
+    ir_profile: PropositionIR
+    subject: f7059adc-c831-5735-b737-52259f7ba396
+    predicate: executed_by_operator
+    object: adf6d2e6-c660-5947-901d-2726b057681d
+    _fragment_id: 70dfaa24-c945-5707-9dcd-ea1421f111f7
+- name: net.ingestion.link.parse_entities_and_relationships_exec
+  fragment_id: 9e3f2d5a-ed08-567a-82b3-c9adf457e6de
+  cas_id: 2b95d9e6656927f33672eb061712e8850236c31852aede88e717f60c4cb3b5d3
+  mime_type: application/vnd.ikam.ir.proposition+yaml
+  value:
+    ir_profile: PropositionIR
+    subject: fc3138cf-2a14-5da9-a5b0-292d801e669c
+    predicate: executed_by_operator
+    object: 22250859-c67e-5bf1-9370-3d59b7cf4c0b
+    _fragment_id: 9e3f2d5a-ed08-567a-82b3-c9adf457e6de
+- name: net.ingestion.link.parse_claims_exec
+  fragment_id: 47eb79ab-cd4b-54da-a4da-22ac05462190
+  cas_id: b5389f055d627a22b7f245f6adbe5898bad6a045e277412551fc35b10c8db745
+  mime_type: application/vnd.ikam.ir.proposition+yaml
+  value:
+    ir_profile: PropositionIR
+    subject: 6ab7bce3-5e26-523b-b1f7-f272f6070336
+    predicate: executed_by_operator
+    object: 773da82d-e6d0-5c12-8657-7fe44f9720e7
+    _fragment_id: 47eb79ab-cd4b-54da-a4da-22ac05462190
+- name: net.ingestion.head
+  fragment_id: 4856f94c-eac8-5133-b32c-5f3b5d2772e1
+  cas_id: 894f76bce092cb86fa614b5f17c1f7ebac2f4e2ea74160bc688df5c9cf13e5b9
+  mime_type: application/vnd.ikam.ir.structured-data+yaml
+  value:
+    ir_profile: StructuredDataIR
+    profile: petri_net
+    name: canonical_ingestion
+    places:
+      artifacts_ready: b27394dd-6060-504a-8612-3047ba7deff9
+      documents_loaded: 9a03056d-4ce9-5a48-a5e4-360c108bc542
+      chunks_parsed: 2e8f5aa7-282b-548c-9426-4df82f870f1d
+      entities_and_relationships_parsed: f9967ade-9fb5-59ce-ba47-31427b534c05
+      claims_parsed: f648f7af-2d1a-54ef-9f9f-8871025441b0
+      fragments_lifted: 69e36443-50e3-5d97-a834-be18358b657a
+    transitions:
+      load_documents: a59d09a4-6521-5b76-910c-708ca69593a9
+      parse_chunk: f7059adc-c831-5735-b737-52259f7ba396
+      parse_entities_and_relationships: fc3138cf-2a14-5da9-a5b0-292d801e669c
+      parse_claims: 6ab7bce3-5e26-523b-b1f7-f272f6070336
+      parse_artifacts: 84eae66f-e354-5d90-a0f0-12a32284c7b7
+      lift_fragments: 7e79b4ce-6b9f-5169-bdf5-84fa45d3f4f6
+    _fragment_id: 4856f94c-eac8-5133-b32c-5f3b5d2772e1

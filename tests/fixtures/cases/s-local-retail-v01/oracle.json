@@ -1,0 +1,328 @@
+{
+  "case_id": "s-local-retail-v01",
+  "domain": "local retail (specialty foods + gifts)",
+  "entities": [
+    {
+      "name": "Maya Chen",
+      "aliases": ["Owner", "GM"],
+      "entity_type": "person",
+      "source_hint": "idea.md, meeting-notes, voice-note-transcript"
+    },
+    {
+      "name": "Jordan Reyes",
+      "aliases": ["Shift Lead"],
+      "entity_type": "person",
+      "source_hint": "idea.md, meeting-notes-2025-11-20"
+    },
+    {
+      "name": "Talia Singh",
+      "aliases": ["Marketing Contractor"],
+      "entity_type": "person",
+      "source_hint": "idea.md, brand-guide"
+    },
+    {
+      "name": "North Ledger LLC",
+      "aliases": ["Bookkeeper", "North Ledger"],
+      "entity_type": "organization",
+      "source_hint": "idea.md, bookkeeping-q4-2025-summary"
+    },
+    {
+      "name": "Bramble & Bitters",
+      "aliases": ["B&B", "the shop", "the store"],
+      "entity_type": "organization",
+      "source_hint": "idea.md, brand-guide, mission-vision-values"
+    },
+    {
+      "name": "Subscription Box",
+      "aliases": ["Seasonal Pantry Box", "Bramble Box", "Quarterly Crate", "subscription program"],
+      "entity_type": "product",
+      "source_hint": "idea.md, roadmap-2026-h1, high-level-strategy-2026"
+    },
+    {
+      "name": "Corporate Gift Bundles",
+      "aliases": ["corporate gifting", "thank you gift packs"],
+      "entity_type": "product",
+      "source_hint": "idea.md, corporate-gifting-one-pager"
+    },
+    {
+      "name": "In-Store Retail",
+      "aliases": ["curated retail assortment", "foot traffic sales"],
+      "entity_type": "product",
+      "source_hint": "idea.md, pos-export-2025-q4"
+    },
+    {
+      "name": "Bayworks Co.",
+      "aliases": ["Bayworks"],
+      "entity_type": "organization",
+      "source_hint": "idea.md (first corporate gifting order)"
+    },
+    {
+      "name": "Square",
+      "aliases": ["POS", "point of sale"],
+      "entity_type": "tool",
+      "source_hint": "idea.md, pos-export-2025-q4"
+    },
+    {
+      "name": "Holiday 2025 Push",
+      "aliases": ["holiday push", "holiday season"],
+      "entity_type": "project",
+      "source_hint": "idea.md, roadmap-2026-h1, meeting-notes-2025-11-20"
+    },
+    {
+      "name": "Subscription Refresh",
+      "aliases": ["Box Revamp"],
+      "entity_type": "project",
+      "source_hint": "idea.md, roadmap-2026-h1"
+    },
+    {
+      "name": "Local Delivery Pilot",
+      "aliases": ["delivery pilot", "local delivery"],
+      "entity_type": "project",
+      "source_hint": "idea.md, roadmap-2026-h1"
+    }
+  ],
+  "predicates": [
+    {
+      "label": "Maya Chen founded Bramble & Bitters",
+      "chain": [
+        {
+          "source": "Maya Chen",
+          "target": "Bramble & Bitters",
+          "relation_type": "founded-by",
+          "evidence_hint": "idea.md: opened storefront 2024-03"
+        }
+      ],
+      "inference_type": "direct",
+      "confidence_note": "strongly stated"
+    },
+    {
+      "label": "Jordan Reyes works at Bramble & Bitters",
+      "chain": [
+        {
+          "source": "Jordan Reyes",
+          "target": "Bramble & Bitters",
+          "relation_type": "employed-by",
+          "evidence_hint": "idea.md: hired 2025-02, promoted to shift lead"
+        }
+      ],
+      "inference_type": "direct",
+      "confidence_note": "strongly stated"
+    },
+    {
+      "label": "Talia Singh provides marketing services",
+      "chain": [
+        {
+          "source": "Talia Singh",
+          "target": "Bramble & Bitters",
+          "relation_type": "contracts-for",
+          "evidence_hint": "idea.md: marketing contractor engaged 2026-01"
+        }
+      ],
+      "inference_type": "direct",
+      "confidence_note": "strongly stated"
+    },
+    {
+      "label": "North Ledger LLC handles bookkeeping",
+      "chain": [
+        {
+          "source": "North Ledger LLC",
+          "target": "Bramble & Bitters",
+          "relation_type": "provides-service",
+          "evidence_hint": "idea.md: external bookkeeping firm"
+        }
+      ],
+      "inference_type": "direct",
+      "confidence_note": "stated in operating model"
+    },
+    {
+      "label": "Bramble & Bitters generates revenue from subscriptions",
+      "chain": [
+        {
+          "source": "Bramble & Bitters",
+          "target": "Subscription Box",
+          "relation_type": "offers",
+          "evidence_hint": "idea.md: launched 2025-09"
+        },
+        {
+          "source": "Subscription Box",
+          "target": "Revenue",
+          "relation_type": "generates",
+          "evidence_hint": "projected-revenue-2026, quarterly-revenue-history"
+        }
+      ],
+      "inference_type": "transitive",
+      "confidence_note": "implied by financial docs"
+    },
+    {
+      "label": "Bayworks Co. is a corporate gifting customer",
+      "chain": [
+        {
+          "source": "Bayworks Co.",
+          "target": "Corporate Gift Bundles",
+          "relation_type": "purchases",
+          "evidence_hint": "idea.md: first corporate gifting order 2024-08"
+        }
+      ],
+      "inference_type": "direct",
+      "confidence_note": "strongly stated"
+    },
+    {
+      "label": "Packaging vendor change affects margins",
+      "chain": [
+        {
+          "source": "Bramble & Bitters",
+          "target": "Packaging Vendor",
+          "relation_type": "switched",
+          "evidence_hint": "idea.md: switched 2025-06 after cost increase"
+        },
+        {
+          "source": "Packaging Vendor",
+          "target": "Gross Margin",
+          "relation_type": "affects",
+          "evidence_hint": "idea.md: affects margin assumptions"
+        }
+      ],
+      "inference_type": "transitive",
+      "confidence_note": "implied by timeline + financial docs"
+    },
+    {
+      "label": "Square POS data feeds revenue reporting",
+      "chain": [
+        {
+          "source": "Square",
+          "target": "Revenue",
+          "relation_type": "reports",
+          "evidence_hint": "pos-export-2025-q4 vs bookkeeping-q4-2025-summary"
+        }
+      ],
+      "inference_type": "direct",
+      "confidence_note": "strongly stated but values conflict"
+    },
+    {
+      "label": "Holiday staffing crunch caused POS-bookkeeping mismatch",
+      "chain": [
+        {
+          "source": "Holiday 2025 Push",
+          "target": "Bramble & Bitters",
+          "relation_type": "strained-operations",
+          "evidence_hint": "idea.md: returns handled manually for a week"
+        },
+        {
+          "source": "Bramble & Bitters",
+          "target": "Revenue",
+          "relation_type": "reported-inconsistently",
+          "evidence_hint": "idea.md: explains POS vs bookkeeping mismatch"
+        }
+      ],
+      "inference_type": "deductive",
+      "confidence_note": "causal chain from idea.md timeline"
+    },
+    {
+      "label": "Shipping footprint reduction due to fulfillment pain",
+      "chain": [
+        {
+          "source": "Bramble & Bitters",
+          "target": "Local Delivery Pilot",
+          "relation_type": "pivoted-to",
+          "evidence_hint": "idea.md: 2026-02 pivot to CA-only shipping"
+        }
+      ],
+      "inference_type": "direct",
+      "confidence_note": "stated but roadmap only partially updated"
+    }
+  ],
+  "contradictions": [
+    {
+      "field": "Q4 2025 revenue",
+      "conflicting_values": ["$310k (pitch deck)", "$286k (bookkeeping summary)", "$295k (POS export, excludes manual returns)"],
+      "artifacts_involved": ["marketing-pitch-deck-final-final.pptx", "bookkeeping-q4-2025-summary.pdf", "pos-export-2025-q4.json"],
+      "resolution_hint": "POS export excludes returns handled manually during holiday week; bookkeeping is most accurate"
+    },
+    {
+      "field": "Subscription program name",
+      "conflicting_values": ["Seasonal Pantry Box", "Bramble Box", "Quarterly Crate"],
+      "artifacts_involved": ["roadmap-2026-h1.md", "high-level-strategy-2026.md", "marketing-pitch-deck.pptx"],
+      "resolution_hint": "Same program with evolving name; 'Bramble Box' appears to be latest preferred name"
+    },
+    {
+      "field": "Product gross margin",
+      "conflicting_values": ["52% target (strategy doc)", "48% blended assumption (finance sheet)"],
+      "artifacts_involved": ["high-level-strategy-2026.md", "projected-revenue-2026.xlsx"],
+      "resolution_hint": "52% is aspirational target; 48% is blended actual used in projections"
+    },
+    {
+      "field": "Headcount",
+      "conflicting_values": ["5 employees (brand one-pager, counts contractors)", "3 staff + 1 contractor (HR notes)"],
+      "artifacts_involved": ["corporate-gifting-one-pager.pdf", "meeting-notes-2025-11-20.md"],
+      "resolution_hint": "Brand one-pager inflates by counting contractors as employees"
+    }
+  ],
+  "benchmark_queries": [
+    {
+      "query": "What is the subscription program called, and when did it launch?",
+      "required_facts": [
+        "The subscription program has multiple names: Seasonal Pantry Box, Bramble Box, and Quarterly Crate",
+        "It launched in September 2025",
+        "Early churn was noted informally"
+      ],
+      "relevant_artifacts": ["idea.md", "roadmap-2026-h1.md", "high-level-strategy-2026.md"],
+      "expected_contradictions": ["Subscription program name"]
+    },
+    {
+      "query": "Why do Q4 2025 revenue numbers disagree across documents?",
+      "required_facts": [
+        "Pitch deck claims $310k",
+        "Bookkeeping summary shows $286k",
+        "POS export totals $295k",
+        "POS export excludes returns handled manually during holiday week",
+        "The manual returns handling was due to a Square workflow issue"
+      ],
+      "relevant_artifacts": ["marketing-pitch-deck-final-final.pptx", "bookkeeping-q4-2025-summary.pdf", "pos-export-2025-q4.json"],
+      "expected_contradictions": ["Q4 2025 revenue"]
+    },
+    {
+      "query": "What are the 2026 H1 priorities and who owns them?",
+      "required_facts": [
+        "Maya Chen is Owner/GM responsible for overall strategy",
+        "Key initiatives include subscription refresh and local delivery pilot",
+        "Shipping footprint was reduced to CA-only due to fulfillment pain",
+        "Talia Singh handles marketing"
+      ],
+      "relevant_artifacts": ["roadmap-2026-h1.md", "annual-goals-okrs-2026.md", "high-level-strategy-2026.md"],
+      "expected_contradictions": null
+    },
+    {
+      "query": "Which vendors are highest risk and why?",
+      "required_facts": [
+        "Packaging vendor was switched in June 2025 after cost increase",
+        "This vendor change affects margin assumptions",
+        "There are 10-15 local makers as vendors",
+        "Some vendors have duplicate names (LLC vs brand)"
+      ],
+      "relevant_artifacts": ["vendor-list.json", "vendor-evaluation-template.md", "meeting-notes-2025-10-15.md"],
+      "expected_contradictions": null
+    },
+    {
+      "query": "How does staffing timeline connect to service levels and corporate order lead time?",
+      "required_facts": [
+        "Jordan Reyes was hired in February 2025 as part-time, later promoted to shift lead",
+        "Two seasonal associates were added for holiday 2025",
+        "Holiday staffing crunch affected operations",
+        "Bayworks Co. was the first corporate gifting customer in August 2024"
+      ],
+      "relevant_artifacts": ["idea.md", "meeting-notes-2025-11-20.md", "corporate-order-intake-form.json"],
+      "expected_contradictions": ["Headcount"]
+    },
+    {
+      "query": "Reconcile the target gross margin vs the margin used in financial projections.",
+      "required_facts": [
+        "Strategy doc targets 52% gross margin",
+        "Finance projections use 48% blended margin",
+        "The gap is due to aspirational target vs actual blended rate",
+        "Packaging vendor switch in June 2025 affected margin assumptions"
+      ],
+      "relevant_artifacts": ["high-level-strategy-2026.md", "projected-revenue-2026.xlsx"],
+      "expected_contradictions": ["Product gross margin"]
+    }
+  ]
+}

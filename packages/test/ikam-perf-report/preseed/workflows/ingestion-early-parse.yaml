@@ -1,0 +1,156 @@
+workflow_id: ingestion-early-parse
+version: "2026-03-21"
+publish:
+  - registry: petri_net_runnables
+    title: Early Ingestion Parse
+    goal: Load documents, chunk them, and extract early semantic structure
+nodes:
+  - node_id: init-initialize
+    kind: checkpoint
+  - node_id: load-documents
+    kind: dispatch_executor
+    capability: python.load_documents
+    validators:
+      - name: input-url
+        direction: input
+        kind: type
+        selector: input.url
+        target: value
+        config:
+          schema:
+            type: object
+            title: url
+            required:
+              - kind
+              - location
+      - name: output-document-set
+        direction: output
+        kind: type
+        selector: output.document_set
+        target: value
+        config:
+          schema:
+            type: object
+            title: document_set
+            required:
+              - kind
+              - artifact_head_ref
+              - subgraph_ref
+              - document_refs
+    policy:
+      cost_tier: standard
+  - node_id: parse-chunk
+    kind: dispatch_executor
+    capability: python.chunk_documents
+    validators:
+      - name: input-document-set
+        direction: input
+        kind: type
+        selector: input.document_set
+        target: value
+        config:
+          schema:
+            type: object
+            title: document_set
+            required:
+              - kind
+              - artifact_head_ref
+              - subgraph_ref
+              - document_refs
+      - name: output-chunk-extraction-set
+        direction: output
+        kind: type
+        selector: output.chunk_extraction_set
+        target: value
+        config:
+          schema:
+            type: object
+            title: chunk_extraction_set
+            required:
+              - kind
+              - source_subgraph_ref
+              - subgraph_ref
+              - extraction_refs
+    policy:
+      cost_tier: standard
+  - node_id: parse-entities-and-relationships
+    kind: dispatch_executor
+    capability: ml.extract_entities_relationships
+    validators:
+      - name: input-chunk-extraction-set
+        direction: input
+        kind: type
+        selector: input.chunk_extraction_set
+        target: value
+        config:
+          schema:
+            type: object
+            title: chunk_extraction_set
+            required:
+              - kind
+              - source_subgraph_ref
+              - subgraph_ref
+              - extraction_refs
+      - name: output-entity-relationship-set
+        direction: output
+        kind: type
+        selector: output.entity_relationship_set
+        target: value
+        config:
+          schema:
+            type: object
+            title: entity_relationship_set
+            required:
+              - kind
+              - source_subgraph_ref
+              - subgraph_ref
+              - entity_relationship_refs
+    policy:
+      gpu_tier: standard
+  - node_id: parse-claims
+    kind: dispatch_executor
+    capability: ml.extract_claims
+    validators:
+      - name: input-entity-relationship-set
+        direction: input
+        kind: type
+        selector: input.entity_relationship_set
+        target: value
+        config:
+          schema:
+            type: object
+            title: entity_relationship_set
+            required:
+              - kind
+              - source_subgraph_ref
+              - subgraph_ref
+              - entity_relationship_refs
+      - name: output-claim-set
+        direction: output
+        kind: type
+        selector: output.claim_set
+        target: value
+        config:
+          schema:
+            type: object
+            title: claim_set
+            required:
+              - kind
+              - source_subgraph_ref
+              - subgraph_ref
+              - claim_refs
+    policy:
+      gpu_tier: standard
+  - node_id: complete
+    kind: complete
+links:
+  - source: init-initialize
+    target: load-documents
+  - source: load-documents
+    target: parse-chunk
+  - source: parse-chunk
+    target: parse-entities-and-relationships
+  - source: parse-entities-and-relationships
+    target: parse-claims
+  - source: parse-claims
+    target: complete

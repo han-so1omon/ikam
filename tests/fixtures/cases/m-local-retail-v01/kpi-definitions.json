@@ -1,0 +1,17 @@
+{
+  "version": "2026-02-01",
+  "kpis": [
+    {
+      "name": "Weekly sales (ops)",
+      "definition": "gross sales"
+    },
+    {
+      "name": "Weekly sales (bookkeeping)",
+      "definition": "net sales after returns"
+    },
+    {
+      "name": "Sell-through",
+      "definition": "units sold / units received"
+    }
+  ]
+}

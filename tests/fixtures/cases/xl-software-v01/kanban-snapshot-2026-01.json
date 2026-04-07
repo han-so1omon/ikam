@@ -1,0 +1,21 @@
+{
+  "snapshot_date": "2026-01-21",
+  "board": "Platform",
+  "columns": {
+    "Backlog": [
+      "ORCHID-101",
+      "ORCHID-122",
+      "QUEUE-88"
+    ],
+    "In Progress": [
+      "ORCHID-140",
+      "QUEUE-91"
+    ],
+    "Review": [
+      "SEC-33"
+    ],
+    "Done": [
+      "ATLAS-12"
+    ]
+  }
+}

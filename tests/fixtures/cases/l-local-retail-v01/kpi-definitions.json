@@ -1,0 +1,23 @@
+{
+  "version": "2026-02-01",
+  "kpis": [
+    {
+      "name": "Revenue (ops)",
+      "definition": "gross sales",
+      "notes": "includes discounts before reconciliation"
+    },
+    {
+      "name": "Revenue (bookkeeping)",
+      "definition": "net sales",
+      "notes": "excludes returns/voids"
+    },
+    {
+      "name": "Sell-through",
+      "definition": "units sold / units received"
+    },
+    {
+      "name": "AOV",
+      "definition": "net sales / orders"
+    }
+  ]
+}

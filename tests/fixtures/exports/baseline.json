@@ -1,0 +1,22 @@
+{
+  "created_at": "2024-01-01T00:00:00Z",
+  "metrics": {
+    "costs": 987654.321099,
+    "profit_margin": 0.2,
+    "revenue": 1234567.890123
+  },
+  "project_name": "Economic Analysis Q4 2024",
+  "sections": [
+    {
+      "timestamp": "2024-01-01T00:00:00Z",
+      "title": "Executive Summary",
+      "value": 3.141593
+    },
+    {
+      "timestamp": "2024-01-01T00:00:00Z",
+      "title": "Market Analysis",
+      "value": 2.718282
+    }
+  ],
+  "updated_at": "2024-01-01T00:00:00Z"
+}

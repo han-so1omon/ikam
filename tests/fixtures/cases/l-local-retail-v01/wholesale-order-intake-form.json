@@ -1,0 +1,27 @@
+{
+  "schema_version": "0.1",
+  "title": "Wholesale Order Intake",
+  "fields": [
+    {
+      "id": "store_name",
+      "type": "string",
+      "required": true
+    },
+    {
+      "id": "contact_email",
+      "type": "string",
+      "required": true
+    },
+    {
+      "id": "sku_list",
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    {
+      "id": "ship_by",
+      "type": "date"
+    }
+  ]
+}

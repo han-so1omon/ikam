@@ -1,0 +1,446 @@
+{
+  "version": "2026-02-24",
+  "notes": "Registry of IKAM benchmark cases. chaos_level is independent of size tier. docx_artifacts added 2026-02-24.",
+  "cases": [
+    {
+      "case_id": "l-construction-v01",
+      "domain": "construction",
+      "size_tier": "l",
+      "chaos_level": 4,
+      "deliberate_contradictions": true,
+      "idea_file": "idea.md",
+      "image_targets": {
+        "logos": 8,
+        "people": 18,
+        "site": 26,
+        "diagrams": 16,
+        "social": 8
+      },
+      "docx_artifacts": [
+        "milestone-report-2026-02-20.docx"
+      ]
+    },
+    {
+      "case_id": "l-consulting-v01",
+      "domain": "consulting",
+      "size_tier": "l",
+      "chaos_level": 4,
+      "deliberate_contradictions": true,
+      "idea_file": "idea.md",
+      "image_targets": {
+        "logos": 6,
+        "people": 22,
+        "social": 18,
+        "diagrams": 18
+      },
+      "docx_artifacts": [
+        "practice-performance-2026-01.docx"
+      ]
+    },
+    {
+      "case_id": "l-healthcare-clinic-v01",
+      "domain": "healthcare-clinic",
+      "size_tier": "l",
+      "chaos_level": 4,
+      "deliberate_contradictions": true,
+      "idea_file": "idea.md",
+      "image_targets": {
+        "logos": 8,
+        "people": 22,
+        "clinic": 22,
+        "diagrams": 16,
+        "social": 8
+      },
+      "docx_artifacts": [
+        "network-ops-summary-2026-01.docx"
+      ]
+    },
+    {
+      "case_id": "l-local-retail-v01",
+      "domain": "local-retail",
+      "size_tier": "l",
+      "chaos_level": 4,
+      "deliberate_contradictions": true,
+      "idea_file": "idea.md",
+      "image_targets": {
+        "logos": 7,
+        "people": 20,
+        "products": 30,
+        "stores": 8,
+        "social": 15,
+        "diagrams": 12
+      },
+      "docx_artifacts": [
+        "weekly-ops-report-2026-02-16.docx"
+      ]
+    },
+    {
+      "case_id": "l-manufacturing-v01",
+      "domain": "manufacturing",
+      "size_tier": "l",
+      "chaos_level": 2,
+      "deliberate_contradictions": true,
+      "idea_file": "idea.md",
+      "image_targets": {
+        "logos": 5,
+        "people": 15,
+        "facility": 10,
+        "products": 25,
+        "diagrams": 15,
+        "social": 10
+      },
+      "docx_artifacts": [
+        "production-summary-2026-01.docx"
+      ]
+    },
+    {
+      "case_id": "l-software-v01",
+      "domain": "software",
+      "size_tier": "l",
+      "chaos_level": 4,
+      "deliberate_contradictions": true,
+      "idea_file": "idea.md",
+      "image_targets": {
+        "logos": 7,
+        "people": 22,
+        "product-ui": 20,
+        "diagrams": 16,
+        "social": 8
+      },
+      "docx_artifacts": [
+        "feature-fable-update-2026-02-18.docx"
+      ]
+    },
+    {
+      "case_id": "m-construction-v01",
+      "domain": "construction",
+      "size_tier": "m",
+      "chaos_level": 3,
+      "deliberate_contradictions": true,
+      "idea_file": "idea.md",
+      "image_targets": {
+        "logos": 5,
+        "people": 14,
+        "site": 20,
+        "diagrams": 12,
+        "social": 8
+      },
+      "docx_artifacts": [
+        "project-status-memo-2026-02-17.docx"
+      ]
+    },
+    {
+      "case_id": "m-consulting-v01",
+      "domain": "consulting",
+      "size_tier": "m",
+      "chaos_level": 4,
+      "deliberate_contradictions": true,
+      "idea_file": "idea.md",
+      "image_targets": {
+        "logos": 6,
+        "people": 18,
+        "social": 24,
+        "diagrams": 12
+      },
+      "docx_artifacts": [
+        "engagement-status-2026-02-10.docx"
+      ]
+    },
+    {
+      "case_id": "m-healthcare-clinic-v01",
+      "domain": "healthcare-clinic",
+      "size_tier": "m",
+      "chaos_level": 2,
+      "deliberate_contradictions": true,
+      "idea_file": "idea.md",
+      "image_targets": {
+        "logos": 6,
+        "people": 18,
+        "clinics": 8,
+        "diagrams": 10,
+        "social": 6
+      },
+      "docx_artifacts": [
+        "ops-report-2026-01.docx"
+      ]
+    },
+    {
+      "case_id": "m-local-retail-v01",
+      "domain": "local-retail",
+      "size_tier": "m",
+      "chaos_level": 3,
+      "deliberate_contradictions": true,
+      "idea_file": "idea.md",
+      "image_targets": {
+        "logos": 6,
+        "people": 18,
+        "products": 25,
+        "stores": 6,
+        "social": 12,
+        "diagrams": 10
+      },
+      "docx_artifacts": [
+        "spring-campaign-brief-2026.docx"
+      ]
+    },
+    {
+      "case_id": "m-manufacturing-v01",
+      "domain": "manufacturing",
+      "size_tier": "m",
+      "chaos_level": 3,
+      "deliberate_contradictions": true,
+      "idea_file": "idea.md",
+      "image_targets": {
+        "logos": 6,
+        "people": 18,
+        "facility": 10,
+        "products": 20,
+        "diagrams": 12,
+        "social": 8
+      },
+      "docx_artifacts": [
+        "ops-review-2026-02.docx"
+      ]
+    },
+    {
+      "case_id": "m-software-v01",
+      "domain": "software",
+      "size_tier": "m",
+      "chaos_level": 3,
+      "deliberate_contradictions": true,
+      "idea_file": "idea.md",
+      "image_targets": {
+        "logos": 6,
+        "people": 18,
+        "product-ui": 16,
+        "diagrams": 12,
+        "social": 6
+      },
+      "docx_artifacts": [
+        "feature-garnet-status-2026-02-14.docx"
+      ]
+    },
+    {
+      "case_id": "s-construction-v01",
+      "domain": "construction",
+      "size_tier": "s",
+      "chaos_level": 1,
+      "deliberate_contradictions": false,
+      "idea_file": "idea.md",
+      "image_targets": {
+        "logos": 4,
+        "people": 10,
+        "site": 12,
+        "diagrams": 8,
+        "social": 6
+      },
+      "docx_artifacts": [
+        "subcontractor-checklist-2026-02.docx"
+      ]
+    },
+    {
+      "case_id": "s-consulting-v01",
+      "domain": "consulting",
+      "size_tier": "s",
+      "chaos_level": 3,
+      "deliberate_contradictions": true,
+      "idea_file": "idea.md",
+      "image_targets": {
+        "logos": 4,
+        "people": 10,
+        "office": 8,
+        "diagrams": 8,
+        "social": 4
+      },
+      "docx_artifacts": [
+        "engagement-scoping-memo-2026-01-06.docx",
+        "hours-reconciliation-2026-02-03.docx"
+      ]
+    },
+    {
+      "case_id": "s-healthcare-clinic-v01",
+      "domain": "healthcare-clinic",
+      "size_tier": "s",
+      "chaos_level": 1,
+      "deliberate_contradictions": false,
+      "idea_file": "idea.md",
+      "image_targets": {
+        "logos": 4,
+        "people": 8,
+        "clinic": 6,
+        "diagrams": 6,
+        "social": 4
+      },
+      "docx_artifacts": [
+        "ops-summary-2026-01.docx"
+      ]
+    },
+    {
+      "case_id": "s-local-retail-v01",
+      "domain": "local-retail",
+      "size_tier": "s",
+      "chaos_level": 3,
+      "deliberate_contradictions": true,
+      "idea_file": "idea.md",
+      "image_targets": {
+        "products": 40,
+        "storefront": 8,
+        "people": 15,
+        "social": 30,
+        "logos": 7
+      },
+      "docx_artifacts": [
+        "holiday-recap-2025.docx",
+        "spring-promo-brief-2026.docx"
+      ]
+    },
+    {
+      "case_id": "s-manufacturing-v01",
+      "domain": "manufacturing",
+      "size_tier": "s",
+      "chaos_level": 2,
+      "deliberate_contradictions": false,
+      "idea_file": "idea.md",
+      "image_targets": {
+        "logos": 4,
+        "people": 8,
+        "shop": 8,
+        "products": 12,
+        "diagrams": 8
+      },
+      "docx_artifacts": [
+        "ops-brief-2026-q1.docx"
+      ]
+    },
+    {
+      "case_id": "s-software-v01",
+      "domain": "software",
+      "size_tier": "s",
+      "chaos_level": 2,
+      "deliberate_contradictions": true,
+      "idea_file": "idea.md",
+      "image_targets": {
+        "logos": 4,
+        "people": 10,
+        "product-ui": 10,
+        "diagrams": 8,
+        "social": 4
+      },
+      "docx_artifacts": [
+        "customer-onboarding-guide-2026.docx",
+        "monthly-metrics-note-2026-01.docx"
+      ]
+    },
+    {
+      "case_id": "xl-construction-v01",
+      "domain": "construction",
+      "size_tier": "xl",
+      "chaos_level": 5,
+      "deliberate_contradictions": true,
+      "idea_file": "idea.md",
+      "image_targets": {
+        "logos": 8,
+        "people": 20,
+        "site": 30,
+        "diagrams": 18,
+        "social": 10
+      },
+      "docx_artifacts": [
+        "enterprise-project-summary-2026-02.docx"
+      ]
+    },
+    {
+      "case_id": "xl-consulting-v01",
+      "domain": "consulting",
+      "size_tier": "xl",
+      "chaos_level": 5,
+      "deliberate_contradictions": true,
+      "idea_file": "idea.md",
+      "image_targets": {
+        "logos": 8,
+        "people": 24,
+        "office": 14,
+        "diagrams": 18,
+        "social": 10
+      },
+      "docx_artifacts": [
+        "q4-impact-summary-2025.docx"
+      ]
+    },
+    {
+      "case_id": "xl-healthcare-clinic-v01",
+      "domain": "healthcare-clinic",
+      "size_tier": "xl",
+      "chaos_level": 4,
+      "deliberate_contradictions": true,
+      "idea_file": "idea.md",
+      "image_targets": {
+        "logos": 10,
+        "people": 30,
+        "clinics": 15,
+        "diagrams": 20,
+        "social": 10
+      },
+      "docx_artifacts": [
+        "network-report-2026-01.docx"
+      ]
+    },
+    {
+      "case_id": "xl-local-retail-v01",
+      "domain": "local-retail",
+      "size_tier": "xl",
+      "chaos_level": 5,
+      "deliberate_contradictions": true,
+      "idea_file": "idea.md",
+      "image_targets": {
+        "logos": 10,
+        "people": 35,
+        "products": 40,
+        "stores": 15,
+        "social": 25,
+        "diagrams": 20
+      },
+      "docx_artifacts": [
+        "weekly-ops-report-2026-02-15.docx"
+      ]
+    },
+    {
+      "case_id": "xl-manufacturing-v01",
+      "domain": "manufacturing",
+      "size_tier": "xl",
+      "chaos_level": 5,
+      "deliberate_contradictions": true,
+      "idea_file": "idea.md",
+      "image_targets": {
+        "logos": 10,
+        "people": 30,
+        "facility": 20,
+        "products": 30,
+        "diagrams": 25,
+        "social": 10
+      },
+      "docx_artifacts": [
+        "exec-ops-report-2026-02.docx"
+      ]
+    },
+    {
+      "case_id": "xl-software-v01",
+      "domain": "software",
+      "size_tier": "xl",
+      "chaos_level": 5,
+      "deliberate_contradictions": true,
+      "idea_file": "idea.md",
+      "image_targets": {
+        "logos": 8,
+        "people": 30,
+        "product-ui": 30,
+        "diagrams": 25,
+        "social": 12
+      },
+      "docx_artifacts": [
+        "arr-reconciliation-memo-2026-02.docx",
+        "product-milestone-update-2026-02.docx"
+      ]
+    }
+  ]
+}

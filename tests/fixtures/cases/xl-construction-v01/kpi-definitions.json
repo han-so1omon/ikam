@@ -1,0 +1,21 @@
+{
+  "version": "2026-06-01",
+  "kpis": [
+    {
+      "name": "CO total (approved)",
+      "definition": "sum approved COs"
+    },
+    {
+      "name": "CO total (forecast)",
+      "definition": "approved + pending"
+    },
+    {
+      "name": "Margin (PM)",
+      "definition": "forecast fee %"
+    },
+    {
+      "name": "Margin (WIP)",
+      "definition": "WIP margin %"
+    }
+  ]
+}

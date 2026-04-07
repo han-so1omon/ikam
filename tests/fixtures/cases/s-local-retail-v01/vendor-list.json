@@ -1,0 +1,53 @@
+{
+  "generated": "2026-02-05",
+  "vendors": [
+    {
+      "vendor_id": "V001",
+      "name": "Sunfield Preserves",
+      "aka": [
+        "Sunfield",
+        "Sunfield Preserves LLC"
+      ],
+      "category": "jams",
+      "risk_notes": "Seasonal supply constraints; labels changed in 2025."
+    },
+    {
+      "vendor_id": "V002",
+      "name": "Oak Ember Foods",
+      "aka": [
+        "OakEmber"
+      ],
+      "category": "hot sauce",
+      "risk_notes": "Lead times unpredictable near holidays."
+    },
+    {
+      "vendor_id": "V003",
+      "name": "Nightjar Chocolate",
+      "aka": [
+        "Nightjar",
+        "Nightjar Chocolate Co."
+      ],
+      "category": "chocolate",
+      "risk_notes": "Reliable; packaging occasionally arrives scuffed."
+    },
+    {
+      "vendor_id": "V004",
+      "name": "Juniper & Co.",
+      "aka": [
+        "Juniper and Co",
+        "Juniper"
+      ],
+      "category": "tea",
+      "risk_notes": "Slow mover but high margin; watch cash tied up."
+    },
+    {
+      "vendor_id": "V005",
+      "name": "PaperMoss Packaging",
+      "aka": [
+        "Paper Moss"
+      ],
+      "category": "packaging",
+      "risk_notes": "Switched to this vendor mid-2025 after cost increase with prior vendor."
+    }
+  ]
+}

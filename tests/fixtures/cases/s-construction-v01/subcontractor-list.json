@@ -1,0 +1,25 @@
+{
+  "generated": "2026-02-05",
+  "subs": [
+    {
+      "name": "Rose City Electric",
+      "trade": "Electrical"
+    },
+    {
+      "name": "Bridgeview Plumbing",
+      "trade": "Plumbing"
+    },
+    {
+      "name": "Cascade HVAC",
+      "trade": "HVAC"
+    },
+    {
+      "name": "Northside Drywall",
+      "trade": "Drywall"
+    },
+    {
+      "name": "Pine & Paint",
+      "trade": "Painting"
+    }
+  ]
+}

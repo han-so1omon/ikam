@@ -1,0 +1,13 @@
+{
+  "version": "2026-01-10",
+  "kpis": [
+    {
+      "name": "On-time",
+      "definition": "jobs shipped by promised date"
+    },
+    {
+      "name": "Job margin",
+      "definition": "(invoice - costs) / invoice"
+    }
+  ]
+}

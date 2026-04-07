@@ -1,0 +1,22 @@
+graph_id: modelado/projects/canonical/executors
+fragments:
+- name: exec_ml_config
+  fragment_id: 89700dc4-a82f-55a9-b94c-fb90987e2be6
+  cas_id: aed0221f0033e0d0a3bc34ee51da1312c8fb206c0d78fec5e23943c2480d9861
+  mime_type: application/vnd.ikam.ir.structured-data+yaml
+  value:
+    ir_profile: StructuredDataIR
+    endpoint: http://ikam-executor-sidecar:8000
+    type: sidecar
+    protocol: http
+    _fragment_id: 89700dc4-a82f-55a9-b94c-fb90987e2be6
+- name: exec_ml_claim
+  fragment_id: 47c0079f-d969-5adc-9011-50a7d8185f89
+  cas_id: 443672fe2a55963d9853c0c154afa8926c955bfbf98b36a5d205b11d3e03e057
+  mime_type: application/vnd.ikam.ir.proposition+yaml
+  value:
+    ir_profile: PropositionIR
+    subject: 89700dc4-a82f-55a9-b94c-fb90987e2be6
+    predicate: acts_as
+    object: executor/ml
+    _fragment_id: 47c0079f-d969-5adc-9011-50a7d8185f89

@@ -1,0 +1,16 @@
+{
+  "generated": "2026-02-05",
+  "leaders": {
+    "ManagingPartner": "Colleen Park",
+    "ProgramDirector": "Devin Holt",
+    "OpsLead": "Mira Shah",
+    "FinanceLead": "Andre Kim",
+    "PMO": "Talia Reed"
+  },
+  "practices": [
+    "Strategy",
+    "Operations",
+    "Finance",
+    "Analytics"
+  ]
+}

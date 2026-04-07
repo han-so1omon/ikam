@@ -1,0 +1,17 @@
+{
+  "generated": "2026-02-05",
+  "vendors": [
+    {
+      "id": "V001",
+      "name": "Inland Steel",
+      "category": "steel",
+      "lead_time_days": 7
+    },
+    {
+      "id": "V002",
+      "name": "Orange County Fasteners",
+      "category": "hardware",
+      "lead_time_days": 5
+    }
+  ]
+}

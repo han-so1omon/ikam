@@ -1,0 +1,19 @@
+{
+  "generated": "2026-02-05",
+  "leaders": {
+    "MedicalDirector": "Dr. Lila Moreno",
+    "COO": "Ethan Park",
+    "Nursing": "Naomi Chen",
+    "RevCycle": "Sofia Alvarez",
+    "Compliance": "Jordan Blake",
+    "HR": "Priya Desai"
+  },
+  "sites": [
+    "Clinic A",
+    "Clinic B",
+    "Clinic C",
+    "Clinic D",
+    "Clinic E",
+    "Clinic F"
+  ]
+}

@@ -1,0 +1,13 @@
+{
+  "version": "2026-01-08",
+  "kpis": [
+    {
+      "name": "Collections",
+      "definition": "payments received / amounts billed"
+    },
+    {
+      "name": "Denial rate",
+      "definition": "denied claims / submitted claims"
+    }
+  ]
+}

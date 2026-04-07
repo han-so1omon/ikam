@@ -1,0 +1,21 @@
+{
+  "version": "2026-02-01",
+  "kpis": [
+    {
+      "name": "Utilization (practice)",
+      "definition": "billable + approved internal / capacity"
+    },
+    {
+      "name": "Utilization (finance)",
+      "definition": "billable only / capacity"
+    },
+    {
+      "name": "Success fee (marketing)",
+      "definition": "claimed total benefit capture"
+    },
+    {
+      "name": "Success fee (finance)",
+      "definition": "booked amount net of contingencies"
+    }
+  ]
+}

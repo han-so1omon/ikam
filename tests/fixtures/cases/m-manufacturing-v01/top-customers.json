@@ -1,0 +1,13 @@
+{
+  "generated": "2026-02-05",
+  "customers": [
+    {
+      "account": "Lakefront Foods",
+      "segment": "food"
+    },
+    {
+      "account": "CedarMed Devices",
+      "segment": "medical devices"
+    }
+  ]
+}

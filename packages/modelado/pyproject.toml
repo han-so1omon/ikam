@@ -1,0 +1,71 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "modelado"
+version = "0.1.0"
+description = "General-purpose modeling framework: documents, mathematics, temporal analysis, and entities"
+readme = "README.md"
+requires-python = ">=3.11"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [
+    {name = "Narraciones Team"}
+]
+keywords = ["modeling", "mathematics", "documents", "temporal", "entities", "framework"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+]
+
+dependencies = [
+    "blake3>=0.4.1",
+    "numpy>=1.24.0",
+    "openai>=1.0.0",
+    "pydantic>=2.0.0",
+    "python-dateutil>=2.8.0",
+    "llama-index-core>=0.10.0",
+    "llama-index-llms-openai>=0.1.0",
+    "llama-index-embeddings-openai>=0.1.0",
+    "llama-index-readers-file>=0.1.0",
+    "docx2txt>=0.8",
+    "pymupdf>=1.23.0",
+    "python-docx>=1.1.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0.0",
+    "pytest-asyncio>=0.21.0",
+    "mypy>=1.0.0",
+    "black>=23.0.0",
+    "ruff>=0.1.0",
+]
+postgres = [
+    "psycopg[pool]>=3.1.0",
+]
+mathematics = [
+    "sympy>=1.12",
+    "numpy>=1.24.0",
+]
+documents = [
+    "langchain>=0.1.0",
+    "sentence-transformers>=2.2.0",
+]
+temporal = [
+    "pandas>=2.0.0",
+    "statsmodels>=0.14.0",
+]
+entities = [
+    "spacy>=3.5.0",
+]
+all = [
+    "modelado[postgres,mathematics,documents,temporal,entities]",
+]
+
+[tool.setuptools.packages.find]
+where = ["src"]

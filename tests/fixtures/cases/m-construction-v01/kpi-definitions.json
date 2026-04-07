@@ -1,0 +1,13 @@
+{
+  "version": "2026-01-03",
+  "kpis": [
+    {
+      "name": "Fee margin % (PM)",
+      "definition": "(contract - costs) / contract"
+    },
+    {
+      "name": "Fee margin % (WIP)",
+      "definition": "(revenue recognized - costs) / revenue recognized"
+    }
+  ]
+}

@@ -1,0 +1,23 @@
+{
+  "generated": "2026-02-05",
+  "vendors": [
+    {
+      "vendor_id": "V-STEEL-01",
+      "name": "Rainier Steel Supply",
+      "category": "steel coil",
+      "risk_notes": "Lead times volatile"
+    },
+    {
+      "vendor_id": "V-PLATE-02",
+      "name": "BlueHarbor Plating",
+      "category": "plating",
+      "risk_notes": "New vendor 2024-11; early quality issues"
+    },
+    {
+      "vendor_id": "V-PACK-01",
+      "name": "NorthPack",
+      "category": "packaging",
+      "risk_notes": "Stable"
+    }
+  ]
+}

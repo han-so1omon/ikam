@@ -1,0 +1,19 @@
+graph_id: "modelado/projects/canonical/operators"
+fragments:
+  - name: "op_parse_artifacts_expr"
+    mime_type: "application/vnd.ikam.ir.expression+yaml"
+    value:
+      ir_profile: "ExpressionIR"
+      language: "python"
+      module: "modelado.executors.loaders"
+      entrypoint: "run"
+      operator_id: "modelado/operators/parse_artifacts"
+      expected_profile: "StructuredDataIR"
+
+  - name: "op_parse_artifacts_exec_link"
+    mime_type: "application/vnd.ikam.ir.proposition+yaml"
+    value:
+      ir_profile: "PropositionIR"
+      subject: "${ref:op_parse_artifacts_expr}"
+      predicate: "executed_by"
+      object: "${ref:exec_python_config}"
