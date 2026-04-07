@@ -14,6 +14,10 @@ coverage/
 !.env.example
 packages/test/ikam-perf-report/.env
 
+# Large local-only benchmark fixtures
+tests/fixtures/wiki/enwik8
+tests/fixtures/wiki/enwik9
+
 # Local agent/tool state
 /.adal/
 /.agents/
