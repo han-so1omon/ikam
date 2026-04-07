@@ -8,6 +8,12 @@ node_modules/
 dist/
 coverage/
 
+# Local environment files
+.env
+.env.*
+!.env.example
+packages/test/ikam-perf-report/.env
+
 # Local agent/tool state
 /.adal/
 /.agents/
