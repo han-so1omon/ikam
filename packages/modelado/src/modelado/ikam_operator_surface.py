@@ -14,6 +14,7 @@ except Exception:  # pragma: no cover - optional in pure-logic tests
 from ikam.fragments import Fragment as V3Fragment, Relation, RELATION_MIME
 from ikam.graph import StoredFragment as StorageFragment, _cas_hex
 
+from modelado.graph_edge_event_folding import delete_matching_subtree_edges, is_subtree_graph_delta_delete
 from modelado.graph_edge_event_log import GraphEdgeEvent, compute_edge_identity_key
 from modelado.knowledge_edge_events import KnowledgeEdgeEventInput, build_knowledge_edge_events
 
@@ -335,6 +336,9 @@ def _fold_effective_edges(events: Sequence[GraphEdgeEvent]) -> list[ContextEdge]
             properties=e.properties,
         )
         if e.op == "delete":
+            if is_subtree_graph_delta_delete(e):
+                delete_matching_subtree_edges(effective, e)
+                continue
             effective.pop(key, None)
             continue
         effective[key] = ContextEdge(

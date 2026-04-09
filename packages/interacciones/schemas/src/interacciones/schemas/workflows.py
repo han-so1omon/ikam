@@ -7,6 +7,7 @@ from typing import Any
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from .execution import ResolutionMode
+from .operator_boundaries import OperatorBoundaries
 from .transition_validators import RichPetriTransitionValidator
 
 SUPPORTED_WORKFLOW_NODE_KINDS = {
@@ -36,6 +37,7 @@ class WorkflowNode(BaseModel):
     executor_selection: dict[str, Any] = Field(default_factory=dict)
     constraints: dict[str, Any] = Field(default_factory=dict)
     validators: list["RichPetriTransitionValidator"] = Field(default_factory=list)
+    boundaries: OperatorBoundaries = Field(default_factory=OperatorBoundaries)
     payload: dict[str, Any] = Field(default_factory=dict)
     config: dict[str, Any] = Field(default_factory=dict)
     resolution_mode: ResolutionMode = ResolutionMode.CAPABILITY_POLICY
@@ -58,6 +60,8 @@ class WorkflowNode(BaseModel):
                 raise ValueError(f"{self.kind} nodes cannot declare executor_selection")
             if self.validators:
                 raise ValueError(f"{self.kind} nodes cannot declare validators")
+            if "boundaries" in self.model_fields_set:
+                raise ValueError(f"{self.kind} nodes cannot declare boundaries")
             if self.resolution_mode != ResolutionMode.CAPABILITY_POLICY:
                 raise ValueError(f"{self.kind} nodes cannot override resolution mode")
             if self.direct_executor_ref is not None:

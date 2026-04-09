@@ -18,8 +18,8 @@ def test_entities_and_relationships_operator_returns_entity_relationship_rows_wi
         parameters={
             "chunk_extraction_set": {
                 "kind": "chunk_extraction_set",
-                "source_subgraph_ref": "hot://run-1/document_set/load-documents",
-                "subgraph_ref": "hot://run-1/chunk_extraction_set/parse-chunk",
+                "source_subgraph_ref": "subgraph://run-1-document-set-load-documents",
+                "subgraph_ref": "subgraph://run-1-chunk-extraction-set-parse-chunk",
                 "extraction_refs": ["frag-chunk-1", "frag-chunk-2"],
                 "chunk_extractions": [
                     {
@@ -65,8 +65,8 @@ def test_entities_and_relationships_operator_returns_entity_relationship_rows_wi
     }
     assert len(result["fragment_ids"]) == 2
     assert result["entity_relationship_set"]["kind"] == "entity_relationship_set"
-    assert result["entity_relationship_set"]["source_subgraph_ref"] == "hot://run-1/chunk_extraction_set/parse-chunk"
-    assert result["entity_relationship_set"]["subgraph_ref"] == "hot://run-1/chunk_extraction_set/parse-chunk:entities"
+    assert result["entity_relationship_set"]["source_subgraph_ref"] == "subgraph://run-1-chunk-extraction-set-parse-chunk"
+    assert result["entity_relationship_set"]["subgraph_ref"] == "subgraph://run-1-chunk-extraction-set-parse-chunk-entities"
     assert result["entity_relationship_set"]["entity_relationship_refs"] == result["fragment_ids"]
     assert [row["chunk_id"] for row in result["entity_relationships"]] == [
         "doc-1:chunk:0",

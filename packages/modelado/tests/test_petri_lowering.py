@@ -42,6 +42,7 @@ def test_lower_rich_petri_transition_creates_single_executable_operator() -> Non
         "approval_hint": {},
         "checkpoint_hint": {},
         "eligible_executor_ids": [],
+        "translator_plan": {"input": [], "output": []},
     }
 
 
@@ -135,3 +136,37 @@ def test_lower_rich_petri_transition_rejects_unknown_direct_executor_override() 
         assert str(exc) == "direct executor override 'executor://missing' is not declared"
     else:
         raise AssertionError("expected missing direct executor override to be rejected")
+
+
+def test_lower_rich_petri_transition_rejects_incompatible_direct_executor_override() -> None:
+    transition = RichPetriTransition(
+        transition_id="transition:normalize",
+        label="normalize",
+        capability="python.transform",
+        resolution_mode=ResolutionMode.DIRECT_EXECUTOR_REF,
+        direct_executor_ref="executor://ml-primary",
+    )
+
+    try:
+        lower_rich_petri_transition(
+            workflow_id="ingestion",
+            version="v1",
+            transition=transition,
+            executor_declarations=[
+                ExecutorDeclaration(
+                    executor_id="executor://ml-primary",
+                    executor_kind="ml-executor",
+                    capabilities=["ml.embed"],
+                    policy_support=["latency"],
+                    transport={"kind": "redpanda"},
+                    runtime={"image": "ml:latest"},
+                    concurrency={"max_inflight": 2},
+                    batching={"max_batch_size": 64},
+                    health={"readiness_path": "/health"},
+                )
+            ],
+        )
+    except ValueError as exc:
+        assert str(exc) == "direct executor override 'executor://ml-primary' does not support capability 'python.transform'"
+    else:
+        raise AssertionError("expected incompatible direct executor override to be rejected")

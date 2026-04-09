@@ -28,3 +28,7 @@ STYLE_IR = "application/ikam-style+v1+json"
 RECONSTRUCTION_PROGRAM = "application/ikam-reconstruction-program+json"
 VERIFICATION_RESULT = "application/ikam-verification-result+json"
 PREDICATE_VOCABULARY = "application/ikam-predicate-vocabulary+json"
+
+# -- Graph-native runtime MIME types --
+GRAPH_SLICE_MIME = "application/ikam-graph-slice+v1+json"
+GRAPH_DELTA_MIME = "application/ikam-graph-delta+v1+json"

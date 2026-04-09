@@ -4,6 +4,7 @@ import re
 from typing import Any
 
 from ikam.inspection import node_id_for
+from modelado.history.head_locators import resolve_locator_identity
 
 
 def resolve_target_value(payload: dict[str, Any], target: str) -> Any:
@@ -91,13 +92,13 @@ def _inspection_payload(entry: dict[str, Any], ref_index: dict[str, dict[str, An
 def _inspection_identity(entry: dict[str, Any], value: dict[str, Any]) -> tuple[str, str] | None:
     subgraph_ref = value.get("subgraph_ref")
     if isinstance(subgraph_ref, str) and subgraph_ref:
-        return "subgraph", subgraph_ref
+        return resolve_locator_identity(subgraph_ref, fallback_kind="subgraph")
     cas_id = entry.get("cas_id") or entry.get("fragment_id")
     if isinstance(cas_id, str) and cas_id:
         return "fragment", cas_id
     artifact_id = value.get("artifact_head_ref") or value.get("location")
     if isinstance(artifact_id, str) and artifact_id:
-        return "artifact", artifact_id
+        return resolve_locator_identity(artifact_id, fallback_kind="artifact")
     return None
 
 
@@ -315,7 +316,7 @@ def _extract_output_fragment_ids(step_outputs: dict[str, Any]) -> list[str]:
 def _document_set_payload(*, artifact_id: str, fragment_refs: list[str], subgraph_ref: str) -> dict[str, Any]:
     return {
         "kind": "document_set",
-        "artifact_head_ref": artifact_id,
+        "artifact_head_ref": f"artifact://{artifact_id}",
         "subgraph_ref": subgraph_ref,
         "document_refs": fragment_refs,
     }
@@ -350,8 +351,8 @@ def _claim_set_payload(*, source_subgraph_ref: str, subgraph_ref: str, claim_ref
 
 def _hot_ref(run_id: str, contract_type: str, step_id: str, fallback: str) -> str:
     if run_id and step_id:
-        return f"hot://{run_id}/{contract_type}/{step_id}"
-    return fallback
+        return f"subgraph://{run_id}-{contract_type.replace('_', '-')}-{step_id}"
+    return f"subgraph://{fallback.replace(':', '-').replace('/', '-')}"
 
 
 def _resolve_chunk_extraction_input_payload(*, artifact_id: str, step_outputs: dict[str, Any]) -> dict[str, Any] | None:
@@ -361,7 +362,7 @@ def _resolve_chunk_extraction_input_payload(*, artifact_id: str, step_outputs: d
     if not isinstance(chunk_extraction_set_ref, str) or not chunk_extraction_set_ref or not extraction_refs:
         return None
     return _chunk_extraction_set_payload(
-        source_subgraph_ref=f"subgraph:{artifact_id}:document_set",
+        source_subgraph_ref=f"subgraph://{artifact_id}-document-set",
         subgraph_ref=chunk_extraction_set_ref,
         extraction_refs=extraction_refs,
     )
@@ -374,7 +375,7 @@ def _resolve_entity_relationship_input_payload(*, artifact_id: str, step_outputs
     if not isinstance(entity_relationship_set_ref, str) or not entity_relationship_set_ref or not entity_relationship_refs:
         return None
     return _entity_relationship_set_payload(
-        source_subgraph_ref=f"subgraph:{artifact_id}:chunk_extraction_set",
+        source_subgraph_ref=f"subgraph://{artifact_id}-chunk-extraction-set",
         subgraph_ref=entity_relationship_set_ref,
         entity_relationship_refs=entity_relationship_refs,
     )

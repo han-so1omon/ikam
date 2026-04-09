@@ -5,6 +5,20 @@ from pydantic import BaseModel, ConfigDict, Field
 from ikam.ir.core import ExpressionIR, PropositionIR, StructuredDataIR
 
 
+class TranslatorPlanBoundary(BaseModel):
+    name: str
+    mime_type: str
+
+    model_config = ConfigDict(extra="forbid")
+
+
+class TranslatorPlan(BaseModel):
+    input: list[TranslatorPlanBoundary] = Field(default_factory=list)
+    output: list[TranslatorPlanBoundary] = Field(default_factory=list)
+
+    model_config = ConfigDict(extra="forbid")
+
+
 class LoweredExecutableGraph(BaseModel):
     executable_graph: StructuredDataIR
     operators: list[ExpressionIR] = Field(default_factory=list)

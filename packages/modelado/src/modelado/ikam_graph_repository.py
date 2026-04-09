@@ -17,6 +17,7 @@ import ikam.adapters as ikam_adapters
 from ikam.ir import OpShape, OpInstance
 
 from modelado.graph_edge_event_log import append_graph_edge_event
+from modelado.graph.delta_lowering import lower_graph_delta_envelope
 from modelado.environment_scope import (
     EnvironmentScope,
     add_scope_qualifiers,
@@ -175,6 +176,49 @@ def integrate_parse_outputs(
             },
         )
     return {"artifact_id": artifact_id, "new_fragment_id": new_fragment_id}
+
+
+def apply_graph_delta_envelope(
+    cx: psycopg.Connection[Any],
+    *,
+    project_id: str,
+    envelope: dict[str, Any] | Any,
+) -> dict[str, Any]:
+    _require_ikam_write("apply_graph_delta_envelope")
+    ctx = get_execution_context()
+    if ctx is not None and ctx.write_scope is not None and ctx.write_scope.project_id != project_id:
+        raise ExecutionPolicyViolation(
+            "Execution policy violation: apply_graph_delta_envelope project_id does not match active write scope "
+            f"(delta_project_id={project_id} scope_project_id={ctx.write_scope.project_id})"
+        )
+    if ctx is not None and ctx.write_scope is not None and ctx.write_scope.operation != "apply_graph_delta_envelope":
+        raise ExecutionPolicyViolation(
+            "Execution policy violation: apply_graph_delta_envelope operation does not match active write scope "
+            f"(scope_operation={ctx.write_scope.operation})"
+        )
+
+    lowered = lower_graph_delta_envelope(project_id=project_id, envelope=envelope)
+    appended_events: list[Any] = []
+    with cx.transaction():
+        for event in lowered.edge_events:
+            appended = append_graph_edge_event(
+                cx,
+                project_id=project_id,
+                op=event.op,
+                edge_label=event.edge_label,
+                out_id=event.out_id,
+                in_id=event.in_id,
+                properties=event.properties,
+                idempotency_key=event.idempotency_key,
+            )
+            if appended is not None:
+                appended_events.append(appended)
+
+    return {
+        "summary": lowered.summary,
+        "attempted_event_count": len(lowered.edge_events),
+        "appended_events": appended_events,
+    }
 
 
 def emit_edge_event(
