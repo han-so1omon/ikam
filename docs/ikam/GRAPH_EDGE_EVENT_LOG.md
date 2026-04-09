@@ -28,8 +28,27 @@ If we later need a denormalized `owner_org_id` column for operational convenienc
 
 ## Identifiers
 
-- `out_id` and `in_id` are the **stable artifact IDs** (`artifacts.id`) for the source and target vertices.
+- `out_id` and `in_id` are the stable graph vertex ids for the source and target vertices.
+- Depending on the producer and edge family, these ids may refer to artifact vertices or fragment vertices.
+- Consumers must interpret endpoint ids in the context of the edge family they are traversing.
 - `edge_label` is the semantic edge label. For derivations we use the `derivation:` prefix (for example: `derivation:derived_from`).
+
+## Read-Time Locator Resolution
+
+The append-only event log remains authoritative, but some read-time consumers now
+resolve locator-style references before traversing the log:
+
+- artifact locators such as `artifact://<semantic_artifact_id>` or `ref://refs/heads/main/artifact/<semantic_artifact_id>`
+  resolve through the selected ref head
+- `head_object_id` is the canonical resolved artifact head target
+- artifact-head resolution then lowers to `ikam_fragment_objects.root_fragment_id`
+  when a consumer needs a concrete graph target
+- fragment locators such as `fragment://<fragment_id>` or `ref://refs/heads/main/fragment/<fragment_id>`
+  target that fragment directly
+
+This read-time resolution model does not change the append-only contract of
+`graph_edge_events`; it defines how callers select the effective graph element
+they want to inspect.
 
 The HugeGraph projection computes a stable `edge_key` from `idempotency_key` when present.
 

@@ -8,7 +8,7 @@ sys.path.insert(0, str(ROOT / "packages/modelado/src"))
 sys.path.insert(0, str(ROOT / "packages/interacciones/schemas/src"))
 
 from interacciones.schemas import RichPetriTransition  # noqa: E402
-from modelado.executors.transition_validation import build_transition_validation  # noqa: E402
+from modelado.executors.transition_validation import build_runtime_transition_validation, build_transition_validation  # noqa: E402
 
 
 def _validator_specs(*validators: dict[str, object]) -> list[dict[str, object]]:
@@ -67,8 +67,8 @@ def test_build_transition_validation_validates_load_documents_handoff() -> None:
                 {
                     "value": {
                         "kind": "document_set",
-                        "artifact_head_ref": "artifact:s-local-retail-v01",
-                        "subgraph_ref": "hot://run-1/document_set/step-1",
+                        "artifact_head_ref": "artifact://s-local-retail-v01",
+                        "subgraph_ref": "subgraph://run-1-document-set-step-1",
                         "document_refs": ["frag-doc-1"],
                     }
                 }
@@ -104,19 +104,19 @@ def test_build_transition_validation_validates_load_documents_handoff() -> None:
         "refs": ["frag-doc-1"],
         "content": {
             "kind": "document_set",
-            "artifact_head_ref": "artifact:s-local-retail-v01",
-            "subgraph_ref": "hot://run-1/document_set/step-1",
+            "artifact_head_ref": "artifact://s-local-retail-v01",
+            "subgraph_ref": "subgraph://run-1-document-set-step-1",
             "document_refs": ["frag-doc-1"],
         },
         "resolved_refs": [],
     }
     assert payload["resolved_outputs"]["document_set"][0]["inspection_stub"] == {
-        "id": "subgraph:hot://run-1/document_set/step-1",
+        "id": "subgraph:subgraph://run-1-document-set-step-1",
         "kind": "subgraph",
         "ir_kind": "document_set",
         "label": "document_set",
         "summary": "document_set 1 ref",
-        "inspection_ref": "inspect://subgraph/hot://run-1/document_set/step-1",
+        "inspection_ref": "inspect://subgraph/subgraph://run-1-document-set-step-1",
     }
     results = {item["name"]: item for item in payload["results"]}
     assert results["input-url"]["status"] == "passed"
@@ -162,8 +162,8 @@ def test_build_transition_validation_validates_parse_claims_handoff() -> None:
                 {
                     "value": {
                         "kind": "entity_relationship_set",
-                        "source_subgraph_ref": "hot://run-1/chunk_extraction_set/step-entities",
-                        "subgraph_ref": "hot://run-1/entity_relationship_set/step-entities",
+                        "source_subgraph_ref": "subgraph://run-1-chunk-extraction-set-step-entities",
+                        "subgraph_ref": "subgraph://run-1-entity-relationship-set-step-entities",
                         "entity_relationship_refs": ["frag-ir-1"],
                     }
                 }
@@ -174,8 +174,8 @@ def test_build_transition_validation_validates_parse_claims_handoff() -> None:
                 {
                     "value": {
                         "kind": "claim_set",
-                        "source_subgraph_ref": "hot://run-1/entity_relationship_set/step-entities",
-                        "subgraph_ref": "hot://run-1/claim_set/step-claims",
+                        "source_subgraph_ref": "subgraph://run-1-entity-relationship-set-step-entities",
+                        "subgraph_ref": "subgraph://run-1-claim-set-step-claims",
                         "claim_refs": ["frag-claim-1"],
                     }
                 }
@@ -192,8 +192,8 @@ def test_build_transition_validation_validates_parse_claims_handoff() -> None:
         "refs": ["frag-ir-1"],
         "content": {
             "kind": "entity_relationship_set",
-            "source_subgraph_ref": "hot://run-1/chunk_extraction_set/step-entities",
-            "subgraph_ref": "hot://run-1/entity_relationship_set/step-entities",
+            "source_subgraph_ref": "subgraph://run-1-chunk-extraction-set-step-entities",
+            "subgraph_ref": "subgraph://run-1-entity-relationship-set-step-entities",
             "entity_relationship_refs": ["frag-ir-1"],
         },
         "resolved_refs": [],
@@ -204,8 +204,8 @@ def test_build_transition_validation_validates_parse_claims_handoff() -> None:
         "refs": ["frag-claim-1"],
         "content": {
             "kind": "claim_set",
-            "source_subgraph_ref": "hot://run-1/entity_relationship_set/step-entities",
-            "subgraph_ref": "hot://run-1/claim_set/step-claims",
+            "source_subgraph_ref": "subgraph://run-1-entity-relationship-set-step-entities",
+            "subgraph_ref": "subgraph://run-1-claim-set-step-claims",
             "claim_refs": ["frag-claim-1"],
         },
         "resolved_refs": [],
@@ -237,7 +237,7 @@ def test_build_transition_validation_filters_unrelated_runtime_inputs_by_selecto
         validators=specs,
         runtime_inputs={
             "url": [{"value": {"kind": "url", "location": "/repo/tests/fixtures/cases/s-local-retail-v01"}}],
-            "document_set": [{"value": {"kind": "document_set", "artifact_head_ref": "artifact:case", "subgraph_ref": "hot://run/document_set/step-load", "document_refs": ["frag-doc-1"]}}],
+            "document_set": [{"value": {"kind": "document_set", "artifact_head_ref": "artifact://case", "subgraph_ref": "subgraph://run-document-set-step-load", "document_refs": ["frag-doc-1"]}}],
         },
         runtime_outputs={},
     )
@@ -314,3 +314,38 @@ def test_build_transition_validation_inspects_fragment_backed_entries() -> None:
         "summary": "loaded_document doc-1",
         "inspection_ref": "inspect://fragment/frag-loaded-document-1",
     }
+
+
+def test_build_runtime_transition_validation_emits_canonical_locator_refs() -> None:
+    specs = _validator_specs(
+        {
+            "name": "output-document-set",
+            "direction": "output",
+            "kind": "type",
+            "selector": "output.document_set",
+            "target": "value",
+            "config": {
+                "schema": {
+                    "type": "object",
+                    "title": "document_set",
+                    "required": ["kind", "artifact_head_ref", "subgraph_ref", "document_refs"],
+                }
+            },
+        }
+    )
+
+    payload = build_runtime_transition_validation(
+        validators=specs,
+        artifact_id="artifact-case-1",
+        mime_type="text/markdown",
+        fixture_path="/repo/tests/fixtures/cases/s-local-retail-v01",
+        run_id="run-1",
+        step_id="step-load",
+        step_outputs={"document_fragment_refs": ["frag-doc-1"]},
+        environment_fragments=[],
+    )
+
+    assert payload is not None
+    value = payload["resolved_outputs"]["document_set"][0]["value"]
+    assert value["artifact_head_ref"] == "artifact://artifact-case-1"
+    assert value["subgraph_ref"] == "subgraph://run-1-document-set-step-load"

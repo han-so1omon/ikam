@@ -8,7 +8,7 @@ sys.path.insert(0, str(ROOT / "packages/modelado/src"))
 sys.path.insert(0, str(ROOT / "packages/interacciones/schemas/src"))
 sys.path.insert(0, str(ROOT / "packages/ikam/src"))
 
-from interacciones.schemas import ExecutorDeclaration, RichPetriArc, RichPetriPlace, RichPetriTransition, RichPetriWorkflow
+from interacciones.schemas import ExecutorDeclaration, RichPetriArc, RichPetriPlace, RichPetriTransition, RichPetriWorkflow, SourceWorkflowStoragePolicy, WorkflowDefinition, WorkflowNode
 from ikam.ir.core import ExpressionIR, PropositionIR, StructuredDataIR
 from modelado.graph.compiler import GraphCompiler
 
@@ -198,3 +198,231 @@ def test_graph_compiler_namespaces_fragment_ids_by_workflow_version() -> None:
 
     assert compiled_v1.operators[0].fragment_id != compiled_v2.operators[0].fragment_id
     assert compiled_v1.graph_edges[0].fragment_id != compiled_v2.graph_edges[0].fragment_id
+
+
+def test_graph_compiler_derives_translator_plans_from_source_workflow_boundaries() -> None:
+    workflow = RichPetriWorkflow(
+        workflow_id="chunk-flow",
+        version="v1",
+        places=[
+            RichPetriPlace(place_id="place:start", label="place:start"),
+            RichPetriPlace(place_id="place:end", label="place:end"),
+        ],
+        transitions=[
+            RichPetriTransition(
+                transition_id="transition:parse-chunk",
+                label="parse-chunk",
+                capability="python.chunk_documents",
+            )
+        ],
+        arcs=[
+            RichPetriArc(source_kind="place", source_id="place:start", target_kind="transition", target_id="transition:parse-chunk"),
+            RichPetriArc(source_kind="transition", source_id="transition:parse-chunk", target_kind="place", target_id="place:end"),
+        ],
+        source_workflow_definition=WorkflowDefinition(
+            workflow_id="chunk-flow",
+            version="v1",
+            nodes=[
+                WorkflowNode(
+                    node_id="parse-chunk",
+                    kind="dispatch_executor",
+                    capability="python.chunk_documents",
+                    boundaries={
+                        "input": [
+                            {
+                                "name": "document_set",
+                                "mime_type": "application/ikam-document-set+v1+json",
+                            }
+                        ],
+                        "output": [
+                            {
+                                "name": "chunk_extraction_set",
+                                "mime_type": "application/ikam-chunk-extraction-set+v1+json",
+                            }
+                        ],
+                    },
+                )
+            ],
+        ),
+    )
+
+    compiled = GraphCompiler().compile(workflow)
+
+    assert compiled.executable_graph.data["translator_plans"] == {
+        "transition:parse-chunk": {
+            "input": [
+                {
+                    "name": "document_set",
+                    "mime_type": "application/ikam-document-set+v1+json",
+                }
+            ],
+            "output": [
+                {
+                    "name": "chunk_extraction_set",
+                    "mime_type": "application/ikam-chunk-extraction-set+v1+json",
+                }
+            ],
+        }
+    }
+    assert compiled.operators[0].ast.params["translator_plan"] == {
+        "input": [
+            {
+                "name": "document_set",
+                "mime_type": "application/ikam-document-set+v1+json",
+            }
+        ],
+        "output": [
+            {
+                "name": "chunk_extraction_set",
+                "mime_type": "application/ikam-chunk-extraction-set+v1+json",
+            }
+        ],
+    }
+
+
+def test_graph_compiler_defaults_missing_node_boundaries_to_empty_translator_plan() -> None:
+    workflow = RichPetriWorkflow(
+        workflow_id="normalize-flow",
+        version="v1",
+        places=[
+            RichPetriPlace(place_id="place:start", label="place:start"),
+            RichPetriPlace(place_id="place:end", label="place:end"),
+        ],
+        transitions=[
+            RichPetriTransition(
+                transition_id="transition:normalize",
+                label="normalize",
+                capability="python.transform",
+            )
+        ],
+        arcs=[
+            RichPetriArc(source_kind="place", source_id="place:start", target_kind="transition", target_id="transition:normalize"),
+            RichPetriArc(source_kind="transition", source_id="transition:normalize", target_kind="place", target_id="place:end"),
+        ],
+        source_workflow_definition=WorkflowDefinition(
+            workflow_id="normalize-flow",
+            version="v1",
+            nodes=[
+                WorkflowNode(
+                    node_id="normalize",
+                    kind="dispatch_executor",
+                    capability="python.transform",
+                )
+            ],
+        ),
+    )
+
+    compiled = GraphCompiler().compile(workflow)
+
+    assert compiled.executable_graph.data["translator_plans"] == {
+        "transition:normalize": {"input": [], "output": []}
+    }
+    assert compiled.operators[0].ast.params["translator_plan"] == {"input": [], "output": []}
+
+
+def test_graph_compiler_matches_boundaries_for_non_prefixed_transition_ids() -> None:
+    workflow = RichPetriWorkflow(
+        workflow_id="chunk-flow",
+        version="v1",
+        places=[
+            RichPetriPlace(place_id="place:start", label="place:start"),
+            RichPetriPlace(place_id="place:end", label="place:end"),
+        ],
+        transitions=[
+            RichPetriTransition(
+                transition_id="parse-chunk",
+                label="parse-chunk",
+                capability="python.chunk_documents",
+            )
+        ],
+        arcs=[
+            RichPetriArc(source_kind="place", source_id="place:start", target_kind="transition", target_id="parse-chunk"),
+            RichPetriArc(source_kind="transition", source_id="parse-chunk", target_kind="place", target_id="place:end"),
+        ],
+        source_workflow_definition=WorkflowDefinition(
+            workflow_id="chunk-flow",
+            version="v1",
+            nodes=[
+                WorkflowNode(
+                    node_id="parse-chunk",
+                    kind="dispatch_executor",
+                    capability="python.chunk_documents",
+                    boundaries={
+                        "input": [
+                            {
+                                "name": "document_set",
+                                "mime_type": "application/ikam-document-set+v1+json",
+                            }
+                        ],
+                        "output": [
+                            {
+                                "name": "chunk_extraction_set",
+                                "mime_type": "application/ikam-chunk-extraction-set+v1+json",
+                            }
+                        ],
+                    },
+                )
+            ],
+        ),
+    )
+
+    compiled = GraphCompiler().compile(workflow)
+
+    assert compiled.executable_graph.data["translator_plans"] == {
+        "parse-chunk": {
+            "input": [
+                {
+                    "name": "document_set",
+                    "mime_type": "application/ikam-document-set+v1+json",
+                }
+            ],
+            "output": [
+                {
+                    "name": "chunk_extraction_set",
+                    "mime_type": "application/ikam-chunk-extraction-set+v1+json",
+                }
+            ],
+        }
+    }
+    assert compiled.operators[0].ast.params["translator_plan"] == {
+        "input": [
+            {
+                "name": "document_set",
+                "mime_type": "application/ikam-document-set+v1+json",
+            }
+        ],
+        "output": [
+            {
+                "name": "chunk_extraction_set",
+                "mime_type": "application/ikam-chunk-extraction-set+v1+json",
+            }
+        ],
+    }
+
+
+def test_graph_compiler_reflects_workflow_reconstructability_flag() -> None:
+    workflow = RichPetriWorkflow(
+        workflow_id="reconstructability-flow",
+        version="v1",
+        places=[
+            RichPetriPlace(place_id="place:start", label="place:start"),
+            RichPetriPlace(place_id="place:end", label="place:end"),
+        ],
+        transitions=[
+            RichPetriTransition(
+                transition_id="transition:dispatch",
+                label="dispatch",
+                capability="python.transform",
+            )
+        ],
+        arcs=[
+            RichPetriArc(source_kind="place", source_id="place:start", target_kind="transition", target_id="transition:dispatch"),
+            RichPetriArc(source_kind="transition", source_id="transition:dispatch", target_kind="place", target_id="place:end"),
+        ],
+        source_workflow_storage=SourceWorkflowStoragePolicy(reconstructable_from_lowered_graph=False),
+    )
+
+    compiled = GraphCompiler().compile(workflow)
+
+    assert compiled.executable_graph.data["reconstructable_from_rich_petri"] is True
+    assert compiled.executable_graph.data["reconstructable_from_lowered_graph"] is False

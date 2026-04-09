@@ -111,3 +111,24 @@ def test_resolve_persistent_chunk_set_normalizes_source_subgraph_edge() -> None:
         "subgraph:refs/heads/main/subgraphs/document-set",
         "source_subgraph",
     ) in edges
+
+
+def test_resolve_persistent_subgraph_locator_round_trips_canonical_locator() -> None:
+    state = PersistentGraphState()
+    state.register_inspection_subgraph(
+        {
+            "kind": "document_set",
+            "subgraph_ref": "subgraph://document-set-main",
+            "member_refs": [],
+            "edges": [],
+        }
+    )
+
+    subgraph = _resolve(state, "subgraph://document-set-main")
+
+    root = next(node for node in subgraph.nodes if node.id == subgraph.root_node_id)
+    assert subgraph.root_node_id == "subgraph:subgraph://document-set-main"
+    assert root.refs["self"] == InspectionRef(
+        backend="persistent",
+        locator={"subgraph_ref": "subgraph://document-set-main"},
+    )

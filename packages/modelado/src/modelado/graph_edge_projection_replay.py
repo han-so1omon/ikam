@@ -6,7 +6,7 @@ from typing import Iterable, Optional
 from psycopg import Connection
 
 from modelado.environment_scope import scope_ref_from_qualifiers
-from modelado.graph_edge_event_folding import EffectiveEdge
+from modelado.graph_edge_event_folding import EffectiveEdge, delete_matching_subtree_edges, is_subtree_graph_delta_delete
 from modelado.graph_edge_event_log import GraphEdgeEvent, compute_edge_identity_key, list_graph_edge_events
 
 
@@ -72,6 +72,9 @@ def replay_effective_edges(
         )
 
         if event.op == "delete":
+            if is_subtree_graph_delta_delete(event):
+                delete_matching_subtree_edges(effective, event)
+                continue
             effective.pop(edge_key, None)
             continue
 

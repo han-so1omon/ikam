@@ -26,7 +26,7 @@ class ClaimsOperator(Operator):
         raw = params.parameters
         entity_relationship_set = raw.get("entity_relationship_set") if isinstance(raw.get("entity_relationship_set"), dict) else {}
         source_subgraph_ref = str(entity_relationship_set.get("source_subgraph_ref") or entity_relationship_set.get("subgraph_ref") or "")
-        default_subgraph_ref = f"{source_subgraph_ref}:claims" if source_subgraph_ref else ""
+        default_subgraph_ref = _derived_subgraph_ref(source_subgraph_ref, suffix="claims")
         subgraph_ref = str(raw.get("subgraph_ref") or default_subgraph_ref)
         entity_relationships = (
             entity_relationship_set.get("entity_relationships") if isinstance(entity_relationship_set.get("entity_relationships"), list) else []
@@ -103,3 +103,11 @@ class ClaimsOperator(Operator):
 
     def provenance(self, params: OperatorParams, env: OperatorEnv) -> ProvenanceRecord:
         return record_provenance(params, env)
+
+
+def _derived_subgraph_ref(source_subgraph_ref: str, *, suffix: str) -> str:
+    if not source_subgraph_ref:
+        return ""
+    if source_subgraph_ref.startswith("subgraph://"):
+        return f"{source_subgraph_ref}-{suffix}"
+    return f"{source_subgraph_ref}:{suffix}"

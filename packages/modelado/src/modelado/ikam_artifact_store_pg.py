@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import datetime as dt
+import json
 from typing import Any, Sequence
 
 from modelado.core.execution_context import ExecutionPolicyViolation, get_execution_context, require_write_scope
@@ -10,6 +11,7 @@ from ikam.adapters import (
     fragment_object_id_for_manifest,
     serialize_fragment_object_manifest,
 )
+from modelado.history.ref_head import build_ref_head
 
 
 class PostgresArtifactStore:
@@ -120,6 +122,42 @@ class PostgresArtifactStore:
             return None
         return row["manifest"] if isinstance(row, dict) else row[0]
 
+    def upsert_artifact_head_ref(
+        self,
+        *,
+        artifact_id: str,
+        ref: str,
+        head_object_id: str,
+        head_commit_id: str,
+    ) -> None:
+        branch_name = _branch_name_from_ref(ref)
+        result_ref = build_ref_head(ref=ref, commit_id=head_commit_id, head_object_id=head_object_id)
+        self._cx.execute(
+            """
+            INSERT INTO ikam_artifact_commits (artifact_id, id, base_ref, result_ref, delta_hash, view_hash, staged_artifact_id)
+            VALUES (%s::uuid, %s, %s::jsonb, %s::jsonb, %s, %s, %s::uuid)
+            ON CONFLICT (id) DO NOTHING;
+
+            INSERT INTO ikam_artifact_branches (artifact_id, name, head_commit_id, status, created_at, updated_at)
+            VALUES (%s::uuid, %s, %s, 'open', now(), now())
+            ON CONFLICT (artifact_id, name) DO UPDATE
+            SET head_commit_id = EXCLUDED.head_commit_id,
+                updated_at = now()
+            """,
+            (
+                artifact_id,
+                head_commit_id,
+                '{"ref": null}',
+                json.dumps(result_ref, sort_keys=True, separators=(",", ":"), ensure_ascii=False),
+                head_commit_id,
+                head_object_id,
+                artifact_id,
+                artifact_id,
+                branch_name,
+                head_commit_id,
+            ),
+        )
+
     def _insert_fragment_object(
         self,
         *,
@@ -149,3 +187,13 @@ class PostgresArtifactStore:
             (object_id, root_fragment_id, payload.decode("utf-8")),
         )
         return object_id
+
+
+def _branch_name_from_ref(ref: str) -> str:
+    prefix = "refs/heads/"
+    if not ref.startswith(prefix):
+        raise ValueError(f"Unsupported ref: {ref}")
+    branch_name = ref[len(prefix) :]
+    if not branch_name:
+        raise ValueError(f"Unsupported ref: {ref}")
+    return branch_name

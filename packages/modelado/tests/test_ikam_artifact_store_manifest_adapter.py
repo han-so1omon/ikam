@@ -44,3 +44,33 @@ def test_insert_fragment_object_uses_current_manifest_adapter_signature(monkeypa
         "kind": "document",
         "fragment_ids": ["fragment-1", "fragment-2"],
     }
+
+
+def test_upsert_artifact_head_ref_records_branch_head_state() -> None:
+    cx = _RecordingConnection()
+    store = PostgresArtifactStore(cx)
+
+    store.upsert_artifact_head_ref(
+        artifact_id="00000000-0000-0000-0000-000000000000",
+        ref="refs/heads/main",
+        head_object_id="obj-head-1",
+        head_commit_id="iac-main-1",
+    )
+
+    assert len(cx.calls) == 1
+    query, params = cx.calls[0]
+    assert "INSERT INTO ikam_artifact_branches" in query
+    assert "INSERT INTO ikam_artifact_commits" in query
+    assert "head_commit_id" in query
+    assert params == (
+        "00000000-0000-0000-0000-000000000000",
+        "iac-main-1",
+        '{"ref": null}',
+        '{"commit_id":"iac-main-1","head_object_id":"obj-head-1","ref":"refs/heads/main"}',
+        "iac-main-1",
+        "obj-head-1",
+        "00000000-0000-0000-0000-000000000000",
+        "00000000-0000-0000-0000-000000000000",
+        "main",
+        "iac-main-1",
+    )

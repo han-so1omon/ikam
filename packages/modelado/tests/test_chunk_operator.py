@@ -32,8 +32,8 @@ def test_chunk_operator_returns_grounded_chunks_per_document() -> None:
         name="parse.chunk",
         parameters={
             "artifact_id": "artifact://bundle",
-            "source_subgraph_ref": "hot://run-1/document_set/step-load",
-            "subgraph_ref": "hot://run-1/chunk_extraction_set/step-parse",
+            "source_subgraph_ref": "subgraph://run-1-document-set-step-load",
+            "subgraph_ref": "subgraph://run-1-chunk-extraction-set-step-parse",
             "documents": [
                 {
                     "id": "doc-1",
@@ -104,8 +104,8 @@ def test_chunk_operator_returns_grounded_chunks_per_document() -> None:
         },
     ]
     assert result["chunk_extraction_set"]["kind"] == "chunk_extraction_set"
-    assert result["chunk_extraction_set"]["source_subgraph_ref"] == "hot://run-1/document_set/step-load"
-    assert result["chunk_extraction_set"]["subgraph_ref"] == "hot://run-1/chunk_extraction_set/step-parse"
+    assert result["chunk_extraction_set"]["source_subgraph_ref"] == "subgraph://run-1-document-set-step-load"
+    assert result["chunk_extraction_set"]["subgraph_ref"] == "subgraph://run-1-chunk-extraction-set-step-parse"
     assert result["chunk_extraction_set"]["extraction_refs"] == result["fragment_ids"]
     assert result["chunk_extraction_set"]["extractions"][0]["cas_id"] == result["fragment_ids"][0]
     assert result["chunk_extraction_set"]["extractions"][0]["value"]["source_document_fragment_id"] == "frag-doc-1"
@@ -158,8 +158,8 @@ def test_chunk_operator_uses_llm_grounded_chunk_boundaries_when_available() -> N
         name="parse.chunk",
         parameters={
             "artifact_id": "artifact://bundle",
-            "source_subgraph_ref": "hot://run-1/document_set/step-load",
-            "subgraph_ref": "hot://run-1/chunk_extraction_set/step-parse",
+            "source_subgraph_ref": "subgraph://run-1-document-set-step-load",
+            "subgraph_ref": "subgraph://run-1-chunk-extraction-set-step-parse",
             "documents": [
                 {
                     "id": "doc-1",
@@ -192,8 +192,8 @@ def test_chunk_operator_emits_document_scoped_chunk_groupings() -> None:
         name="parse.chunk",
         parameters={
             "artifact_id": "artifact://bundle",
-            "source_subgraph_ref": "hot://run-1/document_set/step-load",
-            "subgraph_ref": "hot://run-1/chunk_extraction_set/step-parse",
+            "source_subgraph_ref": "subgraph://run-1-document-set-step-load",
+            "subgraph_ref": "subgraph://run-1-chunk-extraction-set-step-parse",
             "documents": [
                 {
                     "id": "doc-1",

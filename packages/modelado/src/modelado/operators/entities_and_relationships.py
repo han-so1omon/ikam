@@ -54,7 +54,7 @@ class EntitiesAndRelationshipsOperator(Operator):
         raw = params.parameters
         chunk_extraction_set = raw.get("chunk_extraction_set") if isinstance(raw.get("chunk_extraction_set"), dict) else {}
         source_subgraph_ref = str(chunk_extraction_set.get("subgraph_ref") or "")
-        subgraph_ref = str(raw.get("subgraph_ref") or f"{source_subgraph_ref}:entities")
+        subgraph_ref = str(raw.get("subgraph_ref") or _derived_subgraph_ref(source_subgraph_ref, suffix="entities"))
         chunk_extractions = (
             chunk_extraction_set.get("chunk_extractions") if isinstance(chunk_extraction_set.get("chunk_extractions"), list) else []
         )
@@ -124,3 +124,11 @@ class EntitiesAndRelationshipsOperator(Operator):
 
     def provenance(self, params: OperatorParams, env: OperatorEnv) -> ProvenanceRecord:
         return record_provenance(params, env)
+
+
+def _derived_subgraph_ref(source_subgraph_ref: str, *, suffix: str) -> str:
+    if not source_subgraph_ref:
+        return ""
+    if source_subgraph_ref.startswith("subgraph://"):
+        return f"{source_subgraph_ref}-{suffix}"
+    return f"{source_subgraph_ref}:{suffix}"

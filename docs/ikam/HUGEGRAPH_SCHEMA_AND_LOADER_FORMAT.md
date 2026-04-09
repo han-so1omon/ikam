@@ -39,6 +39,16 @@ The vertex `id` is the stable artifact id (i.e. `artifacts.id`).
 
 `edge_key` is used for idempotent replay and is derived from the Postgres event `idempotency_key` when present.
 
+### EdgeLabel: `value-at`
+
+- source/target labels are created by the projector for graph-native addressed
+  content
+- this is the first-class HugeGraph projection label for `graph:value_at`
+- it is not projected through `Derivation`
+
+The `value-at` family preserves addressed graph slot metadata so HugeGraph can
+query graph-native content without conflating it with derivation/provenance edges.
+
 ### Indexes
 
 HugeGraph rejects property filters without an index, so the projection creates minimal secondary indexes:
@@ -113,3 +123,17 @@ This is the same logic as the replay projector, expressed as a bulk-loadable sna
 
 - Local dev/backfills: replay via [scripts/hugegraph/replay_graph_edge_events.py](../../scripts/hugegraph/replay_graph_edge_events.py)
 - Always-on dev projection: `hugegraph-projection-worker` in `docker-compose.yml`
+
+## Read-Time Head Resolution
+
+The HugeGraph projection remains rebuildable from the Postgres log, but read-time
+callers may resolve locator-style references before they query the projected graph:
+
+- `artifact_head_ref` is a locator, not a raw persisted head id
+- shorthand locators resolve only against the current `EnvironmentScope.ref`
+- `head_object_id` is the canonical resolved artifact head target
+- artifact locators may lower to the selected head fragment before traversal or
+  inspection logic runs
+
+This keeps ref/head semantics in the runtime layer while leaving the projection
+replay model append-only and deterministic.

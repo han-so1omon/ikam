@@ -16,6 +16,7 @@ class _FakeHugeGraphClient:
     def __init__(self) -> None:
         self.created: list[tuple[str, dict[str, Any]]] = []
         self.edges: list[dict[str, Any]] = []
+        self.gremlin_queries: list[str] = []
 
     def schema_get(self, kind: str, name: str | None = None) -> Any:
         raise RuntimeError("not found")
@@ -50,6 +51,7 @@ class _FakeHugeGraphClient:
         return {"id": "edge-1"}
 
     def gremlin_query(self, gremlin: str) -> Any:
+        self.gremlin_queries.append(gremlin)
         return {"ok": True}
 
 
@@ -208,6 +210,125 @@ def test_projection_schema_and_replay_include_env_scope_properties(
     props = client.edges[0]["properties"]
     assert props["envType"] == "dev"
     assert props["envId"] == "run/123"
+
+
+def test_replay_projects_subtree_graph_delete_by_handle_and_path_prefix(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client = _FakeHugeGraphClient()
+    cx = _FakeConnection()
+
+    monkeypatch.setattr(
+        "modelado.hugegraph_projection.get_projection_checkpoint",
+        lambda *_args, **_kwargs: None,
+    )
+    monkeypatch.setattr(
+        "modelado.hugegraph_projection.set_projection_checkpoint",
+        lambda *_args, **_kwargs: None,
+    )
+
+    events = [
+        GraphEdgeEvent(
+            id=1,
+            project_id="p1",
+            op="upsert",
+            edge_label="graph:value_at",
+            out_id="graph-anchor:claim-set",
+            in_id="graph-value:claim-set",
+            properties={
+                "graphDeltaHandle": "claim-set",
+                "graphDeltaPath": ["claims", 0, "evidence"],
+            },
+            t=1,
+            idempotency_key="k1",
+        ),
+        GraphEdgeEvent(
+            id=2,
+            project_id="p1",
+            op="delete",
+            edge_label="graph:value_at",
+            out_id="graph-anchor:claim-set",
+            in_id="graph-value:claim-set",
+            properties={
+                "graphDeltaHandle": "claim-set",
+                "graphDeltaPath": ["claims", 0],
+                "graphDeltaExtent": "subtree",
+            },
+            t=2,
+            idempotency_key="k2",
+        ),
+    ]
+
+    def _list_events(*_args: Any, **kwargs: Any) -> list[GraphEdgeEvent]:
+        after_id = int(kwargs.get("after_id", 0))
+        if after_id >= 2:
+            return []
+        return events
+
+    monkeypatch.setattr("modelado.hugegraph_projection.list_graph_edge_events", _list_events)
+
+    replay_graph_edge_events_until_done(
+        cx,  # type: ignore[arg-type]
+        client=client,  # type: ignore[arg-type]
+        project_id="p1",
+    )
+
+    assert client.gremlin_queries, "expected subtree delete query"
+    gremlin = client.gremlin_queries[0]
+    assert "graphDeltaHandle', 'claim-set'" in gremlin
+    assert "graphDeltaPath" in gremlin
+    assert '[\"claims\",0' in gremlin
+
+
+def test_replay_maps_graph_value_at_to_first_class_edge_label(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client = _FakeHugeGraphClient()
+    cx = _FakeConnection()
+
+    monkeypatch.setattr(
+        "modelado.hugegraph_projection.get_projection_checkpoint",
+        lambda *_args, **_kwargs: None,
+    )
+    monkeypatch.setattr(
+        "modelado.hugegraph_projection.set_projection_checkpoint",
+        lambda *_args, **_kwargs: None,
+    )
+
+    events = [
+        GraphEdgeEvent(
+            id=1,
+            project_id="p1",
+            op="upsert",
+            edge_label="graph:value_at",
+            out_id="graph-anchor:claim-set",
+            in_id="graph-value:claim-set",
+            properties={
+                "graphDeltaHandle": "claim-set",
+                "graphDeltaPath": ["claims", 0],
+            },
+            t=1,
+            idempotency_key="k1",
+        )
+    ]
+
+    def _list_events(*_args: Any, **kwargs: Any) -> list[GraphEdgeEvent]:
+        after_id = int(kwargs.get("after_id", 0))
+        if after_id >= 1:
+            return []
+        return events
+
+    monkeypatch.setattr("modelado.hugegraph_projection.list_graph_edge_events", _list_events)
+
+    replay_graph_edge_events_until_done(
+        cx,  # type: ignore[arg-type]
+        client=client,  # type: ignore[arg-type]
+        project_id="p1",
+        edge_label_prefix="graph:",
+    )
+
+    assert client.edges, "expected projected graph value edge"
+    assert client.edges[0]["label"] == "value-at"
 
 
 @pytest.mark.anyio
