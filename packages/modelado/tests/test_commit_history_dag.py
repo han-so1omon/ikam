@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from modelado.environment_scope import EnvironmentScope
+from modelado.history.ref_head import build_ref_head
 from modelado.operators.commit import CommitOperator
 from modelado.operators.core import OperatorEnv, OperatorParams
 
@@ -90,3 +91,13 @@ def test_ref_heads_are_stored_per_ref_not_shared_blob() -> None:
     assert history["ref_heads"]["refs/heads/main"]["commit_id"] == main["commit_entry"]["id"]
     assert history["ref_heads"]["refs/heads/feature"]["commit_id"] == feature["commit_entry"]["id"]
     assert "heads" not in history
+
+
+def test_build_ref_head_supports_head_object_id_metadata() -> None:
+    ref_head = build_ref_head(ref="refs/heads/main", commit_id="commit-1", head_object_id="obj-head-1")
+
+    assert ref_head == {
+        "ref": "refs/heads/main",
+        "commit_id": "commit-1",
+        "head_object_id": "obj-head-1",
+    }

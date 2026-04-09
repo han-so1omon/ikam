@@ -2,10 +2,12 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import dataclass
+import json
 from typing import Any, Mapping, Optional
 
 import psycopg
 
+from modelado.graph_edge_event_folding import is_subtree_graph_delta_delete
 from modelado.graph_edge_event_log import GraphEdgeEvent, compute_edge_identity_key, list_graph_edge_events
 from modelado.hugegraph_client import HugeGraphClient, HugeGraphError
 
@@ -17,6 +19,7 @@ _EXPRESSION_VLABEL = "Expression"
 _STRUCTURED_DATA_VLABEL = "StructuredData"
 
 _DERIVATION_ELABEL = "Derivation"
+_VALUE_AT_ELABEL = "value-at"
 _ROOT_ELABEL = "root"
 _CONNECTION_ELABEL = "connection"
 _CALCULATES_ELABEL = "calculates"
@@ -80,6 +83,8 @@ def ensure_ikam_projection_schema(client: HugeGraphClient) -> None:
         ("project_id", "TEXT"),
         ("edge_key", "TEXT"),
         ("edge_label", "TEXT"),
+        ("graphDeltaHandle", "TEXT"),
+        ("graphDeltaPath", "TEXT"),
         ("envType", "TEXT"),
         ("envId", "TEXT"),
         ("t", "LONG"),
@@ -129,6 +134,8 @@ def ensure_ikam_projection_schema(client: HugeGraphClient) -> None:
                         "edge_key",
                         "project_id",
                         "edge_label",
+                        "graphDeltaHandle",
+                        "graphDeltaPath",
                         "envType",
                         "envId",
                         "t",
@@ -140,6 +147,8 @@ def ensure_ikam_projection_schema(client: HugeGraphClient) -> None:
                     "nullable_keys": [
                         "envType",
                         "envId",
+                        "graphDeltaHandle",
+                        "graphDeltaPath",
                         "derivation_id",
                         "derivation_type",
                         "confidence",
@@ -147,8 +156,9 @@ def ensure_ikam_projection_schema(client: HugeGraphClient) -> None:
                 },
             )
 
-    # Core Derivations
+    # Core Derivations and graph-native addressed content
     ensure_edge_label(_DERIVATION_ELABEL, _ARTIFACT_VLABEL, _ARTIFACT_VLABEL)
+    ensure_edge_label(_VALUE_AT_ELABEL, _STRUCTURED_DATA_VLABEL, _STRUCTURED_DATA_VLABEL)
     
     # Fragment Tree
     ensure_edge_label(_ROOT_ELABEL, _ARTIFACT_VLABEL, _FRAGMENT_VLABEL)
@@ -181,7 +191,7 @@ def ensure_ikam_projection_schema(client: HugeGraphClient) -> None:
             raise
 
     # Secondary indexes for projection management
-    for elabel in [_DERIVATION_ELABEL, _ROOT_ELABEL, _CONNECTION_ELABEL]:
+    for elabel in [_DERIVATION_ELABEL, _VALUE_AT_ELABEL, _ROOT_ELABEL, _CONNECTION_ELABEL]:
         ensure_index_label(f"{elabel}_by_edge_key", elabel, "EDGE", "edge_key")
         ensure_index_label(f"{elabel}_by_project_id", elabel, "EDGE", "project_id")
 
@@ -233,6 +243,18 @@ def _edge_key_for_event(e: GraphEdgeEvent) -> str:
         out_id=e.out_id,
         in_id=e.in_id,
         properties=e.properties,
+    )
+
+
+def _subtree_delete_gremlin(*, project_id: str, event: GraphEdgeEvent) -> str:
+    handle = str(event.properties["graphDeltaHandle"])
+    path = json.dumps(event.properties["graphDeltaPath"], separators=(",", ":"), ensure_ascii=False)
+    descendant_prefix = f"{path[:-1]},"
+    return (
+        f"g.E().has('project_id', '{project_id}')"
+        f".has('graphDeltaHandle', '{handle}')"
+        f".or(__.has('graphDeltaPath', '{path}'),__.has('graphDeltaPath', org.apache.tinkerpop.gremlin.process.traversal.TextP.startingWith('{descendant_prefix}')))"
+        ".drop()"
     )
 
 
@@ -290,6 +312,8 @@ def _ensure_vertex(client: HugeGraphClient, *, id: str, project_id: str, propert
 
 
 def _infer_elabel(edge_label: str) -> str:
+    if edge_label == "graph:value_at":
+        return _VALUE_AT_ELABEL
     if edge_label.startswith("derivation:"):
         return _DERIVATION_ELABEL
     if edge_label == "root":
@@ -343,8 +367,11 @@ def replay_graph_edge_events_until_done(
                 continue
 
             if e.op == "delete":
-                # Best effort delete by Gremlin for now as it handles complex properties well
-                gremlin = f"g.E().has('project_id', '{project_id}').has('edge_key', '{edge_key}').drop()"
+                if is_subtree_graph_delta_delete(e):
+                    gremlin = _subtree_delete_gremlin(project_id=project_id, event=e)
+                else:
+                    # Best effort delete by Gremlin for now as it handles complex properties well
+                    gremlin = f"g.E().has('project_id', '{project_id}').has('edge_key', '{edge_key}').drop()"
                 client.gremlin_query(gremlin)
             else:
                 out_v_props = dict(e.properties.get("out_properties") or {})
@@ -365,6 +392,12 @@ def replay_graph_edge_events_until_done(
                     val = e.properties.get(key)
                     if val is not None:
                         props[key] = val
+                if e.properties.get("graphDeltaHandle") is not None:
+                    props["graphDeltaHandle"] = e.properties["graphDeltaHandle"]
+                if e.properties.get("graphDeltaPath") is not None:
+                    props["graphDeltaPath"] = json.dumps(
+                        e.properties["graphDeltaPath"], separators=(",", ":"), ensure_ascii=False
+                    )
                 for key in ["envType", "envId"]:
                     val = e.properties.get(key)
                     if val is not None:

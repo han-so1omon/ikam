@@ -90,6 +90,55 @@ def test_fold_multiple_edges_independent() -> None:
     assert remaining_key in effective
 
 
+def test_fold_subtree_delete_removes_descendant_graph_contains_edges() -> None:
+    events = [
+        _e(
+            event_id=1,
+            op="upsert",
+            edge_label="graph:value_at",
+            out_id="graph-anchor:claim-set",
+            in_id="graph-value:claim-set",
+            properties={
+                "derivationId": "graph-delta:p:claim-set:[\"claims\",0]",
+                "graphDeltaHandle": "claim-set",
+                "graphDeltaPath": ["claims", 0],
+                "graphDeltaValue": {"kind": "claim"},
+            },
+            t=1,
+        ),
+        _e(
+            event_id=2,
+            op="upsert",
+            edge_label="graph:value_at",
+            out_id="graph-anchor:claim-set",
+            in_id="graph-value:claim-set",
+            properties={
+                "derivationId": "graph-delta:p:claim-set:[\"claims\",0,\"evidence\"]",
+                "graphDeltaHandle": "claim-set",
+                "graphDeltaPath": ["claims", 0, "evidence"],
+                "graphDeltaValue": {"kind": "evidence"},
+            },
+            t=2,
+        ),
+        _e(
+            event_id=3,
+            op="delete",
+            edge_label="graph:value_at",
+            out_id="graph-anchor:claim-set",
+            in_id="graph-value:claim-set",
+            properties={
+                "derivationId": "graph-delta:p:claim-set:[\"claims\",0]",
+                "graphDeltaHandle": "claim-set",
+                "graphDeltaPath": ["claims", 0],
+                "graphDeltaExtent": "subtree",
+            },
+            t=3,
+        ),
+    ]
+
+    assert fold_effective_edges(events) == {}
+
+
 def test_relation_commit_receipt_id_is_deterministic_order_independent() -> None:
     first = compute_relation_commit_receipt_id(
         project_id="p1",

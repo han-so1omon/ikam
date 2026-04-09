@@ -3,7 +3,7 @@ from __future__ import annotations
 from interacciones.schemas import ExecutorDeclaration, RichPetriWorkflow, SourceWorkflowStorageMode
 from ikam.ir.core import EvidenceRef, EvidenceRole, PropositionIR, StructuredDataIR
 
-from .ir import LoweredExecutableGraph
+from .ir import LoweredExecutableGraph, TranslatorPlan, TranslatorPlanBoundary
 from .lowering_petri import lower_rich_petri_transition
 
 
@@ -23,11 +23,13 @@ class GraphCompiler:
             else ExecutorDeclaration.model_validate(declaration)
             for declaration in (executor_declarations or [])
         ]
+        translator_plans = _build_translator_plans(validated_workflow)
         operators = [
             lower_rich_petri_transition(
                 workflow_id=validated_workflow.workflow_id,
                 version=validated_workflow.version,
                 transition=transition,
+                translator_plan=translator_plans[transition.transition_id],
                 executor_declarations=validated_declarations,
             )
             for transition in validated_workflow.transitions
@@ -43,9 +45,13 @@ class GraphCompiler:
                 "operator_fragment_ids": [operator.fragment_id for operator in operators],
                 "arc_count": len(validated_workflow.arcs),
                 "reconstructable_from_rich_petri": True,
+                "reconstructable_from_lowered_graph": validated_workflow.source_workflow_storage.reconstructable_from_lowered_graph,
                 "rich_petri_snapshot": validated_workflow.model_dump(mode="json"),
                 "source_workflow_storage_mode": validated_workflow.source_workflow_storage.mode.value,
                 "executor_declaration_ids": [declaration.executor_id for declaration in validated_declarations],
+                "translator_plans": {
+                    transition_id: plan.model_dump(mode="json") for transition_id, plan in translator_plans.items()
+                },
                 "support_inputs": dict(support_inputs or {}),
                 "publish": [target.model_dump(mode="json") for target in validated_workflow.publish],
             },
@@ -98,3 +104,27 @@ class GraphCompiler:
             source_workflow=source_workflow,
             source_graph_link=source_graph_link,
         )
+
+
+def _build_translator_plans(workflow: RichPetriWorkflow) -> dict[str, TranslatorPlan]:
+    nodes = workflow.source_workflow_definition.nodes if workflow.source_workflow_definition else []
+    nodes_by_id = {node.node_id: node for node in nodes}
+    translator_plans: dict[str, TranslatorPlan] = {}
+    for transition in workflow.transitions:
+        node = nodes_by_id.get(transition.transition_id)
+        if node is None and transition.transition_id.startswith("transition:"):
+            node = nodes_by_id.get(transition.transition_id.split(":", 1)[1])
+        if node is None:
+            translator_plans[transition.transition_id] = TranslatorPlan()
+            continue
+        translator_plans[transition.transition_id] = TranslatorPlan(
+            input=[
+                TranslatorPlanBoundary(name=boundary.name, mime_type=boundary.mime_type)
+                for boundary in node.boundaries.input
+            ],
+            output=[
+                TranslatorPlanBoundary(name=boundary.name, mime_type=boundary.mime_type)
+                for boundary in node.boundaries.output
+            ],
+        )
+    return translator_plans

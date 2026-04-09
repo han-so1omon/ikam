@@ -4,6 +4,17 @@ from ikam.ir.mime_types import (
     FORMULA_CELL, VALUE_CELL, TABLE_REGION, SLIDE_SHAPE, PDF_PAGE,
     EXPRESSION_IR, CLAIM_IR, TABLE_IR, STYLE_IR,
     RECONSTRUCTION_PROGRAM, VERIFICATION_RESULT,
+    GRAPH_SLICE_MIME, GRAPH_DELTA_MIME,
+)
+from ikam.ir.graph_native import (
+    ATOMIC_GRAPH_APPLY_MODE,
+    GraphAnchor,
+    GraphRegion,
+    IKAMGraphDelta,
+    IKAMGraphDeltaOp,
+    IKAMGraphSlice,
+    RemoveGraphDeltaOp,
+    UpsertGraphDeltaOp,
 )
 from ikam.ir.protocols import Lifter, Renderer, Canonicalizer, FragmentEmbedder
 from ikam.ir.core import (
@@ -49,6 +60,12 @@ __all__ = [
     "FORMULA_CELL", "VALUE_CELL", "TABLE_REGION", "SLIDE_SHAPE", "PDF_PAGE",
     "EXPRESSION_IR", "CLAIM_IR", "TABLE_IR", "STYLE_IR",
     "RECONSTRUCTION_PROGRAM", "VERIFICATION_RESULT",
+    "GRAPH_SLICE_MIME", "GRAPH_DELTA_MIME",
+    # Graph-native contracts
+    "ATOMIC_GRAPH_APPLY_MODE",
+    "GraphAnchor", "GraphRegion",
+    "UpsertGraphDeltaOp", "RemoveGraphDeltaOp", "IKAMGraphDeltaOp",
+    "IKAMGraphSlice", "IKAMGraphDelta",
     # Protocols
     "Lifter", "Renderer", "Canonicalizer", "FragmentEmbedder",
     # Utilities

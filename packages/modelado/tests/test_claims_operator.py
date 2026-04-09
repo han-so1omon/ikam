@@ -18,8 +18,8 @@ def test_claims_operator_returns_claim_rows_with_entity_relationship_provenance(
         parameters={
             "entity_relationship_set": {
                 "kind": "entity_relationship_set",
-                "source_subgraph_ref": "hot://run-1/chunk_extraction_set/parse-chunk",
-                "subgraph_ref": "hot://run-1/entity_relationship_set/parse-entities",
+                "source_subgraph_ref": "subgraph://run-1-chunk-extraction-set-parse-chunk",
+                "subgraph_ref": "subgraph://run-1-entity-relationship-set-parse-entities",
                 "entity_relationship_refs": ["frag-ir-1", "frag-ir-2"],
                 "entity_relationships": [
                     {
@@ -85,8 +85,8 @@ def test_claims_operator_returns_claim_rows_with_entity_relationship_provenance(
     assert len(result["fragment_ids"]) == 3
     assert result["claim_set"] == {
         "kind": "claim_set",
-        "source_subgraph_ref": "hot://run-1/chunk_extraction_set/parse-chunk",
-        "subgraph_ref": "hot://run-1/chunk_extraction_set/parse-chunk:claims",
+        "source_subgraph_ref": "subgraph://run-1-chunk-extraction-set-parse-chunk",
+        "subgraph_ref": "subgraph://run-1-chunk-extraction-set-parse-chunk-claims",
         "claim_refs": result["fragment_ids"],
         "claims": result["claim_set"]["claims"],
     }
