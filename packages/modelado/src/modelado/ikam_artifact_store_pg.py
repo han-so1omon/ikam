@@ -136,13 +136,7 @@ class PostgresArtifactStore:
             """
             INSERT INTO ikam_artifact_commits (artifact_id, id, base_ref, result_ref, delta_hash, view_hash, staged_artifact_id)
             VALUES (%s::uuid, %s, %s::jsonb, %s::jsonb, %s, %s, %s::uuid)
-            ON CONFLICT (id) DO NOTHING;
-
-            INSERT INTO ikam_artifact_branches (artifact_id, name, head_commit_id, status, created_at, updated_at)
-            VALUES (%s::uuid, %s, %s, 'open', now(), now())
-            ON CONFLICT (artifact_id, name) DO UPDATE
-            SET head_commit_id = EXCLUDED.head_commit_id,
-                updated_at = now()
+            ON CONFLICT (id) DO NOTHING
             """,
             (
                 artifact_id,
@@ -152,10 +146,17 @@ class PostgresArtifactStore:
                 head_commit_id,
                 head_object_id,
                 artifact_id,
-                artifact_id,
-                branch_name,
-                head_commit_id,
             ),
+        )
+        self._cx.execute(
+            """
+            INSERT INTO ikam_artifact_branches (artifact_id, name, head_commit_id, status, created_at, updated_at)
+            VALUES (%s::uuid, %s, %s, 'open', now(), now())
+            ON CONFLICT (artifact_id, name) DO UPDATE
+            SET head_commit_id = EXCLUDED.head_commit_id,
+                updated_at = now()
+            """,
+            (artifact_id, branch_name, head_commit_id),
         )
 
     def _insert_fragment_object(
