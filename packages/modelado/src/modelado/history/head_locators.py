@@ -98,24 +98,7 @@ def resolve_locator_identity(raw: str, *, fallback_kind: str) -> tuple[str, str]
 
 
 def resolve_artifact_head(raw: str, *, env_scope: EnvironmentScope, cx: object) -> ResolvedArtifactHead:
-    locator = resolve_head_locator(raw, env_scope=env_scope)
-    if locator.kind != "artifact" or locator.ref is None:
-        raise ValueError("artifact head locator required")
-    row = cx.execute(
-        """
-        SELECT id, head_object_id
-          FROM ikam_artifacts
-         WHERE id = %s
-        """,
-        (locator.semantic_id,),
-    ).fetchone()
-    if not row:
-        raise LookupError(f"No artifact head for {locator.semantic_id} in {locator.ref}")
-    return ResolvedArtifactHead(
-        semantic_id=str(row["id"]),
-        ref=str(locator.ref),
-        head_object_id=str(row["head_object_id"]),
-    )
+    return resolve_ref_scoped_artifact_head(raw, env_scope=env_scope, cx=cx)
 
 
 def resolve_ref_scoped_artifact_head(raw: str, *, env_scope: EnvironmentScope, cx: object) -> ResolvedArtifactHead:

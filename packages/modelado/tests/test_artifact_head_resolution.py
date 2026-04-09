@@ -19,17 +19,6 @@ class _FakeCursorResult:
         return self._row
 
 
-class _FakeConnection:
-    def __init__(self, rows: dict[str, dict[str, object] | None]) -> None:
-        self.rows = rows
-        self.calls: list[tuple[str, tuple[object, ...]]] = []
-
-    def execute(self, query: str, params: tuple[object, ...]):
-        self.calls.append((query, params))
-        artifact_id = params[0]
-        return _FakeCursorResult(self.rows.get(str(artifact_id)))
-
-
 class _FakeBranchConnection:
     def __init__(self, rows: dict[tuple[str, str], dict[str, object] | None], commits: dict[str, dict[str, object] | None]) -> None:
         self.rows = rows
@@ -61,16 +50,25 @@ class _FakeBranchConnection:
         return _FakeCursorResult(commit)
 
 
-def test_resolve_artifact_head_returns_head_object_id() -> None:
+def test_resolve_artifact_head_returns_ref_scoped_head_object_id() -> None:
     from modelado.history.head_locators import resolve_artifact_head
 
-    cx = _FakeConnection(
+    cx = _FakeBranchConnection(
         {
-            "artifact-semantic-1": {
-                "id": "artifact-semantic-1",
-                "head_object_id": "obj-head-1",
+            ("artifact-semantic-1", "main"): {
+                "artifact_id": "artifact-semantic-1",
+                "branch_name": "main",
+                "head_commit_id": "iac-main",
             }
-        }
+        },
+        {
+            "iac-main": {
+                "id": "iac-main",
+                "artifact_id": "artifact-semantic-1",
+                "branch_name": "main",
+                "result_ref": {"ref": "refs/heads/main", "head_object_id": "obj-main-head"},
+            }
+        },
     )
 
     resolved = resolve_artifact_head(
@@ -81,14 +79,15 @@ def test_resolve_artifact_head_returns_head_object_id() -> None:
 
     assert resolved.semantic_id == "artifact-semantic-1"
     assert resolved.ref == "refs/heads/main"
-    assert resolved.head_object_id == "obj-head-1"
-    assert "FROM ikam_artifacts" in cx.calls[0][0]
+    assert resolved.head_object_id == "obj-main-head"
+    assert resolved.head_commit_id == "iac-main"
+    assert "FROM ikam_artifact_branches" in cx.calls[0][0]
 
 
 def test_artifact_shorthand_locator_fails_when_current_ref_has_no_head() -> None:
     from modelado.history.head_locators import resolve_artifact_head
 
-    cx = _FakeConnection({})
+    cx = _FakeBranchConnection({}, {})
 
     with pytest.raises(LookupError):
         resolve_artifact_head(
