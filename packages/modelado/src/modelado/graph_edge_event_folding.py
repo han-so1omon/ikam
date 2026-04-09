@@ -35,6 +35,9 @@ def fold_effective_edges(events: Iterable[GraphEdgeEvent]) -> dict[str, Effectiv
         )
 
         if e.op == "delete":
+            if is_subtree_graph_delta_delete(e):
+                delete_matching_subtree_edges(effective, e)
+                continue
             effective.pop(edge_key, None)
             continue
 
@@ -49,3 +52,40 @@ def fold_effective_edges(events: Iterable[GraphEdgeEvent]) -> dict[str, Effectiv
         )
 
     return effective
+
+
+def is_subtree_graph_delta_delete(event: GraphEdgeEvent) -> bool:
+    return (
+        event.op == "delete"
+        and event.edge_label == "graph:value_at"
+        and event.properties.get("graphDeltaExtent") == "subtree"
+        and isinstance(event.properties.get("graphDeltaHandle"), str)
+        and isinstance(event.properties.get("graphDeltaPath"), list)
+    )
+
+
+def delete_matching_subtree_edges(effective: dict[str, Any], event: GraphEdgeEvent) -> None:
+    handle = event.properties.get("graphDeltaHandle")
+    path = event.properties.get("graphDeltaPath")
+    if not isinstance(handle, str) or not isinstance(path, list):
+        return
+    prefix = tuple(path)
+    keys_to_delete = [
+        edge_key
+        for edge_key, edge in effective.items()
+        if _matches_graph_delta_subtree(edge, handle=handle, prefix=prefix)
+    ]
+    for edge_key in keys_to_delete:
+        effective.pop(edge_key, None)
+
+
+def _matches_graph_delta_subtree(edge: Any, *, handle: str, prefix: tuple[Any, ...]) -> bool:
+    properties = getattr(edge, "properties", None)
+    if not isinstance(properties, dict):
+        return False
+    if properties.get("graphDeltaHandle") != handle:
+        return False
+    path = properties.get("graphDeltaPath")
+    if not isinstance(path, list):
+        return False
+    return tuple(path[: len(prefix)]) == prefix

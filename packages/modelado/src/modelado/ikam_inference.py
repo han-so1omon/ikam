@@ -24,6 +24,8 @@ except ImportError:  # pragma: no cover
     psycopg = None  # type: ignore
 
 from ikam.graph import StoredFragment
+from modelado.environment_scope import EnvironmentScope
+from modelado.history.head_locators import ResolvedGraphTarget, resolve_graph_target_input
 
 
 def _row_value(row: Any, key: str, idx: int) -> Any:
@@ -45,25 +47,84 @@ def _infer_project_id(cx: psycopg.Connection[Any], artifact_id: str) -> str | No
     if isinstance(pid, str) and pid:
         return pid
 
-    row = cx.execute(
+    row = _execute_fetchone(
+        cx,
         "SELECT project_id FROM artifacts WHERE id = %s",
         (artifact_id,),
-    ).fetchone()
+    )
+    if row is None:
+        row = _execute_fetchone(
+            cx,
+            "SELECT project_id FROM ikam_artifacts WHERE id = %s::uuid",
+            (artifact_id,),
+        )
     project_id = _row_value(row, "project_id", 0)
     if project_id:
         return str(project_id)
 
     # Last resort: infer from any edge event involving the artifact.
-    row = cx.execute(
+    row = _execute_fetchone(
+        cx,
         """
         SELECT project_id
           FROM graph_edge_events
          WHERE in_id = %s OR out_id = %s
-         ORDER BY id DESC
-         LIMIT 1
+          ORDER BY id DESC
+          LIMIT 1
         """,
         (artifact_id, artifact_id),
-    ).fetchone()
+    )
+    project_id = _row_value(row, "project_id", 0)
+    if project_id:
+        return str(project_id)
+    return None
+
+
+def _execute_fetchone(cx: psycopg.Connection[Any], query: str, params: tuple[Any, ...]) -> Any:
+    try:
+        return cx.execute(query, params).fetchone()
+    except Exception:
+        return None
+
+
+def _infer_project_id_for_fragment(cx: psycopg.Connection[Any], fragment_id: str) -> str | None:
+    row = _execute_fetchone(
+        cx,
+        """
+        SELECT a.project_id
+          FROM ikam_artifact_fragments af
+          JOIN artifacts a ON a.id = af.artifact_id
+         WHERE fragment_id = %s
+         LIMIT 1
+        """,
+        (fragment_id,),
+    )
+    if row is None:
+        row = _execute_fetchone(
+            cx,
+            """
+            SELECT a.project_id
+              FROM ikam_artifact_fragments af
+              JOIN ikam_artifacts a ON a.id = af.artifact_id
+             WHERE fragment_id = %s
+             LIMIT 1
+            """,
+            (fragment_id,),
+        )
+    project_id = _row_value(row, "project_id", 0)
+    if project_id:
+        return str(project_id)
+    row = _execute_fetchone(
+        cx,
+        """
+        SELECT project_id
+          FROM graph_edge_events
+         WHERE in_id = %s OR out_id = %s
+          ORDER BY id DESC
+          LIMIT 1
+        """,
+        (fragment_id, fragment_id),
+    )
     project_id = _row_value(row, "project_id", 0)
     if project_id:
         return str(project_id)
@@ -121,13 +182,13 @@ def _fetch_effective_derivation_edges(
 
 @dataclass
 class FragmentCompletionSuggestion:
-    """Suggested fragment to complete an artifact based on provenance patterns.
+    """Suggested fragment to complete a graph target based on provenance patterns.
     
     Attributes:
         fragment_id: Suggested fragment CAS ID
         confidence: 0.0-1.0 confidence score based on provenance evidence
         reasoning: Human-readable explanation for the suggestion
-        provenance_support: List of artifact IDs that support this suggestion
+        provenance_support: List of graph target ids that support this suggestion
         fisher_info_delta: Expected Fisher information increase (≥0)
     """
     
@@ -140,10 +201,10 @@ class FragmentCompletionSuggestion:
 
 @dataclass
 class VariationSuggestion:
-    """Suggested variation/delta to apply to an artifact.
+    """Suggested variation/delta to apply to a resolved target.
     
     Attributes:
-        base_artifact_id: Artifact to vary
+        target_ref: Canonical explicit target reference
         suggested_delta: Proposed delta/patch operation
         confidence: 0.0-1.0 confidence based on similar derivation patterns
         reasoning: Explanation of why this variation makes sense
@@ -151,7 +212,7 @@ class VariationSuggestion:
         fisher_info_delta: Expected Fisher information increase (≥0)
     """
     
-    base_artifact_id: str
+    target_ref: str
     suggested_delta: dict[str, Any]  # Structured delta operation
     confidence: float
     reasoning: str
@@ -182,21 +243,29 @@ class CoalescingSuggestion:
 
 def suggest_fragment_completion(
     cx: psycopg.Connection[Any],
-    artifact_id: str,
+    artifact_id: str | None = None,
+    *,
+    target_ref: str | None = None,
+    env_scope: EnvironmentScope | None = None,
     context_window: int = 5,
     min_confidence: float = 0.5,
 ) -> list[FragmentCompletionSuggestion]:
-    """Suggest fragments to complete an artifact based on provenance patterns.
-    
-    Uses provenance graph to find artifacts derived from similar sources and suggests
-    their fragments as potential completions. Confidence increases with:
+    """Suggest fragments to complete a resolved graph target.
+
+    Uses provenance graph to find similar downstream targets and suggest fragment
+    completions. Callers may pass a raw artifact id, an artifact locator, or a
+    fragment locator via `target_ref`.
+
+    Confidence increases with:
     - Number of similar derivation paths
     - Depth of shared provenance
     - Fragment reuse count across artifacts
     
     Args:
         cx: Database connection
-        artifact_id: Target artifact to suggest completions for
+        artifact_id: Backward-compatible artifact id entrypoint
+        target_ref: Canonical artifact or fragment locator
+        env_scope: Current ref used for shorthand locator resolution
         context_window: How many derivation steps to look back
         min_confidence: Minimum confidence threshold (0.0-1.0)
         
@@ -205,31 +274,37 @@ def suggest_fragment_completion(
         
     Mathematical Guarantee:
         Adding suggested fragments increases Fisher information:
-        I(θ | artifact + suggestions) ≥ I(θ | artifact)
+        I(θ | target + suggestions) ≥ I(θ | target)
     """
-    # Require a project scope for provenance-based inference.
-    project_id = _infer_project_id(cx, artifact_id)
+    target = resolve_graph_target_input(artifact_id=artifact_id, target_ref=target_ref, env_scope=env_scope, cx=cx)
+    if target is None:
+        return []
+
+    project_id = _infer_project_id_for_target(cx, target)
     if not project_id:
         return []
 
-    # Fetch target fragments.
-    try:
-        target_uuid = uuid.UUID(artifact_id)
-    except Exception:
-        return []
-
-    target_frags = {
-        str(_row_value(r, "fragment_id", 0))
-        for r in cx.execute(
-            "SELECT fragment_id FROM ikam_artifact_fragments WHERE artifact_id = %s",
-            (target_uuid,),
-        ).fetchall()
-    }
+    if target.kind == "fragment":
+        target_frags = {target.target_id}
+        root_node = target.target_id
+    else:
+        try:
+            target_uuid = uuid.UUID(target.target_id)
+        except Exception:
+            return []
+        target_frags = {
+            str(_row_value(r, "fragment_id", 0))
+            for r in cx.execute(
+                "SELECT fragment_id FROM ikam_artifact_fragments WHERE artifact_id = %s",
+                (target_uuid,),
+            ).fetchall()
+        }
+        root_node = target.target_id
 
     # Collect ancestors up to context_window steps.
     ancestors: set[str] = set()
-    visited: set[str] = {artifact_id}
-    frontier: list[str] = [artifact_id]
+    visited: set[str] = {root_node}
+    frontier: list[str] = [root_node]
     for _ in range(max(0, int(context_window))):
         edges = _fetch_effective_derivation_edges(cx, project_id=project_id, direction="IN", node_ids=frontier)
         parents = sorted({e["out_id"] for e in edges if e.get("out_id")})
@@ -249,34 +324,14 @@ def suggest_fragment_completion(
         outgoing = _fetch_effective_derivation_edges(cx, project_id=project_id, direction="OUT", node_ids=[anc])
         for e in outgoing:
             tid = e.get("in_id")
-            if not tid or tid == artifact_id:
+            if not tid or tid == root_node:
                 continue
             shared_ancestors_by_artifact[tid] = shared_ancestors_by_artifact.get(tid, 0) + 1
 
     if not shared_ancestors_by_artifact:
         return []
 
-    similar_artifacts = list(shared_ancestors_by_artifact.keys())
-    similar_uuids: list[uuid.UUID] = []
-    for aid in similar_artifacts:
-        try:
-            similar_uuids.append(uuid.UUID(aid))
-        except Exception:
-            continue
-    if not similar_uuids:
-        return []
-
-    rows = cx.execute(
-        """
-        SELECT fragment_id,
-               COUNT(DISTINCT artifact_id) AS reuse_count,
-               array_agg(DISTINCT artifact_id::text) AS supporting_artifacts
-          FROM ikam_artifact_fragments
-         WHERE artifact_id = ANY(%s)
-         GROUP BY fragment_id
-        """,
-        (similar_uuids,),
-    ).fetchall()
+    rows = _load_completion_candidate_rows(cx, target=target, shared_ancestors_by_artifact=shared_ancestors_by_artifact)
 
     suggestions: list[FragmentCompletionSuggestion] = []
     for row in rows:
@@ -284,8 +339,12 @@ def suggest_fragment_completion(
         if frag_id in target_frags:
             continue
         reuse = int((_row_value(row, "reuse_count", 1) or 0))
-        support_artifacts = [str(x) for x in ((_row_value(row, "supporting_artifacts", 2) or []))]
-        shared_anc = sum(shared_ancestors_by_artifact.get(aid, 0) for aid in support_artifacts)
+        support_targets = _normalize_completion_support_targets(
+            cx,
+            target=target,
+            support_values=[str(x) for x in ((_row_value(row, "supporting_artifacts", 2) or []))],
+        )
+        shared_anc = sum(shared_ancestors_by_artifact.get(target_id, 0) for target_id in support_targets)
         conf = min(1.0, shared_anc * 0.3 + reuse * 0.1)
         if conf < float(min_confidence):
             continue
@@ -294,8 +353,8 @@ def suggest_fragment_completion(
             FragmentCompletionSuggestion(
                 fragment_id=frag_id,
                 confidence=float(conf),
-                reasoning=f"Found in {reuse} similar artifact(s) with shared provenance",
-                provenance_support=support_artifacts,
+                reasoning=f"Found in {reuse} similar target(s) with shared provenance",
+                provenance_support=support_targets,
                 fisher_info_delta=float(fisher_delta),
             )
         )
@@ -306,48 +365,64 @@ def suggest_fragment_completion(
 
 def suggest_variation(
     cx: psycopg.Connection[Any],
-    base_artifact_id: str,
+    base_artifact_id: str | None = None,
+    *,
+    target_ref: str | None = None,
+    env_scope: EnvironmentScope | None = None,
     derivation_type: str = "delta",
     min_confidence: float = 0.6,
 ) -> list[VariationSuggestion]:
-    """Suggest likely variation/delta parameters for an artifact.
+    """Suggest likely variation/delta parameters for a resolved target.
 
-    Learns recurring derivation parameter patterns from artifacts with overlapping
-    fragments, scoped to the artifact's project.
+    Learns recurring derivation parameter patterns from overlapping artifacts or
+    fragment targets, scoped to the resolved target's project.
     """
-    project_id = _infer_project_id(cx, base_artifact_id)
+    target = resolve_graph_target_input(artifact_id=base_artifact_id, target_ref=target_ref, env_scope=env_scope, cx=cx)
+    if target is None:
+        return []
+
+    project_id = _infer_project_id_for_target(cx, target)
     if not project_id:
         return []
 
-    try:
-        base_uuid = uuid.UUID(base_artifact_id)
-    except Exception:
-        return []
-
-    base_frags = [
-        str(_row_value(r, "fragment_id", 0))
-        for r in cx.execute(
-            "SELECT fragment_id FROM ikam_artifact_fragments WHERE artifact_id = %s",
-            (base_uuid,),
+    if target.kind == "fragment":
+        base_frags = [target.target_id]
+        rows = cx.execute(
+            """
+            SELECT artifact_id::text AS artifact_id,
+                   1.0 AS similarity_ratio
+              FROM ikam_artifact_fragments
+             WHERE fragment_id = %s
+            """,
+            (target.target_id,),
         ).fetchall()
-    ]
+    else:
+        try:
+            base_uuid = uuid.UUID(target.target_id)
+        except Exception:
+            return []
+        base_frags = [
+            str(_row_value(r, "fragment_id", 0))
+            for r in cx.execute(
+                "SELECT fragment_id FROM ikam_artifact_fragments WHERE artifact_id = %s",
+                (base_uuid,),
+            ).fetchall()
+        ]
+        base_count = len(base_frags)
+        rows = cx.execute(
+            """
+            SELECT artifact_id::text AS artifact_id,
+                   COUNT(*)::float / %s::float AS similarity_ratio
+              FROM ikam_artifact_fragments
+             WHERE fragment_id = ANY(%s)
+               AND artifact_id <> %s
+             GROUP BY artifact_id
+            HAVING COUNT(*)::float / %s::float > 0.3
+            """,
+            (base_count, base_frags, base_uuid, base_count),
+        ).fetchall()
     if not base_frags:
         return []
-    base_count = len(base_frags)
-
-    # Find artifacts with >=30% fragment overlap.
-    rows = cx.execute(
-        """
-        SELECT artifact_id::text AS artifact_id,
-               COUNT(*)::float / %s::float AS similarity_ratio
-          FROM ikam_artifact_fragments
-         WHERE fragment_id = ANY(%s)
-           AND artifact_id <> %s
-         GROUP BY artifact_id
-        HAVING COUNT(*)::float / %s::float > 0.3
-        """,
-        (base_count, base_frags, base_uuid, base_count),
-    ).fetchall()
 
     similar_sources: list[tuple[str, float]] = [
         (str(_row_value(r, "artifact_id", 0)), float(_row_value(r, "similarity_ratio", 1))) for r in rows
@@ -389,7 +464,7 @@ def suggest_variation(
         fisher_delta = 0.05 * freq
         suggestions.append(
             VariationSuggestion(
-                base_artifact_id=base_artifact_id,
+                target_ref=target.target_ref,
                 suggested_delta=dict(entry["params"]),
                 confidence=float(conf),
                 reasoning=f"Pattern seen {freq} time(s) in similar artifacts (avg similarity {avg_sim:.2f})",
@@ -537,3 +612,80 @@ def validate_fisher_information_increase(
     # TODO: Implement actual Fisher information computation
     # See docs/ikam/FISHER_INFORMATION_GAINS.md for mathematical details
     return expected_delta >= 0.0
+
+
+def _infer_project_id_for_target(cx: psycopg.Connection[Any], target: ResolvedGraphTarget) -> str | None:
+    if target.kind == "fragment":
+        return _infer_project_id_for_fragment(cx, target.target_id)
+    return _infer_project_id(cx, target.target_id)
+
+
+def _load_completion_candidate_rows(
+    cx: psycopg.Connection[Any],
+    *,
+    target: ResolvedGraphTarget,
+    shared_ancestors_by_artifact: dict[str, int],
+) -> list[Any]:
+    if target.kind == "fragment":
+        fragment_ids = list(shared_ancestors_by_artifact.keys())
+        return cx.execute(
+            """
+            SELECT fragment_id,
+                   COUNT(DISTINCT artifact_id) AS reuse_count,
+                   array_agg(DISTINCT artifact_id::text) AS supporting_artifacts
+              FROM ikam_artifact_fragments
+             WHERE fragment_id = ANY(%s)
+             GROUP BY fragment_id
+            """,
+            (fragment_ids,),
+        ).fetchall()
+
+    similar_artifacts = list(shared_ancestors_by_artifact.keys())
+    similar_uuids: list[uuid.UUID] = []
+    for aid in similar_artifacts:
+        try:
+            similar_uuids.append(uuid.UUID(aid))
+        except Exception:
+            continue
+    if not similar_uuids:
+        return []
+    return cx.execute(
+        """
+        SELECT fragment_id,
+               COUNT(DISTINCT artifact_id) AS reuse_count,
+               array_agg(DISTINCT artifact_id::text) AS supporting_artifacts
+          FROM ikam_artifact_fragments
+         WHERE artifact_id = ANY(%s)
+         GROUP BY fragment_id
+        """,
+        (similar_uuids,),
+    ).fetchall()
+
+
+def _normalize_completion_support_targets(
+    cx: psycopg.Connection[Any],
+    *,
+    target: ResolvedGraphTarget,
+    support_values: list[str],
+) -> list[str]:
+    if target.kind != "fragment":
+        return support_values
+
+    support_targets: list[str] = []
+    for artifact_id in support_values:
+        row = _execute_fetchone(
+            cx,
+            """
+            SELECT fragment_id
+              FROM ikam_artifact_fragments
+             WHERE artifact_id = %s::uuid
+             LIMIT 1
+            """,
+            (artifact_id,),
+        )
+        fragment_id = _row_value(row, "fragment_id", 0)
+        if isinstance(fragment_id, str) and fragment_id:
+            support_targets.append(fragment_id)
+            continue
+        support_targets.append(artifact_id)
+    return support_targets

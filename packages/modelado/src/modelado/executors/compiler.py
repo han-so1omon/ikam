@@ -66,14 +66,7 @@ class ExecutionDispatcher:
         return None
 
     def _resolve_operator_and_executor(self, transition_fragment_id: str) -> tuple[str, Dict[str, Any], str, Dict[str, Any]]:
-        operator_id = self.get_object_for_predicate(transition_fragment_id, "executed_by_operator")
-        if not operator_id:
-            raise ValueError(f"No operator found for transition {transition_fragment_id}")
-
-        expr_val = self.get_fragment_value(operator_id)
-        if not expr_val or expr_val.get("ir_profile") != "ExpressionIR":
-            raise ValueError(f"Operator {operator_id} is not a valid ExpressionIR")
-
+        operator_id, expr_val = self._resolve_operator_expression(transition_fragment_id)
         executor_id = self.get_object_for_predicate(operator_id, "executed_by")
         if not executor_id:
             raise ValueError(f"No executor found for operator {operator_id}")
@@ -84,13 +77,26 @@ class ExecutionDispatcher:
 
         return operator_id, expr_val, executor_id, exec_val
 
-    def _build_context(self, env: OperatorEnv) -> Dict[str, Any]:
+    def _resolve_operator_expression(self, transition_fragment_id: str) -> tuple[str, Dict[str, Any]]:
+        operator_id = self.get_object_for_predicate(transition_fragment_id, "executed_by_operator")
+        if not operator_id:
+            raise ValueError(f"No operator found for transition {transition_fragment_id}")
+
+        expr_val = self.get_fragment_value(operator_id)
+        if not expr_val or expr_val.get("ir_profile") != "ExpressionIR":
+            raise ValueError(f"Operator {operator_id} is not a valid ExpressionIR")
+        return operator_id, expr_val
+
+    def _build_context(self, env: OperatorEnv, *, translator_plan: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         marking = env.slots.get("current_marking")
-        return {
+        context = {
             "tokens": marking.tokens if marking else {},
             "meta": marking.meta if marking else {},
             "env_scope": {"ref": env.env_scope.ref} if getattr(env, "env_scope", None) else {},
         }
+        if isinstance(translator_plan, dict):
+            context["translator_plan"] = copy.deepcopy(translator_plan)
+        return context
 
     def _build_sidecar_payload(
         self,
@@ -100,6 +106,7 @@ class ExecutionDispatcher:
         params: OperatorParams,
         env: OperatorEnv,
     ) -> Dict[str, Any]:
+        operator_params = expr_val.get("ast", {}).get("params", {})
         return {
             "module": expr_val.get("module"),
             "entrypoint": expr_val.get("entrypoint"),
@@ -107,7 +114,7 @@ class ExecutionDispatcher:
                 "fragment": fragment,
                 "params": params.parameters,
             },
-            "context": self._build_context(env),
+            "context": self._build_context(env, translator_plan=operator_params.get("translator_plan")),
         }
 
     def _resolve_executor_declaration(self, expr_val: Dict[str, Any]):
@@ -147,7 +154,7 @@ class ExecutionDispatcher:
         params: OperatorParams,
         env: OperatorEnv,
     ) -> ExecutionQueueRequest:
-        _, expr_val, _, _ = self._resolve_operator_and_executor(transition_fragment_id)
+        _, expr_val = self._resolve_operator_expression(transition_fragment_id)
         declaration = self._resolve_executor_declaration(expr_val)
         operator_params = expr_val.get("ast", {}).get("params", {})
         execution_context = get_execution_context()

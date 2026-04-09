@@ -23,6 +23,13 @@ def test_system_mime_types_are_strings():
     assert "verification" in VERIFICATION_RESULT
 
 
+def test_graph_native_mime_types_are_strings():
+    from ikam.ir.mime_types import GRAPH_DELTA_MIME, GRAPH_SLICE_MIME
+
+    assert GRAPH_SLICE_MIME == "application/ikam-graph-slice+v1+json"
+    assert GRAPH_DELTA_MIME == "application/ikam-graph-delta+v1+json"
+
+
 def test_no_duplicate_mime_types():
     from ikam.ir import mime_types
     all_values = [v for k, v in vars(mime_types).items() if not k.startswith("_") and isinstance(v, str)]

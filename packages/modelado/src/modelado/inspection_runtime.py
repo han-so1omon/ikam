@@ -12,6 +12,7 @@ from ikam.inspection import (
     node_id_for,
 )
 
+from modelado.history.head_locators import try_canonicalize_locator_ref
 from modelado.hot_subgraph_store import HotSubgraphStore
 from modelado.oraculo.persistent_graph_state import PersistentGraphState
 
@@ -30,7 +31,9 @@ class HotInspectionResolver:
 
     def resolve(self, request: ResolveInspectionRequest) -> InspectionSubgraph:
         payload = self._resolve_payload(request.inspection_ref)
-        subgraph_ref = str(payload.get("subgraph_ref") or request.inspection_ref.locator.get("subgraph_ref") or "")
+        subgraph_ref = try_canonicalize_locator_ref(request.inspection_ref.locator.get("subgraph_ref"), kind="subgraph") or str(
+            payload.get("subgraph_ref") or request.inspection_ref.locator.get("subgraph_ref") or ""
+        )
         root_node_id = node_id_for("subgraph", {"subgraph_ref": subgraph_ref})
         nodes = [
             InspectionNode(
@@ -47,6 +50,7 @@ class HotInspectionResolver:
 
         source_subgraph_ref = payload.get("source_subgraph_ref")
         if isinstance(source_subgraph_ref, str) and source_subgraph_ref:
+            source_subgraph_ref = try_canonicalize_locator_ref(source_subgraph_ref, kind="subgraph") or source_subgraph_ref
             source_node_id = node_id_for("subgraph", {"subgraph_ref": source_subgraph_ref})
             nodes.append(
                 InspectionNode(
@@ -167,7 +171,9 @@ class PersistentInspectionResolver:
 
     def resolve(self, request: ResolveInspectionRequest) -> InspectionSubgraph:
         payload = self._resolve_payload(request.inspection_ref)
-        subgraph_ref = str(payload.get("subgraph_ref") or request.inspection_ref.locator.get("subgraph_ref") or "")
+        subgraph_ref = try_canonicalize_locator_ref(request.inspection_ref.locator.get("subgraph_ref"), kind="subgraph") or str(
+            payload.get("subgraph_ref") or request.inspection_ref.locator.get("subgraph_ref") or ""
+        )
         root_node_id = node_id_for("subgraph", {"subgraph_ref": subgraph_ref})
         nodes = [
             InspectionNode(
@@ -187,6 +193,7 @@ class PersistentInspectionResolver:
             target_fragment_id = edge_payload.get("to")
             relation = _normalize_relation(edge_payload.get("edge_label"))
             if relation == "source_subgraph" and isinstance(target_subgraph_ref, str) and target_subgraph_ref:
+                target_subgraph_ref = try_canonicalize_locator_ref(target_subgraph_ref, kind="subgraph") or target_subgraph_ref
                 source_node_id = node_id_for("subgraph", {"subgraph_ref": target_subgraph_ref})
                 nodes.append(
                     InspectionNode(

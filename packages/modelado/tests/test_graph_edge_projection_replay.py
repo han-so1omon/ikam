@@ -220,3 +220,54 @@ def test_policy_filters_by_pipeline_identity() -> None:
     only = next(iter(snapshot.effective_edges.values()))
     assert only.properties["pipelineId"] == "compression-rerender/v1"
     assert only.properties["pipelineRunId"] == "pipe-a"
+
+
+def test_replay_subtree_delete_removes_descendant_graph_contains_edges() -> None:
+    events = [
+        _event(
+            event_id=1,
+            op="upsert",
+            edge_label="graph:value_at",
+            out_id="graph-anchor:claim-set",
+            in_id="graph-value:claim-set",
+            properties={
+                "derivationId": "graph-delta:p:claim-set:[\"claims\",0]",
+                "graphDeltaHandle": "claim-set",
+                "graphDeltaPath": ["claims", 0],
+                "graphDeltaValue": {"kind": "claim"},
+            },
+            t=1,
+        ),
+        _event(
+            event_id=2,
+            op="upsert",
+            edge_label="graph:value_at",
+            out_id="graph-anchor:claim-set",
+            in_id="graph-value:claim-set",
+            properties={
+                "derivationId": "graph-delta:p:claim-set:[\"claims\",0,\"evidence\"]",
+                "graphDeltaHandle": "claim-set",
+                "graphDeltaPath": ["claims", 0, "evidence"],
+                "graphDeltaValue": {"kind": "evidence"},
+            },
+            t=2,
+        ),
+        _event(
+            event_id=3,
+            op="delete",
+            edge_label="graph:value_at",
+            out_id="graph-anchor:claim-set",
+            in_id="graph-value:claim-set",
+            properties={
+                "derivationId": "graph-delta:p:claim-set:[\"claims\",0]",
+                "graphDeltaHandle": "claim-set",
+                "graphDeltaPath": ["claims", 0],
+                "graphDeltaExtent": "subtree",
+            },
+            t=3,
+        ),
+    ]
+
+    snapshot = replay_effective_edges(events, policy=ProjectionPolicy(edge_label_prefix="graph:"))
+
+    assert snapshot.effective_edges == {}

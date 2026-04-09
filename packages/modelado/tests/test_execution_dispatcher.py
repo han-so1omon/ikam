@@ -162,6 +162,20 @@ def test_execution_dispatcher_builds_shared_queue_request_from_resolved_operator
                     "policy": {"cost_tier": "standard"},
                     "constraints": {"locality": "local"},
                     "eligible_executor_ids": ["executor://python-primary"],
+                    "translator_plan": {
+                        "input": [
+                            {
+                                "name": "document_set",
+                                "mime_type": "application/ikam-document-set+v1+json",
+                            }
+                        ],
+                        "output": [
+                            {
+                                "name": "chunk_extraction_set",
+                                "mime_type": "application/ikam-chunk-extraction-set+v1+json",
+                            }
+                        ],
+                    },
                 }
             },
         },
@@ -227,6 +241,20 @@ def test_execution_dispatcher_builds_shared_queue_request_from_resolved_operator
                 "tokens": {"place:start": 1},
                 "meta": {"source": "ingest"},
                 "env_scope": {"ref": "refs/heads/run/env-1"},
+                "translator_plan": {
+                    "input": [
+                        {
+                            "name": "document_set",
+                            "mime_type": "application/ikam-document-set+v1+json",
+                        }
+                    ],
+                    "output": [
+                        {
+                            "name": "chunk_extraction_set",
+                            "mime_type": "application/ikam-chunk-extraction-set+v1+json",
+                        }
+                    ],
+                },
             },
         },
         transport={"kind": "redpanda", "request_topic": "execution.requests"},
@@ -322,6 +350,71 @@ def test_execution_dispatcher_prefers_direct_executor_override_for_shared_queue_
 
     assert request.executor_id == "executor://ml-primary"
     assert request.executor_kind == "ml-executor"
+
+
+def test_execution_dispatcher_builds_queue_request_without_legacy_executor_fragment(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    dispatcher = ExecutionDispatcher()
+
+    monkeypatch.setattr(
+        dispatcher,
+        "get_object_for_predicate",
+        lambda subject_id, predicate: {
+            ("transition-fragment", "executed_by_operator"): "operator-fragment",
+            ("operator-fragment", "executed_by"): None,
+        }.get((subject_id, predicate)),
+    )
+    monkeypatch.setattr(
+        dispatcher,
+        "get_fragment_value",
+        lambda fragment_id: {
+            "operator-fragment": {
+                "ir_profile": "ExpressionIR",
+                "module": "modelado.executors.loaders",
+                "entrypoint": "run",
+                "ast": {
+                    "params": {
+                        "workflow_id": "wf-queue-only",
+                        "transition_id": "dispatch-parse",
+                        "capability": "python.parse_artifacts",
+                        "policy": {},
+                        "constraints": {},
+                        "eligible_executor_ids": ["executor://python-primary"],
+                        "translator_plan": {"input": [], "output": []},
+                    }
+                },
+            }
+        }.get(fragment_id),
+    )
+    monkeypatch.setattr("modelado.executors.compiler.get_execution_context", lambda: None)
+    monkeypatch.setattr(
+        "modelado.executors.compiler.load_executor_declarations",
+        lambda: [
+            types.SimpleNamespace(
+                executor_id="executor://python-primary",
+                executor_kind="python-executor",
+                capabilities=["python.parse_artifacts"],
+                transport={"kind": "redpanda", "request_topic": "execution.requests"},
+            )
+        ],
+        raising=False,
+    )
+
+    request = dispatcher.build_execution_queue_request(
+        transition_fragment_id="transition-fragment",
+        fragment={"fragment_id": "doc-queue-only"},
+        params=types.SimpleNamespace(name="dispatch-parse", parameters={"input": "hola"}),
+        env=OperatorEnv(
+            seed=1,
+            renderer_version="test",
+            policy="test",
+            env_scope=EnvironmentScope(ref="refs/heads/run/env-1"),
+        ),
+    )
+
+    assert request.executor_id == "executor://python-primary"
+    assert request.payload["context"]["translator_plan"] == {"input": [], "output": []}
 
 
 def test_execution_dispatcher_publishes_shared_queue_request_on_transport_topic(

@@ -56,6 +56,7 @@ from .execution import (
     ResolutionMode,
 )
 from .executors import ExecutorDeclaration
+from .operator_boundaries import OperatorBoundaries, OperatorBoundarySpec
 from .topics import OrchestrationTopicNames
 from .traces import TracePersistenceMode, TracePersistencePolicy
 from .petri import (
@@ -107,6 +108,8 @@ __all__ = [
     "ExecutionScope",
     "ResolutionMode",
     "ExecutorDeclaration",
+    "OperatorBoundaries",
+    "OperatorBoundarySpec",
     "OrchestrationTopicNames",
     "TracePersistenceMode",
     "TracePersistencePolicy",
