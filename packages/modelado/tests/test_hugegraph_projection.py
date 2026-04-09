@@ -280,6 +280,59 @@ def test_replay_projects_subtree_graph_delete_by_handle_and_path_prefix(
     assert '[\"claims\",0' in gremlin
 
 
+def test_replay_projects_subtree_graph_delete_with_path_segment_boundary(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client = _FakeHugeGraphClient()
+    cx = _FakeConnection()
+
+    monkeypatch.setattr(
+        "modelado.hugegraph_projection.get_projection_checkpoint",
+        lambda *_args, **_kwargs: None,
+    )
+    monkeypatch.setattr(
+        "modelado.hugegraph_projection.set_projection_checkpoint",
+        lambda *_args, **_kwargs: None,
+    )
+
+    events = [
+        GraphEdgeEvent(
+            id=2,
+            project_id="p1",
+            op="delete",
+            edge_label="graph:value_at",
+            out_id="graph-anchor:claim-set",
+            in_id="graph-value:claim-set",
+            properties={
+                "graphDeltaHandle": "claim-set",
+                "graphDeltaPath": ["claims", 1],
+                "graphDeltaExtent": "subtree",
+            },
+            t=2,
+            idempotency_key="k2",
+        ),
+    ]
+
+    def _list_events(*_args: Any, **kwargs: Any) -> list[GraphEdgeEvent]:
+        after_id = int(kwargs.get("after_id", 0))
+        if after_id >= 2:
+            return []
+        return events
+
+    monkeypatch.setattr("modelado.hugegraph_projection.list_graph_edge_events", _list_events)
+
+    replay_graph_edge_events_until_done(
+        cx,  # type: ignore[arg-type]
+        client=client,  # type: ignore[arg-type]
+        project_id="p1",
+    )
+
+    assert client.gremlin_queries, "expected subtree delete query"
+    gremlin = client.gremlin_queries[0]
+    assert "startingWith('[\"claims\",1')" not in gremlin
+    assert "startingWith('[\"claims\",1,')" in gremlin
+
+
 def test_replay_maps_graph_value_at_to_first_class_edge_label(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

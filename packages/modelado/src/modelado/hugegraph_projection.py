@@ -249,10 +249,11 @@ def _edge_key_for_event(e: GraphEdgeEvent) -> str:
 def _subtree_delete_gremlin(*, project_id: str, event: GraphEdgeEvent) -> str:
     handle = str(event.properties["graphDeltaHandle"])
     path = json.dumps(event.properties["graphDeltaPath"], separators=(",", ":"), ensure_ascii=False)
+    descendant_prefix = f"{path[:-1]},"
     return (
         f"g.E().has('project_id', '{project_id}')"
         f".has('graphDeltaHandle', '{handle}')"
-        f".has('graphDeltaPath', org.apache.tinkerpop.gremlin.process.traversal.TextP.startingWith('{path[:-1]}'))"
+        f".or(__.has('graphDeltaPath', '{path}'),__.has('graphDeltaPath', org.apache.tinkerpop.gremlin.process.traversal.TextP.startingWith('{descendant_prefix}')))"
         ".drop()"
     )
 

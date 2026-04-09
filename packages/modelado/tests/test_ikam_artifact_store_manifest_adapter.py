@@ -57,12 +57,12 @@ def test_upsert_artifact_head_ref_records_branch_head_state() -> None:
         head_commit_id="iac-main-1",
     )
 
-    assert len(cx.calls) == 1
-    query, params = cx.calls[0]
-    assert "INSERT INTO ikam_artifact_branches" in query
-    assert "INSERT INTO ikam_artifact_commits" in query
-    assert "head_commit_id" in query
-    assert params == (
+    assert len(cx.calls) == 2
+    commit_query, commit_params = cx.calls[0]
+    branch_query, branch_params = cx.calls[1]
+    assert "INSERT INTO ikam_artifact_commits" in commit_query
+    assert "INSERT INTO ikam_artifact_branches" not in commit_query
+    assert commit_params == (
         "00000000-0000-0000-0000-000000000000",
         "iac-main-1",
         '{"ref": null}',
@@ -70,6 +70,11 @@ def test_upsert_artifact_head_ref_records_branch_head_state() -> None:
         "iac-main-1",
         "obj-head-1",
         "00000000-0000-0000-0000-000000000000",
+    )
+    assert "INSERT INTO ikam_artifact_branches" in branch_query
+    assert "INSERT INTO ikam_artifact_commits" not in branch_query
+    assert "head_commit_id" in branch_query
+    assert branch_params == (
         "00000000-0000-0000-0000-000000000000",
         "main",
         "iac-main-1",
