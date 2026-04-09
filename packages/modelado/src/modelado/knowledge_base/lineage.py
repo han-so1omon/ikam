@@ -27,7 +27,8 @@ def build_lineage_graph(
     traversal starts.
 
     Notes:
-    - Nodes are emitted as "artifact" for compatibility; callers may enrich.
+    - The root node preserves its resolved target type; fragment-rooted traversals
+      also emit connected fragment nodes as `fragment`.
     - Edges are derived from `edge_label` (expected format: 'derivation:<type>').
     """
 
