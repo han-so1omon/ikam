@@ -4,8 +4,8 @@ use std::fs;
 
 use ikam_kernel::matcher::{MIN_MATCH, Part};
 use ikam_kernel::{
-    Commit, Error, Form, FsStore, Id, Kind, MemStore, Object, Repo, Slice, Store, TreeEntry,
-    snapshot,
+    Apply, Commit, Error, Form, FsStore, Id, Kind, MemStore, Object, Repo, Run, Slice, Store,
+    TreeEntry, snapshot,
 };
 use proptest::prelude::*;
 
@@ -33,6 +33,11 @@ fn any_object() -> impl Strategy<Value = Object> {
             })
         },
     );
+    let apply = || {
+        (any_id(), prop::collection::vec(any_id(), 0..4))
+            .prop_map(|(func, args)| Apply { func, args })
+    };
+    let run = (apply(), any_id()).prop_map(|(apply, output)| Object::Run(Run { apply, output }));
     prop_oneof![
         prop::collection::vec(any::<u8>(), 0..256).prop_map(Object::Blob),
         prop::collection::vec(slice, 0..6).prop_map(Object::Rep),
@@ -42,6 +47,8 @@ fn any_object() -> impl Strategy<Value = Object> {
                 .collect()
         )),
         commit,
+        apply().prop_map(Object::Apply),
+        run,
     ]
 }
 
@@ -139,11 +146,35 @@ proptest! {
 }
 
 #[test]
-fn unique_content_costs_no_overhead() {
+fn incompressible_unique_content_costs_one_byte() {
     let mut repo = Repo::new(MemStore::default());
-    let x: Vec<u8> = (0..10_000u32).map(|i| (i * 7919 % 251) as u8).collect();
+    let mut state = 0x2545_f491_4f6c_dd1du64;
+    let x: Vec<u8> = (0..10_000)
+        .map(|_| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            (state >> 56) as u8
+        })
+        .collect();
     assert_eq!(repo.put_content(&x).unwrap().form, Form::Blob);
     assert_eq!(repo.bytes_written, x.len() + 1);
+}
+
+#[test]
+fn compressible_content_is_stored_compressed() {
+    let mut repo = Repo::new(MemStore::default());
+    let x = "the same sentence again and again. "
+        .repeat(500)
+        .into_bytes();
+    let put = repo.put_content(&x).unwrap();
+    assert_eq!(put.id, Id::of_content(&x));
+    assert!(
+        repo.bytes_written < x.len() / 10,
+        "stored {} bytes",
+        repo.bytes_written
+    );
+    assert_eq!(repo.read_content(&put.id).unwrap(), x);
 }
 
 #[test]
@@ -182,6 +213,11 @@ fn corruption_is_detected_through_reps() {
         Err(Error::Corrupt(_))
     ));
     assert!(matches!(repo.read_content(&put.id), Err(Error::Corrupt(_))));
+    let mut bad: Vec<Id> = repo.fsck().unwrap().into_iter().map(|(id, _)| id).collect();
+    bad.sort();
+    let mut expected = vec![base_id, put.id];
+    expected.sort();
+    assert_eq!(bad, expected, "fsck reports exactly the damaged objects");
 }
 
 #[test]

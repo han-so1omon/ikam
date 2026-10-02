@@ -4,7 +4,7 @@ use std::io::Write;
 use std::path::Path;
 use std::process::ExitCode;
 
-use ikam_kernel::{FsStore, Object, Repo, snapshot};
+use ikam_kernel::{Apply, FsStore, Id, Object, Repo, snapshot};
 
 const USAGE: &str = "usage: ikam [--store DIR] <command>
   put FILE                         store a file, print its content id
@@ -12,7 +12,12 @@ const USAGE: &str = "usage: ikam [--store DIR] <command>
   commit DIR [-m MSG] [--ref REF]  snapshot DIR and advance REF (default main)
   log [REV]                        first-parent history of REV (default main)
   checkout REV DEST                write REV's tree into new directory DEST
-  show ID                          print a tree or commit
+  show ID                          print a tree, commit or run record
+  apply FUNC ARG...                run function FUNC (a stored WASM module id) on
+                                   stored contents, print the output id (memoized)
+  links ID                         outgoing graph edges of an object
+  used-by ID                       incoming graph edges (objects that link to ID)
+  fsck                             reconstruct and verify every stored object
   gc                               delete objects unreachable from any ref";
 
 fn main() -> ExitCode {
@@ -80,8 +85,47 @@ fn run(store_dir: &str, args: &mut Vec<String>) -> Result<(), String> {
             Object::Commit(c) => {
                 println!("tree {}\nparents {:?}\n\n{}", c.tree, c.parents, c.message)
             }
+            Object::Run(r) => println!(
+                "func {}\nargs {:?}\noutput {}",
+                r.apply.func, r.apply.args, r.output
+            ),
             _ => unreachable!(),
         },
+        Some("apply") => {
+            let func = repo.resolve(&arg(1)?).map_err(err)?;
+            let args = args[2..]
+                .iter()
+                .map(|a| a.parse::<Id>())
+                .collect::<Result<_, _>>()
+                .map_err(err)?;
+            println!("{}", repo.apply(Apply { func, args }).map_err(err)?);
+        }
+        Some("links") => {
+            for (label, id) in repo
+                .links(&repo.resolve(&arg(1)?).map_err(err)?)
+                .map_err(err)?
+            {
+                println!("{id} {label}");
+            }
+        }
+        Some("used-by") => {
+            for (id, label) in repo
+                .used_by(&repo.resolve(&arg(1)?).map_err(err)?)
+                .map_err(err)?
+            {
+                println!("{id} {label}");
+            }
+        }
+        Some("fsck") => {
+            let failures = repo.fsck().map_err(err)?;
+            for (id, e) in &failures {
+                println!("{id} {e}");
+            }
+            if !failures.is_empty() {
+                return Err(format!("{} objects failed verification", failures.len()));
+            }
+            println!("ok");
+        }
         Some("gc") => println!("deleted {} objects", repo.gc().map_err(err)?),
         _ => return Err(USAGE.into()),
     }

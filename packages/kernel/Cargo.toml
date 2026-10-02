@@ -5,12 +5,23 @@ edition = "2024"
 
 [dependencies]
 blake3 = "1.8.7"
+flate2 = { version = "1.1.10", default-features = false, features = ["zlib"] }
+# Reconstruction depends on exact compressor and interpreter behaviour:
+# keep these pinned; see container::tests::deflate_output_is_pinned.
+libz-sys = { version = "=1.1.29", features = ["static"] }
 thiserror = "2.0.21"
+wasmi = { version = "=2.0.0", features = ["portable-dispatch", "deterministic"] }
+zstd = "0.14.0"
 
 [dev-dependencies]
 proptest = "1.11.0"
 tempfile = "3.27.0"
+wat = "1.260.0"
 
 [[bin]]
 name = "ikam"
 path = "src/main.rs"
+
+# Dependencies (wasmi, zlib, zstd) are far slower unoptimized; tests run them heavily.
+[profile.dev.package."*"]
+opt-level = 2
