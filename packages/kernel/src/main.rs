@@ -1,14 +1,19 @@
-//! `ikam` CLI: put files through a codec, render them back, inspect trees.
+//! `ikam` CLI over a filesystem store.
 
 use std::io::Write;
+use std::path::Path;
 use std::process::ExitCode;
 
-use ikam_kernel::{Error, FsStore, Id, Object, Store, codec, ingest, render};
+use ikam_kernel::{FsStore, Object, Repo, snapshot};
 
 const USAGE: &str = "usage: ikam [--store DIR] <command>
-  put [--codec raw|cdc|md] FILE   ingest FILE, print its root id
-  cat ID                          write the reconstructed bytes to stdout
-  tree ID                         print the object tree";
+  put FILE                         store a file, print its content id
+  cat ID                           write a file's bytes to stdout
+  commit DIR [-m MSG] [--ref REF]  snapshot DIR and advance REF (default main)
+  log [REV]                        first-parent history of REV (default main)
+  checkout REV DEST                write REV's tree into new directory DEST
+  show ID                          print a tree or commit
+  gc                               delete objects unreachable from any ref";
 
 fn main() -> ExitCode {
     let mut args: Vec<String> = std::env::args().skip(1).collect();
@@ -23,51 +28,64 @@ fn main() -> ExitCode {
 }
 
 fn run(store_dir: &str, args: &mut Vec<String>) -> Result<(), String> {
-    let mut store = FsStore::open(store_dir).map_err(err)?;
+    let mut repo = Repo::new(FsStore::open(store_dir).map_err(err)?);
+    let message = take_flag(args, "-m").unwrap_or_default();
+    let refname = take_flag(args, "--ref").unwrap_or_else(|| "main".into());
+    let arg = |i: usize| args.get(i).cloned().ok_or_else(|| USAGE.to_string());
     match args.first().map(String::as_str) {
         Some("put") => {
-            let codec_name = take_flag(args, "--codec").unwrap_or_else(|| "md".into());
-            let codec = codec::by_name(&codec_name).ok_or(format!("unknown codec {codec_name}"))?;
-            let path = args.get(1).ok_or(USAGE)?;
-            let input = std::fs::read(path).map_err(err)?;
-            let r = ingest(&mut store, codec.as_ref(), &input).map_err(err)?;
-            println!("{}", r.root);
+            let input = std::fs::read(arg(1)?).map_err(err)?;
+            let put = repo.put_content(&input).map_err(err)?;
+            println!("{}", put.id);
             eprintln!(
-                "codec={} fell_back={} input_bytes={} new_objects={} new_bytes={}",
-                codec.name(),
-                r.fell_back,
+                "form={:?} input_bytes={} new_bytes={}",
+                put.form,
                 input.len(),
-                r.objects_written,
-                r.bytes_written
+                repo.bytes_written
             );
-            Ok(())
         }
         Some("cat") => {
-            let bytes = render(&store, &parse_id(args)?).map_err(err)?;
-            std::io::stdout().write_all(&bytes).map_err(err)
+            let bytes = repo
+                .read_content(&repo.resolve(&arg(1)?).map_err(err)?)
+                .map_err(err)?;
+            std::io::stdout().write_all(&bytes).map_err(err)?;
         }
-        Some("tree") => print_tree(&store, &parse_id(args)?, "", 0).map_err(err),
-        _ => Err(USAGE.into()),
-    }
-}
-
-fn print_tree(store: &dyn Store, id: &Id, label: &str, depth: usize) -> Result<(), Error> {
-    let pad = "  ".repeat(depth);
-    let short = &id.to_hex()[..12];
-    match store.get(id)? {
-        Object::Blob(bytes) => println!("{pad}{short} blob {}B {label}", bytes.len()),
-        Object::Node(entries) => {
-            println!("{pad}{short} node {} {label}", entries.len());
-            for e in entries {
-                print_tree(store, &e.id, &e.label, depth + 1)?;
+        Some("commit") => {
+            let tree = snapshot::snapshot(&mut repo, Path::new(&arg(1)?), Path::new(store_dir))
+                .map_err(err)?;
+            let id = repo.commit(&refname, tree, &message).map_err(err)?;
+            println!("{id}");
+            eprintln!("new_bytes={}", repo.bytes_written);
+        }
+        Some("log") => {
+            let start = repo
+                .resolve(args.get(1).map_or("main", String::as_str))
+                .map_err(err)?;
+            for (id, c) in repo.log(start).map_err(err)? {
+                println!("{} tree={} {}", id, &c.tree.to_hex()[..12], c.message);
             }
         }
+        Some("checkout") => {
+            let tree =
+                snapshot::tree_of(&repo, &repo.resolve(&arg(1)?).map_err(err)?).map_err(err)?;
+            snapshot::checkout(&repo, &tree, Path::new(&arg(2)?)).map_err(err)?;
+        }
+        Some("show") => match repo
+            .get(&repo.resolve(&arg(1)?).map_err(err)?)
+            .map_err(err)?
+        {
+            Object::Tree(entries) => entries
+                .iter()
+                .for_each(|e| println!("{:?} {} {}", e.kind, e.id, e.name)),
+            Object::Commit(c) => {
+                println!("tree {}\nparents {:?}\n\n{}", c.tree, c.parents, c.message)
+            }
+            _ => unreachable!(),
+        },
+        Some("gc") => println!("deleted {} objects", repo.gc().map_err(err)?),
+        _ => return Err(USAGE.into()),
     }
     Ok(())
-}
-
-fn parse_id(args: &[String]) -> Result<Id, String> {
-    args.get(1).ok_or(USAGE)?.parse().map_err(err)
 }
 
 fn take_flag(args: &mut Vec<String>, flag: &str) -> Option<String> {

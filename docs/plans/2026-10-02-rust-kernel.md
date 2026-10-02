@@ -1,6 +1,6 @@
 # IKAM Rust kernel: reconstructable store with an execution layer
 
-Status: L0 and L1 implemented in `packages/kernel`. L2, L3 and versioning are planned, not built.
+Status: built in `packages/kernel` — L0 objects, L1 data-driven dedup, and versioning (commits, refs, gc). Not built yet — semantic dedup (L2), derivations (L3) and scheduling.
 
 ## Why restart
 
@@ -16,45 +16,63 @@ The kernel keeps the ideas and makes each layer's guarantee a tested law.
 
 ## Layers and laws
 
-| Layer | Contents | Law (enforced, not documented) |
+| Layer | Contents | Law (enforced by code and tests) |
 |---|---|---|
-| L0 objects | `Blob(bytes)`, `Node([(label, kind, id)])`; `id = BLAKE3(encode(obj))` | `decode(encode(o)) == o`; `encode(decode(b)) == b`; `get(put(o)) == o`; `get` re-hashes on read |
-| L1 codecs | A codec proposes a `Shape`: a labelled tree of byte ranges. Rendering is fixed by the kernel (concatenate leaves in order). | `render(ingest(c, x)) == x` for every codec `c`. A shape that does not tile `x` exactly, or a failed byte comparison, falls back to storing `x` as one blob. |
-| L2 dedup (planned) | Exact = CAS. Structural = codecs. Semantic = an AI proposes a canonical form `C` plus a residual patch per source. | Accepted only if `apply(C, patch_i) == x_i` is verified and the merge saves bytes. An AI mistake costs space, never correctness. |
-| L3 derivations (planned) | `(fn_id, input_ids, env_id) -> output_id`. Functions are objects (WASM, or pinned sandboxed code; never `exec`). Each op carries an effect tag: `pure` / `nondet` / `io`. | `pure` results are memoized by key. `nondet` results (LLM, tools) are recorded as objects and replayed, never silently regenerated. |
-| Versioning (planned) | Commit objects (root, parents, metadata); refs are the only mutable state, updated by compare-and-swap. | History is immutable. A ref moves only from its expected old value. |
-| Scheduling (planned) | Petri nets over derivations, for approvals, budgets/resources and retries. Markings are content-addressed. | A transition fires only when enabled; every firing records `marking_before` and `marking_after`. |
+| L0 objects | `Blob`, `Rep` (slices of blobs), `Tree`, `Commit`. Id = `BLAKE3(encoding)`. | Strict canonical encoding: `encode(decode(b)) == b`. Every read is re-hashed against its id. |
+| L1 storage dedup | A file's id is `Id::of_content(bytes)`, i.e. the id of its blob form. It is stored either as that blob or as a `Rep` slicing other blobs. A planner proposes the slices; the kernel verifies them. | `read_content(put_content(x).id) == x`. The id never depends on storage form or planner. A plan that is invalid, wrong or not smaller falls back to a blob. |
+| Versioning | Trees (sorted, validated names), commits, refs. Refs are the only mutable state, updated by compare-and-swap under a lock file. `gc` deletes whatever no ref can reach. | History is immutable. A ref moves only from its expected old value. `gc` keeps everything a ref can reach, including rep sources. |
+| L2 semantic dedup (planned) | An AI proposes that content is a transformation of other content (e.g. reformatted, reordered, templated). | Accepted only if reconstruction is verified byte-for-byte and saves bytes. An AI mistake costs space, never correctness. |
+| L3 derivations (planned) | `(fn_id, input_ids, env_id) -> output_id`. Functions are objects (WASM, or pinned sandboxed code; never `exec`). Each op has an effect tag: `pure` / `nondet` / `io`. | `pure` results are memoized. `nondet` results (LLM, tools) are recorded and replayed, never silently regenerated. |
+| Scheduling (planned) | Petri nets over derivations, for approvals, budgets/resources and retries. Markings are content-addressed. | A transition fires only when enabled; each firing records its before and after markings. |
 
-Postgres, pgvector and any graph database are **projections** that can be rebuilt from objects and refs. They are never a source of truth.
+Postgres, pgvector and any graph database are **projections** that can be rebuilt from objects and refs. They are never a source of truth. The seed index used for dedup is already one: it is rebuilt from blobs on demand.
 
 ## L0 encoding (normative)
 
-All lengths are u32 big-endian.
+u32 and u64 are big-endian.
 
 ```
-blob = "B" bytes
-node = "N" count { label_len label(utf-8) kind("B"|"N") id[32] }
+blob   = "B" bytes
+rep    = "R" count:u32 { src[32] start:u64 len:u64 }          stored under the id of the blob it reproduces
+tree   = "T" count:u32 { name_len:u32 name kind("F"|"T") id[32] }   names strictly ascending, no "/", NUL, ".", ".."
+commit = "C" tree[32] nparents:u32 { parent[32] } msg_len:u32 msg
 ```
 
-- The kind tag inside the hashed bytes prevents a blob from colliding with a node.
-- Labels are metadata and part of node identity, but never of leaf identity, so identical paragraphs under different headings still dedup.
-- Media type is not part of identity.
+- **Rep sources** must be stored as plain blobs, so reconstruction is at most one level deep. There are no delta chains to bound or rebase.
+- **Structure and media type are not part of a file's identity.** Semantic structure (sections, entities, relations) belongs in a separate annotation layer over content ids. It never belongs in storage.
 
-## Design decisions
+## Dedup boundaries are data-driven
 
-- **Rendering is not pluggable.** Codecs only split. That lets the guarantee hold for heuristic and AI codecs alike: the LLM boundary planner from `forja/boundary_planner_llm.py` becomes a codec whose output is checked like any other. Transforming renderings (normalization, canonical-plus-patch) belong to L2/L3 as derivations with their own verified law.
-- **The round trip is checked at ingest** even though tiling makes it hold by construction, so the guarantee rests on a byte comparison.
-- **Objects written by a rejected shape** are left for a future GC (mark from refs).
+Chunks are not cut at predefined positions: no fixed sizes, no headings or paragraphs. The current planner (`matcher.rs`) works as follows:
 
-## Measured (2026-10-02, `packages/kernel`, release build)
+1. **Index seeds.** For every stored blob, index 32-byte seeds at content-defined anchors. An anchor is a gear-hash position, about 1 in 64, and depends only on the preceding 64 bytes. Seeds are only a lookup key.
+2. **Find candidates.** At each anchor of new content, look up candidate matches in stored blobs.
+3. **Extend byte by byte.** Grow each candidate backward and forward. A slice therefore ends exactly where the content stops agreeing. `tests/laws.rs::boundaries_are_byte_precise` checks this for insertions at arbitrary offsets.
+4. **Keep only matches that pay.** A match is used only if it is at least 96 B, the cost of its slice entry plus the entry needed to resume the literal run. This is a cost rule, not a boundary.
+5. **Store new bytes once.** All unmatched bytes become one new literal blob, which is indexed for future matches.
 
-- **Fixture corpus** (`tests/fixtures/cases`, 344 md files, 180 KB): 0 round-trip failures, 0 fallbacks. The md codec stores 1.70× the input, versus 1.00× raw.
-  - Files average about 520 B and rarely share text, so the ~38 B-per-entry overhead (4 B label length, 1 B kind, 32 B id, 1 B blob tag) dominates.
-  - Removing heading labels only gets to 1.55×. The fix is a minimum leaf size: merge small paragraphs, as CDC does.
-- **pdf+xlsx** (220 files, 967 KB): cdc 1.01×, raw 1.00×. These are compressed containers, so byte-level dedup cannot help. They need format codecs (unzip xlsx parts).
-- **Edit history** (21 synthetic revisions of a 30 KB markdown spec, one-line edits plus appended sections): raw 1.00×, cdc 0.39×, md **0.15×**.
+Known limits:
+- Repeats inside a single new file are not yet matched against themselves.
+- Matches shorter than about 96 B, or that contain no anchor, are missed.
+- The index is rebuilt in memory per process. A persisted index would be a checkpointed projection.
 
-These are the only measurements so far. The edit history is synthetic.
+## Measured (2026-10-02, release build, via the CLI)
+
+Ratio = stored object bytes / input bytes. No compression is applied anywhere.
+
+| Corpus | First L1 (predefined md/cdc chunks) | Data-driven L1 |
+|---|---|---|
+| 344 md fixtures, 180 KB | 1.70× (md), 1.00× (raw) | **0.97×** |
+| 220 pdf+xlsx fixtures, 967 KB | 1.01× (cdc) | **0.41×** |
+| 21 synthetic revisions of a 30 KB spec | 0.15× (md), 0.39× (cdc) | **0.086×** |
+| 10 real snapshots of this repo's history (docs + 3 Python packages, 46 MB) | — | **0.104×** |
+
+All files round-tripped byte-for-byte. A checkout of the latest snapshot matches the source tree exactly.
+
+Reference points for the real history:
+- **File-level dedup only:** 0.116×. This history mostly adds or removes whole files, so there is little in-file reuse to find.
+- **git's packed store (zlib + deltas):** 1.23 MB, or 0.027×. git wins by about 4×, and most of the gap is compression.
+- **Next fix:** compress blobs in storage (zstd). Identity is computed over uncompressed content, so this changes no ids.
 
 ## Salvage inventory from the Python packages
 
@@ -62,12 +80,12 @@ The Python packages are stripped to their ideas, not ported line-for-line.
 
 | Source | Idea taken | Kernel home |
 |---|---|---|
-| `ikam/forja/boundary_planner*.py` | AI proposes spans, deterministic validator checks full coverage | L1 codec + `tiles()` |
-| `ikam/forja/verifier.py` (`ByteIdentityVerifier`) | Byte identity as the only pass criterion | `ingest` |
-| `ikam/delta_chain.py` | Bounded delta chains with rebase | L2 residual patches |
+| `ikam/forja/boundary_planner*.py` | AI proposes, deterministic code verifies | `Repo::put_planned` accepts any planner's proposal, then verifies it |
+| `ikam/forja/verifier.py` (`ByteIdentityVerifier`) | Byte identity as the only pass criterion | `put_planned`, `read_content` |
+| `ikam/delta_chain.py` | Store versions as deltas | `Rep` slices; one level deep, so no chains |
 | `ikam/fragments.py` relations + `relation_eval.py` | Operator identified by function hash plus slot bindings | L3 derivation key |
-| `modelado/graph_edge_event_log.py`, `graph_edge_event_folding.py` | Idempotency keys; deterministic fold; projections with checkpoints | Projections over refs/objects |
-| `modelado/history/head_locators.py`, `ikam_fragment_objects` | Refs → commits → immutable manifests | Versioning |
+| `modelado/graph_edge_event_log.py`, `graph_edge_event_folding.py` | Idempotency keys; deterministic fold; checkpointed projections | Projections over objects/refs (seed index first) |
+| `modelado/history/head_locators.py`, `ikam_fragment_objects` | Refs → commits → immutable manifests | Versioning (built) |
 | `modelado/core/model_call_cache*` | Cache keyed by (model, prompt hash, seed) | L3 `nondet` record/replay |
 | `modelado/authz/signing.py`, `core/execution_context.py` | Signed write envelopes; single write chokepoint | Ref updates |
 | `modelado/plans/engine.py`, `interacciones/schemas/petri.py` | Petri enabling/firing; CAS-hashed markings; bipartite validation | Scheduling |
@@ -86,9 +104,9 @@ To be dropped when the Python packages are retired:
 
 ## Next steps
 
-1. **L1:** set a minimum leaf size in the md codec; add a JSON codec; add an xlsx/docx/pptx codec that splits zip parts. Re-measure on the fixtures.
-2. **Versioning:** a `Commit` object kind, a refs file with compare-and-swap, `ikam log`, and a GC that marks from refs.
+1. **Storage:** zstd-compressed blob form; a persisted seed index; self-matching within a file.
+2. **Format awareness without fixed boundaries:** expand container formats (zip parts of xlsx/docx/pptx, PDF streams) into a stored *derivation* `unpack(x) -> parts`, so dedup sees uncompressed content. Reconstruction is verified like any plan.
 3. **L3:** a derivation record plus a memo table; effect tags; WASM function objects (wasmtime).
-4. **L2:** residual patches (`Patch` derivation), then AI-proposed canonical forms gated by the patch law.
+4. **L2:** AI-proposed transformations, gated by verified reconstruction and measured savings.
 5. **Scheduling:** a Petri net over derivations; port the enabling/firing semantics from `modelado/plans/engine.py`.
 6. **Bindings:** PyO3 bindings so remaining Python code can call the kernel while it is retired.
