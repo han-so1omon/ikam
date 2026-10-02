@@ -12,6 +12,15 @@ impl Id {
         Id(*blake3::hash(encoded).as_bytes())
     }
 
+    /// Identity of file content: the id of its blob encoding (`"B" ++ bytes`),
+    /// computed without copying.
+    pub fn of_content(bytes: &[u8]) -> Id {
+        let mut h = blake3::Hasher::new();
+        h.update(b"B");
+        h.update(bytes);
+        Id(*h.finalize().as_bytes())
+    }
+
     pub fn from_bytes(bytes: [u8; 32]) -> Id {
         Id(bytes)
     }

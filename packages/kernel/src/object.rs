@@ -1,84 +1,126 @@
 //! L0 objects and their canonical encoding.
 //!
-//! There are exactly two object kinds. A `Blob` is opaque bytes. A `Node` is an
-//! ordered list of labelled references whose rendering is the concatenation of
-//! its children. Identity is `BLAKE3(encode(object))`; the encoding is strict,
-//! so every byte string has at most one decoding and `encode(decode(b)) == b`.
+//! Encoding (u32/u64 are big-endian):
+//!   blob   = "B" bytes
+//!   rep    = "R" count:u32 { src[32] start:u64 len:u64 }
+//!   tree   = "T" count:u32 { name_len:u32 name kind("F"|"T") id[32] }   names strictly ascending
+//!   commit = "C" tree[32] nparents:u32 { parent[32] } msg_len:u32 msg
 //!
-//! Encoding (all lengths are u32 big-endian):
-//!   blob = b"B" bytes
-//!   node = b"N" count { label_len label kind(b"B"|b"N") id[32] }
+//! Blobs, trees and commits are named by `BLAKE3(encoding)`. A file's identity
+//! is the id of its blob form; a `Rep` is an alternative storage form for that
+//! same id (slices of other blobs), so how a file is stored never changes what
+//! it is called. Decoding is strict: `encode(decode(b)) == b` whenever it
+//! succeeds.
 
 use crate::{Error, Id};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Kind {
-    Blob,
-    Node,
+    File,
+    Tree,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Entry {
-    pub label: String,
+pub struct TreeEntry {
+    pub name: String,
     pub kind: Kind,
     pub id: Id,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub enum Object {
-    Blob(Vec<u8>),
-    Node(Vec<Entry>),
+pub struct Slice {
+    pub src: Id,
+    pub start: u64,
+    pub len: u64,
 }
 
-impl Kind {
-    fn tag(self) -> u8 {
-        match self {
-            Kind::Blob => b'B',
-            Kind::Node => b'N',
-        }
-    }
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Commit {
+    pub tree: Id,
+    pub parents: Vec<Id>,
+    pub message: String,
+}
 
-    fn from_tag(tag: u8) -> Result<Kind, Error> {
-        match tag {
-            b'B' => Ok(Kind::Blob),
-            b'N' => Ok(Kind::Node),
-            _ => Err(Error::Decode("unknown kind tag")),
-        }
-    }
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Object {
+    Blob(Vec<u8>),
+    Rep(Vec<Slice>),
+    Tree(Vec<TreeEntry>),
+    Commit(Commit),
 }
 
 impl Object {
-    pub fn kind(&self) -> Kind {
-        match self {
-            Object::Blob(_) => Kind::Blob,
-            Object::Node(_) => Kind::Node,
-        }
+    /// Build a tree, sorting entries; fails on duplicate or invalid names.
+    pub fn tree(mut entries: Vec<TreeEntry>) -> Result<Object, Error> {
+        entries.sort_by(|a, b| a.name.cmp(&b.name));
+        let tree = Object::Tree(entries);
+        Object::decode(&tree.encode())?;
+        Ok(tree)
     }
 
     pub fn encode(&self) -> Vec<u8> {
+        let mut out = Vec::new();
         match self {
-            Object::Blob(bytes) => [&b"B"[..], bytes].concat(),
-            Object::Node(entries) => {
-                let mut out = vec![b'N'];
-                put_len(&mut out, entries.len());
+            Object::Blob(bytes) => {
+                out.push(b'B');
+                out.extend_from_slice(bytes);
+            }
+            Object::Rep(slices) => {
+                out.push(b'R');
+                put_u32(&mut out, slices.len());
+                for s in slices {
+                    out.extend_from_slice(s.src.as_bytes());
+                    out.extend_from_slice(&s.start.to_be_bytes());
+                    out.extend_from_slice(&s.len.to_be_bytes());
+                }
+            }
+            Object::Tree(entries) => {
+                out.push(b'T');
+                put_u32(&mut out, entries.len());
                 for e in entries {
-                    put_len(&mut out, e.label.len());
-                    out.extend_from_slice(e.label.as_bytes());
-                    out.push(e.kind.tag());
+                    put_str(&mut out, &e.name);
+                    out.push(if e.kind == Kind::File { b'F' } else { b'T' });
                     out.extend_from_slice(e.id.as_bytes());
                 }
-                out
+            }
+            Object::Commit(c) => {
+                out.push(b'C');
+                out.extend_from_slice(c.tree.as_bytes());
+                put_u32(&mut out, c.parents.len());
+                c.parents
+                    .iter()
+                    .for_each(|p| out.extend_from_slice(p.as_bytes()));
+                put_str(&mut out, &c.message);
             }
         }
+        out
     }
 
     pub fn decode(bytes: &[u8]) -> Result<Object, Error> {
-        let (&tag, rest) = bytes.split_first().ok_or(Error::Decode("empty object"))?;
-        match tag {
-            b'B' => Ok(Object::Blob(rest.to_vec())),
-            b'N' => decode_node(rest),
-            _ => Err(Error::Decode("unknown object tag")),
-        }
+        let mut r = Reader(bytes);
+        let obj = match r.take(1)?[0] {
+            b'B' => Object::Blob(r.rest().to_vec()),
+            b'R' => Object::Rep(r.many(|r| {
+                let s = Slice {
+                    src: r.id()?,
+                    start: r.u64()?,
+                    len: r.u64()?,
+                };
+                if s.len == 0 {
+                    return Err(Error::Decode("empty slice"));
+                }
+                Ok(s)
+            })?),
+            b'T' => decode_tree(&mut r)?,
+            b'C' => Object::Commit(Commit {
+                tree: r.id()?,
+                parents: r.many(Reader::id)?,
+                message: r.string()?,
+            }),
+            _ => return Err(Error::Decode("unknown object tag")),
+        };
+        r.finish()?;
+        Ok(obj)
     }
 
     pub fn id(&self) -> Id {
@@ -86,39 +128,90 @@ impl Object {
     }
 }
 
-fn put_len(out: &mut Vec<u8>, len: usize) {
-    let len = u32::try_from(len).expect("length exceeds u32");
-    out.extend_from_slice(&len.to_be_bytes());
+fn decode_tree(r: &mut Reader) -> Result<Object, Error> {
+    let entries = r.many(|r| {
+        let name = r.string()?;
+        let kind = match r.take(1)?[0] {
+            b'F' => Kind::File,
+            b'T' => Kind::Tree,
+            _ => return Err(Error::Decode("unknown entry kind")),
+        };
+        Ok(TreeEntry {
+            name,
+            kind,
+            id: r.id()?,
+        })
+    })?;
+    for e in &entries {
+        if e.name.is_empty() || e.name == "." || e.name == ".." || e.name.contains(['/', '\0']) {
+            return Err(Error::InvalidName(e.name.clone()));
+        }
+    }
+    if entries.windows(2).any(|w| w[0].name >= w[1].name) {
+        return Err(Error::Decode("tree names not strictly ascending"));
+    }
+    Ok(Object::Tree(entries))
 }
 
-fn decode_node(mut rest: &[u8]) -> Result<Object, Error> {
-    let count = take_len(&mut rest)?;
-    let mut entries = Vec::with_capacity(count.min(rest.len() / 37));
-    for _ in 0..count {
-        let label_len = take_len(&mut rest)?;
-        let label = take(&mut rest, label_len)?;
-        let label =
-            String::from_utf8(label.to_vec()).map_err(|_| Error::Decode("label not utf-8"))?;
-        let kind = Kind::from_tag(take(&mut rest, 1)?[0])?;
-        let id = Id::from_bytes(take(&mut rest, 32)?.try_into().unwrap());
-        entries.push(Entry { label, kind, id });
-    }
-    if !rest.is_empty() {
-        return Err(Error::Decode("trailing bytes"));
-    }
-    Ok(Object::Node(entries))
+fn put_u32(out: &mut Vec<u8>, n: usize) {
+    out.extend_from_slice(&u32::try_from(n).expect("length exceeds u32").to_be_bytes());
 }
 
-fn take<'a>(rest: &mut &'a [u8], n: usize) -> Result<&'a [u8], Error> {
-    if rest.len() < n {
-        return Err(Error::Decode("truncated"));
-    }
-    let (head, tail) = rest.split_at(n);
-    *rest = tail;
-    Ok(head)
+fn put_str(out: &mut Vec<u8>, s: &str) {
+    put_u32(out, s.len());
+    out.extend_from_slice(s.as_bytes());
 }
 
-fn take_len(rest: &mut &[u8]) -> Result<usize, Error> {
-    let raw = take(rest, 4)?;
-    Ok(u32::from_be_bytes(raw.try_into().unwrap()) as usize)
+struct Reader<'a>(&'a [u8]);
+
+impl<'a> Reader<'a> {
+    fn take(&mut self, n: usize) -> Result<&'a [u8], Error> {
+        if self.0.len() < n {
+            return Err(Error::Decode("truncated"));
+        }
+        let (head, tail) = self.0.split_at(n);
+        self.0 = tail;
+        Ok(head)
+    }
+
+    fn rest(&mut self) -> &'a [u8] {
+        std::mem::take(&mut self.0)
+    }
+
+    fn u32(&mut self) -> Result<usize, Error> {
+        Ok(u32::from_be_bytes(self.take(4)?.try_into().unwrap()) as usize)
+    }
+
+    fn u64(&mut self) -> Result<u64, Error> {
+        Ok(u64::from_be_bytes(self.take(8)?.try_into().unwrap()))
+    }
+
+    fn id(&mut self) -> Result<Id, Error> {
+        Ok(Id::from_bytes(self.take(32)?.try_into().unwrap()))
+    }
+
+    fn string(&mut self) -> Result<String, Error> {
+        let len = self.u32()?;
+        String::from_utf8(self.take(len)?.to_vec()).map_err(|_| Error::Decode("string not utf-8"))
+    }
+
+    fn many<T>(
+        &mut self,
+        mut item: impl FnMut(&mut Self) -> Result<T, Error>,
+    ) -> Result<Vec<T>, Error> {
+        let count = self.u32()?;
+        let mut out = Vec::with_capacity(count.min(self.0.len() / 32));
+        for _ in 0..count {
+            out.push(item(self)?);
+        }
+        Ok(out)
+    }
+
+    fn finish(self) -> Result<(), Error> {
+        if self.0.is_empty() {
+            Ok(())
+        } else {
+            Err(Error::Decode("trailing bytes"))
+        }
+    }
 }
