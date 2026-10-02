@@ -1,16 +1,22 @@
 //! IKAM kernel: a content-addressed store whose files are guaranteed to
-//! reconstruct byte-for-byte, with data-driven dedup and git-like versioning.
+//! reconstruct byte-for-byte, with data-driven dedup, git-like versioning,
+//! and pure functions whose applications are both storage and provenance.
 //! See docs/plans/2026-10-02-rust-kernel.md for the layer laws.
 
+mod container;
+mod exec;
+pub mod func;
+mod history;
 mod id;
 pub mod matcher;
 mod object;
 mod repo;
 pub mod snapshot;
 mod store;
+mod wasm;
 
 pub use id::Id;
-pub use object::{Commit, Kind, Object, Slice, TreeEntry};
+pub use object::{Apply, Commit, Kind, Object, Run, Slice, TreeEntry};
 pub use repo::{Form, Put, Repo};
 pub use store::{FsStore, MemStore, Store};
 
@@ -26,6 +32,8 @@ pub enum Error {
     Decode(&'static str),
     #[error("invalid name: {0:?}")]
     InvalidName(String),
+    #[error("execution failed: {0}")]
+    Exec(String),
     #[error("ref {0} moved or is locked; retry")]
     RefConflict(String),
     #[error(transparent)]

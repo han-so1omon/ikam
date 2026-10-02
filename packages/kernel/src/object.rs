@@ -5,12 +5,16 @@
 //!   rep    = "R" count:u32 { src[32] start:u64 len:u64 }
 //!   tree   = "T" count:u32 { name_len:u32 name kind("F"|"T") id[32] }   names strictly ascending
 //!   commit = "C" tree[32] nparents:u32 { parent[32] } msg_len:u32 msg
+//!   apply  = "A" func[32] nargs:u32 { arg[32] }
+//!   run    = "X" func[32] nargs:u32 { arg[32] } output[32]
 //!
-//! Blobs, trees and commits are named by `BLAKE3(encoding)`. A file's identity
-//! is the id of its blob form; a `Rep` is an alternative storage form for that
-//! same id (slices of other blobs), so how a file is stored never changes what
-//! it is called. Decoding is strict: `encode(decode(b)) == b` whenever it
-//! succeeds.
+//! Trees, commits and runs are named by `BLAKE3(encoding)`. A file's identity
+//! is the id of its blob form. `Rep` (slices of other blobs) and `Apply` (a
+//! pure function of other files) are alternative storage forms kept under
+//! that same id, so how a file is stored never changes what it is called.
+//! Fragments are therefore values (blobs), references (reps) or function
+//! applications (applies); all three must reproduce the identical bytes.
+//! Decoding is strict: `encode(decode(b)) == b` whenever it succeeds.
 
 use crate::{Error, Id};
 
@@ -41,12 +45,28 @@ pub struct Commit {
     pub message: String,
 }
 
+/// `func` applied to the contents of `args`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Apply {
+    pub func: Id,
+    pub args: Vec<Id>,
+}
+
+/// A record that evaluating `apply` produced `output`: provenance and memo.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Run {
+    pub apply: Apply,
+    pub output: Id,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Object {
     Blob(Vec<u8>),
     Rep(Vec<Slice>),
     Tree(Vec<TreeEntry>),
     Commit(Commit),
+    Apply(Apply),
+    Run(Run),
 }
 
 impl Object {
@@ -92,8 +112,49 @@ impl Object {
                     .for_each(|p| out.extend_from_slice(p.as_bytes()));
                 put_str(&mut out, &c.message);
             }
+            Object::Apply(a) => put_apply(&mut out, b'A', a),
+            Object::Run(run) => {
+                put_apply(&mut out, b'X', &run.apply);
+                out.extend_from_slice(run.output.as_bytes());
+            }
         }
         out
+    }
+
+    /// Outgoing edges `(label, target)`: the object graph that gc walks and
+    /// that connectivity queries read.
+    pub fn links(&self) -> Vec<(String, Id)> {
+        let apply_links = |a: &Apply| {
+            let args = a
+                .args
+                .iter()
+                .enumerate()
+                .map(|(i, id)| (format!("arg{i}"), *id));
+            std::iter::once(("func".to_string(), a.func))
+                .chain(args)
+                .collect::<Vec<_>>()
+        };
+        match self {
+            Object::Blob(_) => vec![],
+            Object::Rep(slices) => {
+                let mut srcs: Vec<Id> = slices.iter().map(|s| s.src).collect();
+                srcs.sort();
+                srcs.dedup();
+                srcs.into_iter()
+                    .map(|id| ("slice".to_string(), id))
+                    .collect()
+            }
+            Object::Tree(entries) => entries.iter().map(|e| (e.name.clone(), e.id)).collect(),
+            Object::Commit(c) => std::iter::once(("tree".to_string(), c.tree))
+                .chain(c.parents.iter().map(|p| ("parent".to_string(), *p)))
+                .collect(),
+            Object::Apply(a) => apply_links(a),
+            Object::Run(run) => {
+                let mut links = apply_links(&run.apply);
+                links.push(("output".to_string(), run.output));
+                links
+            }
+        }
     }
 
     pub fn decode(bytes: &[u8]) -> Result<Object, Error> {
@@ -116,6 +177,17 @@ impl Object {
                 tree: r.id()?,
                 parents: r.many(Reader::id)?,
                 message: r.string()?,
+            }),
+            b'A' => Object::Apply(Apply {
+                func: r.id()?,
+                args: r.many(Reader::id)?,
+            }),
+            b'X' => Object::Run(Run {
+                apply: Apply {
+                    func: r.id()?,
+                    args: r.many(Reader::id)?,
+                },
+                output: r.id()?,
             }),
             _ => return Err(Error::Decode("unknown object tag")),
         };
@@ -151,6 +223,15 @@ fn decode_tree(r: &mut Reader) -> Result<Object, Error> {
         return Err(Error::Decode("tree names not strictly ascending"));
     }
     Ok(Object::Tree(entries))
+}
+
+fn put_apply(out: &mut Vec<u8>, tag: u8, a: &Apply) {
+    out.push(tag);
+    out.extend_from_slice(a.func.as_bytes());
+    put_u32(out, a.args.len());
+    a.args
+        .iter()
+        .for_each(|id| out.extend_from_slice(id.as_bytes()));
 }
 
 fn put_u32(out: &mut Vec<u8>, n: usize) {
