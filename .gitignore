@@ -49,3 +49,6 @@ tests/fixtures/wiki/enwik9
 /.vibe/
 /.windsurf/
 /.zencoder/
+
+# Rust build output
+packages/kernel/target/
