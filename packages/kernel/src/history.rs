@@ -1,8 +1,9 @@
-//! Commits, refs, history and garbage collection.
+//! Commits, refs, history, garbage collection and verification.
 
 use std::collections::HashSet;
 
-use crate::{Commit, Error, Id, Object, Repo, Store};
+use crate::repo::{Cx, decode_plain};
+use crate::{Arg, Commit, Derivation, Error, Id, Kind, Object, Repo, Store, func};
 
 impl<S: Store> Repo<S> {
     /// Advance `name` to a new commit of `tree` whose parent is the ref's
@@ -46,20 +47,19 @@ impl<S: Store> Repo<S> {
         }
     }
 
-    /// Re-verify every stored object: content is fully reconstructed and
-    /// hash-checked, other objects are hash-checked. Run this after upgrading
-    /// dependencies that reconstruction relies on. Returns the failures.
+    /// Re-verify every stored object: stored content against its id,
+    /// trees/commits/derivations against their hash, and every derivation by
+    /// evaluating it. Run after upgrading dependencies that reconstruction
+    /// relies on. Returns the failing object ids.
     pub fn fsck(&self) -> Result<Vec<(Id, Error)>, Error> {
         let mut failures = Vec::new();
         for id in self.store.ids()? {
-            let content = matches!(
-                self.store.read(&id)?.first(),
-                Some(b'B' | b'Z' | b'R' | b'A')
-            );
-            let result = if content {
-                self.read_content(&id).map(drop)
-            } else {
-                self.get(&id).map(drop)
+            let encoded = self.store.read(&id)?;
+            let result = match decode_plain(&id, &encoded) {
+                Ok(bytes) if Id::of_content(&bytes) == id => Ok(()),
+                Ok(_) => Err(Error::Corrupt(id)),
+                Err(Error::WrongKind(_)) => self.check_object(&id),
+                Err(e) => Err(e),
             };
             if let Err(e) = result {
                 failures.push((id, e));
@@ -68,41 +68,81 @@ impl<S: Store> Repo<S> {
         Ok(failures)
     }
 
-    /// Delete every object that no ref reaches. Run records are kept while
-    /// their output is kept, so live content retains its provenance.
-    /// Returns the number of objects deleted.
-    pub fn gc(&mut self) -> Result<usize, Error> {
-        let all = self.store.ids()?;
-        let runs: Vec<(Id, Id)> = all
-            .iter()
-            .filter_map(|id| match self.get(id) {
-                Ok(Object::Run(run)) => Some((*id, run.output)),
-                _ => None,
-            })
-            .collect();
-        let mut live = HashSet::new();
+    fn check_object(&self, id: &Id) -> Result<(), Error> {
+        if let Object::Derivation(d) = self.get(id)? {
+            let out = self.eval(&d.func, &d.args, &mut Cx::default())?;
+            if Id::of_content(&out) != d.output {
+                return Err(Error::Corrupt(*id));
+            }
+        }
+        Ok(())
+    }
+
+    /// Ids reachable from refs: tree/commit objects, and the file content
+    /// ids those trees name.
+    pub(crate) fn reachable(&self) -> Result<(HashSet<Id>, Vec<Id>), Error> {
+        let (mut objects, mut files) = (HashSet::new(), Vec::new());
         let mut stack: Vec<Id> = self.store.refs()?.into_iter().map(|(_, id)| id).collect();
-        loop {
-            while let Some(id) = stack.pop() {
-                if self.store.has(&id) && live.insert(id) {
-                    stack.extend(self.links(&id)?.into_iter().map(|(_, target)| target));
+        while let Some(id) = stack.pop() {
+            if !objects.insert(id) {
+                continue;
+            }
+            match self.get(&id) {
+                Ok(Object::Commit(c)) => stack.extend(std::iter::once(c.tree).chain(c.parents)),
+                Ok(Object::Tree(entries)) => {
+                    for e in entries {
+                        if e.kind == Kind::Tree {
+                            stack.push(e.id)
+                        } else {
+                            files.push(e.id)
+                        }
+                    }
                 }
-            }
-            stack.extend(
-                runs.iter()
-                    .filter(|(run, out)| live.contains(out) && !live.contains(run))
-                    .map(|(run, _)| *run),
-            );
-            if stack.is_empty() {
-                break;
+                _ => {}
             }
         }
-        let dead: Vec<&Id> = all.iter().filter(|id| !live.contains(*id)).collect();
-        for id in &dead {
-            self.store.delete(id)?;
+        Ok((objects, files))
+    }
+
+    /// Content ids `roots` depend on through derivations accepted by
+    /// `follow`, with the ids of those derivation records.
+    pub(crate) fn closure(
+        &self,
+        mut stack: Vec<Id>,
+        follow: impl Fn(&Derivation) -> bool,
+    ) -> Result<(HashSet<Id>, HashSet<Id>), Error> {
+        let (mut content, mut records) = (HashSet::new(), HashSet::new());
+        while let Some(c) = stack.pop() {
+            if !content.insert(c) {
+                continue;
+            }
+            for d in self.derivations(&c)?.into_iter().filter(|d| follow(d)) {
+                if !func::is_builtin(&d.func) {
+                    stack.push(d.func);
+                }
+                stack.extend(d.args.iter().map(Arg::id));
+                records.insert(Object::Derivation(d).id());
+            }
         }
-        self.index = None;
-        self.runs = None;
-        Ok(dead.len())
+        Ok((content, records))
+    }
+
+    /// Delete every object that no ref needs. Every derivation of live
+    /// content is kept along with its inputs, so live content stays
+    /// reconstructible and keeps its provenance. Returns the number of
+    /// objects deleted.
+    pub fn gc(&mut self) -> Result<usize, Error> {
+        let (mut objects, files) = self.reachable()?;
+        let (content, records) = self.closure(files, |_| true)?;
+        objects.extend(records);
+        let mut deleted = 0;
+        for id in self.store.ids()? {
+            if !objects.contains(&id) && !content.contains(&id) {
+                self.store.delete(&id)?;
+                deleted += 1;
+            }
+        }
+        self.reset_projections();
+        Ok(deleted)
     }
 }

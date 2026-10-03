@@ -1,19 +1,21 @@
 //! L0 objects and their canonical encoding.
 //!
 //! Encoding (u32/u64 are big-endian):
-//!   blob   = "B" bytes
-//!   rep    = "R" count:u32 { src[32] start:u64 len:u64 }
-//!   tree   = "T" count:u32 { name_len:u32 name kind("F"|"T") id[32] }   names strictly ascending
-//!   commit = "C" tree[32] nparents:u32 { parent[32] } msg_len:u32 msg
-//!   apply  = "A" func[32] nargs:u32 { arg[32] }
-//!   run    = "X" func[32] nargs:u32 { arg[32] } output[32]
+//!   blob       = "B" bytes                     (storage variant "Z" zstd(bytes), same id)
+//!   tree       = "T" count:u32 { name_len:u32 name kind("F"|"T") id[32] }   names strictly ascending
+//!   commit     = "C" tree[32] nparents:u32 { parent[32] } msg_len:u32 msg
+//!   derivation = "D" output[32] func[32] nargs:u32 { arg }
+//!   arg        = 0 id[32] | 1 id[32] start:u64 len:u64              (whole content | byte range)
 //!
-//! Trees, commits and runs are named by `BLAKE3(encoding)`. A file's identity
-//! is the id of its blob form. `Rep` (slices of other blobs) and `Apply` (a
-//! pure function of other files) are alternative storage forms kept under
-//! that same id, so how a file is stored never changes what it is called.
-//! Fragments are therefore values (blobs), references (reps) or function
-//! applications (applies); all three must reproduce the identical bytes.
+//! A file's identity is the id of its blob form, `Id::of_content(bytes)`.
+//! Trees, commits and derivations are named by `BLAKE3(encoding)`.
+//!
+//! A derivation is a ledger entry: `output = func(args)`, verified by
+//! reproducing the output's exact bytes before it is recorded. One output may
+//! have many derivations. Whether an output's bytes are also stored is a
+//! separate, cost-driven choice, so fragments can be values (stored bytes),
+//! references (byte ranges of other content) or function applications, and
+//! all of them name the same bytes.
 //! Decoding is strict: `encode(decode(b)) == b` whenever it succeeds.
 
 use crate::{Error, Id};
@@ -32,41 +34,52 @@ pub struct TreeEntry {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Slice {
-    pub src: Id,
-    pub start: u64,
-    pub len: u64,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Commit {
     pub tree: Id,
     pub parents: Vec<Id>,
     pub message: String,
 }
 
-/// `func` applied to the contents of `args`.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Apply {
-    pub func: Id,
-    pub args: Vec<Id>,
+/// A selector: all of a content's bytes, or a byte range of them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum Arg {
+    Whole(Id),
+    Range { id: Id, start: u64, len: u64 },
 }
 
-/// A record that evaluating `apply` produced `output`: provenance and memo.
+impl Arg {
+    pub fn id(&self) -> Id {
+        match self {
+            Arg::Whole(id) | Arg::Range { id, .. } => *id,
+        }
+    }
+}
+
+/// `output = func(args)`, recorded only after it has been verified.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Run {
-    pub apply: Apply,
+pub struct Derivation {
     pub output: Id,
+    pub func: Id,
+    pub args: Vec<Arg>,
+}
+
+impl Derivation {
+    /// Identity of the computation alone (func and args, not output): the
+    /// memo key for pure functions.
+    pub fn key(func: &Id, args: &[Arg]) -> Id {
+        let mut out = vec![b'K'];
+        out.extend_from_slice(func.as_bytes());
+        put_args(&mut out, args);
+        Id::of(&out)
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Object {
     Blob(Vec<u8>),
-    Rep(Vec<Slice>),
     Tree(Vec<TreeEntry>),
     Commit(Commit),
-    Apply(Apply),
-    Run(Run),
+    Derivation(Derivation),
 }
 
 impl Object {
@@ -84,15 +97,6 @@ impl Object {
             Object::Blob(bytes) => {
                 out.push(b'B');
                 out.extend_from_slice(bytes);
-            }
-            Object::Rep(slices) => {
-                out.push(b'R');
-                put_u32(&mut out, slices.len());
-                for s in slices {
-                    out.extend_from_slice(s.src.as_bytes());
-                    out.extend_from_slice(&s.start.to_be_bytes());
-                    out.extend_from_slice(&s.len.to_be_bytes());
-                }
             }
             Object::Tree(entries) => {
                 out.push(b'T');
@@ -112,82 +116,30 @@ impl Object {
                     .for_each(|p| out.extend_from_slice(p.as_bytes()));
                 put_str(&mut out, &c.message);
             }
-            Object::Apply(a) => put_apply(&mut out, b'A', a),
-            Object::Run(run) => {
-                put_apply(&mut out, b'X', &run.apply);
-                out.extend_from_slice(run.output.as_bytes());
+            Object::Derivation(d) => {
+                out.push(b'D');
+                out.extend_from_slice(d.output.as_bytes());
+                out.extend_from_slice(d.func.as_bytes());
+                put_args(&mut out, &d.args);
             }
         }
         out
-    }
-
-    /// Outgoing edges `(label, target)`: the object graph that gc walks and
-    /// that connectivity queries read.
-    pub fn links(&self) -> Vec<(String, Id)> {
-        let apply_links = |a: &Apply| {
-            let args = a
-                .args
-                .iter()
-                .enumerate()
-                .map(|(i, id)| (format!("arg{i}"), *id));
-            std::iter::once(("func".to_string(), a.func))
-                .chain(args)
-                .collect::<Vec<_>>()
-        };
-        match self {
-            Object::Blob(_) => vec![],
-            Object::Rep(slices) => {
-                let mut srcs: Vec<Id> = slices.iter().map(|s| s.src).collect();
-                srcs.sort();
-                srcs.dedup();
-                srcs.into_iter()
-                    .map(|id| ("slice".to_string(), id))
-                    .collect()
-            }
-            Object::Tree(entries) => entries.iter().map(|e| (e.name.clone(), e.id)).collect(),
-            Object::Commit(c) => std::iter::once(("tree".to_string(), c.tree))
-                .chain(c.parents.iter().map(|p| ("parent".to_string(), *p)))
-                .collect(),
-            Object::Apply(a) => apply_links(a),
-            Object::Run(run) => {
-                let mut links = apply_links(&run.apply);
-                links.push(("output".to_string(), run.output));
-                links
-            }
-        }
     }
 
     pub fn decode(bytes: &[u8]) -> Result<Object, Error> {
         let mut r = Reader(bytes);
         let obj = match r.take(1)?[0] {
             b'B' => Object::Blob(r.rest().to_vec()),
-            b'R' => Object::Rep(r.many(|r| {
-                let s = Slice {
-                    src: r.id()?,
-                    start: r.u64()?,
-                    len: r.u64()?,
-                };
-                if s.len == 0 {
-                    return Err(Error::Decode("empty slice"));
-                }
-                Ok(s)
-            })?),
             b'T' => decode_tree(&mut r)?,
             b'C' => Object::Commit(Commit {
                 tree: r.id()?,
                 parents: r.many(Reader::id)?,
                 message: r.string()?,
             }),
-            b'A' => Object::Apply(Apply {
-                func: r.id()?,
-                args: r.many(Reader::id)?,
-            }),
-            b'X' => Object::Run(Run {
-                apply: Apply {
-                    func: r.id()?,
-                    args: r.many(Reader::id)?,
-                },
+            b'D' => Object::Derivation(Derivation {
                 output: r.id()?,
+                func: r.id()?,
+                args: r.many(Reader::arg)?,
             }),
             _ => return Err(Error::Decode("unknown object tag")),
         };
@@ -197,6 +149,34 @@ impl Object {
 
     pub fn id(&self) -> Id {
         Id::of(&self.encode())
+    }
+
+    /// Outgoing edges `(label, target)`. Range selectors keep their offsets
+    /// in the label, so the graph says which part of a source is used.
+    pub fn links(&self) -> Vec<(String, Id)> {
+        match self {
+            Object::Blob(_) => vec![],
+            Object::Tree(entries) => entries.iter().map(|e| (e.name.clone(), e.id)).collect(),
+            Object::Commit(c) => std::iter::once(("tree".to_string(), c.tree))
+                .chain(c.parents.iter().map(|p| ("parent".to_string(), *p)))
+                .collect(),
+            Object::Derivation(d) => {
+                let mut links = vec![
+                    ("output".to_string(), d.output),
+                    ("func".to_string(), d.func),
+                ];
+                for (i, a) in d.args.iter().enumerate() {
+                    let label = match a {
+                        Arg::Whole(_) => format!("arg{i}"),
+                        Arg::Range { start, len, .. } => {
+                            format!("arg{i}[{start}..{}]", start + len)
+                        }
+                    };
+                    links.push((label, a.id()));
+                }
+                links
+            }
+        }
     }
 }
 
@@ -225,13 +205,22 @@ fn decode_tree(r: &mut Reader) -> Result<Object, Error> {
     Ok(Object::Tree(entries))
 }
 
-fn put_apply(out: &mut Vec<u8>, tag: u8, a: &Apply) {
-    out.push(tag);
-    out.extend_from_slice(a.func.as_bytes());
-    put_u32(out, a.args.len());
-    a.args
-        .iter()
-        .for_each(|id| out.extend_from_slice(id.as_bytes()));
+fn put_args(out: &mut Vec<u8>, args: &[Arg]) {
+    put_u32(out, args.len());
+    for a in args {
+        match a {
+            Arg::Whole(id) => {
+                out.push(0);
+                out.extend_from_slice(id.as_bytes());
+            }
+            Arg::Range { id, start, len } => {
+                out.push(1);
+                out.extend_from_slice(id.as_bytes());
+                out.extend_from_slice(&start.to_be_bytes());
+                out.extend_from_slice(&len.to_be_bytes());
+            }
+        }
+    }
 }
 
 fn put_u32(out: &mut Vec<u8>, n: usize) {
@@ -247,10 +236,10 @@ struct Reader<'a>(&'a [u8]);
 
 impl<'a> Reader<'a> {
     fn take(&mut self, n: usize) -> Result<&'a [u8], Error> {
-        if self.0.len() < n {
-            return Err(Error::Decode("truncated"));
-        }
-        let (head, tail) = self.0.split_at(n);
+        let (head, tail) = self
+            .0
+            .split_at_checked(n)
+            .ok_or(Error::Decode("truncated"))?;
         self.0 = tail;
         Ok(head)
     }
@@ -269,6 +258,20 @@ impl<'a> Reader<'a> {
 
     fn id(&mut self) -> Result<Id, Error> {
         Ok(Id::from_bytes(self.take(32)?.try_into().unwrap()))
+    }
+
+    fn arg(&mut self) -> Result<Arg, Error> {
+        match self.take(1)?[0] {
+            0 => Ok(Arg::Whole(self.id()?)),
+            1 => {
+                let (id, start, len) = (self.id()?, self.u64()?, self.u64()?);
+                if len == 0 || start.checked_add(len).is_none() {
+                    return Err(Error::Decode("empty or overflowing range"));
+                }
+                Ok(Arg::Range { id, start, len })
+            }
+            _ => Err(Error::Decode("unknown arg tag")),
+        }
     }
 
     fn string(&mut self) -> Result<String, Error> {

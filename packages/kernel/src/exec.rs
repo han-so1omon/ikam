@@ -1,53 +1,48 @@
 //! Execution and graph connectivity.
 //!
-//! `apply` evaluates a pure function and records a `Run` (apply -> output).
-//! The run record is both the memo entry and the provenance edge. Because
-//! every function is pure (builtins, or sandboxed WASM without imports or
-//! floats), a recorded output stays valid forever.
+//! `apply` evaluates a pure function and records the derivation
+//! `output = func(args)`. That ledger entry is the memo, the provenance edge,
+//! and a storage option (`repack` may drop the output's bytes and rely on
+//! it). Functions are pure (builtins, or sandboxed WASM without imports), so
+//! a recorded derivation stays valid forever.
 
-use std::collections::HashMap;
-
-use crate::{Apply, Error, Id, Object, Repo, Run, Store};
+use crate::repo::{Cx, decode_plain};
+use crate::{Arg, Derivation, Error, Id, Object, Repo, Store};
 
 impl<S: Store> Repo<S> {
-    /// Evaluate `apply`, reusing a recorded run when one exists. Returns the
-    /// output's content id.
-    pub fn apply(&mut self, apply: Apply) -> Result<Id, Error> {
-        let key = Object::Apply(apply.clone()).id();
-        self.ensure_runs()?;
-        if let Some(out) = self.runs.as_ref().unwrap().get(&key)
-            && self.store.has(out)
+    /// Evaluate `func(args)`, reusing a recorded derivation when one exists.
+    /// Returns the output's content id.
+    pub fn apply(&mut self, func: Id, args: Vec<Arg>) -> Result<Id, Error> {
+        if let Some(out) = self
+            .ledger()?
+            .by_key
+            .get(&Derivation::key(&func, &args))
+            .copied()
+            && self.has_content(&out)?
         {
-            return Ok(*out);
+            return Ok(out);
         }
-        let bytes = self.eval(&apply, 0)?;
+        let bytes = self.eval(&func, &args, &mut Cx::default())?;
         let output = self.put_content(&bytes)?.id;
-        self.put(&Object::Run(Run { apply, output }))?;
-        self.runs.as_mut().unwrap().insert(key, output);
+        self.record(Derivation { output, func, args })?;
         Ok(output)
     }
 
-    fn ensure_runs(&mut self) -> Result<(), Error> {
-        if self.runs.is_none() {
-            let mut runs = HashMap::new();
-            for id in self.store.ids()? {
-                if let Ok(Object::Run(run)) = self.get(&id) {
-                    runs.insert(Object::Apply(run.apply).id(), run.output);
-                }
-            }
-            self.runs = Some(runs);
-        }
-        Ok(())
-    }
-
-    /// Outgoing edges of any stored object or content: slice sources,
-    /// function and argument ids, tree entries, commit parents, run outputs.
+    /// Outgoing edges of a stored object, or of a content id (its
+    /// derivation records, labelled "derivation").
     pub fn links(&self, id: &Id) -> Result<Vec<(String, Id)>, Error> {
-        let encoded = self.store.read(id)?;
-        match encoded.first() {
-            Some(b'B' | b'Z') => Ok(vec![]),
-            _ => Ok(Object::decode(&encoded)?.links()),
+        let mut out = match self.store.read(id) {
+            Ok(encoded) if decode_plain(id, &encoded).is_err() => Object::decode(&encoded)?.links(),
+            Ok(_) | Err(Error::NotFound(_)) => vec![],
+            Err(e) => return Err(e),
+        };
+        for d in self.derivations(id)? {
+            out.push(("derivation".to_string(), Object::Derivation(d).id()));
         }
+        if out.is_empty() && !self.has_content(id)? {
+            return Err(Error::NotFound(*id));
+        }
+        Ok(out)
     }
 
     /// Incoming edges: every stored object that links to `id`, with the
@@ -56,7 +51,11 @@ impl<S: Store> Repo<S> {
     pub fn used_by(&self, id: &Id) -> Result<Vec<(Id, String)>, Error> {
         let mut out = Vec::new();
         for src in self.store.ids()? {
-            for (label, target) in self.links(&src)? {
+            let encoded = self.store.read(&src)?;
+            if decode_plain(&src, &encoded).is_ok() {
+                continue;
+            }
+            for (label, target) in Object::decode(&encoded)?.links() {
                 if target == *id {
                     out.push((src, label));
                 }

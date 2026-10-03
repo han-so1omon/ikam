@@ -4,7 +4,7 @@ use std::io::Write;
 use std::path::Path;
 use std::process::ExitCode;
 
-use ikam_kernel::{Apply, FsStore, Id, Object, Repo, snapshot};
+use ikam_kernel::{Arg, FsStore, Id, Object, Repo, snapshot};
 
 const USAGE: &str = "usage: ikam [--store DIR] <command>
   put FILE                         store a file, print its content id
@@ -12,13 +12,15 @@ const USAGE: &str = "usage: ikam [--store DIR] <command>
   commit DIR [-m MSG] [--ref REF]  snapshot DIR and advance REF (default main)
   log [REV]                        first-parent history of REV (default main)
   checkout REV DEST                write REV's tree into new directory DEST
-  show ID                          print a tree, commit or run record
+  show ID                          print a tree, commit or derivation record
   apply FUNC ARG...                run function FUNC (a stored WASM module id) on
                                    stored contents, print the output id (memoized)
-  links ID                         outgoing graph edges of an object
+  links ID                         outgoing graph edges of an object or content
   used-by ID                       incoming graph edges (objects that link to ID)
   fsck                             reconstruct and verify every stored object
-  gc                               delete objects unreachable from any ref";
+  gc                               delete objects unreachable from any ref
+  repack                           re-plan storage of all live content; applied
+                                   only if smaller and fully verified";
 
 fn main() -> ExitCode {
     let mut args: Vec<String> = std::env::args().skip(1).collect();
@@ -85,20 +87,19 @@ fn run(store_dir: &str, args: &mut Vec<String>) -> Result<(), String> {
             Object::Commit(c) => {
                 println!("tree {}\nparents {:?}\n\n{}", c.tree, c.parents, c.message)
             }
-            Object::Run(r) => println!(
-                "func {}\nargs {:?}\noutput {}",
-                r.apply.func, r.apply.args, r.output
-            ),
+            Object::Derivation(d) => {
+                println!("output {}\nfunc {}\nargs {:?}", d.output, d.func, d.args)
+            }
             _ => unreachable!(),
         },
         Some("apply") => {
             let func = repo.resolve(&arg(1)?).map_err(err)?;
             let args = args[2..]
                 .iter()
-                .map(|a| a.parse::<Id>())
+                .map(|a| a.parse::<Id>().map(Arg::Whole))
                 .collect::<Result<_, _>>()
                 .map_err(err)?;
-            println!("{}", repo.apply(Apply { func, args }).map_err(err)?);
+            println!("{}", repo.apply(func, args).map_err(err)?);
         }
         Some("links") => {
             for (label, id) in repo
@@ -125,6 +126,13 @@ fn run(store_dir: &str, args: &mut Vec<String>) -> Result<(), String> {
                 return Err(format!("{} objects failed verification", failures.len()));
             }
             println!("ok");
+        }
+        Some("repack") => {
+            let r = repo.repack().map_err(err)?;
+            println!(
+                "before={} after={} applied={}",
+                r.before, r.after, r.applied
+            );
         }
         Some("gc") => println!("deleted {} objects", repo.gc().map_err(err)?),
         _ => return Err(USAGE.into()),
