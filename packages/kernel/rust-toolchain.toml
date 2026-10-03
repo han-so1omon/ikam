@@ -1,0 +1,6 @@
+# Pinned toolchain for the kernel (rustup reads this directly; mise.toml pins
+# the same version). Rust >= 1.88 is required for let-chains.
+[toolchain]
+channel = "1.97.0"
+components = ["clippy", "rustfmt"]
+profile = "minimal"
