@@ -2,7 +2,7 @@
 
 use std::path::{Path, PathBuf};
 
-use ikam_kernel::{Apply, Error, Form, Id, Kind, MemStore, Object, Repo, TreeEntry, func};
+use ikam_kernel::{Arg, Error, Form, Id, Kind, MemStore, Object, Repo, Store, TreeEntry, func};
 use proptest::prelude::*;
 
 fn fixtures(ext: &str) -> Vec<PathBuf> {
@@ -24,21 +24,21 @@ fn fixtures(ext: &str) -> Vec<PathBuf> {
 }
 
 #[test]
-fn zip_containers_are_stored_as_verified_applies() {
+fn zip_containers_are_stored_as_verified_derivations() {
     let files = fixtures("xlsx");
     assert!(files.len() >= 2, "xlsx fixtures missing");
     let mut repo = Repo::new(MemStore::default());
     for path in &files[..2] {
         let bytes = std::fs::read(path).unwrap();
         let put = repo.put_content(&bytes).unwrap();
-        assert_eq!(put.form, Form::Apply, "{}", path.display());
+        assert_eq!(put.form, Form::Derived, "{}", path.display());
         assert_eq!(repo.read_content(&put.id).unwrap(), bytes);
         // The members are first-class content, reachable as graph edges.
-        let links = repo.links(&put.id).unwrap();
-        assert_eq!(links[0], ("func".to_string(), func::deflate_pack()));
-        assert!(links.len() > 2);
-        for (_, member) in &links[1..] {
-            assert!(!repo.used_by(member).unwrap().is_empty());
+        let d = &repo.derivations(&put.id).unwrap()[0];
+        assert_eq!(d.func, func::deflate_pack());
+        assert!(d.args.len() > 2);
+        for member in &d.args {
+            assert!(!repo.used_by(&member.id()).unwrap().is_empty());
         }
     }
 }
@@ -116,7 +116,7 @@ fn text(n: usize) -> Vec<u8> {
 }
 
 #[test]
-fn semantic_dedup_stores_a_verified_function_application() {
+fn semantic_dedup_records_a_verified_function_application() {
     let mut repo = Repo::new(MemStore::default());
     let upper = store_module(&mut repo, UPPER);
     let x = text(20_000);
@@ -124,18 +124,16 @@ fn semantic_dedup_stores_a_verified_function_application() {
     let y = x.to_ascii_uppercase();
     let before = repo.bytes_written;
     let put = repo
-        .put_apply(
-            &y,
-            Apply {
-                func: upper,
-                args: vec![x_id],
-            },
-        )
+        .put_derivation(&y, upper, vec![Arg::Whole(x_id)])
         .unwrap()
         .unwrap();
-    assert_eq!(put.form, Form::Apply);
+    assert_eq!(put.form, Form::Derived);
     assert_eq!(put.id, Id::of_content(&y));
-    assert_eq!(repo.bytes_written - before, 1 + 32 + 4 + 32);
+    assert_eq!(
+        repo.bytes_written - before,
+        1 + 32 + 32 + 4 + 33,
+        "one derivation record"
+    );
     assert_eq!(repo.read_content(&put.id).unwrap(), y);
 
     // A proposal that does not reproduce the bytes is rejected, nothing written.
@@ -143,43 +141,69 @@ fn semantic_dedup_stores_a_verified_function_application() {
     wrong[100] = b'!';
     let before = repo.bytes_written;
     assert!(
-        repo.put_apply(
-            &wrong,
-            Apply {
-                func: upper,
-                args: vec![x_id]
-            }
-        )
-        .unwrap()
-        .is_none()
+        repo.put_derivation(&wrong, upper, vec![Arg::Whole(x_id)])
+            .unwrap()
+            .is_none()
     );
     assert_eq!(repo.bytes_written, before);
 }
 
 #[test]
-fn runs_are_memoized_provenance() {
+fn applies_are_memoized_provenance() {
     let mut repo = Repo::new(MemStore::default());
     let upper = store_module(&mut repo, UPPER);
     let x_id = repo.put_content(b"hello graph").unwrap().id;
-    let apply = Apply {
-        func: upper,
-        args: vec![x_id],
-    };
-    let out = repo.apply(apply.clone()).unwrap();
+    let out = repo.apply(upper, vec![Arg::Whole(x_id)]).unwrap();
     assert_eq!(repo.read_content(&out).unwrap(), b"HELLO GRAPH");
     let after_first = repo.bytes_written;
-    assert_eq!(repo.apply(apply).unwrap(), out);
+    assert_eq!(repo.apply(upper, vec![Arg::Whole(x_id)]).unwrap(), out);
     assert_eq!(
         repo.bytes_written, after_first,
         "second apply must hit the memo"
     );
 
     let used_by = repo.used_by(&out).unwrap();
-    assert_eq!(used_by.len(), 1, "only the run record links to the output");
+    assert_eq!(
+        used_by.len(),
+        1,
+        "only the derivation record links to the output"
+    );
     assert_eq!(used_by[0].1, "output");
-    let run_links = repo.links(&used_by[0].0).unwrap();
-    assert!(run_links.contains(&("func".to_string(), upper)));
-    assert!(run_links.contains(&("arg0".to_string(), x_id)));
+    let links = repo.links(&used_by[0].0).unwrap();
+    assert!(links.contains(&("func".to_string(), upper)));
+    assert!(links.contains(&("arg0".to_string(), x_id)));
+    assert_eq!(
+        repo.links(&out).unwrap(),
+        [("derivation".to_string(), used_by[0].0)]
+    );
+}
+
+#[test]
+fn repack_drops_bytes_a_derivation_rebuilds() {
+    let mut repo = Repo::new(MemStore::default());
+    let upper = store_module(&mut repo, UPPER);
+    let x_id = repo.put_content(&text(20_000)).unwrap().id;
+    let y_id = repo.apply(upper, vec![Arg::Whole(x_id)]).unwrap();
+    assert!(repo.store().has(&y_id), "apply stores its output as bytes");
+    let tree = repo
+        .put(
+            &Object::tree(vec![TreeEntry {
+                name: "y".into(),
+                kind: Kind::File,
+                id: y_id,
+            }])
+            .unwrap(),
+        )
+        .unwrap();
+    repo.commit("main", tree, "").unwrap();
+    let r = repo.repack().unwrap();
+    assert!(r.applied && r.after < r.before, "{r:?}");
+    assert!(!repo.store().has(&y_id), "y is now rebuilt from x");
+    assert_eq!(
+        repo.read_content(&y_id).unwrap(),
+        text(20_000).to_ascii_uppercase()
+    );
+    assert!(repo.fsck().unwrap().is_empty());
 }
 
 #[test]
@@ -188,18 +212,8 @@ fn gc_keeps_provenance_of_live_outputs_only() {
     let upper = store_module(&mut repo, UPPER);
     let kept_in = repo.put_content(b"kept").unwrap().id;
     let dropped_in = repo.put_content(b"dropped").unwrap().id;
-    let kept = repo
-        .apply(Apply {
-            func: upper,
-            args: vec![kept_in],
-        })
-        .unwrap();
-    let dropped = repo
-        .apply(Apply {
-            func: upper,
-            args: vec![dropped_in],
-        })
-        .unwrap();
+    let kept = repo.apply(upper, vec![Arg::Whole(kept_in)]).unwrap();
+    let dropped = repo.apply(upper, vec![Arg::Whole(dropped_in)]).unwrap();
     let tree = repo
         .put(
             &Object::tree(vec![TreeEntry {
@@ -213,13 +227,13 @@ fn gc_keeps_provenance_of_live_outputs_only() {
     repo.commit("main", tree, "").unwrap();
     repo.gc().unwrap();
 
-    let (run, _) = repo
+    let (record, _) = repo
         .used_by(&kept)
         .unwrap()
         .into_iter()
         .find(|(_, label)| label == "output")
         .unwrap();
-    assert!(matches!(repo.get(&run), Ok(Object::Run(_))));
+    assert!(matches!(repo.get(&record), Ok(Object::Derivation(_))));
     assert_eq!(
         repo.read_content(&upper).unwrap(),
         wat::parse_str(UPPER).unwrap(),
@@ -255,13 +269,7 @@ fn sandbox_rejects_impure_or_unbounded_modules() {
     for wat in &cases {
         let f = store_module(&mut repo, wat);
         assert!(
-            matches!(
-                repo.apply(Apply {
-                    func: f,
-                    args: vec![x]
-                }),
-                Err(Error::Exec(_))
-            ),
+            matches!(repo.apply(f, vec![Arg::Whole(x)]), Err(Error::Exec(_))),
             "{wat}"
         );
     }

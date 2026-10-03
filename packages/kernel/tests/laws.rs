@@ -1,11 +1,12 @@
 //! Property tests for the kernel laws in docs/plans/2026-10-02-rust-kernel.md.
 
 use std::fs;
+use std::path::Path;
 
-use ikam_kernel::matcher::{MIN_MATCH, Part};
+use ikam_kernel::matcher::MIN_MATCH;
 use ikam_kernel::{
-    Apply, Commit, Error, Form, FsStore, Id, Kind, MemStore, Object, Repo, Run, Slice, Store,
-    TreeEntry, snapshot,
+    Arg, Commit, Derivation, Error, Form, FsStore, Id, Kind, MemStore, Object, Repo, Store,
+    TreeEntry, func, snapshot,
 };
 use proptest::prelude::*;
 
@@ -13,12 +14,18 @@ fn any_id() -> impl Strategy<Value = Id> {
     any::<[u8; 32]>().prop_map(Id::from_bytes)
 }
 
+fn any_arg() -> impl Strategy<Value = Arg> {
+    prop_oneof![
+        any_id().prop_map(Arg::Whole),
+        (any_id(), 0..u64::MAX / 2, 1..u64::MAX / 2).prop_map(|(id, start, len)| Arg::Range {
+            id,
+            start,
+            len
+        }),
+    ]
+}
+
 fn any_object() -> impl Strategy<Value = Object> {
-    let slice = (any_id(), any::<u64>(), 1..u64::MAX).prop_map(|(src, start, len)| Slice {
-        src,
-        start,
-        len,
-    });
     let entry = ("[a-z]{1,8}", any::<bool>(), any_id()).prop_map(|(name, f, id)| TreeEntry {
         name,
         kind: if f { Kind::File } else { Kind::Tree },
@@ -33,22 +40,17 @@ fn any_object() -> impl Strategy<Value = Object> {
             })
         },
     );
-    let apply = || {
-        (any_id(), prop::collection::vec(any_id(), 0..4))
-            .prop_map(|(func, args)| Apply { func, args })
-    };
-    let run = (apply(), any_id()).prop_map(|(apply, output)| Object::Run(Run { apply, output }));
+    let derivation = (any_id(), any_id(), prop::collection::vec(any_arg(), 0..5))
+        .prop_map(|(output, func, args)| Object::Derivation(Derivation { output, func, args }));
     prop_oneof![
         prop::collection::vec(any::<u8>(), 0..256).prop_map(Object::Blob),
-        prop::collection::vec(slice, 0..6).prop_map(Object::Rep),
         prop::collection::btree_map("[a-z]{1,8}", entry, 0..6).prop_map(|m| Object::Tree(
             m.into_iter()
                 .map(|(name, e)| TreeEntry { name, ..e })
                 .collect()
         )),
         commit,
-        apply().prop_map(Object::Apply),
-        run,
+        derivation,
     ]
 }
 
@@ -61,17 +63,27 @@ fn edits() -> impl Strategy<Value = Vec<(f64, usize, Vec<u8>)>> {
     prop::collection::vec((0.0..1.0f64, 0..64usize, bytes(64)), 1..12)
 }
 
-fn apply(base: &[u8], (at, del, ins): &(f64, usize, Vec<u8>)) -> Vec<u8> {
+fn edit(base: &[u8], (at, del, ins): &(f64, usize, Vec<u8>)) -> Vec<u8> {
     let i = (at * base.len() as f64) as usize;
     let j = (i + del).min(base.len());
     [&base[..i], ins, &base[j..]].concat()
 }
 
-fn rep_slices<S: Store>(repo: &Repo<S>, id: &Id) -> Vec<Slice> {
-    match Object::decode(&repo.store().read(id).unwrap()).unwrap() {
-        Object::Rep(s) => s,
-        other => panic!("expected rep, got {other:?}"),
-    }
+fn noise(n: usize, seed: u64) -> Vec<u8> {
+    let mut state = seed | 1;
+    (0..n)
+        .map(|_| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            (state >> 56) as u8
+        })
+        .collect()
+}
+
+fn object_path(root: &Path, id: &Id) -> std::path::PathBuf {
+    let hex = id.to_hex();
+    root.join("objects").join(&hex[..2]).join(&hex[2..])
 }
 
 proptest! {
@@ -98,21 +110,21 @@ proptest! {
     }
 
     /// Every version in an edit history reads back exactly, and its id does
-    /// not depend on whether it was stored as a blob or as slices.
+    /// not depend on how it was stored.
     #[test]
     fn edit_histories_roundtrip(base in bytes(20_000), history in edits()) {
         let mut repo = Repo::new(MemStore::default());
         let mut versions = vec![base];
         for e in &history {
-            versions.push(apply(versions.last().unwrap(), e));
+            versions.push(edit(versions.last().unwrap(), e));
         }
         for v in &versions {
-            let put = repo.put_content(v).unwrap();
-            prop_assert_eq!(put.id, Id::of_content(v));
+            prop_assert_eq!(repo.put_content(v).unwrap().id, Id::of_content(v));
         }
         for v in &versions {
             prop_assert_eq!(&repo.read_content(&Id::of_content(v)).unwrap(), v);
         }
+        prop_assert!(repo.fsck().unwrap().is_empty());
     }
 
     /// Slice boundaries follow the data: an insertion at an arbitrary offset
@@ -125,38 +137,34 @@ proptest! {
         let mut repo = Repo::new(MemStore::default());
         let base_id = repo.put_content(&base).unwrap().id;
         let put = repo.put_content(&edited).unwrap();
-        prop_assert_eq!(put.form, Form::Rep);
-        let slices = rep_slices(&repo, &put.id);
-        prop_assert_eq!(&slices[0], &Slice { src: base_id, start: 0, len: k as u64 });
-        prop_assert_eq!(slices.last().unwrap().src, base_id);
+        prop_assert_eq!(put.form, Form::Derived);
+        let d = &repo.derivations(&put.id).unwrap()[0];
+        prop_assert_eq!(d.func, func::concat());
+        prop_assert_eq!(d.args[0], Arg::Range { id: base_id, start: 0, len: k as u64 });
+        prop_assert_eq!(d.args.last().unwrap().id(), base_id);
         prop_assert_eq!(repo.read_content(&put.id).unwrap(), edited);
     }
 
-    /// Arbitrary (mostly wrong) plans never lose data: invalid ones fall back.
+    /// Arbitrary (mostly wrong) derivation proposals never lose data: the
+    /// wrong ones are rejected and write nothing.
     #[test]
-    fn any_plan_is_safe(base in bytes(2000), x in bytes(2000), raw in prop::collection::vec((any::<bool>(), 0..2100usize, 0..2100usize), 0..8)) {
+    fn any_proposal_is_safe(base in bytes(2000), x in bytes(2000),
+                            raw in prop::collection::vec((0..2100u64, 1..2100u64), 0..8)) {
         let mut repo = Repo::new(MemStore::default());
         let base_id = repo.put_content(&base).unwrap().id;
-        let plan: Vec<Part> = raw.iter().map(|&(existing, a, n)| {
-            if existing { Part::Existing { src: base_id, start: a, len: n } } else { Part::Input(a..a + n) }
-        }).collect();
-        let put = repo.put_planned(&x, &plan).unwrap();
-        prop_assert_eq!(repo.read_content(&put.id).unwrap(), x);
+        let args = raw.iter().map(|&(start, len)| Arg::Range { id: base_id, start, len }).collect();
+        let before = repo.bytes_written;
+        match repo.put_derivation(&x, func::concat(), args).unwrap() {
+            Some(put) => prop_assert_eq!(repo.read_content(&put.id).unwrap(), x),
+            None => prop_assert_eq!(repo.bytes_written, before),
+        }
     }
 }
 
 #[test]
 fn incompressible_unique_content_costs_one_byte() {
     let mut repo = Repo::new(MemStore::default());
-    let mut state = 0x2545_f491_4f6c_dd1du64;
-    let x: Vec<u8> = (0..10_000)
-        .map(|_| {
-            state ^= state << 13;
-            state ^= state >> 7;
-            state ^= state << 17;
-            (state >> 56) as u8
-        })
-        .collect();
+    let x = noise(10_000, 7);
     assert_eq!(repo.put_content(&x).unwrap().form, Form::Blob);
     assert_eq!(repo.bytes_written, x.len() + 1);
 }
@@ -180,44 +188,153 @@ fn compressible_content_is_stored_compressed() {
 #[test]
 fn small_edit_stores_little() {
     let mut repo = Repo::new(MemStore::default());
-    let base: Vec<u8> = (0..50_000u32)
-        .map(|i| (i.wrapping_mul(2654435761) >> 13) as u8)
-        .collect();
+    let base = noise(50_000, 11);
     repo.put_content(&base).unwrap();
     let before = repo.bytes_written;
     let edited = [&base[..20_000], b"a small edit", &base[20_000..]].concat();
-    assert_eq!(repo.put_content(&edited).unwrap().form, Form::Rep);
+    assert_eq!(repo.put_content(&edited).unwrap().form, Form::Derived);
     let cost = repo.bytes_written - before;
     assert!(cost < 4 * MIN_MATCH, "edit cost {cost} bytes");
 }
 
+/// A range may point into content that is itself only derived: reuse is not
+/// limited to stored bytes.
 #[test]
-fn corruption_is_detected_through_reps() {
+fn ranges_may_point_into_derived_content() {
+    let mut repo = Repo::new(MemStore::default());
+    let base = noise(8000, 3);
+    repo.put_content(&base).unwrap();
+    let mid = [&base[..4000], b"--inserted--", &base[4000..]].concat();
+    let mid_id = repo.put_content(&mid).unwrap().id;
+    assert!(!repo.store().has(&mid_id), "mid is derived, not stored");
+    let tail = mid[3990..4020].to_vec();
+    let put = repo
+        .put_derivation(
+            &tail,
+            func::concat(),
+            vec![Arg::Range {
+                id: mid_id,
+                start: 3990,
+                len: 30,
+            }],
+        )
+        .unwrap()
+        .unwrap();
+    assert_eq!(repo.read_content(&put.id).unwrap(), tail);
+}
+
+/// One id may have several derivations, and a corrupt stored copy falls
+/// through to them: the read heals, while fsck still reports the damage.
+#[test]
+fn derivations_heal_a_corrupt_copy() {
     let dir = tempfile::tempdir().unwrap();
     let mut repo = Repo::new(FsStore::open(dir.path()).unwrap());
-    let base: Vec<u8> = (0..5000u32)
-        .map(|i| (i.wrapping_mul(2654435761) >> 11) as u8)
-        .collect();
-    let base_id = repo.put_content(&base).unwrap().id;
-    let edited = [&base[..2500], b"!", &base[2500..]].concat();
-    let put = repo.put_content(&edited).unwrap();
-    assert_eq!(put.form, Form::Rep);
+    let (a, b) = (noise(3000, 5), noise(3000, 9));
+    let (a_id, b_id) = (
+        repo.put_content(&a).unwrap().id,
+        repo.put_content(&b).unwrap().id,
+    );
+    let ab = [a.clone(), b.clone()].concat();
+    let ab_id = Id::of_content(&ab);
+    // Store ab's bytes directly, then record two independent derivations.
+    fs::create_dir_all(object_path(dir.path(), &ab_id).parent().unwrap()).unwrap();
+    fs::write(
+        object_path(dir.path(), &ab_id),
+        [b"B".as_slice(), &ab].concat(),
+    )
+    .unwrap();
+    let whole = vec![Arg::Whole(a_id), Arg::Whole(b_id)];
+    let halves = vec![
+        Arg::Range {
+            id: a_id,
+            start: 0,
+            len: 1500,
+        },
+        Arg::Range {
+            id: a_id,
+            start: 1500,
+            len: 1500,
+        },
+        Arg::Whole(b_id),
+    ];
+    assert_eq!(
+        repo.put_derivation(&ab, func::concat(), whole)
+            .unwrap()
+            .unwrap()
+            .form,
+        Form::Existing
+    );
+    repo.put_derivation(&ab, func::concat(), halves)
+        .unwrap()
+        .unwrap();
+    assert_eq!(repo.derivations(&ab_id).unwrap().len(), 2);
 
-    let hex = base_id.to_hex();
-    let path = dir.path().join("objects").join(&hex[..2]).join(&hex[2..]);
-    let mut tampered = fs::read(&path).unwrap();
-    tampered[100] ^= 1;
-    fs::write(&path, tampered).unwrap();
-    assert!(matches!(
-        repo.read_content(&base_id),
-        Err(Error::Corrupt(_))
-    ));
-    assert!(matches!(repo.read_content(&put.id), Err(Error::Corrupt(_))));
-    let mut bad: Vec<Id> = repo.fsck().unwrap().into_iter().map(|(id, _)| id).collect();
-    bad.sort();
-    let mut expected = vec![base_id, put.id];
-    expected.sort();
-    assert_eq!(bad, expected, "fsck reports exactly the damaged objects");
+    fs::write(
+        object_path(dir.path(), &ab_id),
+        [b"B".as_slice(), &noise(6000, 1)].concat(),
+    )
+    .unwrap();
+    assert_eq!(
+        repo.read_content(&ab_id).unwrap(),
+        ab,
+        "healed through a derivation"
+    );
+    let bad: Vec<Id> = repo.fsck().unwrap().into_iter().map(|(id, _)| id).collect();
+    assert_eq!(bad, [ab_id]);
+
+    // A corrupt source with no derivation of its own cannot heal.
+    fs::write(
+        object_path(dir.path(), &a_id),
+        [b"B".as_slice(), &noise(3000, 2)].concat(),
+    )
+    .unwrap();
+    assert!(matches!(repo.read_content(&a_id), Err(Error::Corrupt(_))));
+    assert!(repo.read_content(&ab_id).is_err());
+}
+
+/// Mutually recursive derivations must fail cleanly, not loop.
+#[test]
+fn derivation_cycles_are_errors() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut repo = Repo::new(FsStore::open(dir.path()).unwrap());
+    let (x, y) = (b"x-part|y-part".to_vec(), b"y-part|x-part".to_vec());
+    let (x_id, y_id) = (
+        repo.put_content(&x).unwrap().id,
+        repo.put_content(&y).unwrap().id,
+    );
+    let swap = |id| {
+        vec![
+            Arg::Range {
+                id,
+                start: 7,
+                len: 6,
+            },
+            Arg::Range {
+                id,
+                start: 6,
+                len: 1,
+            },
+            Arg::Range {
+                id,
+                start: 0,
+                len: 6,
+            },
+        ]
+    };
+    repo.put_derivation(&x, func::concat(), swap(y_id))
+        .unwrap()
+        .unwrap();
+    repo.put_derivation(&y, func::concat(), swap(x_id))
+        .unwrap()
+        .unwrap();
+    fs::remove_file(object_path(dir.path(), &x_id)).unwrap();
+    assert_eq!(
+        repo.read_content(&x_id).unwrap(),
+        x,
+        "derived from stored y"
+    );
+    fs::remove_file(object_path(dir.path(), &y_id)).unwrap();
+    assert!(matches!(repo.read_content(&x_id), Err(Error::Exec(_))));
 }
 
 #[test]
@@ -268,36 +385,74 @@ fn refs_are_compare_and_swap() {
     assert_eq!(store.refs().unwrap(), [("heads/main".to_string(), b)]);
 }
 
+fn commit_files<S: Store>(repo: &mut Repo<S>, files: &[Id]) {
+    let entries = files
+        .iter()
+        .enumerate()
+        .map(|(i, id)| TreeEntry {
+            name: format!("f{i:03}"),
+            kind: Kind::File,
+            id: *id,
+        })
+        .collect();
+    let tree = repo.put(&Object::tree(entries).unwrap()).unwrap();
+    repo.commit("main", tree, "").unwrap();
+}
+
 #[test]
 fn gc_keeps_exactly_what_refs_reach() {
     let mut repo = Repo::new(MemStore::default());
-    let base: Vec<u8> = (0..5000u32)
-        .map(|i| (i.wrapping_mul(2654435761) >> 11) as u8)
-        .collect();
+    let base = noise(5000, 13);
     let edited = [&base[..100], b"edit", &base[100..]].concat();
     repo.put_content(&base).unwrap();
-    let rep = repo.put_content(&edited).unwrap();
-    assert_eq!(rep.form, Form::Rep);
+    let derived = repo.put_content(&edited).unwrap();
+    assert_eq!(derived.form, Form::Derived);
     let orphan = repo.put_content(b"not committed").unwrap().id;
 
-    // Commit only the edited file: its rep's source blob must survive gc.
-    let tree = repo
-        .put(
-            &Object::tree(vec![TreeEntry {
-                name: "f".into(),
-                kind: Kind::File,
-                id: rep.id,
-            }])
-            .unwrap(),
-        )
-        .unwrap();
-    repo.commit("main", tree, "").unwrap();
+    // Commit only the edited file: the content its derivation reads survives.
+    commit_files(&mut repo, &[derived.id]);
     assert!(repo.gc().unwrap() >= 1);
     assert!(matches!(
         repo.read_content(&orphan),
         Err(Error::NotFound(_))
     ));
-    assert_eq!(repo.read_content(&rep.id).unwrap(), edited);
+    assert_eq!(repo.read_content(&derived.id).unwrap(), edited);
+    assert!(repo.fsck().unwrap().is_empty());
+}
+
+/// Ingest order should not decide storage size: repack re-plans the whole
+/// store and is applied only if smaller and fully verified.
+#[test]
+fn repack_removes_ingest_order_dependence() {
+    let mut versions = vec![noise(20_000, 17)];
+    for i in 0..12u8 {
+        let mut v = versions.last().unwrap().clone();
+        let at = (i as usize * 1543) % v.len();
+        v.splice(at..at, noise(200, i as u64 + 100));
+        versions.push(v);
+    }
+    let size_after = |order: &[Vec<u8>]| {
+        let mut repo = Repo::new(MemStore::default());
+        let ids: Vec<Id> = order
+            .iter()
+            .map(|v| repo.put_content(v).unwrap().id)
+            .collect();
+        commit_files(&mut repo, &ids);
+        let r = repo.repack().unwrap();
+        for v in order {
+            assert_eq!(&repo.read_content(&Id::of_content(v)).unwrap(), v);
+        }
+        assert!(repo.fsck().unwrap().is_empty());
+        (r.before, r.after)
+    };
+    let reversed: Vec<Vec<u8>> = versions.iter().rev().cloned().collect();
+    let (fwd_before, fwd_after) = size_after(&versions);
+    let (rev_before, rev_after) = size_after(&reversed);
+    assert!(fwd_after <= fwd_before && rev_after <= rev_before);
+    assert_eq!(
+        fwd_after, rev_after,
+        "after repack, order no longer matters"
+    );
 }
 
 #[test]

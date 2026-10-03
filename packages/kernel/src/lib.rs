@@ -1,6 +1,7 @@
 //! IKAM kernel: a content-addressed store whose files are guaranteed to
 //! reconstruct byte-for-byte, with data-driven dedup, git-like versioning,
-//! and pure functions whose applications are both storage and provenance.
+//! and a ledger of verified derivations that is at once storage, provenance
+//! and the object graph.
 //! See docs/plans/2026-10-02-rust-kernel.md for the layer laws.
 
 mod container;
@@ -8,15 +9,18 @@ mod exec;
 pub mod func;
 mod history;
 mod id;
+mod ingest;
 pub mod matcher;
 mod object;
+mod repack;
 mod repo;
 pub mod snapshot;
 mod store;
 mod wasm;
 
 pub use id::Id;
-pub use object::{Apply, Commit, Kind, Object, Run, Slice, TreeEntry};
+pub use object::{Arg, Commit, Derivation, Kind, Object, TreeEntry};
+pub use repack::Repacked;
 pub use repo::{Form, Put, Repo};
 pub use store::{FsStore, MemStore, Store};
 
