@@ -1,0 +1,17 @@
+# Local toolchain for the kernel: `mise install`, then `mise run test`.
+# A C compiler must come from the OS (zlib and zstd are built from source):
+#   macOS: xcode-select --install    Debian/Ubuntu: apt install build-essential
+[tools]
+rust = { version = "1.97.0", components = "clippy,rustfmt" } # keep in sync with rust-toolchain.toml
+
+[tasks.test]
+description = "Run all tests"
+run = "cargo test"
+
+[tasks.lint]
+description = "Check formatting and lints"
+run = ["cargo fmt --check", "cargo clippy --all-targets -- -D warnings"]
+
+[tasks.build]
+description = "Build the release CLI (target/release/ikam)"
+run = "cargo build --release"
