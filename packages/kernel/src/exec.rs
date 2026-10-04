@@ -6,7 +6,8 @@
 //! it). Functions are pure (builtins, or sandboxed WASM without imports), so
 //! a recorded derivation stays valid forever.
 
-use crate::repo::{Cx, decode_plain};
+use crate::dict::is_plain;
+use crate::repo::Cx;
 use crate::{Arg, Derivation, Error, Id, Object, Repo, Store};
 
 impl<S: Store> Repo<S> {
@@ -32,7 +33,7 @@ impl<S: Store> Repo<S> {
     /// derivation records, labelled "derivation").
     pub fn links(&self, id: &Id) -> Result<Vec<(String, Id)>, Error> {
         let mut out = match self.store.read(id) {
-            Ok(encoded) if decode_plain(id, &encoded).is_err() => Object::decode(&encoded)?.links(),
+            Ok(encoded) if !is_plain(&encoded) => Object::decode(&encoded)?.links(),
             Ok(_) | Err(Error::NotFound(_)) => vec![],
             Err(e) => return Err(e),
         };
@@ -52,7 +53,7 @@ impl<S: Store> Repo<S> {
         let mut out = Vec::new();
         for src in self.store.ids()? {
             let encoded = self.store.read(&src)?;
-            if decode_plain(&src, &encoded).is_ok() {
+            if is_plain(&encoded) {
                 continue;
             }
             for (label, target) in Object::decode(&encoded)?.links() {

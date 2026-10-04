@@ -16,7 +16,7 @@ use std::ops::Range;
 use crate::Id;
 
 /// Seed window length in bytes.
-const SEED: usize = 32;
+pub(crate) const SEED: usize = 32;
 /// An anchor follows ~1 in 64 positions (top 6 gear-hash bits zero).
 const ANCHOR_SHIFT: u32 = 58;
 /// Shortest match worth a slice: one slice entry (48 B) plus the extra entry
@@ -52,7 +52,7 @@ const GEAR: [u64; 256] = {
 
 /// Positions where a seed may start. Depends only on the preceding 64 bytes,
 /// so the same content yields the same anchors wherever it appears.
-fn anchors(bytes: &[u8]) -> impl Iterator<Item = usize> + '_ {
+pub(crate) fn anchors(bytes: &[u8]) -> impl Iterator<Item = usize> + '_ {
     let mut h = 0u64;
     bytes.iter().enumerate().filter_map(move |(i, &b)| {
         h = (h << 1).wrapping_add(GEAR[b as usize]);
@@ -60,7 +60,7 @@ fn anchors(bytes: &[u8]) -> impl Iterator<Item = usize> + '_ {
     })
 }
 
-fn seed_key(window: &[u8]) -> u64 {
+pub(crate) fn seed_key(window: &[u8]) -> u64 {
     u64::from_le_bytes(blake3::hash(window).as_bytes()[..8].try_into().unwrap())
 }
 
@@ -105,13 +105,6 @@ pub fn neighbors(input: &[u8], index: &Index, k: usize) -> (Vec<(Id, usize)>, us
     (ranked, seeds)
 }
 
-/// Worth an alignment: a neighbour sharing at least 3 seeds and at least a
-/// quarter of the input's seeds. Aligning dissimilar contents costs time
-/// and cannot yield a useful template.
-pub fn similar(shared: usize, seeds: usize) -> bool {
-    shared >= 3 && shared * 4 >= seeds
-}
-
 /// Propose a plan for `input`. `load` returns a stored blob's bytes.
 pub fn plan(input: &[u8], index: &Index, load: impl Fn(&Id) -> Option<Vec<u8>>) -> Vec<Part> {
     let mut cache: HashMap<Id, Option<Vec<u8>>> = HashMap::new();
@@ -151,11 +144,11 @@ pub fn plan(input: &[u8], index: &Index, load: impl Fn(&Id) -> Option<Vec<u8>>) 
     parts
 }
 
-fn common_prefix(a: &[u8], b: &[u8]) -> usize {
+pub(crate) fn common_prefix(a: &[u8], b: &[u8]) -> usize {
     a.iter().zip(b).take_while(|(x, y)| x == y).count()
 }
 
-fn common_suffix(a: &[u8], b: &[u8]) -> usize {
+pub(crate) fn common_suffix(a: &[u8], b: &[u8]) -> usize {
     a.iter()
         .rev()
         .zip(b.iter().rev())

@@ -6,6 +6,7 @@
 
 mod claims;
 mod container;
+mod dict;
 mod exec;
 pub mod func;
 mod history;
@@ -23,7 +24,7 @@ mod wasm;
 pub use id::Id;
 pub use object::{Arg, Claim, Commit, Derivation, Kind, Object, TreeEntry};
 pub use repack::Repacked;
-pub use repo::{Form, Put, Repo};
+pub use repo::{DEFAULT_READ_WEIGHT, Form, Put, Repo};
 pub use store::{FsStore, MemStore, Store};
 
 #[derive(Debug, thiserror::Error)]

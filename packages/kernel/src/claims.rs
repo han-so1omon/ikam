@@ -122,7 +122,9 @@ impl<S: Store> Repo<S> {
         // Dropping x is safe only if the derivation never needs x itself,
         // e.g. when the object is in turn derived from the subject.
         if candidate.cost >= stored.len() as isize
-            || !self.verify_without(&candidate.derivations[0], &x_bytes, &known, Some(x))
+            || self
+                .verify_without(&candidate.derivations[0], &x_bytes, &known, Some(x))
+                .is_none()
         {
             return Ok(None);
         }

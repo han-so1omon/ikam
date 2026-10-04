@@ -103,38 +103,47 @@ fn templates_survive_gc_and_repack() {
     }
     assert!(repo.fsck().unwrap().is_empty());
     assert_eq!(repo.put_content(&docs[3]).unwrap().form, Form::Existing);
-    // A new document from the same generator fits the induced template.
-    let put = repo.put_content(&invoice(99)).unwrap();
-    let d = &repo.derivations(&put.id).unwrap()[0];
-    assert_eq!(d.func, func::fill(), "new document reuses the template");
+    // A new document from the same generator is cheap to add, whichever plan
+    // wins (a fill of the template, or bytes against the trained dictionary).
+    let before = repo.bytes_written;
+    let fresh = invoice(99);
+    let put = repo.put_content(&fresh).unwrap();
+    assert_eq!(repo.read_content(&put.id).unwrap(), fresh);
+    let cost = repo.bytes_written - before;
+    assert!(
+        cost * 5 < fresh.len(),
+        "new document cost {cost} of {} bytes",
+        fresh.len()
+    );
 }
 
-fn pdf_fixtures() -> Vec<Vec<u8>> {
-    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/cases");
-    let mut out = Vec::new();
-    for case in std::fs::read_dir(root).unwrap() {
-        let case = case.unwrap().path();
-        if !case.is_dir() {
-            continue;
+/// 21 revisions of a spec (as in examples/bench.rs): one appended phrase per
+/// revision, a new section every fifth.
+fn revisions() -> Vec<Vec<u8>> {
+    let spec = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../docs/ikam/ikam-sheet-specification.md");
+    let mut versions = vec![std::fs::read_to_string(spec).unwrap()];
+    for i in 1..=20usize {
+        let mut lines: Vec<String> = versions.last().unwrap().lines().map(String::from).collect();
+        let k = (i * 37) % lines.len();
+        lines[k].push_str(&format!(" (edit {i})"));
+        let mut v = lines.join("\n") + "\n";
+        if i % 5 == 0 {
+            v.push_str(&format!(
+                "\n## Added section {i}\nNew text for revision {i}.\n"
+            ));
         }
-        for f in std::fs::read_dir(&case).unwrap() {
-            let f = f.unwrap().path();
-            if f.extension().is_some_and(|e| e == "pdf") {
-                out.push(std::fs::read(f).unwrap());
-            }
-        }
+        versions.push(v);
     }
-    out.sort();
-    out
+    versions.into_iter().map(String::into_bytes).collect()
 }
 
-/// Templates and fillers are content too, so repack templates them again:
-/// on the pdf fixtures some level-1 template or filler list is itself a
-/// `fill` of a level-2 template (measured: -1.9% vs one level).
+/// Templates and fillers are content too, so repack templates them again,
+/// with no fixed number of levels: on a revision history every revision is
+/// a fill, and some templates or filler lists are themselves fills.
 #[test]
-fn templates_layer_on_real_documents() {
-    let docs = pdf_fixtures();
-    assert!(docs.len() >= 10, "pdf fixtures missing");
+fn templates_layer_without_a_level_limit() {
+    let docs = revisions();
     let mut repo = Repo::new(MemStore::default());
     let ids = commit_all(&mut repo, &docs);
     let r = repo.repack().unwrap();
@@ -155,7 +164,7 @@ fn templates_layer_on_real_documents() {
         .filter_map(fill_of)
         .flat_map(|d| d.args.into_iter().map(|a| a.id()))
         .collect();
-    assert!(!level1.is_empty(), "documents use templates");
+    assert!(!level1.is_empty(), "revisions use templates");
     assert!(
         level1.iter().any(|part| fill_of(part).is_some()),
         "some template or fillers are themselves templated"

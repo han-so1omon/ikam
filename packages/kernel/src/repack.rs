@@ -7,7 +7,8 @@
 //! drops stored bytes wherever a recorded derivation rebuilds them. It does
 //! this twice, with and without template induction (one template per
 //! cluster of similar contents, generalized over all of them, recursively
-//! over the templates and fillers themselves), and keeps the smaller plan. The plan is verified completely and replaces the old
+//! over the templates and fillers themselves for as long as the evaluator
+//! estimates a saving), and keeps the smaller plan. The plan is verified completely and replaces the old
 //! representation only if it is smaller. Ids never change, so trees, commits
 //! and refs are untouched.
 //!
@@ -20,14 +21,14 @@
 use std::cmp::Reverse;
 use std::collections::{HashMap, HashSet};
 
+use crate::dict::{DICT_REF, is_plain};
+use crate::ingest::derivation_size;
 use crate::matcher::{self, Index};
-use crate::repo::{Cx, decode_plain};
+use crate::repo::Cx;
 use crate::{Arg, Derivation, Error, Id, MemStore, Repo, Store, func, template};
 
-/// Levels of template induction: templates and fillers induced at one
-/// level are clustered and templated again at the next. Each level adds one
-/// derivation hop to reads, within ingest's plan-depth budget.
-const TEMPLATE_LEVELS: usize = 3;
+/// Seed neighbours considered for each star centre.
+const STAR_CANDIDATES: usize = 64;
 
 #[derive(Debug, PartialEq, Eq)]
 pub struct Repacked {
@@ -49,13 +50,32 @@ impl<S: Store> Repo<S> {
             .collect::<Result<_, Error>>()?;
         files.sort_by_key(|(id, bytes)| (Reverse(bytes.len()), *id));
 
-        let plain = self.replan(&files, 0)?;
-        let templated = self.replan(&files, TEMPLATE_LEVELS)?;
-        let fresh = if templated.content_bytes()? < plain.content_bytes()? {
-            templated
-        } else {
-            plain
-        };
+        // Train only on content that will be stored as bytes: content rebuilt
+        // by a fact (e.g. a zip from its members) never is.
+        let mut stored = Vec::new();
+        for (id, bytes) in &files {
+            if self.derivations(id)?.iter().all(|d| func::is_plan(&d.func)) {
+                stored.push(bytes.as_slice());
+            }
+        }
+        // Exact structure (templates) and statistics (a dictionary) compete
+        // and combine differently per corpus: try each combination, keep the
+        // smallest verified plan.
+        let dict = train_dictionary(&stored);
+        let mut fresh: Option<(usize, Repo<MemStore>)> = None;
+        for d in [dict.as_deref(), None]
+            .into_iter()
+            .take(if dict.is_some() { 2 } else { 1 })
+        {
+            for induce in [false, true] {
+                let plan = self.replan(&files, induce, d)?;
+                let size = plan.content_bytes()?;
+                if fresh.as_ref().is_none_or(|(best, _)| size < *best) {
+                    fresh = Some((size, plan));
+                }
+            }
+        }
+        let (_, fresh) = fresh.expect("at least one plan");
         let (before, after) = (self.content_bytes()?, fresh.content_bytes()?);
         if after >= before {
             return Ok(Repacked {
@@ -66,12 +86,22 @@ impl<S: Store> Repo<S> {
         }
         let keep: HashSet<Id> = fresh.store.ids()?.into_iter().collect();
         for id in &keep {
-            self.store.write(*id, &fresh.store.read(id)?)?;
+            // The fresh plan may encode existing content more compactly
+            // (e.g. against the new dictionary); both decode identically.
+            let encoded = fresh.store.read(id)?;
+            if !self.store.write(*id, &encoded)? && self.store.read(id)? != encoded {
+                self.store.replace(*id, &encoded)?;
+            }
         }
+        let refs: HashSet<Id> = self.store.refs()?.into_iter().map(|(_, id)| id).collect();
         for id in self.store.ids()? {
-            if !keep.contains(&id) && self.is_content_or_derivation(&id)? {
+            if !keep.contains(&id) && !refs.contains(&id) && self.is_content_or_derivation(&id)? {
                 self.store.delete(&id)?;
             }
+        }
+        if let Some((dict, _)) = fresh.dictionary() {
+            let current = self.store.get_ref(DICT_REF)?;
+            self.store.set_ref(DICT_REF, current, *dict)?;
         }
         self.reset_projections();
         self.gc()?; // drop claims about content the new plan no longer holds
@@ -83,13 +113,31 @@ impl<S: Store> Repo<S> {
     }
 
     /// A verified fresh store holding exactly `files` and what they need.
-    fn replan(&self, files: &[(Id, Vec<u8>)], levels: usize) -> Result<Repo<MemStore>, Error> {
+    fn replan(
+        &self,
+        files: &[(Id, Vec<u8>)],
+        induce: bool,
+        dict: Option<&[u8]>,
+    ) -> Result<Repo<MemStore>, Error> {
         let mut fresh = Repo::new(MemStore::default());
+        fresh.read_weight = self.read_weight;
+        if let Some(dict) = dict {
+            fresh.set_dictionary(dict.to_vec())?;
+        }
         let mut hints: HashMap<Id, Vec<Derivation>> = HashMap::new();
         for (id, _) in files {
-            hints.insert(*id, self.derivations(id)?);
+            // Only facts: storage plans from earlier ingests would make the
+            // re-plan depend on ingest order.
+            let facts = self
+                .derivations(id)?
+                .into_iter()
+                .filter(|d| !func::is_plan(&d.func))
+                .collect();
+            hints.insert(*id, facts);
         }
-        induce_into(&mut fresh, files, &mut hints, levels)?;
+        if induce {
+            induce_into(&mut fresh, files, &mut hints)?;
+        }
         for (id, bytes) in files {
             fresh.put_content_with(bytes, 0, &hints[id])?;
         }
@@ -123,8 +171,9 @@ impl<S: Store> Repo<S> {
     fn prune(&mut self, files: &[(Id, Vec<u8>)]) -> Result<(), Error> {
         let (content, records) =
             self.closure(files.iter().map(|(id, _)| *id).collect(), |_| true)?;
+        let dict = self.dictionary().map(|(id, _)| *id);
         for id in self.store.ids()? {
-            if !content.contains(&id) && !records.contains(&id) {
+            if !content.contains(&id) && !records.contains(&id) && Some(id) != dict {
                 self.store.delete(&id)?;
             }
         }
@@ -141,11 +190,16 @@ impl<S: Store> Repo<S> {
             if !self.store.has(id) {
                 continue;
             }
+            let stored = self.store.read(id)?.len() as f64;
             for d in self.derivations(id)? {
                 let mut cx = Cx::default();
                 cx.stack_guard(*id); // the derivation may not read `id` itself
                 let rebuilt = self.eval(&d.func, &d.args, &mut cx);
-                if rebuilt.as_ref().is_ok_and(|b| b == bytes) {
+                // Evaluator: the stored bytes saved must outweigh the decode
+                // work now needed to rebuild them.
+                if rebuilt.as_ref().is_ok_and(|b| b == bytes)
+                    && stored > self.read_weight * cx.work as f64
+                {
                     self.store.delete(id)?;
                     break;
                 }
@@ -157,7 +211,7 @@ impl<S: Store> Repo<S> {
 
     fn is_content_or_derivation(&self, id: &Id) -> Result<bool, Error> {
         let encoded = self.store.read(id)?;
-        Ok(decode_plain(id, &encoded).is_ok() || encoded.first() == Some(&b'D'))
+        Ok(is_plain(&encoded) || encoded.first() == Some(&b'D'))
     }
 
     pub(crate) fn content_bytes(&self) -> Result<usize, Error> {
@@ -171,20 +225,19 @@ impl<S: Store> Repo<S> {
     }
 }
 
-/// Induce one template per cluster of similar `items`, offering each item a
-/// `fill` hint. The templates and fillers produced are content too: they are
-/// clustered and templated again, `levels` deep, then put into `fresh` with
-/// their own hints. Ingest's cost comparison decides which hints are used;
-/// unused templates and fillers are pruned later.
+/// Induce one template per cluster of similar `items`, offering each member
+/// a `fill` hint. A cluster is kept only if the evaluator estimates it
+/// shrinks storage (template + fillers + records, encoded, against the
+/// members' own encodings). The templates and fillers kept are content too,
+/// so they are clustered and templated again, with no fixed number of
+/// levels: every kept level strictly shrinks the encoded total, so the
+/// recursion ends. Ingest's cost comparison then decides which hints are
+/// used; unused templates and fillers are pruned later.
 fn induce_into(
     fresh: &mut Repo<MemStore>,
     items: &[(Id, Vec<u8>)],
     hints: &mut HashMap<Id, Vec<Derivation>>,
-    levels: usize,
 ) -> Result<(), Error> {
-    if levels == 0 {
-        return Ok(());
-    }
     let mut artifacts: Vec<(Id, Vec<u8>)> = Vec::new();
     for group in template_groups(items) {
         let members: Vec<&[u8]> = group.iter().map(|&i| items[i].1.as_slice()).collect();
@@ -192,31 +245,57 @@ fn induce_into(
             continue;
         };
         let t_id = Id::of_content(&t);
-        for &i in &group {
-            if let Some(fillers) = template::fit(&t, &items[i].1) {
-                let f_id = Id::of_content(&fillers);
-                let d = Derivation {
-                    output: items[i].0,
-                    func: func::fill(),
-                    args: vec![Arg::Whole(t_id), Arg::Whole(f_id)],
-                };
-                hints.entry(items[i].0).or_default().push(d);
-                artifacts.push((f_id, fillers));
-            }
+        let fitted: Vec<(usize, Vec<u8>)> = group
+            .iter()
+            .filter_map(|&i| template::fit(&t, &items[i].1).map(|f| (i, f)))
+            .collect();
+        let fill = |output, f| Derivation {
+            output,
+            func: func::fill(),
+            args: vec![Arg::Whole(t_id), Arg::Whole(f)],
+        };
+        let before: usize = fitted
+            .iter()
+            .map(|(i, _)| fresh.encode_plain(&items[*i].1).len())
+            .sum();
+        let after: usize = fresh.encode_plain(&t).len()
+            + fitted
+                .iter()
+                .map(|(i, f)| {
+                    fresh.encode_plain(f).len()
+                        + derivation_size(&fill(items[*i].0, Id::of_content(f)))
+                })
+                .sum::<usize>();
+        if fitted.len() < 2 || after >= before {
+            continue;
+        }
+        for (i, f) in fitted {
+            hints
+                .entry(items[i].0)
+                .or_default()
+                .push(fill(items[i].0, Id::of_content(&f)));
+            artifacts.push((Id::of_content(&f), f));
         }
         artifacts.push((t_id, t));
     }
+    if artifacts.is_empty() {
+        return Ok(());
+    }
     artifacts.sort_by_key(|(id, bytes)| (Reverse(bytes.len()), *id));
     artifacts.dedup_by_key(|(id, _)| *id);
-    induce_into(fresh, &artifacts, hints, levels - 1)?;
+    induce_into(fresh, &artifacts, hints)?;
     for (id, bytes) in &artifacts {
         fresh.put_content_with(bytes, 0, hints.get(id).map_or(&[][..], Vec::as_slice))?;
     }
     Ok(())
 }
 
-/// Clusters (indices into `files`) of contents linked to their most similar
-/// other content, when the two are `matcher::similar`.
+/// Star clusters (indices into `files`) of contents worth a shared template.
+/// Largest unassigned content first becomes a centre; its seed neighbours
+/// join if aligning with the centre shares more bytes than a `fill` record
+/// costs. Stars avoid transitive chaining of unrelated contents, and the
+/// test is absolute (shared bytes), so contents dominated by unique payload
+/// still join when their boilerplate is shared.
 fn template_groups(files: &[(Id, Vec<u8>)]) -> Vec<Vec<usize>> {
     let mut index = Index::default();
     for (id, bytes) in files {
@@ -227,30 +306,49 @@ fn template_groups(files: &[(Id, Vec<u8>)]) -> Vec<Vec<usize>> {
         .enumerate()
         .map(|(i, (id, _))| (*id, i))
         .collect();
-    let mut parent: Vec<usize> = (0..files.len()).collect();
-    fn root(parent: &mut [usize], mut i: usize) -> usize {
-        while parent[i] != i {
-            parent[i] = parent[parent[i]];
-            i = parent[i];
+    let record = derivation_size(&Derivation {
+        output: Id::of(b""),
+        func: func::fill(),
+        args: vec![Arg::Whole(Id::of(b"")), Arg::Whole(Id::of(b""))],
+    });
+    let mut assigned = vec![false; files.len()];
+    let mut groups = Vec::new();
+    for centre in 0..files.len() {
+        if assigned[centre] {
+            continue;
         }
-        i
-    }
-    for (i, (id, bytes)) in files.iter().enumerate() {
-        let (near, seeds) = matcher::neighbors(bytes, &index, 2);
-        if let Some(j) = near
-            .iter()
-            .filter(|(n, shared)| n != id && matcher::similar(*shared, seeds))
-            .find_map(|(n, _)| position.get(n))
-        {
-            let (a, b) = (root(&mut parent, i), root(&mut parent, *j));
-            parent[a] = b;
+        assigned[centre] = true;
+        let mut group = vec![centre];
+        for (n, _) in matcher::neighbors(&files[centre].1, &index, STAR_CANDIDATES).0 {
+            let Some(&j) = position.get(&n) else { continue };
+            if !assigned[j] && template::shared(&files[centre].1, &files[j].1) > record {
+                assigned[j] = true;
+                group.push(j);
+            }
+        }
+        if group.len() >= 2 {
+            groups.push(group);
         }
     }
-    let mut groups: HashMap<usize, Vec<usize>> = HashMap::new();
-    for i in 0..files.len() {
-        groups.entry(root(&mut parent, i)).or_default().push(i);
-    }
-    let mut groups: Vec<Vec<usize>> = groups.into_values().filter(|g| g.len() >= 2).collect();
-    groups.sort();
     groups
+}
+
+/// A zstd dictionary trained on `samples`, if its estimated saving (smaller
+/// per-sample encodings) exceeds its own size. The re-plan then decides
+/// which contents actually use it.
+fn train_dictionary(samples: &[&[u8]]) -> Option<Vec<u8>> {
+    let samples: Vec<&[u8]> = samples.iter().copied().filter(|b| !b.is_empty()).collect();
+    let total: usize = samples.iter().map(|b| b.len()).sum();
+    if samples.len() < 8 {
+        return None;
+    }
+    let dict = zstd::dict::from_samples(&samples, (total / 10).clamp(4096, 112_640)).ok()?;
+    let mut with_dict = zstd::bulk::Compressor::with_dictionary(3, &dict).ok()?;
+    let (mut alone, mut given) = (0, dict.len());
+    for b in samples {
+        let z = zstd::bulk::compress(b, 3).map_or(b.len(), |z| z.len().min(b.len()));
+        alone += z;
+        given += with_dict.compress(b).map_or(z, |d| (d.len() + 32).min(z));
+    }
+    (given < alone).then_some(dict)
 }

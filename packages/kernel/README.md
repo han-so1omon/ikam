@@ -30,6 +30,14 @@ cargo run --release -- repack                      # re-plan all storage (only i
 
 The store lives in `.ikam` by default; override it with `--store DIR`.
 
+Benchmark (deterministic corpora from this repo, verified exact, with zstd baselines):
+
+```sh
+cargo run --release --example bench               # table
+cargo run --release --example bench -- --json     # one JSON line per corpus
+cargo run --release --example bench -- --read-weight 0.01 invoices
+```
+
 A file's id is the BLAKE3 hash of its content and never depends on how it is stored. Its bytes may be stored (zstd-compressed when smaller), or it may exist only through derivations, for example:
 - `concat` of byte ranges of other content, found by extending matches byte-by-byte
 - `deflate-pack` rebuilding a zip from its uncompressed members
@@ -39,6 +47,8 @@ A file's id is the BLAKE3 hash of its content and never depends on how it is sto
 One file may have several derivations. A corrupt stored copy falls through to them.
 
 Claims are the descriptive half of the graph: `subject predicate object` over any selections, with a weight the kernel measures (bits the object saves on the subject). They never affect reconstruction, but `promote` turns one into storage when that is verifiably smaller.
+
+Stored bytes use the smallest of raw, zstd, or zstd against a shared dictionary trained by `repack` (the dictionary is content too). Plans are chosen by an evaluator: bytes written plus `read_weight` × decode work.
 
 Every derivation is verified by reconstructing the exact bytes before it is recorded. Planners, including future AI ones, can therefore cost space but never correctness. Which bytes stay stored is a cost decision that `repack` re-makes store-wide.
 
