@@ -8,8 +8,8 @@
 //!   fails. Corruption is an error, never data.
 //! - Derivations enter the ledger only after they reproduce their output.
 
-use std::cell::OnceCell;
 use std::collections::{BTreeMap, HashMap};
+use std::sync::OnceLock;
 
 use crate::dict::object_tag;
 use crate::matcher::Index;
@@ -78,9 +78,9 @@ impl Cx {
 pub struct Repo<S: Store> {
     pub(crate) store: S,
     pub(crate) index: Option<Index>,
-    ledger: OnceCell<Ledger>,
+    ledger: OnceLock<Ledger>,
     /// Current shared dictionary (see `dict.rs`), loaded on first use.
-    pub(crate) dict: OnceCell<Option<(Id, Vec<u8>)>>,
+    pub(crate) dict: OnceLock<Option<(Id, Vec<u8>)>>,
     /// Encoded bytes newly written through this handle.
     pub bytes_written: usize,
     /// Evaluator weight of decode work against storage when choosing plans:
@@ -93,8 +93,8 @@ impl<S: Store> Repo<S> {
         Repo {
             store,
             index: None,
-            ledger: OnceCell::new(),
-            dict: OnceCell::new(),
+            ledger: OnceLock::new(),
+            dict: OnceLock::new(),
             bytes_written: 0,
             read_weight: DEFAULT_READ_WEIGHT,
         }
@@ -125,8 +125,8 @@ impl<S: Store> Repo<S> {
 
     pub(crate) fn reset_projections(&mut self) {
         self.index = None;
-        self.ledger = OnceCell::new();
-        self.dict = OnceCell::new();
+        self.ledger = OnceLock::new();
+        self.dict = OnceLock::new();
     }
 
     /// Every recorded derivation of `id`.

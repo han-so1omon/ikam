@@ -125,3 +125,11 @@ Newest last. Format and rules: `README.md`.
 - Verdict: kept. Every corpus now beats the zstd+dict baseline.
 - Safety note: a prefix collision needs ~2^64 work to create deliberately. If one arises, decoding tries candidates; more than 4,096 combinations in one tree would fail as Corrupt (an error, never wrong data). The bound is unreachable at our scale; it is recorded here, not hidden.
 - Open: dictionary sample-order sensitivity (E005); repack time (E003); md's remaining bytes are file content (Y 59.6 KB) against the baseline's 76.9 KB total.
+
+### E007 parallel-repack
+- Branch / parent: exp/007-parallel-repack / E006
+- Hypothesis: repack's candidate plans (3 dictionaries + none, each with and without induction) are independent and pure, so building them in parallel removes E003's time cost without changing any result (source: E003 time measurement)
+- Change: `src/repo.rs` caches use `OnceLock` instead of `OnceCell`, so a `Repo` can be shared read-only across threads. `src/repack.rs` builds the plans in a `std::thread::scope` and compares them in the fixed order used before, so the choice never depends on scheduling. `repack` now needs `S: Store + Sync` (MemStore and FsStore are).
+- Result: score 0.6182 -> **0.6182**; every stored size and `by_kind` identical to E006, and identical across two runs; time 48.5 s -> **17.0 s** on 4 cores (office repack 27.1 -> 8.3 s, repo-history 16.3 -> 5.7 s)
+  - The speedup depends on the core count; on one core it is the old time.
+- Verdict: kept. Same score, E003's flagged time cost removed (now below E002's 20.6 s).

@@ -42,7 +42,7 @@ pub struct Repacked {
 /// Dictionary candidates re-planned in full per repack (best estimates).
 const DICT_SHORTLIST: usize = 3;
 
-impl<S: Store> Repo<S> {
+impl<S: Store + Sync> Repo<S> {
     pub fn repack(&mut self) -> Result<Repacked, Error> {
         self.unshare_trees()?;
         self.gc()?;
@@ -69,15 +69,31 @@ impl<S: Store> Repo<S> {
         // Exact structure (templates) and statistics (a dictionary) compete
         // and combine differently per corpus: try each combination, keep the
         // smallest verified plan.
-        let mut fresh: Option<(usize, Repo<MemStore>)> = None;
+        // Plans are independent: build them in parallel, then compare them in
+        // a fixed order, so the choice never depends on scheduling.
         let dicts = train_dictionaries(&stored, DICT_SHORTLIST);
-        for d in dicts.iter().map(|d| Some(d.as_slice())).chain([None]) {
-            for induce in [false, true] {
-                let plan = self.replan(&files, induce, d)?;
-                let size = plan.content_bytes()?;
-                if fresh.as_ref().is_none_or(|(best, _)| size < *best) {
-                    fresh = Some((size, plan));
-                }
+        let options: Vec<(Option<&[u8]>, bool)> = (dicts.iter().map(|d| Some(d.as_slice())))
+            .chain([None])
+            .flat_map(|d| [(d, false), (d, true)])
+            .collect();
+        let plans: Vec<Result<Repo<MemStore>, Error>> = std::thread::scope(|scope| {
+            let workers: Vec<_> = (options.iter())
+                .map(|&(d, induce)| {
+                    let (this, files) = (&*self, &files);
+                    scope.spawn(move || this.replan(files, induce, d))
+                })
+                .collect();
+            workers
+                .into_iter()
+                .map(|w| w.join().expect("planner panicked"))
+                .collect()
+        });
+        let mut fresh: Option<(usize, Repo<MemStore>)> = None;
+        for plan in plans {
+            let plan = plan?;
+            let size = plan.content_bytes()?;
+            if fresh.as_ref().is_none_or(|(best, _)| size < *best) {
+                fresh = Some((size, plan));
             }
         }
         let (_, fresh) = fresh.expect("at least one plan");
