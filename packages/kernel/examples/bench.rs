@@ -18,6 +18,7 @@ use std::time::Instant;
 use ikam_kernel::{Id, Kind, MemStore, Object, Repo, Store, TreeEntry};
 
 type Snapshot = Vec<(String, Vec<u8>)>;
+type Corpus = (&'static str, fn() -> Vec<Snapshot>);
 
 fn repo_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -173,7 +174,7 @@ fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let json = args.iter().any(|a| a == "--json");
     let only: Vec<&String> = args.iter().filter(|a| !a.starts_with("--")).collect();
-    let corpora: Vec<(&str, fn() -> Vec<Snapshot>)> = vec![
+    let corpora: Vec<Corpus> = vec![
         ("md", || fixtures(&["md"])),
         ("pdf", || fixtures(&["pdf"])),
         ("office", || fixtures(&["xlsx", "docx", "pptx"])),
