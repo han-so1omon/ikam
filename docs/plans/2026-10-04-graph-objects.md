@@ -81,4 +81,4 @@ The graph is the semantic layer *over* the existing dedup layers. It is not a re
 4. Slicing (induced subgraph, split by prefix, reassemble) and diff. Laws 6 and 7.
 5. A graph corpus in the benchmark (versions of a real graph), as a benchmark-change log entry.
 
-Which storage engine to borrow from (own, HugeGraph, Rama, TerminusDB, Dolt prolly trees, ...) is open: `docs/research/graph-storage.md`.
+Storage engines compared in `docs/research/graph-storage.md`: none gives versioning, structural sharing and compact storage in an embeddable form, so the layer is our own, borrowing prolly-tree chunking (Noms/Dolt), add/remove layers (TerminusDB) and reference-compressed adjacency lists (WebGraph). Its hypotheses G1–G4 are open.
