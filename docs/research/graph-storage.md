@@ -136,7 +136,7 @@ We want a graph layer in the kernel: labelled nodes (optionally pointing at byte
 - Expected effect: diff and slicing by key range cost O(changes). Identical subranges dedupe across versions and across graphs for free.
 - Risk: E009 showed that many small objects pay framing plus full ids, so the chunk target must be large, about 4 KB as in Noms/Dolt. A key-only boundary hash (Dolt) keeps edits from re-chunking.
 - Measure: bytes per edge per version on a synthetic edit history, with byte-exact reconstruction and a clean fsck.
-- **Status:** `open` (not yet run).
+- **Status:** implemented in E011 (capability): prolly chunks of 4–32 KB stored as content; 20 versions take 3.3x one compressed version (one content per version: 1.6x, without chunk-level lookup or diff).
 
 **G2. Layer deltas instead of re-chunking: commit = parent graph id + positive edge set + negative edge set, with periodic rollup (source: TerminusDB layers).**
 - Change: store a graph commit as small `+E`/`−E` objects over a parent, and roll up when the chain exceeds a bound. This mirrors git `pack.depth` and Mercurial's 2× rule from tree-metadata.md.

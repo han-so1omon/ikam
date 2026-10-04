@@ -1,6 +1,6 @@
 # Graph objects: cyclic graphs in a content-addressed kernel
 
-Status: design, not implemented. Decided with the user: option 2 of three (a graph as one object, sliceable into many). Claims stay as they are. Revised after a probe: edges reference nodes by key, not position.
+Status: implemented (steps 1–4; `src/graph.rs`, `tests/graphs.rs`, log E011); step 5 (a benchmark corpus) is open. Decided with the user: option 2 of three (a graph as one object, sliceable into many). Claims stay as they are. Revised after a probe: edges reference nodes by key, not position.
 
 ## Why
 
@@ -41,7 +41,7 @@ The graph is the semantic layer *over* the existing dedup layers. It is not a re
 ## Slicing and version history
 
 - **Slices are graphs.** The induced subgraph on a set of nodes is a `G` with those nodes and their edges (keys outside the set stay as dangling keys). It has its own id, so slices are shareable, and the same slice taken from two versions dedups to one object when unchanged.
-- **Large graphs are a tree of slices.** A commit's graph can be split, like a directory tree, into slices by label prefix (or any partition) under a tree of `G` entries. A version then rewrites only the slices that changed, as nested trees do (E009). This is structural sharing without a new mechanism. Prolly trees (content-defined node boundaries, as in Dolt) are the alternative, pending the storage research.
+- **Large graphs are a prolly tree** (Noms/Dolt; `docs/research/graph-storage.md`). Nodes sorted by label are cut into chunks where a hash of the label falls under a threshold that rises with the chunk's size (4–32 KB), never at fixed positions; parents list `(first label, child)` up to one root. An edit rewrites only nearby chunks and their parents, so versions share every other chunk by id, a lookup reads one chunk per level, and a diff skips shared chunks. Chunks are stored as content (like trees, E005), so a changed chunk is itself mostly slices of its previous version.
 - **History is commits.** Each version is a commit whose tree holds the graph slices. `log` gives history; time travel is reading an old commit. A diff is a merge-walk of two sorted node lists, skipping slices whose ids are equal.
 - **Cycles across slices** are fine: they are dangling keys resolved within the commit, never hash links.
 
@@ -65,6 +65,19 @@ The graph is the semantic layer *over* the existing dedup layers. It is not a re
 5. A graph in a commit is restored exactly after repack, whatever storage form it takes.
 6. Slicing: the induced subgraph of an unchanged node set has the same id in two versions; a graph split into slices and reassembled is equal to the original.
 7. Versions: storing 20 versions of a keyed graph costs less than 3 versions' worth of zstd (the probe's 1.6, with margin).
+
+## Measured (law 7, `tests/graphs.rs`)
+
+20 versions of a 2,000-node, ~6,000-edge graph (each adding 5 nodes and 10 edges and removing 2 edges) take, relative to one version at zstd -19 (47 KB):
+
+| storage | 20 versions |
+|---|---:|
+| positional edges, one content per version (first design) | 625 KB (13x) |
+| prolly chunks as objects | 480 KB (10x) |
+| prolly chunks as content, chunk bounds 512 B–4 KB / 1–8 KB / 2–16 KB / **4–32 KB** | 186 / 170 / 161 / **157 KB (3.3x)** |
+| keyed adjacency, one content per version (probe) | 77 KB (1.6x) |
+
+One content per version compresses a linear history best, but reading one node or diffing means rebuilding the whole graph. Prolly chunks cost about 2x as much over a linear history, and buy lookup by chunk, diffs in proportion to the change, and sharing of unchanged chunks across graphs. The law's bound is 4x.
 
 ## Not in scope (open questions)
 

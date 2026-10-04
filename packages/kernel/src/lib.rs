@@ -10,6 +10,7 @@ mod container;
 mod dict;
 mod exec;
 pub mod func;
+mod graph;
 mod history;
 mod id;
 mod ingest;
@@ -23,7 +24,9 @@ mod template;
 mod wasm;
 
 pub use id::Id;
-pub use object::{Arg, Claim, Commit, Derivation, Kind, Object, TreeEntry};
+pub use object::{
+    Arg, Claim, Commit, Derivation, Edge, Graph, Kind, Node, Object, Target, TreeEntry, node_key,
+};
 pub use repack::Repacked;
 pub use repo::{DEFAULT_READ_WEIGHT, Form, Put, Repo};
 pub use store::{FsStore, MemStore, Store};

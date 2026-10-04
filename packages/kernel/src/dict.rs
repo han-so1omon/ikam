@@ -25,11 +25,11 @@
 //! `BLAKE3(canonical)`. Records repeat the same content ids across objects,
 //! which only a shared dictionary can exploit.
 //!
-//! A tree may also be stored as `t 2 content[32]`: its canonical encoding
-//! is that content, stored like any other (sliced against earlier trees,
-//! templated, re-planned by repack), so successive snapshots share their
-//! listings. Only trees: derivation records must stay readable without the
-//! ledger they make up.
+//! A tree or graph chunk may also be stored as `t 2 content[32]` (`g 2`):
+//! its canonical encoding is that content, stored like any other (sliced
+//! against earlier versions, templated, re-planned by repack), so successive
+//! versions share bytes. Only these: derivation records must stay readable
+//! without the ledger they make up.
 
 use std::io::Read;
 
@@ -53,7 +53,7 @@ pub(crate) fn is_plain(encoded: &[u8]) -> bool {
 /// encoded; `None` for content.
 pub(crate) fn object_tag(encoded: &[u8]) -> Option<u8> {
     let tag = encoded.first()?.to_ascii_uppercase();
-    (!is_plain(encoded) && b"TCDL".contains(&tag)).then_some(tag)
+    (!is_plain(encoded) && b"TCDLG".contains(&tag)).then_some(tag)
 }
 
 /// The dictionary reference (an id prefix) a stored encoding needs, if any.
@@ -66,10 +66,11 @@ pub(crate) fn dict_of(encoded: &[u8]) -> Option<DictRef> {
     encoded.get(at..at + DICT_REF_LEN)?.try_into().ok()
 }
 
-/// The content holding a tree's canonical encoding, if it is stored so.
+/// The content holding a tree's or graph chunk's canonical encoding, if it
+/// is stored so.
 pub(crate) fn tree_content(encoded: &[u8]) -> Option<Id> {
     match encoded {
-        [b't', 2, id @ ..] => Some(Id::from_bytes(id.try_into().ok()?)),
+        [b't' | b'g', 2, id @ ..] => Some(Id::from_bytes(id.try_into().ok()?)),
         _ => None,
     }
 }

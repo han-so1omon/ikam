@@ -4,7 +4,7 @@ use std::collections::HashSet;
 
 use crate::dict::{dict_of, names, object_tag, tree_content};
 use crate::repo::Cx;
-use crate::{Arg, Commit, Derivation, Error, Id, Kind, Object, Repo, Store, func};
+use crate::{Arg, Commit, Derivation, Error, Graph, Id, Kind, Object, Repo, Store, Target, func};
 
 impl<S: Store> Repo<S> {
     /// Advance `name` to a new commit of `tree` whose parent is the ref's
@@ -98,10 +98,23 @@ impl<S: Store> Repo<S> {
                 Ok(Object::Commit(c)) => stack.extend(std::iter::once(c.tree).chain(c.parents)),
                 Ok(Object::Tree(entries)) => {
                     for e in entries {
-                        if e.kind == Kind::Tree {
-                            stack.push(e.id)
-                        } else {
-                            files.push(e.id)
+                        match e.kind {
+                            Kind::File => files.push(e.id),
+                            Kind::Tree | Kind::Graph => stack.push(e.id),
+                        }
+                    }
+                }
+                // A graph keeps its chunks and node targets live; its edges
+                // name nodes by key and are never followed, so cycles are moot.
+                Ok(Object::Graph(Graph::Children(_, children))) => {
+                    stack.extend(children.into_iter().map(|(_, id)| id))
+                }
+                Ok(Object::Graph(Graph::Nodes(nodes))) => {
+                    for n in nodes {
+                        match n.target {
+                            Target::Content(a) => files.push(a.id()),
+                            Target::Object(id) => stack.push(id),
+                            Target::None => {}
                         }
                     }
                 }
