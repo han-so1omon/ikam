@@ -157,3 +157,11 @@ Newest last. Format and rules: `README.md`.
   - md: 76 trees instead of 1. 48 are tiny and stored canonical (2,376 B), because they are too small to compress and abbreviated ids (E006) apply only inside compressed forms. 28 are stored as content (8,295 B).
   - repo-history: 153 trees per run; unchanged directories are shared by id across snapshots, but each small tree pays its own framing and full 32 B ids.
 - Verdict: reference for later experiments. Next: make small trees cheap (abbreviated ids without compression; no pointer form for tiny trees).
+
+### E010 small-trees
+- Branch / parent: exp/010-small-trees / E009
+- Hypothesis: with nested trees, many trees are too small to compress, so they kept full 32 B ids. An uncompressed abbreviated form recovers most of E006's saving for them (source: E009 measurement; tree-metadata H3)
+- Change: `src/dict.rs` adds mode 3, an uncompressed body. `encode_object` now picks the smallest of canonical and {plain, abbreviated} × {zstd, zstd+dictionary, raw}. New unit test: a one-entry tree is stored >20 B smaller and decodes exactly.
+- Result: score 0.6265 -> **0.6210**; per corpus vs_dict: md 1.040->1.027, pdf 0.904->0.895, office 0.559->0.559, invoices 0.439->0.439, synthetic 0.289->0.281, repo 0.908->0.905; time 23.7 s
+  - md trees (76): 10,671 -> 9,615 B. The flat single tree was 5,999 B, so nesting still costs about 3.6 KB in per-object framing on md.
+- Verdict: kept.

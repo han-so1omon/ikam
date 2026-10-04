@@ -136,4 +136,30 @@ mod tests {
         repo.store.write(Id::from_bytes(decoy), b"Bdecoy").unwrap();
         assert_eq!(repo.expand(&tree.id(), &short).unwrap(), &canonical[1..]);
     }
+
+    /// A tree too small to compress still stores abbreviated ids.
+    #[test]
+    fn tiny_trees_store_abbreviated_ids() {
+        let mut repo = Repo::new(MemStore::default());
+        let file = repo
+            .put_content(b"one file in its own directory")
+            .unwrap()
+            .id;
+        let tree = Object::tree(vec![TreeEntry {
+            name: "notes.md".into(),
+            kind: Kind::File,
+            id: file,
+        }])
+        .unwrap();
+        let encoded = repo.encode_object(&tree.encode());
+        assert!(
+            encoded.len() < tree.encode().len() - 20,
+            "{} bytes",
+            encoded.len()
+        );
+        assert_eq!(
+            repo.decode_object(&tree.id(), encoded).unwrap(),
+            tree.encode()
+        );
+    }
 }

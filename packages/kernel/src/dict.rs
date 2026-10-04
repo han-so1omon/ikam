@@ -19,6 +19,7 @@
 //! Objects (trees, commits, derivations, claims) are stored the same way,
 //! keeping their kind visible in the first byte:
 //!   canonical | lower(tag) 0 zstd(rest) | lower(tag) 1 dict[4] zstd_with_dict(rest)
+//!   | lower(tag) 3 rest
 //! (a tree's rest may have abbreviated ids: mode | 0x80, see `abbrev.rs`)
 //! where rest is the canonical encoding after its tag. Their ids stay
 //! `BLAKE3(canonical)`. Records repeat the same content ids across objects,
@@ -37,6 +38,8 @@ use crate::{Error, Id, Repo, Store};
 pub(crate) const DICT_REF: &str = "meta/zstd-dict";
 /// Mode-byte flag: a tree body with abbreviated ids (see `abbrev.rs`).
 const ABBREVIATED: u8 = 0x80;
+/// Mode: an uncompressed body (only worth it abbreviated).
+const RAW: u8 = 3;
 /// Bytes of a dictionary's id stored in each encoding that uses it.
 pub(crate) const DICT_REF_LEN: usize = 4;
 type DictRef = [u8; DICT_REF_LEN];
@@ -151,23 +154,23 @@ impl<S: Store> Repo<S> {
         let short = (tag == b'T')
             .then(|| self.abbreviate(rest).ok().flatten())
             .flatten();
-        let (flag, rest) = match &short {
-            Some(short) => (ABBREVIATED, short.as_slice()),
-            None => (0, rest),
-        };
         let tag = tag.to_ascii_lowercase();
-        let encoded = match self.compress(rest) {
-            Some((None, z)) => [&[tag, flag][..], &z].concat(),
-            Some((Some(id), z)) => {
-                [&[tag, flag | 1][..], &id.as_bytes()[..DICT_REF_LEN], &z].concat()
+        let mut best = canonical.to_vec();
+        let bodies = [(0, Some(rest)), (ABBREVIATED, short.as_deref())];
+        for (flag, body) in bodies.into_iter().filter_map(|(f, b)| Some((f, b?))) {
+            let encoded = match self.compress(body) {
+                Some((None, z)) => [&[tag, flag][..], &z].concat(),
+                Some((Some(id), z)) => {
+                    [&[tag, flag | 1][..], &id.as_bytes()[..DICT_REF_LEN], &z].concat()
+                }
+                // Too small to compress: abbreviation alone may still pay.
+                None => [&[tag, flag | RAW][..], body].concat(),
+            };
+            if encoded.len() < best.len() {
+                best = encoded;
             }
-            None => return canonical.to_vec(),
-        };
-        if encoded.len() < canonical.len() {
-            encoded
-        } else {
-            canonical.to_vec()
         }
+        best
     }
 
     /// The canonical encoding of a stored object, or any other stored bytes
@@ -195,6 +198,7 @@ impl<S: Store> Repo<S> {
                 })?;
                 finish(rest)
             }
+            RAW if t.is_ascii_lowercase() => finish(z.to_vec()),
             _ => match tree_content(&encoded) {
                 Some(content) => self.read_content(&content),
                 None => Ok(encoded),
