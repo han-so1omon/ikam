@@ -16,3 +16,8 @@ Literature that informs the kernel, read before experiments are designed (`docs/
 - **Unknowns**, with inferences marked as such.
 
 A paper's claim stays *unverified for this kernel* until an experiment reproduces it on our benchmark.
+
+## Notes
+
+- `office-gap.md`: why office, md and repo-history lose to zstd+dict (framing, dictionary sizing, deltas, solid regions, accounting).
+- `kernel-direction.md`: library learning, program-synthesis compression and e-graph extraction, mapped onto templates, claims and repack.

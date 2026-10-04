@@ -15,3 +15,4 @@ Newest last. Format and rules: `README.md`.
   - md: 1.41. Many tiny files; tree metadata is part of it.
   - office: 1.32. The trained dictionary for the members is only 6.9 KB.
   - repo-history: 1.22.
+  - Literature and hypotheses for these gaps: `docs/research/office-gap.md`, `docs/research/kernel-direction.md`.
