@@ -502,3 +502,30 @@ fn id_hex_roundtrip_and_rejects_garbage() {
     assert!("xyz".parse::<Id>().is_err());
     assert!(id.to_hex().to_uppercase().parse::<Id>().is_err());
 }
+
+/// Objects may be stored compressed, but their id stays the hash of the
+/// canonical encoding, `get` returns the canonical object, and a corrupt
+/// compressed copy is an error, never data.
+#[test]
+fn compressed_objects_keep_identity_and_detect_corruption() {
+    let mut repo = Repo::new(MemStore::default());
+    let entries: Vec<TreeEntry> = (0..64)
+        .map(|i| TreeEntry {
+            name: format!("docs__chapter-{i:03}.md"),
+            kind: Kind::File,
+            id: Id::of_content(&[i as u8]),
+        })
+        .collect();
+    let tree = Object::tree(entries).unwrap();
+    let id = repo.put(&tree).unwrap();
+    assert_eq!(id, tree.id());
+    let stored = repo.store().read(&id).unwrap();
+    assert!(stored.len() < tree.encode().len(), "stored compressed");
+    assert_eq!(repo.get(&id).unwrap(), tree);
+
+    let mut store = MemStore::default();
+    let mut bad = stored.clone();
+    *bad.last_mut().unwrap() ^= 1;
+    store.write(id, &bad).unwrap();
+    assert!(Repo::new(store).get(&id).is_err());
+}

@@ -33,7 +33,9 @@ impl<S: Store> Repo<S> {
     /// derivation records, labelled "derivation").
     pub fn links(&self, id: &Id) -> Result<Vec<(String, Id)>, Error> {
         let mut out = match self.store.read(id) {
-            Ok(encoded) if !is_plain(&encoded) => Object::decode(&encoded)?.links(),
+            Ok(encoded) if !is_plain(&encoded) => {
+                Object::decode(&self.decode_object(id, encoded)?)?.links()
+            }
             Ok(_) | Err(Error::NotFound(_)) => vec![],
             Err(e) => return Err(e),
         };
@@ -56,7 +58,7 @@ impl<S: Store> Repo<S> {
             if is_plain(&encoded) {
                 continue;
             }
-            for (label, target) in Object::decode(&encoded)?.links() {
+            for (label, target) in Object::decode(&self.decode_object(&src, encoded)?)?.links() {
                 if target == *id {
                     out.push((src, label));
                 }

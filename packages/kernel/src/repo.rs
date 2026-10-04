@@ -11,6 +11,7 @@
 use std::cell::OnceCell;
 use std::collections::HashMap;
 
+use crate::dict::object_tag;
 use crate::matcher::Index;
 use crate::{Arg, Derivation, Error, Id, Object, Store, func};
 
@@ -109,9 +110,11 @@ impl<S: Store> Repo<S> {
         }
         let mut ledger = Ledger::default();
         for id in self.store.ids()? {
-            let encoded = self.store.read(&id)?;
-            if encoded.first() == Some(&b'D')
-                && Id::of(&encoded) == id
+            if object_tag(&self.store.read(&id)?) != Some(b'D') {
+                continue;
+            }
+            let encoded = self.read_object(&id)?;
+            if Id::of(&encoded) == id
                 && let Object::Derivation(d) = Object::decode(&encoded)?
             {
                 ledger.insert(d);
@@ -141,10 +144,19 @@ impl<S: Store> Repo<S> {
         Ok(self.store.has(id) || self.ledger()?.by_output.contains_key(id))
     }
 
+    /// Write content in a plain encoding, or an object in its canonical
+    /// encoding (stored in its smallest encoding, see `dict.rs`).
     pub(crate) fn write(&mut self, id: Id, encoded: &[u8]) -> Result<bool, Error> {
-        let fresh = self.store.write(id, encoded)?;
+        if self.store.has(&id) {
+            return Ok(false);
+        }
+        let stored = match object_tag(encoded) {
+            Some(_) => self.encode_object(encoded),
+            None => encoded.to_vec(),
+        };
+        let fresh = self.store.write(id, &stored)?;
         if fresh {
-            self.bytes_written += encoded.len();
+            self.bytes_written += stored.len();
         }
         Ok(fresh)
     }
@@ -190,7 +202,7 @@ impl<S: Store> Repo<S> {
 
     /// Read a tree, commit or derivation record, verifying its hash.
     pub fn get(&self, id: &Id) -> Result<Object, Error> {
-        let encoded = self.store.read(id)?;
+        let encoded = self.read_object(id)?;
         if Id::of(&encoded) != *id {
             return Err(Error::Corrupt(*id));
         }
