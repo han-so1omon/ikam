@@ -8,10 +8,11 @@
 - Container unpacking
 - L3 pure functions (builtin and WASM), memoized through the ledger
 - A ledger of verified derivations with selectors (many per id), which is also the graph
+- Templates: lossless anti-unification (`fill(template, fillers)`), induced store-wide by repack
 - Versioning: commits, refs, gc, fsck, repack
 
 **Not built:**
-- template (anti-unification) and AI planners that propose derivations
+- AI planners that propose derivations (templates are built: see "Templates")
 - unverified semantic claims
 - effectful/LLM runs
 - scheduling
@@ -179,20 +180,61 @@ The cheapest verified candidate wins. `repack` re-plans all live content togethe
 
 **Claims vs derivations.** Unverified semantic claims (mentions, paraphrase, section-of) are a separate record kind, not built yet. A claim can be promoted to a derivation once a function plus residual reproduces the bytes.
 
-**Planned after this:** an anti-unification (template + fillers) planner, measured on the fixtures before any general transform search is built.
+## Templates (2026-10-04, built)
+
+Lossless semantic dedup for content that shares *structure* but not long byte runs: reports from one generator, invoices, XML from one producer, revisions with scattered edits.
+
+**Model.** Similar contents become one shared *template* (their common segments, in order) plus per-content *fillers* (whatever sits in each hole). The builtin `fill(template, fillers)` rebuilds each one exactly. Templates and fillers are ordinary content: they dedup, appear in the graph, and are themselves subject to every planner.
+
+**Boundaries come from the data.**
+- Segments come from a byte-level Myers alignment, within a 50 ms budget.
+- An equal run becomes a segment only if it is longer than a hole costs (8 B of length headers). Shorter runs stay in the fillers.
+- The alignment only plans. The kernel verifies every `fill` by rebuilding the bytes, so the budget never affects correctness.
+
+**Where templates are found:**
+- *Ingest* fits existing templates found near the new content. It also offers a pair template: the new content anti-unified with its most similar stored *document*. The pair candidate re-expresses that document through the template and is credited with dropping its stored bytes.
+- *Repack* clusters live content by seed similarity, induces one template per cluster, and generalizes it over every member: each new segment is a substring of an old one, in order, so earlier members still fit. It then builds the store both with and without induced templates and keeps the smaller fully verified result.
+
+**Rules learned from failures** (each caught by tests or benchmarks):
+1. **Pair templates overfit.** Two invoices whose values happen to share a leading digit pull that digit into a segment, so a third invoice no longer fits. Generalizing one file at a time never pays at ingest, because the savings come only from later files. Induction over whole clusters therefore belongs in repack.
+2. **Templates of templates chained without bound.** Re-ingesting pulled each previous template into a new one, about 30 levels deep, past the read depth limit. Repack's verification caught it, so no data was at risk.
+   - A new plan may now need at most 8 levels of derivation nesting.
+   - Pair templates may only replace plain documents: no templates, fillers, or content with derivations.
+   - Deeper layering (the fractal case) needs its own budgeted pass.
+3. **Alignment against weak neighbours costs time for nothing.** Ungated, repo-history ingest plus repack went from 2.5 s to 43 s for a 0.2% gain. Alignment now runs only against a neighbour sharing at least 3 seeds and at least a quarter of the input's seeds. Fitting existing templates is cheap and ungated.
+4. **`fill` is a storage plan, like `concat`.** Repack replaces it rather than preserving it as a fact, so stale or overfit templates do not persist.
+
+**Measured** (2026-10-04, same benchmark as the ledger table; "previous" is `3bc3eec`; all runs pass `fsck` and exact checkout):
+
+| Corpus | Previous (after repack) | Templates (after repack) | Change | Time |
+|---|---|---|---|---|
+| 344 md fixtures | 136,434 | 136,028 | −0.3% | 0.35 s → 0.47 s |
+| 44 pdf fixtures | 49,569 | 40,717 | **−18%** | 0.18 s → 0.35 s |
+| 238 office fixtures | 528,919 | 510,346 | −3.5% | 5.6 s → 11.3 s |
+| 30 generated invoices | 11,937 | 9,471 | **−21%** | 0.10 s → 0.15 s |
+| Synthetic 21 revisions | 25,919 | 20,206 | **−22%** | 0.26 s → 0.32 s |
+| This repo, 10 snapshots | 1,421,641 | 1,418,961 | −0.2% | 2.5 s → 4.5 s |
+
+**Reading the results:**
+- Templates pay off where content shares structure with scattered differences: generated documents, PDFs from one producer, revisions with many small edits. They do little where reuse is already whole files or long runs (repo history) or where files share little (small markdown).
+- The office corpus is the main time cost (2×), from aligning many similar XML members.
+- Not yet compared against a zstd dictionary trained on the store, which captures some of the same shared structure statistically rather than exactly.
 
 ## Next steps
 
-1. **Template planner:** anti-unification over similar segments; measure against slices + zstd.
-2. **Claims:** unverified semantic relations over selectors, with edge weight = measured bits saved by conditioning.
-3. **WASM floats:** allow them. The `deterministic` feature already canonicalizes NaNs; disable relaxed-SIMD instead.
-4. **Effectful runs.** LLM and tool calls as recorded, replayed, never-regenerated runs. These are never storage derivations.
-5. **Storage.**
-   - A zstd dictionary trained from the store.
+1. **Claims:** unverified semantic relations over selectors, with edge weight = measured bits saved by conditioning.
+2. **WASM floats:** allow them. The `deterministic` feature already canonicalizes NaNs; disable relaxed-SIMD instead.
+3. **Effectful runs.** LLM and tool calls as recorded, replayed, never-regenerated runs. These are never storage derivations.
+4. **Storage.**
+   - A zstd dictionary trained from the store; compare against templates.
    - Persisted ledger, seed and reverse-link indexes as checkpointed projections. Today each CLI process rebuilds them by reading every object.
    - Cheaper derivation records (implicit output for the primary derivation; short builtin ids).
    - Let the matcher index derived content too. Today it only finds matches in stored bytes; ranges into derived content come only from proposals.
    - Self-matching within a file.
    - zlib-as-WASM.
    - PDF FlateDecode streams.
+5. **Templates, next.**
+   - Budgeted multi-level templating (templates of templates, fillers of fillers) with an explicit read-depth cost.
+   - Indexing the fillers of a cluster so structurally similar fillers dedup too.
+   - Lower the office-corpus alignment cost.
 6. **Scheduling** (a Petri net over derivations) and **PyO3 bindings**.

@@ -16,6 +16,7 @@ mod repack;
 mod repo;
 pub mod snapshot;
 mod store;
+mod template;
 mod wasm;
 
 pub use id::Id;

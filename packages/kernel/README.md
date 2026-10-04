@@ -30,6 +30,7 @@ The store lives in `.ikam` by default; override it with `--store DIR`.
 A file's id is the BLAKE3 hash of its content and never depends on how it is stored. Its bytes may be stored (zstd-compressed when smaller), or it may exist only through derivations, for example:
 - `concat` of byte ranges of other content, found by extending matches byte-by-byte
 - `deflate-pack` rebuilding a zip from its uncompressed members
+- `fill(template, fillers)`: similar documents share one template; each keeps only what differs
 - a WASM function of other content
 
 One file may have several derivations. A corrupt stored copy falls through to them.
