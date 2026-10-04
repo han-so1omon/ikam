@@ -133,3 +133,19 @@ Newest last. Format and rules: `README.md`.
 - Result: score 0.6182 -> **0.6182**; every stored size and `by_kind` identical to E006, and identical across two runs; time 48.5 s -> **17.0 s** on 4 cores (office repack 27.1 -> 8.3 s, repo-history 16.3 -> 5.7 s)
   - The speedup depends on the core count; on one core it is the old time.
 - Verdict: kept. Same score, E003's flagged time cost removed (now below E002's 20.6 s).
+
+### E008 repeat-dictionary
+- Branch / parent: exp/008-repeat-dictionary / E007
+- Hypothesis: a raw dictionary built from the content that repeats across samples beats one sampled at even steps, and does not depend on sample order (source: Kuruppu, Puglisi, Zobel, SPIRE 2011, in `docs/research/office-gap.md`: references built from corpus repeats beat sampled ones; E005's order sensitivity)
+- Change: `src/repack.rs` adds `repeat_dictionary`: 1 KiB pieces around the seeds found in the most samples, no seed covered twice, most shared last. It is a third candidate construction next to COVER and even-spaced raw, at the same sizes. New unit test: same dictionary for reversed samples; nothing from a single sample.
+- Variants (all exact and fsck-clean):
+  | variant | shortlist | score | office | repo-history | time |
+  |---|---|---:|---:|---:|---:|
+  | a | top 3 by estimate (as E003) | 0.6151 | 220,105 | 1,168,263 | 17.0 s |
+  | c | top 3 + best of each construction | 0.6151 | 220,105 | 1,168,263 | 20.2 s |
+  | d | top 4 + best of each construction | **0.6115** | 214,988 | 1,153,834 | 22.9 s |
+  - The repo-history regression in a and c: the 112 KB repeat dictionary ranks first by estimate but re-plans to 1,243,616 B and pushes out COVER-112 KB, E007's winner at 1,152,971 B.
+  - Why the estimate misjudges it: content that repeats across files is what slice dedup already removes, so a dictionary of repeats is largely redundant with dedup on repo-history. On office, zip members are not sliced, and it helps.
+- Result (d): score 0.6182 -> **0.6115**; per corpus vs_dict: office 0.587->**0.550** (229,574 -> 214,988), every other corpus byte-identical to E007; time 17.0 s -> 22.9 s (1.35x; up to 6 dictionaries, 14 parallel plans). Sizes identical on a second run.
+- Verdict: kept.
+- Learned: the dictionary estimate ignores dedup, and that keeps costing re-plans. An estimate that discounts content the matcher would slice is the open question (E003b's estimate on a no-dictionary plan's literals failed).

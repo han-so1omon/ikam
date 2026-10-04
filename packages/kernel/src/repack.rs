@@ -40,7 +40,7 @@ pub struct Repacked {
 }
 
 /// Dictionary candidates re-planned in full per repack (best estimates).
-const DICT_SHORTLIST: usize = 3;
+const DICT_SHORTLIST: usize = 4;
 
 impl<S: Store + Sync> Repo<S> {
     pub fn repack(&mut self) -> Result<Repacked, Error> {
@@ -400,32 +400,47 @@ fn template_groups(files: &[(Id, Vec<u8>)]) -> Vec<Vec<usize>> {
     groups
 }
 
-/// Candidate zstd dictionaries for `samples`, best estimate first, at most
-/// `k`, each estimated to save more than its own size. Candidates are
-/// trained (COVER, zstd's trainer) and raw (evenly spaced pieces of the
-/// samples themselves, as in relative Lempel-Ziv) at a few sizes: neither
-/// construction nor any size wins on every corpus (COVER can return a tiny
+/// Candidate zstd dictionaries for `samples`, each estimated to save more
+/// than its own size: the `k` best estimates, plus the best of each
+/// construction not among them. Candidates are trained (COVER, zstd's
+/// trainer), raw evenly spaced pieces of the samples (relative Lempel-Ziv)
+/// and raw pieces of the most repeated content, at a few sizes: no
+/// construction or size wins on every corpus (COVER can return a tiny
 /// dictionary when asked for a large one). The estimate ignores dedup, so
-/// the re-plans decide among the shortlist.
+/// the re-plans decide among the shortlist, and every construction gets one.
 fn train_dictionaries(samples: &[&[u8]], k: usize) -> Vec<Vec<u8>> {
     let samples: Vec<&[u8]> = samples.iter().copied().filter(|b| !b.is_empty()).collect();
     let total: usize = samples.iter().map(|b| b.len()).sum();
     let Some(alone) = dictionary_cost(&samples, &[]).filter(|_| samples.len() >= 8) else {
         return vec![];
     };
+    // (estimate, construction, dictionary)
     let mut ranked = Vec::new();
     for size in [total / 100, total / 30, total / 10].map(|s| s.clamp(4096, 112_640)) {
-        let trained = zstd::dict::from_samples(&samples, size).ok();
-        for dict in trained.into_iter().chain([raw_dictionary(&samples, size)]) {
-            if let Some(cost) = dictionary_cost(&samples, &dict).filter(|&c| c < alone)
-                && !ranked.iter().any(|(_, d)| *d == dict)
+        let built = [
+            zstd::dict::from_samples(&samples, size).ok(),
+            Some(raw_dictionary(&samples, size)),
+            Some(repeat_dictionary(&samples, size)),
+        ];
+        for (construction, dict) in built.into_iter().enumerate() {
+            if let Some(dict) = dict
+                && let Some(cost) = dictionary_cost(&samples, &dict).filter(|&c| c < alone)
+                && !ranked.iter().any(|(_, _, d)| *d == dict)
             {
-                ranked.push((cost, dict));
+                ranked.push((cost, construction, dict));
             }
         }
     }
     ranked.sort();
-    ranked.into_iter().take(k).map(|(_, d)| d).collect()
+    let mut shortlist: Vec<usize> = (0..k.min(ranked.len())).collect();
+    for construction in 0..3 {
+        if let Some(i) = ranked.iter().position(|r| r.1 == construction)
+            && !shortlist.contains(&i)
+        {
+            shortlist.push(i);
+        }
+    }
+    shortlist.into_iter().map(|i| ranked[i].2.clone()).collect()
 }
 
 /// Estimated stored size of `samples` given `dict` (empty: none): the
@@ -461,6 +476,54 @@ fn raw_dictionary(samples: &[&[u8]], size: usize) -> Vec<u8> {
         .take(size / PIECE)
         .flatten()
         .copied()
+        .collect()
+}
+
+/// Seed positions and keys of `s` (the matcher's content-defined anchors).
+fn seeds(s: &[u8]) -> impl Iterator<Item = (usize, u64)> + '_ {
+    matcher::anchors(s).map(move |p| (p, matcher::seed_key(&s[p..p + matcher::SEED])))
+}
+
+/// A raw-content dictionary of the content that repeats most across
+/// samples: 1 KiB pieces around the seeds found in the most samples, no
+/// seed covered twice, the most shared last (zstd reaches the end of a
+/// dictionary with the shortest offsets). Built from the corpus's repeats,
+/// not from one sampling of it (Kuruppu, Puglisi and Zobel, SPIRE 2011),
+/// and independent of sample order.
+fn repeat_dictionary(samples: &[&[u8]], size: usize) -> Vec<u8> {
+    const PIECE: usize = 1024;
+    let mut found_in: HashMap<u64, usize> = HashMap::new();
+    for s in samples {
+        let keys: HashSet<u64> = seeds(s).map(|(_, k)| k).collect();
+        keys.into_iter()
+            .for_each(|k| *found_in.entry(k).or_default() += 1);
+    }
+    let mut pieces: Vec<(usize, &[u8], u64)> = Vec::new();
+    for s in samples {
+        for (p, k) in seeds(s) {
+            if found_in[&k] > 1 {
+                let start = p
+                    .saturating_sub(PIECE / 2)
+                    .min(s.len().saturating_sub(PIECE));
+                pieces.push((found_in[&k], &s[start..(start + PIECE).min(s.len())], k));
+            }
+        }
+    }
+    pieces.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(b.1)));
+    let (mut covered, mut chosen, mut len) = (HashSet::new(), Vec::new(), 0);
+    for (_, piece, k) in pieces {
+        if len + piece.len() > size || covered.contains(&k) {
+            continue;
+        }
+        covered.extend(seeds(piece).map(|(_, k)| k));
+        covered.insert(k);
+        len += piece.len();
+        chosen.push(piece);
+    }
+    chosen
+        .iter()
+        .rev()
+        .flat_map(|p| p.iter().copied())
         .collect()
 }
 
@@ -508,6 +571,24 @@ mod tests {
             files.iter().all(|(id, _)| !plan.store().has(id)),
             "no document keeps its bytes"
         );
+    }
+
+    /// The repeat dictionary depends on the samples, not their order, and
+    /// holds only content found in more than one sample.
+    #[test]
+    fn repeat_dictionary_ignores_sample_order() {
+        let shared = (0..400)
+            .map(|i| format!("shared clause {i}; "))
+            .collect::<String>();
+        let docs: Vec<Vec<u8>> = (0..12)
+            .map(|n| format!("{shared} unique text {}", "x".repeat(n * 97)).into_bytes())
+            .collect();
+        let forward: Vec<&[u8]> = docs.iter().map(Vec::as_slice).collect();
+        let backward: Vec<&[u8]> = forward.iter().rev().copied().collect();
+        let dict = repeat_dictionary(&forward, 8192);
+        assert!(!dict.is_empty() && dict.len() <= 8192);
+        assert_eq!(dict, repeat_dictionary(&backward, 8192));
+        assert!(repeat_dictionary(&forward[..1], 8192).is_empty());
     }
 
     /// Templates and fillers are content too, so induction templates them
