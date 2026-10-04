@@ -81,6 +81,37 @@ impl Index {
     }
 }
 
+/// Up to `k` indexed blobs sharing the most seeds with `input`, most
+/// first, with their shared-seed counts, plus how many seeds `input` has.
+/// Neighbours are found without any minimum match length, so they suit
+/// alignment (templates). Entries for blobs no longer stored as bytes may be
+/// returned; the caller decides what to do with them.
+pub fn neighbors(input: &[u8], index: &Index, k: usize) -> (Vec<(Id, usize)>, usize) {
+    let (mut hits, mut seeds) = (HashMap::<Id, usize>::new(), 0);
+    for q in anchors(input) {
+        seeds += 1;
+        for (id, _) in index
+            .seeds
+            .get(&seed_key(&input[q..q + SEED]))
+            .into_iter()
+            .flatten()
+        {
+            *hits.entry(*id).or_default() += 1;
+        }
+    }
+    let mut ranked: Vec<(Id, usize)> = hits.into_iter().collect();
+    ranked.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+    ranked.truncate(k);
+    (ranked, seeds)
+}
+
+/// Worth an alignment: a neighbour sharing at least 3 seeds and at least a
+/// quarter of the input's seeds. Aligning dissimilar contents costs time
+/// and cannot yield a useful template.
+pub fn similar(shared: usize, seeds: usize) -> bool {
+    shared >= 3 && shared * 4 >= seeds
+}
+
 /// Propose a plan for `input`. `load` returns a stored blob's bytes.
 pub fn plan(input: &[u8], index: &Index, load: impl Fn(&Id) -> Option<Vec<u8>>) -> Vec<Part> {
     let mut cache: HashMap<Id, Option<Vec<u8>>> = HashMap::new();

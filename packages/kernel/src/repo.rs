@@ -57,6 +57,8 @@ impl Ledger {
 pub(crate) struct Cx {
     stack: Vec<Id>,
     pub(crate) known: HashMap<Id, Vec<u8>>,
+    /// Deepest derivation nesting reached so far.
+    pub(crate) deepest: usize,
 }
 
 impl Cx {
@@ -209,6 +211,7 @@ impl<S: Store> Repo<S> {
         }
         let derivations = self.derivations(id)?;
         cx.stack.push(*id);
+        cx.deepest = cx.deepest.max(cx.stack.len());
         for d in derivations {
             match self.eval(&d.func, &d.args, cx) {
                 Ok(bytes) if Id::of_content(&bytes) == *id => {
