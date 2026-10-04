@@ -4,6 +4,7 @@
 //! and the object graph.
 //! See docs/plans/2026-10-02-rust-kernel.md for the layer laws.
 
+mod abbrev;
 mod claims;
 mod container;
 mod dict;

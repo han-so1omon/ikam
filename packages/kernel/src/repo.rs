@@ -9,7 +9,7 @@
 //! - Derivations enter the ledger only after they reproduce their output.
 
 use std::cell::OnceCell;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 use crate::dict::object_tag;
 use crate::matcher::Index;
@@ -43,7 +43,7 @@ pub struct Put {
 /// Ledger projection: rebuilt from derivation objects on demand.
 #[derive(Default)]
 pub(crate) struct Ledger {
-    pub(crate) by_output: HashMap<Id, Vec<Derivation>>,
+    pub(crate) by_output: BTreeMap<Id, Vec<Derivation>>,
     pub(crate) by_key: HashMap<Id, Id>,
 }
 
@@ -137,6 +137,24 @@ impl<S: Store> Repo<S> {
             .get(id)
             .cloned()
             .unwrap_or_default())
+    }
+
+    /// Stored or derivable ids starting with `prefix`, without duplicates.
+    pub(crate) fn ids_with_prefix(&self, prefix: &[u8]) -> Result<Vec<Id>, Error> {
+        let mut out = self.store.ids_with_prefix(prefix)?;
+        for (id, _) in self
+            .ledger()?
+            .by_output
+            .range(Id::from_bytes(std::array::from_fn(|i| prefix.get(i).copied().unwrap_or(0)))..)
+        {
+            if !id.as_bytes().starts_with(prefix) {
+                break;
+            }
+            if !out.contains(id) {
+                out.push(*id);
+            }
+        }
+        Ok(out)
     }
 
     /// True if `id` (a content id) is stored as bytes or has a derivation.
