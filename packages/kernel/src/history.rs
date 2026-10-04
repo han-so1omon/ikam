@@ -129,20 +129,34 @@ impl<S: Store> Repo<S> {
 
     /// Delete every object that no ref needs. Every derivation of live
     /// content is kept along with its inputs, so live content stays
-    /// reconstructible and keeps its provenance. Returns the number of
-    /// objects deleted.
+    /// reconstructible and keeps its provenance; claims are kept while both
+    /// endpoints are live. Returns the number of objects deleted.
     pub fn gc(&mut self) -> Result<usize, Error> {
         let (mut objects, files) = self.reachable()?;
         let (content, records) = self.closure(files, |_| true)?;
         objects.extend(records);
         let mut deleted = 0;
         for id in self.store.ids()? {
-            if !objects.contains(&id) && !content.contains(&id) {
+            if !objects.contains(&id)
+                && !content.contains(&id)
+                && !self.claim_is_live(&id, &content)?
+            {
                 self.store.delete(&id)?;
                 deleted += 1;
             }
         }
         self.reset_projections();
         Ok(deleted)
+    }
+
+    /// Claims annotate content without keeping it alive: one survives while
+    /// both its endpoints do.
+    fn claim_is_live(&self, id: &Id, content: &HashSet<Id>) -> Result<bool, Error> {
+        if self.store.read(id)?.first() != Some(&b'L') {
+            return Ok(false);
+        }
+        Ok(
+            matches!(self.get(id), Ok(Object::Claim(c)) if content.contains(&c.subject.id()) && content.contains(&c.object.id())),
+        )
     }
 }

@@ -4,6 +4,7 @@
 //! and the object graph.
 //! See docs/plans/2026-10-02-rust-kernel.md for the layer laws.
 
+mod claims;
 mod container;
 mod exec;
 pub mod func;
@@ -20,7 +21,7 @@ mod template;
 mod wasm;
 
 pub use id::Id;
-pub use object::{Arg, Commit, Derivation, Kind, Object, TreeEntry};
+pub use object::{Arg, Claim, Commit, Derivation, Kind, Object, TreeEntry};
 pub use repack::Repacked;
 pub use repo::{Form, Put, Repo};
 pub use store::{FsStore, MemStore, Store};

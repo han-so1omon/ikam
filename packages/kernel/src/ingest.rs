@@ -34,16 +34,16 @@ const MAX_PLAN_DEPTH: usize = 8;
 type Literal = (Id, Vec<u8>, Vec<u8>);
 
 /// A storage plan for one new content.
-struct Candidate {
+pub(crate) struct Candidate {
     /// Net bytes written: may be negative when it frees a stored copy.
-    cost: isize,
+    pub(crate) cost: isize,
     /// `derivations[0]` produces the new content; others re-express
     /// existing content through shared parts.
-    derivations: Vec<Derivation>,
+    pub(crate) derivations: Vec<Derivation>,
     /// New content the derivations read.
-    literals: Vec<Literal>,
+    pub(crate) literals: Vec<Literal>,
     /// Existing content whose stored bytes the plan makes redundant.
-    drop: Option<Id>,
+    pub(crate) drop: Option<Id>,
 }
 
 impl Candidate {
@@ -99,6 +99,16 @@ impl<S: Store> Repo<S> {
                 form: Form::Blob,
             });
         };
+        self.apply_candidate(c)?;
+        Ok(Put {
+            id,
+            form: Form::Derived,
+        })
+    }
+
+    /// Write a verified candidate: its new content, its derivations, then
+    /// drop the stored copy it makes redundant (only after the rest exists).
+    pub(crate) fn apply_candidate(&mut self, c: Candidate) -> Result<(), Error> {
         for (lit_id, encoded, lit) in &c.literals {
             self.materialize(*lit_id, encoded, lit)?;
         }
@@ -108,10 +118,7 @@ impl<S: Store> Repo<S> {
         if let Some(old) = c.drop {
             self.store.delete(&old)?;
         }
-        Ok(Put {
-            id,
-            form: Form::Derived,
-        })
+        Ok(())
     }
 
     /// Record `bytes = func(args)` if evaluating it reproduces `bytes`
@@ -145,8 +152,24 @@ impl<S: Store> Repo<S> {
     }
 
     fn verify(&self, d: &Derivation, bytes: &[u8], known: &HashMap<Id, Vec<u8>>) -> bool {
+        self.verify_without(d, bytes, known, None)
+    }
+
+    /// `verify`, optionally forbidding any read of `without`: required before
+    /// dropping `without`'s stored copy, so the derivation that replaces it
+    /// cannot depend on that copy (directly or through other derivations).
+    pub(crate) fn verify_without(
+        &self,
+        d: &Derivation,
+        bytes: &[u8],
+        known: &HashMap<Id, Vec<u8>>,
+        without: Option<Id>,
+    ) -> bool {
         let mut cx = Cx::default();
         cx.known = known.clone();
+        if let Some(w) = without {
+            cx.stack_guard(w);
+        }
         d.output == Id::of_content(bytes)
             && self
                 .eval(&d.func, &d.args, &mut cx)
@@ -192,15 +215,25 @@ impl<S: Store> Repo<S> {
         let store = &self.store;
         let load = |id: &Id| store.read(id).ok().and_then(|e| decode_plain(id, &e).ok());
         let plan = matcher::plan(bytes, self.index.as_ref().unwrap(), load);
+        self.concat_candidate(bytes, &plan)
+    }
+
+    /// A `concat` candidate from a slice plan: reused ranges plus one new
+    /// literal blob holding the unmatched bytes.
+    pub(crate) fn concat_candidate(
+        &self,
+        bytes: &[u8],
+        plan: &[Part],
+    ) -> Result<Option<Candidate>, Error> {
         let mut literal = Vec::new();
-        for part in &plan {
+        for part in plan {
             if let Part::Input(r) = part {
                 literal.extend_from_slice(&bytes[r.clone()]);
             }
         }
         let lit_id = Id::of_content(&literal);
         let (mut args, mut lit_pos) = (Vec::new(), 0);
-        for part in &plan {
+        for part in plan {
             let (id, start, len) = match part {
                 Part::Input(r) => (lit_id, lit_pos, r.len()),
                 Part::Existing { src, start, len } => (*src, *start, *len),
@@ -298,7 +331,8 @@ impl<S: Store> Repo<S> {
             args: vec![Arg::Whole(t_id), Arg::Whole(f)],
         };
         let (dx, dy) = (fill(Id::of_content(bytes), fx_id), fill(y, fy_id));
-        if !self.verify(&dx, bytes, &known) || !self.verify(&dy, &y_bytes, &known) {
+        if !self.verify(&dx, bytes, &known) || !self.verify_without(&dy, &y_bytes, &known, Some(y))
+        {
             return Ok(None);
         }
         let mut literals = Vec::new();

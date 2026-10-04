@@ -20,6 +20,9 @@ cargo run --release -- checkout main DEST          # restore a snapshot
 cargo run --release -- apply FUNC ARG...           # run a stored WASM function (memoized)
 cargo run --release -- links ID                    # outgoing graph edges
 cargo run --release -- used-by ID                  # incoming graph edges
+cargo run --release -- claim A "revision of" B     # semantic claim, weight measured in bits
+cargo run --release -- relate ID 5                 # contents most informative about ID
+cargo run --release -- promote CLAIM               # turn a claim into verified storage
 cargo run --release -- fsck                        # reconstruct and verify everything
 cargo run --release -- gc                          # drop objects no ref reaches
 cargo run --release -- repack                      # re-plan all storage (only if smaller and verified)
@@ -34,6 +37,8 @@ A file's id is the BLAKE3 hash of its content and never depends on how it is sto
 - a WASM function of other content
 
 One file may have several derivations. A corrupt stored copy falls through to them.
+
+Claims are the descriptive half of the graph: `subject predicate object` over any selections, with a weight the kernel measures (bits the object saves on the subject). They never affect reconstruction, but `promote` turns one into storage when that is verifiably smaller.
 
 Every derivation is verified by reconstructing the exact bytes before it is recorded. Planners, including future AI ones, can therefore cost space but never correctness. Which bytes stay stored is a cost decision that `repack` re-makes store-wide.
 

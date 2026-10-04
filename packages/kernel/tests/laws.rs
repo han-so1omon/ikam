@@ -5,7 +5,7 @@ use std::path::Path;
 
 use ikam_kernel::matcher::MIN_MATCH;
 use ikam_kernel::{
-    Arg, Commit, Derivation, Error, Form, FsStore, Id, Kind, MemStore, Object, Repo, Store,
+    Arg, Claim, Commit, Derivation, Error, Form, FsStore, Id, Kind, MemStore, Object, Repo, Store,
     TreeEntry, func, snapshot,
 };
 use proptest::prelude::*;
@@ -42,7 +42,24 @@ fn any_object() -> impl Strategy<Value = Object> {
     );
     let derivation = (any_id(), any_id(), prop::collection::vec(any_arg(), 0..5))
         .prop_map(|(output, func, args)| Object::Derivation(Derivation { output, func, args }));
+    let claim = (
+        any_arg(),
+        ".{0,12}",
+        any_arg(),
+        any::<i64>(),
+        prop::option::of(any_id()),
+    )
+        .prop_map(|(subject, predicate, object, gain_bits, by)| {
+            Object::Claim(Claim {
+                subject,
+                predicate,
+                object,
+                gain_bits,
+                by,
+            })
+        });
     prop_oneof![
+        claim,
         prop::collection::vec(any::<u8>(), 0..256).prop_map(Object::Blob),
         prop::collection::btree_map("[a-z]{1,8}", entry, 0..6).prop_map(|m| Object::Tree(
             m.into_iter()

@@ -6,6 +6,7 @@
 //!   commit     = "C" tree[32] nparents:u32 { parent[32] } msg_len:u32 msg
 //!   derivation = "D" output[32] func[32] nargs:u32 { arg }
 //!   arg        = 0 id[32] | 1 id[32] start:u64 len:u64              (whole content | byte range)
+//!   claim      = "L" subject:arg pred_len:u32 predicate object:arg gain_bits:i64 by:(0 | 1 id[32])
 //!
 //! A file's identity is the id of its blob form, `Id::of_content(bytes)`.
 //! Trees, commits and derivations are named by `BLAKE3(encoding)`.
@@ -74,12 +75,29 @@ impl Derivation {
     }
 }
 
+/// An unverified semantic relation between two selections of content:
+/// `subject predicate object`, e.g. "bytes 0..400 of report mentions
+/// <entity>". The predicate is free text. `gain_bits` is measured by the
+/// kernel, not asserted: how many bits knowing the object saves when
+/// compressing the subject. `by` names who asserted it (e.g. an extractor
+/// function), if known. Claims never take part in reconstruction; one can
+/// be promoted to a derivation once a verified function reproduces it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Claim {
+    pub subject: Arg,
+    pub predicate: String,
+    pub object: Arg,
+    pub gain_bits: i64,
+    pub by: Option<Id>,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Object {
     Blob(Vec<u8>),
     Tree(Vec<TreeEntry>),
     Commit(Commit),
     Derivation(Derivation),
+    Claim(Claim),
 }
 
 impl Object {
@@ -122,6 +140,20 @@ impl Object {
                 out.extend_from_slice(d.func.as_bytes());
                 put_args(&mut out, &d.args);
             }
+            Object::Claim(c) => {
+                out.push(b'L');
+                put_arg(&mut out, &c.subject);
+                put_str(&mut out, &c.predicate);
+                put_arg(&mut out, &c.object);
+                out.extend_from_slice(&c.gain_bits.to_be_bytes());
+                match c.by {
+                    None => out.push(0),
+                    Some(by) => {
+                        out.push(1);
+                        out.extend_from_slice(by.as_bytes());
+                    }
+                }
+            }
         }
         out
     }
@@ -140,6 +172,17 @@ impl Object {
                 output: r.id()?,
                 func: r.id()?,
                 args: r.many(Reader::arg)?,
+            }),
+            b'L' => Object::Claim(Claim {
+                subject: r.arg()?,
+                predicate: r.string()?,
+                object: r.arg()?,
+                gain_bits: r.u64()? as i64,
+                by: match r.take(1)?[0] {
+                    0 => None,
+                    1 => Some(r.id()?),
+                    _ => return Err(Error::Decode("unknown claim author tag")),
+                },
             }),
             _ => return Err(Error::Decode("unknown object tag")),
         };
@@ -166,14 +209,19 @@ impl Object {
                     ("func".to_string(), d.func),
                 ];
                 for (i, a) in d.args.iter().enumerate() {
-                    let label = match a {
-                        Arg::Whole(_) => format!("arg{i}"),
-                        Arg::Range { start, len, .. } => {
-                            format!("arg{i}[{start}..{}]", start + len)
-                        }
-                    };
-                    links.push((label, a.id()));
+                    links.push((label(&format!("arg{i}"), a), a.id()));
                 }
+                links
+            }
+            Object::Claim(c) => {
+                let mut links = vec![
+                    (label("subject", &c.subject), c.subject.id()),
+                    (
+                        label(&format!("object ({})", c.predicate), &c.object),
+                        c.object.id(),
+                    ),
+                ];
+                links.extend(c.by.map(|by| ("by".to_string(), by)));
                 links
             }
         }
@@ -205,20 +253,30 @@ fn decode_tree(r: &mut Reader) -> Result<Object, Error> {
     Ok(Object::Tree(entries))
 }
 
+/// Edge label for a selector, keeping range offsets visible.
+fn label(name: &str, a: &Arg) -> String {
+    match a {
+        Arg::Whole(_) => name.to_string(),
+        Arg::Range { start, len, .. } => format!("{name}[{start}..{}]", start + len),
+    }
+}
+
 fn put_args(out: &mut Vec<u8>, args: &[Arg]) {
     put_u32(out, args.len());
-    for a in args {
-        match a {
-            Arg::Whole(id) => {
-                out.push(0);
-                out.extend_from_slice(id.as_bytes());
-            }
-            Arg::Range { id, start, len } => {
-                out.push(1);
-                out.extend_from_slice(id.as_bytes());
-                out.extend_from_slice(&start.to_be_bytes());
-                out.extend_from_slice(&len.to_be_bytes());
-            }
+    args.iter().for_each(|a| put_arg(out, a));
+}
+
+fn put_arg(out: &mut Vec<u8>, a: &Arg) {
+    match a {
+        Arg::Whole(id) => {
+            out.push(0);
+            out.extend_from_slice(id.as_bytes());
+        }
+        Arg::Range { id, start, len } => {
+            out.push(1);
+            out.extend_from_slice(id.as_bytes());
+            out.extend_from_slice(&start.to_be_bytes());
+            out.extend_from_slice(&len.to_be_bytes());
         }
     }
 }
