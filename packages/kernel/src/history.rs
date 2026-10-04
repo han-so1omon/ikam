@@ -2,7 +2,8 @@
 
 use std::collections::HashSet;
 
-use crate::repo::{Cx, decode_plain};
+use crate::dict::dict_of;
+use crate::repo::Cx;
 use crate::{Arg, Commit, Derivation, Error, Id, Kind, Object, Repo, Store, func};
 
 impl<S: Store> Repo<S> {
@@ -55,7 +56,7 @@ impl<S: Store> Repo<S> {
         let mut failures = Vec::new();
         for id in self.store.ids()? {
             let encoded = self.store.read(&id)?;
-            let result = match decode_plain(&id, &encoded) {
+            let result = match self.decode_plain(&id, &encoded) {
                 Ok(bytes) if Id::of_content(&bytes) == id => Ok(()),
                 Ok(_) => Err(Error::Corrupt(id)),
                 Err(Error::WrongKind(_)) => self.check_object(&id),
@@ -135,6 +136,14 @@ impl<S: Store> Repo<S> {
         let (mut objects, files) = self.reachable()?;
         let (content, records) = self.closure(files, |_| true)?;
         objects.extend(records);
+        // Dictionaries that live stored bytes are encoded against.
+        for id in &content {
+            if let Ok(encoded) = self.store.read(id)
+                && let Some(dict) = dict_of(&encoded)
+            {
+                objects.insert(dict);
+            }
+        }
         let mut deleted = 0;
         for id in self.store.ids()? {
             if !objects.contains(&id)

@@ -144,8 +144,9 @@ proptest! {
         prop_assert!(repo.fsck().unwrap().is_empty());
     }
 
-    /// Slice boundaries follow the data: an insertion at an arbitrary offset
-    /// is reused up to exactly that byte.
+    /// Reuse boundaries follow the data: an insertion at an arbitrary offset
+    /// is reused up to exactly that byte, whichever plan wins (a `concat`
+    /// of ranges, or a template whose first segment ends there).
     #[test]
     fn boundaries_are_byte_precise(base in prop::collection::vec(any::<u8>(), 4000..8000), at in 0.1..0.9f64) {
         let k = (at * base.len() as f64) as usize;
@@ -156,10 +157,18 @@ proptest! {
         let put = repo.put_content(&edited).unwrap();
         prop_assert_eq!(put.form, Form::Derived);
         let d = &repo.derivations(&put.id).unwrap()[0];
-        prop_assert_eq!(d.func, func::concat());
-        prop_assert_eq!(d.args[0], Arg::Range { id: base_id, start: 0, len: k as u64 });
-        prop_assert_eq!(d.args.last().unwrap().id(), base_id);
+        if d.func == func::concat() {
+            prop_assert_eq!(d.args[0], Arg::Range { id: base_id, start: 0, len: k as u64 });
+            prop_assert_eq!(d.args.last().unwrap().id(), base_id);
+        } else {
+            prop_assert_eq!(d.func, func::fill());
+            // Template encoding: count:u32 { len:u32 bytes }; first segment.
+            let t = repo.read_content(&d.args[0].id()).unwrap();
+            let len = u32::from_be_bytes(t[4..8].try_into().unwrap()) as usize;
+            prop_assert_eq!(&t[8..8 + len], &base[..k]);
+        }
         prop_assert_eq!(repo.read_content(&put.id).unwrap(), edited);
+        prop_assert_eq!(repo.read_content(&base_id).unwrap(), base);
     }
 
     /// Arbitrary (mostly wrong) derivation proposals never lose data: the

@@ -14,8 +14,14 @@ use std::collections::HashMap;
 use crate::matcher::Index;
 use crate::{Arg, Derivation, Error, Id, Object, Store, func};
 
-/// Bound on nested derivations followed by one read.
-const MAX_DEPTH: usize = 32;
+/// Stack-safety guard for malformed stores (reconstruction recurses). It is
+/// not a planning policy: the evaluator (`read_weight`) prices read work, so
+/// plans this deep are never chosen in practice.
+const STACK_GUARD: usize = 256;
+
+/// Default weight of decode work against storage in plan choice: 1 KiB of
+/// bytes produced while rebuilding content costs as much as 1 stored byte.
+pub const DEFAULT_READ_WEIGHT: f64 = 0.001;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Form {
@@ -57,8 +63,8 @@ impl Ledger {
 pub(crate) struct Cx {
     stack: Vec<Id>,
     pub(crate) known: HashMap<Id, Vec<u8>>,
-    /// Deepest derivation nesting reached so far.
-    pub(crate) deepest: usize,
+    /// Bytes produced by function evaluations so far: the decode work.
+    pub(crate) work: usize,
 }
 
 impl Cx {
@@ -72,8 +78,13 @@ pub struct Repo<S: Store> {
     pub(crate) store: S,
     pub(crate) index: Option<Index>,
     ledger: OnceCell<Ledger>,
+    /// Current shared dictionary (see `dict.rs`), loaded on first use.
+    pub(crate) dict: OnceCell<Option<(Id, Vec<u8>)>>,
     /// Encoded bytes newly written through this handle.
     pub bytes_written: usize,
+    /// Evaluator weight of decode work against storage when choosing plans:
+    /// a plan scores `bytes written + read_weight * decode work`.
+    pub read_weight: f64,
 }
 
 impl<S: Store> Repo<S> {
@@ -82,7 +93,9 @@ impl<S: Store> Repo<S> {
             store,
             index: None,
             ledger: OnceCell::new(),
+            dict: OnceCell::new(),
             bytes_written: 0,
+            read_weight: DEFAULT_READ_WEIGHT,
         }
     }
 
@@ -110,6 +123,7 @@ impl<S: Store> Repo<S> {
     pub(crate) fn reset_projections(&mut self) {
         self.index = None;
         self.ledger = OnceCell::new();
+        self.dict = OnceCell::new();
     }
 
     /// Every recorded derivation of `id`.
@@ -194,14 +208,14 @@ impl<S: Store> Repo<S> {
         if let Some(bytes) = cx.known.get(id) {
             return Ok(bytes.clone());
         }
-        if cx.stack.len() >= MAX_DEPTH || cx.stack.contains(id) {
+        if cx.stack.len() >= STACK_GUARD || cx.stack.contains(id) {
             return Err(Error::Exec(format!(
                 "{id}: derivation cycle or nesting too deep"
             )));
         }
         let mut err = Error::NotFound(*id);
         match self.store.read(id) {
-            Ok(encoded) => match decode_plain(id, &encoded) {
+            Ok(encoded) => match self.decode_plain(id, &encoded) {
                 Ok(bytes) if Id::of_content(&bytes) == *id => return self.remember(id, bytes, cx),
                 Ok(_) | Err(Error::Corrupt(_)) => err = Error::Corrupt(*id),
                 Err(e) => return Err(e),
@@ -211,7 +225,6 @@ impl<S: Store> Repo<S> {
         }
         let derivations = self.derivations(id)?;
         cx.stack.push(*id);
-        cx.deepest = cx.deepest.max(cx.stack.len());
         for d in derivations {
             match self.eval(&d.func, &d.args, cx) {
                 Ok(bytes) if Id::of_content(&bytes) == *id => {
@@ -249,30 +262,13 @@ impl<S: Store> Repo<S> {
         } else {
             Some(self.rebuild(func, cx)?)
         };
-        func::run(func, module.as_deref(), &inputs)
+        let out = func::run(func, module.as_deref(), &inputs)?;
+        cx.work += out.len();
+        Ok(out)
     }
 }
 
 fn select(bytes: &[u8], start: u64, len: u64) -> Option<&[u8]> {
     let start = usize::try_from(start).ok()?;
     bytes.get(start..start.checked_add(usize::try_from(len).ok()?)?)
-}
-
-/// `"B" bytes`, or `"Z" zstd(bytes)` when smaller. Identity is always over
-/// the uncompressed bytes, so this choice never changes an id.
-pub(crate) fn plain_encoding(bytes: &[u8]) -> Vec<u8> {
-    if let Ok(z) = zstd::bulk::compress(bytes, 3)
-        && z.len() < bytes.len()
-    {
-        return [&b"Z"[..], &z].concat();
-    }
-    [&b"B"[..], bytes].concat()
-}
-
-pub(crate) fn decode_plain(id: &Id, encoded: &[u8]) -> Result<Vec<u8>, Error> {
-    match encoded.split_first() {
-        Some((b'B', bytes)) => Ok(bytes.to_vec()),
-        Some((b'Z', z)) => zstd::stream::decode_all(z).map_err(|_| Error::Corrupt(*id)),
-        _ => Err(Error::WrongKind(*id)),
-    }
 }

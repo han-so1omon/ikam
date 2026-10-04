@@ -11,6 +11,9 @@ use crate::{Error, Id};
 pub trait Store {
     /// Write `encoded` under `id` unless present. Returns true if newly written.
     fn write(&mut self, id: Id, encoded: &[u8]) -> Result<bool, Error>;
+    /// Atomically replace the encoding stored under `id` (written or not).
+    /// Callers must only swap encodings of the same object or content.
+    fn replace(&mut self, id: Id, encoded: &[u8]) -> Result<(), Error>;
     fn read(&self, id: &Id) -> Result<Vec<u8>, Error>;
     fn has(&self, id: &Id) -> bool;
     fn ids(&self) -> Result<Vec<Id>, Error>;
@@ -52,6 +55,11 @@ impl Store for MemStore {
         }
         self.objects.insert(id, encoded.to_vec());
         Ok(true)
+    }
+
+    fn replace(&mut self, id: Id, encoded: &[u8]) -> Result<(), Error> {
+        self.objects.insert(id, encoded.to_vec());
+        Ok(())
     }
 
     fn read(&self, id: &Id) -> Result<Vec<u8>, Error> {
@@ -138,6 +146,10 @@ impl Store for FsStore {
         }
         write_atomic(&path, encoded)?;
         Ok(true)
+    }
+
+    fn replace(&mut self, id: Id, encoded: &[u8]) -> Result<(), Error> {
+        write_atomic(&self.path(&id), encoded) // rename is atomic over an old file
     }
 
     fn read(&self, id: &Id) -> Result<Vec<u8>, Error> {

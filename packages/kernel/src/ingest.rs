@@ -17,7 +17,7 @@
 use std::collections::HashMap;
 
 use crate::matcher::{self, Index, Part};
-use crate::repo::{Cx, decode_plain, plain_encoding};
+use crate::repo::Cx;
 use crate::{
     Arg, Derivation, Error, Form, Id, Object, Put, Repo, Store, container, func, template,
 };
@@ -26,9 +26,6 @@ use crate::{
 const MAX_UNPACK_DEPTH: usize = 4;
 /// Similar stored contents considered for templates.
 const NEIGHBORS: usize = 3;
-/// Deepest derivation nesting a new plan may need to rebuild its output.
-/// Reads stay bounded; deeper layering must come from a deliberate pass.
-const MAX_PLAN_DEPTH: usize = 8;
 
 /// New content a candidate writes: (id, plain encoding, bytes).
 type Literal = (Id, Vec<u8>, Vec<u8>);
@@ -37,6 +34,8 @@ type Literal = (Id, Vec<u8>, Vec<u8>);
 pub(crate) struct Candidate {
     /// Net bytes written: may be negative when it frees a stored copy.
     pub(crate) cost: isize,
+    /// Decode work (bytes produced) to rebuild what the plan derives.
+    pub(crate) work: usize,
     /// `derivations[0]` produces the new content; others re-express
     /// existing content through shared parts.
     pub(crate) derivations: Vec<Derivation>,
@@ -47,10 +46,11 @@ pub(crate) struct Candidate {
 }
 
 impl Candidate {
-    fn single(d: Derivation, literals: Vec<Literal>) -> Candidate {
+    fn single(d: Derivation, literals: Vec<Literal>, work: usize) -> Candidate {
         let cost = derivation_size(&d) + literals.iter().map(|l| l.1.len()).sum::<usize>();
         Candidate {
             cost: cost as isize,
+            work,
             derivations: vec![d],
             literals,
             drop: None,
@@ -76,11 +76,11 @@ impl<S: Store> Repo<S> {
                 form: Form::Existing,
             });
         }
-        let plain = plain_encoding(bytes);
+        let plain = self.encode_plain(bytes);
         let mut candidates = Vec::new();
         for d in hints {
-            if self.verify(d, bytes, &HashMap::new()) {
-                candidates.push(Candidate::single(d.clone(), vec![]));
+            if let Some(work) = self.verify(d, bytes, &HashMap::new()) {
+                candidates.push(Candidate::single(d.clone(), vec![], work));
             }
         }
         if depth < MAX_UNPACK_DEPTH {
@@ -90,8 +90,10 @@ impl<S: Store> Repo<S> {
         candidates.extend(self.template_candidates(bytes)?);
         let best = candidates
             .into_iter()
-            .filter(|c| c.cost < plain.len() as isize)
-            .min_by_key(|c| c.cost);
+            .map(|c| (c.cost as f64 + self.read_weight * c.work as f64, c))
+            .filter(|(score, _)| *score < plain.len() as f64)
+            .min_by(|a, b| a.0.total_cmp(&b.0))
+            .map(|(_, c)| c);
         let Some(c) = best else {
             self.materialize(id, &plain, bytes)?;
             return Ok(Put {
@@ -115,7 +117,10 @@ impl<S: Store> Repo<S> {
         for d in c.derivations {
             self.record(d)?;
         }
-        if let Some(old) = c.drop {
+        // A dictionary is decoded from its stored bytes and must stay stored.
+        if let Some(old) = c.drop
+            && Some(old) != self.dictionary().map(|(id, _)| *id)
+        {
             self.store.delete(&old)?;
         }
         Ok(())
@@ -139,7 +144,7 @@ impl<S: Store> Repo<S> {
             func,
             args,
         };
-        if !self.verify(&d, bytes, &HashMap::new()) {
+        if self.verify(&d, bytes, &HashMap::new()).is_none() {
             return Ok(None);
         }
         let form = if self.has_content(&id)? {
@@ -151,7 +156,8 @@ impl<S: Store> Repo<S> {
         Ok(Some(Put { id, form }))
     }
 
-    fn verify(&self, d: &Derivation, bytes: &[u8], known: &HashMap<Id, Vec<u8>>) -> bool {
+    /// Decode work if `d` reproduces `bytes` exactly, else `None`.
+    fn verify(&self, d: &Derivation, bytes: &[u8], known: &HashMap<Id, Vec<u8>>) -> Option<usize> {
         self.verify_without(d, bytes, known, None)
     }
 
@@ -164,23 +170,23 @@ impl<S: Store> Repo<S> {
         bytes: &[u8],
         known: &HashMap<Id, Vec<u8>>,
         without: Option<Id>,
-    ) -> bool {
+    ) -> Option<usize> {
         let mut cx = Cx::default();
         cx.known = known.clone();
         if let Some(w) = without {
             cx.stack_guard(w);
         }
-        d.output == Id::of_content(bytes)
+        let ok = d.output == Id::of_content(bytes)
             && self
                 .eval(&d.func, &d.args, &mut cx)
-                .is_ok_and(|out| out == bytes)
-            && cx.deepest < MAX_PLAN_DEPTH
+                .is_ok_and(|out| out == bytes);
+        ok.then_some(cx.work)
     }
 
     /// `(id, plain encoding, bytes)` for content not yet stored or derivable.
     fn new_literal(&self, bytes: Vec<u8>) -> Result<Option<Literal>, Error> {
         let id = Id::of_content(&bytes);
-        Ok((!self.has_content(&id)?).then(|| (id, plain_encoding(&bytes), bytes)))
+        Ok((!self.has_content(&id)?).then(|| (id, self.encode_plain(&bytes), bytes)))
     }
 
     fn container_candidate(
@@ -207,13 +213,18 @@ impl<S: Store> Repo<S> {
         };
         Ok(self
             .verify(&d, bytes, &HashMap::new())
-            .then(|| Candidate::single(d, vec![])))
+            .map(|work| Candidate::single(d, vec![], work)))
     }
 
     fn slice_candidate(&mut self, bytes: &[u8]) -> Result<Option<Candidate>, Error> {
         self.ensure_index()?;
         let store = &self.store;
-        let load = |id: &Id| store.read(id).ok().and_then(|e| decode_plain(id, &e).ok());
+        let load = |id: &Id| {
+            store
+                .read(id)
+                .ok()
+                .and_then(|e| self.decode_plain(id, &e).ok())
+        };
         let plan = matcher::plan(bytes, self.index.as_ref().unwrap(), load);
         self.concat_candidate(bytes, &plan)
     }
@@ -251,22 +262,26 @@ impl<S: Store> Repo<S> {
             func: func::concat(),
             args,
         };
-        if !self.verify(&d, bytes, &HashMap::from([(lit_id, literal.clone())])) {
+        let Some(work) = self.verify(&d, bytes, &HashMap::from([(lit_id, literal.clone())])) else {
             return Ok(None);
-        }
+        };
         let literal = if literal.is_empty() {
             None
         } else {
             self.new_literal(literal)?
         };
-        Ok(Some(Candidate::single(d, literal.into_iter().collect())))
+        Ok(Some(Candidate::single(
+            d,
+            literal.into_iter().collect(),
+            work,
+        )))
     }
 
     /// Template candidates against the most similar stored contents: fit an
     /// existing template, or anti-unify with a neighbour into a new one.
     fn template_candidates(&mut self, bytes: &[u8]) -> Result<Vec<Candidate>, Error> {
         self.ensure_index()?;
-        let (neighbors, seeds) = matcher::neighbors(bytes, self.index.as_ref().unwrap(), NEIGHBORS);
+        let (neighbors, _) = matcher::neighbors(bytes, self.index.as_ref().unwrap(), NEIGHBORS);
         let mut templates = Vec::new();
         for (n, _) in &neighbors {
             templates.extend(
@@ -290,17 +305,16 @@ impl<S: Store> Repo<S> {
                     func: func::fill(),
                     args: vec![Arg::Whole(t), Arg::Whole(f)],
                 };
-                if self.verify(&d, bytes, &HashMap::from([(f, fillers.clone())])) {
+                if let Some(work) = self.verify(&d, bytes, &HashMap::from([(f, fillers.clone())])) {
                     out.push(Candidate::single(
                         d,
                         self.new_literal(fillers)?.into_iter().collect(),
+                        work,
                     ));
                 }
             }
         }
-        if let Some((n, shared)) = neighbors.first()
-            && matcher::similar(*shared, seeds)
-        {
+        if let Some((n, _)) = neighbors.first() {
             out.extend(self.new_template_candidate(bytes, *n)?);
         }
         Ok(out)
@@ -308,16 +322,21 @@ impl<S: Store> Repo<S> {
 
     /// Anti-unify `bytes` with stored content `y`; both become `fill`s of a
     /// new shared template, and `y`'s stored bytes are credited back. Only a
-    /// plain document qualifies as `y`: not a template, fillers, or content
-    /// with derivations, so templates never chain through repeated pairing.
+    /// plain document qualifies as `y`: not a template, fillers, content
+    /// with derivations (so templates never chain through repeated pairing),
+    /// or the dictionary (which must stay stored).
     fn new_template_candidate(&self, bytes: &[u8], y: Id) -> Result<Option<Candidate>, Error> {
         let Ok(stored) = self.store.read(&y) else {
             return Ok(None);
         };
-        let Ok(y_bytes) = decode_plain(&y, &stored) else {
+        let Ok(y_bytes) = self.decode_plain(&y, &stored) else {
             return Ok(None);
         };
-        if !self.derivations(&y)?.is_empty() || template::decode_parts(&y_bytes).is_some() {
+        let is_dict = self.dictionary().is_some_and(|(d, _)| *d == y);
+        if is_dict
+            || !self.derivations(&y)?.is_empty()
+            || template::decode_parts(&y_bytes).is_some()
+        {
             return Ok(None);
         }
         let Some((t, fy, fx)) = template::anti_unify(&y_bytes, bytes) else {
@@ -331,10 +350,12 @@ impl<S: Store> Repo<S> {
             args: vec![Arg::Whole(t_id), Arg::Whole(f)],
         };
         let (dx, dy) = (fill(Id::of_content(bytes), fx_id), fill(y, fy_id));
-        if !self.verify(&dx, bytes, &known) || !self.verify_without(&dy, &y_bytes, &known, Some(y))
-        {
+        let (Some(work_x), Some(work_y)) = (
+            self.verify(&dx, bytes, &known),
+            self.verify_without(&dy, &y_bytes, &known, Some(y)),
+        ) else {
             return Ok(None);
-        }
+        };
         let mut literals = Vec::new();
         for part in [t, fy, fx] {
             literals.extend(self.new_literal(part)?);
@@ -346,6 +367,7 @@ impl<S: Store> Repo<S> {
         let cost = written as isize - stored.len() as isize;
         Ok(Some(Candidate {
             cost,
+            work: work_x + work_y,
             derivations: vec![dx, dy],
             literals,
             drop: Some(y),
@@ -356,7 +378,7 @@ impl<S: Store> Repo<S> {
         if self.index.is_none() {
             let mut index = Index::default();
             for id in self.store.ids()? {
-                if let Ok(bytes) = decode_plain(&id, &self.store.read(&id)?) {
+                if let Ok(bytes) = self.decode_plain(&id, &self.store.read(&id)?) {
                     index.add(id, &bytes);
                 }
             }

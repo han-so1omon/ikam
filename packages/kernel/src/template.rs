@@ -11,15 +11,25 @@
 //! length header in the template and in every filler list); shorter runs
 //! stay in the fillers.
 //!
+//! The alignment is anchored: exact matches at content-defined seeds
+//! (extended byte-by-byte) anchor it in linear time even when most bytes
+//! differ, and Myers runs only inside small gaps between anchors, where
+//! short equal runs (a shared digit, a closing tag) hide. Contents dominated
+//! by unique payload can therefore still share their boilerplate, without
+//! paying for a full diff.
+//!
 //! Encoding of both template and fillers: count:u32 { len:u32 bytes }.
 //! A template with m segments takes m + 1 fillers:
 //! output = f0 s1 f1 s2 ... sm fm.
 
 use std::time::{Duration, Instant};
 
+use std::collections::HashMap;
+
 use similar::{Algorithm, DiffOp, capture_diff_slices_deadline};
 
 use crate::Error;
+use crate::matcher::{SEED, anchors, common_prefix, common_suffix, seed_key};
 
 /// Two u32 length headers: what a hole costs in the template plus in one
 /// filler list. Equal runs no longer than this are cheaper left in fillers.
@@ -27,6 +37,82 @@ const HOLE_COST: usize = 8;
 /// Alignment budget. Planning may stop early; correctness never depends on
 /// it, because every result is verified.
 const ALIGN_BUDGET: Duration = Duration::from_millis(50);
+/// Gaps between anchors larger than this (either side) are unique payload,
+/// not worth a diff: they stay holes.
+const GAP_DIFF: usize = 1024;
+/// Positions remembered per seed when indexing one side.
+const SEED_POSITIONS: usize = 8;
+
+/// Equal runs `(a_pos, b_pos, len)` between `a` and `b`, increasing in both.
+pub(crate) fn align(a: &[u8], b: &[u8]) -> Vec<(usize, usize, usize)> {
+    let deadline = Instant::now() + ALIGN_BUDGET;
+    let mut seeds: HashMap<u64, Vec<usize>> = HashMap::new();
+    for p in anchors(a) {
+        let slot = seeds.entry(seed_key(&a[p..p + SEED])).or_default();
+        if slot.len() < SEED_POSITIONS {
+            slot.push(p);
+        }
+    }
+    let (mut runs, mut ca, mut cb) = (Vec::new(), 0, 0);
+    for q in anchors(b) {
+        if q < cb {
+            continue;
+        }
+        let Some(ps) = seeds.get(&seed_key(&b[q..q + SEED])) else {
+            continue;
+        };
+        let best = ps
+            .iter()
+            .filter(|&&p| p >= ca && a[p..p + SEED] == b[q..q + SEED])
+            .map(|&p| {
+                let back = common_suffix(&b[cb..q], &a[ca..p]);
+                (p - back, q - back, back + common_prefix(&b[q..], &a[p..]))
+            })
+            .max_by_key(|&(_, _, len)| len);
+        if let Some((pa, pb, len)) = best {
+            diff_gap(a, b, (ca, pa), (cb, pb), deadline, &mut runs);
+            runs.push((pa, pb, len));
+            (ca, cb) = (pa + len, pb + len);
+        }
+    }
+    diff_gap(a, b, (ca, a.len()), (cb, b.len()), deadline, &mut runs);
+    runs
+}
+
+/// Myers inside one small gap between anchors, appending its equal runs.
+fn diff_gap(
+    a: &[u8],
+    b: &[u8],
+    (a0, a1): (usize, usize),
+    (b0, b1): (usize, usize),
+    deadline: Instant,
+    runs: &mut Vec<(usize, usize, usize)>,
+) {
+    if a0 >= a1 || b0 >= b1 || a1 - a0 > GAP_DIFF || b1 - b0 > GAP_DIFF || Instant::now() > deadline
+    {
+        return;
+    }
+    for op in capture_diff_slices_deadline(Algorithm::Myers, &a[a0..a1], &b[b0..b1], Some(deadline))
+    {
+        if let DiffOp::Equal {
+            old_index,
+            new_index,
+            len,
+        } = op
+        {
+            runs.push((a0 + old_index, b0 + new_index, len));
+        }
+    }
+}
+
+/// Bytes `a` and `b` share in runs long enough to become segments.
+pub(crate) fn shared(a: &[u8], b: &[u8]) -> usize {
+    align(a, b)
+        .iter()
+        .map(|r| r.2)
+        .filter(|&len| len > HOLE_COST)
+        .sum()
+}
 
 pub(crate) fn encode_parts<P: AsRef<[u8]>>(parts: &[P]) -> Vec<u8> {
     let mut out = (parts.len() as u32).to_be_bytes().to_vec();
@@ -76,18 +162,10 @@ pub fn fill(args: &[Vec<u8>]) -> Result<Vec<u8>, Error> {
 /// Anti-unify `a` and `b`: `(template, fillers_a, fillers_b)`, or `None`
 /// if they share no segment worth a hole.
 pub(crate) fn anti_unify(a: &[u8], b: &[u8]) -> Option<(Vec<u8>, Vec<u8>, Vec<u8>)> {
-    let ops =
-        capture_diff_slices_deadline(Algorithm::Myers, a, b, Some(Instant::now() + ALIGN_BUDGET));
     let (mut segments, mut fa, mut fb) = (Vec::new(), Vec::new(), Vec::new());
     let (mut ca, mut cb) = (0, 0);
-    for op in ops {
-        if let DiffOp::Equal {
-            old_index,
-            new_index,
-            len,
-        } = op
-            && len > HOLE_COST
-        {
+    for (old_index, new_index, len) in align(a, b) {
+        if len > HOLE_COST {
             fa.push(&a[ca..old_index]);
             fb.push(&b[cb..new_index]);
             segments.push(&a[old_index..old_index + len]);
@@ -132,17 +210,8 @@ pub(crate) fn generalize(template: &[u8], x: &[u8]) -> Option<Vec<u8>> {
         joined.extend_from_slice(s);
     }
     bounds.push(joined.len());
-    let ops = capture_diff_slices_deadline(
-        Algorithm::Myers,
-        &joined,
-        x,
-        Some(Instant::now() + ALIGN_BUDGET),
-    );
     let mut kept = Vec::new();
-    for op in ops {
-        let DiffOp::Equal { old_index, len, .. } = op else {
-            continue;
-        };
+    for (old_index, _, len) in align(&joined, x) {
         let mut start = old_index;
         // Split runs at old segment boundaries, so holes are never removed.
         for &b in bounds

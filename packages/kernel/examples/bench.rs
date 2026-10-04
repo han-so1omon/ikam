@@ -3,6 +3,7 @@
 //!   cargo run --release --example bench            # table
 //!   cargo run --release --example bench -- --json  # one JSON object per corpus
 //!   cargo run --release --example bench -- pdf md  # only corpora named so
+//!   cargo run --release --example bench -- --read-weight 0   # evaluator setting
 //!
 //! Every corpus is built deterministically from this repository. Each run
 //! ingests the corpus snapshot by snapshot (one commit each), repacks, then
@@ -173,7 +174,17 @@ fn baselines(snapshots: &[Snapshot]) -> (usize, usize) {
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let json = args.iter().any(|a| a == "--json");
-    let only: Vec<&String> = args.iter().filter(|a| !a.starts_with("--")).collect();
+    let read_weight = args.iter().position(|a| a == "--read-weight").map(|i| {
+        args[i + 1]
+            .parse::<f64>()
+            .expect("--read-weight takes a number")
+    });
+    let only: Vec<&String> = args
+        .iter()
+        .enumerate()
+        .filter(|(i, a)| !a.starts_with("--") && (*i == 0 || args[i - 1] != "--read-weight"))
+        .map(|(_, a)| a)
+        .collect();
     let corpora: Vec<Corpus> = vec![
         ("md", || fixtures(&["md"])),
         ("pdf", || fixtures(&["pdf"])),
@@ -189,6 +200,9 @@ fn main() {
         let snapshots = build();
         let input: usize = snapshots.iter().flatten().map(|(_, b)| b.len()).sum();
         let mut repo = Repo::new(MemStore::default());
+        if let Some(w) = read_weight {
+            repo.read_weight = w;
+        }
         let t = Instant::now();
         snapshots.iter().for_each(|s| commit(&mut repo, s));
         let (ingest, ingest_ms) = (stored(&repo), t.elapsed().as_millis());

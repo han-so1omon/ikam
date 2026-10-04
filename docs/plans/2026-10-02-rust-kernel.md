@@ -57,7 +57,7 @@ arg        = 0 id[32] | 1 id[32] start:u64 len:u64        (whole content | non-e
 ```
 
 - **Range selectors** may point into any content, including content that is itself only derived.
-- **Reconstruction** follows derivations under a cycle guard and a depth bound (32).
+- **Reconstruction** follows derivations under a cycle guard. A stack guard (256) protects against malformed stores; plan depth itself is priced by the evaluator, not capped.
 - **Builtin function ids** are hashes of `"\0ikam/builtin/<name>"`. Every stored encoding starts with a letter tag, so a builtin id cannot collide with stored content.
 
 ## Dedup boundaries are data-driven
@@ -195,16 +195,15 @@ Lossless semantic dedup for content that shares *structure* but not long byte ru
 **Where templates are found:**
 - *Ingest* fits existing templates found near the new content. It also offers a pair template: the new content anti-unified with its most similar stored *document*. The pair candidate re-expresses that document through the template and is credited with dropping its stored bytes.
 - *Repack* clusters live content by seed similarity, induces one template per cluster, and generalizes it over every member: each new segment is a substring of an old one, in order, so earlier members still fit.
-  - Induction is recursive (`TEMPLATE_LEVELS = 3`): the templates and fillers produced at one level are clustered and templated again at the next.
-  - Repack builds the store both with and without induced templates and keeps the smaller fully verified result.
+  - Induction is recursive with no level count: the templates and fillers kept at one level are clustered and templated again, for as long as the evaluator estimates a saving (see "Evaluator").
+  - Repack builds the store with and without induced templates (and with and without the trained dictionary) and keeps the smallest fully verified result.
 
 **Rules learned from failures** (each caught by tests or benchmarks):
 1. **Pair templates overfit.** Two invoices whose values happen to share a leading digit pull that digit into a segment, so a third invoice no longer fits. Generalizing one file at a time never pays at ingest, because the savings come only from later files. Induction over whole clusters therefore belongs in repack.
 2. **Templates of templates chained without bound.** Re-ingesting pulled each previous template into a new one, about 30 levels deep, past the read depth limit. Repack's verification caught it, so no data was at risk.
-   - A new plan may now need at most 8 levels of derivation nesting.
-   - Pair templates may only replace plain documents: no templates, fillers, or content with derivations.
-   - Deeper layering (the fractal case) needs its own budgeted pass.
-3. **Alignment against weak neighbours costs time for nothing.** Ungated, repo-history ingest plus repack went from 2.5 s to 43 s for a 0.2% gain. Alignment now runs only against a neighbour sharing at least 3 seeds and at least a quarter of the input's seeds. Fitting existing templates is cheap and ungated.
+   - Pair templates may only replace plain documents: no templates, fillers, content with derivations, or the dictionary.
+   - Deeper layering is left to repack's evaluator-driven induction. The temporary 8-level plan cap was later replaced by the evaluator's read-work price.
+3. **Full alignment against weak neighbours costs time for nothing.** Ungated full Myers, repo-history ingest plus repack went from 2.5 s to 43 s for a 0.2% gain. A temporary "share at least a quarter of seeds" gate fixed the time but excluded documents dominated by unique payload. It has since been replaced by anchored alignment (see "Similarity without a ratio gate").
 4. **`fill` is a storage plan, like `concat`.** Repack replaces it rather than preserving it as a fact, so stale or overfit templates do not persist.
 
 **Measured** (2026-10-04, same benchmark as the ledger table; "previous" is `3bc3eec`; all runs pass `fsck` and exact checkout):
@@ -231,9 +230,99 @@ Lossless semantic dedup for content that shares *structure* but not long byte ru
 | Synthetic 21 revisions | 20,206 | **18,656** (−7.7%) |
 | md, office, invoices, repo history | unchanged | unchanged (repo-history repack 4.5 s → 7.6 s) |
 
-- `tests/templates.rs::templates_layer_on_real_documents` asserts layering on the pdf fixtures.
 - A synthetic two-generator test meant to force a second level never did. Clustering merged the generators, and one generalized template already absorbed their difference. That test was replaced rather than tuned until it passed.
-- Read depth grows by one hop per level, within ingest's 8-level plan budget.
+- Since the dictionary (below), the pdf fixtures no longer use templates at all. Layering is now tested on the revision history (`tests/templates.rs::templates_layer_without_a_level_limit`), where all 21 revisions are fills and 15 of their templates or filler lists are fills themselves.
+
+## Dictionary, evaluator, anchored alignment (2026-10-04, built)
+
+### Reproducible benchmark
+
+`cargo run --release --example bench [-- --json] [--read-weight W] [corpus...]`
+- Builds every corpus deterministically from this repository:
+  - the md, pdf and office fixtures
+  - 30 generated invoices
+  - the 21-revision synthetic history
+  - the pre-kernel git history (9 commits)
+- Ingests snapshot by snapshot, repacks, then verifies every file byte-for-byte and runs `fsck`.
+- Baselines: file-level dedup + zstd per file, and file-level dedup + zstd with a dictionary trained on the corpus (dictionary included).
+- The ad-hoc shell benchmarks above are superseded; their numbers are not directly comparable (flat trees here, 9 not 10 history snapshots).
+
+### The baseline result that changed the plan
+
+On the first run, the trained-dictionary baseline beat the kernel on md (76,892 vs 138,860), pdf, office and repo history. The kernel won only on invoices and the revision history.
+- Cause: the kernel compressed every object independently, so many small files each paid for zstd learning their shared vocabulary.
+- Lesson: exact reuse (slices, templates) and statistical reuse (a shared dictionary) are complementary, and the kernel only had the first.
+
+### Dictionary storage encoding
+
+- A third plain encoding, `"Y" dict[32] zstd_with_dict(bytes)`. The dictionary is ordinary content, named by the ref `meta/zstd-dict`.
+- Ids are over uncompressed bytes, so no id changes.
+- Repack trains the dictionary only on content that will be stored as bytes. Containers rebuilt from members are excluded: training on them produced a useless dictionary for office.
+- Repack keeps the dictionary only if its estimated saving exceeds its own size.
+
+Two bugs found while building it:
+1. **The template planner paired with the dictionary itself.** It dropped the dictionary's stored copy, making every `Y` object unreadable. Repack's verification caught it, so nothing was lost. Rule now: a dictionary is never a pairing candidate and is never dropped.
+2. **Repack silently kept old, larger encodings.** It copied fresh objects with `write`, which skips ids that exist. A new atomic `Store::replace` now swaps the encoding when the fresh plan's differs.
+
+### Evaluator instead of hard limits
+
+A plan scores `bytes written + read_weight × decode work`, where decode work is the bytes produced while rebuilding, measured during verification.
+- `Repo::read_weight` defaults to 0.001: 1 KiB of decode work prices like one stored byte.
+- It governs ingest's candidate choice and repack's stored-copy drops.
+- Template induction recurses while a level's estimated encoded size shrinks. That strictly decreases, so the recursion terminates with no level count.
+- The former 8-level plan cap and 3-level induction cap are gone. A 256-deep stack guard remains for malformed stores only.
+- Measured sweep: read weights 0 / 0.001 / 0.01 change little (synthetic history 19,146 / 19,278 / 19,875). The dictionary, not the read price, is what displaced templates.
+
+### Similarity without a ratio gate
+
+Alignment is anchored, so no "share a quarter of seeds" gate is needed:
+1. Exact seed matches, extended byte-by-byte, anchor it in linear time even when most bytes differ.
+2. Myers runs only inside gaps ≤ 1 KiB between anchors, under a shared 50 ms budget, where short equal runs hide.
+
+Repack clusters by *stars*: the largest unassigned content becomes a centre, and neighbours join only if aligning with it shares more bytes than a `fill` record costs. This is an absolute test, so payload-heavy documents with shared boilerplate qualify, and stars avoid transitive chaining.
+- Sizes are unchanged versus the gated version.
+- Repo-history ingest is 0.55 s, against 43 s ungated before.
+
+### Order independence by construction
+
+Repack now offers only *facts* as hints, never earlier storage plans. With the dictionary, plan hints had made a 49-byte order difference reappear. The re-plan now depends only on content and facts.
+
+### All combinations
+
+Repack tries {dictionary, none} × {templates, none} and keeps the smallest verified plan. Without this, the dictionary displaced better template plans on the revision history: 19,146 vs 18,680 with this rule.
+
+**Measured** (2026-10-04, `examples/bench.rs`, after repack; every row exact and fsck-clean):
+
+| Corpus | Before dictionary | Now | zstd per file | zstd + trained dict | Repack time |
+|---|---|---|---|---|---|
+| md (343) | 138,860 | **108,244** | 111,213 | 76,892 | 0.6 s |
+| pdf (44) | 39,573 | **25,043** | 47,586 | 24,643 | 0.3 s |
+| office (238) | 514,749 | 516,710 | 2,481,589 | **391,236** | 10.9 s |
+| invoices (30) | 9,470 | **9,470** | 10,450 | 13,519 | 0.05 s |
+| synthetic history (21) | 18,635 | **18,680** | 223,892 | 60,744 | 0.2 s |
+| repo history (9) | 1,722,941 | **1,572,127** | 1,433,779 | 1,290,663 | 6.5 s |
+
+The kernel's figures include trees, commits and ledger records, which the baselines do not.
+
+**Where it stands:**
+- **Beats both baselines:** invoices and revision history, by up to 3.3× on the latter.
+- **About level:** pdf.
+- **Still behind the trained-dictionary baseline:**
+  - md: about 31 KB, much of it tree metadata for 343 tiny files.
+  - repo history: 22%.
+  - office: 32%. The trainer returns only a 6.9 KB dictionary for the ~2,600 small XML members, and per-member compression of many small files still loses. This is open and well-defined; see Next steps.
+
+### OpenResearch (alphaXiv)
+
+[alphaXiv's OpenResearch](https://github.com/alphaXiv/OpenResearch) is a local-first workspace (MIT) that turns coding agents into research agents. It runs a propose → change code → run experiment → inspect → decide loop, with parallel directions in git worktrees and an experiment tree that preserves lineage. It is alphaXiv's project, not arXiv's.
+
+How it can help:
+- **As an experiment harness for the open questions here.** For example: why office loses to the baseline; dictionary training strategy; star-clustering thresholds; `read_weight`.
+- **The benchmark is the metric it needs.** `examples/bench.rs --json` gives one JSON line per corpus, with exactness and fsck checks that make any reported gain trustworthy.
+
+Limits:
+- It could not be installed from this cloud session: `openresearch.sh` is blocked by the environment's network policy. It runs locally (`curl -LsSf https://openresearch.sh/install.sh | sh`, then `orx up`).
+- Its `autoarxiv` reproduction feature targets ML papers. It could help check related work (compression-based similarity, anti-unification, resemblance detection in dedup systems), but nothing here depends on it.
 
 ## Claims (2026-10-04, built)
 
@@ -274,15 +363,14 @@ So measured gain is a strong structural signal and a moderate semantic one, with
 2. **WASM floats:** allow them. The `deterministic` feature already canonicalizes NaNs; disable relaxed-SIMD instead.
 3. **Effectful runs.** LLM and tool calls as recorded, replayed, never-regenerated runs. These are never storage derivations.
 4. **Storage.**
-   - A zstd dictionary trained from the store; compare against templates.
+   - Close the office gap to the trained-dictionary baseline. Candidates: a larger dictionary trained per content family; delta-against-member for near-identical XML; a cheaper tree encoding for many small files. This is a good first OpenResearch experiment.
    - Persisted ledger, seed and reverse-link indexes as checkpointed projections. Today each CLI process rebuilds them by reading every object.
    - Cheaper derivation records (implicit output for the primary derivation; short builtin ids).
    - Let the matcher index derived content too. Today it only finds matches in stored bytes; ranges into derived content come only from proposals.
    - Self-matching within a file.
    - zlib-as-WASM.
    - PDF FlateDecode streams.
-5. **Templates, next.**
-   - Put read depth into the cost model, instead of only a hard budget.
-   - Clustering: top-1 union merges transitively, and the 1/4-shared-seeds gate excludes documents dominated by unique payloads even when their boilerplate is shared.
-   - Lower the office-corpus alignment cost.
+5. **Evaluator, next.**
+   - Measure decode *time* as well as decode bytes, and calibrate `read_weight` against real read patterns.
+   - Make repack incremental. Today it re-plans everything and runs four plans, which costs 11 s on office.
 6. **Scheduling** (a Petri net over derivations) and **PyO3 bindings**.
