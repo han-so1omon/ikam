@@ -21,3 +21,4 @@ A paper's claim stays *unverified for this kernel* until an experiment reproduce
 
 - `office-gap.md`: why office, md and repo-history lose to zstd+dict (framing, dictionary sizing, deltas, solid regions, accounting).
 - `kernel-direction.md`: library learning, program-synthesis compression and e-graph extraction, mapped onto templates, claims and repack.
+- `tree-metadata.md`: how git, Mercurial and dedup systems (Meister et al., FAST 2013) store versioned listings and fingerprint lists compactly.
