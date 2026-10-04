@@ -529,3 +529,60 @@ fn compressed_objects_keep_identity_and_detect_corruption() {
     store.write(id, &bad).unwrap();
     assert!(Repo::new(store).get(&id).is_err());
 }
+
+/// Successive snapshots share their listings: a tree is stored as content,
+/// so a near-identical later tree is derived from the earlier one. After
+/// repack, a tree whose content nothing shares goes back to object form.
+#[test]
+fn trees_share_listings_across_snapshots() {
+    let mut repo = Repo::new(MemStore::default());
+    let tree = |n: usize, extra: &str| {
+        let mut entries: Vec<TreeEntry> = (0..n)
+            .map(|i| TreeEntry {
+                name: format!("src__module_{i:04}.rs"),
+                kind: Kind::File,
+                id: Id::of_content(&i.to_be_bytes()),
+            })
+            .collect();
+        entries.push(TreeEntry {
+            name: extra.into(),
+            kind: Kind::File,
+            id: Id::of_content(extra.as_bytes()),
+        });
+        Object::tree(entries).unwrap()
+    };
+    for i in 0..200usize {
+        repo.put_content(&i.to_be_bytes()).unwrap();
+    }
+    for extra in ["a", "b", "c", "z"] {
+        repo.put_content(extra.as_bytes()).unwrap();
+    }
+    let (first, second) = (tree(200, "a"), tree(200, "b"));
+    let (a, b) = (repo.put(&first).unwrap(), repo.put(&second).unwrap());
+    let before = repo.bytes_written;
+    let third = repo.put(&tree(200, "c")).unwrap();
+    assert!(
+        repo.bytes_written - before < first.encode().len() / 10,
+        "a near-identical tree is derived from earlier ones"
+    );
+    let unrelated = Object::tree(vec![TreeEntry {
+        name: "readme".into(),
+        kind: Kind::File,
+        id: Id::of_content(b"z"),
+    }])
+    .unwrap();
+    let lone = repo.put(&unrelated).unwrap();
+    for (i, id) in [a, b, third, lone].into_iter().enumerate() {
+        repo.commit(&format!("t{i}"), id, "").unwrap();
+    }
+    assert_eq!(repo.get(&b).unwrap(), second);
+    repo.repack().unwrap();
+    assert_eq!(repo.get(&lone).unwrap(), unrelated);
+    assert_eq!(repo.get(&third).unwrap(), tree(200, "c"));
+    assert!(repo.fsck().unwrap().is_empty());
+    let stored = repo.store().read(&lone).unwrap();
+    assert!(
+        !stored.starts_with(b"t\x02"),
+        "an unshared tree is back in object form"
+    );
+}

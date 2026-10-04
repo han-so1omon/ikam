@@ -22,6 +22,12 @@
 //! where rest is the canonical encoding after its tag. Their ids stay
 //! `BLAKE3(canonical)`. Records repeat the same content ids across objects,
 //! which only a shared dictionary can exploit.
+//!
+//! A tree may also be stored as `t 2 content[32]`: its canonical encoding
+//! is that content, stored like any other (sliced against earlier trees,
+//! templated, re-planned by repack), so successive snapshots share their
+//! listings. Only trees: derivation records must stay readable without the
+//! ledger they make up.
 
 use std::io::Read;
 
@@ -52,6 +58,14 @@ pub(crate) fn dict_of(encoded: &[u8]) -> Option<DictRef> {
         _ => return None,
     };
     encoded.get(at..at + DICT_REF_LEN)?.try_into().ok()
+}
+
+/// The content holding a tree's canonical encoding, if it is stored so.
+pub(crate) fn tree_content(encoded: &[u8]) -> Option<Id> {
+    match encoded {
+        [b't', 2, id @ ..] => Some(Id::from_bytes(id.try_into().ok()?)),
+        _ => None,
+    }
 }
 
 /// True if `id` is one of the ids `dict` may name.
@@ -158,7 +172,10 @@ impl<S: Store> Repo<S> {
                 })?;
                 Ok([&tag[..], &rest].concat())
             }
-            _ => Ok(encoded),
+            _ => match tree_content(&encoded) {
+                Some(content) => self.read_content(&content),
+                None => Ok(encoded),
+            },
         }
     }
 

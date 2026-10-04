@@ -21,7 +21,7 @@
 use std::cmp::Reverse;
 use std::collections::{HashMap, HashSet};
 
-use crate::dict::{DICT_REF, DICT_REF_LEN, is_plain, object_tag};
+use crate::dict::{DICT_REF, DICT_REF_LEN, is_plain, object_tag, tree_content};
 use crate::ingest::derivation_size;
 use crate::matcher::{self, Index};
 use crate::repo::Cx;
@@ -44,6 +44,7 @@ const DICT_SHORTLIST: usize = 3;
 
 impl<S: Store> Repo<S> {
     pub fn repack(&mut self) -> Result<Repacked, Error> {
+        self.unshare_trees()?;
         self.gc()?;
         let (_, roots) = self.reachable()?;
         let (content, _) = self.closure(roots, |d| !func::is_plan(&d.func))?;
@@ -220,12 +221,33 @@ impl<S: Store> Repo<S> {
         Ok(())
     }
 
+    /// A tree stored as content pays for its pointer only if that content
+    /// is derived or shared; otherwise the tree goes back to object form
+    /// (gc then drops the content).
+    fn unshare_trees(&mut self) -> Result<(), Error> {
+        let used: HashSet<Id> = (self.ledger()?.by_output.values().flatten())
+            .flat_map(|d| d.args.iter().map(Arg::id))
+            .collect();
+        for id in self.store.ids()? {
+            if let Some(content) = tree_content(&self.store.read(&id)?)
+                && self.store.has(&content)
+                && !used.contains(&content)
+            {
+                let encoded = self.encode_object(&self.read_object(&id)?);
+                self.store.replace(id, &encoded)?;
+            }
+        }
+        Ok(())
+    }
+
     /// Canonical encodings of stored trees, commits, claims and fact
-    /// derivations: the objects a re-plan keeps as they are.
+    /// derivations: the objects a re-plan keeps as they are. Trees stored as
+    /// content are not among them: the re-plan covers that content.
     fn lasting_objects(&self) -> Result<Vec<(Id, Vec<u8>)>, Error> {
         let mut out = Vec::new();
         for id in self.store.ids()? {
-            if object_tag(&self.store.read(&id)?).is_none() {
+            let encoded = self.store.read(&id)?;
+            if object_tag(&encoded).is_none() || tree_content(&encoded).is_some() {
                 continue;
             }
             let canonical = self.read_object(&id)?;

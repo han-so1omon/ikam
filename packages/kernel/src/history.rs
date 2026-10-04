@@ -2,7 +2,7 @@
 
 use std::collections::HashSet;
 
-use crate::dict::{dict_of, names, object_tag};
+use crate::dict::{dict_of, names, object_tag, tree_content};
 use crate::repo::Cx;
 use crate::{Arg, Commit, Derivation, Error, Id, Kind, Object, Repo, Store, func};
 
@@ -79,14 +79,20 @@ impl<S: Store> Repo<S> {
         Ok(())
     }
 
-    /// Ids reachable from refs: tree/commit objects, and the file content
-    /// ids those trees name.
+    /// Ids reachable from refs: tree/commit objects, the file content ids
+    /// those trees name, and the content trees are stored as.
     pub(crate) fn reachable(&self) -> Result<(HashSet<Id>, Vec<Id>), Error> {
         let (mut objects, mut files) = (HashSet::new(), Vec::new());
         let mut stack: Vec<Id> = self.store.refs()?.into_iter().map(|(_, id)| id).collect();
         while let Some(id) = stack.pop() {
             if !objects.insert(id) {
                 continue;
+            }
+            // A tree stored as content keeps that content live.
+            if let Ok(encoded) = self.store.read(&id)
+                && let Some(content) = tree_content(&encoded)
+            {
+                files.push(content);
             }
             match self.get(&id) {
                 Ok(Object::Commit(c)) => stack.extend(std::iter::once(c.tree).chain(c.parents)),
