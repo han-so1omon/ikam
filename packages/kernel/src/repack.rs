@@ -69,6 +69,7 @@ impl<S: Store> Repo<S> {
             }
         }
         self.reset_projections();
+        self.gc()?; // drop claims about content the new plan no longer holds
         Ok(Repacked {
             before,
             after,

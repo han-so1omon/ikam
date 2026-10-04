@@ -19,6 +19,11 @@ const USAGE: &str = "usage: ikam [--store DIR] <command>
   used-by ID                       incoming graph edges (objects that link to ID)
   fsck                             reconstruct and verify every stored object
   gc                               delete objects unreachable from any ref
+  claim SUBJ PRED OBJ [--by ID]    record a semantic claim; its weight (bits the
+                                   object saves on the subject) is measured
+  claims ID                        claims about ID, with measured gains
+  relate ID [K]                    the K stored contents most informative about ID
+  promote CLAIM                    derive the claim's subject from its object, if smaller
   repack                           re-plan storage of all live content; applied
                                    only if smaller and fully verified";
 
@@ -38,6 +43,7 @@ fn run(store_dir: &str, args: &mut Vec<String>) -> Result<(), String> {
     let mut repo = Repo::new(FsStore::open(store_dir).map_err(err)?);
     let message = take_flag(args, "-m").unwrap_or_default();
     let refname = take_flag(args, "--ref").unwrap_or_else(|| "main".into());
+    let by = take_flag(args, "--by");
     let arg = |i: usize| args.get(i).cloned().ok_or_else(|| USAGE.to_string());
     match args.first().map(String::as_str) {
         Some("put") => {
@@ -134,6 +140,47 @@ fn run(store_dir: &str, args: &mut Vec<String>) -> Result<(), String> {
                 r.before, r.after, r.applied
             );
         }
+        Some("claim") => {
+            let by = by.map(|b| repo.resolve(&b)).transpose().map_err(err)?;
+            let (s, o) = (
+                repo.resolve(&arg(1)?).map_err(err)?,
+                repo.resolve(&arg(3)?).map_err(err)?,
+            );
+            let id = repo
+                .claim(Arg::Whole(s), &arg(2)?, Arg::Whole(o), by)
+                .map_err(err)?;
+            println!("{id}");
+        }
+        Some("claims") => {
+            for (id, c) in repo
+                .claims(&repo.resolve(&arg(1)?).map_err(err)?)
+                .map_err(err)?
+            {
+                println!(
+                    "{id} {} {} {} gain_bits={}",
+                    c.subject.id(),
+                    c.predicate,
+                    c.object.id(),
+                    c.gain_bits
+                );
+            }
+        }
+        Some("relate") => {
+            let k = args.get(2).map_or(Ok(5), |k| k.parse()).map_err(err)?;
+            for (id, gain) in repo
+                .relate(&repo.resolve(&arg(1)?).map_err(err)?, k)
+                .map_err(err)?
+            {
+                println!("{id} gain_bits={gain}");
+            }
+        }
+        Some("promote") => match repo
+            .promote(&repo.resolve(&arg(1)?).map_err(err)?)
+            .map_err(err)?
+        {
+            Some(put) => println!("{} now derived", put.id),
+            None => println!("no smaller derivation found"),
+        },
         Some("gc") => println!("deleted {} objects", repo.gc().map_err(err)?),
         _ => return Err(USAGE.into()),
     }

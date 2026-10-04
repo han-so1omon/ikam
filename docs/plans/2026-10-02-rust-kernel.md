@@ -9,6 +9,7 @@
 - L3 pure functions (builtin and WASM), memoized through the ledger
 - A ledger of verified derivations with selectors (many per id), which is also the graph
 - Templates: lossless anti-unification (`fill(template, fillers)`), induced store-wide by repack
+- Claims: unverified semantic relations over selectors, weighted by measured conditional information, promotable to derivations
 - Versioning: commits, refs, gc, fsck, repack
 
 **Not built:**
@@ -178,7 +179,7 @@ The cheapest verified candidate wins. `repack` re-plans all live content togethe
 - `Apply` becomes a derivation used for storage.
 - `Run` becomes a derivation recorded by execution, which serves as the memo.
 
-**Claims vs derivations.** Unverified semantic claims (mentions, paraphrase, section-of) are a separate record kind, not built yet. A claim can be promoted to a derivation once a function plus residual reproduces the bytes.
+**Claims vs derivations.** Unverified semantic claims (mentions, paraphrase, section-of) are a separate record kind; see "Claims". A claim can be promoted to a derivation once a function plus residual reproduces the bytes.
 
 ## Templates (2026-10-04, built)
 
@@ -220,9 +221,42 @@ Lossless semantic dedup for content that shares *structure* but not long byte ru
 - The office corpus is the main time cost (2×), from aligning many similar XML members.
 - Not yet compared against a zstd dictionary trained on the store, which captures some of the same shared structure statistically rather than exactly.
 
+## Claims (2026-10-04, built)
+
+The graph's *descriptive* edges, beside the ledger's constructive ones.
+
+**Record.** `claim = "L" subject:arg predicate object:arg gain_bits:i64 by:(id?)`.
+- Subject and object are selectors, so a claim can relate byte ranges: "bytes 15..21 of report mentions <entity>".
+- The predicate is free text.
+- `by` optionally names the asserting agent, e.g. an extractor function stored as content.
+
+**Weight is measured, not asserted.** `gain_bits` is the number of bits saved compressing the subject with the object as a zstd raw-content dictionary, against compressing it alone. The kernel measures it when the claim is recorded.
+- It is a computable stand-in for conditional information: about zero for unrelated content, and it grows with shared structure and wording.
+- It is the saving dedup could try to realize. This replaces the old "Fisher information in bits", which was asserted constants.
+
+**Lifetime.** Claims never take part in reconstruction and never keep content alive. `gc` keeps a claim while both endpoints are live, and repack re-runs `gc` afterwards.
+
+**Promotion.** `promote(claim)` tries to derive the subject from the object by reusing the object's bytes (a `concat` plan over the object alone). It keeps the result only if the result is smaller than the subject's stored bytes and verifies *without* the subject's stored copy. That last condition generalizes a rule found while building this: dropping a stored copy is safe only if the replacement never reads it. Otherwise "x from y" with y already derived from x would make both unreadable. Template drops now use the same guarded check.
+
+**Queries:**
+- `claims(id)`: claims touching an id.
+- `relate(id, k)`: stored contents most informative about `id`, ranked by measured gain. Candidates come from shared seeds, and internal fragments (literals, templates, fillers) are content too, so they can appear.
+- CLI: `claim`, `claims`, `relate`, `promote`.
+
+**Measured: does gain find related content?** `cargo run --release --example relatedness`, over 343 markdown fixtures from 24 fictional companies. For each file, the other file with the highest measured gain:
+
+| Neighbour is… | Observed | Chance |
+|---|---|---|
+| the same document type at another company (structural) | **53.4%** | 2.4% |
+| from the same company (semantic: shared names, products, terms) | **26.5%** | 4.1% |
+
+So measured gain is a strong structural signal and a moderate semantic one, with no model involved.
+- These are fixtures generated per company; real corpora may differ.
+- The O(n²) scan took 21 s here. `relate` limits candidates to seed neighbours instead.
+
 ## Next steps
 
-1. **Claims:** unverified semantic relations over selectors, with edge weight = measured bits saved by conditioning.
+1. **Claim producers:** extractors (WASM functions, or recorded AI runs once effectful runs exist) that assert mentions and relations, each claim weighted by measured gain.
 2. **WASM floats:** allow them. The `deterministic` feature already canonicalizes NaNs; disable relaxed-SIMD instead.
 3. **Effectful runs.** LLM and tool calls as recorded, replayed, never-regenerated runs. These are never storage derivations.
 4. **Storage.**
