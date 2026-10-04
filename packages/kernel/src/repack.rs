@@ -39,6 +39,9 @@ pub struct Repacked {
     pub applied: bool,
 }
 
+/// Dictionary candidates re-planned in full per repack (best estimates).
+const DICT_SHORTLIST: usize = 3;
+
 impl<S: Store> Repo<S> {
     pub fn repack(&mut self) -> Result<Repacked, Error> {
         self.gc()?;
@@ -65,12 +68,9 @@ impl<S: Store> Repo<S> {
         // Exact structure (templates) and statistics (a dictionary) compete
         // and combine differently per corpus: try each combination, keep the
         // smallest verified plan.
-        let dict = train_dictionary(&stored);
         let mut fresh: Option<(usize, Repo<MemStore>)> = None;
-        for d in [dict.as_deref(), None]
-            .into_iter()
-            .take(if dict.is_some() { 2 } else { 1 })
-        {
+        let dicts = train_dictionaries(&stored, DICT_SHORTLIST);
+        for d in dicts.iter().map(|d| Some(d.as_slice())).chain([None]) {
             for induce in [false, true] {
                 let plan = self.replan(&files, induce, d)?;
                 let size = plan.content_bytes()?;
@@ -362,29 +362,110 @@ fn template_groups(files: &[(Id, Vec<u8>)]) -> Vec<Vec<usize>> {
     groups
 }
 
-/// A zstd dictionary trained on `samples`, if its estimated saving (smaller
-/// per-sample encodings) exceeds its own size. The re-plan then decides
-/// which contents actually use it.
-fn train_dictionary(samples: &[&[u8]]) -> Option<Vec<u8>> {
+/// Candidate zstd dictionaries for `samples`, best estimate first, at most
+/// `k`, each estimated to save more than its own size. Candidates are
+/// trained (COVER, zstd's trainer) and raw (evenly spaced pieces of the
+/// samples themselves, as in relative Lempel-Ziv) at a few sizes: neither
+/// construction nor any size wins on every corpus (COVER can return a tiny
+/// dictionary when asked for a large one). The estimate ignores dedup, so
+/// the re-plans decide among the shortlist.
+fn train_dictionaries(samples: &[&[u8]], k: usize) -> Vec<Vec<u8>> {
     let samples: Vec<&[u8]> = samples.iter().copied().filter(|b| !b.is_empty()).collect();
     let total: usize = samples.iter().map(|b| b.len()).sum();
-    if samples.len() < 8 {
-        return None;
+    let Some(alone) = dictionary_cost(&samples, &[]).filter(|_| samples.len() >= 8) else {
+        return vec![];
+    };
+    let mut ranked = Vec::new();
+    for size in [total / 100, total / 30, total / 10].map(|s| s.clamp(4096, 112_640)) {
+        let trained = zstd::dict::from_samples(&samples, size).ok();
+        for dict in trained.into_iter().chain([raw_dictionary(&samples, size)]) {
+            if let Some(cost) = dictionary_cost(&samples, &dict).filter(|&c| c < alone)
+                && !ranked.iter().any(|(_, d)| *d == dict)
+            {
+                ranked.push((cost, dict));
+            }
+        }
     }
-    let dict = zstd::dict::from_samples(&samples, (total / 10).clamp(4096, 112_640)).ok()?;
-    let mut with_dict = zstd::bulk::Compressor::with_dictionary(3, &dict).ok()?;
-    let (mut alone, mut given) = (0, dict.len());
+    ranked.sort();
+    ranked.into_iter().take(k).map(|(_, d)| d).collect()
+}
+
+/// Estimated stored size of `samples` given `dict` (empty: none): the
+/// dictionary plus each sample's smallest encoding, a dictionary encoding
+/// paying for the id it names.
+fn dictionary_cost(samples: &[&[u8]], dict: &[u8]) -> Option<usize> {
+    let mut with_dict = zstd::bulk::Compressor::with_dictionary(3, dict).ok()?;
+    let mut cost = dict.len();
     for b in samples {
         let z = zstd::bulk::compress(b, 3).map_or(b.len(), |z| z.len().min(b.len()));
-        alone += z;
-        given += with_dict.compress(b).map_or(z, |d| (d.len() + 32).min(z));
+        cost += match dict.is_empty() {
+            true => z,
+            false => with_dict.compress(b).map_or(z, |d| (d.len() + 32).min(z)),
+        };
     }
-    (given < alone).then_some(dict)
+    Some(cost)
+}
+
+/// A raw-content dictionary: `size` bytes of 1 KiB pieces taken at even
+/// steps through the samples (Hoobin, Puglisi and Zobel, PVLDB 2011).
+fn raw_dictionary(samples: &[&[u8]], size: usize) -> Vec<u8> {
+    const PIECE: usize = 1024;
+    let joined = samples.concat();
+    let step = (joined.len() / (size / PIECE).max(1)).max(PIECE);
+    joined
+        .chunks(step)
+        .filter_map(|c| c.get(..PIECE))
+        .take(size / PIECE)
+        .flatten()
+        .copied()
+        .collect()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Ingest is greedy, so pair templates may overfit; induction finds one
+    /// template generalized over the whole cluster, and no document keeps
+    /// its bytes.
+    #[test]
+    fn induction_shares_one_template_across_a_cluster() {
+        let invoice = |n: u32| -> Vec<u8> {
+            (0..20u32)
+                .map(|k| {
+                    let v = (n.wrapping_mul(2654435761) ^ k.wrapping_mul(40503)) % 100_000;
+                    format!("<section id=\"{k}\"><label>Line item {k}: standard terms and conditions apply; see master agreement clause {k}.</label><value>{v:x}</value></section>\n")
+                })
+                .collect::<String>()
+                .into_bytes()
+        };
+        let files: Vec<(Id, Vec<u8>)> = (0..30)
+            .map(invoice)
+            .map(|d| (Id::of_content(&d), d))
+            .collect();
+        let plan = Repo::new(MemStore::default())
+            .replan(&files, true, None)
+            .unwrap();
+        let templates: Vec<Id> = files
+            .iter()
+            .map(|(id, _)| {
+                let d = plan.derivations(id).unwrap();
+                d.into_iter()
+                    .find(|d| d.func == func::fill())
+                    .expect("fill")
+                    .args[0]
+                    .id()
+            })
+            .collect();
+        assert!(
+            templates.iter().all(|t| *t == templates[0]),
+            "one shared template"
+        );
+        assert!(
+            files.iter().all(|(id, _)| !plan.store().has(id)),
+            "no document keeps its bytes"
+        );
+    }
 
     /// Templates and fillers are content too, so induction templates them
     /// again, with no fixed number of levels: in the induced plan for a

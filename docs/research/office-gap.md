@@ -78,7 +78,7 @@ Not read: Broder 1997 and Odess (ICDE'21), which I know only through citations i
 - **Change B:** keep COVER but train on *pre-dedup* member occurrences, or weight samples by reference count, and request ~total/100. Sweep the size over 16, 32, 64 and 110 KB.
 - **Expected effect:** fewer misses on first-occurrence XML vocabulary. Large effect on office; small on markdown.
 - **Measure:** office kernel bytes against the 391,236-byte baseline, plus the dictionary size reported.
-- **Status:** `open` (not yet run).
+- **Status:** confirmed by E003 (change A wins on office: a raw dictionary, 0.662 vs 1.224; COVER collapses to 6.6 KB when asked for more; change B alone is not best anywhere). Selection must re-plan, since estimates ignore dedup.
 
 **H3 – Per-family dictionaries beat one global dictionary** (source 9: "one dictionary per type"; sources 3 and 4).
 - **Change:** cluster stored blobs by container member path (or, for markdown, by file extension or by the first SF). Train one dictionary per cluster with ≥8 samples, and fall back to the global dictionary otherwise.
