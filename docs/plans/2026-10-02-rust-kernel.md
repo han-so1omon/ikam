@@ -194,7 +194,9 @@ Lossless semantic dedup for content that shares *structure* but not long byte ru
 
 **Where templates are found:**
 - *Ingest* fits existing templates found near the new content. It also offers a pair template: the new content anti-unified with its most similar stored *document*. The pair candidate re-expresses that document through the template and is credited with dropping its stored bytes.
-- *Repack* clusters live content by seed similarity, induces one template per cluster, and generalizes it over every member: each new segment is a substring of an old one, in order, so earlier members still fit. It then builds the store both with and without induced templates and keeps the smaller fully verified result.
+- *Repack* clusters live content by seed similarity, induces one template per cluster, and generalizes it over every member: each new segment is a substring of an old one, in order, so earlier members still fit.
+  - Induction is recursive (`TEMPLATE_LEVELS = 3`): the templates and fillers produced at one level are clustered and templated again at the next.
+  - Repack builds the store both with and without induced templates and keeps the smaller fully verified result.
 
 **Rules learned from failures** (each caught by tests or benchmarks):
 1. **Pair templates overfit.** Two invoices whose values happen to share a leading digit pull that digit into a segment, so a third invoice no longer fits. Generalizing one file at a time never pays at ingest, because the savings come only from later files. Induction over whole clusters therefore belongs in repack.
@@ -220,6 +222,18 @@ Lossless semantic dedup for content that shares *structure* but not long byte ru
 - Templates pay off where content shares structure with scattered differences: generated documents, PDFs from one producer, revisions with many small edits. They do little where reuse is already whole files or long runs (repo history) or where files share little (small markdown).
 - The office corpus is the main time cost (2×), from aligning many similar XML members.
 - Not yet compared against a zstd dictionary trained on the store, which captures some of the same shared structure statistically rather than exactly.
+
+**Multi-level templates (templates of templates, fillers of fillers).** Measured after repack, 1 level vs 3 levels:
+
+| Corpus | 1 level | 3 levels |
+|---|---|---|
+| pdf fixtures | 40,717 | **39,951** (−1.9%) |
+| Synthetic 21 revisions | 20,206 | **18,656** (−7.7%) |
+| md, office, invoices, repo history | unchanged | unchanged (repo-history repack 4.5 s → 7.6 s) |
+
+- `tests/templates.rs::templates_layer_on_real_documents` asserts layering on the pdf fixtures.
+- A synthetic two-generator test meant to force a second level never did. Clustering merged the generators, and one generalized template already absorbed their difference. That test was replaced rather than tuned until it passed.
+- Read depth grows by one hop per level, within ingest's 8-level plan budget.
 
 ## Claims (2026-10-04, built)
 
@@ -268,7 +282,7 @@ So measured gain is a strong structural signal and a moderate semantic one, with
    - zlib-as-WASM.
    - PDF FlateDecode streams.
 5. **Templates, next.**
-   - Budgeted multi-level templating (templates of templates, fillers of fillers) with an explicit read-depth cost.
-   - Indexing the fillers of a cluster so structurally similar fillers dedup too.
+   - Put read depth into the cost model, instead of only a hard budget.
+   - Clustering: top-1 union merges transitively, and the 1/4-shared-seeds gate excludes documents dominated by unique payloads even when their boilerplate is shared.
    - Lower the office-corpus alignment cost.
 6. **Scheduling** (a Petri net over derivations) and **PyO3 bindings**.

@@ -108,3 +108,56 @@ fn templates_survive_gc_and_repack() {
     let d = &repo.derivations(&put.id).unwrap()[0];
     assert_eq!(d.func, func::fill(), "new document reuses the template");
 }
+
+fn pdf_fixtures() -> Vec<Vec<u8>> {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/cases");
+    let mut out = Vec::new();
+    for case in std::fs::read_dir(root).unwrap() {
+        let case = case.unwrap().path();
+        if !case.is_dir() {
+            continue;
+        }
+        for f in std::fs::read_dir(&case).unwrap() {
+            let f = f.unwrap().path();
+            if f.extension().is_some_and(|e| e == "pdf") {
+                out.push(std::fs::read(f).unwrap());
+            }
+        }
+    }
+    out.sort();
+    out
+}
+
+/// Templates and fillers are content too, so repack templates them again:
+/// on the pdf fixtures some level-1 template or filler list is itself a
+/// `fill` of a level-2 template (measured: -1.9% vs one level).
+#[test]
+fn templates_layer_on_real_documents() {
+    let docs = pdf_fixtures();
+    assert!(docs.len() >= 10, "pdf fixtures missing");
+    let mut repo = Repo::new(MemStore::default());
+    let ids = commit_all(&mut repo, &docs);
+    let r = repo.repack().unwrap();
+    assert!(r.applied, "{r:?}");
+    for (id, d) in ids.iter().zip(&docs) {
+        assert_eq!(&repo.read_content(id).unwrap(), d);
+    }
+    assert!(repo.fsck().unwrap().is_empty());
+
+    let fill_of = |id: &Id| {
+        repo.derivations(id)
+            .unwrap()
+            .into_iter()
+            .find(|d| d.func == func::fill())
+    };
+    let level1: Vec<Id> = ids
+        .iter()
+        .filter_map(fill_of)
+        .flat_map(|d| d.args.into_iter().map(|a| a.id()))
+        .collect();
+    assert!(!level1.is_empty(), "documents use templates");
+    assert!(
+        level1.iter().any(|part| fill_of(part).is_some()),
+        "some template or fillers are themselves templated"
+    );
+}
