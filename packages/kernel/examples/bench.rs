@@ -138,6 +138,24 @@ fn stored(repo: &Repo<MemStore>) -> usize {
         .sum()
 }
 
+/// Stored objects by encoding tag ("B"/"Z"/"Y" content, "T" tree, "C"
+/// commit, "D" derivation, "L" claim): `{"T":[count,bytes],...}`.
+fn by_kind(repo: &Repo<MemStore>) -> String {
+    let mut kinds: BTreeMap<char, (usize, usize)> = BTreeMap::new();
+    for id in repo.store().ids().unwrap() {
+        let encoded = repo.store().read(&id).unwrap();
+        let k = kinds
+            .entry(*encoded.first().unwrap_or(&b'?') as char)
+            .or_default();
+        (k.0, k.1) = (k.0 + 1, k.1 + encoded.len());
+    }
+    let parts: Vec<String> = kinds
+        .iter()
+        .map(|(k, (n, b))| format!("\"{k}\":[{n},{b}]"))
+        .collect();
+    format!("{{{}}}", parts.join(","))
+}
+
 fn commit(repo: &mut Repo<MemStore>, snapshot: &Snapshot) {
     let entries = snapshot
         .iter()
@@ -210,7 +228,8 @@ fn main() {
         let ratio = repack as f64 / zstd_dict as f64;
         if json {
             println!(
-                "{{\"corpus\":\"{name}\",\"input\":{input},\"ingest\":{ingest},\"repack\":{repack},\"ingest_ms\":{ingest_ms},\"repack_ms\":{repack_ms},\"zstd_files\":{zstd_files},\"zstd_dict\":{zstd_dict},\"vs_dict\":{ratio:.4},\"exact\":{exact},\"fsck\":{fsck}}}"
+                "{{\"corpus\":\"{name}\",\"input\":{input},\"ingest\":{ingest},\"repack\":{repack},\"ingest_ms\":{ingest_ms},\"repack_ms\":{repack_ms},\"zstd_files\":{zstd_files},\"zstd_dict\":{zstd_dict},\"vs_dict\":{ratio:.4},\"exact\":{exact},\"fsck\":{fsck},\"by_kind\":{}}}",
+                by_kind(&repo)
             );
         } else {
             println!(

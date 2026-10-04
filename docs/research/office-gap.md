@@ -101,7 +101,7 @@ Not read: Broder 1997 and Odess (ICDE'21), which I know only through citations i
 **H6 – Accounting parity** (from the code, not the literature).
 - **Change:** report the kernel's metadata (trees, commits, manifests, function-application objects) separately, or add the same metadata cost to the baseline.
 - **Expected effect:** it shows how much of the 32% gap is real compression loss and how much is bookkeeping. Run this first.
-- **Status:** `open` (not yet run).
+- **Status:** confirmed by E001: the md/office/repo-history gaps are trees and derivation records, not content.
 
 ## Unknowns and weak evidence
 - I did not read the Liao 2016 paper itself; its description here comes from zstd's code. I also did not read Odess, Broder, or any "delta compression for dedup" survey.
