@@ -149,3 +149,11 @@ Newest last. Format and rules: `README.md`.
 - Result (d): score 0.6182 -> **0.6115**; per corpus vs_dict: office 0.587->**0.550** (229,574 -> 214,988), every other corpus byte-identical to E007; time 17.0 s -> 22.9 s (1.35x; up to 6 dictionaries, 14 parallel plans). Sizes identical on a second run.
 - Verdict: kept.
 - Learned: the dictionary estimate ignores dedup, and that keeps costing re-plans. An estimate that discounts content the matcher would slice is the open question (E003b's estimate on a no-dictionary plan's literals failed).
+
+### E009 nested-trees (benchmark change)
+- Branch / parent: exp/009-nested-trees / E008
+- Change to the measurement, not the kernel: `examples/bench.rs` commits each snapshot as nested trees, one per directory, as a real checkout is stored, instead of one flat tree with `/` replaced by `__`. Decided by the user (tree-metadata H4). **Scores before and after E009 are not comparable**; E009 is the new reference.
+- Result, same kernel (E008) on both: score 0.6115 (flat) -> **0.6265** (nested); per corpus vs_dict: md 0.984->1.040, pdf 0.854->0.904, office 0.550->0.559, invoices and synthetic unchanged (no directories), repo 0.894->0.908; time 23.6 s
+  - md: 76 trees instead of 1. 48 are tiny and stored canonical (2,376 B), because they are too small to compress and abbreviated ids (E006) apply only inside compressed forms. 28 are stored as content (8,295 B).
+  - repo-history: 153 trees per run; unchanged directories are shared by id across snapshots, but each small tree pays its own framing and full 32 B ids.
+- Verdict: reference for later experiments. Next: make small trees cheap (abbreviated ids without compression; no pointer form for tiny trees).

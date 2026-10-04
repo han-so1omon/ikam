@@ -156,16 +156,37 @@ fn by_kind(repo: &Repo<MemStore>) -> String {
     format!("{{{}}}", parts.join(","))
 }
 
+/// Nested trees, one per directory, as a real checkout would be stored:
+/// unchanged directories are shared across snapshots by id.
+fn tree(repo: &mut Repo<MemStore>, files: &[(&str, &[u8])]) -> Id {
+    let mut dirs: BTreeMap<&str, Vec<(&str, &[u8])>> = BTreeMap::new();
+    let mut entries = Vec::new();
+    for &(path, bytes) in files {
+        match path.split_once('/') {
+            Some((dir, rest)) => dirs.entry(dir).or_default().push((rest, bytes)),
+            None => entries.push(TreeEntry {
+                name: path.into(),
+                kind: Kind::File,
+                id: repo.put_content(bytes).unwrap().id,
+            }),
+        }
+    }
+    for (dir, files) in dirs {
+        entries.push(TreeEntry {
+            name: dir.into(),
+            kind: Kind::Tree,
+            id: tree(repo, &files),
+        });
+    }
+    repo.put(&Object::tree(entries).unwrap()).unwrap()
+}
+
 fn commit(repo: &mut Repo<MemStore>, snapshot: &Snapshot) {
-    let entries = snapshot
+    let files: Vec<(&str, &[u8])> = snapshot
         .iter()
-        .map(|(name, bytes)| TreeEntry {
-            name: name.replace('/', "__"),
-            kind: Kind::File,
-            id: repo.put_content(bytes).unwrap().id,
-        })
+        .map(|(name, bytes)| (name.as_str(), bytes.as_slice()))
         .collect();
-    let tree = repo.put(&Object::tree(entries).unwrap()).unwrap();
+    let tree = tree(repo, &files);
     repo.commit("main", tree, "").unwrap();
 }
 
