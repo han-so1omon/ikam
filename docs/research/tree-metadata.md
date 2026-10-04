@@ -95,7 +95,7 @@ Our tree object is a flat sorted list of entries: `name_len:u32 name kind id[32]
 - Change: stop flattening paths into names, so unchanged subdirectories dedupe by id across snapshots.
 - Expected effect: only the trees along changed paths are rewritten each snapshot. The cost is more objects and per-object framing.
 - Flattening is done by the benchmark (`examples/bench.rs` `commit` replaces `/` with `__`), not by the kernel, which supports nested trees. Changing it changes the measurement, not the kernel, so H4 would need a protocol decision. (`unshare_trees` is unrelated: it returns unshared trees to object form; see E005.)
-- **Status:** `open` (not yet run).
+- **Status:** adopted as the benchmark by user decision (E009). With the E008 kernel, nesting costs more than it shares (0.6115 -> 0.6265), because many small trees each pay framing and full ids.
 
 ## Unknowns
 
