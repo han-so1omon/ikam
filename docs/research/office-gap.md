@@ -71,7 +71,7 @@ Not read: Broder 1997 and Odess (ICDE'21), which I know only through citations i
 - **Change:** store the dictionary reference once (as a repo-wide default, or a 1-byte index into a dictionary table) instead of 32 B per blob. Also emit magicless zstd frames with `contentSizeFlag=0` and `dictIDFlag=0`; the kernel already knows the size and the dictionary.
 - **Expected effect:** ~35–45 B saved per Y blob, which is tens of KB on office and a noticeable share on markdown (343 files × ~40 B ≈ 14 KB of 108 KB).
 - **Measure:** first add a breakdown of stored bytes by object kind (Y/Z/B/tree/manifest) and count to `bench --json`, then compare before and after.
-- **Status:** `open` (not yet run).
+- **Status:** confirmed by E004 for the dictionary reference (32 -> 4 B) and zstd's dictionary id; md 1.222 -> 1.091. Magicless frames not yet tried.
 
 **H2 – The dictionary is undersized and mis-shaped** (sources 1, 2, 3, 9).
 - **Change A:** build a *raw-content* dictionary up to the 110 KB budget from concatenated representative members, Hoobin/Kuruppu style. Pick one or a few exemplars per member path family (`xl/styles.xml`, `xl/worksheets/sheet*.xml`, `ppt/slides/slide*.xml`, `word/document.xml`, `theme*.xml`, `[Content_Types].xml`, the zip manifests), with the most frequent first and placed at the dictionary's end. Finalize it with `ZDICT_finalizeDictionary` to add entropy tables.
