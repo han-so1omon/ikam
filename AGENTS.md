@@ -62,3 +62,15 @@ Claims must be proportional to evidence.
 Avoid language implying a universal or definitive solution without support.
 
 When uncertain, explicitly state unknowns, tradeoffs, and confidence level.
+
+## 7. Experiments and Research (Rust kernel)
+
+Changes to how `packages/kernel` chunks, deduplicates, compresses or reconstructs data follow `docs/experiments/README.md`:
+- **One fixed command:** `cargo run --release --example bench -- --json`.
+- **One score:** geometric mean of kernel / trained-dictionary bytes.
+- **Hard gates:** byte-exact reconstruction and a clean fsck.
+- **One hypothesis per branch.**
+- **Every result is recorded** in `docs/experiments/log.md`.
+
+Hypotheses must be grounded in papers actually read (notes in `docs/research/`) or in prior measurements. A paper's claim is unverified for this kernel until our benchmark reproduces it.
+

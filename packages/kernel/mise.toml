@@ -15,3 +15,7 @@ run = ["cargo fmt --check", "cargo clippy --all-targets -- -D warnings"]
 [tasks.build]
 description = "Build the release CLI (target/release/ikam)"
 run = "cargo build --release"
+
+[tasks.experiment]
+description = "The fixed experiment command: full benchmark as JSON lines; last line is the score"
+run = "cargo run --release --example bench -- --json"
