@@ -22,11 +22,9 @@
 //! A template with m segments takes m + 1 fillers:
 //! output = f0 s1 f1 s2 ... sm fm.
 
-use std::time::{Duration, Instant};
-
 use std::collections::HashMap;
 
-use similar::{Algorithm, DiffOp, capture_diff_slices_deadline};
+use similar::{Algorithm, DiffOp, capture_diff_slices};
 
 use crate::Error;
 use crate::matcher::{SEED, anchors, common_prefix, common_suffix, seed_key};
@@ -34,9 +32,11 @@ use crate::matcher::{SEED, anchors, common_prefix, common_suffix, seed_key};
 /// Two u32 length headers: what a hole costs in the template plus in one
 /// filler list. Equal runs no longer than this are cheaper left in fillers.
 const HOLE_COST: usize = 8;
-/// Alignment budget. Planning may stop early; correctness never depends on
-/// it, because every result is verified.
-const ALIGN_BUDGET: Duration = Duration::from_millis(50);
+/// Alignment work budget: gap bytes diffed per alignment. A count, not a
+/// clock, so planning (and therefore every stored size) is deterministic
+/// regardless of machine load. Correctness never depends on it: every
+/// result is verified.
+const ALIGN_WORK: usize = 256 * 1024;
 /// Gaps between anchors larger than this (either side) are unique payload,
 /// not worth a diff: they stay holes.
 const GAP_DIFF: usize = 1024;
@@ -45,7 +45,7 @@ const SEED_POSITIONS: usize = 8;
 
 /// Equal runs `(a_pos, b_pos, len)` between `a` and `b`, increasing in both.
 pub(crate) fn align(a: &[u8], b: &[u8]) -> Vec<(usize, usize, usize)> {
-    let deadline = Instant::now() + ALIGN_BUDGET;
+    let mut budget = ALIGN_WORK;
     let mut seeds: HashMap<u64, Vec<usize>> = HashMap::new();
     for p in anchors(a) {
         let slot = seeds.entry(seed_key(&a[p..p + SEED])).or_default();
@@ -70,12 +70,12 @@ pub(crate) fn align(a: &[u8], b: &[u8]) -> Vec<(usize, usize, usize)> {
             })
             .max_by_key(|&(_, _, len)| len);
         if let Some((pa, pb, len)) = best {
-            diff_gap(a, b, (ca, pa), (cb, pb), deadline, &mut runs);
+            diff_gap(a, b, (ca, pa), (cb, pb), &mut budget, &mut runs);
             runs.push((pa, pb, len));
             (ca, cb) = (pa + len, pb + len);
         }
     }
-    diff_gap(a, b, (ca, a.len()), (cb, b.len()), deadline, &mut runs);
+    diff_gap(a, b, (ca, a.len()), (cb, b.len()), &mut budget, &mut runs);
     runs
 }
 
@@ -85,15 +85,15 @@ fn diff_gap(
     b: &[u8],
     (a0, a1): (usize, usize),
     (b0, b1): (usize, usize),
-    deadline: Instant,
+    budget: &mut usize,
     runs: &mut Vec<(usize, usize, usize)>,
 ) {
-    if a0 >= a1 || b0 >= b1 || a1 - a0 > GAP_DIFF || b1 - b0 > GAP_DIFF || Instant::now() > deadline
-    {
+    let work = (a1 - a0) + (b1 - b0);
+    if a0 >= a1 || b0 >= b1 || a1 - a0 > GAP_DIFF || b1 - b0 > GAP_DIFF || work > *budget {
         return;
     }
-    for op in capture_diff_slices_deadline(Algorithm::Myers, &a[a0..a1], &b[b0..b1], Some(deadline))
-    {
+    *budget -= work;
+    for op in capture_diff_slices(Algorithm::Myers, &a[a0..a1], &b[b0..b1]) {
         if let DiffOp::Equal {
             old_index,
             new_index,
