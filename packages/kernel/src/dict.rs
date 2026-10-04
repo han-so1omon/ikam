@@ -19,6 +19,7 @@
 //! Objects (trees, commits, derivations, claims) are stored the same way,
 //! keeping their kind visible in the first byte:
 //!   canonical | lower(tag) 0 zstd(rest) | lower(tag) 1 dict[4] zstd_with_dict(rest)
+//! (a tree's rest may have abbreviated ids: mode | 0x80, see `abbrev.rs`)
 //! where rest is the canonical encoding after its tag. Their ids stay
 //! `BLAKE3(canonical)`. Records repeat the same content ids across objects,
 //! which only a shared dictionary can exploit.
@@ -34,6 +35,8 @@ use std::io::Read;
 use crate::{Error, Id, Repo, Store};
 
 pub(crate) const DICT_REF: &str = "meta/zstd-dict";
+/// Mode-byte flag: a tree body with abbreviated ids (see `abbrev.rs`).
+const ABBREVIATED: u8 = 0x80;
 /// Bytes of a dictionary's id stored in each encoding that uses it.
 pub(crate) const DICT_REF_LEN: usize = 4;
 type DictRef = [u8; DICT_REF_LEN];
@@ -54,7 +57,7 @@ pub(crate) fn object_tag(encoded: &[u8]) -> Option<u8> {
 pub(crate) fn dict_of(encoded: &[u8]) -> Option<DictRef> {
     let at = match encoded {
         [b'Y', ..] => 1,
-        [t, 1, ..] if t.is_ascii_lowercase() => 2,
+        [t, m, ..] if t.is_ascii_lowercase() && m & !ABBREVIATED == 1 => 2,
         _ => return None,
     };
     encoded.get(at..at + DICT_REF_LEN)?.try_into().ok()
@@ -138,15 +141,26 @@ impl<S: Store> Repo<S> {
         }
     }
 
-    /// The smallest stored encoding of a canonical object encoding.
+    /// The smallest stored encoding of a canonical object encoding. A tree
+    /// may abbreviate its entry ids (see `abbrev.rs`), flagged by
+    /// `ABBREVIATED` in the mode byte.
     pub(crate) fn encode_object(&self, canonical: &[u8]) -> Vec<u8> {
         let Some((&tag, rest)) = canonical.split_first() else {
             return canonical.to_vec();
         };
+        let short = (tag == b'T')
+            .then(|| self.abbreviate(rest).ok().flatten())
+            .flatten();
+        let (flag, rest) = match &short {
+            Some(short) => (ABBREVIATED, short.as_slice()),
+            None => (0, rest),
+        };
         let tag = tag.to_ascii_lowercase();
         let encoded = match self.compress(rest) {
-            Some((None, z)) => [&[tag, 0][..], &z].concat(),
-            Some((Some(id), z)) => [&[tag, 1][..], &id.as_bytes()[..DICT_REF_LEN], &z].concat(),
+            Some((None, z)) => [&[tag, flag][..], &z].concat(),
+            Some((Some(id), z)) => {
+                [&[tag, flag | 1][..], &id.as_bytes()[..DICT_REF_LEN], &z].concat()
+            }
             None => return canonical.to_vec(),
         };
         if encoded.len() < canonical.len() {
@@ -160,17 +174,26 @@ impl<S: Store> Repo<S> {
     /// unchanged. Unverified (callers check the result against its id),
     /// except that a dictionary is accepted only if its output does.
     pub(crate) fn decode_object(&self, id: &Id, encoded: Vec<u8>) -> Result<Vec<u8>, Error> {
-        match encoded.as_slice() {
-            [t, 0, z @ ..] if object_tag(&encoded).is_some() && t.is_ascii_lowercase() => {
-                let rest = zstd::stream::decode_all(z).map_err(|_| Error::Corrupt(*id))?;
-                Ok([&[t.to_ascii_uppercase()][..], &rest].concat())
+        let (Some(tag), [t, mode, z @ ..]) = (object_tag(&encoded), encoded.as_slice()) else {
+            return Ok(encoded);
+        };
+        // Canonical encoding from a decompressed body.
+        let finish = |rest: Vec<u8>| -> Result<Vec<u8>, Error> {
+            let rest = match mode & ABBREVIATED {
+                0 => rest,
+                _ => self.expand(id, &rest)?,
+            };
+            Ok([&[tag][..], &rest].concat())
+        };
+        match mode & !ABBREVIATED {
+            0 if t.is_ascii_lowercase() => {
+                finish(zstd::stream::decode_all(z).map_err(|_| Error::Corrupt(*id))?)
             }
-            [t, 1, ..] if object_tag(&encoded).is_some() && t.is_ascii_lowercase() => {
-                let tag = [t.to_ascii_uppercase()];
+            1 if t.is_ascii_lowercase() => {
                 let rest = self.unzstd_with_dict(id, &encoded, 2, &|rest| {
-                    Id::of(&[&tag[..], rest].concat()) == *id
+                    finish(rest.to_vec()).is_ok_and(|c| Id::of(&c) == *id)
                 })?;
-                Ok([&tag[..], &rest].concat())
+                finish(rest)
             }
             _ => match tree_content(&encoded) {
                 Some(content) => self.read_content(&content),
@@ -220,7 +243,7 @@ impl<S: Store> Repo<S> {
         {
             return Ok(out);
         }
-        for candidate in self.store.ids()?.iter().filter(|c| names(&dict, c)) {
+        for candidate in &self.store.ids_with_prefix(&dict)? {
             if let Ok(bytes) = decode_basic(candidate, &self.store.read(candidate)?)
                 && Id::of_content(&bytes) == *candidate
                 && let Some(out) = attempt(&bytes)

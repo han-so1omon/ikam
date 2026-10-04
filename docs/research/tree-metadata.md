@@ -89,7 +89,7 @@ Our tree object is a flat sorted list of entries: `name_len:u32 name kind id[32]
 - Change: in the stored (not hashed) form, replace each 32 B entry id with a varint ordinal into the pack's object table. The canonical form, and the hash, keep the full ids.
 - Expected effect: id bytes go from 32 to about 2–3 per entry. The 343-entry tree goes from about 14 KB to about 4–5 KB before zstd. It helps every tree, including the first.
 - It stacks with H1/H2: under a delta, only the changed entries' ids remain.
-- **Status:** `open` (not yet run).
+- **Status:** confirmed by E006: 8-byte abbreviated ids in object-form trees; md tree 14,226 -> 5,999 B, md 1.091 -> 0.984.
 
 **H4. Nested per-directory trees (sources: git trees; Mercurial treemanifest, which reports +7% revlog count on Mozilla).**
 - Change: stop flattening paths into names, so unchanged subdirectories dedupe by id across snapshots.
