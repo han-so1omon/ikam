@@ -2,7 +2,7 @@
 
 use std::collections::HashSet;
 
-use crate::dict::dict_of;
+use crate::dict::{dict_of, object_tag};
 use crate::repo::Cx;
 use crate::{Arg, Commit, Derivation, Error, Id, Kind, Object, Repo, Store, func};
 
@@ -136,8 +136,8 @@ impl<S: Store> Repo<S> {
         let (mut objects, files) = self.reachable()?;
         let (content, records) = self.closure(files, |_| true)?;
         objects.extend(records);
-        // Dictionaries that live stored bytes are encoded against.
-        for id in &content {
+        // Dictionaries that live stored encodings need.
+        for id in content.iter().chain(&objects.clone()) {
             if let Ok(encoded) = self.store.read(id)
                 && let Some(dict) = dict_of(&encoded)
             {
@@ -161,7 +161,7 @@ impl<S: Store> Repo<S> {
     /// Claims annotate content without keeping it alive: one survives while
     /// both its endpoints do.
     fn claim_is_live(&self, id: &Id, content: &HashSet<Id>) -> Result<bool, Error> {
-        if self.store.read(id)?.first() != Some(&b'L') {
+        if object_tag(&self.store.read(id)?) != Some(b'L') {
             return Ok(false);
         }
         Ok(

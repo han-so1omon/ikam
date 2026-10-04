@@ -21,11 +21,11 @@
 use std::cmp::Reverse;
 use std::collections::{HashMap, HashSet};
 
-use crate::dict::{DICT_REF, is_plain};
+use crate::dict::{DICT_REF, is_plain, object_tag};
 use crate::ingest::derivation_size;
 use crate::matcher::{self, Index};
 use crate::repo::Cx;
-use crate::{Arg, Derivation, Error, Id, MemStore, Repo, Store, func, template};
+use crate::{Arg, Derivation, Error, Id, MemStore, Object, Repo, Store, func, template};
 
 /// Seed neighbours considered for each star centre.
 const STAR_CANDIDATES: usize = 64;
@@ -50,14 +50,18 @@ impl<S: Store> Repo<S> {
             .collect::<Result<_, Error>>()?;
         files.sort_by_key(|(id, bytes)| (Reverse(bytes.len()), *id));
 
-        // Train only on content that will be stored as bytes: content rebuilt
-        // by a fact (e.g. a zip from its members) never is.
+        // Train only on what will be stored: content stored as bytes (content
+        // rebuilt by a fact, e.g. a zip from its members, never is) and the
+        // objects that outlive the re-plan (trees, commits, facts), whose
+        // repeated content ids a dictionary can hold.
         let mut stored = Vec::new();
         for (id, bytes) in &files {
             if self.derivations(id)?.iter().all(|d| func::is_plan(&d.func)) {
                 stored.push(bytes.as_slice());
             }
         }
+        let structure = self.lasting_objects()?;
+        stored.extend(structure.iter().map(|(_, o)| o.as_slice()));
         // Exact structure (templates) and statistics (a dictionary) compete
         // and combine differently per corpus: try each combination, keep the
         // smallest verified plan.
@@ -104,6 +108,13 @@ impl<S: Store> Repo<S> {
             self.store.set_ref(DICT_REF, current, *dict)?;
         }
         self.reset_projections();
+        // Objects the re-plan did not rebuild move to the new dictionary.
+        for (id, canonical) in self.lasting_objects()? {
+            let encoded = self.encode_object(&canonical);
+            if self.store.read(&id)? != encoded {
+                self.store.replace(id, &encoded)?;
+            }
+        }
         self.gc()?; // drop claims about content the new plan no longer holds
         Ok(Repacked {
             before,
@@ -209,9 +220,27 @@ impl<S: Store> Repo<S> {
         Ok(())
     }
 
+    /// Canonical encodings of stored trees, commits, claims and fact
+    /// derivations: the objects a re-plan keeps as they are.
+    fn lasting_objects(&self) -> Result<Vec<(Id, Vec<u8>)>, Error> {
+        let mut out = Vec::new();
+        for id in self.store.ids()? {
+            if object_tag(&self.store.read(&id)?).is_none() {
+                continue;
+            }
+            let canonical = self.read_object(&id)?;
+            match Object::decode(&canonical)? {
+                Object::Derivation(d) if func::is_plan(&d.func) => {}
+                _ => out.push((id, canonical)),
+            }
+        }
+        out.sort();
+        Ok(out)
+    }
+
     fn is_content_or_derivation(&self, id: &Id) -> Result<bool, Error> {
         let encoded = self.store.read(id)?;
-        Ok(is_plain(&encoded) || encoded.first() == Some(&b'D'))
+        Ok(is_plain(&encoded) || object_tag(&encoded) == Some(b'D'))
     }
 
     pub(crate) fn content_bytes(&self) -> Result<usize, Error> {
@@ -351,4 +380,54 @@ fn train_dictionary(samples: &[&[u8]]) -> Option<Vec<u8>> {
         given += with_dict.compress(b).map_or(z, |d| (d.len() + 32).min(z));
     }
     (given < alone).then_some(dict)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Templates and fillers are content too, so induction templates them
+    /// again, with no fixed number of levels: in the induced plan for a
+    /// revision history, some template or filler list is itself a fill.
+    #[test]
+    fn induction_layers_templates_without_a_level_limit() {
+        let spec = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../docs/ikam/ikam-sheet-specification.md");
+        let mut docs = vec![std::fs::read_to_string(spec).unwrap()];
+        for i in 1..=20usize {
+            let mut lines: Vec<String> = docs.last().unwrap().lines().map(String::from).collect();
+            let k = (i * 37) % lines.len();
+            lines[k].push_str(&format!(" (edit {i})"));
+            let mut v = lines.join("\n") + "\n";
+            if i % 5 == 0 {
+                v.push_str(&format!(
+                    "\n## Added section {i}\nNew text for revision {i}.\n"
+                ));
+            }
+            docs.push(v);
+        }
+        let files: Vec<(Id, Vec<u8>)> = docs
+            .into_iter()
+            .map(|d| (Id::of_content(d.as_bytes()), d.into_bytes()))
+            .collect();
+        let plan = Repo::new(MemStore::default())
+            .replan(&files, true, None)
+            .unwrap();
+        let fill_of = |id: &Id| {
+            plan.derivations(id)
+                .unwrap()
+                .into_iter()
+                .find(|d| d.func == func::fill())
+        };
+        let level1: Vec<Id> = files
+            .iter()
+            .filter_map(|(id, _)| fill_of(id))
+            .flat_map(|d| d.args.into_iter().map(|a| a.id()))
+            .collect();
+        assert!(!level1.is_empty(), "revisions use templates");
+        assert!(
+            level1.iter().any(|part| fill_of(part).is_some()),
+            "some template or fillers are themselves templated"
+        );
+    }
 }

@@ -138,11 +138,11 @@ fn revisions() -> Vec<Vec<u8>> {
     versions.into_iter().map(String::into_bytes).collect()
 }
 
-/// Templates and fillers are content too, so repack templates them again,
-/// with no fixed number of levels: on a revision history every revision is
-/// a fill, and some templates or filler lists are themselves fills.
+/// On a revision history, repack stores the revisions as fills of templates.
+/// (That induction layers templates without a level limit is a unit test in
+/// `repack.rs`; which plan repack keeps is the evaluator's call.)
 #[test]
-fn templates_layer_without_a_level_limit() {
+fn revisions_repack_into_templates() {
     let docs = revisions();
     let mut repo = Repo::new(MemStore::default());
     let ids = commit_all(&mut repo, &docs);
@@ -165,8 +165,4 @@ fn templates_layer_without_a_level_limit() {
         .flat_map(|d| d.args.into_iter().map(|a| a.id()))
         .collect();
     assert!(!level1.is_empty(), "revisions use templates");
-    assert!(
-        level1.iter().any(|part| fill_of(part).is_some()),
-        "some template or fillers are themselves templated"
-    );
 }

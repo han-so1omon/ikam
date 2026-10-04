@@ -11,6 +11,7 @@
 
 use std::collections::HashMap;
 
+use crate::dict::object_tag;
 use crate::matcher::{self, Index};
 use crate::{Arg, Claim, Error, Form, Id, Object, Put, Repo, Store};
 
@@ -63,7 +64,7 @@ impl<S: Store> Repo<S> {
     pub fn claims(&self, id: &Id) -> Result<Vec<(Id, Claim)>, Error> {
         let mut out = Vec::new();
         for cid in self.store.ids()? {
-            if self.store.read(&cid)?.first() == Some(&b'L')
+            if object_tag(&self.store.read(&cid)?) == Some(b'L')
                 && let Object::Claim(c) = self.get(&cid)?
                 && (c.subject.id() == *id || c.object.id() == *id)
             {
