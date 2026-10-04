@@ -169,9 +169,11 @@ impl<S: Store> Repo<S> {
             return Ok(false);
         }
         let stored = match object_tag(encoded) {
-            Some(b'T') => {
+            // Trees and graph chunks are stored as content, so a new version
+            // is derived from earlier ones (slices); see `dict.rs`.
+            Some(tag @ (b'T' | b'G')) => {
                 let content = self.put_content(encoded)?.id;
-                [&b"t\x02"[..], content.as_bytes()].concat()
+                [&[tag.to_ascii_lowercase(), 2][..], content.as_bytes()].concat()
             }
             Some(_) => self.encode_object(encoded),
             None => encoded.to_vec(),
@@ -210,9 +212,9 @@ impl<S: Store> Repo<S> {
         Ok(id)
     }
 
-    /// Store a tree or commit (content goes through `put_content`).
+    /// Store a tree, commit or graph chunk (content goes through `put_content`).
     pub fn put(&mut self, obj: &Object) -> Result<Id, Error> {
-        if !matches!(obj, Object::Tree(_) | Object::Commit(_)) {
+        if !matches!(obj, Object::Tree(_) | Object::Commit(_) | Object::Graph(_)) {
             return Err(Error::WrongKind(obj.id()));
         }
         let encoded = obj.encode();

@@ -165,3 +165,15 @@ Newest last. Format and rules: `README.md`.
 - Result: score 0.6265 -> **0.6210**; per corpus vs_dict: md 1.040->1.027, pdf 0.904->0.895, office 0.559->0.559, invoices 0.439->0.439, synthetic 0.289->0.281, repo 0.908->0.905; time 23.7 s
   - md trees (76): 10,671 -> 9,615 B. The flat single tree was 5,999 B, so nesting still costs about 3.6 KB in per-object framing on md.
 - Verdict: kept.
+
+### E011 graph-objects (capability)
+- Branch / parent: feat/graph-objects / E010
+- Hypothesis: a graph layer (cycles, versions, slices) can be added as prolly-tree chunks without changing anything the benchmark measures (source: `docs/plans/2026-10-04-graph-objects.md`; `docs/research/graph-storage.md` G1)
+- Change:
+  - `src/object.rs`: `G` objects (node chunks and parent chunks); `Node`, `Edge` (target by `node_key`), `Target`, tree entry kind `G`.
+  - New `src/graph.rs`: `put_graph` (content-defined chunk boundaries, 4–32 KB), `graph_nodes`, `graph_node`, `graph_slice`, `graph_diff`.
+  - `src/history.rs`: reachability keeps chunks and node targets, never edges.
+  - `src/repo.rs`: graph chunks are stored as content, like trees (E005).
+  - New `tests/graphs.rs`, laws 1–7.
+- Result: score 0.6210 -> **0.6210**; every corpus byte-identical to E010. Law 7 measurements are in the design note: 20 versions take 157 KB, 3.3x one version at zstd -19 (one content per version: 1.6x; positional edges: 13x).
+- Verdict: kept (capability; score holds). Open: a graph corpus in the benchmark; WebGraph-style reference lists (G3); TerminusDB-style add/remove layers as a competing variant (G2).

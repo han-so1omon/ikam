@@ -7,6 +7,14 @@
 //!   derivation = "D" output[32] func[32] nargs:u32 { arg }
 //!   arg        = 0 id[32] | 1 id[32] start:u64 len:u64              (whole content | byte range)
 //!   claim      = "L" subject:arg pred_len:u32 predicate object:arg gain_bits:i64 by:(0 | 1 id[32])
+//!   graph      = "G" level:u8 count:u32 { node (level 0) | label_len:u32 first_label id[32] (above) }
+//!   node       = label_len:u32 label target nedges:u32 { key[8] label_len:u32 label }
+//!   target     = 0 | 1 arg | 2 id[32]                  (none | content | another object)
+//!
+//! A graph is a prolly tree of `G` chunks (see `graph.rs`): nodes sorted by
+//! label, each with its outgoing edges, which name their target node by
+//! `node_key(label)`, so edges may form cycles. Tree entries of kind "G"
+//! name a graph's root.
 //!
 //! A file's identity is the id of its blob form, `Id::of_content(bytes)`.
 //! Trees, commits and derivations are named by `BLAKE3(encoding)`.
@@ -25,6 +33,47 @@ use crate::{Error, Id};
 pub enum Kind {
     File,
     Tree,
+    Graph,
+}
+
+/// What a graph node stands for, if anything.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Target {
+    None,
+    /// Content, or a byte range of it: a semantic chunk.
+    Content(Arg),
+    /// Another object: a tree, graph, commit or derivation record.
+    Object(Id),
+}
+
+/// An edge to the node whose label has key `to` (see `node_key`).
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub struct Edge {
+    pub to: [u8; 8],
+    pub label: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Node {
+    pub label: String,
+    pub target: Target,
+    pub edges: Vec<Edge>,
+}
+
+/// One chunk of a graph's prolly tree.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Graph {
+    /// Level 0: nodes, strictly ascending by label.
+    Nodes(Vec<Node>),
+    /// Level > 0: children `(first label, chunk id)`, strictly ascending.
+    Children(u8, Vec<(String, Id)>),
+}
+
+/// The key edges use to name the node labelled `label`.
+pub fn node_key(label: &str) -> [u8; 8] {
+    blake3::hash(label.as_bytes()).as_bytes()[..8]
+        .try_into()
+        .unwrap()
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -98,6 +147,7 @@ pub enum Object {
     Commit(Commit),
     Derivation(Derivation),
     Claim(Claim),
+    Graph(Graph),
 }
 
 impl Object {
@@ -121,7 +171,11 @@ impl Object {
                 put_u32(&mut out, entries.len());
                 for e in entries {
                     put_str(&mut out, &e.name);
-                    out.push(if e.kind == Kind::File { b'F' } else { b'T' });
+                    out.push(match e.kind {
+                        Kind::File => b'F',
+                        Kind::Tree => b'T',
+                        Kind::Graph => b'G',
+                    });
                     out.extend_from_slice(e.id.as_bytes());
                 }
             }
@@ -154,6 +208,7 @@ impl Object {
                     }
                 }
             }
+            Object::Graph(g) => encode_graph(&mut out, g),
         }
         out
     }
@@ -184,6 +239,7 @@ impl Object {
                     _ => return Err(Error::Decode("unknown claim author tag")),
                 },
             }),
+            b'G' => Object::Graph(decode_graph(&mut r)?),
             _ => return Err(Error::Decode("unknown object tag")),
         };
         r.finish()?;
@@ -224,6 +280,16 @@ impl Object {
                 links.extend(c.by.map(|by| ("by".to_string(), by)));
                 links
             }
+            // Node targets and child chunks; edges are internal (by key).
+            Object::Graph(Graph::Nodes(nodes)) => nodes
+                .iter()
+                .filter_map(|n| match &n.target {
+                    Target::None => None,
+                    Target::Content(a) => Some((label(&n.label, a), a.id())),
+                    Target::Object(id) => Some((n.label.clone(), *id)),
+                })
+                .collect(),
+            Object::Graph(Graph::Children(_, children)) => children.clone(),
         }
     }
 }
@@ -234,6 +300,7 @@ fn decode_tree(r: &mut Reader) -> Result<Object, Error> {
         let kind = match r.take(1)?[0] {
             b'F' => Kind::File,
             b'T' => Kind::Tree,
+            b'G' => Kind::Graph,
             _ => return Err(Error::Decode("unknown entry kind")),
         };
         Ok(TreeEntry {
@@ -251,6 +318,87 @@ fn decode_tree(r: &mut Reader) -> Result<Object, Error> {
         return Err(Error::Decode("tree names not strictly ascending"));
     }
     Ok(Object::Tree(entries))
+}
+
+fn encode_graph(out: &mut Vec<u8>, g: &Graph) {
+    out.push(b'G');
+    match g {
+        Graph::Nodes(nodes) => {
+            out.push(0);
+            put_u32(out, nodes.len());
+            for n in nodes {
+                put_str(out, &n.label);
+                match &n.target {
+                    Target::None => out.push(0),
+                    Target::Content(a) => {
+                        out.push(1);
+                        put_arg(out, a);
+                    }
+                    Target::Object(id) => {
+                        out.push(2);
+                        out.extend_from_slice(id.as_bytes());
+                    }
+                }
+                put_u32(out, n.edges.len());
+                for e in &n.edges {
+                    out.extend_from_slice(&e.to);
+                    put_str(out, &e.label);
+                }
+            }
+        }
+        Graph::Children(level, children) => {
+            out.push(*level);
+            put_u32(out, children.len());
+            for (first, id) in children {
+                put_str(out, first);
+                out.extend_from_slice(id.as_bytes());
+            }
+        }
+    }
+}
+
+fn decode_graph(r: &mut Reader) -> Result<Graph, Error> {
+    let g = match r.take(1)?[0] {
+        0 => Graph::Nodes(r.many(|r| {
+            let label = r.string()?;
+            let target = match r.take(1)?[0] {
+                0 => Target::None,
+                1 => Target::Content(r.arg()?),
+                2 => Target::Object(r.id()?),
+                _ => return Err(Error::Decode("unknown graph target")),
+            };
+            let edges = r.many(|r| {
+                let to = r.take(8)?.try_into().unwrap();
+                Ok(Edge {
+                    to,
+                    label: r.string()?,
+                })
+            })?;
+            if edges.windows(2).any(|w| w[0] >= w[1]) {
+                return Err(Error::Decode("graph edges not strictly ascending"));
+            }
+            Ok(Node {
+                label,
+                target,
+                edges,
+            })
+        })?),
+        level => {
+            let children = r.many(|r| Ok((r.string()?, r.id()?)))?;
+            if children.is_empty() {
+                return Err(Error::Decode("empty graph chunk"));
+            }
+            Graph::Children(level, children)
+        }
+    };
+    let ascending = match &g {
+        Graph::Nodes(n) => n.windows(2).all(|w| w[0].label < w[1].label),
+        Graph::Children(_, c) => c.windows(2).all(|w| w[0].0 < w[1].0),
+    };
+    if !ascending {
+        return Err(Error::Decode("graph labels not strictly ascending"));
+    }
+    Ok(g)
 }
 
 /// Edge label for a selector, keeping range offsets visible.

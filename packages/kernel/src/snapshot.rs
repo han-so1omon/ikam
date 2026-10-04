@@ -51,6 +51,7 @@ pub fn checkout<S: Store>(repo: &Repo<S>, id: &Id, dest: &Path) -> Result<(), Er
         match e.kind {
             Kind::Tree => checkout(repo, &e.id, &path)?,
             Kind::File => fs::write(&path, repo.read_content(&e.id)?)?,
+            Kind::Graph => {} // a graph has no file-system form
         }
     }
     Ok(())
