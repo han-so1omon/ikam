@@ -151,6 +151,10 @@ impl<S: Store> Repo<S> {
             return Ok(false);
         }
         let stored = match object_tag(encoded) {
+            Some(b'T') => {
+                let content = self.put_content(encoded)?.id;
+                [&b"t\x02"[..], content.as_bytes()].concat()
+            }
             Some(_) => self.encode_object(encoded),
             None => encoded.to_vec(),
         };
