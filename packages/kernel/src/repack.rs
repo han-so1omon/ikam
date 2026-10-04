@@ -6,8 +6,8 @@
 //! largest first, re-offering every recorded derivation as a candidate, then
 //! drops stored bytes wherever a recorded derivation rebuilds them. It does
 //! this twice, with and without template induction (one template per
-//! cluster of similar contents, generalized over all of them), and keeps the
-//! smaller plan. The plan is verified completely and replaces the old
+//! cluster of similar contents, generalized over all of them, recursively
+//! over the templates and fillers themselves), and keeps the smaller plan. The plan is verified completely and replaces the old
 //! representation only if it is smaller. Ids never change, so trees, commits
 //! and refs are untouched.
 //!
@@ -23,6 +23,11 @@ use std::collections::{HashMap, HashSet};
 use crate::matcher::{self, Index};
 use crate::repo::{Cx, decode_plain};
 use crate::{Arg, Derivation, Error, Id, MemStore, Repo, Store, func, template};
+
+/// Levels of template induction: templates and fillers induced at one
+/// level are clustered and templated again at the next. Each level adds one
+/// derivation hop to reads, within ingest's plan-depth budget.
+const TEMPLATE_LEVELS: usize = 3;
 
 #[derive(Debug, PartialEq, Eq)]
 pub struct Repacked {
@@ -44,8 +49,8 @@ impl<S: Store> Repo<S> {
             .collect::<Result<_, Error>>()?;
         files.sort_by_key(|(id, bytes)| (Reverse(bytes.len()), *id));
 
-        let plain = self.replan(&files, false)?;
-        let templated = self.replan(&files, true)?;
+        let plain = self.replan(&files, 0)?;
+        let templated = self.replan(&files, TEMPLATE_LEVELS)?;
         let fresh = if templated.content_bytes()? < plain.content_bytes()? {
             templated
         } else {
@@ -78,32 +83,13 @@ impl<S: Store> Repo<S> {
     }
 
     /// A verified fresh store holding exactly `files` and what they need.
-    fn replan(&self, files: &[(Id, Vec<u8>)], induce: bool) -> Result<Repo<MemStore>, Error> {
+    fn replan(&self, files: &[(Id, Vec<u8>)], levels: usize) -> Result<Repo<MemStore>, Error> {
         let mut fresh = Repo::new(MemStore::default());
         let mut hints: HashMap<Id, Vec<Derivation>> = HashMap::new();
         for (id, _) in files {
             hints.insert(*id, self.derivations(id)?);
         }
-        if induce {
-            for group in template_groups(files) {
-                let members: Vec<&[u8]> = group.iter().map(|&i| files[i].1.as_slice()).collect();
-                let Some(t) = template::induce(&members) else {
-                    continue;
-                };
-                let t_id = fresh.put_content(&t)?.id;
-                for &i in &group {
-                    if let Some(fillers) = template::fit(&t, &files[i].1) {
-                        let f_id = fresh.put_content(&fillers)?.id;
-                        let d = Derivation {
-                            output: files[i].0,
-                            func: func::fill(),
-                            args: vec![Arg::Whole(t_id), Arg::Whole(f_id)],
-                        };
-                        hints.entry(files[i].0).or_default().push(d);
-                    }
-                }
-            }
-        }
+        induce_into(&mut fresh, files, &mut hints, levels)?;
         for (id, bytes) in files {
             fresh.put_content_with(bytes, 0, &hints[id])?;
         }
@@ -183,6 +169,50 @@ impl<S: Store> Repo<S> {
         }
         Ok(total)
     }
+}
+
+/// Induce one template per cluster of similar `items`, offering each item a
+/// `fill` hint. The templates and fillers produced are content too: they are
+/// clustered and templated again, `levels` deep, then put into `fresh` with
+/// their own hints. Ingest's cost comparison decides which hints are used;
+/// unused templates and fillers are pruned later.
+fn induce_into(
+    fresh: &mut Repo<MemStore>,
+    items: &[(Id, Vec<u8>)],
+    hints: &mut HashMap<Id, Vec<Derivation>>,
+    levels: usize,
+) -> Result<(), Error> {
+    if levels == 0 {
+        return Ok(());
+    }
+    let mut artifacts: Vec<(Id, Vec<u8>)> = Vec::new();
+    for group in template_groups(items) {
+        let members: Vec<&[u8]> = group.iter().map(|&i| items[i].1.as_slice()).collect();
+        let Some(t) = template::induce(&members) else {
+            continue;
+        };
+        let t_id = Id::of_content(&t);
+        for &i in &group {
+            if let Some(fillers) = template::fit(&t, &items[i].1) {
+                let f_id = Id::of_content(&fillers);
+                let d = Derivation {
+                    output: items[i].0,
+                    func: func::fill(),
+                    args: vec![Arg::Whole(t_id), Arg::Whole(f_id)],
+                };
+                hints.entry(items[i].0).or_default().push(d);
+                artifacts.push((f_id, fillers));
+            }
+        }
+        artifacts.push((t_id, t));
+    }
+    artifacts.sort_by_key(|(id, bytes)| (Reverse(bytes.len()), *id));
+    artifacts.dedup_by_key(|(id, _)| *id);
+    induce_into(fresh, &artifacts, hints, levels - 1)?;
+    for (id, bytes) in &artifacts {
+        fresh.put_content_with(bytes, 0, hints.get(id).map_or(&[][..], Vec::as_slice))?;
+    }
+    Ok(())
 }
 
 /// Clusters (indices into `files`) of contents linked to their most similar
