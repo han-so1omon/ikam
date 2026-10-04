@@ -3,7 +3,11 @@
 //!   cargo run --release --example bench            # table
 //!   cargo run --release --example bench -- --json  # one JSON object per corpus
 //!   cargo run --release --example bench -- pdf md  # only corpora named so
-//!   cargo run --release --example bench -- --read-weight 0   # evaluator setting
+//!
+//! This is the fixed experiment command (docs/experiments/README.md): vary
+//! code, never flags. The last line is the score: the geometric mean over
+//! corpora of kernel bytes / trained-dictionary baseline bytes (lower is
+//! better). Inexact or fsck-failing results abort the run.
 //!
 //! Every corpus is built deterministically from this repository. Each run
 //! ingests the corpus snapshot by snapshot (one commit each), repacks, then
@@ -174,17 +178,7 @@ fn baselines(snapshots: &[Snapshot]) -> (usize, usize) {
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let json = args.iter().any(|a| a == "--json");
-    let read_weight = args.iter().position(|a| a == "--read-weight").map(|i| {
-        args[i + 1]
-            .parse::<f64>()
-            .expect("--read-weight takes a number")
-    });
-    let only: Vec<&String> = args
-        .iter()
-        .enumerate()
-        .filter(|(i, a)| !a.starts_with("--") && (*i == 0 || args[i - 1] != "--read-weight"))
-        .map(|(_, a)| a)
-        .collect();
+    let only: Vec<&String> = args.iter().filter(|a| !a.starts_with("--")).collect();
     let corpora: Vec<Corpus> = vec![
         ("md", || fixtures(&["md"])),
         ("pdf", || fixtures(&["pdf"])),
@@ -193,6 +187,7 @@ fn main() {
         ("synthetic-history", synthetic_history),
         ("repo-history", repo_history),
     ];
+    let (mut log_ratio, mut n, mut total_ms) = (0.0, 0, 0);
     for (name, build) in corpora {
         if !only.is_empty() && !only.iter().any(|o| *o == name) {
             continue;
@@ -200,9 +195,6 @@ fn main() {
         let snapshots = build();
         let input: usize = snapshots.iter().flatten().map(|(_, b)| b.len()).sum();
         let mut repo = Repo::new(MemStore::default());
-        if let Some(w) = read_weight {
-            repo.read_weight = w;
-        }
         let t = Instant::now();
         snapshots.iter().for_each(|s| commit(&mut repo, s));
         let (ingest, ingest_ms) = (stored(&repo), t.elapsed().as_millis());
@@ -215,16 +207,36 @@ fn main() {
             .all(|(_, b)| repo.read_content(&Id::of_content(b)).unwrap() == *b);
         let fsck = repo.fsck().unwrap().is_empty();
         let (zstd_files, zstd_dict) = baselines(&snapshots);
+        let ratio = repack as f64 / zstd_dict as f64;
         if json {
             println!(
-                "{{\"corpus\":\"{name}\",\"input\":{input},\"ingest\":{ingest},\"repack\":{repack},\"ingest_ms\":{ingest_ms},\"repack_ms\":{repack_ms},\"zstd_files\":{zstd_files},\"zstd_dict\":{zstd_dict},\"exact\":{exact},\"fsck\":{fsck}}}"
+                "{{\"corpus\":\"{name}\",\"input\":{input},\"ingest\":{ingest},\"repack\":{repack},\"ingest_ms\":{ingest_ms},\"repack_ms\":{repack_ms},\"zstd_files\":{zstd_files},\"zstd_dict\":{zstd_dict},\"vs_dict\":{ratio:.4},\"exact\":{exact},\"fsck\":{fsck}}}"
             );
         } else {
             println!(
-                "{name:<18} input={input:>9} ingest={ingest:>8} repack={repack:>8} ({:.3})  zstd/file={zstd_files:>8} zstd+dict={zstd_dict:>8}  {ingest_ms}+{repack_ms} ms  exact={exact} fsck={fsck}",
+                "{name:<18} input={input:>9} ingest={ingest:>8} repack={repack:>8} ({:.3})  zstd/file={zstd_files:>8} zstd+dict={zstd_dict:>8}  vs_dict={ratio:.3}  {ingest_ms}+{repack_ms} ms  exact={exact} fsck={fsck}",
                 repack as f64 / input as f64
             );
         }
+        // Hard gates: an inexact or fsck-failing result is a failure, not a score.
         assert!(exact && fsck, "{name}: verification failed");
+        (log_ratio, n, total_ms) = (
+            log_ratio + ratio.ln(),
+            n + 1,
+            total_ms + ingest_ms + repack_ms,
+        );
+    }
+    // The experiment score: geometric mean of kernel bytes / trained-dictionary
+    // baseline bytes across corpora (every corpus weighs the same; lower is
+    // better; below 1.0 beats the baseline).
+    let score = (log_ratio / n.max(1) as f64).exp();
+    if json {
+        println!(
+            "{{\"corpus\":\"_summary\",\"corpora\":{n},\"score\":{score:.4},\"total_ms\":{total_ms}}}"
+        );
+    } else {
+        println!(
+            "score (geometric mean of repack / zstd+dict) = {score:.4} over {n} corpora, {total_ms} ms"
+        );
     }
 }

@@ -35,7 +35,8 @@ Benchmark (deterministic corpora from this repo, verified exact, with zstd basel
 ```sh
 cargo run --release --example bench               # table
 cargo run --release --example bench -- --json     # one JSON line per corpus
-cargo run --release --example bench -- --read-weight 0.01 invoices
+cargo run --release --example bench -- invoices pdf   # a subset while iterating
+mise run experiment                               # the fixed experiment command (docs/experiments)
 ```
 
 A file's id is the BLAKE3 hash of its content and never depends on how it is stored. Its bytes may be stored (zstd-compressed when smaller), or it may exist only through derivations, for example:
