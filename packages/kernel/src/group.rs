@@ -7,10 +7,13 @@
 //! Each member's stored entry becomes `S group[8] start len`: its bytes are
 //! that range of the group. A member's id is still checked on every read,
 //! and a group prefix shared by later objects costs a retry, never exactness.
-//! Groups are formed by repack's re-plans and kept only if smaller than the
-//! members stored separately; gc keeps a group while a member names it.
+//! Groups are formed by repack's re-plans from contents that resemble each
+//! other (shared seeds), and kept only if smaller than the members stored
+//! separately; gc keeps a group while a member names it.
 
-use crate::{Error, Id, Repo, Store};
+use std::collections::{HashMap, HashSet};
+
+use crate::{Error, Id, Repo, Store, matcher};
 
 /// Bytes of a group's id stored in each member entry.
 pub(crate) const GROUP_REF_LEN: usize = 8;
@@ -37,6 +40,72 @@ fn varint(b: &mut &[u8]) -> Option<usize> {
         }
     }
     None
+}
+
+/// A group ready to write: its id and encoding, its members' entries, and
+/// the bytes it saves.
+struct Planned {
+    group: Id,
+    encoded: Vec<u8>,
+    entries: Vec<(Id, Vec<u8>)>,
+    saved: usize,
+}
+
+/// Groups of consecutive items in byte order, each up to `GROUP_SIZE`.
+fn byte_order_groups(items: &[(Vec<u8>, Id, usize)]) -> Vec<Vec<usize>> {
+    let (mut groups, mut start) = (Vec::new(), 0);
+    while start < items.len() {
+        let (mut end, mut size) = (start, 0);
+        while end < items.len() && (end == start || size + items[end].0.len() <= GROUP_SIZE) {
+            size += items[end].0.len();
+            end += 1;
+        }
+        groups.push((start..end).collect());
+        start = end;
+    }
+    groups
+}
+
+/// Groups of item indices, each up to `GROUP_SIZE` bytes. A group starts
+/// from the first unplaced item (in byte order) and grows by the unplaced
+/// item sharing the most content-defined seeds with the group so far (the
+/// matcher's anchors: a MinHash-like resemblance), falling back to byte
+/// order. Deterministic: ties go to byte order.
+fn similar_groups(items: &[(Vec<u8>, Id, usize)]) -> Vec<Vec<usize>> {
+    let seeds: Vec<HashSet<u64>> = items.iter().map(|(b, _, _)| seed_keys(b)).collect();
+    let mut index: HashMap<u64, Vec<usize>> = HashMap::new();
+    for (i, s) in seeds.iter().enumerate() {
+        s.iter().for_each(|k| index.entry(*k).or_default().push(i));
+    }
+    let (mut placed, mut groups) = (vec![false; items.len()], Vec::new());
+    while let Some(first) = placed.iter().position(|p| !p) {
+        let (mut group, mut size, mut seen) = (Vec::new(), 0, HashSet::new());
+        let mut score = vec![0usize; items.len()];
+        let mut next = Some(first);
+        while let Some(i) = next {
+            placed[i] = true;
+            group.push(i);
+            size += items[i].0.len();
+            for k in &seeds[i] {
+                if seen.insert(*k) {
+                    index[k].iter().for_each(|&j| score[j] += 1);
+                }
+            }
+            let fits = |j: usize| !placed[j] && size + items[j].0.len() <= GROUP_SIZE;
+            next = (0..items.len())
+                .filter(|&j| fits(j))
+                .max_by_key(|&j| (score[j], std::cmp::Reverse(j)));
+        }
+        groups.push(group);
+    }
+    groups
+}
+
+/// The matcher's seed keys of `bytes`.
+fn seed_keys(bytes: &[u8]) -> HashSet<u64> {
+    matcher::anchors(bytes)
+        .map(|p| matcher::seed_key(&bytes[p..p + matcher::SEED]))
+        .collect()
 }
 
 /// A member's stored entry.
@@ -94,23 +163,32 @@ impl<S: Store> Repo<S> {
             }
         }
         items.sort();
-        let mut start = 0;
-        while start < items.len() {
-            let (mut end, mut size) = (start, 0);
-            while end < items.len() && (end == start || size + items[end].0.len() <= GROUP_SIZE) {
-                size += items[end].0.len();
-                end += 1;
+        // Proposers suggest groupings; the one that saves most is written.
+        let mut best: (usize, Vec<Planned>) = (0, Vec::new());
+        for proposal in [byte_order_groups(&items), similar_groups(&items)] {
+            let plans: Vec<Planned> = proposal
+                .iter()
+                .filter_map(|g| self.plan_group(&g.iter().map(|&i| &items[i]).collect::<Vec<_>>()))
+                .collect();
+            let saved = plans.iter().map(|p| p.saved).sum();
+            if saved > best.0 {
+                best = (saved, plans);
             }
-            self.write_group(&items[start..end])?;
-            start = end;
+        }
+        for p in best.1 {
+            self.store.write(p.group, &p.encoded)?;
+            for (id, entry) in p.entries {
+                self.store.replace(id, &entry)?;
+            }
         }
         self.reset_projections();
         Ok(())
     }
 
-    fn write_group(&mut self, members: &[(Vec<u8>, Id, usize)]) -> Result<(), Error> {
+    /// The group of `members` and their entries, if it saves bytes.
+    fn plan_group(&self, members: &[&(Vec<u8>, Id, usize)]) -> Option<Planned> {
         if members.len() < 2 {
-            return Ok(());
+            return None;
         }
         let joined: Vec<u8> = members.iter().flat_map(|m| m.0.iter().copied()).collect();
         let group = Id::of_content(&joined);
@@ -121,14 +199,13 @@ impl<S: Store> Repo<S> {
             at += bytes.len();
         }
         let grouped = encoded.len() + entries.iter().map(|e| e.1.len()).sum::<usize>();
-        if grouped >= members.iter().map(|m| m.2).sum() || self.store.has(&group) {
-            return Ok(());
-        }
-        self.store.write(group, &encoded)?;
-        for (id, entry) in entries {
-            self.store.replace(id, &entry)?;
-        }
-        Ok(())
+        let alone: usize = members.iter().map(|m| m.2).sum();
+        (grouped < alone && !self.store.has(&group)).then_some(Planned {
+            group,
+            encoded,
+            entries,
+            saved: alone - grouped,
+        })
     }
 }
 

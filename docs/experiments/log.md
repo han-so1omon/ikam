@@ -245,3 +245,18 @@ Newest last. Format and rules: `README.md`.
 - Known limits:
   - Reading a member decompresses its group (up to 64 KiB); the evaluator's read weight does not price decompression yet.
   - A group keeps the bytes of members that die until the next repack regroups.
+
+### E017 seed-similarity groups
+- Branch / parent: exp/017-seed-groups / E016
+- Hypothesis: grouping contents by resemblance (shared content-defined seeds, MinHash-like) instead of by byte order puts more redundancy in each group (source: E016's byte-order grouping; Broder-style resemblance via the matcher's anchors; literature in `docs/research/semantic-grouping.md`, read in parallel)
+- Change: `src/group.rs`:
+  - `similar_groups`: a greedy proposer. It starts from the first unplaced content in byte order and adds the unplaced content sharing the most seeds with the group so far, using an inverted seed index.
+  - `group_small` plans every proposer's grouping without writing (`plan_group`) and writes the one that saves most. This keeps byte order (`byte_order_groups`) as a competitor, and later proposers (embeddings, LLM) plug in the same way.
+- Variants:
+  | variant | score | md | pdf | office | invoices | repo-history | repo-graph |
+  |---|---:|---:|---:|---:|---:|---:|---:|
+  | a: seed proposer only | 0.4856 | 68,911 | 20,601 | 173,282 | 5,454 | 1,119,910 | 22,313 |
+  | b: best of {byte order, seeds} | **0.4830** | 68,911 | 20,547 | 172,886 | 5,309 | 1,119,910 | 22,195 |
+  - Seeds win on md (-1.4%) and repo-history (-1.5%); byte order wins on invoices, pdf, office and repo-graph, where files with the same header already sort together.
+- Result (b): score 0.4851 -> **0.4830**; per corpus vs_dict: md 0.909->0.896, repo-history 0.881->0.868, others unchanged; time 28.5 s -> 23.5 s (measured twice; cause not established). Sizes identical on a second run.
+- Verdict: kept.
