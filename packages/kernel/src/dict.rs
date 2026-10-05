@@ -80,10 +80,53 @@ pub(crate) fn names(dict: &DictRef, id: &Id) -> bool {
     id.as_bytes().starts_with(dict)
 }
 
+/// zstd level 3 in the kernel's frame format: no magic number, content size,
+/// checksum or dictionary id. The encoding around a frame already says what
+/// it is, and decoded bytes are always checked against their id, so those
+/// fields would only repeat what is known (up to ~10 B per stored object).
+/// `dict` empty means no dictionary.
+pub(crate) fn zstd_frame(bytes: &[u8], dict: &[u8]) -> Option<Vec<u8>> {
+    framer(dict)?.compress(bytes).ok()
+}
+
+/// A compressor for `zstd_frame`'s format, reusable across many inputs.
+pub(crate) fn framer(dict: &[u8]) -> Option<zstd::bulk::Compressor<'static>> {
+    use zstd::zstd_safe::{CParameter, FrameFormat};
+    let mut c = match dict.is_empty() {
+        true => zstd::bulk::Compressor::new(3).ok()?,
+        false => zstd::bulk::Compressor::with_dictionary(3, dict).ok()?,
+    };
+    for p in [
+        CParameter::Format(FrameFormat::Magicless),
+        CParameter::ContentSizeFlag(false),
+        CParameter::ChecksumFlag(false),
+        CParameter::DictIdFlag(false),
+    ] {
+        c.set_parameter(p).ok()?;
+    }
+    Some(c)
+}
+
+/// Decode a frame written by `zstd_frame` with the same `dict`.
+pub(crate) fn unzstd_frame(frame: &[u8], dict: &[u8]) -> Option<Vec<u8>> {
+    use zstd::zstd_safe::{DCtx, DParameter, FrameFormat};
+    let mut ctx = DCtx::create();
+    ctx.set_parameter(DParameter::Format(FrameFormat::Magicless))
+        .ok()?;
+    if !dict.is_empty() {
+        ctx.load_dictionary(dict).ok()?;
+    }
+    let mut out = Vec::new();
+    zstd::stream::read::Decoder::with_context(frame, &mut ctx)
+        .read_to_end(&mut out)
+        .ok()?;
+    Some(out)
+}
+
 fn decode_basic(id: &Id, encoded: &[u8]) -> Result<Vec<u8>, Error> {
     match encoded.split_first() {
         Some((b'B', bytes)) => Ok(bytes.to_vec()),
-        Some((b'Z', z)) => zstd::stream::decode_all(z).map_err(|_| Error::Corrupt(*id)),
+        Some((b'Z', z)) => unzstd_frame(z, &[]).ok_or(Error::Corrupt(*id)),
         _ => Err(Error::WrongKind(*id)),
     }
 }
@@ -103,9 +146,7 @@ impl<S: Store> Repo<S> {
     /// Store `dict` as content and make it the current dictionary.
     pub(crate) fn set_dictionary(&mut self, dict: Vec<u8>) -> Result<Id, Error> {
         let id = Id::of_content(&dict);
-        let z = zstd::bulk::compress(&dict, 3)
-            .ok()
-            .filter(|z| z.len() < dict.len());
+        let z = zstd_frame(&dict, &[]).filter(|z| z.len() < dict.len());
         let encoded = z.map_or_else(|| [&b"B"[..], &dict].concat(), |z| [&b"Z"[..], &z].concat());
         self.write(id, &encoded)?;
         let current = self.store.get_ref(DICT_REF)?;
@@ -119,16 +160,13 @@ impl<S: Store> Repo<S> {
     /// `bytes`.
     fn compress(&self, bytes: &[u8]) -> Option<(Option<Id>, Vec<u8>)> {
         let mut best: Option<(Option<Id>, Vec<u8>)> = None;
-        if let Ok(z) = zstd::bulk::compress(bytes, 3)
+        if let Some(z) = zstd_frame(bytes, &[])
             && z.len() < bytes.len()
         {
             best = Some((None, z));
         }
         if let Some((id, dict)) = self.dictionary()
-            && let Ok(z) = zstd::bulk::Compressor::with_dictionary(3, dict).and_then(|mut c| {
-                c.set_parameter(zstd::zstd_safe::CParameter::DictIdFlag(false))?;
-                c.compress(bytes)
-            })
+            && let Some(z) = zstd_frame(bytes, dict)
             && z.len() + DICT_REF_LEN < best.as_ref().map_or(bytes.len(), |b| b.1.len())
         {
             best = Some((Some(*id), z));
@@ -190,9 +228,7 @@ impl<S: Store> Repo<S> {
             Ok([&[tag][..], &rest].concat())
         };
         match mode & !ABBREVIATED {
-            0 if t.is_ascii_lowercase() => {
-                finish(zstd::stream::decode_all(z).map_err(|_| Error::Corrupt(*id))?)
-            }
+            0 if t.is_ascii_lowercase() => finish(unzstd_frame(z, &[]).ok_or(Error::Corrupt(*id))?),
             1 if t.is_ascii_lowercase() => {
                 let rest = self.unzstd_with_dict(id, &encoded, 2, &|rest| {
                     finish(rest.to_vec()).is_ok_and(|c| Id::of(&c) == *id)
@@ -234,14 +270,7 @@ impl<S: Store> Repo<S> {
     ) -> Result<Vec<u8>, Error> {
         let dict = dict_of(encoded).ok_or(Error::Corrupt(*id))?;
         let frame = &encoded[at + DICT_REF_LEN..];
-        let attempt = |bytes: &[u8]| {
-            let mut out = Vec::new();
-            zstd::stream::Decoder::with_dictionary(frame, bytes)
-                .and_then(|mut d| d.read_to_end(&mut out))
-                .ok()
-                .filter(|_| check(&out))
-                .map(|_| out)
-        };
+        let attempt = |bytes: &[u8]| unzstd_frame(frame, bytes).filter(|out| check(out));
         if let Some((current, bytes)) = self.dictionary()
             && names(&dict, current)
             && let Some(out) = attempt(bytes)
