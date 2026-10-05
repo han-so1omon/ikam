@@ -183,6 +183,7 @@ impl<S: Store + Sync> Repo<S> {
         }
         fresh.drop_derivable_bytes(files)?;
         fresh.prune(files)?;
+        fresh.group_small()?;
         for (id, bytes) in files {
             if fresh.read_content(id)? != *bytes {
                 return Err(Error::Corrupt(*id));

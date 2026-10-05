@@ -2,7 +2,7 @@
 
 use std::collections::HashSet;
 
-use crate::dict::{dict_of, names, object_tag, tree_content};
+use crate::dict::{names, needs, object_tag, tree_content};
 use crate::repo::Cx;
 use crate::{Arg, Commit, Derivation, Error, Graph, Id, Kind, Object, Repo, Store, Target, func};
 
@@ -155,15 +155,15 @@ impl<S: Store> Repo<S> {
         let (mut objects, files) = self.reachable()?;
         let (content, records) = self.closure(files, |_| true)?;
         objects.extend(records);
-        // Dictionaries that live stored encodings need: every object their
-        // id prefix may name.
-        let mut dicts = Vec::new();
+        // Dictionaries and groups that live stored encodings need: every
+        // object their id prefix may name.
+        let mut dicts: Vec<Vec<u8>> = Vec::new();
         for id in content.iter().chain(&objects) {
             if let Ok(encoded) = self.store.read(id)
-                && let Some(dict) = dict_of(&encoded)
-                && !dicts.contains(&dict)
+                && let Some(prefix) = needs(&encoded)
+                && !dicts.iter().any(|d| d == prefix)
             {
-                dicts.push(dict);
+                dicts.push(prefix.to_vec());
             }
         }
         for id in self.store.ids()? {
