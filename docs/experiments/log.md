@@ -260,3 +260,10 @@ Newest last. Format and rules: `README.md`.
   - Seeds win on md (-1.4%) and repo-history (-1.5%); byte order wins on invoices, pdf, office and repo-graph, where files with the same header already sort together.
 - Result (b): score 0.4851 -> **0.4830**; per corpus vs_dict: md 0.909->0.896, repo-history 0.881->0.868, others unchanged; time 28.5 s -> 23.5 s (measured twice; cause not established). Sizes identical on a second run.
 - Verdict: kept.
+
+### E018 marginal-cost groups
+- Branch / parent: exp/018-marginal-cost / E017
+- Hypothesis: the compression-native resemblance, the bytes a content adds to a group as measured by the kernel's own zstd and dictionary, predicts group compressibility better than seed overlap alone (source: `docs/research/semantic-grouping.md` H2; Cilibrasi and Vitanyi's NCD; DeepSketch, FAST 2022: sketches miss a usable reference for 35.7% of blocks, and a hash trained on measured gains gives +21% data reduction)
+- Change: `src/group.rs` adds a third proposer, `similar_groups(items, Some(dict))`. Seed scores shortlist `SHORTLIST` = 8 candidates per step, and the next member maximises `C(x) - (C(G x) - C(G))` with the kernel's zstd framing and dictionary. The best of the three proposers is written, as in E017.
+- Result: score 0.4830 -> **0.4798**; per corpus vs_dict: md 0.896->0.894, office 0.442->0.437, invoices 0.393->0.384, synthetic 0.2787->0.2786, repo-history 0.868->0.859, pdf and repo-graph unchanged; time 23.5 s -> 28.1 s (1.2x). Sizes identical on a second run.
+- Verdict: kept. Measured compression beats resemblance proxies wherever both are tried, as the literature predicted.
