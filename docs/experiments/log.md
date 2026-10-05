@@ -177,3 +177,15 @@ Newest last. Format and rules: `README.md`.
   - New `tests/graphs.rs`, laws 1–7.
 - Result: score 0.6210 -> **0.6210**; every corpus byte-identical to E010. Law 7 measurements are in the design note: 20 versions take 157 KB, 3.3x one version at zstd -19 (one content per version: 1.6x; positional edges: 13x).
 - Verdict: kept (capability; score holds). Open: a graph corpus in the benchmark; WebGraph-style reference lists (G3); TerminusDB-style add/remove layers as a competing variant (G2).
+
+### E012 graph-corpus (benchmark change)
+- Branch / parent: exp/012-graph-corpus / E011
+- Change to the measurement: a seventh corpus, `repo-graph`. It is this repository's dependency graph at each of the 38 commits up to 0ca74e4 (a fixed range): one node per file or module referenced, edges "imports" (Python), "links" (markdown, resolved to a path) and "uses" (Rust `mod`, `use crate::`), from `git grep` per commit.
+  - The baseline compresses each version's sorted edge list as one file (zstd with a trained dictionary, as for every corpus). The kernel stores each version with `put_graph` under a tree entry of kind `G`.
+  - Exactness: every version's graph, read back through its commit, equals the edge list.
+  - **Scores before and after E012 are not comparable**; E012 is the new reference.
+- Result, E011 kernel: score **0.5349** over 7 corpora (the six others byte-identical to E010); repo-graph 24,782 B vs baseline 113,441 B (0.218); input 2.94 MB, about 77 KB per version; time 25.6 s
+  - Like the other history corpora, the baseline compresses each version alone, which favours the kernel.
+  - Unscored comparison within the kernel: the same edge lists stored as plain files take 14,513 B, so graph form costs 1.7x for chunk-level lookup, diff and slicing (as law 7 measured on synthetic graphs).
+  - Breakdown: graph chunks g 54 objects 5,795 B plus their content (Y/Z/d) ~15 KB; 38 commits 2,742 B (11%).
+- Verdict: reference for later experiments. Next: WebGraph-style reference lists (graph-storage G3).
