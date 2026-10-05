@@ -83,7 +83,7 @@ The hypotheses are ordered by expected gain over cost.
   - **md and office:** a small gain, because templated near-copies get placed together. Byte order already clusters contents that share a *prefix*, but not ones that share a middle. [inf]
   - **synthetic and repo-graph:** about 0.
 - **Cost:** O(Σ seeds) for the index. The greedy step is O(n) per member, so O(n²) per run, which is fine at hundreds of members.
-- **Status:** `open` (not yet run).
+- **Status:** confirmed by E017 as a competing proposer (best of byte order and seeds): md -1.4%, repo-history -1.5%, score 0.4851 -> 0.4830. Byte order still wins on invoices, pdf, office and repo-graph.
 
 ### H2. Refine by marginal compressed cost, a compression-native NCD
 
