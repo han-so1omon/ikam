@@ -13,7 +13,7 @@ memchr = "2.8.3"
 similar = "3.2.0"
 thiserror = "2.0.21"
 wasmi = { version = "=2.0.0", features = ["portable-dispatch", "deterministic"] }
-zstd = "0.14.0"
+zstd = { version = "0.14.0", features = ["experimental"] }
 
 [dev-dependencies]
 proptest = "1.11.0"

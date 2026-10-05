@@ -21,7 +21,7 @@
 use std::cmp::Reverse;
 use std::collections::{HashMap, HashSet};
 
-use crate::dict::{DICT_REF, DICT_REF_LEN, is_plain, object_tag, tree_content};
+use crate::dict::{DICT_REF, DICT_REF_LEN, framer, is_plain, object_tag, tree_content};
 use crate::ingest::derivation_size;
 use crate::matcher::{self, Index};
 use crate::repo::Cx;
@@ -447,16 +447,13 @@ fn train_dictionaries(samples: &[&[u8]], k: usize) -> Vec<Vec<u8>> {
 /// dictionary plus each sample's smallest encoding, a dictionary encoding
 /// paying for the id it names.
 fn dictionary_cost(samples: &[&[u8]], dict: &[u8]) -> Option<usize> {
-    let mut with_dict = zstd::bulk::Compressor::with_dictionary(3, dict).ok()?;
-    with_dict
-        .set_parameter(zstd::zstd_safe::CParameter::DictIdFlag(false))
-        .ok()?;
+    let (mut alone, mut given) = (framer(&[])?, framer(dict)?);
     let mut cost = dict.len();
     for b in samples {
-        let z = zstd::bulk::compress(b, 3).map_or(b.len(), |z| z.len().min(b.len()));
+        let z = alone.compress(b).map_or(b.len(), |z| z.len().min(b.len()));
         cost += match dict.is_empty() {
             true => z,
-            false => with_dict
+            false => given
                 .compress(b)
                 .map_or(z, |d| (d.len() + DICT_REF_LEN).min(z)),
         };

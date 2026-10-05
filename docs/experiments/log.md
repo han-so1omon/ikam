@@ -213,3 +213,16 @@ Newest last. Format and rules: `README.md`.
 - Workable variant probed instead: a per-chunk table of distinct target keys, with edges as u16 indices (with front-coded labels): 12,718 / 10,427 / 9,591 B at 64 / 256 / all nodes per chunk, against 12,465 / 10,359 / 9,477 B without the table.
 - Decomposition of the final repo-graph version (zstd -3, each part compressed alone): node labels 5,719 B (56% of 10,301), edge keys 1,788 B (17%; 1,121 edges, only 100 distinct targets), edge counts 378 B, edge labels 108 B, the rest length fields and framing.
 - Verdict: not applicable. Keys are not where the bytes are, and zstd already compresses repeated keys. Node labels are; front coding them saves 5–8% of a chunk (E013 probe).
+
+### E015 magicless-frames
+- Branch / parent: exp/015-magicless / E012
+- Hypothesis: nested trees multiplied small stored objects (md: 333 files and 76 trees). Each zstd frame repeats a 4-byte magic number and a content-size field that the surrounding encoding and the id check make redundant, so dropping them recovers per-object overhead (source: `docs/research/office-gap.md` H1, zstd.h frame parameters; magicless frames left untried in E004)
+- Change:
+  - `Cargo.toml`: zstd `experimental` feature (exposes the frame-format parameter).
+  - `src/dict.rs`: `zstd_frame`, `framer` and `unzstd_frame` write and read every stored frame (Z, Y, compressed objects, the dictionary) as magicless, with no content size, checksum or dictionary id.
+  - `src/repack.rs`: the dictionary estimate uses the same framing, with one compressor per dictionary.
+  - Decoding is unchanged in what it guarantees: output is checked against its id.
+- Result: score 0.5349 -> **0.5270**; per corpus vs_dict: md 1.027->1.006, pdf 0.895->0.882, office 0.559->0.547, invoices 0.439->0.427, synthetic 0.281->0.279, repo-history 0.905->0.902, repo-graph 0.218->0.216; time 25.6 s -> 25.2 s
+  - Bytes: md 78,935->77,352; office 218,801->214,168; repo-history 1,168,467->1,164,322.
+  - A first version loaded the dictionary for every sample in the estimate (29.7 s); reusing one compressor per dictionary fixed it, with identical sizes.
+- Verdict: kept. md is still just above the baseline (1.006): Y 333 objects 58,025 B, trees 76 objects 9,479 B, dictionary 9,807 B.
