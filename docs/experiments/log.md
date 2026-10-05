@@ -202,5 +202,14 @@ Newest last. Format and rules: `README.md`.
 - Verdict: refuted for this corpus. With 1.8 edges per node, neighbours' edge lists rarely overlap; WebGraph relies on dozens of links per node with URL-order locality.
 - Learned:
   - The bytes are the edges' 8-byte target keys: 1,121 x 8 B = 8,968 B of random data, nearly all of the 9,477 B left after front coding.
+  - **Correction (E014):** wrong. The 1,121 edges have only 100 distinct targets, so the keys compress to 1,788 B (17%). Node labels are 56% (5,719 B).
   - Front-coded labels save 5–8%.
-  - The next lever is key width, which trades bytes against the rule that keys must be unique within a graph.
+  - ~~The next lever is key width~~ (see the correction above and E014).
+
+### E014 short-edge-keys (not applicable, probe only)
+- Branch / parent: none (no kernel change) / E013
+- Hypothesis as proposed: store each edge's target key as its shortest prefix unique within the chunk (stored form only, as E006 did for tree ids).
+- Why it cannot work as stated: targets mostly live in other chunks, so a chunk-local prefix cannot be expanded back to the full key without reading the whole graph or keeping a second, key-sorted index. E006 worked because tree ids resolve against the store.
+- Workable variant probed instead: a per-chunk table of distinct target keys, with edges as u16 indices (with front-coded labels): 12,718 / 10,427 / 9,591 B at 64 / 256 / all nodes per chunk, against 12,465 / 10,359 / 9,477 B without the table.
+- Decomposition of the final repo-graph version (zstd -3, each part compressed alone): node labels 5,719 B (56% of 10,301), edge keys 1,788 B (17%; 1,121 edges, only 100 distinct targets), edge counts 378 B, edge labels 108 B, the rest length fields and framing.
+- Verdict: not applicable. Keys are not where the bytes are, and zstd already compresses repeated keys. Node labels are; front coding them saves 5–8% of a chunk (E013 probe).
