@@ -13,6 +13,7 @@
 
 use std::collections::{HashMap, HashSet};
 
+use crate::dict::framer;
 use crate::{Error, Id, Repo, Store, matcher};
 
 /// Bytes of a group's id stored in each member entry.
@@ -71,7 +72,19 @@ fn byte_order_groups(items: &[(Vec<u8>, Id, usize)]) -> Vec<Vec<usize>> {
 /// item sharing the most content-defined seeds with the group so far (the
 /// matcher's anchors: a MinHash-like resemblance), falling back to byte
 /// order. Deterministic: ties go to byte order.
-fn similar_groups(items: &[(Vec<u8>, Id, usize)]) -> Vec<Vec<usize>> {
+///
+/// With `measure` (the dictionary to compress with), the seed scores only
+/// shortlist `SHORTLIST` candidates, and the next member is the one whose
+/// bytes the group compresses best: the largest saving `C(x) - (C(G x) -
+/// C(G))`, measured with the kernel's own zstd and dictionary (a
+/// compression-native resemblance, after Cilibrasi and Vitanyi's NCD).
+fn similar_groups(items: &[(Vec<u8>, Id, usize)], measure: Option<&[u8]>) -> Vec<Vec<usize>> {
+    let mut zstd = measure.and_then(framer);
+    let mut cost = |b: &[u8]| {
+        zstd.as_mut()
+            .map_or(0, |z| z.compress(b).map_or(b.len(), |c| c.len()))
+    };
+    let alone: Vec<usize> = items.iter().map(|(b, _, _)| cost(b)).collect();
     let seeds: Vec<HashSet<u64>> = items.iter().map(|(b, _, _)| seed_keys(b)).collect();
     let mut index: HashMap<u64, Vec<usize>> = HashMap::new();
     for (i, s) in seeds.iter().enumerate() {
@@ -80,26 +93,46 @@ fn similar_groups(items: &[(Vec<u8>, Id, usize)]) -> Vec<Vec<usize>> {
     let (mut placed, mut groups) = (vec![false; items.len()], Vec::new());
     while let Some(first) = placed.iter().position(|p| !p) {
         let (mut group, mut size, mut seen) = (Vec::new(), 0, HashSet::new());
-        let mut score = vec![0usize; items.len()];
+        let (mut score, mut joined) = (vec![0usize; items.len()], Vec::new());
         let mut next = Some(first);
         while let Some(i) = next {
             placed[i] = true;
             group.push(i);
             size += items[i].0.len();
+            if measure.is_some() {
+                joined.extend_from_slice(&items[i].0);
+            }
             for k in &seeds[i] {
                 if seen.insert(*k) {
                     index[k].iter().for_each(|&j| score[j] += 1);
                 }
             }
             let fits = |j: usize| !placed[j] && size + items[j].0.len() <= GROUP_SIZE;
-            next = (0..items.len())
-                .filter(|&j| fits(j))
-                .max_by_key(|&j| (score[j], std::cmp::Reverse(j)));
+            let mut ranked: Vec<usize> = (0..items.len()).filter(|&j| fits(j)).collect();
+            ranked.sort_by_key(|&j| (std::cmp::Reverse(score[j]), j));
+            next = match measure {
+                None => ranked.first().copied(),
+                Some(_) => {
+                    let base = cost(&joined);
+                    ranked.truncate(SHORTLIST);
+                    // Largest saving; ties to the seed ranking.
+                    let mut saving = |j: usize| {
+                        let with = cost(&[&joined[..], &items[j].0].concat());
+                        alone[j] as isize - (with as isize - base as isize)
+                    };
+                    let scored: Vec<(isize, usize)> =
+                        ranked.iter().map(|&j| (saving(j), j)).collect();
+                    scored.iter().rev().max_by_key(|s| s.0).map(|s| s.1)
+                }
+            };
         }
         groups.push(group);
     }
     groups
 }
+
+/// Candidates measured per step when growing a group by compressed cost.
+const SHORTLIST: usize = 8;
 
 /// The matcher's seed keys of `bytes`.
 fn seed_keys(bytes: &[u8]) -> HashSet<u64> {
@@ -165,7 +198,16 @@ impl<S: Store> Repo<S> {
         items.sort();
         // Proposers suggest groupings; the one that saves most is written.
         let mut best: (usize, Vec<Planned>) = (0, Vec::new());
-        for proposal in [byte_order_groups(&items), similar_groups(&items)] {
+        let dict = self
+            .dictionary()
+            .map(|(_, d)| d.clone())
+            .unwrap_or_default();
+        let proposals = [
+            byte_order_groups(&items),
+            similar_groups(&items, None),
+            similar_groups(&items, Some(&dict)),
+        ];
+        for proposal in proposals {
             let plans: Vec<Planned> = proposal
                 .iter()
                 .filter_map(|g| self.plan_group(&g.iter().map(|&i| &items[i]).collect::<Vec<_>>()))

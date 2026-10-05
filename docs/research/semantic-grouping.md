@@ -91,7 +91,7 @@ The hypotheses are ordered by expected gain over cost.
 - **Change:** in the greedy step, take the top K = 8 candidates by seed score. Pick the one that minimises `zstd3_dict(G ‖ x) − zstd3_dict(G)`; ties go to byte order. Optionally, order members inside a group the same way: start from the member that compresses best with the dictionary alone. This is still deterministic, since zstd is deterministic at a fixed level and version.
 - **Expected effect:** gains where seeds are a poor proxy, for example short members whose overlap falls below the seed length, or overlap with the dictionary rather than with group-mates. DeepSketch's numbers suggest a proxy loses 33% to 44% of the available reduction on the blocks where it guesses wrong, but those blocks are delta pairs, not 64 KiB groups. [inf]
 - **Cost:** about K × members compressions of at most 64 KiB each, so a few hundred ms per corpus at level 3. [inf, unmeasured]
-- **Status:** `open` (not yet run).
+- **Status:** confirmed by E018 (8 seed-shortlisted candidates per step, measured marginal cost): score 0.4830 -> 0.4798, no corpus worse; 1.2x time.
 
 ### H3. Path order (the URL analogue) as a proposer
 
