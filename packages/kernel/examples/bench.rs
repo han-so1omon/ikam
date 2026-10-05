@@ -15,15 +15,18 @@
 //! baselines are file-level dedup + zstd per file, and file-level dedup +
 //! zstd with a dictionary trained on the corpus (dictionary size included).
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Instant;
 
-use ikam_kernel::{Id, Kind, MemStore, Object, Repo, Store, TreeEntry};
+use ikam_kernel::{
+    Edge, Id, Kind, MemStore, Node, Object, Repo, Store, Target, TreeEntry, node_key,
+};
 
 type Snapshot = Vec<(String, Vec<u8>)>;
-type Corpus = (&'static str, fn() -> Vec<Snapshot>);
+/// (name, snapshots, whether each snapshot is one graph's edge list).
+type Corpus = (&'static str, fn() -> Vec<Snapshot>, bool);
 
 fn repo_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -111,6 +114,103 @@ fn repo_history() -> Vec<Snapshot> {
         .collect()
 }
 
+/// This repository's dependency graph at each commit up to the graph layer
+/// (a fixed range): one node per file or module referenced, with edges
+/// "imports" (Python), "links" (markdown, resolved to a path) and "uses"
+/// (Rust `mod` and `use crate::`). Imports may form cycles. Each version is
+/// one file, the sorted edge list `source\tlabel\ttarget\n`: the baseline
+/// compresses it; the kernel stores it as a graph (`graph_of`).
+fn repo_graph() -> Vec<Snapshot> {
+    let root = repo_root();
+    let git = |args: &[&str]| {
+        let out = Command::new("git")
+            .args(args)
+            .current_dir(&root)
+            .output()
+            .unwrap();
+        String::from_utf8(out.stdout).unwrap()
+    };
+    let pattern = r"^\s*(from\s+[A-Za-z_][\w.]*\s+import|import\s+[A-Za-z_][\w.]*)|\]\([^)#[:space:]]+|^\s*(pub\s+)?mod\s+\w+;|use crate::\w+";
+    let mut out = Vec::new();
+    for c in git(&["rev-list", "--reverse", "0ca74e4"]).lines() {
+        let found = git(&[
+            "grep",
+            "-I",
+            "-o",
+            "-E",
+            pattern,
+            c,
+            "--",
+            "packages",
+            "docs",
+            ":!packages/narraciones",
+        ]);
+        let edges: BTreeSet<String> = found
+            .lines()
+            .filter_map(|l| edge(l.split_once(':')?.1))
+            .collect();
+        out.push(vec![(
+            "graph.tsv".to_string(),
+            edges.into_iter().collect::<String>().into_bytes(),
+        )]);
+    }
+    out
+}
+
+/// One edge line from a `path:match` grep result.
+fn edge(line: &str) -> Option<String> {
+    let (path, m) = line.split_once(':')?;
+    let m = m.trim();
+    let (label, target) = if let Some(link) = m.strip_prefix("](") {
+        if link.contains("://") || link.starts_with("mailto:") {
+            return None;
+        }
+        let mut parts: Vec<&str> = path.split('/').collect();
+        parts.pop();
+        for seg in link.split('/') {
+            match seg {
+                "." | "" => {}
+                ".." => drop(parts.pop()),
+                s => parts.push(s),
+            }
+        }
+        ("links", parts.join("/"))
+    } else if let Some(module) = m.strip_prefix("from ") {
+        (
+            "imports",
+            format!("py:{}", module.split_whitespace().next()?),
+        )
+    } else if let Some(module) = m.strip_prefix("import ") {
+        ("imports", format!("py:{}", module.trim()))
+    } else {
+        let name = m.trim_end_matches(';').rsplit([' ', ':']).next()?;
+        ("uses", format!("rs:{name}"))
+    };
+    Some(format!("{path}\t{label}\t{target}\n"))
+}
+
+/// The graph an edge list describes: every source and target is a node.
+fn graph_of(text: &[u8]) -> Vec<Node> {
+    let mut nodes: BTreeMap<String, BTreeSet<Edge>> = BTreeMap::new();
+    for line in std::str::from_utf8(text).unwrap().lines() {
+        let mut f = line.split('\t');
+        let (src, label, dst) = (f.next().unwrap(), f.next().unwrap(), f.next().unwrap());
+        nodes.entry(dst.to_string()).or_default();
+        nodes.entry(src.to_string()).or_default().insert(Edge {
+            to: node_key(dst),
+            label: label.into(),
+        });
+    }
+    nodes
+        .into_iter()
+        .map(|(label, edges)| Node {
+            label,
+            target: Target::None,
+            edges: edges.into_iter().collect(),
+        })
+        .collect()
+}
+
 /// Invoices from one generator: long shared boilerplate, short fields.
 fn invoices() -> Vec<Snapshot> {
     let one = |n: u32| {
@@ -181,7 +281,18 @@ fn tree(repo: &mut Repo<MemStore>, files: &[(&str, &[u8])]) -> Id {
     repo.put(&Object::tree(entries).unwrap()).unwrap()
 }
 
-fn commit(repo: &mut Repo<MemStore>, snapshot: &Snapshot) {
+fn commit(repo: &mut Repo<MemStore>, snapshot: &Snapshot, graph: bool) {
+    if graph {
+        let root = repo.put_graph(graph_of(&snapshot[0].1)).unwrap();
+        let entry = TreeEntry {
+            name: "graph".into(),
+            kind: Kind::Graph,
+            id: root,
+        };
+        let tree = repo.put(&Object::tree(vec![entry]).unwrap()).unwrap();
+        repo.commit("main", tree, "").unwrap();
+        return;
+    }
     let files: Vec<(&str, &[u8])> = snapshot
         .iter()
         .map(|(name, bytes)| (name.as_str(), bytes.as_slice()))
@@ -219,15 +330,16 @@ fn main() {
     let json = args.iter().any(|a| a == "--json");
     let only: Vec<&String> = args.iter().filter(|a| !a.starts_with("--")).collect();
     let corpora: Vec<Corpus> = vec![
-        ("md", || fixtures(&["md"])),
-        ("pdf", || fixtures(&["pdf"])),
-        ("office", || fixtures(&["xlsx", "docx", "pptx"])),
-        ("invoices", invoices),
-        ("synthetic-history", synthetic_history),
-        ("repo-history", repo_history),
+        ("md", || fixtures(&["md"]), false),
+        ("pdf", || fixtures(&["pdf"]), false),
+        ("office", || fixtures(&["xlsx", "docx", "pptx"]), false),
+        ("invoices", invoices, false),
+        ("synthetic-history", synthetic_history, false),
+        ("repo-history", repo_history, false),
+        ("repo-graph", repo_graph, true),
     ];
     let (mut log_ratio, mut n, mut total_ms) = (0.0, 0, 0);
-    for (name, build) in corpora {
+    for (name, build, graph) in corpora {
         if !only.is_empty() && !only.iter().any(|o| *o == name) {
             continue;
         }
@@ -235,15 +347,30 @@ fn main() {
         let input: usize = snapshots.iter().flatten().map(|(_, b)| b.len()).sum();
         let mut repo = Repo::new(MemStore::default());
         let t = Instant::now();
-        snapshots.iter().for_each(|s| commit(&mut repo, s));
+        snapshots.iter().for_each(|s| commit(&mut repo, s, graph));
         let (ingest, ingest_ms) = (stored(&repo), t.elapsed().as_millis());
         let t = Instant::now();
         repo.repack().unwrap();
         let (repack, repack_ms) = (stored(&repo), t.elapsed().as_millis());
-        let exact = snapshots
-            .iter()
-            .flatten()
-            .all(|(_, b)| repo.read_content(&Id::of_content(b)).unwrap() == *b);
+        let exact = match graph {
+            // Every version's graph, read back from its commit, is the one stored.
+            true => repo
+                .log(repo.resolve("main").unwrap())
+                .unwrap()
+                .iter()
+                .rev()
+                .zip(&snapshots)
+                .all(|((_, c), s)| {
+                    let Object::Tree(entries) = repo.get(&c.tree).unwrap() else {
+                        return false;
+                    };
+                    repo.graph_nodes(&entries[0].id).unwrap() == graph_of(&s[0].1)
+                }),
+            false => snapshots
+                .iter()
+                .flatten()
+                .all(|(_, b)| repo.read_content(&Id::of_content(b)).unwrap() == *b),
+        };
         let fsck = repo.fsck().unwrap().is_empty();
         let (zstd_files, zstd_dict) = baselines(&snapshots);
         let ratio = repack as f64 / zstd_dict as f64;

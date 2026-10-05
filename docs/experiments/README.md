@@ -7,7 +7,7 @@ How we improve the kernel: one fixed command, one score, hard gates, one hypothe
 - **Run command (fixed, identical on every experiment):** `cd packages/kernel && cargo run --release --example bench -- --json`, also available as `mise run experiment`.
   - It prints one JSON line per corpus, then a `_summary` line.
   - Never pass extra flags or environment variables to vary behaviour. Change committed code instead.
-- **Benchmark changes** (corpus or how it is committed) are their own log entries that re-measure the current kernel, and scores across them are not compared. Since E009 snapshots are committed as nested trees.
+- **Benchmark changes** (corpus or how it is committed) are their own log entries that re-measure the current kernel, and scores across them are not compared. Since E009 snapshots are committed as nested trees; since E012 there are 7 corpora, including a versioned graph (`repo-graph`).
 - **Score:** the `_summary.score`, which is the geometric mean over corpora of `repack bytes / zstd+trained-dictionary baseline bytes`.
   - Lower is better; below 1.0 means the kernel beats a strong conventional baseline.
   - Every corpus weighs the same, whatever its size.
