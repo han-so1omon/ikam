@@ -96,7 +96,7 @@ Not read: Broder 1997 and Odess (ICDE'21), which I know only through citations i
 - **Change:** pack small unique blobs, up to ~64–128 KB per group ordered by similarity or path, into one zstd frame with an offset index. This is the Shilane "compression region" approach, and it trades random-access cost.
 - **Expected effect:** likely the largest single gain on markdown (500 B files) and on office.
 - **Measure:** bytes, plus read latency for a single blob.
-- **Status:** `open` (not yet run).
+- **Status:** confirmed by E016: 64 KiB groups with 13 B member entries; md 1.006 -> 0.909, office 0.547 -> 0.442, score 0.5270 -> 0.4851.
 
 **H6 – Accounting parity** (from the code, not the literature).
 - **Change:** report the kernel's metadata (trees, commits, manifests, function-application objects) separately, or add the same metadata cost to the baseline.

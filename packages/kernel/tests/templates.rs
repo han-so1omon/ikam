@@ -1,6 +1,6 @@
 //! Template (anti-unification) dedup, end to end.
 
-use ikam_kernel::{Form, Id, Kind, MemStore, Object, Repo, Store, TreeEntry, func};
+use ikam_kernel::{Form, Id, Kind, MemStore, Object, Repo, Store, TreeEntry};
 
 /// An invoice from one generator: long shared boilerplate, short fields.
 fn invoice(n: u32) -> Vec<u8> {
@@ -119,11 +119,11 @@ fn revisions() -> Vec<Vec<u8>> {
     versions.into_iter().map(String::into_bytes).collect()
 }
 
-/// On a revision history, repack stores the revisions as fills of templates.
-/// (That induction layers templates without a level limit is a unit test in
+/// A revision history repacks into little more than one revision. (That
+/// induction layers templates without a level limit is a unit test in
 /// `repack.rs`; which plan repack keeps is the evaluator's call.)
 #[test]
-fn revisions_repack_into_templates() {
+fn revisions_repack_into_little_more_than_one() {
     let docs = revisions();
     let mut repo = Repo::new(MemStore::default());
     let ids = commit_all(&mut repo, &docs);
@@ -134,16 +134,12 @@ fn revisions_repack_into_templates() {
     }
     assert!(repo.fsck().unwrap().is_empty());
 
-    let fill_of = |id: &Id| {
-        repo.derivations(id)
-            .unwrap()
-            .into_iter()
-            .find(|d| d.func == func::fill())
-    };
-    let level1: Vec<Id> = ids
-        .iter()
-        .filter_map(fill_of)
-        .flat_map(|d| d.args.into_iter().map(|a| a.id()))
-        .collect();
-    assert!(!level1.is_empty(), "revisions use templates");
+    // Whichever plan wins (templates, or a group compressing revisions
+    // against each other), the history costs under two revisions.
+    let one = zstd::bulk::compress(&docs[0], 19).unwrap().len();
+    let stored = stored_bytes(&repo);
+    assert!(
+        stored < 2 * one,
+        "21 revisions stored in {stored} B; one is {one} B at zstd -19"
+    );
 }

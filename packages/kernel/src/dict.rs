@@ -2,6 +2,7 @@
 //!
 //! Stored bytes are encoded as the smallest of:
 //!   "B" bytes | "Z" zstd(bytes) | "Y" dict[4] zstd_with_dict(bytes)
+//!   | "S" group[8] start:varint len:varint   (bytes of a group, see `group.rs`)
 //! Identity is always over the uncompressed bytes, so the choice never
 //! changes an id. The dictionary is ordinary content, named by the ref
 //! `meta/zstd-dict`. Exact reuse (slices, templates) and this statistical
@@ -46,7 +47,20 @@ type DictRef = [u8; DICT_REF_LEN];
 
 /// True for any plain encoding of content bytes.
 pub(crate) fn is_plain(encoded: &[u8]) -> bool {
-    matches!(encoded.first(), Some(b'B' | b'Z' | b'Y'))
+    matches!(encoded.first(), Some(b'B' | b'Z' | b'Y' | b'S'))
+}
+
+/// The id prefix of the stored content an encoding cannot be decoded
+/// without (its dictionary, or its group), if any. gc keeps every object
+/// the prefix names.
+pub(crate) fn needs(encoded: &[u8]) -> Option<&[u8]> {
+    match encoded {
+        [b'S', group @ ..] => group.get(..crate::group::GROUP_REF_LEN),
+        _ => dict_of(encoded).map(|_| {
+            let at = if encoded[0] == b'Y' { 1 } else { 2 };
+            &encoded[at..at + DICT_REF_LEN]
+        }),
+    }
 }
 
 /// The kind of a stored object ("T", "C", "D" or "L"), however it is
@@ -75,9 +89,9 @@ pub(crate) fn tree_content(encoded: &[u8]) -> Option<Id> {
     }
 }
 
-/// True if `id` is one of the ids `dict` may name.
-pub(crate) fn names(dict: &DictRef, id: &Id) -> bool {
-    id.as_bytes().starts_with(dict)
+/// True if `id` is one of the ids an id prefix may name.
+pub(crate) fn names(prefix: &[u8], id: &Id) -> bool {
+    id.as_bytes().starts_with(prefix)
 }
 
 /// zstd level 3 in the kernel's frame format: no magic number, content size,
@@ -254,6 +268,7 @@ impl<S: Store> Repo<S> {
     pub(crate) fn decode_plain(&self, id: &Id, encoded: &[u8]) -> Result<Vec<u8>, Error> {
         match encoded.first() {
             Some(b'Y') => self.unzstd_with_dict(id, encoded, 1, &|b| Id::of_content(b) == *id),
+            Some(b'S') => self.read_member(id, encoded),
             _ => decode_basic(id, encoded),
         }
     }

@@ -226,3 +226,22 @@ Newest last. Format and rules: `README.md`.
   - Bytes: md 78,935->77,352; office 218,801->214,168; repo-history 1,168,467->1,164,322.
   - A first version loaded the dictionary for every sample in the estimate (29.7 s); reusing one compressor per dictionary fixed it, with identical sizes.
 - Verdict: kept. md is still just above the baseline (1.006): Y 333 objects 58,025 B, trees 76 objects 9,479 B, dictionary 9,807 B.
+
+### E016 solid-groups
+- Branch / parent: exp/016-solid-groups / E015
+- Hypothesis: small contents compressed one by one lose their neighbours' context and pay a frame each. Compressing similar small contents together in groups of up to 64 KB beats per-content compression with a shared dictionary, even after a short entry per member (source: `docs/research/office-gap.md` H5; Shilane et al. FAST 2012 compression regions). Probe first (temporary, not committed): md 76.2 KB per file with dictionary -> 69.2 KB in 64 KB groups including 13 B per member; office zips -5 to -11%.
+- Change:
+  - New `src/group.rs`. A member's stored entry is `S group[8] start len` (varints). A group is ordinary content, the concatenation of its members, stored plain (with the dictionary). Members are read through a prefix lookup, and each read is checked against the member's id, so a shared prefix costs a retry, not exactness.
+  - `group_small` runs at the end of each re-plan, so repack compares plans with grouping applied. It sorts small stored contents by bytes, packs groups up to `GROUP_SIZE` = 64 KiB, and writes a group only if it and its entries are smaller than the members' encodings.
+  - `src/dict.rs`: `S` is a plain encoding; `needs` covers dictionaries and groups.
+  - `src/history.rs`: gc keeps every object a live encoding's prefix names.
+  - Tests:
+    - New unit tests: varints; grouped members read back past a decoy, gc keeps the group, fsck flags exactly the forged decoy.
+    - `revisions_repack_into_templates` asserted that repack *chooses* templates. With grouping, three near-identical revisions per 64 KB group compress against each other, and the re-plan without templates wins (21 revisions in 14,893 B, 1.56x one revision at zstd -19). The test now asserts that outcome: under 2x one revision, whichever plan wins.
+- Result: score 0.5270 -> **0.4851**; per corpus vs_dict: md 1.006->**0.909**, pdf 0.882->0.834, office 0.547->**0.442**, invoices 0.427->0.393, synthetic 0.279->0.279, repo-history 0.902->0.881, repo-graph 0.216->0.196; time 25.2 s -> 28.5 s (1.13x). Sizes identical on a second run.
+  - md: 333 members (4,481 B of entries), 3 groups (52,526 B); the dictionary shrank 9,807 -> 2,824 B, since the groups carry the shared context.
+  - office: 656 members (8,993 B), 21 groups (95,054 B).
+- Verdict: kept. Every corpus now beats the zstd+dict baseline.
+- Known limits:
+  - Reading a member decompresses its group (up to 64 KiB); the evaluator's read weight does not price decompression yet.
+  - A group keeps the bytes of members that die until the next repack regroups.

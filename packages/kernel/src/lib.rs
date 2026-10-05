@@ -11,6 +11,7 @@ mod dict;
 mod exec;
 pub mod func;
 mod graph;
+mod group;
 mod history;
 mod id;
 mod ingest;
