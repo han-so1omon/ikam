@@ -147,7 +147,7 @@ We want a graph layer in the kernel: labelled nodes (optionally pointing at byte
 **G3. WebGraph-style reference adjacency as a semantic-dedup derivation (source: Boldi–Vigna reference compression, copy blocks, chain bound R).**
 - Change: in the ledger, allow an adjacency list (or edge chunk) to be derived as `copy-blocks(ref list) + extras`. The reference is chosen within a window, and the chain is capped at R ≈ 3.
 - Expected effect: Boldi–Vigna report 3.08 vs 4.17 bits/link (R=∞ vs R=1) on WebBase. Our graphs have no URL-order locality, so the gain is unknown [inf]. Node ordering (e.g. by source byte offset) would matter.
-- **Status:** `open` (not yet run).
+- **Status:** refuted by E013 on repo-graph (1.8 edges/node: lists rarely overlap; reference lists +0.3–1%). The bytes are 8-byte target keys.
 
 **G4. Dictionary-coded node ids per immutable segment (sources: HDT/TerminusDB front-coded dictionaries; HDTCat merge by id remap).**
 - Change: inside a stored edge chunk, replace 32 B node ids with ordinals into a per-chunk sorted id table. Gaps plus varints, as in WebGraph, keep the canonical (hashed) form full-width. This is analogous to E006.

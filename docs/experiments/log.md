@@ -189,3 +189,18 @@ Newest last. Format and rules: `README.md`.
   - Unscored comparison within the kernel: the same edge lists stored as plain files take 14,513 B, so graph form costs 1.7x for chunk-level lookup, diff and slicing (as law 7 measured on synthetic graphs).
   - Breakdown: graph chunks g 54 objects 5,795 B plus their content (Y/Z/d) ~15 KB; 38 commits 2,742 B (11%).
 - Verdict: reference for later experiments. Next: WebGraph-style reference lists (graph-storage G3).
+
+### E013 reference-adjacency (refuted, probe only)
+- Branch / parent: none (no kernel change) / E012
+- Hypothesis: WebGraph-style reference lists (copy a similar previous node's edges by bitmask, plus extras; window 7) shrink graph chunks (source: `docs/research/graph-storage.md` G3; Boldi–Vigna, 4.17 -> 3.08 bits/link on WebBase)
+- Probe (temporary example, not committed; source in the session scratchpad `ref_probe.rs`): the final repo-graph version, 634 nodes and 1,121 edges, zstd -3 per chunk:
+  | nodes per chunk | canonical | reference lists | front-coded labels |
+  |---|---:|---:|---:|
+  | 64 | 13,173 B | 13,303 B | 12,465 B |
+  | 256 | 11,088 B | 11,178 B | 10,359 B |
+  | whole graph | 10,301 B | 10,330 B | 9,477 B |
+- Verdict: refuted for this corpus. With 1.8 edges per node, neighbours' edge lists rarely overlap; WebGraph relies on dozens of links per node with URL-order locality.
+- Learned:
+  - The bytes are the edges' 8-byte target keys: 1,121 x 8 B = 8,968 B of random data, nearly all of the 9,477 B left after front coding.
+  - Front-coded labels save 5–8%.
+  - The next lever is key width, which trades bytes against the rule that keys must be unique within a graph.
