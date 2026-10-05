@@ -23,3 +23,4 @@ A paper's claim stays *unverified for this kernel* until an experiment reproduce
 - `kernel-direction.md`: library learning, program-synthesis compression and e-graph extraction, mapped onto templates, claims and repack.
 - `tree-metadata.md`: how git, Mercurial and dedup systems (Meister et al., FAST 2013) store versioned listings and fingerprint lists compactly.
 - `graph-storage.md`: graph stores compared (HugeGraph, Rama, TerminusDB, Dolt/Noms prolly trees, Datomic/XTDB, HDT, k²-trees, WebGraph, Kùzu, Neo4j) for a versioned, sliceable, deduplicating graph layer.
+- `semantic-grouping.md`: which signal (byte order, MinHash/seeds, NCD, embeddings, LLM) should decide which small contents are compressed together.
