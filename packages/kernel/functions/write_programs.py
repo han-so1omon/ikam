@@ -11,7 +11,7 @@ prices them like any other proposal. Every API call is appended to
 `llm_runs.jsonl` with its token counts and cost, and a run stops at its
 dollar budget. Nothing here runs during the benchmark.
 
-    export ANTHROPIC_API_KEY=...        # a key with a workspace spend limit
+    export IKAM_ANTHROPIC_API_KEY=...   # a key with a workspace spend limit
     cargo build --release               # builds target/release/ikam
     cargo run --release --example bench -- --dump-generated /tmp/generated
     python3 functions/write_programs.py /tmp/generated/*.txt --budget-usd 3
@@ -20,6 +20,7 @@ dollar budget. Nothing here runs during the benchmark.
 import argparse
 import datetime
 import json
+import os
 import re
 import subprocess
 import sys
@@ -219,7 +220,11 @@ def main():
         sys.exit("build the kernel first: cargo build --release")
     # The public endpoint, explicitly: an ANTHROPIC_BASE_URL meant for another
     # tool must not receive this key.
-    client = anthropic.Anthropic(base_url="https://api.anthropic.com")
+    # Its own variable name: ANTHROPIC_API_KEY has a meaning to Claude Code.
+    key = os.environ.get("IKAM_ANTHROPIC_API_KEY") or os.environ.get("ANTHROPIC_API_KEY")
+    if not key:
+        sys.exit("set IKAM_ANTHROPIC_API_KEY (a key from a workspace with a spend limit)")
+    client = anthropic.Anthropic(api_key=key, base_url="https://api.anthropic.com")
     budget = {"spent": 0.0, "limit": args.budget_usd}
     with open(HERE / "llm_runs.jsonl", "a") as runs:
         def log(record):
