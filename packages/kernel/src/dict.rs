@@ -123,6 +123,24 @@ pub(crate) fn framer(dict: &[u8]) -> Option<zstd::bulk::Compressor<'static>> {
 
 /// Decode a frame written by `zstd_frame` with the same `dict`.
 pub(crate) fn unzstd_frame(frame: &[u8], dict: &[u8]) -> Option<Vec<u8>> {
+    unzstd_prefix(frame, dict, usize::MAX)
+}
+
+thread_local! {
+    static DECOMPRESSED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Bytes decompressed from stored frames on this thread so far: the decode
+/// cost of reads that the evaluator's work (function output) leaves out.
+/// A measurement for benchmarks; differences between two calls are what
+/// one read cost.
+pub fn decompressed_bytes() -> usize {
+    DECOMPRESSED.with(|d| d.get())
+}
+
+/// Decode at most the first `limit` bytes of a frame: zstd decodes
+/// sequentially, so a prefix costs only its own length.
+pub(crate) fn unzstd_prefix(frame: &[u8], dict: &[u8], limit: usize) -> Option<Vec<u8>> {
     use zstd::zstd_safe::{DCtx, DParameter, FrameFormat};
     let mut ctx = DCtx::create();
     ctx.set_parameter(DParameter::Format(FrameFormat::Magicless))
@@ -132,8 +150,10 @@ pub(crate) fn unzstd_frame(frame: &[u8], dict: &[u8]) -> Option<Vec<u8>> {
     }
     let mut out = Vec::new();
     zstd::stream::read::Decoder::with_context(frame, &mut ctx)
+        .take(limit as u64)
         .read_to_end(&mut out)
         .ok()?;
+    DECOMPRESSED.with(|d| d.set(d.get() + out.len()));
     Some(out)
 }
 
@@ -244,7 +264,7 @@ impl<S: Store> Repo<S> {
         match mode & !ABBREVIATED {
             0 if t.is_ascii_lowercase() => finish(unzstd_frame(z, &[]).ok_or(Error::Corrupt(*id))?),
             1 if t.is_ascii_lowercase() => {
-                let rest = self.unzstd_with_dict(id, &encoded, 2, &|rest| {
+                let rest = self.unzstd_with_dict(id, &encoded, 2, usize::MAX, &|rest| {
                     finish(rest.to_vec()).is_ok_and(|c| Id::of(&c) == *id)
                 })?;
                 finish(rest)
@@ -267,10 +287,31 @@ impl<S: Store> Repo<S> {
     /// output does.
     pub(crate) fn decode_plain(&self, id: &Id, encoded: &[u8]) -> Result<Vec<u8>, Error> {
         match encoded.first() {
-            Some(b'Y') => self.unzstd_with_dict(id, encoded, 1, &|b| Id::of_content(b) == *id),
+            Some(b'Y') => {
+                self.unzstd_with_dict(id, encoded, 1, usize::MAX, &|b| Id::of_content(b) == *id)
+            }
             Some(b'S') => self.read_member(id, encoded),
             _ => decode_basic(id, encoded),
         }
+    }
+
+    /// The first `limit` bytes of a plain encoding ("B", "Z" or "Y"), if
+    /// they pass `check`. Nothing here verifies the whole content's id, so
+    /// `check` must verify what the caller uses (a group member's own id).
+    pub(crate) fn decode_prefix(
+        &self,
+        id: &Id,
+        encoded: &[u8],
+        limit: usize,
+        check: &dyn Fn(&[u8]) -> bool,
+    ) -> Result<Vec<u8>, Error> {
+        let out = match encoded.split_first() {
+            Some((b'B', bytes)) => Some(bytes[..limit.min(bytes.len())].to_vec()),
+            Some((b'Z', z)) => unzstd_prefix(z, &[], limit),
+            Some((b'Y', _)) => return self.unzstd_with_dict(id, encoded, 1, limit, check),
+            _ => return Err(Error::WrongKind(*id)),
+        };
+        out.filter(|b| check(b)).ok_or(Error::Corrupt(*id))
     }
 
     /// Decompress the frame after the dictionary reference at `at`, with
@@ -281,11 +322,12 @@ impl<S: Store> Repo<S> {
         id: &Id,
         encoded: &[u8],
         at: usize,
+        limit: usize,
         check: &dyn Fn(&[u8]) -> bool,
     ) -> Result<Vec<u8>, Error> {
         let dict = dict_of(encoded).ok_or(Error::Corrupt(*id))?;
         let frame = &encoded[at + DICT_REF_LEN..];
-        let attempt = |bytes: &[u8]| unzstd_frame(frame, bytes).filter(|out| check(out));
+        let attempt = |bytes: &[u8]| unzstd_prefix(frame, bytes, limit).filter(|out| check(out));
         if let Some((current, bytes)) = self.dictionary()
             && names(&dict, current)
             && let Some(out) = attempt(bytes)

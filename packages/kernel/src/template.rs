@@ -140,6 +140,13 @@ pub(crate) fn decode_parts(mut b: &[u8]) -> Option<Vec<&[u8]>> {
 
 /// Builtin `fill`: args are `[template, fillers]`.
 pub fn fill(args: &[Vec<u8>]) -> Result<Vec<u8>, Error> {
+    Ok(pieces(args)?.concat())
+}
+
+/// `fill`'s output in order, as slices of its inputs: filler 0, then each
+/// segment followed by the next filler. A range read takes only the
+/// pieces it overlaps.
+pub(crate) fn pieces(args: &[Vec<u8>]) -> Result<Vec<&[u8]>, Error> {
     let bad = || Error::Exec("fill: malformed template or fillers".into());
     let [template, fillers] = args else {
         return Err(bad());
@@ -151,10 +158,9 @@ pub fn fill(args: &[Vec<u8>]) -> Result<Vec<u8>, Error> {
     if fillers.len() != segments.len() + 1 {
         return Err(bad());
     }
-    let mut out = fillers[0].to_vec();
+    let mut out = vec![fillers[0]];
     for (s, f) in segments.iter().zip(&fillers[1..]) {
-        out.extend_from_slice(s);
-        out.extend_from_slice(f);
+        out.extend([*s, *f]);
     }
     Ok(out)
 }

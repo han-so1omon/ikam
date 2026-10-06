@@ -143,3 +143,37 @@ fn revisions_repack_into_little_more_than_one() {
         "21 revisions stored in {stored} B; one is {one} B at zstd -19"
     );
 }
+
+/// Range reads equal slices of whole reads, through slices (after ingest)
+/// and templates and groups (after repack), and through plans they decode
+/// less than the whole content.
+#[test]
+fn range_reads_equal_slices_of_whole_reads() {
+    let mut docs = revisions();
+    docs.extend((0..30).map(invoice));
+    let mut repo = Repo::new(MemStore::default());
+    let ids = commit_all(&mut repo, &docs);
+    for repacked in [false, true] {
+        if repacked {
+            assert!(repo.repack().unwrap().applied);
+        }
+        let mut cheaper = 0;
+        for (id, d) in ids.iter().zip(&docs) {
+            let n = d.len() as u64;
+            let (whole, whole_work) = repo.read_range(id, 0, n).unwrap();
+            assert_eq!(&whole, d);
+            for (start, len) in [(0, 1), (n / 3, 100), (n / 2, 4096), (n - 7, 7), (n, 0)] {
+                let len = len.min(n - start);
+                let (bytes, work) = repo.read_range(id, start, len).unwrap();
+                assert_eq!(bytes, d[start as usize..(start + len) as usize]);
+                cheaper += usize::from(len < n && work < whole_work);
+            }
+            assert!(repo.read_range(id, n - 3, 4).is_err());
+            assert!(repo.read_range(id, u64::MAX, 2).is_err());
+        }
+        assert!(
+            cheaper > 0,
+            "no range read was cheaper (repacked: {repacked})"
+        );
+    }
+}

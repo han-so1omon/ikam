@@ -171,8 +171,10 @@ impl<S: Store> Repo<S> {
         known: &HashMap<Id, Vec<u8>>,
         without: Option<Id>,
     ) -> Option<usize> {
-        let mut cx = Cx::default();
-        cx.known = known.clone();
+        let mut cx = Cx {
+            known: known.clone(),
+            ..Cx::default()
+        };
         if let Some(w) = without {
             cx.stack_guard(w);
         }
