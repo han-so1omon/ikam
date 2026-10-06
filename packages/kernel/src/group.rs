@@ -67,6 +67,28 @@ fn byte_order_groups(items: &[(Vec<u8>, Id, usize)]) -> Vec<Vec<usize>> {
     groups
 }
 
+/// Groups packed in an external proposed order (unlisted items follow in
+/// byte order), each up to `GROUP_SIZE`. Empty without a proposal.
+fn proposed_groups(items: &[(Vec<u8>, Id, usize)], order: &[Id]) -> Vec<Vec<usize>> {
+    if order.is_empty() {
+        return Vec::new();
+    }
+    let rank: HashMap<Id, usize> = order.iter().enumerate().map(|(i, id)| (*id, i)).collect();
+    let mut sequence: Vec<usize> = (0..items.len()).collect();
+    sequence.sort_by_key(|&i| (rank.get(&items[i].1).copied().unwrap_or(usize::MAX), i));
+    let (mut groups, mut group, mut size) = (Vec::new(), Vec::new(), 0);
+    for i in sequence {
+        if !group.is_empty() && size + items[i].0.len() > GROUP_SIZE {
+            groups.push(std::mem::take(&mut group));
+            size = 0;
+        }
+        size += items[i].0.len();
+        group.push(i);
+    }
+    groups.push(group);
+    groups
+}
+
 /// Groups of item indices, each up to `GROUP_SIZE` bytes. A group starts
 /// from the first unplaced item (in byte order) and grows by the unplaced
 /// item sharing the most content-defined seeds with the group so far (the
@@ -206,6 +228,7 @@ impl<S: Store> Repo<S> {
             byte_order_groups(&items),
             similar_groups(&items, None),
             similar_groups(&items, Some(&dict)),
+            proposed_groups(&items, &self.proposed_order),
         ];
         for proposal in proposals {
             let plans: Vec<Planned> = proposal

@@ -267,3 +267,23 @@ Newest last. Format and rules: `README.md`.
 - Change: `src/group.rs` adds a third proposer, `similar_groups(items, Some(dict))`. Seed scores shortlist `SHORTLIST` = 8 candidates per step, and the next member maximises `C(x) - (C(G x) - C(G))` with the kernel's zstd framing and dictionary. The best of the three proposers is written, as in E017.
 - Result: score 0.4830 -> **0.4798**; per corpus vs_dict: md 0.896->0.894, office 0.442->0.437, invoices 0.393->0.384, synthetic 0.2787->0.2786, repo-history 0.868->0.859, pdf and repo-graph unchanged; time 23.5 s -> 28.1 s (1.2x). Sizes identical on a second run.
 - Verdict: kept. Measured compression beats resemblance proxies wherever both are tried, as the literature predicted.
+
+### E019 embedding-proposer
+- Branch / parent: exp/019-embedding-proposer / E018
+- Hypothesis: a modern semantic signal, sentence embeddings, proposes groups that compress better than byte order, seeds or measured cost. The literature expected it to be weakest, since embeddings group by topic and zstd needs shared byte runs, but no paper measured storage bytes (source: `docs/research/semantic-grouping.md` H4; SemDeDup, D4, Ferragina and Manzini)
+- Change:
+  - New `packages/kernel/semantic/embed.py`, an offline tool. It embeds every content the benchmark stores (md files, office zip members, repo-history files; 1,494 contents) with a pinned model: all-MiniLM-L6-v2 @ 1110a243, ONNX sha256 6fd5d72f…, 256 tokens. It writes `semantic/order.txt`, a greedy cosine nearest-neighbour chain per corpus. Its ids match the kernel's (checked against `ikam put`).
+  - Kernel: `Repo::proposed_order` is a model-agnostic hook carried into re-plans. `group.rs` packs groups in that order as a fourth proposer, kept only if it saves most.
+  - `examples/bench.rs` reads the committed `order.txt`; no model runs in the benchmark.
+- Per-proposer bytes saved by grouping (diagnostic, every candidate plan; showing the plan without a dictionary):
+  | corpus | byte order | seeds | measured cost | embeddings |
+  |---|---:|---:|---:|---:|
+  | md | 46,341 | 47,117 | **47,341** | 46,905 |
+  | office | 158,750 | 163,925 | **165,921** | 158,735 |
+  | repo-history | 124,593 | 147,897 | **156,733** | 153,483 |
+  - Embeddings beat lexical seeds on repo-history in every plan and on md in most, contrary to the literature's ranking. Measured cost still wins nearly every plan, and on office embeddings are about equal to byte order.
+- Variants:
+  - a (kept): the embedding order as a proposer.
+  - b: the embedding order shortlists candidates and measured cost picks (DeepSketch-style). Score 0.4763, but **not a semantic gain**: it improved only invoices (5,191 -> 4,941) and repo-graph, which have no embeddings. The fallback ranked their items in byte order, making b also a "byte-order shortlist + measured cost" proposer. md and repo-history did not improve. Time +30%. That proposer is tested on its own in E020.
+- Result (a): score 0.4798 -> **0.4797**; md 68,706 -> 68,625 (-81 B), every other corpus unchanged; time 28.1 s -> 30.3 s. Sizes identical on a second run.
+- Verdict: kept as a capability (an offline, reproducible semantic proposer and the hook an LLM proposer would use), with a **neutral storage effect** on this benchmark. Embeddings are informative but are dominated by measured compression here.

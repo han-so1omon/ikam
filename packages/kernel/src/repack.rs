@@ -149,6 +149,7 @@ impl<S: Store + Sync> Repo<S> {
     ) -> Result<Repo<MemStore>, Error> {
         let mut fresh = Repo::new(MemStore::default());
         fresh.read_weight = self.read_weight;
+        fresh.proposed_order = self.proposed_order.clone();
         if let Some(dict) = dict {
             fresh.set_dictionary(dict.to_vec())?;
         }

@@ -211,6 +211,19 @@ fn graph_of(text: &[u8]) -> Vec<Node> {
         .collect()
 }
 
+/// The committed embedding proposal (`semantic/order.txt`, written by
+/// `semantic/embed.py`): content ids in a semantic order. Repack uses it as
+/// one grouping proposal among several, so no model runs here.
+fn proposed_order() -> Vec<Id> {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("semantic/order.txt");
+    std::fs::read_to_string(path)
+        .unwrap_or_default()
+        .lines()
+        .filter(|l| !l.starts_with('#'))
+        .map(|l| l.parse().unwrap())
+        .collect()
+}
+
 /// Invoices from one generator: long shared boilerplate, short fields.
 fn invoices() -> Vec<Snapshot> {
     let one = |n: u32| {
@@ -350,6 +363,7 @@ fn main() {
         snapshots.iter().for_each(|s| commit(&mut repo, s, graph));
         let (ingest, ingest_ms) = (stored(&repo), t.elapsed().as_millis());
         let t = Instant::now();
+        repo.proposed_order = proposed_order();
         repo.repack().unwrap();
         let (repack, repack_ms) = (stored(&repo), t.elapsed().as_millis());
         let exact = match graph {
