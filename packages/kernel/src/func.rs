@@ -34,19 +34,21 @@ pub fn is_builtin(func: &Id) -> bool {
     *func == concat() || *func == deflate_pack() || *func == fill()
 }
 
-/// Run `func` on `args`. `module` is the WASM module for non-builtins.
-pub fn run(func: &Id, module: Option<&[u8]>, args: &[Vec<u8>]) -> Result<Vec<u8>, Error> {
-    if *func == concat() {
-        return Ok(args.concat());
-    }
-    if *func == deflate_pack() {
-        return container::pack(args);
-    }
-    if *func == fill() {
-        return template::fill(args);
-    }
-    wasm::run(
-        module.ok_or_else(|| Error::Exec(format!("{func}: no such function")))?,
-        args,
-    )
+/// Run `func` on `args`: its output and the decode work it took (bytes
+/// produced, plus measured WASM fuel; see `wasm::FUEL_PER_WORK`).
+pub fn run(func: &Id, module: Option<&[u8]>, args: &[Vec<u8>]) -> Result<(Vec<u8>, usize), Error> {
+    let out = if *func == concat() {
+        args.concat()
+    } else if *func == deflate_pack() {
+        container::pack(args)?
+    } else if *func == fill() {
+        template::fill(args)?
+    } else {
+        let module = module.ok_or_else(|| Error::Exec(format!("{func}: no such function")))?;
+        let (out, fuel) = wasm::run(module, args)?;
+        let work = out.len() + (fuel / wasm::FUEL_PER_WORK) as usize;
+        return Ok((out, work));
+    };
+    let work = out.len();
+    Ok((out, work))
 }

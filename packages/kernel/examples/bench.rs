@@ -21,7 +21,7 @@ use std::process::Command;
 use std::time::Instant;
 
 use ikam_kernel::{
-    Edge, Id, Kind, MemStore, Node, Object, Repo, Store, Target, TreeEntry, node_key,
+    Arg, Edge, Id, Kind, MemStore, Node, Object, Repo, Store, Target, TreeEntry, node_key,
 };
 
 type Snapshot = Vec<(String, Vec<u8>)>;
@@ -209,6 +209,45 @@ fn graph_of(text: &[u8]) -> Vec<Node> {
             edges: edges.into_iter().collect(),
         })
         .collect()
+}
+
+/// Offer the kernel the reconstruction programs priced in
+/// `functions/proposals.txt` (written by `examples/programs.rs`) whose output
+/// is a file of this corpus, and whose decode work could pay at the default
+/// read weight. The kernel verifies each one; repack keeps it only if
+/// dropping the stored bytes saves more than the interpreter, the program
+/// and the read cost.
+fn propose_programs(repo: &mut Repo<MemStore>, snapshots: &[Snapshot]) {
+    let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("functions");
+    let files: BTreeMap<Id, &Vec<u8>> = snapshots
+        .iter()
+        .flatten()
+        .map(|(_, b)| (Id::of_content(b), b))
+        .collect();
+    let proposals = std::fs::read_to_string(dir.join("proposals.txt")).unwrap_or_default();
+    for line in proposals.lines().filter(|l| !l.starts_with('#')) {
+        let f: Vec<&str> = line.split_whitespace().collect();
+        let (out, len, work): (Id, f64, f64) = (
+            f[1].parse().unwrap(),
+            f[2].parse().unwrap(),
+            f[3].parse().unwrap(),
+        );
+        let Some(bytes) = files.get(&out) else {
+            continue;
+        };
+        if work * ikam_kernel::DEFAULT_READ_WEIGHT >= len {
+            continue;
+        }
+        let interp = std::fs::read(dir.join("interp.wasm")).unwrap();
+        let interp = repo.put_content(&interp).unwrap().id;
+        let program = std::fs::read(dir.join("programs").join(f[0])).unwrap();
+        let program = repo.put_content(&program).unwrap().id;
+        assert!(
+            repo.put_derivation(bytes, interp, vec![Arg::Whole(program)])
+                .unwrap()
+                .is_some()
+        );
+    }
 }
 
 /// The committed embedding proposal (`semantic/order.txt`, written by
@@ -448,6 +487,7 @@ fn main() {
         let t = Instant::now();
         snapshots.iter().for_each(|s| commit(&mut repo, s, graph));
         let (ingest, ingest_ms) = (stored(&repo), t.elapsed().as_millis());
+        propose_programs(&mut repo, &snapshots);
         let t = Instant::now();
         repo.proposed_order = proposed_order();
         repo.repack().unwrap();

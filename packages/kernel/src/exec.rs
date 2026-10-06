@@ -11,6 +11,15 @@ use crate::repo::Cx;
 use crate::{Arg, Derivation, Error, Id, Object, Repo, Store};
 
 impl<S: Store> Repo<S> {
+    /// Evaluate `func(args)` without recording anything: the output and its
+    /// decode work (bytes produced plus measured WASM fuel). Lets a proposer
+    /// price a candidate derivation before offering it.
+    pub fn evaluate(&self, func: &Id, args: &[Arg]) -> Result<(Vec<u8>, usize), Error> {
+        let mut cx = Cx::default();
+        let out = self.eval(func, args, &mut cx)?;
+        Ok((out, cx.work))
+    }
+
     /// Evaluate `func(args)`, reusing a recorded derivation when one exists.
     /// Returns the output's content id.
     pub fn apply(&mut self, func: Id, args: Vec<Arg>) -> Result<Id, Error> {
