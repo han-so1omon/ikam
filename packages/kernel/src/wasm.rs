@@ -13,12 +13,20 @@ use wasmi::{Config, Engine, Linker, Module, StoreLimits, StoreLimitsBuilder};
 
 use crate::Error;
 
-/// Instruction budget per call. Part of a function's semantics: a call that
-/// runs out of fuel has no output.
-const FUEL: u64 = 1 << 30;
+/// Fuel budget per call: a hard bound on any one read (about 30 s at
+/// measured wasmi speeds). Part of a function's semantics: a call that runs
+/// out of fuel has no output. Raising it only lets more calls succeed; every
+/// recorded derivation already succeeded. Whether a slow function is worth
+/// using is the evaluator's call (`run` reports the fuel spent).
+const FUEL: u64 = 1 << 38;
+/// wasmi fuel per unit of decode work (one unit = one byte produced by a
+/// builtin). Measured: interpreted programs spend ~1,000-2,000 fuel per byte
+/// they output, so an interpreted generator costs 1-2x its output in work.
+pub const FUEL_PER_WORK: u64 = 1_000;
 const MAX_MEMORY: usize = 256 << 20;
 
-pub fn run(module: &[u8], args: &[Vec<u8>]) -> Result<Vec<u8>, Error> {
+/// Run `module` on `args`: its output and the fuel it spent.
+pub fn run(module: &[u8], args: &[Vec<u8>]) -> Result<(Vec<u8>, u64), Error> {
     let fail = |e: &dyn std::fmt::Display| Error::Exec(format!("wasm: {e}"));
     let mut config = Config::default();
     config.floats(false).consume_fuel(true);
@@ -60,5 +68,6 @@ pub fn run(module: &[u8], args: &[Vec<u8>]) -> Result<Vec<u8>, Error> {
     memory
         .read(&store, (packed >> 32) as usize, &mut out)
         .map_err(|e| fail(&e))?;
-    Ok(out)
+    let spent = FUEL - store.get_fuel().map_err(|e| fail(&e))?;
+    Ok((out, spent))
 }

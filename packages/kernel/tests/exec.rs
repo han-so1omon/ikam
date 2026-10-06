@@ -1,5 +1,6 @@
 //! Containers, functions, runs and graph links.
 
+use std::fs;
 use std::path::{Path, PathBuf};
 
 use ikam_kernel::{Arg, Error, Form, Id, Kind, MemStore, Object, Repo, Store, TreeEntry, func};
@@ -273,4 +274,32 @@ fn sandbox_rejects_impure_or_unbounded_modules() {
             "{wat}"
         );
     }
+}
+
+/// The shared interpreter (`functions/interp.wasm`) passes the sandbox and
+/// runs a 50-byte program into a 49 KB multiplication table exactly; its
+/// decode work counts the WASM fuel, not only the bytes produced.
+#[test]
+fn interpreter_programs_reconstruct_exactly_and_price_their_fuel() {
+    let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("functions");
+    let mut repo = Repo::new(MemStore::default());
+    let interp = repo
+        .put_content(&fs::read(dir.join("interp.wasm")).unwrap())
+        .unwrap()
+        .id;
+    let program = fs::read(dir.join("programs/multiplication.bin")).unwrap();
+    let program = repo.put_content(&program).unwrap().id;
+    let table: String = (1..=99u32)
+        .map(|a| {
+            (1..=99u32)
+                .map(|b| format!("{:>5}", a * b))
+                .collect::<String>()
+                + "\n"
+        })
+        .collect();
+    let (out, work) = repo.evaluate(&interp, &[Arg::Whole(program)]).unwrap();
+    assert_eq!(out, table.as_bytes());
+    assert!(work > 2 * out.len(), "fuel is priced: work {work}");
+    let put = repo.put_derivation(table.as_bytes(), interp, vec![Arg::Whole(program)]);
+    assert!(put.unwrap().is_some(), "verified derivation");
 }

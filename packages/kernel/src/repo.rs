@@ -304,8 +304,8 @@ impl<S: Store> Repo<S> {
         } else {
             Some(self.rebuild(func, cx)?)
         };
-        let out = func::run(func, module.as_deref(), &inputs)?;
-        cx.work += out.len();
+        let (out, work) = func::run(func, module.as_deref(), &inputs)?;
+        cx.work += work;
         Ok(out)
     }
 }

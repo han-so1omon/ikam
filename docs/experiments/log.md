@@ -306,3 +306,25 @@ Newest last. Format and rules: `README.md`.
   - **Scores before and after E021 are not comparable**; E021 is the new reference.
 - Result, E020 kernel: score **0.5225** over 8 corpora; the seven others byte-identical to E020. generated: 175,169 B vs baseline 175,017 B (1.001), so the kernel does no better than zstd here, as expected without functions.
 - Verdict: reference for the function-library experiments.
+
+### E022 interpreter-programs
+- Branch / parent: exp/022-interpreter-programs / E021
+- Hypothesis: data produced by a procedure is stored far smaller as a short program over one shared, stored interpreter than as compressed bytes, once the interpreter, the programs and the read cost (measured fuel) are all paid for (source: `docs/plans/2026-10-06-system-architecture.md`, functions in the graph; the KoLMogorov Test; minimum description length as in DreamCoder, Stitch and Brevis)
+- Change:
+  - New `packages/kernel/functions/`:
+    - `interp/` is an integer stack machine, `no_std`, no floats, no imports; `interp.wasm` is 6,942 B, stored as 3,133 B.
+    - `asm.py` is the assembler.
+    - `programs/` holds five **hand-written** programs (a baseline proposer, standing in for the LLM writer of step 4): multiplication 50 B, metrics 136 B, server_log 299 B, mandelbrot 185 B, primes 113 B (a sieve; a first trial-division version needed 41.9 G fuel and was replaced).
+    - `proposals.txt` holds each program's output id, size and decode work, written by `examples/programs.rs`.
+  - Kernel:
+    - `wasm::run` reports the fuel spent, and `func::run` returns decode work = bytes produced + fuel / `FUEL_PER_WORK` (1,000). The evaluator now prices WASM fuel, not only output bytes.
+    - The fuel cap rises from 2^30 to 2^38. It is a hard bound on any read (~30 s at measured speeds); raising it only lets more calls succeed.
+    - `Repo::evaluate` prices a candidate without recording it.
+  - `examples/bench.rs` offers a priced program when its output is a file of the corpus and its decode work could pay at the default read weight. The kernel verifies it; repack keeps it only if it saves bytes.
+- Measured:
+  - wasmi charges ~1,300 fuel per interpreted op; the same module under wasmtime executes ~85 instructions per op.
+  - Mandelbrot needs 255 G fuel (~28 s): priced at ~255 KB-equivalent read cost for a 77 KB output, it is never offered and stays stored. The other four are priced at 211–11,202 byte-equivalents.
+- Result: score 0.5225 -> **0.3770**; generated 175,169 -> **12,851 B** (vs_dict 1.001 -> 0.073); the seven other corpora byte-identical to E021; time 42.7 s -> 45.3 s. Sizes identical on a second run. What generated now stores: the interpreter and the Mandelbrot image (Z, 12,201 B), 4 derivation records (408 B), the grouped programs (62 B of entries), tree and commit.
+- Verdict: kept, with caveats:
+  - The programs are hand-written. This shows what the mechanism can do, not what an automatic proposer finds. The LLM writer (step 4) is the real test.
+  - The score is a geometric mean, so one corpus improving 14x moves it a lot (0.5225 -> 0.3770). Per-corpus ratios are the honest view.
