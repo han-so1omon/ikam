@@ -92,6 +92,41 @@ Rules that keep this sound:
 - **No trust in model output.** A wrong relation costs a failed verification or a rejected plan, never wrong bytes.
 - **Learning from measurements.** Measured `gain_bits` per relation type is the training signal for which relations to propose. This is DeepSketch's lesson: learn from measured compression, not from semantic similarity. E019 measured embeddings as informative but dominated by measured cost.
 
+## Reconstruction functions as a library in the graph (proposed, from the user's direction)
+
+The LLM's main job is to **write reconstruction functions**, not only to name relations. Functions are stored like everything else, organised in the graph, and applied through the ledger. Reconstruction can then be any algorithm: arithmetic (a multiplication table), common algorithms (run-length, delta, transpose, reversal), templates, experimental ones, or recursive and fractal generators.
+
+**What exists (built).** A derivation's function may be any WASM module stored as content (`func.rs`, `wasm.rs`, `tests/exec.rs`):
+- deterministic: no imports, floats disabled, bounded fuel and memory;
+- verified: recorded only after reproducing the exact bytes;
+- used by repack: it drops stored bytes a function rebuilds when that is cheaper.
+
+So an LLM-written function can never produce wrong bytes; at worst it fails verification or does not pay.
+
+```mermaid
+flowchart LR
+  subgraph Lib["Function library (graph G: one node per function)"]
+    F1["rle-decode"] ---|composes| F2["delta-decode"]
+    F3["dsl-interpreter"] ---|runs| P1["program: 'table i*j'"]
+    F4["transpose"]
+  end
+  LLM["LLM (offline): sees content + library + past failures"] -->|new function or small program| Lib
+  Lib -->|candidate: output = f(args)| V{"verify: exact bytes?<br/>fuel and memory bounded"}
+  V -->|yes| S{"pays? module counted once,<br/>amortised over every use,<br/>+ w * fuel"}
+  V -->|no| X["discard; record the failure for the LLM"]
+  S -->|yes| R["ledger derivation; stored bytes dropped;<br/>claim: measured gain per function"]
+  S -->|no| K["keep as library entry only if reused elsewhere"]
+```
+
+Design points:
+- **Library in the graph.** Each function is a graph node targeting its module (content). Edges record "applied-to" (its derivations), "composes" and "generalises". Claims carry the measured gain per function, which is the evidence for keeping it, generalising it, or dropping it (library learning, as in Stitch and babble).
+- **Cost is description length.** A module is content, so it is stored once and shared by every derivation that uses it; its bytes are paid once. Each use pays only its small argument contents and its fuel (read work). This is the minimum-description-length rule DreamCoder, Stitch and Brevis use, and the kernel's evaluator already counts it this way.
+- **Small programs over a shared interpreter.** An LLM-written WASM module is hundreds of bytes or more. A better shape is one stored interpreter module for a small deterministic language (integer arithmetic, loops, byte output, calls to library functions). Each LLM program is then a short argument, tens of bytes, so a program that generates a 100 KB table can cost less than its zstd output. *[inference]*
+- **Composition and recursion.** Function outputs are content, so functions feed functions: delta of a transpose, a template filled by a generator, a fractal as an iterated function. The ledger's DAG is the composition; cycles stay impossible, as reconstruction requires.
+- **Determinism limits.** No floating point: fractals and numeric generators use fixed-point integers or a deterministic soft-float compiled into the module.
+- **Where it should pay (from the literature, not yet measured here).** Data that is the output of a procedure: computed spreadsheet columns, numeric sequences, logs, procedural images, generated code. For prose, the KoLMogorov Test (ICLR 2025) found frontier LLM programs failing 40–78% of the time and losing to gzip when correct. Templates, deltas and the dictionary remain the right tools there.
+- **Reproducibility.** The LLM runs offline. Its functions and programs are stored as content, so once written they are ordinary data. The benchmark never calls a model.
+
 ## Partial reads: decompress only the segments needed (proposed)
 
 **Yes, the render structure lets reads decode only what they need, with one codec-level limit.**
@@ -128,5 +163,8 @@ With range reads, the evaluator can price **decode work actually needed** for a 
 | range reads through concat, fill, containers and groups (stop the frame early) | proposed | decode work per read, same stored bytes |
 | seekable groups (independent blocks) | proposed | bytes vs decode work per read, block size swept |
 | evaluator prices decompression | proposed | score and read metric together |
-| LLM relation extractor writing claims; relation-to-candidate mapping | proposed (needs an API key or a local model) | bytes saved per relation type (measured `gain_bits`) |
+| function library as a graph; hand-written baseline functions (rle, delta, transpose, reversal, arithmetic tables) | proposed | bytes on a new "generated" corpus |
+| deterministic DSL interpreter module + programs as arguments | proposed | program bytes vs zstd of the output |
+| generated corpus (computed tables, sequences, logs, procedural images) | proposed (benchmark change) | new reference score |
+| LLM function writer and relation extractor (offline, outputs recorded) | proposed (needs an API key or a local model) | bytes saved per function and relation (measured `gain_bits`) |
 | per-family dictionaries from relations | proposed | office/md bytes |
