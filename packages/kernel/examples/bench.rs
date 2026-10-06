@@ -211,12 +211,18 @@ fn graph_of(text: &[u8]) -> Vec<Node> {
         .collect()
 }
 
-/// Offer the kernel the reconstruction programs priced in
+/// A priced proposal: (function file, argument file or "-", output id,
+/// output bytes, decode work).
+type Candidate<'a> = (&'a str, &'a str, Id, f64, f64);
+
+/// Offer the kernel the reconstruction functions priced in
 /// `functions/proposals.txt` (written by `examples/programs.rs`) whose output
-/// is a file of this corpus, and whose decode work could pay at the default
-/// read weight. The kernel verifies each one; repack keeps it only if
-/// dropping the stored bytes saves more than the interpreter, the program
-/// and the read cost.
+/// is a file of this corpus. A file may have several forms (a program for
+/// the shared interpreter, or the same program compiled to its own module).
+/// The proposer offers the form with the lowest estimated cost: function
+/// bytes (the interpreter's shared by the files using it) + argument bytes +
+/// read weight x decode work, and only if that is below the output's size.
+/// The kernel verifies what is offered; repack keeps it only if it pays.
 fn propose_programs(repo: &mut Repo<MemStore>, snapshots: &[Snapshot]) {
     let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("functions");
     let files: BTreeMap<Id, &Vec<u8>> = snapshots
@@ -225,25 +231,50 @@ fn propose_programs(repo: &mut Repo<MemStore>, snapshots: &[Snapshot]) {
         .map(|(_, b)| (Id::of_content(b), b))
         .collect();
     let proposals = std::fs::read_to_string(dir.join("proposals.txt")).unwrap_or_default();
-    for line in proposals.lines().filter(|l| !l.starts_with('#')) {
-        let f: Vec<&str> = line.split_whitespace().collect();
-        let (out, len, work): (Id, f64, f64) = (
-            f[1].parse().unwrap(),
-            f[2].parse().unwrap(),
-            f[3].parse().unwrap(),
-        );
-        let Some(bytes) = files.get(&out) else {
-            continue;
-        };
-        if work * ikam_kernel::DEFAULT_READ_WEIGHT >= len {
-            continue;
+    let found: Vec<Candidate> = proposals
+        .lines()
+        .filter(|l| !l.starts_with('#'))
+        .map(|l| l.split_whitespace().collect::<Vec<_>>())
+        .map(|f| {
+            (
+                f[0],
+                f[1],
+                f[2].parse().unwrap(),
+                f[3].parse().unwrap(),
+                f[4].parse().unwrap(),
+            )
+        })
+        .filter(|p: &Candidate| files.contains_key(&p.2))
+        .collect();
+    let size = |path: &str| std::fs::metadata(dir.join(path)).map_or(0.0, |m| m.len() as f64);
+    let users = |func: &str| found.iter().filter(|p| p.0 == func).count() as f64;
+    let cost = |p: &Candidate| {
+        size(p.0) / users(p.0)
+            + if p.1 == "-" { 0.0 } else { size(p.1) }
+            + ikam_kernel::DEFAULT_READ_WEIGHT * p.4
+    };
+    let mut best: BTreeMap<Id, (f64, &Candidate)> = BTreeMap::new();
+    for p in &found {
+        let c = cost(p);
+        if c < p.3 && best.get(&p.2).is_none_or(|b| c < b.0) {
+            best.insert(p.2, (c, p));
         }
-        let interp = std::fs::read(dir.join("interp.wasm")).unwrap();
-        let interp = repo.put_content(&interp).unwrap().id;
-        let program = std::fs::read(dir.join("programs").join(f[0])).unwrap();
-        let program = repo.put_content(&program).unwrap().id;
+    }
+    for (out, (_, p)) in best {
+        let func = repo
+            .put_content(&std::fs::read(dir.join(p.0)).unwrap())
+            .unwrap()
+            .id;
+        let mut args = Vec::new();
+        if p.1 != "-" {
+            args.push(Arg::Whole(
+                repo.put_content(&std::fs::read(dir.join(p.1)).unwrap())
+                    .unwrap()
+                    .id,
+            ));
+        }
         assert!(
-            repo.put_derivation(bytes, interp, vec![Arg::Whole(program)])
+            repo.put_derivation(files[&out], func, args)
                 .unwrap()
                 .is_some()
         );
