@@ -86,6 +86,11 @@ pub struct Repo<S: Store> {
     /// Evaluator weight of decode work against storage when choosing plans:
     /// a plan scores `bytes written + read_weight * decode work`.
     pub read_weight: f64,
+    /// An external proposal of content order for grouping (e.g. from an
+    /// embedding model or an LLM; see `group.rs`). Only ever a proposal:
+    /// it is used when it saves bytes, and never affects what is stored
+    /// otherwise or how anything is rebuilt.
+    pub proposed_order: Vec<Id>,
 }
 
 impl<S: Store> Repo<S> {
@@ -97,6 +102,7 @@ impl<S: Store> Repo<S> {
             dict: OnceLock::new(),
             bytes_written: 0,
             read_weight: DEFAULT_READ_WEIGHT,
+            proposed_order: Vec::new(),
         }
     }
 

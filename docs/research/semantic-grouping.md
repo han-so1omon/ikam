@@ -113,7 +113,7 @@ The hypotheses are ordered by expected gain over cost.
 - **Expected effect:** small or none on md and office relative to H1. Embeddings group by *topic*, while LZ needs shared byte runs of at least the minimum match length. Ferragina and Manzini's term-vector clustering lost to URL order, and D4 shows that embedding clusters are distorted by truncation and document endings. A gain is possible only where same-topic files share boilerplate that seeds miss. [inf]
   - The best learned variant would follow DeepSketch: train on measured marginal gains (H2's numbers), not on semantic similarity.
 - **Cost:** model inference offline, and a proposal file per corpus.
-- **Status:** `open` (not yet run).
+- **Status:** tested by E019. The embedding proposer beats seeds on repo-history and md but is dominated by measured cost (H2): score 0.4798 -> 0.4797. Kept as a reproducible capability; no storage gain shown.
 
 ## Unknowns
 
