@@ -43,7 +43,15 @@ pub struct Repacked {
 const DICT_SHORTLIST: usize = 4;
 
 impl<S: Store + Sync> Repo<S> {
+    /// Re-plan storage of all live content (applied only if smaller and
+    /// verified), then rebuild the function library graph.
     pub fn repack(&mut self) -> Result<Repacked, Error> {
+        let repacked = self.replan_store()?;
+        self.function_library()?;
+        Ok(repacked)
+    }
+
+    fn replan_store(&mut self) -> Result<Repacked, Error> {
         self.unshare_trees()?;
         self.gc()?;
         let (_, roots) = self.reachable()?;

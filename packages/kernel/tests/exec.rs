@@ -303,3 +303,60 @@ fn interpreter_programs_reconstruct_exactly_and_price_their_fuel() {
     let put = repo.put_derivation(table.as_bytes(), interp, vec![Arg::Whole(program)]);
     assert!(put.unwrap().is_some(), "verified derivation");
 }
+
+/// After repack, `meta/functions` names the function library graph: the
+/// interpreter, the application and its measured saving.
+#[test]
+fn repack_publishes_the_function_library_graph() {
+    let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("functions");
+    let mut repo = Repo::new(MemStore::default());
+    let table: String = (1..=99u32)
+        .map(|a| {
+            (1..=99u32)
+                .map(|b| format!("{:>5}", a * b))
+                .collect::<String>()
+                + "\n"
+        })
+        .collect();
+    let file = repo.put_content(table.as_bytes()).unwrap().id;
+    let interp = repo
+        .put_content(&fs::read(dir.join("interp.wasm")).unwrap())
+        .unwrap()
+        .id;
+    let program = fs::read(dir.join("programs/multiplication.bin")).unwrap();
+    let program = repo.put_content(&program).unwrap().id;
+    repo.put_derivation(table.as_bytes(), interp, vec![Arg::Whole(program)])
+        .unwrap();
+    let tree = Object::tree(vec![TreeEntry {
+        name: "table.txt".into(),
+        kind: Kind::File,
+        id: file,
+    }])
+    .unwrap();
+    let tree = repo.put(&tree).unwrap();
+    repo.commit("main", tree, "").unwrap();
+    repo.repack().unwrap();
+    assert_eq!(repo.read_content(&file).unwrap(), table.as_bytes());
+    let root = repo.resolve("meta/functions").unwrap();
+    let nodes = repo.graph_nodes(&root).unwrap();
+    assert!(
+        nodes
+            .iter()
+            .any(|n| n.label == format!("function {interp}"))
+    );
+    let app = nodes
+        .iter()
+        .find(|n| n.label.starts_with("application "))
+        .unwrap();
+    let output = app
+        .edges
+        .iter()
+        .find(|e| e.label.starts_with("output"))
+        .unwrap();
+    assert!(
+        !output.label.starts_with("output (saves 0 B"),
+        "{}",
+        output.label
+    );
+    assert!(repo.fsck().unwrap().is_empty());
+}

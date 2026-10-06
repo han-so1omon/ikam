@@ -15,6 +15,7 @@ mod group;
 mod history;
 mod id;
 mod ingest;
+mod library;
 pub mod matcher;
 mod object;
 mod repack;
