@@ -224,6 +224,91 @@ fn proposed_order() -> Vec<Id> {
         .collect()
 }
 
+/// Data that is the output of a small procedure: where a reconstruction
+/// function (a program) can be far smaller than any compression of its
+/// output. Deterministic, integer-only.
+fn generated() -> Vec<Snapshot> {
+    let mut s = 0x2545_f491_4f6c_dd1du64;
+    let mut lcg = move || {
+        s = s
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        (s >> 33) as usize
+    };
+    let mut metrics = String::from("minute,requests,errors,p50_ms,total\n");
+    let mut total = 0usize;
+    for i in 0..4000usize {
+        let (req, err, p50) = (1000 + (i * 37) % 251, (i * i) % 7, 20 + (i % 60));
+        total += req;
+        metrics.push_str(&format!(
+            "{},{req},{err},{p50},{total}\n",
+            1_700_000_000 + 60 * i
+        ));
+    }
+    let table: String = (1..=99usize)
+        .map(|a| {
+            (1..=99usize)
+                .map(|b| format!("{:>5}", a * b))
+                .collect::<String>()
+                + "\n"
+        })
+        .collect();
+    let paths = [
+        "/api/users",
+        "/api/orders",
+        "/health",
+        "/static/app.js",
+        "/api/search",
+    ];
+    let log: String = (0..6000usize)
+        .map(|i| {
+            let status = [200, 200, 200, 304, 404, 500][lcg() % 6];
+            format!(
+                "2026-10-06T12:{:02}:{:02}Z req={:06} {} {status} {}ms\n",
+                (i / 60) % 60,
+                i % 60,
+                100_000 + i,
+                paths[lcg() % paths.len()],
+                5 + lcg() % 200
+            )
+        })
+        .collect();
+    let (w, h) = (320usize, 240usize);
+    let mut pgm = format!("P5\n{w} {h}\n255\n").into_bytes();
+    for y in 0..h as i64 {
+        for x in 0..w as i64 {
+            // Fixed point, 12 fractional bits: c = (-2.2 + 3.2 x/w, -1.2 + 2.4 y/h).
+            let (cr, ci) = (-9011 + x * 13107 / w as i64, -4915 + y * 9830 / h as i64);
+            let (mut zr, mut zi, mut n) = (0i64, 0i64, 0u8);
+            while n < 255 && zr * zr + zi * zi <= 4 << 24 {
+                (zr, zi) = (((zr * zr - zi * zi) >> 12) + cr, ((2 * zr * zi) >> 12) + ci);
+                n += 1;
+            }
+            pgm.push(n);
+        }
+    }
+    let mut primes = Vec::new();
+    let mut n = 2usize;
+    while primes.len() < 20_000 {
+        if primes
+            .iter()
+            .take_while(|&&p| p * p <= n)
+            .all(|p| !n.is_multiple_of(*p))
+        {
+            primes.push(n);
+        }
+        n += 1;
+    }
+    let primes: String = primes.iter().map(|p| format!("{p}\n")).collect();
+    vec![vec![
+        ("metrics.csv".to_string(), metrics.into_bytes()),
+        ("multiplication.txt".to_string(), table.into_bytes()),
+        ("server.log".to_string(), log.into_bytes()),
+        ("mandelbrot.pgm".to_string(), pgm),
+        ("primes.txt".to_string(), primes.into_bytes()),
+    ]]
+}
+
 /// Invoices from one generator: long shared boilerplate, short fields.
 fn invoices() -> Vec<Snapshot> {
     let one = |n: u32| {
@@ -350,6 +435,7 @@ fn main() {
         ("synthetic-history", synthetic_history, false),
         ("repo-history", repo_history, false),
         ("repo-graph", repo_graph, true),
+        ("generated", generated, false),
     ];
     let (mut log_ratio, mut n, mut total_ms) = (0.0, 0, 0);
     for (name, build, graph) in corpora {

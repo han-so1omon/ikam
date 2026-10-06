@@ -294,3 +294,15 @@ Newest last. Format and rules: `README.md`.
 - Change: `src/group.rs`: `similar_groups` takes an optional rank order that shortlists candidates and starts groups (byte order here), and a fifth proposer uses it with measured cost. The E019 embedding proposer is unchanged.
 - Result: score 0.4797 -> **0.4762**; per corpus vs_dict: invoices 0.384->0.366 (5,191 -> 4,941), repo-graph 0.1957->0.1954, every other corpus byte-identical to E019 (md keeps the embedding proposer's 81 B); time 30.3 s -> 34.0 s (1.12x). Sizes identical on a second run.
 - Verdict: kept. Across E017–E020, measured compression is the deciding signal, and resemblance signals (byte order, seeds, embeddings) are only useful as shortlists.
+
+### E021 generated-corpus (benchmark change)
+- Branch / parent: exp/021-generated-corpus / E020
+- Change to the measurement: an eighth corpus, `generated`. It is data that is the output of a small integer-only procedure, where a reconstruction function (a program) can be far smaller than any compression of its output (source: `docs/plans/2026-10-06-system-architecture.md`, functions as a library in the graph; the KoLMogorov Test: programs beat compressors on generated data, not on prose). One snapshot of five files, 688,414 B:
+  - `metrics.csv`: 4,000 rows of computed columns and a running total.
+  - `multiplication.txt`: a 99 x 99 table.
+  - `server.log`: 6,000 lines with sequential timestamps and ids, and LCG-chosen paths, statuses and latencies.
+  - `mandelbrot.pgm`: 320 x 240, fixed point with 12 fractional bits.
+  - `primes.txt`: the first 20,000 primes.
+  - **Scores before and after E021 are not comparable**; E021 is the new reference.
+- Result, E020 kernel: score **0.5225** over 8 corpora; the seven others byte-identical to E020. generated: 175,169 B vs baseline 175,017 B (1.001), so the kernel does no better than zstd here, as expected without functions.
+- Verdict: reference for the function-library experiments.
