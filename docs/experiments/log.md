@@ -427,3 +427,27 @@ Newest last. Format and rules: `README.md`.
   - Reads still decode far more than they return: md's whole reads decode 9.3 MB to return its files (input 178,741 B over all snapshots), because each member read decodes its group from the start (up to 64 KiB) and office reads rebuild zips member by member.
 - Result: score 0.3302 -> **0.3302**; every corpus byte-identical to E027: md 0.8925, pdf 0.8338, office 0.4370, invoices 0.3655, synthetic-history 0.2786, repo-history 0.8586, repo-graph 0.1954, generated 0.0254; time 36.3–36.7 s (E027: 37.9 s; the full-group diagnostic: 37.3 s). Sizes and read costs identical on three runs (the third after the clippy fix).
 - Verdict: **kept** (score holds while adding a capability). Range reads through plans and half-cost member reads, both still verified per leaf. Not done: container ranges (zip members), WASM range maps, and per-segment reads inside a group (seekable blocks), which the read costs above point to as the remaining cost.
+
+### E029 seekable-groups
+- Branch / parent: exp/029-seekable-groups / E028
+- Hypothesis: storing a group as independently decodable blocks (zstd's seekable layout), each compressed with the shared dictionary, lets a member read decode only its blocks instead of the group's prefix. With group plans priced as the planner prices everything else (bytes + read weight x decode), the planner uses blocks where they pay (source: E028 measurement: reads still decode far more than they return, e.g. md 9.3 MB for a 179 KB corpus; `docs/plans/2026-10-06-system-architecture.md`, "the codec limit")
+- Change:
+  - `src/dict.rs`: a new plain encoding `K dict[4] block count {frame_len} frames`, each block its own frame with the dictionary (`block_frames`, `unblock`). `decode_span` replaces `decode_prefix`: a single frame decodes its prefix, `K` only the blocks a span overlaps. `with_dict` generalises the dictionary retry. `K` is plain content for `is_plain`, `dict_of` and `needs`, so gc keeps its dictionary.
+  - `src/group.rs`: `plan_group` prices a group as stored bytes + `read_weight` x (bytes decoded to read each member once), against members stored alone (their bytes + `read_weight` x their length). It compares one frame with blocks of 4 KiB and 16 KiB (`BLOCKS`, only with a dictionary), and `saved` becomes f64. `read_member` reads through `decode_span`.
+  - Test `blocked_group_members_read_back`: a hand-built `K` group's members read back exactly, decoding at most two blocks each; the whole group decodes; gc and fsck accept it. (A planner-driven test found no setting where repack chose blocks on that synthetic data. Stored alone with the dictionary beat any group once reads were priced, and where groups won the plan had no dictionary.)
+- Result (two runs, identical sizes and read costs): score 0.3302 -> **0.3357** (worse). Diagnostic "pricing only" (`BLOCKS` empty, one run): 0.3310.
+  | corpus | bytes E028 / pricing only / E029 | read_whole E028 / pricing only / E029 | bytes + 0.001 x read |
+  |---|---|---|---|
+  | md | 68,625 / 68,911 / 71,035 (+3.5%) | 9.27 M / 8.90 M / 4.42 M (0.48x) | 77,891 -> 75,456 |
+  | pdf | 20,547 / 20,547 / 20,977 (+2.1%) | 1.26 M / 1.26 M / 0.69 M (0.55x) | 21,806 -> 21,667 |
+  | office | 170,953 / 171,060 / 175,757 (+2.8%) | 162.9 M / 140.1 M / 119.1 M (0.73x) | 333,857 -> 294,878 |
+  | invoices | 4,941 / 4,941 / 5,117 (+3.6%) | 825,330 / 825,330 / 825,327 | 5,766 -> 5,942 (worse) |
+  | synthetic-history | 16,926 / 16,957 / 16,957 | 1.74 M / 1.49 M / 1.49 M | 18,664 -> 18,447 |
+  | repo-history | 1,108,165 / 1,110,471 / 1,110,471 | 33.6 M / 29.6 M / 29.6 M | 1,141,796 -> 1,140,089 |
+  | repo-graph | 22,161 / 22,378 / 22,378 | (not measured) | worse by 217 B |
+  | generated | 4,454 / 4,454 / 4,454 | unchanged | unchanged |
+  - vs_dict: md 0.8925 -> 0.9238, pdf 0.8338 -> 0.8512, office 0.4370 -> 0.4492, invoices 0.3655 -> 0.3785, synthetic-history 0.2786 -> 0.2792, repo-history 0.8586 -> 0.8604, repo-graph 0.1954 -> 0.1973, generated 0.0254. Time 36.5 s -> 44.0 s (1.2x; each group is compressed three ways).
+  - Blocked groups stored: md 1, pdf 1, office 10. 4 KiB range reads cost the same as whole reads on these corpora (files are whole group members), so `read_4k` moves with `read_whole`.
+  - **Attribution:** blocks make the large read reductions (md 0.96x -> 0.48x, pdf 1.0x -> 0.55x, office 0.86x -> 0.73x of E028), for 2–3.5% more bytes. Read pricing alone moves synthetic-history and repo-history (fewer groups: repo-history members 743 -> 643) and costs repo-graph 217 B.
+  - **Inconsistent objectives:** repack's outer choice between whole plans (dictionary x template induction) compares **content bytes only** (`repack.rs`, `size < best`), while the group step now uses bytes + read weight x read. On invoices this picked a plan 176 B larger with no read gain. Any read-cost trade-off needs one objective in both places.
+- Verdict: **discarded.** The score is bytes-only and gets worse. By the planner's own objective (bytes + 0.001 x read) E029 is better on md, pdf, office, synthetic-history and repo-history and worse on invoices and repo-graph. Whether read cost belongs in the score is a benchmark decision, not this experiment's. If it is made, it should be its own log entry (re-measure, scores not comparable), together with making repack's plan choice use the same objective. Not merged.

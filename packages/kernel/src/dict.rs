@@ -34,6 +34,7 @@
 
 use std::io::Read;
 
+use crate::group::{put_varint, varint};
 use crate::{Error, Id, Repo, Store};
 
 pub(crate) const DICT_REF: &str = "meta/zstd-dict";
@@ -47,7 +48,7 @@ type DictRef = [u8; DICT_REF_LEN];
 
 /// True for any plain encoding of content bytes.
 pub(crate) fn is_plain(encoded: &[u8]) -> bool {
-    matches!(encoded.first(), Some(b'B' | b'Z' | b'Y' | b'S'))
+    matches!(encoded.first(), Some(b'B' | b'Z' | b'Y' | b'K' | b'S'))
 }
 
 /// The id prefix of the stored content an encoding cannot be decoded
@@ -57,7 +58,11 @@ pub(crate) fn needs(encoded: &[u8]) -> Option<&[u8]> {
     match encoded {
         [b'S', group @ ..] => group.get(..crate::group::GROUP_REF_LEN),
         _ => dict_of(encoded).map(|_| {
-            let at = if encoded[0] == b'Y' { 1 } else { 2 };
+            let at = if matches!(encoded[0], b'Y' | b'K') {
+                1
+            } else {
+                2
+            };
             &encoded[at..at + DICT_REF_LEN]
         }),
     }
@@ -73,7 +78,7 @@ pub(crate) fn object_tag(encoded: &[u8]) -> Option<u8> {
 /// The dictionary reference (an id prefix) a stored encoding needs, if any.
 pub(crate) fn dict_of(encoded: &[u8]) -> Option<DictRef> {
     let at = match encoded {
-        [b'Y', ..] => 1,
+        [b'Y' | b'K', ..] => 1,
         [t, m, ..] if t.is_ascii_lowercase() && m & !ABBREVIATED == 1 => 2,
         _ => return None,
     };
@@ -155,6 +160,40 @@ pub(crate) fn unzstd_prefix(frame: &[u8], dict: &[u8], limit: usize) -> Option<V
         .ok()?;
     DECOMPRESSED.with(|d| d.set(d.get() + out.len()));
     Some(out)
+}
+
+/// A blocked encoding's body: `block count { frame_len } frames`, each
+/// block of `block` bytes (the last may be shorter) its own frame with
+/// `dict`, so a span decodes only the blocks it overlaps (as in zstd's
+/// seekable format).
+pub(crate) fn block_frames(bytes: &[u8], dict: &[u8], block: usize) -> Option<Vec<u8>> {
+    let frames: Vec<Vec<u8>> = bytes
+        .chunks(block)
+        .map(|c| zstd_frame(c, dict))
+        .collect::<Option<_>>()?;
+    let mut out = Vec::new();
+    put_varint(&mut out, block);
+    put_varint(&mut out, frames.len());
+    frames.iter().for_each(|f| put_varint(&mut out, f.len()));
+    frames.iter().for_each(|f| out.extend_from_slice(f));
+    Some(out)
+}
+
+/// The blocks of a `block_frames` body overlapping `start..end`, decoded:
+/// their first byte's offset in the content, and their bytes.
+fn unblock(mut body: &[u8], dict: &[u8], start: usize, end: usize) -> Option<(usize, Vec<u8>)> {
+    let (block, count) = (varint(&mut body).filter(|&b| b > 0)?, varint(&mut body)?);
+    let lens: Vec<usize> = (0..count)
+        .map(|_| varint(&mut body))
+        .collect::<Option<_>>()?;
+    let (first, last) = (start / block, end.div_ceil(block).min(count));
+    let mut at = lens[..first.min(count)].iter().sum::<usize>();
+    let mut out = Vec::new();
+    for &n in lens.get(first..last)? {
+        out.extend(unzstd_frame(body.get(at..at + n)?, dict)?);
+        at += n;
+    }
+    Some((first * block, out))
 }
 
 fn decode_basic(id: &Id, encoded: &[u8]) -> Result<Vec<u8>, Error> {
@@ -264,8 +303,10 @@ impl<S: Store> Repo<S> {
         match mode & !ABBREVIATED {
             0 if t.is_ascii_lowercase() => finish(unzstd_frame(z, &[]).ok_or(Error::Corrupt(*id))?),
             1 if t.is_ascii_lowercase() => {
-                let rest = self.unzstd_with_dict(id, &encoded, 2, usize::MAX, &|rest| {
-                    finish(rest.to_vec()).is_ok_and(|c| Id::of(&c) == *id)
+                let frame = &encoded[2 + DICT_REF_LEN..];
+                let rest = self.with_dict(id, &encoded, &|d| {
+                    unzstd_frame(frame, d)
+                        .filter(|rest| finish(rest.to_vec()).is_ok_and(|c| Id::of(&c) == *id))
                 })?;
                 finish(rest)
             }
@@ -287,57 +328,70 @@ impl<S: Store> Repo<S> {
     /// output does.
     pub(crate) fn decode_plain(&self, id: &Id, encoded: &[u8]) -> Result<Vec<u8>, Error> {
         match encoded.first() {
-            Some(b'Y') => {
-                self.unzstd_with_dict(id, encoded, 1, usize::MAX, &|b| Id::of_content(b) == *id)
+            Some(b'Y' | b'K') => {
+                let whole = |_: usize, b: &[u8]| Id::of_content(b) == *id;
+                Ok(self.decode_span(id, encoded, 0, usize::MAX, &whole)?.1)
             }
             Some(b'S') => self.read_member(id, encoded),
             _ => decode_basic(id, encoded),
         }
     }
 
-    /// The first `limit` bytes of a plain encoding ("B", "Z" or "Y"), if
-    /// they pass `check`. Nothing here verifies the whole content's id, so
-    /// `check` must verify what the caller uses (a group member's own id).
-    pub(crate) fn decode_prefix(
+    /// Bytes `start..end` of a plain encoding ("B", "Z", "Y" or blocked
+    /// "K"), decoded as cheaply as the encoding allows, if they pass
+    /// `check(offset, bytes)`: `bytes` start at `offset` and cover at least
+    /// up to `end` (or the content's end). A single frame decodes its
+    /// prefix up to `end`; "K" decodes only the blocks the span overlaps.
+    /// Nothing here verifies the whole content's id, so `check` must verify
+    /// what the caller uses (a group member's own id).
+    pub(crate) fn decode_span(
         &self,
         id: &Id,
         encoded: &[u8],
-        limit: usize,
-        check: &dyn Fn(&[u8]) -> bool,
-    ) -> Result<Vec<u8>, Error> {
+        start: usize,
+        end: usize,
+        check: &dyn Fn(usize, &[u8]) -> bool,
+    ) -> Result<(usize, Vec<u8>), Error> {
         let out = match encoded.split_first() {
-            Some((b'B', bytes)) => Some(bytes[..limit.min(bytes.len())].to_vec()),
-            Some((b'Z', z)) => unzstd_prefix(z, &[], limit),
-            Some((b'Y', _)) => return self.unzstd_with_dict(id, encoded, 1, limit, check),
+            Some((b'B', bytes)) => Some(bytes[..end.min(bytes.len())].to_vec()),
+            Some((b'Z', z)) => unzstd_prefix(z, &[], end),
+            Some((b'Y', rest)) => {
+                let frame = &rest[DICT_REF_LEN.min(rest.len())..];
+                let decode = |d: &[u8]| unzstd_prefix(frame, d, end).filter(|b| check(0, b));
+                return Ok((0, self.with_dict(id, encoded, &decode)?));
+            }
+            Some((b'K', rest)) => {
+                let body = &rest[DICT_REF_LEN.min(rest.len())..];
+                let decode = |d: &[u8]| unblock(body, d, start, end).filter(|(o, b)| check(*o, b));
+                return self.with_dict(id, encoded, &decode);
+            }
             _ => return Err(Error::WrongKind(*id)),
         };
-        out.filter(|b| check(b)).ok_or(Error::Corrupt(*id))
+        out.filter(|b| check(0, b))
+            .map(|b| (0, b))
+            .ok_or(Error::Corrupt(*id))
     }
 
-    /// Decompress the frame after the dictionary reference at `at`, with
-    /// the first dictionary it names whose output passes `check`: the
-    /// current dictionary first, then any stored content the prefix names.
-    fn unzstd_with_dict(
+    /// Decode with the first dictionary the encoding names whose output
+    /// `decode` accepts: the current dictionary first, then any stored
+    /// content the prefix names.
+    fn with_dict<T>(
         &self,
         id: &Id,
         encoded: &[u8],
-        at: usize,
-        limit: usize,
-        check: &dyn Fn(&[u8]) -> bool,
-    ) -> Result<Vec<u8>, Error> {
+        decode: &dyn Fn(&[u8]) -> Option<T>,
+    ) -> Result<T, Error> {
         let dict = dict_of(encoded).ok_or(Error::Corrupt(*id))?;
-        let frame = &encoded[at + DICT_REF_LEN..];
-        let attempt = |bytes: &[u8]| unzstd_prefix(frame, bytes, limit).filter(|out| check(out));
         if let Some((current, bytes)) = self.dictionary()
             && names(&dict, current)
-            && let Some(out) = attempt(bytes)
+            && let Some(out) = decode(bytes)
         {
             return Ok(out);
         }
         for candidate in &self.store.ids_with_prefix(&dict)? {
             if let Ok(bytes) = decode_basic(candidate, &self.store.read(candidate)?)
                 && Id::of_content(&bytes) == *candidate
-                && let Some(out) = attempt(&bytes)
+                && let Some(out) = decode(&bytes)
             {
                 return Ok(out);
             }

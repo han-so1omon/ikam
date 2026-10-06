@@ -13,7 +13,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use crate::dict::framer;
+use crate::dict::{DICT_REF_LEN, block_frames, framer};
 use crate::{Error, Id, Repo, Store, matcher};
 
 /// Bytes of a group's id stored in each member entry.
@@ -22,7 +22,7 @@ pub(crate) const GROUP_REF_LEN: usize = 8;
 /// group, so this bounds the read cost of a member.
 const GROUP_SIZE: usize = 64 * 1024;
 
-fn put_varint(out: &mut Vec<u8>, mut n: usize) {
+pub(crate) fn put_varint(out: &mut Vec<u8>, mut n: usize) {
     while n >= 0x80 {
         out.push(n as u8 | 0x80);
         n >>= 7;
@@ -30,7 +30,7 @@ fn put_varint(out: &mut Vec<u8>, mut n: usize) {
     out.push(n as u8);
 }
 
-fn varint(b: &mut &[u8]) -> Option<usize> {
+pub(crate) fn varint(b: &mut &[u8]) -> Option<usize> {
     let mut n = 0usize;
     for shift in (0..64).step_by(7) {
         let (&byte, rest) = b.split_first()?;
@@ -44,13 +44,17 @@ fn varint(b: &mut &[u8]) -> Option<usize> {
 }
 
 /// A group ready to write: its id and encoding, its members' entries, and
-/// the bytes it saves.
+/// what it saves: bytes + read weight x decode work of reading each member.
 struct Planned {
     group: Id,
     encoded: Vec<u8>,
     entries: Vec<(Id, Vec<u8>)>,
-    saved: usize,
+    saved: f64,
 }
+
+/// Block sizes a group may be split into (see `dict::block_frames`), besides
+/// one frame. Smaller blocks cost lost context, larger ones read work.
+const BLOCKS: [usize; 2] = [4 * 1024, 16 * 1024];
 
 /// Groups of consecutive items in byte order, each up to `GROUP_SIZE`.
 fn byte_order_groups(items: &[(Vec<u8>, Id, usize)]) -> Vec<Vec<usize>> {
@@ -208,12 +212,16 @@ impl<S: Store> Repo<S> {
             if stored.first() == Some(&b'S') {
                 continue;
             }
-            // Decode the group only up to the member's end; the member is
-            // verified by its own id (the group's id is not checked).
+            // Decode only the part of the group the member needs (a prefix,
+            // or its blocks); the member is verified by its own id (the
+            // group's id is not checked).
             let end = start.saturating_add(len);
-            let member = |b: &[u8]| b.get(start..end).is_some_and(|r| Id::of_content(r) == *id);
-            if let Ok(bytes) = self.decode_prefix(&group, &stored, end, &member) {
-                return Ok(bytes[start..end].to_vec());
+            let member = |at: usize, b: &[u8]| {
+                b.get(start - at..end - at)
+                    .is_some_and(|r| Id::of_content(r) == *id)
+            };
+            if let Ok((at, bytes)) = self.decode_span(&group, &stored, start, end, &member) {
+                return Ok(bytes[start - at..end - at].to_vec());
             }
         }
         Err(bad())
@@ -237,7 +245,7 @@ impl<S: Store> Repo<S> {
         }
         items.sort();
         // Proposers suggest groupings; the one that saves most is written.
-        let mut best: (usize, Vec<Planned>) = (0, Vec::new());
+        let mut best: (f64, Vec<Planned>) = (0.0, Vec::new());
         let dict = self
             .dictionary()
             .map(|(_, d)| d.clone())
@@ -274,24 +282,54 @@ impl<S: Store> Repo<S> {
         Ok(())
     }
 
-    /// The group of `members` and their entries, if it saves bytes.
+    /// The group of `members` and their entries, if it saves cost: stored
+    /// bytes + `read_weight` x bytes decoded to read every member once.
+    /// The group is one frame (a member read decodes up to its end) or,
+    /// with a dictionary, blocks of a size in `BLOCKS` (a member read
+    /// decodes the blocks it overlaps), whichever costs least.
     fn plan_group(&self, members: &[&(Vec<u8>, Id, usize)]) -> Option<Planned> {
         if members.len() < 2 {
             return None;
         }
         let joined: Vec<u8> = members.iter().flat_map(|m| m.0.iter().copied()).collect();
         let group = Id::of_content(&joined);
-        let encoded = self.encode_plain(&joined);
-        let (mut entries, mut at) = (Vec::new(), 0);
+        let (mut entries, mut spans, mut at) = (Vec::new(), Vec::new(), 0);
         for (bytes, id, _) in members {
             entries.push((*id, member_entry(&group, at, bytes.len())));
+            spans.push((at, at + bytes.len()));
             at += bytes.len();
         }
-        let grouped = encoded.len() + entries.iter().map(|e| e.1.len()).sum::<usize>();
-        let alone: usize = members.iter().map(|m| m.2).sum();
+        let w = self.read_weight;
+        let entry_bytes: usize = entries.iter().map(|e| e.1.len()).sum();
+        let single = self.encode_plain(&joined);
+        let read: usize = spans.iter().map(|s| s.1).sum();
+        let mut best = (single.len() as f64 + w * read as f64, single);
+        if let Some((dict_id, dict)) = self.dictionary() {
+            for block in BLOCKS.into_iter().filter(|&b| b < joined.len()) {
+                let Some(body) = block_frames(&joined, dict, block) else {
+                    continue;
+                };
+                let encoded = [&b"K"[..], &dict_id.as_bytes()[..DICT_REF_LEN], &body].concat();
+                let read: usize = spans
+                    .iter()
+                    .map(|&(s, e)| {
+                        (e.div_ceil(block) * block).min(joined.len()) - s / block * block
+                    })
+                    .sum();
+                let cost = encoded.len() as f64 + w * read as f64;
+                if cost < best.0 {
+                    best = (cost, encoded);
+                }
+            }
+        }
+        let grouped = best.0 + entry_bytes as f64;
+        let alone: f64 = members
+            .iter()
+            .map(|m| m.2 as f64 + w * m.0.len() as f64)
+            .sum();
         (grouped < alone && !self.store.has(&group)).then_some(Planned {
             group,
-            encoded,
+            encoded: best.1,
             entries,
             saved: alone - grouped,
         })
@@ -302,6 +340,58 @@ impl<S: Store> Repo<S> {
 mod tests {
     use super::*;
     use crate::{Kind, MemStore, Object, TreeEntry};
+
+    /// A blocked group ("K"): members read back exactly while decoding only
+    /// their blocks, the whole group decodes, and gc and fsck accept it.
+    #[test]
+    fn blocked_group_members_read_back() {
+        let mut repo = Repo::new(MemStore::default());
+        let docs: Vec<Vec<u8>> = (0..100)
+            .map(|i| format!("record {i}: {}\n", "shared text ".repeat(20 + i % 7)).into_bytes())
+            .collect();
+        let dict = zstd::dict::from_continuous(
+            &docs.concat(),
+            &docs.iter().map(Vec::len).collect::<Vec<_>>(),
+            4096,
+        )
+        .unwrap();
+        let dict_id = repo.set_dictionary(dict.clone()).unwrap();
+        let ids: Vec<Id> = docs
+            .iter()
+            .map(|d| repo.put_content(d).unwrap().id)
+            .collect();
+        let entries = ids.iter().enumerate().map(|(i, id)| TreeEntry {
+            name: format!("r{i:03}"),
+            kind: Kind::File,
+            id: *id,
+        });
+        let tree = repo.put(&Object::tree(entries.collect()).unwrap()).unwrap();
+        repo.commit("main", tree, "").unwrap();
+        let joined = docs.concat();
+        let group = Id::of_content(&joined);
+        let body = block_frames(&joined, &dict, 4096).unwrap();
+        let encoded = [&b"K"[..], &dict_id.as_bytes()[..DICT_REF_LEN], &body].concat();
+        repo.store.write(group, &encoded).unwrap();
+        let mut at = 0;
+        for (id, d) in ids.iter().zip(&docs) {
+            repo.store
+                .replace(*id, &member_entry(&group, at, d.len()))
+                .unwrap();
+            at += d.len();
+        }
+        repo.reset_projections();
+        repo.gc().unwrap();
+        for (id, d) in ids.iter().zip(&docs) {
+            let before = crate::decompressed_bytes();
+            assert_eq!(&repo.read_content(id).unwrap(), d);
+            assert!(
+                crate::decompressed_bytes() - before <= 2 * 4096,
+                "decoded more than two blocks"
+            );
+        }
+        assert_eq!(repo.read_content(&group).unwrap(), joined);
+        assert!(repo.fsck().unwrap().is_empty());
+    }
 
     #[test]
     fn varints_round_trip() {
