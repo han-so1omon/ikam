@@ -328,3 +328,15 @@ Newest last. Format and rules: `README.md`.
 - Verdict: kept, with caveats:
   - The programs are hand-written. This shows what the mechanism can do, not what an automatic proposer finds. The LLM writer (step 4) is the real test.
   - The score is a geometric mean, so one corpus improving 14x moves it a lot (0.5225 -> 0.3770). Per-corpus ratios are the honest view.
+
+### E023 compiled-programs
+- Branch / parent: exp/023-compiled-programs / E022
+- Hypothesis: interpreted programs are slow to read under wasmi (~1,300 fuel per op), which kept Mandelbrot from paying. Compiling each program to its own WASM module cuts its decode work by orders of magnitude, so more of the generated corpus can be stored as functions (source: E022 measurements)
+- Change:
+  - New `functions/compile.py` turns program bytecode into WAT: a dispatch loop (`br_table`) over basic blocks, the operand stack on WASM's value stack, registers as locals, the scratch array and output in linear memory, plus runtime helpers. It refuses programs whose stack is not empty at a block boundary; those stay interpreted.
+  - `examples/programs.rs` assembles each WAT with the `wat` crate and prices both forms. `proposals.txt` lines are now `function argument output-id bytes work`.
+  - The `examples/bench.rs` proposer offers, per corpus file, the cheapest form: function bytes (the interpreter's shared by its users) + argument bytes + read weight x work, if below the output size. The kernel verifies it; repack keeps it only if it pays.
+  - A first compile emitted string addresses relative to the data segment instead of its base, so every output differed (newlines became zero bytes). The id comparison caught it before use; after the fix all five compiled outputs equal the interpreted ones byte for byte.
+- Decode work, interpreted -> compiled: mandelbrot 255,193,789 -> 580,478 (440x); primes 11,202,154 -> 228,638 (49x); server_log 910,458 -> 327,045; metrics 378,822 -> 121,809; multiplication 211,358 -> 53,915. Compiled modules are 2.4–2.9 KB each.
+- Result: score 0.3770 -> **0.3444**; generated 12,851 -> **6,241 B** (vs_dict 0.073 -> 0.036; Mandelbrot is now a function too); the other seven corpora byte-identical; time 45.3 s -> 43.9 s. Sizes identical on two runs.
+- Verdict: kept. The programs are still hand-written (E022's caveat), and the score's change again comes from one corpus.
