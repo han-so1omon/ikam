@@ -340,3 +340,16 @@ Newest last. Format and rules: `README.md`.
 - Decode work, interpreted -> compiled: mandelbrot 255,193,789 -> 580,478 (440x); primes 11,202,154 -> 228,638 (49x); server_log 910,458 -> 327,045; metrics 378,822 -> 121,809; multiplication 211,358 -> 53,915. Compiled modules are 2.4–2.9 KB each.
 - Result: score 0.3770 -> **0.3444**; generated 12,851 -> **6,241 B** (vs_dict 0.073 -> 0.036; Mandelbrot is now a function too); the other seven corpora byte-identical; time 45.3 s -> 43.9 s. Sizes identical on two runs.
 - Verdict: kept. The programs are still hand-written (E022's caveat), and the score's change again comes from one corpus.
+
+### E024 function-library (capability) and fuel cap restored
+- Branch / parent: exp/024-function-library / E023
+- Hypothesis: the reconstruction functions in use can be kept as a graph in the semantic layer (functions, their applications, measured savings and decode work) at negligible cost (source: `docs/plans/2026-10-06-system-architecture.md`, functions as a library in the graph)
+- Change:
+  - New `src/library.rs`: `Repo::function_library` rebuilds, from the ledger, a graph with nodes per non-builtin function, application (derivation record) and content read or produced. Edges are "function", "argument" and "output (saves N B, work W)". It points the ref `meta/functions` at the graph; same ledger, same graph.
+  - `repack` calls it after re-planning, whether or not the re-plan applied.
+  - New test `repack_publishes_the_function_library_graph`.
+  - **Correction to E022:** the fuel cap returns from 2^38 to 2^30. At 2^38, a module that never stops ran **572 s** (the sandbox test: `tests/exec.rs` took 573 s); at 2^30 it stops in 2.2 s. E022's "about 30 s" was an extrapolation and wrong for tight loops. Compiled programs (E023) all fit under 2^30 (largest: Mandelbrot, ~0.58 G fuel). Interpreted Mandelbrot and primes no longer fit and drop out of `proposals.txt`.
+- Result: score 0.3444 -> **0.3307**; generated 6,241 -> **4,512 B** (vs_dict 0.036 -> 0.026); other corpora byte-identical; time 43.9 s -> 44.9 s. Sizes identical on two runs.
+  - **Attribution:** the gain is not from the library graph, which adds bytes (a 34 B pointer plus its content). It comes from the regenerated proposals. With interpreted primes and Mandelbrot gone, the proposer splits the interpreter's size over 3 files instead of 5, prefers compiled modules for all five files, and the interpreter is no longer stored. The five modules share their runtime code and compress well in one group (5 members, 64 B of entries).
+  - The proposer's cost estimate (raw module size, not grouped compression) is crude; the kernel's evaluator is what keeps choices sound.
+- Verdict: kept (capability; and the fuel cap correction).
