@@ -18,6 +18,7 @@ mod ingest;
 mod library;
 pub mod matcher;
 mod object;
+mod range;
 mod repack;
 mod repo;
 pub mod snapshot;
@@ -25,6 +26,7 @@ mod store;
 mod template;
 mod wasm;
 
+pub use dict::decompressed_bytes;
 pub use id::Id;
 pub use object::{
     Arg, Claim, Commit, Derivation, Edge, Graph, Kind, Node, Object, Target, TreeEntry, node_key,

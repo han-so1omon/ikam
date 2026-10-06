@@ -127,7 +127,7 @@ Design points:
 - **Where it should pay (from the literature, not yet measured here).** Data that is the output of a procedure: computed spreadsheet columns, numeric sequences, logs, procedural images, generated code. For prose, the KoLMogorov Test (ICLR 2025) found frontier LLM programs failing 40–78% of the time and losing to gzip when correct. Templates, deltas and the dictionary remain the right tools there.
 - **Reproducibility.** The LLM runs offline. Its functions and programs are stored as content, so once written they are ordinary data. The benchmark never calls a model.
 
-## Partial reads: decompress only the segments needed (proposed)
+## Partial reads: decompress only the segments needed (partly built, E028)
 
 **Yes, the render structure lets reads decode only what they need, with one codec-level limit.**
 
@@ -143,11 +143,11 @@ flowchart LR
   R -->|"opaque WASM function"| C5["whole inputs (no range map)"]
 ```
 
-- **concat and slices**: exact. A range of the output is a computable set of ranges of the inputs.
-- **fill**: exact. Template segments and filler parts have known offsets.
-- **Containers**: a range of a zip maps to the members that cover it, plus header bytes.
-- **Opaque WASM functions**: no general range map, so whole inputs are needed, unless the function declares one (a proposed extension).
-- **The codec limit.** A zstd frame decodes sequentially. Inside a group, reading a member must decode from the frame start to the member's end: on average half the group, not all of it as today. To read one segment in O(segment), a group is split into **independently decodable blocks** (zstd's "seekable format": frames of a few KiB plus an offset table, shipped in zstd's `contrib/`). Blocks lose some shared context, and the dictionary recovers part of it. The block size is then a measured trade-off.
+- **concat and slices** (built, E028): exact. A range of the output is a computable set of ranges of the inputs (`Repo::read_range`, `src/range.rs`).
+- **fill** (built, E028): exact. Template segments and filler parts have known offsets. The template and fillers are still decoded whole; only the output is partial.
+- **Containers** (proposed): a range of a zip maps to the members that cover it, plus header bytes. Today a range read rebuilds the whole container and slices it.
+- **Opaque WASM functions** (whole read, then sliced): no general range map, so whole inputs are needed, unless the function declares one (a proposed extension).
+- **The codec limit.** A zstd frame decodes sequentially. Inside a group, reading a member must decode from the frame start to the member's end: on average half the group, not all of it (built, E028: whole reads now decode 0.50–0.68x of what full-group decoding did on the group-heavy corpora). To read one segment in O(segment), a group is split into **independently decodable blocks** (zstd's "seekable format": frames of a few KiB plus an offset table, shipped in zstd's `contrib/`). Blocks lose some shared context, and the dictionary recovers part of it. The block size is then a measured trade-off.
 
 With range reads, the evaluator can price **decode work actually needed** for a given access pattern (whole files, or segments named in the graph), instead of today's proxy (bytes produced by derivations, decompression unpriced).
 

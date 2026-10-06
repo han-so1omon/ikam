@@ -208,11 +208,12 @@ impl<S: Store> Repo<S> {
             if stored.first() == Some(&b'S') {
                 continue;
             }
-            if let Ok(bytes) = self.decode_plain(&group, &stored)
-                && let Some(range) = bytes.get(start..start.saturating_add(len))
-                && Id::of_content(range) == *id
-            {
-                return Ok(range.to_vec());
+            // Decode the group only up to the member's end; the member is
+            // verified by its own id (the group's id is not checked).
+            let end = start.saturating_add(len);
+            let member = |b: &[u8]| b.get(start..end).is_some_and(|r| Id::of_content(r) == *id);
+            if let Ok(bytes) = self.decode_prefix(&group, &stored, end, &member) {
+                return Ok(bytes[start..end].to_vec());
             }
         }
         Err(bad())

@@ -18,7 +18,7 @@ use crate::{Arg, Derivation, Error, Id, Object, Store, func};
 /// Stack-safety guard for malformed stores (reconstruction recurses). It is
 /// not a planning policy: the evaluator (`read_weight`) prices read work, so
 /// plans this deep are never chosen in practice.
-const STACK_GUARD: usize = 256;
+pub(crate) const STACK_GUARD: usize = 256;
 
 /// Default weight of decode work against storage in plan choice: 1 KiB of
 /// bytes produced while rebuilding content costs as much as 1 stored byte.
@@ -62,7 +62,7 @@ impl Ledger {
 /// bound) and bytes already resolved, including not-yet-stored candidates.
 #[derive(Default)]
 pub(crate) struct Cx {
-    stack: Vec<Id>,
+    pub(crate) stack: Vec<Id>,
     pub(crate) known: HashMap<Id, Vec<u8>>,
     /// Bytes produced by function evaluations so far: the decode work.
     pub(crate) work: usize,
@@ -310,7 +310,7 @@ impl<S: Store> Repo<S> {
     }
 }
 
-fn select(bytes: &[u8], start: u64, len: u64) -> Option<&[u8]> {
+pub(crate) fn select(bytes: &[u8], start: u64, len: u64) -> Option<&[u8]> {
     let start = usize::try_from(start).ok()?;
     bytes.get(start..start.checked_add(usize::try_from(len).ok()?)?)
 }

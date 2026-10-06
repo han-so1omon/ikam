@@ -316,6 +316,30 @@ fn propose_programs(repo: &mut Repo<MemStore>, snapshots: &[Snapshot]) {
     }
 }
 
+/// Read cost per corpus (reported, not scored): over every distinct file,
+/// the decode cost of a whole read and of a 4 KiB range read from its
+/// middle, each counted as bytes decompressed + bytes produced by
+/// functions. Also whether every range read equals the slice it names.
+fn read_costs(repo: &Repo<MemStore>, snapshots: &[Snapshot]) -> (usize, usize, bool) {
+    let files: BTreeMap<Id, &Vec<u8>> = snapshots
+        .iter()
+        .flatten()
+        .map(|(_, b)| (Id::of_content(b), b))
+        .collect();
+    let (mut whole, mut window, mut exact) = (0, 0, true);
+    for (id, b) in files {
+        let n = b.len() as u64;
+        let (start, len) = (n / 2, (n - n / 2).min(4096));
+        for (cost, start, len) in [(&mut whole, 0, n), (&mut window, start, len)] {
+            let before = ikam_kernel::decompressed_bytes();
+            let (bytes, work) = repo.read_range(&id, start, len).unwrap();
+            *cost += ikam_kernel::decompressed_bytes() - before + work;
+            exact &= bytes == b[start as usize..(start + len) as usize];
+        }
+    }
+    (whole, window, exact)
+}
+
 /// The committed embedding proposal (`semantic/order.txt`, written by
 /// `semantic/embed.py`): content ids in a semantic order. Repack uses it as
 /// one grouping proposal among several, so no model runs here.
@@ -592,12 +616,17 @@ fn main() {
                 .flatten()
                 .all(|(_, b)| repo.read_content(&Id::of_content(b)).unwrap() == *b),
         };
+        let (read_whole, read_4k, range_exact) = match graph {
+            true => (0, 0, true),
+            false => read_costs(&repo, &snapshots),
+        };
+        let exact = exact && range_exact;
         let fsck = repo.fsck().unwrap().is_empty();
         let (zstd_files, zstd_dict) = baselines(&snapshots);
         let ratio = repack as f64 / zstd_dict as f64;
         if json {
             println!(
-                "{{\"corpus\":\"{name}\",\"input\":{input},\"ingest\":{ingest},\"repack\":{repack},\"ingest_ms\":{ingest_ms},\"repack_ms\":{repack_ms},\"zstd_files\":{zstd_files},\"zstd_dict\":{zstd_dict},\"vs_dict\":{ratio:.4},\"exact\":{exact},\"fsck\":{fsck},\"by_kind\":{}}}",
+                "{{\"corpus\":\"{name}\",\"input\":{input},\"ingest\":{ingest},\"repack\":{repack},\"ingest_ms\":{ingest_ms},\"repack_ms\":{repack_ms},\"zstd_files\":{zstd_files},\"zstd_dict\":{zstd_dict},\"vs_dict\":{ratio:.4},\"exact\":{exact},\"fsck\":{fsck},\"read_whole\":{read_whole},\"read_4k\":{read_4k},\"by_kind\":{}}}",
                 by_kind(&repo)
             );
         } else {

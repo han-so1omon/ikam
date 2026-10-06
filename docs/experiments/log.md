@@ -398,3 +398,32 @@ Newest last. Format and rules: `README.md`.
   - Reversing the file order gives the same `proposals.txt` lines (checked once, with a temporary edit).
 - Result: score 0.3302 -> **0.3302**; every corpus byte-identical to E026, generated included (4,454 B, the same forms chosen): md 0.8925, pdf 0.8338, office 0.4370, invoices 0.3655, synthetic-history 0.2786, repo-history 0.8586, repo-graph 0.1954, generated 0.0254; time 37.9 s (E026: 37.9 s). Sizes identical on two runs.
 - Verdict: **kept** as a measurement correction. Neutral on storage: at the default read weight the bias was too small to change any choice. It would matter at higher read weights, or with more similar modules priced in one run.
+
+### E028 range-reads
+- Branch / parent: exp/028-range-reads / E027
+- Hypothesis: a read can decode only what it needs, with every leaf it decodes still verified against its own id. Mapping a byte range backwards through `concat` and `fill` plans, and decoding a group's zstd frame only up to the member's end (on average half the group), lowers read cost with storage unchanged (source: `docs/plans/2026-10-06-system-architecture.md`, "Partial reads", which predicted the half-group figure; zstd frames decode sequentially, so a prefix costs only its length)
+- Change:
+  - New `src/range.rs`: `Repo::read_range(id, start, len) -> (bytes, work)`.
+    - Through `concat` it reads only the overlapping arguments, recursively. `Arg::Range` carries its length; an `Arg::Whole` before the range is read to learn its length.
+    - Through `fill` it decodes the template and fillers, then produces only the overlapping pieces (`template::pieces`, which `fill` now uses too).
+    - A stored leaf, `deflate-pack` or WASM is read whole, verified, and sliced. Out-of-range or overflowing requests are errors.
+    - Soundness: leaves are verified by id. A walked plan relies on its derivation record having been verified when recorded (and by fsck); the whole output's id is not re-checked.
+  - `src/dict.rs`: `unzstd_prefix` decodes at most `limit` bytes of a frame, and `decode_prefix` does the same for a plain "B"/"Z"/"Y" encoding, under a caller's check. A per-thread `decompressed_bytes()` counter (measurement only) counts bytes decompressed from frames.
+  - `src/group.rs` `read_member`: decodes the group only up to the member's end and verifies the member by its own id (as before; the group's id was never what verified a member). This applies to **every** member read, whole or range.
+  - `examples/bench.rs` reports `read_whole` and `read_4k` per corpus: over every distinct file, bytes decompressed + bytes produced by functions, for a whole read and for a 4 KiB read from the file's middle. Every range read must equal its slice, or the exactness gate fails. Graph corpora are skipped (0).
+  - Test `range_reads_equal_slices_of_whole_reads` (`tests/templates.rs`): windows over revisions and invoices, after ingest (slices) and after repack (templates, groups), equal slices of whole reads; at least one read through a plan costs less than the whole read; out-of-range reads are refused.
+  - `src/ingest.rs`: a struct-initializer form for `Cx`, required by clippy once `Cx.stack` became crate-visible. No behaviour change.
+- Read cost (decoded bytes; deterministic). "Full group" is a diagnostic run with the prefix limit removed (one run, reverted):
+  | corpus | whole, full group | whole, E028 | 4 KiB range, E028 | 4 KiB / whole |
+  |---|---:|---:|---:|---:|
+  | md | 18,714,864 | 9,265,537 (0.495x) | 9,265,537 | 1.000 |
+  | pdf | 2,386,018 | 1,259,030 (0.528x) | 1,259,030 | 1.000 |
+  | office | 239,158,160 | 162,904,289 (0.681x) | 162,904,289 | 1.000 |
+  | invoices | 1,565,130 | 825,330 (0.527x) | 825,330 | 1.000 |
+  | synthetic-history | 1,743,558 | 1,738,154 (0.997x) | 1,012,279 | 0.582 |
+  | repo-history | 52,233,071 | 33,631,273 (0.644x) | 31,206,091 | 0.928 |
+  | generated | 1,349,187 | 1,322,701 (0.980x) | 1,322,701 | 1.000 |
+  - **Attribution:** almost all of the gain is from prefix decoding of groups, and it applies to whole reads too (0.50–0.68x on md, pdf, office, invoices, repo-history). Range walking through plans helps only where files are plans: synthetic-history (0.58x of a whole read) and repo-history (0.93x). Elsewhere a 4 KiB read costs exactly as much as a whole read, because the file is a group member, a zip container or a WASM output, and the cost is decoding the leaf or container, not walking a plan.
+  - Reads still decode far more than they return: md's whole reads decode 9.3 MB to return its files (input 178,741 B over all snapshots), because each member read decodes its group from the start (up to 64 KiB) and office reads rebuild zips member by member.
+- Result: score 0.3302 -> **0.3302**; every corpus byte-identical to E027: md 0.8925, pdf 0.8338, office 0.4370, invoices 0.3655, synthetic-history 0.2786, repo-history 0.8586, repo-graph 0.1954, generated 0.0254; time 36.3–36.7 s (E027: 37.9 s; the full-group diagnostic: 37.3 s). Sizes and read costs identical on three runs (the third after the clippy fix).
+- Verdict: **kept** (score holds while adding a capability). Range reads through plans and half-cost member reads, both still verified per leaf. Not done: container ranges (zip members), WASM range maps, and per-segment reads inside a group (seekable blocks), which the read costs above point to as the remaining cost.
