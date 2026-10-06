@@ -496,7 +496,22 @@ fn baselines(snapshots: &[Snapshot]) -> (usize, usize) {
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let json = args.iter().any(|a| a == "--json");
-    let only: Vec<&String> = args.iter().filter(|a| !a.starts_with("--")).collect();
+    // Not a scoring option: writes the generated corpus out as input for an
+    // offline program writer (functions/write_programs.py), then exits.
+    if let Some(i) = args.iter().position(|a| a == "--dump-generated") {
+        let dir = Path::new(&args[i + 1]);
+        std::fs::create_dir_all(dir).unwrap();
+        for (name, bytes) in generated().concat() {
+            std::fs::write(dir.join(name), bytes).unwrap();
+        }
+        return;
+    }
+    let only: Vec<&String> = args
+        .iter()
+        .enumerate()
+        .filter(|(i, a)| !a.starts_with("--") && (*i == 0 || args[i - 1] != "--dump-generated"))
+        .map(|(_, a)| a)
+        .collect();
     let corpora: Vec<Corpus> = vec![
         ("md", || fixtures(&["md"]), false),
         ("pdf", || fixtures(&["pdf"]), false),
