@@ -163,8 +163,9 @@ With range reads, the evaluator can price **decode work actually needed** for a 
 | range reads through concat, fill, containers and groups (stop the frame early) | proposed | decode work per read, same stored bytes |
 | seekable groups (independent blocks) | proposed | bytes vs decode work per read, block size swept |
 | evaluator prices decompression | proposed | score and read metric together |
-| function library as a graph; hand-written baseline functions (rle, delta, transpose, reversal, arithmetic tables) | proposed | bytes on a new "generated" corpus |
-| deterministic DSL interpreter module + programs as arguments | proposed | program bytes vs zstd of the output |
-| generated corpus (computed tables, sequences, logs, procedural images) | proposed (benchmark change) | new reference score |
+| generated corpus (computed tables, sequences, logs, procedural images) | built (E021) | new reference 0.5225 |
+| deterministic integer interpreter (WASM) + programs as arguments; WASM fuel priced as decode work | built (E022); programs hand-written | generated 175,169 -> 12,851 B |
+| programs compiled to their own WASM modules (the interpreter costs ~1,300 wasmi fuel per op) | built (E023) | generated -> 6,241 B; Mandelbrot 440x less decode work |
+| function library as a graph under `meta/functions` (functions, applications, measured savings and work) | built (E024) | capability; bytes reported |
 | LLM function writer and relation extractor (offline, outputs recorded) | proposed (needs an API key or a local model) | bytes saved per function and relation (measured `gain_bits`) |
 | per-family dictionaries from relations | proposed | office/md bytes |

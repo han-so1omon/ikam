@@ -13,12 +13,13 @@ use wasmi::{Config, Engine, Linker, Module, StoreLimits, StoreLimitsBuilder};
 
 use crate::Error;
 
-/// Fuel budget per call: a hard bound on any one read (about 30 s at
-/// measured wasmi speeds). Part of a function's semantics: a call that runs
-/// out of fuel has no output. Raising it only lets more calls succeed; every
-/// recorded derivation already succeeded. Whether a slow function is worth
-/// using is the evaluator's call (`run` reports the fuel spent).
-const FUEL: u64 = 1 << 38;
+/// Fuel budget per call: a hard bound on any one read. Measured: a module
+/// that never stops exhausts it in ~2.2 s (at 2^38 it took 572 s, E024).
+/// Part of a function's semantics: a call that runs out of fuel has no
+/// output. Slow-but-bounded functions are priced by the evaluator (`run`
+/// reports the fuel spent); programs that need more fuel are compiled
+/// (`functions/compile.py`) rather than given a larger budget.
+const FUEL: u64 = 1 << 30;
 /// wasmi fuel per unit of decode work (one unit = one byte produced by a
 /// builtin). Measured: interpreted programs spend ~1,000-2,000 fuel per byte
 /// they output, so an interpreted generator costs 1-2x its output in work.
