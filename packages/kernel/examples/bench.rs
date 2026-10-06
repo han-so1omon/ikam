@@ -219,9 +219,10 @@ type Candidate<'a> = (&'a str, &'a str, Id, f64, f64);
 /// `functions/proposals.txt` (written by `examples/programs.rs`) whose output
 /// is a file of this corpus. A file may have several forms (a program for
 /// the shared interpreter, or the same program compiled to its own module).
-/// The proposer offers the form with the lowest estimated cost: function
-/// bytes (the interpreter's shared by the files using it) + argument bytes +
-/// read weight x decode work, and only if that is below the output's size.
+/// The proposer prices a set of choices jointly, as repack stores them:
+/// zstd of the distinct function and argument contents chosen (one group) +
+/// read weight x decode work + zstd of each file left stored. Coordinate
+/// descent picks, per file, the form (or none) that lowers that total.
 /// The kernel verifies what is offered; repack keeps it only if it pays.
 fn propose_programs(repo: &mut Repo<MemStore>, snapshots: &[Snapshot]) {
     let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("functions");
@@ -246,21 +247,55 @@ fn propose_programs(repo: &mut Repo<MemStore>, snapshots: &[Snapshot]) {
         })
         .filter(|p: &Candidate| files.contains_key(&p.2))
         .collect();
-    let size = |path: &str| std::fs::metadata(dir.join(path)).map_or(0.0, |m| m.len() as f64);
-    let users = |func: &str| found.iter().filter(|p| p.0 == func).count() as f64;
-    let cost = |p: &Candidate| {
-        size(p.0) / users(p.0)
-            + if p.1 == "-" { 0.0 } else { size(p.1) }
-            + ikam_kernel::DEFAULT_READ_WEIGHT * p.4
+    let zstd = |b: &[u8]| zstd::bulk::compress(b, 3).unwrap().len() as f64;
+    let read = |path: &str| std::fs::read(dir.join(path)).unwrap();
+    let outputs: BTreeSet<Id> = found.iter().map(|p| p.2).collect();
+    let stored: BTreeMap<Id, f64> = outputs.iter().map(|o| (*o, zstd(files[o]))).collect();
+    let total = |chosen: &BTreeMap<Id, &Candidate>| {
+        let parts: BTreeSet<&str> = chosen
+            .values()
+            .flat_map(|p| [p.0, p.1])
+            .filter(|f| *f != "-")
+            .collect();
+        let group: Vec<u8> = parts.iter().flat_map(|f| read(f)).collect();
+        let work: f64 = chosen.values().map(|p| p.4).sum();
+        let left: f64 = stored
+            .iter()
+            .filter(|(o, _)| !chosen.contains_key(o))
+            .map(|(_, s)| s)
+            .sum();
+        zstd(&group) + ikam_kernel::DEFAULT_READ_WEIGHT * work + left
     };
-    let mut best: BTreeMap<Id, (f64, &Candidate)> = BTreeMap::new();
-    for p in &found {
-        let c = cost(p);
-        if c < p.3 && best.get(&p.2).is_none_or(|b| c < b.0) {
-            best.insert(p.2, (c, p));
+    let mut best: BTreeMap<Id, &Candidate> = BTreeMap::new();
+    let mut changed = true;
+    while changed {
+        changed = false;
+        for out in &outputs {
+            let mut options: Vec<Option<&Candidate>> = vec![None];
+            options.extend(found.iter().filter(|p| p.2 == *out).map(Some));
+            let price = |o: &Option<&Candidate>| {
+                let mut c = best.clone();
+                match o {
+                    Some(p) => c.insert(*out, p),
+                    None => c.remove(out),
+                };
+                total(&c)
+            };
+            let now = price(&best.get(out).copied());
+            let pick = options
+                .iter()
+                .min_by(|a, b| price(a).total_cmp(&price(b)))
+                .unwrap();
+            if price(pick) < now {
+                match pick {
+                    Some(p) => best.insert(*out, p),
+                    None => best.remove(out),
+                };
+                changed = true;
+            }
         }
     }
-    for (out, (_, p)) in best {
+    for (out, p) in best {
         let func = repo
             .put_content(&std::fs::read(dir.join(p.0)).unwrap())
             .unwrap()
