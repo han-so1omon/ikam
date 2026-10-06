@@ -100,7 +100,15 @@ fn proposed_groups(items: &[(Vec<u8>, Id, usize)], order: &[Id]) -> Vec<Vec<usiz
 /// bytes the group compresses best: the largest saving `C(x) - (C(G x) -
 /// C(G))`, measured with the kernel's own zstd and dictionary (a
 /// compression-native resemblance, after Cilibrasi and Vitanyi's NCD).
-fn similar_groups(items: &[(Vec<u8>, Id, usize)], measure: Option<&[u8]>) -> Vec<Vec<usize>> {
+///
+/// With `order` (a rank per item), groups start and grow in that order
+/// instead of by seed score: the order shortlists candidates and `measure`
+/// still picks.
+fn similar_groups(
+    items: &[(Vec<u8>, Id, usize)],
+    measure: Option<&[u8]>,
+    order: Option<&[usize]>,
+) -> Vec<Vec<usize>> {
     let mut zstd = measure.and_then(framer);
     let mut cost = |b: &[u8]| {
         zstd.as_mut()
@@ -113,7 +121,13 @@ fn similar_groups(items: &[(Vec<u8>, Id, usize)], measure: Option<&[u8]>) -> Vec
         s.iter().for_each(|k| index.entry(*k).or_default().push(i));
     }
     let (mut placed, mut groups) = (vec![false; items.len()], Vec::new());
-    while let Some(first) = placed.iter().position(|p| !p) {
+    let unplaced_first = |placed: &[bool]| match order {
+        None => placed.iter().position(|p| !p),
+        Some(rank) => (0..items.len())
+            .filter(|&j| !placed[j])
+            .min_by_key(|&j| rank[j]),
+    };
+    while let Some(first) = unplaced_first(&placed) {
         let (mut group, mut size, mut seen) = (Vec::new(), 0, HashSet::new());
         let (mut score, mut joined) = (vec![0usize; items.len()], Vec::new());
         let mut next = Some(first);
@@ -131,7 +145,10 @@ fn similar_groups(items: &[(Vec<u8>, Id, usize)], measure: Option<&[u8]>) -> Vec
             }
             let fits = |j: usize| !placed[j] && size + items[j].0.len() <= GROUP_SIZE;
             let mut ranked: Vec<usize> = (0..items.len()).filter(|&j| fits(j)).collect();
-            ranked.sort_by_key(|&j| (std::cmp::Reverse(score[j]), j));
+            match order {
+                None => ranked.sort_by_key(|&j| (std::cmp::Reverse(score[j]), j)),
+                Some(rank) => ranked.sort_by_key(|&j| rank[j]),
+            }
             next = match measure {
                 None => ranked.first().copied(),
                 Some(_) => {
@@ -226,8 +243,14 @@ impl<S: Store> Repo<S> {
             .unwrap_or_default();
         let proposals = [
             byte_order_groups(&items),
-            similar_groups(&items, None),
-            similar_groups(&items, Some(&dict)),
+            similar_groups(&items, None, None),
+            similar_groups(&items, Some(&dict), None),
+            // Byte order shortlists, measured cost picks.
+            similar_groups(
+                &items,
+                Some(&dict),
+                Some(&(0..items.len()).collect::<Vec<_>>()),
+            ),
             proposed_groups(&items, &self.proposed_order),
         ];
         for proposal in proposals {

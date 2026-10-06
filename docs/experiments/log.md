@@ -287,3 +287,10 @@ Newest last. Format and rules: `README.md`.
   - b: the embedding order shortlists candidates and measured cost picks (DeepSketch-style). Score 0.4763, but **not a semantic gain**: it improved only invoices (5,191 -> 4,941) and repo-graph, which have no embeddings. The fallback ranked their items in byte order, making b also a "byte-order shortlist + measured cost" proposer. md and repo-history did not improve. Time +30%. That proposer is tested on its own in E020.
 - Result (a): score 0.4798 -> **0.4797**; md 68,706 -> 68,625 (-81 B), every other corpus unchanged; time 28.1 s -> 30.3 s. Sizes identical on a second run.
 - Verdict: kept as a capability (an offline, reproducible semantic proposer and the hook an LLM proposer would use), with a **neutral storage effect** on this benchmark. Embeddings are informative but are dominated by measured compression here.
+
+### E020 byte-order-cost groups
+- Branch / parent: exp/020-byte-order-cost / E019
+- Hypothesis: measured cost helps whichever proposal shortlists candidates. A proposer that grows groups in byte order but adds, from the next 8 unplaced contents, the one the group compresses best wins where byte order already wins (invoices, repo-graph) (source: E019 variant b, whose gain came from this fallback and not from embeddings; `docs/research/semantic-grouping.md` H2)
+- Change: `src/group.rs`: `similar_groups` takes an optional rank order that shortlists candidates and starts groups (byte order here), and a fifth proposer uses it with measured cost. The E019 embedding proposer is unchanged.
+- Result: score 0.4797 -> **0.4762**; per corpus vs_dict: invoices 0.384->0.366 (5,191 -> 4,941), repo-graph 0.1957->0.1954, every other corpus byte-identical to E019 (md keeps the embedding proposer's 81 B); time 30.3 s -> 34.0 s (1.12x). Sizes identical on a second run.
+- Verdict: kept. Across E017–E020, measured compression is the deciding signal, and resemblance signals (byte order, seeds, embeddings) are only useful as shortlists.
