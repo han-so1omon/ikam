@@ -454,3 +454,28 @@ Newest last. Format and rules: `README.md`.
   - Variant a is 1.7% smaller than E030, because there plans were also chosen and groups grown by level-19 sizes.
 - **Caveat on the baseline:** the baseline is still zstd level 3 with a trained dictionary (the benchmark contract, unchanged here). Part of this gain is a stronger setting of the same codec, not a better structure. A level-19 baseline would be a benchmark change (its own entry, scores not comparable). The "vs zstd" ratios now compare a level-19 store with a level-3 baseline.
 - Verdict: **kept.** The largest single gain since E022, from one tunable plus a final recompression pass. Next: other codecs as candidates (xz, brotli) chosen per piece, and domain transforms before the coder.
+
+### E031 codec-candidates
+- Branch / parent: exp/031-codec-candidates / E030
+- Hypothesis: after E030, zstd frames are still most stored bytes. Offering two other codecs and keeping the smallest encoding per stored piece shrinks the store further, mostly on large frames, since neither codec uses the shared dictionary (source: measurement before E030, whole-file samples: xz -9e 0.83–0.85x and brotli-11 0.81–0.95x of zstd-19 on the repo's markdown, Rust source, server.log and metrics.csv)
+- Change:
+  - New `src/codec.rs`: "X" is an .lzma stream (LZMA at xz's preset 9e, dictionary sized to the input, so decoding a small frame allocates little); "R" is brotli at quality 11 (window sized to the input). Both decode as streams, so a group member's prefix read still stops at the member's end. Decoded bytes count in `decompressed_bytes`.
+  - `src/dict.rs`: `encode_smallest` (zstd at the repo's level, .lzma or brotli, whichever is smallest); "X" and "R" are plain encodings for `is_plain`, `decode_plain` and `decode_prefix`.
+  - `src/repack.rs` `recompress` uses `encode_smallest` for plain content (the dictionary stays "B"/"Z"). Plans are still compared with zstd level 3.
+  - `Cargo.toml`: `xz2 =0.1.7` (static liblzma) and `brotli =9.0.0`, pinned like the other compressors.
+  - Test `codecs_round_trip_and_read_prefixes`.
+- Result (two runs, identical sizes): score 0.2900 -> **0.2859** (-1.4%).
+  | corpus | E030 | E031 | ratio | frames now .lzma / brotli |
+  |---|---:|---:|---:|---|
+  | md | 63,422 | 60,560 | 0.955 | 0 / 3 |
+  | pdf | 20,379 | 20,379 | 1.000 | – |
+  | office | 148,812 | 148,607 | 0.999 | 2 / 1 |
+  | invoices | 3,370 | 3,370 | 1.000 | – |
+  | synthetic-history | 15,655 | 14,675 | 0.937 | 0 / 1 |
+  | repo-history | 907,851 | 905,850 | 0.998 | 0 / 8 (77 frames stay zstd + dictionary, 697 KB) |
+  | repo-graph | 19,871 | 19,871 | 1.000 | – |
+  | generated | 4,260 | 4,260 | 1.000 | – |
+  - vs_dict: md 0.8248 -> 0.7876, office 0.3804 -> 0.3798, synthetic-history 0.2577 -> 0.2416, repo-history 0.7034 -> 0.7018; the others unchanged.
+  - Time 52.5 s -> 67.6 s (1.29x). The added repack time over all corpora (15.0 s) accounts for all of it. Read cost in decoded bytes is identical to E030 (as expected; the measure counts bytes, not CPU). xz and brotli decode more slowly per byte than zstd, which no figure here prices; read time is not measured separately.
+  - **Attribution:** brotli wins 13 frames and .lzma 2, all large ones (groups or whole files). Small frames keep zstd with the dictionary. On repo-history the dictionary beats both new codecs on most frames.
+- Verdict: **kept** (score improves; gain modest and concentrated in md and synthetic-history). Not tried: codecs with a shared dictionary (brotli's shared-dictionary format, LZMA2 preset dictionaries), which the repo-history result points to.
