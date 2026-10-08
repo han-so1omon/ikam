@@ -94,7 +94,7 @@ pub(crate) fn names(prefix: &[u8], id: &Id) -> bool {
     id.as_bytes().starts_with(prefix)
 }
 
-/// zstd level 3 in the kernel's frame format: no magic number, content size,
+/// zstd at `LEVEL` in the kernel's frame format: no magic number, content size,
 /// checksum or dictionary id. The encoding around a frame already says what
 /// it is, and decoded bytes are always checked against their id, so those
 /// fields would only repeat what is known (up to ~10 B per stored object).
@@ -103,12 +103,16 @@ pub(crate) fn zstd_frame(bytes: &[u8], dict: &[u8]) -> Option<Vec<u8>> {
     framer(dict)?.compress(bytes).ok()
 }
 
+/// zstd level of every stored frame. Decoding speed barely depends on the
+/// level; encoding (ingest, repack) is slower at higher levels.
+pub(crate) const LEVEL: i32 = 19;
+
 /// A compressor for `zstd_frame`'s format, reusable across many inputs.
 pub(crate) fn framer(dict: &[u8]) -> Option<zstd::bulk::Compressor<'static>> {
     use zstd::zstd_safe::{CParameter, FrameFormat};
     let mut c = match dict.is_empty() {
-        true => zstd::bulk::Compressor::new(3).ok()?,
-        false => zstd::bulk::Compressor::with_dictionary(3, dict).ok()?,
+        true => zstd::bulk::Compressor::new(LEVEL).ok()?,
+        false => zstd::bulk::Compressor::with_dictionary(LEVEL, dict).ok()?,
     };
     for p in [
         CParameter::Format(FrameFormat::Magicless),
