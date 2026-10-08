@@ -6,6 +6,7 @@
 
 mod abbrev;
 mod claims;
+mod codec;
 mod container;
 mod dict;
 mod exec;

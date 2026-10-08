@@ -316,7 +316,7 @@ impl<S: Store + Sync> Repo<S> {
                         // A dictionary is never encoded against a dictionary.
                         true => zstd_frame(&bytes, &[], STORE_LEVEL)
                             .map_or(stored.clone(), |z| [&b"Z"[..], &z].concat()),
-                        false => self.encode_plain(&bytes),
+                        false => self.encode_smallest(&bytes),
                     }
                 }
                 Some(_) if object_tag(&stored).is_some() && tree_content(&stored).is_none() => {

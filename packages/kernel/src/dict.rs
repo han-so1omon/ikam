@@ -3,6 +3,7 @@
 //! Stored bytes are encoded as the smallest of:
 //!   "B" bytes | "Z" zstd(bytes) | "Y" dict[4] zstd_with_dict(bytes)
 //!   | "S" group[8] start:varint len:varint   (bytes of a group, see `group.rs`)
+//!   | "X" .lzma(bytes) | "R" brotli(bytes)     (only from repack, see `codec.rs`)
 //! Identity is always over the uncompressed bytes, so the choice never
 //! changes an id. The dictionary is ordinary content, named by the ref
 //! `meta/zstd-dict`. Exact reuse (slices, templates) and this statistical
@@ -34,7 +35,7 @@
 
 use std::io::Read;
 
-use crate::{Error, Id, Repo, Store};
+use crate::{Error, Id, Repo, Store, codec};
 
 pub(crate) const DICT_REF: &str = "meta/zstd-dict";
 /// Mode-byte flag: a tree body with abbreviated ids (see `abbrev.rs`).
@@ -47,7 +48,10 @@ type DictRef = [u8; DICT_REF_LEN];
 
 /// True for any plain encoding of content bytes.
 pub(crate) fn is_plain(encoded: &[u8]) -> bool {
-    matches!(encoded.first(), Some(b'B' | b'Z' | b'Y' | b'S'))
+    matches!(
+        encoded.first(),
+        Some(b'B' | b'Z' | b'Y' | b'X' | b'R' | b'S')
+    )
 }
 
 /// The id prefix of the stored content an encoding cannot be decoded
@@ -150,6 +154,10 @@ pub fn decompressed_bytes() -> usize {
     DECOMPRESSED.with(|d| d.get())
 }
 
+pub(crate) fn count_decompressed(n: usize) {
+    DECOMPRESSED.with(|d| d.set(d.get() + n));
+}
+
 /// Decode at most the first `limit` bytes of a frame: zstd decodes
 /// sequentially, so a prefix costs only its own length.
 pub(crate) fn unzstd_prefix(frame: &[u8], dict: &[u8], limit: usize) -> Option<Vec<u8>> {
@@ -165,7 +173,7 @@ pub(crate) fn unzstd_prefix(frame: &[u8], dict: &[u8], limit: usize) -> Option<V
         .take(limit as u64)
         .read_to_end(&mut out)
         .ok()?;
-    DECOMPRESSED.with(|d| d.set(d.get() + out.len()));
+    count_decompressed(out.len());
     Some(out)
 }
 
@@ -216,6 +224,18 @@ impl<S: Store> Repo<S> {
             && z.len() + DICT_REF_LEN < best.as_ref().map_or(bytes.len(), |b| b.1.len())
         {
             best = Some((Some(*id), z));
+        }
+        best
+    }
+
+    /// The smallest plain encoding of `bytes` among zstd (at the repo's
+    /// level), .lzma and brotli: for what repack keeps.
+    pub(crate) fn encode_smallest(&self, bytes: &[u8]) -> Vec<u8> {
+        let mut best = self.encode_plain(bytes);
+        for (tag, code) in [(b'X', codec::xz(bytes)), (b'R', codec::brotli(bytes))] {
+            if let Some(c) = code.filter(|c| c.len() + 1 < best.len()) {
+                best = [&[tag][..], &c].concat();
+            }
         }
         best
     }
@@ -299,15 +319,15 @@ impl<S: Store> Repo<S> {
     /// output does.
     pub(crate) fn decode_plain(&self, id: &Id, encoded: &[u8]) -> Result<Vec<u8>, Error> {
         match encoded.first() {
-            Some(b'Y') => {
-                self.unzstd_with_dict(id, encoded, 1, usize::MAX, &|b| Id::of_content(b) == *id)
+            Some(b'Y' | b'X' | b'R') => {
+                self.decode_prefix(id, encoded, usize::MAX, &|b| Id::of_content(b) == *id)
             }
             Some(b'S') => self.read_member(id, encoded),
             _ => decode_basic(id, encoded),
         }
     }
 
-    /// The first `limit` bytes of a plain encoding ("B", "Z" or "Y"), if
+    /// The first `limit` bytes of a plain encoding ("B", "Z", "Y", "X" or "R"), if
     /// they pass `check`. Nothing here verifies the whole content's id, so
     /// `check` must verify what the caller uses (a group member's own id).
     pub(crate) fn decode_prefix(
@@ -320,6 +340,8 @@ impl<S: Store> Repo<S> {
         let out = match encoded.split_first() {
             Some((b'B', bytes)) => Some(bytes[..limit.min(bytes.len())].to_vec()),
             Some((b'Z', z)) => unzstd_prefix(z, &[], limit),
+            Some((b'X', x)) => codec::unxz_prefix(x, limit),
+            Some((b'R', r)) => codec::unbrotli_prefix(r, limit),
             Some((b'Y', _)) => return self.unzstd_with_dict(id, encoded, 1, limit, check),
             _ => return Err(Error::WrongKind(*id)),
         };
