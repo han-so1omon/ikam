@@ -479,3 +479,29 @@ Newest last. Format and rules: `README.md`.
   - Time 52.5 s -> 67.6 s (1.29x). The added repack time over all corpora (15.0 s) accounts for all of it. Read cost in decoded bytes is identical to E030 (as expected; the measure counts bytes, not CPU). xz and brotli decode more slowly per byte than zstd, which no figure here prices; read time is not measured separately.
   - **Attribution:** brotli wins 13 frames and .lzma 2, all large ones (groups or whole files). Small frames keep zstd with the dictionary. On repo-history the dictionary beats both new codecs on most frames.
 - Verdict: **kept** (score improves; gain modest and concentrated in md and synthetic-history). Not tried: codecs with a shared dictionary (brotli's shared-dictionary format, LZMA2 preset dictionaries), which the repo-history result points to.
+
+### E032 domain-transforms (offline measurement; no kernel change)
+- Branch / parent: exp/032-domain-transforms / E031
+- Hypothesis: transforming stored content before the coder (fields and columns for logs and CSV, markup and text separated for XML as in XMill, block sorting as in bzip2) shrinks what the coders leave (source: the coder comparison before E030; server.log and metrics.csv shrank most under stronger coders)
+- Method:
+  - A temporary diagnostic in `examples/bench.rs` (not committed) dumped every plain leaf ("B", "Z", "Y", "X", "R") after repack for office, repo-history, md and synthetic-history.
+  - Offline, each leaf was compressed with: bzip2-9 (BWT); PPMd orders 6 and 8 (pyppmd, 16 MiB); and, for XML leaves, an XMill-style split (markup and character data as two streams, each coded with the best of xz -9e, brotli-11 and PPMd). Each candidate counts only where it beats the leaf's current encoding (best of zstd-19 with or without dictionary, .lzma and brotli), plus 1–2 B of tags.
+- What the leaves are:
+  - repo-history: 89 leaves, 866,301 B stored (4.76 MB decoded), mostly 64 KiB groups of Python, markdown and lock files.
+  - office: 22 leaves, 88,607 B, of which XML 50,173 B (docx, pptx and sheet XML), plus zip-header groups and the dictionary.
+  - md: 4 leaves, 46,339 B; synthetic-history: 1 leaf, 8,780 B (markdown).
+  - No CSV or log content is stored as a leaf. The generated corpus's CSV and log are stored as programs (E022–E026).
+- Measured (leaf bytes, candidate / current):
+  | corpus | bzip2-9 | PPMd o6 | PPMd o8 | XMill-style (XML leaves only) |
+  |---|---:|---:|---:|---:|
+  | office | 0.989 | 1.000 | 0.993 | 50,173 -> 50,008 (0.997) |
+  | repo-history | 0.999 | 0.989 | 0.983 | – |
+  | md | 1.000 | 0.947 | 0.929 | – |
+  | synthetic-history | 1.000 | 0.970 | 0.966 | – |
+- Result: no kernel change, so the score stays **0.2859**.
+- Verdict: **not applicable / refuted on this benchmark.**
+  - Field and column transforms have no target: the only structured text (generated) is already stored as programs.
+  - The XML split saves 0.3% of office's XML leaves.
+  - Block sorting saves at most 1.1%.
+  - The largest remaining gain is a context-modelling **codec** (PPMd: md -7.1%, synthetic-history -3.4%, repo-history -1.7%), not a transform.
+  - Testing transforms properly needs a corpus of structured data (CSV, logs, JSON) that programs do not already cover, which would be a benchmark change.
