@@ -427,3 +427,30 @@ Newest last. Format and rules: `README.md`.
   - Reads still decode far more than they return: md's whole reads decode 9.3 MB to return its files (input 178,741 B over all snapshots), because each member read decodes its group from the start (up to 64 KiB) and office reads rebuild zips member by member.
 - Result: score 0.3302 -> **0.3302**; every corpus byte-identical to E027: md 0.8925, pdf 0.8338, office 0.4370, invoices 0.3655, synthetic-history 0.2786, repo-history 0.8586, repo-graph 0.1954, generated 0.0254; time 36.3–36.7 s (E027: 37.9 s; the full-group diagnostic: 37.3 s). Sizes and read costs identical on three runs (the third after the clippy fix).
 - Verdict: **kept** (score holds while adding a capability). Range reads through plans and half-cost member reads, both still verified per leaf. Not done: container ranges (zip members), WASM range maps, and per-segment reads inside a group (seekable blocks), which the read costs above point to as the remaining cost.
+
+### E030 zstd-level
+- Branch / parent: exp/030-zstd-level / E028
+- Hypothesis: most stored bytes are zstd frames, all written at level 3, so a higher level shrinks the store at almost no read cost (zstd decodes about as fast at any level). Comparing plans at level 3 and compressing only the kept plan at the high level keeps most of the gain at a fraction of the time (source: measurement. zstd frames (Y/Z) are 47–96% of stored bytes per corpus in E028; on whole-file samples zstd-19 is 0.84x of zstd-3 on the repo's markdown, 0.82x on its Rust source, 0.65x on server.log, 0.59x on metrics.csv, with xz -9e and brotli-11 smaller still)
+- Change:
+  - `src/dict.rs`: `MEASURE_LEVEL` (3) for estimates (group growth, dictionary scoring, trial plans) and for what ingest writes; `STORE_LEVEL` (19) for what repack keeps. `framer` stays at the measuring level; `zstd_frame` takes a level; encoders use the repo's `level`.
+  - `src/repo.rs`: `Repo.level`, `MEASURE_LEVEL` by default.
+  - `src/repack.rs`: `Repo::recompress` re-encodes every plain frame and compressible object at `STORE_LEVEL`, checking decoded content against its id first, and keeps an encoding only if it is smaller. Repack compares plans at level 3, then recompresses the kept plan before comparing it with the current store. Objects repack re-encodes afterwards also use `STORE_LEVEL`. The dictionary itself is only ever re-encoded as "B" or "Z" (decoding never chains).
+  - Test `recompress_shrinks_and_keeps_the_dictionary_plain` (fails with the dictionary guard removed: checked once).
+  - A first version without that guard re-encoded the dictionary against itself. The exactness gate failed on md (`Corrupt` on read) before any score was recorded.
+- Variant a (diagnostic; committed as wip `cfdf03c`, superseded): level 19 for **everything**, including every trial plan and measurement. One run: score 0.2851; time 37.3 s -> **1,175.7 s (32x)**, e.g. office repack 12.4 s -> 426.6 s, repo-history 15.7 s -> 566.8 s.
+- Result (kept variant, two runs, identical sizes): score 0.3302 -> **0.2900** (-12.2%, 89% of variant a's gain).
+  | corpus | E028 | variant a (all level 19) | E030 | E030 / E028 |
+  |---|---:|---:|---:|---:|
+  | md | 68,625 | 60,560 | 63,422 | 0.924 |
+  | pdf | 20,547 | 20,334 | 20,379 | 0.992 |
+  | office | 170,953 | 148,368 | 148,812 | 0.870 |
+  | invoices | 4,941 | 3,343 | 3,370 | 0.682 |
+  | synthetic-history | 16,926 | 15,073 | 15,655 | 0.925 |
+  | repo-history | 1,108,165 | 891,517 | 907,851 | 0.819 |
+  | repo-graph | 22,161 | 19,488 | 19,871 | 0.897 |
+  | generated | 4,454 | 4,253 | 4,260 | 0.956 |
+  - vs_dict: md 0.8925 -> 0.8248, pdf 0.8338 -> 0.8270, office 0.4370 -> 0.3804, invoices 0.3655 -> 0.2493, synthetic-history 0.2786 -> 0.2577, repo-history 0.8586 -> 0.7034, repo-graph 0.1954 -> 0.1752, generated 0.0254 -> 0.0243.
+  - Time 36.7 s -> 51.6–52.5 s (1.4x): the kept plan is compressed at level 19 once per repack. Read cost (`read_whole`, `read_4k`): identical bytes decoded on every corpus.
+  - Variant a is 1.7% smaller than E030, because there plans were also chosen and groups grown by level-19 sizes.
+- **Caveat on the baseline:** the baseline is still zstd level 3 with a trained dictionary (the benchmark contract, unchanged here). Part of this gain is a stronger setting of the same codec, not a better structure. A level-19 baseline would be a benchmark change (its own entry, scores not comparable). The "vs zstd" ratios now compare a level-19 store with a level-3 baseline.
+- Verdict: **kept.** The largest single gain since E022, from one tunable plus a final recompression pass. Next: other codecs as candidates (xz, brotli) chosen per piece, and domain transforms before the coder.

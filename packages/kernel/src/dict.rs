@@ -94,25 +94,33 @@ pub(crate) fn names(prefix: &[u8], id: &Id) -> bool {
     id.as_bytes().starts_with(prefix)
 }
 
-/// zstd at `LEVEL` in the kernel's frame format: no magic number, content size,
+/// zstd at `level` in the kernel's frame format: no magic number, content size,
 /// checksum or dictionary id. The encoding around a frame already says what
 /// it is, and decoded bytes are always checked against their id, so those
 /// fields would only repeat what is known (up to ~10 B per stored object).
 /// `dict` empty means no dictionary.
-pub(crate) fn zstd_frame(bytes: &[u8], dict: &[u8]) -> Option<Vec<u8>> {
-    framer(dict)?.compress(bytes).ok()
+pub(crate) fn zstd_frame(bytes: &[u8], dict: &[u8], level: i32) -> Option<Vec<u8>> {
+    framer_at(dict, level)?.compress(bytes).ok()
 }
 
-/// zstd level of every stored frame. Decoding speed barely depends on the
-/// level; encoding (ingest, repack) is slower at higher levels.
-pub(crate) const LEVEL: i32 = 19;
+/// zstd level for estimates (growing groups, scoring dictionaries, comparing
+/// trial plans) and for what ingest writes: fast.
+pub(crate) const MEASURE_LEVEL: i32 = 3;
+/// zstd level of what repack finally keeps (`Repo::recompress`). Decoding
+/// speed barely depends on the level; only encoding is slower.
+pub(crate) const STORE_LEVEL: i32 = 19;
 
-/// A compressor for `zstd_frame`'s format, reusable across many inputs.
+/// A compressor for `zstd_frame`'s format at `MEASURE_LEVEL`, reusable
+/// across many inputs.
 pub(crate) fn framer(dict: &[u8]) -> Option<zstd::bulk::Compressor<'static>> {
+    framer_at(dict, MEASURE_LEVEL)
+}
+
+fn framer_at(dict: &[u8], level: i32) -> Option<zstd::bulk::Compressor<'static>> {
     use zstd::zstd_safe::{CParameter, FrameFormat};
     let mut c = match dict.is_empty() {
-        true => zstd::bulk::Compressor::new(LEVEL).ok()?,
-        false => zstd::bulk::Compressor::with_dictionary(LEVEL, dict).ok()?,
+        true => zstd::bulk::Compressor::new(level).ok()?,
+        false => zstd::bulk::Compressor::with_dictionary(level, dict).ok()?,
     };
     for p in [
         CParameter::Format(FrameFormat::Magicless),
@@ -184,7 +192,7 @@ impl<S: Store> Repo<S> {
     /// Store `dict` as content and make it the current dictionary.
     pub(crate) fn set_dictionary(&mut self, dict: Vec<u8>) -> Result<Id, Error> {
         let id = Id::of_content(&dict);
-        let z = zstd_frame(&dict, &[]).filter(|z| z.len() < dict.len());
+        let z = zstd_frame(&dict, &[], self.level).filter(|z| z.len() < dict.len());
         let encoded = z.map_or_else(|| [&b"B"[..], &dict].concat(), |z| [&b"Z"[..], &z].concat());
         self.write(id, &encoded)?;
         let current = self.store.get_ref(DICT_REF)?;
@@ -198,13 +206,13 @@ impl<S: Store> Repo<S> {
     /// `bytes`.
     fn compress(&self, bytes: &[u8]) -> Option<(Option<Id>, Vec<u8>)> {
         let mut best: Option<(Option<Id>, Vec<u8>)> = None;
-        if let Some(z) = zstd_frame(bytes, &[])
+        if let Some(z) = zstd_frame(bytes, &[], self.level)
             && z.len() < bytes.len()
         {
             best = Some((None, z));
         }
         if let Some((id, dict)) = self.dictionary()
-            && let Some(z) = zstd_frame(bytes, dict)
+            && let Some(z) = zstd_frame(bytes, dict, self.level)
             && z.len() + DICT_REF_LEN < best.as_ref().map_or(bytes.len(), |b| b.1.len())
         {
             best = Some((Some(*id), z));
