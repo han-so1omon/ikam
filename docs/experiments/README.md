@@ -15,7 +15,7 @@ How we improve the kernel: one fixed command, one score, hard gates, one hypothe
 - **Reported, not scored:** per-corpus bytes, `vs_dict` ratios and times; since E028, read costs (`read_whole`, `read_4k`: bytes decompressed + bytes produced by functions, over every distinct file, for whole reads and 4 KiB range reads; deterministic).
   - Sizes are deterministic and reproduce exactly. Times are noisy.
   - A change that worsens time by more than 2× must say so in its result.
-- **Tunables live in code** (constants such as `DEFAULT_READ_WEIGHT`, `GAP_DIFF`, `STAR_CANDIDATES`, dictionary sizing). An experiment edits them on its branch.
+- **Tunables live in code** (constants such as `DEFAULT_READ_WEIGHT`, `GAP_DIFF`, `STAR_CANDIDATES`, dictionary sizing, the zstd levels `MEASURE_LEVEL` and `STORE_LEVEL`). An experiment edits them on its branch.
 
 ## The loop
 

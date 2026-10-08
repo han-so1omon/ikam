@@ -21,7 +21,10 @@
 use std::cmp::Reverse;
 use std::collections::{HashMap, HashSet};
 
-use crate::dict::{DICT_REF, DICT_REF_LEN, framer, is_plain, object_tag, tree_content};
+use crate::dict::{
+    DICT_REF, DICT_REF_LEN, MEASURE_LEVEL, STORE_LEVEL, framer, is_plain, object_tag, tree_content,
+    zstd_frame,
+};
 use crate::ingest::derivation_size;
 use crate::matcher::{self, Index};
 use crate::repo::Cx;
@@ -104,7 +107,8 @@ impl<S: Store + Sync> Repo<S> {
                 fresh = Some((size, plan));
             }
         }
-        let (_, fresh) = fresh.expect("at least one plan");
+        let (_, mut fresh) = fresh.expect("at least one plan");
+        fresh.recompress()?;
         let (before, after) = (self.content_bytes()?, fresh.content_bytes()?);
         if after >= before {
             return Ok(Repacked {
@@ -134,12 +138,14 @@ impl<S: Store + Sync> Repo<S> {
         }
         self.reset_projections();
         // Objects the re-plan did not rebuild move to the new dictionary.
+        self.level = STORE_LEVEL;
         for (id, canonical) in self.lasting_objects()? {
             let encoded = self.encode_object(&canonical);
             if self.store.read(&id)? != encoded {
                 self.store.replace(id, &encoded)?;
             }
         }
+        self.level = MEASURE_LEVEL;
         self.gc()?; // drop claims about content the new plan no longer holds
         Ok(Repacked {
             before,
@@ -289,6 +295,42 @@ impl<S: Store + Sync> Repo<S> {
     fn is_content_or_derivation(&self, id: &Id) -> Result<bool, Error> {
         let encoded = self.store.read(id)?;
         Ok(is_plain(&encoded) || object_tag(&encoded) == Some(b'D'))
+    }
+
+    /// Re-encode every plain frame and compressible object at
+    /// `STORE_LEVEL`, keeping a new encoding only if it is smaller. Plans
+    /// are compared at the fast `MEASURE_LEVEL`; only the one kept pays for
+    /// the slow level. Decoded content is checked against its id first.
+    pub(crate) fn recompress(&mut self) -> Result<(), Error> {
+        self.level = STORE_LEVEL;
+        let dict = self.dictionary().map(|(id, _)| *id);
+        for id in self.store.ids()? {
+            let stored = self.store.read(&id)?;
+            let encoded = match stored.first() {
+                Some(b'B' | b'Z' | b'Y') => {
+                    let bytes = self.decode_plain(&id, &stored)?;
+                    if Id::of_content(&bytes) != id {
+                        return Err(Error::Corrupt(id));
+                    }
+                    match Some(id) == dict {
+                        // A dictionary is never encoded against a dictionary.
+                        true => zstd_frame(&bytes, &[], STORE_LEVEL)
+                            .map_or(stored.clone(), |z| [&b"Z"[..], &z].concat()),
+                        false => self.encode_plain(&bytes),
+                    }
+                }
+                Some(_) if object_tag(&stored).is_some() && tree_content(&stored).is_none() => {
+                    self.encode_object(&self.read_object(&id)?)
+                }
+                _ => continue,
+            };
+            if encoded.len() < stored.len() {
+                self.store.replace(id, &encoded)?;
+            }
+        }
+        self.level = MEASURE_LEVEL;
+        self.reset_projections();
+        Ok(())
     }
 
     pub(crate) fn content_bytes(&self) -> Result<usize, Error> {
@@ -537,6 +579,39 @@ fn repeat_dictionary(samples: &[&[u8]], size: usize) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Recompression at the storing level keeps every content readable,
+    /// never grows an encoding, and keeps the dictionary itself out of
+    /// dictionary encodings (decoding never chains).
+    #[test]
+    fn recompress_shrinks_and_keeps_the_dictionary_plain() {
+        let mut repo = Repo::new(MemStore::default());
+        let docs: Vec<Vec<u8>> = (0..60)
+            .map(|i| {
+                format!(
+                    "entry {i}: {}\n",
+                    "shared words for the dictionary ".repeat(4 + i % 9)
+                )
+                .into_bytes()
+            })
+            .collect();
+        let sizes: Vec<usize> = docs.iter().map(Vec::len).collect();
+        let dict = zstd::dict::from_continuous(&docs.concat(), &sizes, 2048).unwrap();
+        let dict_id = repo.set_dictionary(dict).unwrap();
+        let ids: Vec<Id> = docs
+            .iter()
+            .map(|d| repo.put_content(d).unwrap().id)
+            .collect();
+        let size = |repo: &Repo<MemStore>, id: &Id| repo.store.read(id).unwrap().len();
+        let before: Vec<usize> = ids.iter().map(|id| size(&repo, id)).collect();
+        repo.recompress().unwrap();
+        assert!(matches!(repo.store.read(&dict_id).unwrap()[0], b'B' | b'Z'));
+        for ((id, d), b) in ids.iter().zip(&docs).zip(before) {
+            assert_eq!(&repo.read_content(id).unwrap(), d);
+            assert!(size(&repo, id) <= b);
+        }
+        assert_eq!(repo.level, MEASURE_LEVEL);
+    }
 
     /// Ingest is greedy, so pair templates may overfit; induction finds one
     /// template generalized over the whole cluster, and no document keeps
