@@ -18,6 +18,19 @@ const XZ_READ: usize = 13;
 const BROTLI_READ: usize = 4;
 const PPMD_READ: usize = 70;
 
+/// An encoder for one of these codecs.
+pub(crate) type Encoder = fn(&[u8]) -> Option<Vec<u8>>;
+
+/// The codecs `recompress` may try besides zstd: (tag, encoder, active).
+/// An inactive codec is **archived**: `recompress` no longer tries it,
+/// but its encoder and decoder stay, so frames stored with it still read
+/// and setting `active` again brings it back. Archived in E038: .lzma and
+/// PPMd, never chosen under the read-aware objective (E035–E037) at
+/// `DEFAULT_READ_WEIGHT`, while trying them cost repack time. They may
+/// pay for cold data (a lower read weight).
+pub(crate) const CODECS: [(u8, Encoder, bool); 3] =
+    [(b'X', xz, false), (b'R', brotli, true), (b'P', ppmd, false)];
+
 /// Decode time per byte of a plain encoding, relative to zstd.
 pub(crate) fn read_weight(tag: u8) -> usize {
     match tag {

@@ -276,19 +276,14 @@ impl<S: Store> Repo<S> {
     }
 
     /// The cheapest plain encoding of `bytes` among zstd (at the repo's
-    /// level), .lzma, brotli and PPMd, for what repack keeps: stored bytes +
+    /// level) and the active `codec::CODECS`, for what repack keeps: stored bytes +
     /// `read_weight` x the codec's decode time x `reads` (bytes decoded to
     /// read everything once, see `Repo::recompress`).
     pub(crate) fn encode_cheapest(&self, bytes: &[u8], reads: usize) -> Vec<u8> {
         let mut best = self.encode_plain(bytes);
-        let codes = [
-            (b'X', codec::xz(bytes)),
-            (b'R', codec::brotli(bytes)),
-            (b'P', codec::ppmd(bytes)),
-        ];
-        for (tag, code) in codes {
-            if let Some(c) = code {
-                let c = [&[tag][..], &c].concat();
+        for (tag, encode, _) in codec::CODECS.iter().filter(|c| c.2) {
+            if let Some(c) = encode(bytes) {
+                let c = [&[*tag][..], &c].concat();
                 if self.cost(&c, reads) < self.cost(&best, reads) {
                     best = c;
                 }
@@ -480,6 +475,24 @@ impl<S: Store> Repo<S> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Every codec in `codec::CODECS`, active or archived, still decodes
+    /// through `decode_plain`: archiving stops trying a codec, never
+    /// reading it.
+    #[test]
+    fn every_codec_in_the_table_still_decodes() {
+        let repo = Repo::new(crate::MemStore::default());
+        let text: Vec<u8> = (0..2000)
+            .flat_map(|i| format!("line {i}\n").into_bytes())
+            .collect();
+        for (tag, encode, _) in codec::CODECS {
+            let encoded = [&[tag][..], &encode(&text).unwrap()].concat();
+            assert_eq!(
+                repo.decode_plain(&Id::of_content(&text), &encoded).unwrap(),
+                text
+            );
+        }
+    }
 
     /// Codecs are chosen by stored bytes + read weight x decode time: a
     /// frame read very often keeps zstd, a frame never read takes the

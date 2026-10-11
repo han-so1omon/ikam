@@ -586,3 +586,13 @@ Newest last. Format and rules: `README.md`.
     - repo-graph loses because the planner prices reads for graph content, which the score does not measure (E036's limit).
     - repo-history is flat: blocking helps two groups, but the extra bytes cancel the read saved.
 - Verdict: **kept** (score improves). E029's hypothesis is confirmed once the objective counts reads and is the same everywhere. Remaining mismatch: graph corpora (the planner prices reads the benchmark does not measure); either measure graph reads in the benchmark or exclude graph content from read pricing.
+
+### E038 archive-slow-codecs
+- Branch / parent: exp/038-archive-slow-codecs / E037
+- Hypothesis: .lzma and PPMd have not been chosen for any frame since codec choice became read-priced (E035–E037; only brotli was, for 1–5 frames). Archiving them (no longer tried, still decodable) leaves every size unchanged and saves repack time (source: by_kind in E035–E037: no "X" or "P" frame on any corpus)
+- Change:
+  - `src/codec.rs`: `CODECS`, a table of (tag, encoder, active). Archived (inactive): .lzma "X" and PPMd "P". Active: brotli "R". An archived codec keeps its encoder, decoder and dependency, so frames stored with it still read and flipping `active` brings it back (e.g. for cold data at a lower read weight).
+  - `src/dict.rs`: `encode_cheapest` tries only active codecs. Test `every_codec_in_the_table_still_decodes` (archived codecs included).
+  - Chosen over deleting the codecs (user preference: archive rather than drop).
+- Result (two runs identical): score **0.3363 -> 0.3363**; every size, read cost and ratio byte-identical to E037. Time 82.3 s -> 78.0–78.7 s (-5%). The saving is smaller than E035's estimate (~13.5 s for three extra codecs), since most recompress time is now blocks, zstd-19 and brotli.
+- Verdict: **kept** (score holds; less repack time; capability kept as archived).
