@@ -1,6 +1,7 @@
 //! Codecs besides zstd, offered only for what repack finally keeps
 //! (`Repo::recompress`), where the smallest encoding of each piece wins:
 //!   "X" .lzma (LZMA, xz's strongest preset)  | "R" brotli (quality 11)
+//!   | "P" mem:u8 PPMd variant H (order 8, 2^mem bytes of model)
 //! Neither uses the shared dictionary, so they pay mostly on large frames
 //! (groups, whole files). Both decoders stream, so a prefix read stops
 //! early. Encoder output is pinned by the crate versions in Cargo.toml;
@@ -50,6 +51,34 @@ pub(crate) fn unbrotli_prefix(data: &[u8], limit: usize) -> Option<Vec<u8>> {
     read_prefix(brotli::Decompressor::new(data, 4096), limit)
 }
 
+/// PPMd model order: measured best of 6 and 8 on the stored leaves (E032).
+const PPMD_ORDER: u32 = 8;
+
+/// `bytes` as PPMd variant H, prefixed by the model size's log2: the
+/// model is sized to the input (16x, 1–16 MiB), since a decoder allocates
+/// it whole even to read a prefix.
+pub(crate) fn ppmd(bytes: &[u8]) -> Option<Vec<u8>> {
+    let mem = (bytes
+        .len()
+        .saturating_mul(16)
+        .next_power_of_two()
+        .trailing_zeros())
+    .clamp(20, 24);
+    let mut enc = ppmd_rust::Ppmd7Encoder::new(vec![mem as u8], PPMD_ORDER, 1 << mem).ok()?;
+    std::io::Write::write_all(&mut enc, bytes).ok()?;
+    enc.finish(true).ok()
+}
+
+/// At most the first `limit` bytes of a `ppmd` stream.
+pub(crate) fn unppmd_prefix(data: &[u8], limit: usize) -> Option<Vec<u8>> {
+    let (&mem, rest) = data.split_first()?;
+    let mem = (20..=24).contains(&mem).then_some(1u32 << mem)?;
+    read_prefix(
+        ppmd_rust::Ppmd7Decoder::new(rest, PPMD_ORDER, mem).ok()?,
+        limit,
+    )
+}
+
 fn read_prefix(r: impl Read, limit: usize) -> Option<Vec<u8>> {
     let mut out = Vec::new();
     r.take(limit as u64).read_to_end(&mut out).ok()?;
@@ -69,7 +98,12 @@ mod tests {
         for b in [&b""[..], b"x", &text] {
             assert_eq!(unxz_prefix(&xz(b).unwrap(), usize::MAX).unwrap(), b);
             assert_eq!(unbrotli_prefix(&brotli(b).unwrap(), usize::MAX).unwrap(), b);
+            assert_eq!(unppmd_prefix(&ppmd(b).unwrap(), usize::MAX).unwrap(), b);
         }
+        assert_eq!(
+            unppmd_prefix(&ppmd(&text).unwrap(), 100).unwrap(),
+            text[..100]
+        );
         assert_eq!(unxz_prefix(&xz(&text).unwrap(), 100).unwrap(), text[..100]);
         assert_eq!(
             unbrotli_prefix(&brotli(&text).unwrap(), 100).unwrap(),

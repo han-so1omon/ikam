@@ -239,6 +239,7 @@ dependencies = [
  "flate2",
  "libz-sys",
  "memchr",
+ "ppmd-rust",
  "proptest",
  "similar",
  "tempfile",
@@ -342,6 +343,12 @@ name = "pkg-config"
 version = "0.3.34"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f6b464fbc74e149a392436b17d523f769e057cb6877f6a5c4618bc6f11800548"
+
+[[package]]
+name = "ppmd-rust"
+version = "1.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "196a7c80b9a7652aba7cc070827516c2abe4ccdf53d128e1944003cf5726cff1"
 
 [[package]]
 name = "ppv-lite86"
