@@ -27,7 +27,7 @@ mod store;
 mod template;
 mod wasm;
 
-pub use dict::decompressed_bytes;
+pub use dict::decode_cost;
 pub use id::Id;
 pub use object::{
     Arg, Claim, Commit, Derivation, Edge, Graph, Kind, Node, Object, Target, TreeEntry, node_key,

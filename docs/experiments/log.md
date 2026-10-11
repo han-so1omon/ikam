@@ -494,3 +494,26 @@ Newest last. Format and rules: `README.md`.
   - md gains less than offline (0.952 vs 0.929), probably from the 1–16 MiB model cap.
 - **Read speed (measured offline, not in the score):** on repo-history's 89 dumped leaves (4.76 MB decoded), decoding runs at 833 MB/s for zstd-19, 364 MB/s for brotli-11, and **9.9 MB/s for PPMd order 8** (pyppmd, the same variant H). So PPMd frames read about **84x slower** than zstd: about 6.5 ms instead of 0.08 ms per 64 KiB group. The benchmark cannot see this: total time is dominated by repack, and read cost counts bytes, not CPU per byte.
 - Verdict: **kept under the benchmark contract** (bytes-only score improves; total time 1.03x). It is the clearest case so far of the score ignoring read speed: 1% fewer bytes for frames that read 84x slower. If read cost enters the objective (pending since E029), decode work should be weighted per codec, and PPMd would likely only pay for cold data. Reverting is one commit.
+
+### E034 read-cost-score (benchmark change)
+- Branch / parent: exp/034-read-cost-score / E033
+- Change to the measurement: the score counts read cost, so a store that is smaller but slower to read is no longer rewarded by construction (source: E029, where blocks halved read cost but were discarded on bytes alone; E033, where PPMd frames read about 84x slower for 1% fewer bytes).
+  - Per corpus: `(repack + w x read_whole) / (zstd_dict + w x read_baseline)`, w = `DEFAULT_READ_WEIGHT` (0.001, the planner's own weight: 1 stored byte = 1,000 decoded zstd bytes). Score = geometric mean, as before. `bytes_score` (the old score) is still reported, with `vs_dict_read` and `read_baseline` per corpus.
+  - Read cost is now weighted per codec: `decode_cost()` (renamed from `decompressed_bytes()`) counts decoded bytes x the codec's decode time relative to zstd-19. Weights are measured by the ignored test `codec::tests::codec_decode_speeds` (Rust, this machine, the repo's own docs and kernel sources in 64 KiB pieces, two runs): zstd 637–672 MB/s; xz 49–50 MB/s (12.9–13.5x); brotli 173–178 MB/s (3.6–3.9x); PPMd 8.7–9.2 MB/s (69–77x). Constants: `XZ_READ` 13, `BROTLI_READ` 4, `PPMD_READ` 70. Function work is unchanged (bytes produced + fuel / 1,000).
+  - The baseline reads each distinct file by decoding its own zstd frame once (`read_baseline` = distinct file bytes). Graph corpora: no file read measured, 0 on both sides, so their ratio is the bytes ratio.
+  - **Scores before and after E034 are not comparable.**
+- Result, E033 kernel (two runs identical; a third with the added `read_baseline` field gives the same values): score **0.6560**; bytes_score 0.2831 (= E033).
+  | corpus | bytes | read_whole | read_baseline | vs_dict | vs_dict_read |
+  |---|---:|---:|---:|---:|---:|
+  | md | 57,657 | 648,587,590 | 177,939 | 0.7498 | **9.1637** |
+  | pdf | 20,379 | 1,259,030 | 80,204 | 0.8270 | 0.8752 |
+  | office | 148,607 | 430,860,281 | 2,802,002 | 0.3798 | **1.4706** |
+  | invoices | 3,370 | 825,330 | 85,680 | 0.2493 | 0.3084 |
+  | synthetic-history | 14,402 | 63,954,557 | 650,028 | 0.2371 | **1.2763** |
+  | repo-history | 896,937 | 823,393,873 | 5,316,822 | 0.6949 | **1.3274** |
+  | repo-graph | 19,871 | 0 | 0 | 0.1752 | 0.1752 |
+  | generated | 4,260 | 1,322,701 | 688,414 | 0.0243 | 0.0318 |
+  - Read costs are large because a group member's read decodes its group from the start (up to 64 KiB), and the group frames on md, synthetic-history and repo-history are now PPMd (70x), on office .lzma and brotli (13x, 4x).
+- Diagnostic (one run; `encode_smallest` temporarily reduced to zstd, i.e. the E030 codec set, reverted): score **0.3511**, bytes_score 0.2900. md 0.9431, office 0.7911, synthetic-history 0.2833, repo-history 0.7265 (the others as above).
+- Sensitivity to w (computed from the same runs; E033 kernel / zstd-only kernel): 0.0001: 0.3424 / 0.2970; 0.0003: 0.4308 / 0.3101; 0.001: 0.6560 / 0.3511; 0.003: 1.1297 / 0.4479. The E031 and E033 codecs lose at every weight tested.
+- Verdict: reference for later experiments. Under the read-aware score, E031's and E033's codec choices (picked by bytes alone in `recompress`) are a large regression. The next experiment is to make `recompress` choose encodings by the same objective.

@@ -11,6 +11,13 @@ use std::io::Read;
 
 use xz2::stream::{LzmaOptions, Stream};
 
+/// Decode time per byte relative to zstd at `STORE_LEVEL`, measured by
+/// `tests::codec_decode_speeds` (E034: xz 12.9–13.5x, brotli 3.6–3.9x,
+/// PPMd 69–77x). Read costs count decoded bytes with these weights.
+const XZ_READ: usize = 13;
+const BROTLI_READ: usize = 4;
+const PPMD_READ: usize = 70;
+
 /// LZMA preset: 9 with the "extreme" flag (xz -9e).
 const XZ_PRESET: u32 = 9 | 1 << 31;
 
@@ -30,7 +37,11 @@ pub(crate) fn xz(bytes: &[u8]) -> Option<Vec<u8>> {
 /// At most the first `limit` bytes of an `xz` stream.
 pub(crate) fn unxz_prefix(data: &[u8], limit: usize) -> Option<Vec<u8>> {
     let stream = Stream::new_lzma_decoder(1 << 27).ok()?;
-    read_prefix(xz2::read::XzDecoder::new_stream(data, stream), limit)
+    read_prefix(
+        xz2::read::XzDecoder::new_stream(data, stream),
+        limit,
+        XZ_READ,
+    )
 }
 
 /// `bytes` as a brotli stream at quality 11, with a window just large
@@ -48,7 +59,7 @@ pub(crate) fn brotli(bytes: &[u8]) -> Option<Vec<u8>> {
 
 /// At most the first `limit` bytes of a `brotli` stream.
 pub(crate) fn unbrotli_prefix(data: &[u8], limit: usize) -> Option<Vec<u8>> {
-    read_prefix(brotli::Decompressor::new(data, 4096), limit)
+    read_prefix(brotli::Decompressor::new(data, 4096), limit, BROTLI_READ)
 }
 
 /// PPMd model order: measured best of 6 and 8 on the stored leaves (E032).
@@ -76,19 +87,82 @@ pub(crate) fn unppmd_prefix(data: &[u8], limit: usize) -> Option<Vec<u8>> {
     read_prefix(
         ppmd_rust::Ppmd7Decoder::new(rest, PPMD_ORDER, mem).ok()?,
         limit,
+        PPMD_READ,
     )
 }
 
-fn read_prefix(r: impl Read, limit: usize) -> Option<Vec<u8>> {
+fn read_prefix(r: impl Read, limit: usize, weight: usize) -> Option<Vec<u8>> {
     let mut out = Vec::new();
     r.take(limit as u64).read_to_end(&mut out).ok()?;
-    crate::dict::count_decompressed(out.len());
+    crate::dict::count_decode(out.len(), weight);
     Some(out)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Decode speed of each codec relative to zstd at `STORE_LEVEL`, on
+    /// the repository's own docs and sources in 64 KiB pieces (like
+    /// groups). Where the `*_READ` weights come from; run with
+    /// `cargo test --release codec_decode_speeds -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn codec_decode_speeds() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let mut text = Vec::new();
+        for dir in ["docs", "packages/kernel/src"] {
+            let mut stack = vec![root.join(dir)];
+            while let Some(d) = stack.pop() {
+                let mut entries: Vec<_> = std::fs::read_dir(d)
+                    .unwrap()
+                    .map(|e| e.unwrap().path())
+                    .collect();
+                entries.sort();
+                for p in entries {
+                    match p.is_dir() {
+                        true => stack.push(p),
+                        false => text.extend(std::fs::read(&p).unwrap()),
+                    }
+                }
+            }
+        }
+        let pieces: Vec<&[u8]> = text.chunks(64 * 1024).collect();
+        let zstd = |b: &[u8]| crate::dict::zstd_frame(b, &[], crate::dict::STORE_LEVEL).unwrap();
+        type Codec<'a> = (
+            &'a str,
+            &'a dyn Fn(&[u8]) -> Vec<u8>,
+            &'a dyn Fn(&[u8]) -> Vec<u8>,
+        );
+        let codecs: [Codec; 4] = [
+            ("zstd", &zstd, &|c| {
+                crate::dict::unzstd_frame(c, &[]).unwrap()
+            }),
+            ("xz", &|b| xz(b).unwrap(), &|c| {
+                unxz_prefix(c, usize::MAX).unwrap()
+            }),
+            ("brotli", &|b| brotli(b).unwrap(), &|c| {
+                unbrotli_prefix(c, usize::MAX).unwrap()
+            }),
+            ("ppmd", &|b| ppmd(b).unwrap(), &|c| {
+                unppmd_prefix(c, usize::MAX).unwrap()
+            }),
+        ];
+        let mut base = 0.0;
+        for (name, enc, dec) in codecs {
+            let coded: Vec<Vec<u8>> = pieces.iter().map(|p| enc(p)).collect();
+            let t = std::time::Instant::now();
+            for _ in 0..3 {
+                coded.iter().for_each(|c| assert!(!dec(c).is_empty()));
+            }
+            let mbs = 3.0 * text.len() as f64 / t.elapsed().as_secs_f64() / 1e6;
+            base = if base == 0.0 { mbs } else { base };
+            println!(
+                "{name:8} {mbs:8.1} MB/s  x{:.1} zstd's decode time",
+                base / mbs
+            );
+        }
+    }
 
     #[test]
     fn codecs_round_trip_and_read_prefixes() {
