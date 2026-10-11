@@ -11,6 +11,7 @@ flate2 = { version = "1.1.10", default-features = false, features = ["zlib"] }
 # keep these pinned; see container::tests::deflate_output_is_pinned.
 libz-sys = { version = "=1.1.29", features = ["static"] }
 memchr = "2.8.3"
+ppmd-rust = "=1.5.0"
 similar = "3.2.0"
 thiserror = "2.0.21"
 wasmi = { version = "=2.0.0", features = ["portable-dispatch", "deterministic"] }

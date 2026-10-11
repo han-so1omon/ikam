@@ -3,7 +3,7 @@
 //! Stored bytes are encoded as the smallest of:
 //!   "B" bytes | "Z" zstd(bytes) | "Y" dict[4] zstd_with_dict(bytes)
 //!   | "S" group[8] start:varint len:varint   (bytes of a group, see `group.rs`)
-//!   | "X" .lzma(bytes) | "R" brotli(bytes)     (only from repack, see `codec.rs`)
+//!   | "X" .lzma(bytes) | "R" brotli(bytes) | "P" ppmd(bytes)   (only from repack, see `codec.rs`)
 //! Identity is always over the uncompressed bytes, so the choice never
 //! changes an id. The dictionary is ordinary content, named by the ref
 //! `meta/zstd-dict`. Exact reuse (slices, templates) and this statistical
@@ -50,7 +50,7 @@ type DictRef = [u8; DICT_REF_LEN];
 pub(crate) fn is_plain(encoded: &[u8]) -> bool {
     matches!(
         encoded.first(),
-        Some(b'B' | b'Z' | b'Y' | b'X' | b'R' | b'S')
+        Some(b'B' | b'Z' | b'Y' | b'X' | b'R' | b'P' | b'S')
     )
 }
 
@@ -229,10 +229,15 @@ impl<S: Store> Repo<S> {
     }
 
     /// The smallest plain encoding of `bytes` among zstd (at the repo's
-    /// level), .lzma and brotli: for what repack keeps.
+    /// level), .lzma, brotli and PPMd: for what repack keeps.
     pub(crate) fn encode_smallest(&self, bytes: &[u8]) -> Vec<u8> {
         let mut best = self.encode_plain(bytes);
-        for (tag, code) in [(b'X', codec::xz(bytes)), (b'R', codec::brotli(bytes))] {
+        let codes = [
+            (b'X', codec::xz(bytes)),
+            (b'R', codec::brotli(bytes)),
+            (b'P', codec::ppmd(bytes)),
+        ];
+        for (tag, code) in codes {
             if let Some(c) = code.filter(|c| c.len() + 1 < best.len()) {
                 best = [&[tag][..], &c].concat();
             }
@@ -319,7 +324,7 @@ impl<S: Store> Repo<S> {
     /// output does.
     pub(crate) fn decode_plain(&self, id: &Id, encoded: &[u8]) -> Result<Vec<u8>, Error> {
         match encoded.first() {
-            Some(b'Y' | b'X' | b'R') => {
+            Some(b'Y' | b'X' | b'R' | b'P') => {
                 self.decode_prefix(id, encoded, usize::MAX, &|b| Id::of_content(b) == *id)
             }
             Some(b'S') => self.read_member(id, encoded),
@@ -327,7 +332,7 @@ impl<S: Store> Repo<S> {
         }
     }
 
-    /// The first `limit` bytes of a plain encoding ("B", "Z", "Y", "X" or "R"), if
+    /// The first `limit` bytes of a plain encoding ("B", "Z", "Y", "X", "R" or "P"), if
     /// they pass `check`. Nothing here verifies the whole content's id, so
     /// `check` must verify what the caller uses (a group member's own id).
     pub(crate) fn decode_prefix(
@@ -342,6 +347,7 @@ impl<S: Store> Repo<S> {
             Some((b'Z', z)) => unzstd_prefix(z, &[], limit),
             Some((b'X', x)) => codec::unxz_prefix(x, limit),
             Some((b'R', r)) => codec::unbrotli_prefix(r, limit),
+            Some((b'P', p)) => codec::unppmd_prefix(p, limit),
             Some((b'Y', _)) => return self.unzstd_with_dict(id, encoded, 1, limit, check),
             _ => return Err(Error::WrongKind(*id)),
         };

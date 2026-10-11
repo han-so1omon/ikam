@@ -479,3 +479,18 @@ Newest last. Format and rules: `README.md`.
   - Time 52.5 s -> 67.6 s (1.29x). The added repack time over all corpora (15.0 s) accounts for all of it. Read cost in decoded bytes is identical to E030 (as expected; the measure counts bytes, not CPU). xz and brotli decode more slowly per byte than zstd, which no figure here prices; read time is not measured separately.
   - **Attribution:** brotli wins 13 frames and .lzma 2, all large ones (groups or whole files). Small frames keep zstd with the dictionary. On repo-history the dictionary beats both new codecs on most frames.
 - Verdict: **kept** (score improves; gain modest and concentrated in md and synthetic-history). Not tried: codecs with a shared dictionary (brotli's shared-dictionary format, LZMA2 preset dictionaries), which the repo-history result points to.
+
+### E033 ppmd-codec
+- Branch / parent: exp/033-ppmd-codec / E031
+- Hypothesis: PPMd context modelling, offered as a fourth codec for the frames repack keeps, shrinks text and code leaves where zstd, .lzma and brotli leave most (source: E032 offline measurement on the stored leaves: PPMd order 8 at 0.929x on md, 0.966x on synthetic-history, 0.983x on repo-history)
+- Change:
+  - `src/codec.rs`: "P" mem:u8 + PPMd variant H (order 8) via `ppmd-rust =1.5.0` (pure Rust, CC0/MIT-0), with an end marker. The model size is 16x the input, clamped to 1–16 MiB and recorded in the byte, because a decoder allocates the whole model even to read a prefix. Streaming decoder, so member prefix reads stop early.
+  - `src/dict.rs`: "P" is plain (`is_plain`, `decode_plain`, `decode_prefix`); `encode_smallest` tries it after .lzma and brotli.
+  - Round-trip and prefix test extended to PPMd.
+- Result (two runs, identical sizes): score 0.2859 -> **0.2831** (-1.0%).
+  - md 60,560 -> 57,657 (0.952; 3 PPMd frames), synthetic-history 14,675 -> 14,402 (0.981; 1), repo-history 905,850 -> 896,937 (0.990; 25 frames, 341 KB); pdf, office, invoices, repo-graph, generated unchanged.
+  - vs_dict: md 0.7876 -> 0.7498, synthetic-history 0.2416 -> 0.2371, repo-history 0.7018 -> 0.6949.
+  - Time 67.6 s -> 69.4–69.5 s (1.03x, repack). Read cost in decoded bytes identical to E031.
+  - md gains less than offline (0.952 vs 0.929), probably from the 1–16 MiB model cap.
+- **Read speed (measured offline, not in the score):** on repo-history's 89 dumped leaves (4.76 MB decoded), decoding runs at 833 MB/s for zstd-19, 364 MB/s for brotli-11, and **9.9 MB/s for PPMd order 8** (pyppmd, the same variant H). So PPMd frames read about **84x slower** than zstd: about 6.5 ms instead of 0.08 ms per 64 KiB group. The benchmark cannot see this: total time is dominated by repack, and read cost counts bytes, not CPU per byte.
+- Verdict: **kept under the benchmark contract** (bytes-only score improves; total time 1.03x). It is the clearest case so far of the score ignoring read speed: 1% fewer bytes for frames that read 84x slower. If read cost enters the objective (pending since E029), decode work should be weighted per codec, and PPMd would likely only pay for cold data. Reverting is one commit.
