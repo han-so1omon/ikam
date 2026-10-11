@@ -534,3 +534,30 @@ Newest last. Format and rules: `README.md`.
   - Codec choices: every frame zstd except one brotli frame (repo-history's `uv.lock`, 25,558 B, read once). .lzma and PPMd are never chosen.
   - Against the zstd-only diagnostic (0.3511): better by 0.0001, from that one frame. Time 70.8 s vs 57.3 s for zstd only (1.24x): trying .lzma, brotli and PPMd on every kept frame costs ~13.5 s of repack and buys almost nothing at w = 0.001.
 - Verdict: **kept** (score 0.6560 -> 0.3510). E031 and E033 were wins only under the bytes-only score. Under the read-aware score, slow codecs pay for almost nothing in this benchmark, where groups are read member by member and templates once per document. Open: drop the .lzma and PPMd candidates (their decoders would stay, so stores written since E031 still read) to save the repack time, unless a lower read weight for cold data is wanted.
+
+### E036 one-objective
+- Branch / parent: exp/036-one-objective / E035
+- Hypothesis: repack still chooses whole plans (dictionary x template induction) and groups by bytes alone, while the score and `recompress` now use bytes + w x read cost. Choosing plans and groups by the same objective lowers the score, mostly where group decoding dominates reads (md, office, repo-history) (source: E034/E035 read costs; E029's invoices anomaly, from a group step and a plan choice using different objectives)
+- Change:
+  - `src/repack.rs`:
+    - `ReadModel` (moved out of `recompress`): a content is read once plus once per derivation argument naming it; a group is decoded up to each member's end per read of that member.
+    - `Repo::plan_cost(files)` = content bytes + `read_weight` x (decoded bytes weighted per codec + output bytes of files rebuilt by functions).
+    - repack picks the plan with the lowest `plan_cost` (was: fewest content bytes) and applies it only if its cost, after `recompress`, is below the current store's.
+  - `src/group.rs` `plan_group`: a group must lower bytes + w x (sum of member ends) against its members stored alone (bytes + w x their own length); `saved` is f64, and `group_small` keeps the proposal saving the most cost.
+- Result (three runs identical, the third after moving `ReadModel` above the tests for clippy): score 0.3510 -> **0.3450**; bytes_score 0.2900 -> 0.2931.
+  | corpus | bytes E035 -> E036 | read_whole E035 -> E036 | vs_dict_read | group members |
+  |---|---|---|---|---|
+  | md | 63,422 -> 65,549 | 9.27 M -> 3.09 M | 0.9431 -> **0.8906** | 333 -> 123 |
+  | pdf | 20,379 | 1.26 M | 0.8752 | 44 |
+  | office | 148,812 -> 151,433 | 162.9 M -> 123.1 M | 0.7911 -> **0.6968** | 656 -> 571 |
+  | invoices | 3,370 | 0.83 M | 0.3084 | 30 |
+  | synthetic-history | 15,655 -> 16,083 | 1.74 M -> 2.06 M | 0.2833 -> 0.2954 (worse) | 3 -> 25 |
+  | repo-history | 907,280 -> 909,859 | 33.9 M -> 30.2 M | 0.7263 -> 0.7253 | 743 -> 643 |
+  | repo-graph | 19,871 -> 19,968 | (not measured) | 0.1752 -> 0.1760 (worse) | 50 -> 35 |
+  | generated | 4,260 | 1.32 M | 0.0318 | 5 |
+  - Time 70.8 s -> 74.1 s (1.05x; `plan_cost` decodes every stored frame of each candidate plan).
+  - **Where the estimate and the measurement disagree:**
+    - synthetic-history: the chosen plan groups 25 members instead of 3, and measured read cost rises 18%.
+    - repo-graph: the planner now trades bytes for read cost there, but the score measures no read for graph corpora.
+    - Both are limits of the estimate (members read through derivations, graph reads), not of the objective.
+- Verdict: **kept** (score improves; md and office gain most). The planner, the group step, `recompress` and the score now use one objective. Next: seekable blocks inside groups (E029), re-tested under this objective.
