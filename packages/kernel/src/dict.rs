@@ -230,9 +230,11 @@ impl<S: Store> Repo<S> {
         best
     }
 
-    /// The smallest plain encoding of `bytes` among zstd (at the repo's
-    /// level), .lzma, brotli and PPMd: for what repack keeps.
-    pub(crate) fn encode_smallest(&self, bytes: &[u8]) -> Vec<u8> {
+    /// The cheapest plain encoding of `bytes` among zstd (at the repo's
+    /// level), .lzma, brotli and PPMd, for what repack keeps: stored bytes +
+    /// `read_weight` x the codec's decode time x `reads` (bytes decoded to
+    /// read everything once, see `Repo::recompress`).
+    pub(crate) fn encode_cheapest(&self, bytes: &[u8], reads: usize) -> Vec<u8> {
         let mut best = self.encode_plain(bytes);
         let codes = [
             (b'X', codec::xz(bytes)),
@@ -240,11 +242,21 @@ impl<S: Store> Repo<S> {
             (b'P', codec::ppmd(bytes)),
         ];
         for (tag, code) in codes {
-            if let Some(c) = code.filter(|c| c.len() + 1 < best.len()) {
-                best = [&[tag][..], &c].concat();
+            if let Some(c) = code {
+                let c = [&[tag][..], &c].concat();
+                if self.cost(&c, reads) < self.cost(&best, reads) {
+                    best = c;
+                }
             }
         }
         best
+    }
+
+    /// Stored bytes + `read_weight` x decode time of a plain encoding that
+    /// is decoded for `reads` bytes.
+    pub(crate) fn cost(&self, encoded: &[u8], reads: usize) -> f64 {
+        let weight = encoded.first().map_or(1, |t| codec::read_weight(*t));
+        encoded.len() as f64 + self.read_weight * (weight * reads) as f64
     }
 
     /// The smallest plain encoding of `bytes`.
@@ -391,6 +403,25 @@ impl<S: Store> Repo<S> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Codecs are chosen by stored bytes + read weight x decode time: a
+    /// frame read very often keeps zstd, a frame never read takes the
+    /// smallest codec.
+    #[test]
+    fn codec_choice_prices_reads() {
+        let repo = Repo::new(crate::MemStore::default());
+        let text: Vec<u8> = (0..3000)
+            .flat_map(|i| format!("row {i}: some words {}\n", i % 17).into_bytes())
+            .collect();
+        let hot = repo.encode_cheapest(&text, 1 << 40);
+        assert!(matches!(hot[0], b'Z' | b'B'), "a hot frame keeps zstd");
+        let cold = repo.encode_cheapest(&text, 0);
+        assert!(cold.len() <= hot.len());
+        assert_eq!(
+            repo.decode_plain(&Id::of_content(&text), &cold).unwrap(),
+            text
+        );
+    }
     use crate::MemStore;
 
     fn sample(n: usize) -> Vec<u8> {

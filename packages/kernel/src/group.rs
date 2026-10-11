@@ -180,6 +180,16 @@ fn seed_keys(bytes: &[u8]) -> HashSet<u64> {
         .collect()
 }
 
+/// A member entry's group prefix and the end of its range: a member read
+/// decodes its group up to there.
+pub(crate) fn member_end(encoded: &[u8]) -> Option<(&[u8], usize)> {
+    let (b'S', rest) = encoded.split_first()? else {
+        return None;
+    };
+    let (prefix, mut rest) = rest.split_at_checked(GROUP_REF_LEN)?;
+    Some((prefix, varint(&mut rest)?.checked_add(varint(&mut rest)?)?))
+}
+
 /// A member's stored entry.
 fn member_entry(group: &Id, start: usize, len: usize) -> Vec<u8> {
     let mut out = [&b"S"[..], &group.as_bytes()[..GROUP_REF_LEN]].concat();

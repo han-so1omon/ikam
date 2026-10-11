@@ -25,6 +25,7 @@ use crate::dict::{
     DICT_REF, DICT_REF_LEN, MEASURE_LEVEL, STORE_LEVEL, framer, is_plain, object_tag, tree_content,
     zstd_frame,
 };
+use crate::group::{GROUP_REF_LEN, member_end};
 use crate::ingest::derivation_size;
 use crate::matcher::{self, Index};
 use crate::repo::Cx;
@@ -298,26 +299,52 @@ impl<S: Store + Sync> Repo<S> {
     }
 
     /// Re-encode every plain frame and compressible object at
-    /// `STORE_LEVEL`, keeping a new encoding only if it is smaller. Plans
-    /// are compared at the fast `MEASURE_LEVEL`; only the one kept pays for
-    /// the slow level. Decoded content is checked against its id first.
+    /// `STORE_LEVEL`, keeping a new encoding only if it costs less: stored
+    /// bytes + `read_weight` x decode time, where a group is decoded up to
+    /// each member's end per member read and any other content whole per
+    /// read; a content is read once, plus once per derivation argument
+    /// naming it. Plans are compared at the fast `MEASURE_LEVEL`; only the one
+    /// kept pays for the slow level. Decoded content is checked against its
+    /// id first.
     pub(crate) fn recompress(&mut self) -> Result<(), Error> {
         self.level = STORE_LEVEL;
         let dict = self.dictionary().map(|(id, _)| *id);
+        // A content is read once for itself and once per derivation that
+        // takes it as an argument (a template per filled document, a slice
+        // source per document sliced from it).
+        let mut uses: HashMap<Id, usize> = HashMap::new();
+        for d in self.ledger()?.by_output.values().flatten() {
+            d.args
+                .iter()
+                .for_each(|a| *uses.entry(a.id()).or_default() += 1);
+        }
+        let times = |id: &Id| 1 + uses.get(id).copied().unwrap_or(0);
+        let mut group_reads: HashMap<Vec<u8>, usize> = HashMap::new();
+        for id in self.store.ids()? {
+            if let Some((group, end)) = member_end(&self.store.read(&id)?) {
+                *group_reads.entry(group.to_vec()).or_default() += end * times(&id);
+            }
+        }
         for id in self.store.ids()? {
             let stored = self.store.read(&id)?;
+            let reads = group_reads.get(&id.as_bytes()[..GROUP_REF_LEN]).copied();
             let encoded = match stored.first() {
                 Some(b'B' | b'Z' | b'Y') => {
                     let bytes = self.decode_plain(&id, &stored)?;
                     if Id::of_content(&bytes) != id {
                         return Err(Error::Corrupt(id));
                     }
-                    match Some(id) == dict {
+                    let reads = reads.unwrap_or(bytes.len() * times(&id));
+                    let encoded = match Some(id) == dict {
                         // A dictionary is never encoded against a dictionary.
                         true => zstd_frame(&bytes, &[], STORE_LEVEL)
                             .map_or(stored.clone(), |z| [&b"Z"[..], &z].concat()),
-                        false => self.encode_smallest(&bytes),
+                        false => self.encode_cheapest(&bytes, reads),
+                    };
+                    if self.cost(&encoded, reads) < self.cost(&stored, reads) {
+                        self.store.replace(id, &encoded)?;
                     }
+                    continue;
                 }
                 Some(_) if object_tag(&stored).is_some() && tree_content(&stored).is_none() => {
                     self.encode_object(&self.read_object(&id)?)

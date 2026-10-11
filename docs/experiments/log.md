@@ -517,3 +517,20 @@ Newest last. Format and rules: `README.md`.
 - Diagnostic (one run; `encode_smallest` temporarily reduced to zstd, i.e. the E030 codec set, reverted): score **0.3511**, bytes_score 0.2900. md 0.9431, office 0.7911, synthetic-history 0.2833, repo-history 0.7265 (the others as above).
 - Sensitivity to w (computed from the same runs; E033 kernel / zstd-only kernel): 0.0001: 0.3424 / 0.2970; 0.0003: 0.4308 / 0.3101; 0.001: 0.6560 / 0.3511; 0.003: 1.1297 / 0.4479. The E031 and E033 codecs lose at every weight tested.
 - Verdict: reference for later experiments. Under the read-aware score, E031's and E033's codec choices (picked by bytes alone in `recompress`) are a large regression. The next experiment is to make `recompress` choose encodings by the same objective.
+
+### E035 read-priced-codecs
+- Branch / parent: exp/035-read-priced-codecs / E034
+- Hypothesis: `recompress` picks codecs by bytes alone, which E034 showed is a large regression once reads count. Picking each frame's encoding by the score's own objective (stored bytes + w x codec decode weight x bytes decoded to read everything once) recovers at least the zstd-only result and keeps a slow codec only where a frame is rarely read (source: E034: score 0.6560, zstd-only diagnostic 0.3511)
+- Change:
+  - `src/dict.rs`: `encode_cheapest(bytes, reads)` replaces `encode_smallest`; `cost(encoded, reads)` = bytes + `read_weight` x `codec::read_weight(tag)` x reads. Test `codec_choice_prices_reads`.
+  - `src/codec.rs`: `read_weight(tag)`, the E034 weights per encoding.
+  - `src/group.rs`: `member_end` (a member entry's group prefix and range end).
+  - `src/repack.rs` `recompress`: a group's reads are the sum of its members' range ends (a member read decodes its group up to there); any other content is read whole. A stored encoding is replaced only if the cost drops.
+- Variants:
+  - a: each content counted as read once. Score **0.3552**. Worse than zstd-only only on synthetic-history (0.2833 -> 0.3114): its single leaf is the **template** all 21 revisions are filled from, read whole on every revision read. The model counted it once and chose brotli (read cost 1.74 M -> 4.44 M).
+  - b (kept): each content (or group member) read once plus once per derivation argument naming it (a template per filled document, a slice source per sliced document). Score **0.3510**; two runs identical.
+- Result (b): score 0.6560 -> **0.3510**; bytes_score 0.2831 -> 0.2900.
+  - Per corpus vs_dict_read: md 9.1637 -> 0.9431, pdf 0.8752, office 1.4706 -> 0.7911, invoices 0.3084, synthetic-history 1.2763 -> 0.2833, repo-history 1.3274 -> 0.7263, repo-graph 0.1752, generated 0.0318. Bytes: md 57,657 -> 63,422, synthetic-history 14,402 -> 15,655, repo-history 896,937 -> 907,280 (read 823.4 M -> 33.9 M), office 148,607 -> 148,812 (read 430.9 M -> 162.9 M).
+  - Codec choices: every frame zstd except one brotli frame (repo-history's `uv.lock`, 25,558 B, read once). .lzma and PPMd are never chosen.
+  - Against the zstd-only diagnostic (0.3511): better by 0.0001, from that one frame. Time 70.8 s vs 57.3 s for zstd only (1.24x): trying .lzma, brotli and PPMd on every kept frame costs ~13.5 s of repack and buys almost nothing at w = 0.001.
+- Verdict: **kept** (score 0.6560 -> 0.3510). E031 and E033 were wins only under the bytes-only score. Under the read-aware score, slow codecs pay for almost nothing in this benchmark, where groups are read member by member and templates once per document. Open: drop the .lzma and PPMd candidates (their decoders would stay, so stores written since E031 still read) to save the repack time, unless a lower read weight for cold data is wanted.

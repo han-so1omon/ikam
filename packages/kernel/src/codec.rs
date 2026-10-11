@@ -18,6 +18,16 @@ const XZ_READ: usize = 13;
 const BROTLI_READ: usize = 4;
 const PPMD_READ: usize = 70;
 
+/// Decode time per byte of a plain encoding, relative to zstd.
+pub(crate) fn read_weight(tag: u8) -> usize {
+    match tag {
+        b'X' => XZ_READ,
+        b'R' => BROTLI_READ,
+        b'P' => PPMD_READ,
+        _ => 1,
+    }
+}
+
 /// LZMA preset: 9 with the "extreme" flag (xz -9e).
 const XZ_PRESET: u32 = 9 | 1 << 31;
 
