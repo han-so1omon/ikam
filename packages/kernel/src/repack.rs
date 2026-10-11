@@ -21,6 +21,7 @@
 use std::cmp::Reverse;
 use std::collections::{HashMap, HashSet};
 
+use crate::codec::read_weight;
 use crate::dict::{
     DICT_REF, DICT_REF_LEN, MEASURE_LEVEL, STORE_LEVEL, framer, is_plain, object_tag, tree_content,
     zstd_frame,
@@ -100,18 +101,18 @@ impl<S: Store + Sync> Repo<S> {
                 .map(|w| w.join().expect("planner panicked"))
                 .collect()
         });
-        let mut fresh: Option<(usize, Repo<MemStore>)> = None;
+        let mut fresh: Option<(f64, Repo<MemStore>)> = None;
         for plan in plans {
             let plan = plan?;
-            let size = plan.content_bytes()?;
-            if fresh.as_ref().is_none_or(|(best, _)| size < *best) {
-                fresh = Some((size, plan));
+            let cost = plan.plan_cost(&files)?;
+            if fresh.as_ref().is_none_or(|(best, _)| cost < *best) {
+                fresh = Some((cost, plan));
             }
         }
         let (_, mut fresh) = fresh.expect("at least one plan");
         fresh.recompress()?;
         let (before, after) = (self.content_bytes()?, fresh.content_bytes()?);
-        if after >= before {
+        if fresh.plan_cost(&files)? >= self.plan_cost(&files)? {
             return Ok(Repacked {
                 before,
                 after: before,
@@ -309,32 +310,16 @@ impl<S: Store + Sync> Repo<S> {
     pub(crate) fn recompress(&mut self) -> Result<(), Error> {
         self.level = STORE_LEVEL;
         let dict = self.dictionary().map(|(id, _)| *id);
-        // A content is read once for itself and once per derivation that
-        // takes it as an argument (a template per filled document, a slice
-        // source per document sliced from it).
-        let mut uses: HashMap<Id, usize> = HashMap::new();
-        for d in self.ledger()?.by_output.values().flatten() {
-            d.args
-                .iter()
-                .for_each(|a| *uses.entry(a.id()).or_default() += 1);
-        }
-        let times = |id: &Id| 1 + uses.get(id).copied().unwrap_or(0);
-        let mut group_reads: HashMap<Vec<u8>, usize> = HashMap::new();
-        for id in self.store.ids()? {
-            if let Some((group, end)) = member_end(&self.store.read(&id)?) {
-                *group_reads.entry(group.to_vec()).or_default() += end * times(&id);
-            }
-        }
+        let model = self.read_model()?;
         for id in self.store.ids()? {
             let stored = self.store.read(&id)?;
-            let reads = group_reads.get(&id.as_bytes()[..GROUP_REF_LEN]).copied();
             let encoded = match stored.first() {
                 Some(b'B' | b'Z' | b'Y') => {
                     let bytes = self.decode_plain(&id, &stored)?;
                     if Id::of_content(&bytes) != id {
                         return Err(Error::Corrupt(id));
                     }
-                    let reads = reads.unwrap_or(bytes.len() * times(&id));
+                    let reads = model.reads(&id, bytes.len());
                     let encoded = match Some(id) == dict {
                         // A dictionary is never encoded against a dictionary.
                         true => zstd_frame(&bytes, &[], STORE_LEVEL)
@@ -358,6 +343,51 @@ impl<S: Store + Sync> Repo<S> {
         self.level = MEASURE_LEVEL;
         self.reset_projections();
         Ok(())
+    }
+
+    /// How often each stored content is decoded when every file is read
+    /// once (the score's read model, see `ReadModel`).
+    pub(crate) fn read_model(&self) -> Result<ReadModel, Error> {
+        let mut uses: HashMap<Id, usize> = HashMap::new();
+        for d in self.ledger()?.by_output.values().flatten() {
+            d.args
+                .iter()
+                .for_each(|a| *uses.entry(a.id()).or_default() += 1);
+        }
+        let mut model = ReadModel {
+            uses,
+            groups: HashMap::new(),
+        };
+        for id in self.store.ids()? {
+            if let Some((group, end)) = member_end(&self.store.read(&id)?) {
+                let n = end * model.times(&id);
+                *model.groups.entry(group.to_vec()).or_default() += n;
+            }
+        }
+        Ok(model)
+    }
+
+    /// Estimated cost of this store when every file of `files` is read
+    /// once: content bytes + `read_weight` x (bytes decoded, weighted by
+    /// codec, + bytes produced for files rebuilt by functions). The same
+    /// objective as the benchmark score, so plans are chosen by it.
+    pub(crate) fn plan_cost(&self, files: &[(Id, Vec<u8>)]) -> Result<f64, Error> {
+        let model = self.read_model()?;
+        let mut read = 0;
+        for id in self.store.ids()? {
+            let stored = self.store.read(&id)?;
+            if matches!(stored[0], b'Z' | b'Y' | b'X' | b'R' | b'P') {
+                let len = self.decode_plain(&id, &stored)?.len();
+                read += read_weight(stored[0]) * model.reads(&id, len);
+            }
+        }
+        for (id, bytes) in files {
+            let stored = self.store.read(id).ok();
+            if stored.is_none_or(|s| !is_plain(&s)) {
+                read += bytes.len() * model.times(id);
+            }
+        }
+        Ok(self.content_bytes()? as f64 + self.read_weight * read as f64)
     }
 
     pub(crate) fn content_bytes(&self) -> Result<usize, Error> {
@@ -601,6 +631,30 @@ fn repeat_dictionary(samples: &[&[u8]], size: usize) -> Vec<u8> {
         .rev()
         .flat_map(|p| p.iter().copied())
         .collect()
+}
+
+/// How often stored content is decoded when every file is read once: a
+/// content once for itself plus once per derivation argument naming it (a
+/// template per filled document, a slice source per sliced document); a
+/// group up to each member's end per read of that member.
+pub(crate) struct ReadModel {
+    uses: HashMap<Id, usize>,
+    groups: HashMap<Vec<u8>, usize>,
+}
+
+impl ReadModel {
+    pub(crate) fn times(&self, id: &Id) -> usize {
+        1 + self.uses.get(id).copied().unwrap_or(0)
+    }
+
+    /// Bytes decoded from content `id` (of `len` bytes) to read every file
+    /// once.
+    pub(crate) fn reads(&self, id: &Id, len: usize) -> usize {
+        match self.groups.get(&id.as_bytes()[..GROUP_REF_LEN]) {
+            Some(&n) => n,
+            None => len * self.times(id),
+        }
+    }
 }
 
 #[cfg(test)]

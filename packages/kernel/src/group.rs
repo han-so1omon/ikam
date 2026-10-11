@@ -49,7 +49,7 @@ struct Planned {
     group: Id,
     encoded: Vec<u8>,
     entries: Vec<(Id, Vec<u8>)>,
-    saved: usize,
+    saved: f64,
 }
 
 /// Groups of consecutive items in byte order, each up to `GROUP_SIZE`.
@@ -247,7 +247,7 @@ impl<S: Store> Repo<S> {
         }
         items.sort();
         // Proposers suggest groupings; the one that saves most is written.
-        let mut best: (usize, Vec<Planned>) = (0, Vec::new());
+        let mut best: (f64, Vec<Planned>) = (0.0, Vec::new());
         let dict = self
             .dictionary()
             .map(|(_, d)| d.clone())
@@ -297,8 +297,19 @@ impl<S: Store> Repo<S> {
             entries.push((*id, member_entry(&group, at, bytes.len())));
             at += bytes.len();
         }
-        let grouped = encoded.len() + entries.iter().map(|e| e.1.len()).sum::<usize>();
-        let alone: usize = members.iter().map(|m| m.2).sum();
+        // Cost = bytes + read weight x bytes decoded to read each member
+        // once: a member of the group decodes the group up to its end, a
+        // member alone decodes itself.
+        let w = self.read_weight;
+        let entry_bytes: usize = entries.iter().map(|e| e.1.len()).sum::<usize>();
+        let reads: usize = (1..=members.len())
+            .map(|k| members[..k].iter().map(|m| m.0.len()).sum::<usize>())
+            .sum();
+        let grouped = (encoded.len() + entry_bytes) as f64 + w * reads as f64;
+        let alone: f64 = members
+            .iter()
+            .map(|m| m.2 as f64 + w * m.0.len() as f64)
+            .sum();
         (grouped < alone && !self.store.has(&group)).then_some(Planned {
             group,
             encoded,
