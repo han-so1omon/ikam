@@ -331,9 +331,9 @@ fn read_costs(repo: &Repo<MemStore>, snapshots: &[Snapshot]) -> (usize, usize, b
         let n = b.len() as u64;
         let (start, len) = (n / 2, (n - n / 2).min(4096));
         for (cost, start, len) in [(&mut whole, 0, n), (&mut window, start, len)] {
-            let before = ikam_kernel::decompressed_bytes();
+            let before = ikam_kernel::decode_cost();
             let (bytes, work) = repo.read_range(&id, start, len).unwrap();
-            *cost += ikam_kernel::decompressed_bytes() - before + work;
+            *cost += ikam_kernel::decode_cost() - before + work;
             exact &= bytes == b[start as usize..(start + len) as usize];
         }
     }
@@ -529,6 +529,17 @@ fn commit(repo: &mut Repo<MemStore>, snapshot: &Snapshot, graph: bool) {
 }
 
 /// (file-level dedup + zstd per file, file-level dedup + trained dictionary).
+/// Bytes of the distinct files of a corpus: what the baseline decodes to
+/// read each file once.
+fn distinct_bytes(snapshots: &[Snapshot]) -> usize {
+    let files: BTreeMap<Id, usize> = snapshots
+        .iter()
+        .flatten()
+        .map(|(_, b)| (Id::of_content(b), b.len()))
+        .collect();
+    files.values().sum()
+}
+
 fn baselines(snapshots: &[Snapshot]) -> (usize, usize) {
     let unique: BTreeMap<Id, &Vec<u8>> = snapshots
         .iter()
@@ -581,7 +592,7 @@ fn main() {
         ("repo-graph", repo_graph, true),
         ("generated", generated, false),
     ];
-    let (mut log_ratio, mut n, mut total_ms) = (0.0, 0, 0);
+    let (mut log_ratio, mut log_bytes, mut n, mut total_ms) = (0.0, 0.0, 0, 0);
     for (name, build, graph) in corpora {
         if !only.is_empty() && !only.iter().any(|o| *o == name) {
             continue;
@@ -624,9 +635,19 @@ fn main() {
         let fsck = repo.fsck().unwrap().is_empty();
         let (zstd_files, zstd_dict) = baselines(&snapshots);
         let ratio = repack as f64 / zstd_dict as f64;
+        // With read cost (E034): the baseline reads each distinct file by
+        // decoding its zstd frame once; the kernel's read cost is
+        // `read_whole`. Graph corpora have no file read measured (0).
+        let w = ikam_kernel::DEFAULT_READ_WEIGHT;
+        let baseline_read = match graph {
+            true => 0,
+            false => distinct_bytes(&snapshots),
+        };
+        let read_ratio =
+            (repack as f64 + w * read_whole as f64) / (zstd_dict as f64 + w * baseline_read as f64);
         if json {
             println!(
-                "{{\"corpus\":\"{name}\",\"input\":{input},\"ingest\":{ingest},\"repack\":{repack},\"ingest_ms\":{ingest_ms},\"repack_ms\":{repack_ms},\"zstd_files\":{zstd_files},\"zstd_dict\":{zstd_dict},\"vs_dict\":{ratio:.4},\"exact\":{exact},\"fsck\":{fsck},\"read_whole\":{read_whole},\"read_4k\":{read_4k},\"by_kind\":{}}}",
+                "{{\"corpus\":\"{name}\",\"input\":{input},\"ingest\":{ingest},\"repack\":{repack},\"ingest_ms\":{ingest_ms},\"repack_ms\":{repack_ms},\"zstd_files\":{zstd_files},\"zstd_dict\":{zstd_dict},\"vs_dict\":{ratio:.4},\"vs_dict_read\":{read_ratio:.4},\"read_baseline\":{baseline_read},\"exact\":{exact},\"fsck\":{fsck},\"read_whole\":{read_whole},\"read_4k\":{read_4k},\"by_kind\":{}}}",
                 by_kind(&repo)
             );
         } else {
@@ -637,23 +658,27 @@ fn main() {
         }
         // Hard gates: an inexact or fsck-failing result is a failure, not a score.
         assert!(exact && fsck, "{name}: verification failed");
-        (log_ratio, n, total_ms) = (
-            log_ratio + ratio.ln(),
+        (log_ratio, log_bytes, n, total_ms) = (
+            log_ratio + read_ratio.ln(),
+            log_bytes + ratio.ln(),
             n + 1,
             total_ms + ingest_ms + repack_ms,
         );
     }
-    // The experiment score: geometric mean of kernel bytes / trained-dictionary
-    // baseline bytes across corpora (every corpus weighs the same; lower is
-    // better; below 1.0 beats the baseline).
+    // The experiment score (since E034): geometric mean across corpora of
+    // (kernel bytes + read weight x read cost) / (trained-dictionary
+    // baseline bytes + read weight x its read cost); every corpus weighs the
+    // same; lower is better; below 1.0 beats the baseline. `bytes_score` is
+    // the score before E034 (bytes only), reported for continuity.
     let score = (log_ratio / n.max(1) as f64).exp();
+    let bytes_score = (log_bytes / n.max(1) as f64).exp();
     if json {
         println!(
-            "{{\"corpus\":\"_summary\",\"corpora\":{n},\"score\":{score:.4},\"total_ms\":{total_ms}}}"
+            "{{\"corpus\":\"_summary\",\"corpora\":{n},\"score\":{score:.4},\"bytes_score\":{bytes_score:.4},\"total_ms\":{total_ms}}}"
         );
     } else {
         println!(
-            "score (geometric mean of repack / zstd+dict) = {score:.4} over {n} corpora, {total_ms} ms"
+            "score (geometric mean of (repack + w*read) / (zstd+dict + w*read)) = {score:.4}, bytes only = {bytes_score:.4}, over {n} corpora, {total_ms} ms"
         );
     }
 }

@@ -146,16 +146,18 @@ thread_local! {
     static DECOMPRESSED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
-/// Bytes decompressed from stored frames on this thread so far: the decode
-/// cost of reads that the evaluator's work (function output) leaves out.
-/// A measurement for benchmarks; differences between two calls are what
-/// one read cost.
-pub fn decompressed_bytes() -> usize {
+/// Decode cost of reads on this thread so far, in zstd-equivalent bytes:
+/// bytes decompressed from stored frames, each weighted by its codec's
+/// decode time relative to zstd (`codec::*_READ`). The part of a read the
+/// evaluator's work (function output) leaves out. A measurement for
+/// benchmarks; the difference between two calls is what one read cost.
+pub fn decode_cost() -> usize {
     DECOMPRESSED.with(|d| d.get())
 }
 
-pub(crate) fn count_decompressed(n: usize) {
-    DECOMPRESSED.with(|d| d.set(d.get() + n));
+/// Count `n` bytes decoded by a codec `weight` times slower than zstd.
+pub(crate) fn count_decode(n: usize, weight: usize) {
+    DECOMPRESSED.with(|d| d.set(d.get() + n * weight));
 }
 
 /// Decode at most the first `limit` bytes of a frame: zstd decodes
@@ -173,7 +175,7 @@ pub(crate) fn unzstd_prefix(frame: &[u8], dict: &[u8], limit: usize) -> Option<V
         .take(limit as u64)
         .read_to_end(&mut out)
         .ok()?;
-    count_decompressed(out.len());
+    count_decode(out.len(), 1);
     Some(out)
 }
 
