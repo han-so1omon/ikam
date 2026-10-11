@@ -561,3 +561,28 @@ Newest last. Format and rules: `README.md`.
     - repo-graph: the planner now trades bytes for read cost there, but the score measures no read for graph corpora.
     - Both are limits of the estimate (members read through derivations, graph reads), not of the objective.
 - Verdict: **kept** (score improves; md and office gain most). The planner, the group step, `recompress` and the score now use one objective. Next: seekable blocks inside groups (E029), re-tested under this objective.
+
+### E037 seekable-groups-read-aware
+- Branch / parent: exp/037-seekable-groups-read-aware / E036
+- Hypothesis: E029's seekable blocks were discarded only because the score ignored reads, and because repack's plan choice and the group step used different objectives. Under the read-aware score (E034) and one objective (E036), storing a group as independently decodable blocks where it lowers bytes + w x read cost improves the score, most where group decoding dominates reads (source: E029: md, pdf and office read cost 0.48–0.73x for 2–3.5% more bytes; E036 read costs)
+- Change (E029's mechanism, ported by hand onto the current kernel):
+  - `src/dict.rs`: plain encoding "K" dict[4] block count { frame_len } frames (`block_frames`, zstd at `STORE_LEVEL` with the dictionary per block; `unblock`; `block_size`); `decode_blocks`; "K" is plain for `is_plain`, `dict_of` and `needs` (gc keeps its dictionary); `with_dict` generalises the dictionary retry.
+  - `src/group.rs`: `member_span` (group prefix, start, end) replaces `member_end`; `read_member` decodes only the blocks of a "K" group the member overlaps (still verified by the member's id). Test `blocked_group_members_read_back` (E029's, ported).
+  - `src/repack.rs`: `ReadModel` keeps each member's range and read count. `block_reads` = bytes of the blocks each member read overlaps. `recompress` also offers a group "K" with blocks of 4 KiB and 16 KiB when a dictionary exists, kept if it lowers bytes + w x reads. `plan_cost` prices "K" groups by `block_reads`.
+- Result (two runs identical): score 0.3450 -> **0.3363** (-2.5%); bytes_score 0.2931 -> 0.3033.
+  | corpus | bytes E036 -> E037 | read_whole E036 -> E037 | vs_dict_read | "K" groups |
+  |---|---|---|---|---|
+  | md | 65,549 -> 66,133 | 3.09 M -> 2.14 M | 0.8906 -> 0.8858 | 1 |
+  | pdf | 20,379 -> 20,853 | 1.26 M -> 0.69 M | 0.8752 -> 0.8714 | 1 |
+  | office | 151,433 -> 170,571 | 123.1 M -> 48.1 M | 0.6968 -> **0.5550** | 14 |
+  | invoices | 3,370 -> 3,662 | 0.83 M -> 0.50 M | 0.3084 -> 0.3058 | 1 |
+  | synthetic-history | 16,083 | 2.06 M | 0.2954 | – |
+  | repo-history | 909,859 -> 910,740 | 30.2 M -> 29.5 M | 0.7253 -> 0.7255 | 2 |
+  | repo-graph | 19,968 -> 20,800 | (not measured) | 0.1760 -> **0.1834** (worse) | 1 |
+  | generated | 4,260 | 1.32 M | 0.0318 | – |
+  - Time 74.1 s -> 82.3 s (1.11x; each group is compressed in blocks twice more).
+  - **Attribution:**
+    - The gain is mostly office: 14 blocked groups cut its read cost 61% for 13% more bytes.
+    - repo-graph loses because the planner prices reads for graph content, which the score does not measure (E036's limit).
+    - repo-history is flat: blocking helps two groups, but the extra bytes cancel the read saved.
+- Verdict: **kept** (score improves). E029's hypothesis is confirmed once the objective counts reads and is the same everywhere. Remaining mismatch: graph corpora (the planner prices reads the benchmark does not measure); either measure graph reads in the benchmark or exclude graph content from read pricing.

@@ -22,7 +22,7 @@ pub(crate) const GROUP_REF_LEN: usize = 8;
 /// group, so this bounds the read cost of a member.
 const GROUP_SIZE: usize = 64 * 1024;
 
-fn put_varint(out: &mut Vec<u8>, mut n: usize) {
+pub(crate) fn put_varint(out: &mut Vec<u8>, mut n: usize) {
     while n >= 0x80 {
         out.push(n as u8 | 0x80);
         n >>= 7;
@@ -30,7 +30,7 @@ fn put_varint(out: &mut Vec<u8>, mut n: usize) {
     out.push(n as u8);
 }
 
-fn varint(b: &mut &[u8]) -> Option<usize> {
+pub(crate) fn varint(b: &mut &[u8]) -> Option<usize> {
     let mut n = 0usize;
     for shift in (0..64).step_by(7) {
         let (&byte, rest) = b.split_first()?;
@@ -180,14 +180,16 @@ fn seed_keys(bytes: &[u8]) -> HashSet<u64> {
         .collect()
 }
 
-/// A member entry's group prefix and the end of its range: a member read
-/// decodes its group up to there.
-pub(crate) fn member_end(encoded: &[u8]) -> Option<(&[u8], usize)> {
+/// A member entry's group prefix and its range in the group: a member read
+/// decodes the group up to the range's end, or (blocked) the blocks it
+/// overlaps.
+pub(crate) fn member_span(encoded: &[u8]) -> Option<(&[u8], usize, usize)> {
     let (b'S', rest) = encoded.split_first()? else {
         return None;
     };
     let (prefix, mut rest) = rest.split_at_checked(GROUP_REF_LEN)?;
-    Some((prefix, varint(&mut rest)?.checked_add(varint(&mut rest)?)?))
+    let start = varint(&mut rest)?;
+    Some((prefix, start, start.checked_add(varint(&mut rest)?)?))
 }
 
 /// A member's stored entry.
@@ -218,12 +220,22 @@ impl<S: Store> Repo<S> {
             if stored.first() == Some(&b'S') {
                 continue;
             }
-            // Decode the group only up to the member's end; the member is
-            // verified by its own id (the group's id is not checked).
+            // Decode only what the member needs (the group up to its end, or
+            // the blocks it overlaps); the member is verified by its own id
+            // (the group's id is not checked).
             let end = start.saturating_add(len);
-            let member = |b: &[u8]| b.get(start..end).is_some_and(|r| Id::of_content(r) == *id);
-            if let Ok(bytes) = self.decode_prefix(&group, &stored, end, &member) {
-                return Ok(bytes[start..end].to_vec());
+            let member = |at: usize, b: &[u8]| {
+                b.get(start - at..end - at)
+                    .is_some_and(|r| Id::of_content(r) == *id)
+            };
+            let span = match stored.first() {
+                Some(b'K') => self.decode_blocks(&group, &stored, start, end, &member),
+                _ => self
+                    .decode_prefix(&group, &stored, end, &|b| member(0, b))
+                    .map(|b| (0, b)),
+            };
+            if let Ok((at, bytes)) = span {
+                return Ok(bytes[start - at..end - at].to_vec());
             }
         }
         Err(bad())
@@ -322,7 +334,60 @@ impl<S: Store> Repo<S> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::dict::{DICT_REF_LEN, block_frames};
     use crate::{Kind, MemStore, Object, TreeEntry};
+
+    /// A blocked group ("K"): members read back exactly while decoding only
+    /// their blocks, the whole group decodes, and gc and fsck accept it.
+    #[test]
+    fn blocked_group_members_read_back() {
+        let mut repo = Repo::new(MemStore::default());
+        let docs: Vec<Vec<u8>> = (0..100)
+            .map(|i| format!("record {i}: {}\n", "shared text ".repeat(20 + i % 7)).into_bytes())
+            .collect();
+        let dict = zstd::dict::from_continuous(
+            &docs.concat(),
+            &docs.iter().map(Vec::len).collect::<Vec<_>>(),
+            4096,
+        )
+        .unwrap();
+        let dict_id = repo.set_dictionary(dict.clone()).unwrap();
+        let ids: Vec<Id> = docs
+            .iter()
+            .map(|d| repo.put_content(d).unwrap().id)
+            .collect();
+        let entries = ids.iter().enumerate().map(|(i, id)| TreeEntry {
+            name: format!("r{i:03}"),
+            kind: Kind::File,
+            id: *id,
+        });
+        let tree = repo.put(&Object::tree(entries.collect()).unwrap()).unwrap();
+        repo.commit("main", tree, "").unwrap();
+        let joined = docs.concat();
+        let group = Id::of_content(&joined);
+        let body = block_frames(&joined, &dict, 4096).unwrap();
+        let encoded = [&b"K"[..], &dict_id.as_bytes()[..DICT_REF_LEN], &body].concat();
+        repo.store.write(group, &encoded).unwrap();
+        let mut at = 0;
+        for (id, d) in ids.iter().zip(&docs) {
+            repo.store
+                .replace(*id, &member_entry(&group, at, d.len()))
+                .unwrap();
+            at += d.len();
+        }
+        repo.reset_projections();
+        repo.gc().unwrap();
+        for (id, d) in ids.iter().zip(&docs) {
+            let before = crate::decode_cost();
+            assert_eq!(&repo.read_content(id).unwrap(), d);
+            assert!(
+                crate::decode_cost() - before <= 2 * 4096,
+                "decoded more than two blocks"
+            );
+        }
+        assert_eq!(repo.read_content(&group).unwrap(), joined);
+        assert!(repo.fsck().unwrap().is_empty());
+    }
 
     #[test]
     fn varints_round_trip() {

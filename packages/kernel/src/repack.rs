@@ -23,10 +23,10 @@ use std::collections::{HashMap, HashSet};
 
 use crate::codec::read_weight;
 use crate::dict::{
-    DICT_REF, DICT_REF_LEN, MEASURE_LEVEL, STORE_LEVEL, framer, is_plain, object_tag, tree_content,
-    zstd_frame,
+    DICT_REF, DICT_REF_LEN, MEASURE_LEVEL, STORE_LEVEL, block_frames, block_size, framer, is_plain,
+    object_tag, tree_content, zstd_frame,
 };
-use crate::group::{GROUP_REF_LEN, member_end};
+use crate::group::{GROUP_REF_LEN, member_span};
 use crate::ingest::derivation_size;
 use crate::matcher::{self, Index};
 use crate::repo::Cx;
@@ -320,13 +320,34 @@ impl<S: Store + Sync> Repo<S> {
                         return Err(Error::Corrupt(id));
                     }
                     let reads = model.reads(&id, bytes.len());
-                    let encoded = match Some(id) == dict {
+                    let mut encoded = match Some(id) == dict {
                         // A dictionary is never encoded against a dictionary.
                         true => zstd_frame(&bytes, &[], STORE_LEVEL)
                             .map_or(stored.clone(), |z| [&b"Z"[..], &z].concat()),
                         false => self.encode_cheapest(&bytes, reads),
                     };
-                    if self.cost(&encoded, reads) < self.cost(&stored, reads) {
+                    let mut cost = self.cost(&encoded, reads);
+                    // A group may instead be stored as blocks, each its own
+                    // frame with the dictionary: a member read decodes only
+                    // the blocks it overlaps.
+                    if model.is_group(&id)
+                        && let Some((dict_id, dict_bytes)) = self.dictionary()
+                    {
+                        for block in BLOCKS.into_iter().filter(|&b| b < bytes.len()) {
+                            let Some(body) = block_frames(&bytes, dict_bytes, block) else {
+                                continue;
+                            };
+                            let k =
+                                [&b"K"[..], &dict_id.as_bytes()[..DICT_REF_LEN], &body].concat();
+                            let k_cost = k.len() as f64
+                                + self.read_weight
+                                    * model.block_reads(&id, bytes.len(), block) as f64;
+                            if k_cost < cost {
+                                (encoded, cost) = (k, k_cost);
+                            }
+                        }
+                    }
+                    if cost < self.cost(&stored, reads) {
                         self.store.replace(id, &encoded)?;
                     }
                     continue;
@@ -359,9 +380,9 @@ impl<S: Store + Sync> Repo<S> {
             groups: HashMap::new(),
         };
         for id in self.store.ids()? {
-            if let Some((group, end)) = member_end(&self.store.read(&id)?) {
-                let n = end * model.times(&id);
-                *model.groups.entry(group.to_vec()).or_default() += n;
+            if let Some((group, start, end)) = member_span(&self.store.read(&id)?) {
+                let span = (start, end, model.times(&id));
+                model.groups.entry(group.to_vec()).or_default().push(span);
             }
         }
         Ok(model)
@@ -376,9 +397,12 @@ impl<S: Store + Sync> Repo<S> {
         let mut read = 0;
         for id in self.store.ids()? {
             let stored = self.store.read(&id)?;
-            if matches!(stored[0], b'Z' | b'Y' | b'X' | b'R' | b'P') {
+            if matches!(stored[0], b'Z' | b'Y' | b'X' | b'R' | b'P' | b'K') {
                 let len = self.decode_plain(&id, &stored)?.len();
-                read += read_weight(stored[0]) * model.reads(&id, len);
+                read += match block_size(&stored) {
+                    Some(block) if stored[0] == b'K' => model.block_reads(&id, len, block),
+                    _ => read_weight(stored[0]) * model.reads(&id, len),
+                };
             }
         }
         for (id, bytes) in files {
@@ -639,8 +663,12 @@ fn repeat_dictionary(samples: &[&[u8]], size: usize) -> Vec<u8> {
 /// group up to each member's end per read of that member.
 pub(crate) struct ReadModel {
     uses: HashMap<Id, usize>,
-    groups: HashMap<Vec<u8>, usize>,
+    /// Per group prefix: each member's range and how often it is read.
+    groups: HashMap<Vec<u8>, Vec<(usize, usize, usize)>>,
 }
+
+/// Block sizes a group may be stored in (see `dict::block_frames`).
+const BLOCKS: [usize; 2] = [4 * 1024, 16 * 1024];
 
 impl ReadModel {
     pub(crate) fn times(&self, id: &Id) -> usize {
@@ -651,9 +679,23 @@ impl ReadModel {
     /// once.
     pub(crate) fn reads(&self, id: &Id, len: usize) -> usize {
         match self.groups.get(&id.as_bytes()[..GROUP_REF_LEN]) {
-            Some(&n) => n,
+            Some(spans) => spans.iter().map(|&(_, end, n)| end * n).sum(),
             None => len * self.times(id),
         }
+    }
+
+    fn is_group(&self, id: &Id) -> bool {
+        self.groups.contains_key(&id.as_bytes()[..GROUP_REF_LEN])
+    }
+
+    /// Bytes decoded from group `id` (of `len` bytes) stored in blocks of
+    /// `block` bytes: each member read decodes the blocks it overlaps.
+    pub(crate) fn block_reads(&self, id: &Id, len: usize, block: usize) -> usize {
+        let spans = self.groups.get(&id.as_bytes()[..GROUP_REF_LEN]);
+        let covered = |s: usize, e: usize| (e.div_ceil(block) * block).min(len) - s / block * block;
+        spans.map_or(len * self.times(id), |spans| {
+            spans.iter().map(|&(s, e, n)| covered(s, e) * n).sum()
+        })
     }
 }
 
