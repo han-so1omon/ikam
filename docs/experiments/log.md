@@ -621,3 +621,30 @@ Newest last. Format and rules: `README.md`.
   - structured: 8,885,967 B in; kernel 110,873 B against zstd + dictionary 1,001,028 B (vs_dict **0.1108**; zstd per file 1,093,528). Read cost 20.5 M against a baseline 8.9 M (vs_dict_read **0.1301**). Time: repack 7.0 s; total 77.7 s -> 90.3 s.
   - Stored as: 21 derivation records ("D" 2,835 B, "d" 2,187 B), 29 group members, and leaves of 3 "Y" frames (86,075 B) plus the dictionary ("Z" 17,844 B). The kernel dedups across versions (repeated inventory rows, the append-only log), which per-file compression cannot. Most of what is left is the unique new rows, largely 40-hex-digit blob ids.
 - Verdict: reference. The first corpus where field- and column-level transforms have a measurable target (the 86 KB of "Y" leaves).
+
+### E041 structured-transforms (offline measurement; no kernel change)
+- Branch / parent: exp/041-structured-transforms / E040
+- Hypothesis: on the structured corpus's stored leaves, field-level transforms before the coder (40-hex-digit ids packed as binary, CSV/NDJSON fields split into one stream per field) shrink what zstd leaves, and pay under the read-aware objective (source: E040; E032 found no such leaves before)
+- Method:
+  - Temporary diagnostics in `examples/bench.rs` (not committed) dumped the structured corpus's plain leaves after repack and reported, per leaf, its group members and derivation uses.
+  - Offline, transforms were compared with zstd-19 on the same bytes (without the dictionary, so ratios not absolute sizes):
+    - hex: ids replaced by a marker, packed ids raw or zstd-compressed;
+    - cols: lines split after every ',' and '{', one stream per field index;
+    - and combinations.
+- Leaves (besides the dictionary, "Z" 17,844 B):
+  - change-log fragment: 593,088 B decoded, 21,236 B stored, not a group, 10 derivation uses, 2,871 ids;
+  - summary/log pieces: 23,192 B, 5,812 B, a group with 29 members;
+  - inventory fragment: 306,534 B, 59,027 B, not a group, 48 derivation uses, 2,625 ids.
+- Measured (vs zstd-19 on the same bytes):
+  | leaf | hex raw | hex, packed ids compressed | cols | cols + hex compressed |
+  |---|---:|---:|---:|---:|
+  | change log | 3.368 | 0.989 | 0.897 | **0.892** |
+  | summary (group) | 1.091 | **0.927** | 1.388 | 1.194 |
+  | inventory | 1.036 | 0.921 | 0.928 | **0.895** |
+  - Raw hex packing is much worse: ids repeat (a commit hash on every row of its commit), and zstd already dedups them and codes unique hex near 4 bits per digit. Best per leaf: 0.896 of zstd-19, roughly 9 KB of structured's 110,873 B.
+- Priced by the score's objective (E034/E036):
+  - A transformed leaf is rebuilt by a function on every read, adding its length in function work each time it is read.
+  - The two eligible leaves are slice sources read whole once per derivation that uses them (11 and 49 reads). Extra work x w: ~6.5 KB (change log) and ~15 KB (inventory), against ~2.4 KB and ~4.4 KB of bytes saved. The summary leaf is a group and cannot be replaced by a derivation (members are byte ranges of the stored group).
+- Result: no kernel change, so the score stays **0.3205**.
+- Verdict: **refuted under the read-aware objective** for this corpus. The transforms save 7–10% of the leaves' bytes but would roughly double their read work, since the leaves are read whole many times. They would pay only for rarely read data or a lower read weight.
+  - The measurement points to structured's real cost driver: slice sources of 306–593 KB decoded whole for every file read (read cost 20.5 M against a 8.9 M baseline). Next hypothesis: store large slice sources in blocks (E037's "K"), with slice reads decoding only the blocks they overlap.
