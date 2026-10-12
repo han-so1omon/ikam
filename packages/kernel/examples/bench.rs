@@ -340,6 +340,25 @@ fn read_costs(repo: &Repo<MemStore>, snapshots: &[Snapshot]) -> (usize, usize, b
     (whole, window, exact)
 }
 
+/// Read cost of a graph corpus (since E039): reading every version's graph
+/// back from its commit once, as bytes decompressed (weighted per codec).
+/// Graph reads go through `graph_nodes`, which reports no function work.
+fn graph_read_cost(repo: &Repo<MemStore>) -> usize {
+    let mut graphs = Vec::new();
+    for (_, c) in repo.log(repo.resolve("main").unwrap()).unwrap() {
+        let Object::Tree(entries) = repo.get(&c.tree).unwrap() else {
+            panic!("a graph commit's tree");
+        };
+        graphs.push(entries[0].id);
+    }
+    // Only the graph reads count, as only content reads do for files.
+    let before = ikam_kernel::decode_cost();
+    graphs
+        .iter()
+        .for_each(|g| drop(repo.graph_nodes(g).unwrap()));
+    ikam_kernel::decode_cost() - before
+}
+
 /// The committed embedding proposal (`semantic/order.txt`, written by
 /// `semantic/embed.py`): content ids in a semantic order. Repack uses it as
 /// one grouping proposal among several, so no model runs here.
@@ -628,7 +647,7 @@ fn main() {
                 .all(|(_, b)| repo.read_content(&Id::of_content(b)).unwrap() == *b),
         };
         let (read_whole, read_4k, range_exact) = match graph {
-            true => (0, 0, true),
+            true => (graph_read_cost(&repo), 0, true),
             false => read_costs(&repo, &snapshots),
         };
         let exact = exact && range_exact;
@@ -637,12 +656,10 @@ fn main() {
         let ratio = repack as f64 / zstd_dict as f64;
         // With read cost (E034): the baseline reads each distinct file by
         // decoding its zstd frame once; the kernel's read cost is
-        // `read_whole`. Graph corpora have no file read measured (0).
+        // `read_whole`. For a graph corpus (E039) the files are each
+        // version's edge list and the kernel reads each version's graph.
         let w = ikam_kernel::DEFAULT_READ_WEIGHT;
-        let baseline_read = match graph {
-            true => 0,
-            false => distinct_bytes(&snapshots),
-        };
+        let baseline_read = distinct_bytes(&snapshots);
         let read_ratio =
             (repack as f64 + w * read_whole as f64) / (zstd_dict as f64 + w * baseline_read as f64);
         if json {

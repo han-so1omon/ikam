@@ -596,3 +596,14 @@ Newest last. Format and rules: `README.md`.
   - Chosen over deleting the codecs (user preference: archive rather than drop).
 - Result (two runs identical): score **0.3363 -> 0.3363**; every size, read cost and ratio byte-identical to E037. Time 82.3 s -> 78.0–78.7 s (-5%). The saving is smaller than E035's estimate (~13.5 s for three extra codecs), since most recompress time is now blocks, zstd-19 and brotli.
 - Verdict: **kept** (score holds; less repack time; capability kept as archived).
+
+### E039 graph-read-cost (benchmark change)
+- Branch / parent: exp/039-graph-read-cost / E038
+- Change to the measurement: graph reads count in the score.
+  - Since E034 the score counted read cost for file corpora only (graph corpora: 0 on both sides). Since E036 the planner prices reads for graph content too, so on repo-graph it traded bytes for read speed the score could not see (repo-graph worse in E036 and E037).
+  - Rather than drop graph content from read pricing, the benchmark now measures graph reads: IKAM's graph is its core read path, and the planner should not learn to ignore it (source: E036/E037 repo-graph regressions).
+  - `examples/bench.rs` `graph_read_cost`: after the exactness check (which warms the dictionary), every version's graph is read back once via `graph_nodes`, counting `decode_cost` only around those calls (finding the graph ids from commits and trees is not counted, as file reads count content only). The baseline is decoding each version's edge list once (`read_baseline` = distinct snapshot bytes), as for files.
+  - Only repo-graph's ratio changes. **Scores before and after E039 are not comparable.**
+- Result, E038 kernel (four runs identical: two counting commit and tree decoding too, two counting graph reads only, same figures): score **0.3588** (E038 under the old measurement: 0.3363); bytes_score 0.3033.
+  - repo-graph: read_whole 0 -> **14,422,902** against read_baseline 1,006,283 (14.3x the baseline); vs_dict_read 0.1834 -> **0.3078**. Every other corpus is unchanged.
+- Verdict: reference. Reading every version's graph costs the kernel 14x what decoding the edge lists costs the baseline, so graph read cost is now visible as a target.
