@@ -157,6 +157,101 @@ fn repo_graph() -> Vec<Snapshot> {
     out
 }
 
+/// Structured data (E040): exports of this repository's history up to the
+/// same pinned commit as `repo_graph`, at every fourth commit and the last.
+/// Each snapshot has a full-table export (`inventory.csv`: every file's
+/// path, mode, size and blob id), an append-only log (`changes.ndjson`: one
+/// JSON object per file change so far, with commit, date, author name,
+/// lines added and deleted) and a summary (`summary.json`: files and bytes
+/// per top-level directory). Real metadata, not the output of a short
+/// procedure; author emails are left out.
+fn structured() -> Vec<Snapshot> {
+    let root = repo_root();
+    let git = |args: &[&str]| {
+        let out = Command::new("git")
+            .args(args)
+            .current_dir(&root)
+            .output()
+            .unwrap();
+        String::from_utf8(out.stdout).unwrap()
+    };
+    let commits: Vec<String> = git(&["rev-list", "--reverse", "0ca74e4"])
+        .lines()
+        .map(String::from)
+        .collect();
+    let (mut log, mut out) = (String::new(), Vec::new());
+    for (i, c) in commits.iter().enumerate() {
+        let meta = git(&["show", "-s", "--format=%aI%x09%an", c]);
+        let (date, author) = meta.trim_end().split_once('\t').unwrap();
+        for row in git(&["show", "--numstat", "--format=", c]).lines() {
+            let mut f = row.splitn(3, '\t');
+            let (added, deleted, path) = (f.next().unwrap(), f.next().unwrap(), f.next().unwrap());
+            let num = |n: &str| {
+                if n == "-" {
+                    "null".to_string()
+                } else {
+                    n.to_string()
+                }
+            };
+            log += &format!(
+                "{{\"commit\":\"{c}\",\"date\":\"{date}\",\"author\":{},\"path\":{},\"added\":{},\"deleted\":{}}}\n",
+                json_str(author),
+                json_str(path),
+                num(added),
+                num(deleted)
+            );
+        }
+        if (i + 1) % 4 != 0 && i + 1 != commits.len() {
+            continue;
+        }
+        let mut inventory = String::from("path,mode,size,blob\n");
+        let mut dirs: BTreeMap<String, (usize, usize)> = BTreeMap::new();
+        for row in git(&["ls-tree", "-r", "-l", c]).lines() {
+            let (meta, path) = row.split_once('\t').unwrap();
+            let f: Vec<&str> = meta.split_whitespace().collect();
+            let size: usize = f[3].parse().unwrap_or(0);
+            inventory += &format!("{},{},{},{}\n", csv_str(path), f[0], f[3], f[2]);
+            let d = dirs
+                .entry(path.split('/').next().unwrap().to_string())
+                .or_default();
+            (d.0, d.1) = (d.0 + 1, d.1 + size);
+        }
+        let summary: Vec<String> = dirs
+            .iter()
+            .map(|(d, (n, b))| format!("  {}: {{\"files\": {n}, \"bytes\": {b}}}", json_str(d)))
+            .collect();
+        out.push(vec![
+            ("inventory.csv".to_string(), inventory.into_bytes()),
+            ("changes.ndjson".to_string(), log.clone().into_bytes()),
+            (
+                "summary.json".to_string(),
+                format!("{{\n{}\n}}\n", summary.join(",\n")).into_bytes(),
+            ),
+        ]);
+    }
+    out
+}
+
+fn json_str(s: &str) -> String {
+    let mut out = String::from("\"");
+    for ch in s.chars() {
+        match ch {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out + "\""
+}
+
+fn csv_str(s: &str) -> String {
+    match s.contains([',', '"', '\n']) {
+        true => format!("\"{}\"", s.replace('"', "\"\"")),
+        false => s.to_string(),
+    }
+}
+
 /// One edge line from a `path:match` grep result.
 fn edge(line: &str) -> Option<String> {
     let (path, m) = line.split_once(':')?;
@@ -610,6 +705,7 @@ fn main() {
         ("repo-history", repo_history, false),
         ("repo-graph", repo_graph, true),
         ("generated", generated, false),
+        ("structured", structured, false),
     ];
     let (mut log_ratio, mut log_bytes, mut n, mut total_ms) = (0.0, 0.0, 0, 0);
     for (name, build, graph) in corpora {

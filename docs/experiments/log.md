@@ -607,3 +607,17 @@ Newest last. Format and rules: `README.md`.
 - Result, E038 kernel (four runs identical: two counting commit and tree decoding too, two counting graph reads only, same figures): score **0.3588** (E038 under the old measurement: 0.3363); bytes_score 0.3033.
   - repo-graph: read_whole 0 -> **14,422,902** against read_baseline 1,006,283 (14.3x the baseline); vs_dict_read 0.1834 -> **0.3078**. Every other corpus is unchanged.
 - Verdict: reference. Reading every version's graph costs the kernel 14x what decoding the edge lists costs the baseline, so graph read cost is now visible as a target.
+
+### E040 structured-corpus (benchmark change)
+- Branch / parent: exp/040-structured-corpus / E039
+- Change to the measurement: a ninth corpus, `structured`, of real structured data that no short program generates, so domain transforms (fields, columns) have something to act on (source: E032, which found no CSV or log content stored as a leaf: the generated corpus's CSV and log are stored as programs).
+  - Built deterministically from this repository's history up to the commit `repo-graph` pins (0ca74e4, 38 commits), with a snapshot at every fourth commit and at the last (10 snapshots, 30 files, 8,885,967 B). Each snapshot has:
+    - `inventory.csv`: a full-table export, every file's path, mode, size and blob id (~2,600 rows, ~330 KB);
+    - `changes.ndjson`: an append-only log, one JSON object per file change so far (commit, ISO date, author name, path, lines added and deleted; up to 2,906 rows);
+    - `summary.json`: files and bytes per top-level directory.
+  - Author emails are left out. All files parse as CSV, NDJSON and JSON (checked once on a temporary dump).
+  - The other eight corpora are unchanged. **Scores before and after E040 are not comparable.**
+- Result, E039 kernel (two runs identical): score **0.3205** over 9 corpora; bytes_score 0.2712. The other eight corpora are byte-identical to E039.
+  - structured: 8,885,967 B in; kernel 110,873 B against zstd + dictionary 1,001,028 B (vs_dict **0.1108**; zstd per file 1,093,528). Read cost 20.5 M against a baseline 8.9 M (vs_dict_read **0.1301**). Time: repack 7.0 s; total 77.7 s -> 90.3 s.
+  - Stored as: 21 derivation records ("D" 2,835 B, "d" 2,187 B), 29 group members, and leaves of 3 "Y" frames (86,075 B) plus the dictionary ("Z" 17,844 B). The kernel dedups across versions (repeated inventory rows, the append-only log), which per-file compression cannot. Most of what is left is the unique new rows, largely 40-hex-digit blob ids.
+- Verdict: reference. The first corpus where field- and column-level transforms have a measurable target (the 86 KB of "Y" leaves).
