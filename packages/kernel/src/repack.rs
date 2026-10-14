@@ -30,7 +30,9 @@ use crate::group::{GROUP_REF_LEN, member_span};
 use crate::ingest::derivation_size;
 use crate::matcher::{self, Index};
 use crate::repo::Cx;
-use crate::{Arg, Derivation, Error, Id, MemStore, Object, Repo, Store, func, template};
+use crate::{
+    Arg, Derivation, Error, Graph, Id, Kind, MemStore, Object, Repo, Store, func, template,
+};
 
 /// Seed neighbours considered for each star centre.
 const STAR_CANDIDATES: usize = 64;
@@ -375,6 +377,14 @@ impl<S: Store + Sync> Repo<S> {
                 .iter()
                 .for_each(|a| *uses.entry(a.id()).or_default() += 1);
         }
+        // A graph chunk is read once per distinct graph that contains it
+        // (E044): count, for each chunk stored as content, the graphs whose
+        // chunk tree reaches it.
+        for (chunk, graphs) in self.graph_chunk_reads()? {
+            if let Some(content) = tree_content(&self.store.read(&chunk)?) {
+                *uses.entry(content).or_default() += graphs;
+            }
+        }
         let mut model = ReadModel {
             uses,
             groups: HashMap::new(),
@@ -386,6 +396,34 @@ impl<S: Store + Sync> Repo<S> {
             }
         }
         Ok(model)
+    }
+
+    /// For every graph chunk reachable from a graph a stored tree names:
+    /// how many of those graphs contain it.
+    fn graph_chunk_reads(&self) -> Result<HashMap<Id, usize>, Error> {
+        let mut roots = HashSet::new();
+        for id in self.store.ids()? {
+            if object_tag(&self.store.read(&id)?) == Some(b'T')
+                && let Object::Tree(entries) = self.get(&id)?
+            {
+                let graphs = entries.into_iter().filter(|e| e.kind == Kind::Graph);
+                roots.extend(graphs.map(|e| e.id));
+            }
+        }
+        let mut reads: HashMap<Id, usize> = HashMap::new();
+        for root in roots {
+            let (mut seen, mut stack) = (HashSet::new(), vec![root]);
+            while let Some(id) = stack.pop() {
+                if !seen.insert(id) {
+                    continue;
+                }
+                *reads.entry(id).or_default() += 1;
+                if let Graph::Children(_, children) = self.graph_chunk(&id)? {
+                    stack.extend(children.into_iter().map(|(_, c)| c));
+                }
+            }
+        }
+        Ok(reads)
     }
 
     /// Estimated cost of this store when every file of `files` is read

@@ -639,3 +639,14 @@ Newest last. Format and rules: `README.md`.
 - Result (two runs identical): score 0.3097 -> **0.3062**; bytes_score 0.2712 (unchanged; every size byte-identical).
   - repo-graph: read_whole 5,024,570 -> **2,518,350** (2.5x the baseline's 1,006,283); vs_dict_read 0.2256 -> **0.2037**. Every other corpus is unchanged.
 - Verdict: **kept** (score improves; a read-path fix, no storage change). Graph reads still cost 2.5x the baseline. Remaining hypothesis: the planner's read model counts a graph chunk's content as read once, though each chunk is read once per distinct graph version that contains it, so it under-prices graph reads when grouping or blocking.
+
+### E044 graph-read-model (discarded)
+- Branch / parent: exp/044-graph-read-model / E043
+- Hypothesis: the planner's read model counts graph chunk content as read once, though each chunk is read once per distinct graph that contains it. Counting those reads lets grouping, blocking and codec choice price graph reads correctly and lowers repo-graph's read cost (source: E043's remaining 2.5x graph read cost)
+- Change:
+  - `src/repack.rs`: `graph_chunk_reads` finds every graph root named by a stored tree, walks each root's chunk tree, and counts per chunk the graphs containing it. `read_model` adds that count to the uses of a chunk's content when the chunk is stored as a pointer to content ("t 2"/"g 2").
+  - `src/graph.rs`: `graph_chunk` crate-visible.
+- Result (two runs identical): score **0.3062 -> 0.3062**; every size and read cost byte-identical to E043. Time 79.9 s -> 80.2 s.
+  - **Why no effect:** repo-graph's 54 chunks are stored as compressed objects ("g", 5,284 B), not as pointers to content. The counted reads never reach content the planner prices (groups, blocks and codec choice apply to content only).
+  - The remaining graph read cost (2.52 M against a 1.01 M baseline) is the size of the decoded canonical chunk encoding (labels, 8-byte edge keys, edge labels), about 2.5x the TSV edge lists the baseline decodes. Encodings of objects are not read-priced either.
+- Verdict: **discarded** (no effect; not merged). Next lever for graph reads: a more compact canonical chunk encoding (front-coded labels, shorter edge keys). That is an object-format change, since an object's id is the hash of its canonical encoding.

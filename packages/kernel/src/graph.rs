@@ -87,7 +87,7 @@ impl<S: Store> Repo<S> {
         Ok(level[0].1)
     }
 
-    fn graph_chunk(&self, id: &Id) -> Result<Graph, Error> {
+    pub(crate) fn graph_chunk(&self, id: &Id) -> Result<Graph, Error> {
         match self.get(id)? {
             Object::Graph(g) => Ok(g),
             _ => Err(Error::WrongKind(*id)),
