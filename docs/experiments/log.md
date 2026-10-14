@@ -621,3 +621,13 @@ Newest last. Format and rules: `README.md`.
   - structured: 8,885,967 B in; kernel 110,873 B against zstd + dictionary 1,001,028 B (vs_dict **0.1108**; zstd per file 1,093,528). Read cost 20.5 M against a baseline 8.9 M (vs_dict_read **0.1301**). Time: repack 7.0 s; total 77.7 s -> 90.3 s.
   - Stored as: 21 derivation records ("D" 2,835 B, "d" 2,187 B), 29 group members, and leaves of 3 "Y" frames (86,075 B) plus the dictionary ("Z" 17,844 B). The kernel dedups across versions (repeated inventory rows, the append-only log), which per-file compression cannot. Most of what is left is the unique new rows, largely 40-hex-digit blob ids.
 - Verdict: reference. The first corpus where field- and column-level transforms have a measurable target (the 86 KB of "Y" leaves).
+
+### E042 graph-reads-distinct (benchmark correction)
+- Branch / parent: exp/042-graph-reads / E041 (merged state: E040)
+- Change to the measurement, a correction to E039:
+  - E039 read the graph of every commit (38) but counted the baseline as each **distinct** edge list once (`distinct_bytes`), the rule for file corpora. Only 13 of the 38 commits have distinct graphs, so the kernel's graph read cost was overcounted about 2.9x against a baseline counted once per distinct version.
+  - `graph_read_cost` now reads each distinct graph id once, matching both the baseline and file corpora.
+  - **Scores before and after E042 are not comparable**; E039's and E040's reported figures for repo-graph's read cost (14,422,902) are superseded.
+- Result, E040 kernel (two runs identical): score **0.3097** (E040 as reported: 0.3205); bytes_score 0.2712.
+  - repo-graph: read_whole 14,422,902 -> **5,024,570** against read_baseline 1,006,283 (5.0x, not 14.3x); vs_dict_read 0.3078 -> **0.2256**. Every other corpus is unchanged.
+- Verdict: reference (measurement fixed). Graph reads still cost 5x the baseline's.

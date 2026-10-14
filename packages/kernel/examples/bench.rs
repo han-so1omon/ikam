@@ -435,16 +435,18 @@ fn read_costs(repo: &Repo<MemStore>, snapshots: &[Snapshot]) -> (usize, usize, b
     (whole, window, exact)
 }
 
-/// Read cost of a graph corpus (since E039): reading every version's graph
-/// back from its commit once, as bytes decompressed (weighted per codec).
+/// Read cost of a graph corpus (since E039): reading every distinct
+/// version's graph back once, as bytes decompressed (weighted per codec).
 /// Graph reads go through `graph_nodes`, which reports no function work.
 fn graph_read_cost(repo: &Repo<MemStore>) -> usize {
-    let mut graphs = Vec::new();
+    // Each distinct graph once, as file corpora read each distinct file
+    // once (E042: E039 read every commit's graph, duplicates included).
+    let mut graphs = BTreeSet::new();
     for (_, c) in repo.log(repo.resolve("main").unwrap()).unwrap() {
         let Object::Tree(entries) = repo.get(&c.tree).unwrap() else {
             panic!("a graph commit's tree");
         };
-        graphs.push(entries[0].id);
+        graphs.insert(entries[0].id);
     }
     // Only the graph reads count, as only content reads do for files.
     let before = ikam_kernel::decode_cost();
