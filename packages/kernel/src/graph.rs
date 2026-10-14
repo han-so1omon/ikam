@@ -108,15 +108,25 @@ impl<S: Store> Repo<S> {
         }
     }
 
-    /// Every node of a graph, in label order.
+    /// Every node of a graph, in label order. One pass: each chunk is read
+    /// once (finding the leaves first, then reading them, read every leaf
+    /// twice; E043).
     pub fn graph_nodes(&self, root: &Id) -> Result<Vec<Node>, Error> {
         let mut out = Vec::new();
-        for leaf in self.graph_leaves(root)? {
-            if let Graph::Nodes(nodes) = self.graph_chunk(&leaf)? {
-                out.extend(nodes);
+        self.collect_nodes(root, &mut out)?;
+        Ok(out)
+    }
+
+    fn collect_nodes(&self, id: &Id, out: &mut Vec<Node>) -> Result<(), Error> {
+        match self.graph_chunk(id)? {
+            Graph::Nodes(nodes) => out.extend(nodes),
+            Graph::Children(_, children) => {
+                for (_, child) in children {
+                    self.collect_nodes(&child, out)?;
+                }
             }
         }
-        Ok(out)
+        Ok(())
     }
 
     /// The node labelled `label`, reading one chunk per level.

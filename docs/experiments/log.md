@@ -631,3 +631,11 @@ Newest last. Format and rules: `README.md`.
 - Result, E040 kernel (two runs identical): score **0.3097** (E040 as reported: 0.3205); bytes_score 0.2712.
   - repo-graph: read_whole 14,422,902 -> **5,024,570** against read_baseline 1,006,283 (5.0x, not 14.3x); vs_dict_read 0.3078 -> **0.2256**. Every other corpus is unchanged.
 - Verdict: reference (measurement fixed). Graph reads still cost 5x the baseline's.
+
+### E043 graph-single-pass
+- Branch / parent: exp/043-graph-single-pass / E042
+- Hypothesis: `graph_nodes` found a graph's leaf chunks with `graph_leaves` (which decodes every chunk to learn its kind) and then decoded each leaf again for its nodes, so every leaf was read twice. One traversal that collects nodes as it goes halves leaf decoding, with storage unchanged (source: reading `src/graph.rs` while investigating E042's 5x graph read cost)
+- Change: `src/graph.rs`: `graph_nodes` uses a recursive `collect_nodes`, reading each chunk once. `graph_leaves` stays for graph diffs, which need leaf ids.
+- Result (two runs identical): score 0.3097 -> **0.3062**; bytes_score 0.2712 (unchanged; every size byte-identical).
+  - repo-graph: read_whole 5,024,570 -> **2,518,350** (2.5x the baseline's 1,006,283); vs_dict_read 0.2256 -> **0.2037**. Every other corpus is unchanged.
+- Verdict: **kept** (score improves; a read-path fix, no storage change). Graph reads still cost 2.5x the baseline. Remaining hypothesis: the planner's read model counts a graph chunk's content as read once, though each chunk is read once per distinct graph version that contains it, so it under-prices graph reads when grouping or blocking.
