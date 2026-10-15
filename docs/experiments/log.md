@@ -669,3 +669,29 @@ Newest last. Format and rules: `README.md`.
   - repo-history: bytes 910,740 -> 910,278; read 29,451,124 -> 29,724,965; vs_dict_read 0.7255 -> 0.7253. Still over-predicted (35.2 M vs 29.7 M), cause not yet found.
   - Other corpora are byte-identical. Time 87.0 s -> 77.5 s.
 - Verdict: **kept**. Remaining model gaps: inner `fill` and WASM fuel work are unmodelled, and repo-history is still over-predicted. md's 12x read cost is the priced cost of grouping, not template work.
+
+### E049 storage-plan-concepts (relatedness measurement)
+- Branch / parent: exp/049-concept-edges / E048
+- Hypothesis (C2 in `docs/research/latent-reasoning.md`): the storage plan's shared structure marks related content. That structure is the templates, slice sources and groups the planner keeps only when they save bytes (an MDL "concept"). Exposing it would give graph edges without a model.
+- Measurement: `cargo run --release --example relatedness`. The 343 markdown fixtures are committed as one tree and repacked (109,398 -> 57,829 B). Each fixture's neighbour is taken from the plan in two ways:
+  - (a) the fixture sharing the most concepts, weighted by rarity. Concepts are every content its derivations reach, plus its group.
+  - (b) the member stored next to it in its group: the one before it, or after it if it comes first.
+
+  Both are compared with the existing top-conditional-gain neighbour.
+
+  | neighbour | files covered | same case (chance 4.1%) | same filename (chance 2.4%) |
+  |---|---|---|---|
+  | top conditional gain (baseline) | 343 | 26.5% | 53.4% |
+  | (a) shared concepts | 127 | 3.1% | 11.0% |
+  | (b) adjacent group member | 127 | 8.7% | 52.8% |
+
+- What the plan contains: for md, repack keeps no template or slice derivation. It keeps only two groups (99 and 28 members), so (a) reduces to a coarse group bucket.
+- Result:
+  - Group membership is not a relatedness signal: (a) is at chance for case.
+  - Order within a group is. (b) matches measured gain on structural relatedness (52.8% vs 53.4% same filename) at no query cost, where the gain baseline compares every pair (343 x 342 gain computations).
+  - (b) does not capture semantic, same-company relatedness (8.7% vs 26.5%).
+  - It covers only the 37% of fixtures that repack groups.
+- Verdict: **partial; no kernel change.**
+  - Adjacency in a group's order is a free structural edge for grouped content. That makes it a cheap candidate source for `claims::relate` (alongside shared seeds), but not a replacement for measured gain.
+  - Concept edges from templates and slices are untested here, because the md plan has none. invoices, synthetic-history or structured would test them, but they have no relatedness labels.
+- The measurement code stays in `examples/relatedness.rs` on this branch.
