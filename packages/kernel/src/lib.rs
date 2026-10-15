@@ -22,6 +22,7 @@ mod object;
 mod range;
 mod repack;
 mod repo;
+mod search;
 pub mod snapshot;
 mod store;
 mod template;
@@ -34,6 +35,7 @@ pub use object::{
 };
 pub use repack::Repacked;
 pub use repo::{DEFAULT_READ_WEIGHT, Form, Put, Repo};
+pub use search::{SEARCH_REF, SearchIndex};
 pub use store::{FsStore, MemStore, Store};
 
 #[derive(Debug, thiserror::Error)]

@@ -708,6 +708,64 @@ fn read_costs(repo: &Repo<MemStore>, snapshots: &[Snapshot]) -> (usize, usize, b
     (whole, window, exact)
 }
 
+/// Search cost per corpus (E058, reported, not scored): 200 deterministic
+/// grep-like queries (an identifier from a random line of a random file, as
+/// the agent trace of E050 searched), over every distinct file. Decode cost
+/// per query without an index (every file decoded and scanned) and with a
+/// trigram index (candidates only, plus the index's own decoding once,
+/// amortised over the queries); the index's stored bytes; and whether both
+/// return the same files. JSON fields to append.
+fn search_costs(repo: &mut Repo<MemStore>, snapshots: &[Snapshot]) -> String {
+    let files: BTreeMap<Id, &Vec<u8>> = snapshots
+        .iter()
+        .flatten()
+        .map(|(_, b)| (Id::of_content(b), b))
+        .collect();
+    let ids: Vec<Id> = files.keys().copied().collect();
+    let mut s = 0x1234_5678u64;
+    let mut lcg = move || {
+        s = s
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        (s >> 33) as usize
+    };
+    let mut queries = Vec::new();
+    while queries.len() < 200 {
+        let text = String::from_utf8_lossy(files[&ids[lcg() % ids.len()]]);
+        let lines: Vec<&str> = text.lines().collect();
+        let line = lines.get(lcg() % lines.len().max(1)).copied().unwrap_or("");
+        let word = line
+            .split(|c: char| !c.is_alphanumeric() && c != '_')
+            .find(|w| w.len() > 3);
+        queries.push(word.unwrap_or("data").as_bytes().to_vec());
+    }
+    let run = |repo: &Repo<MemStore>, index: Option<&ikam_kernel::SearchIndex>| {
+        let before = ikam_kernel::decode_cost();
+        let (mut work, mut found) = (0, Vec::new());
+        for q in &queries {
+            let (hits, w) = repo.search(q, &ids, index).unwrap();
+            (work, found) = (work + w, [found, hits].concat());
+        }
+        (ikam_kernel::decode_cost() - before + work, found)
+    };
+    let (scan, full) = run(repo, None);
+    let index_id = repo.build_search_index(&ids).unwrap();
+    let index_bytes = ikam_kernel::Store::read(repo.store(), &index_id)
+        .unwrap()
+        .len();
+    let before = ikam_kernel::decode_cost();
+    let index = repo.search_index().unwrap().unwrap();
+    let load = ikam_kernel::decode_cost() - before;
+    let (indexed, fast) = run(repo, Some(&index));
+    let n = queries.len();
+    format!(
+        ",\"search_scan\":{},\"search_indexed\":{},\"search_index_bytes\":{index_bytes},\"search_exact\":{}",
+        scan / n,
+        (indexed + load) / n,
+        full == fast
+    )
+}
+
 /// Read cost of a graph corpus (since E039): reading every distinct
 /// version's graph back once, as bytes decompressed (weighted per codec).
 /// Graph reads go through `graph_nodes`, which reports no function work.
@@ -1035,10 +1093,16 @@ fn main() {
         let baseline_read = distinct_bytes(&snapshots);
         let read_ratio =
             (repack as f64 + w * read_whole as f64) / (zstd_dict as f64 + w * baseline_read as f64);
+        // Search (E058, reported, not scored): measured after everything
+        // scored, since building the index stores it.
+        let kinds = by_kind(&repo);
+        let search = match graph {
+            true => String::new(),
+            false => search_costs(&mut repo, &snapshots),
+        };
         if json {
             println!(
-                "{{\"corpus\":\"{name}\",\"input\":{input},\"ingest\":{ingest},\"repack\":{repack},\"ingest_ms\":{ingest_ms},\"repack_ms\":{repack_ms},\"zstd_files\":{zstd_files},\"zstd_dict\":{zstd_dict},\"vs_dict\":{ratio:.4},\"vs_dict_read\":{read_ratio:.4},\"read_baseline\":{baseline_read},\"exact\":{exact},\"fsck\":{fsck},\"read_whole\":{read_whole},\"read_4k\":{read_4k},\"by_kind\":{}}}",
-                by_kind(&repo)
+                "{{\"corpus\":\"{name}\",\"input\":{input},\"ingest\":{ingest},\"repack\":{repack},\"ingest_ms\":{ingest_ms},\"repack_ms\":{repack_ms},\"zstd_files\":{zstd_files},\"zstd_dict\":{zstd_dict},\"vs_dict\":{ratio:.4},\"vs_dict_read\":{read_ratio:.4},\"read_baseline\":{baseline_read},\"exact\":{exact},\"fsck\":{fsck},\"read_whole\":{read_whole},\"read_4k\":{read_4k}{search},\"by_kind\":{kinds}}}"
             );
         } else {
             println!(
