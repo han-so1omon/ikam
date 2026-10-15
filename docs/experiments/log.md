@@ -682,3 +682,23 @@ Newest last. Format and rules: `README.md`.
   - Kept: the hook (`Repo::proposed_order`), and the order file it reads.
   - Added: the swap test as a standard step for proposer experiments (`docs/experiments/README.md`, step 5).
   - Ties to E017–E020: measured cost already beats every resemblance signal tried.
+
+### E054 plan-first-ingest (measurement, refuted)
+- Branch / parent: exp/054-plan-first-ingest / E051
+- Hypothesis (C4 in `docs/research/latent-reasoning.md`, after R-Capsule and PLaT: compress the plan, sample it, verify it). A cheap proposer emits a small plan for each new file, "the previous version at the same path, with edits", and the kernel realises it exactly or falls back to search. This would replace the global seed search, saving time and possibly picking better sources.
+- Measurement (temporary diagnostics, not kept):
+  - Ingest and repack times per corpus, from E048's run: ingest totals about 2.6 s of the 77 s run, against about 75 s of repack. The score is measured after repack, which re-plans everything.
+  - Where kept slice plans take their bytes from after repack, by source: the previous version at the same path, another version at the same path, another path, or content that is not a file (literals, intermediate content).
+
+  | corpus | same path, previous version | same path, other version | other path | not a file |
+  |---|---|---|---|---|
+  | synthetic-history | 0 | 186,439 | 0 | 401,427 |
+  | repo-history | 284,415 | 254,869 | 1,698 | 7,298 |
+  | structured | 0 | 5,529,143 | 0 | 2,138,537 |
+
+  No other corpus keeps slice plans.
+- Result:
+  - The plan's sources are almost always the same path: 99.7% of the bytes sliced from files.
+  - They are usually *not* the previous version: 53% in repo-history, 0% in structured and synthetic-history. The read-priced planner prefers a shared base version, which keeps chains shallow.
+  - A "previous version" plan would therefore be wrong for most of the bytes. The planner keeps less than 0.4% cross-path reuse, so a "same path" restriction would lose almost nothing, but it could only save ingest time (3% of the run) and repack search time. The score can't move either way.
+- Verdict: **refuted as a score lever; nothing built.** Note for any future proposer of version plans: the plan is "same path, base version chosen by read cost", not "the previous version".
