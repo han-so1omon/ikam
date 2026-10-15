@@ -798,3 +798,24 @@ Newest last. Format and rules: `README.md`.
   - E050's agent trace ran roughly 100 searches per read pass of the files it touched. At that rate the index would pay on generated, repo-history, office and md, but not on pdf, transcripts, structured, invoices or synthetic-history. There, words recur in every file, or the files that hold them are the big ones.
   - Whether search belongs in the score is a decision about the workload, not something the benchmark can settle. The numbers above give its size.
   - The index is large: full 32-byte ids, and a posting for every distinct trigram. It is bigger than the md store itself. Abbreviated ids, or indexing only rarer trigrams, are the obvious next levers if it is ever scored.
+
+### E059 measured-plan-cost
+- Branch / parent: exp/059-measured-function-work / E058
+- Hypothesis (open since E048): the planner's read estimate is wrong where the score's read term is not a sum of whole decodes.
+  - Function work: E048 found synthetic-history's nested `fill` levels and generated's WASM fuel unmodelled.
+  - Read counts: repo-history was still over-predicted by 18%. Cause, found here: `read_model` counted every content as read once for itself (`1 + uses`), including intermediates (slice literals, templates) that are only ever read through the files that use them. It counted each use once, whatever its reader's own read count. It also counted the arguments of derivations that a read never evaluates: those of contents stored plainly, and of alternatives after the first.
+  - Plans compared on wrong costs can be chosen wrongly.
+- Change, all in `src/repack.rs`:
+  - `plan_cost(roots)` now **measures** the score's read term instead of modelling it: it reads every root file once and counts bytes decoded (codec-weighted) plus function work, as the benchmark does. Plan choice and repack's acceptance test use it.
+  - `read_model(roots)`, which `recompress` still uses per content, counts reads recursively from the roots. A root is read once. Any content is read once per read of each content whose read evaluates a derivation naming it: none for content stored plainly, otherwise the first derivation. Each source is still counted once per derivation (E048).
+  - Removed `dict::block_size`, no longer used.
+- Prediction check (diagnostic, not kept), measured read against the planner's estimate with only the function work measured:
+  - generated 1.32 M against 1.33 M (was 0.73 M);
+  - synthetic-history 1.49 M against 1.52 M (was 1.17 M).
+  - With the measured `plan_cost`, prediction equals measurement by construction (up to read_range's walk vs a rebuild).
+- Result (two runs identical; tests, clippy and fmt clean; every corpus exact with a clean fsck; search results identical): score 0.2920 -> **0.2918**; bytes_score 0.2604 -> 0.2600.
+  - office: 170,492 -> 165,802 B; read 48.1 M -> 51.9 M; vs_dict_read 0.5549 -> **0.5524**.
+  - transcripts: 71,507 -> 72,592 B; read 12.4 M -> 11.2 M; vs_dict_read 0.2575 -> **0.2569**. More bytes, less read: the measured cost prefers it.
+  - repo-history: 908,059 -> 907,329 B; vs_dict_read 0.7243, unchanged at 4 decimals.
+  - Other corpora are byte-identical. Time 93 s -> 106 s (each candidate plan is now read once to price it).
+- Verdict: **kept.** Plans are compared on the measured objective, and the per-content model no longer over-counts intermediates.
