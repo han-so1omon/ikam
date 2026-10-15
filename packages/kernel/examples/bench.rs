@@ -164,6 +164,123 @@ fn repo_graph() -> Vec<Snapshot> {
 /// JSON object per file change so far, with commit, date, author name,
 /// lines added and deleted) and a summary (`summary.json`: files and bytes
 /// per top-level directory). Real metadata, not the output of a short
+/// A coding agent's session log as it grows (since E055): the kernel's own
+/// sources pinned at 0ca74e4, plus a JSONL transcript of an agent reading
+/// them. Reads quote files as Read results do (line-numbered, JSON-escaped),
+/// whole or as 40-line ranges; searches quote matching lines. Every event
+/// carries a random id and its parent's, as real transcripts do. Snapshots
+/// every 75 steps; deterministic.
+fn transcripts() -> Vec<Snapshot> {
+    let root = repo_root();
+    let git = |args: &[&str]| {
+        let out = Command::new("git")
+            .args(args)
+            .current_dir(&root)
+            .output()
+            .unwrap();
+        String::from_utf8(out.stdout).unwrap()
+    };
+    let paths: Vec<String> = git(&[
+        "ls-tree",
+        "-r",
+        "--name-only",
+        "0ca74e4",
+        "packages/kernel/src",
+    ])
+    .lines()
+    .map(String::from)
+    .collect();
+    let sources: Vec<(String, String)> = paths
+        .iter()
+        .map(|p| (p.clone(), git(&["show", &format!("0ca74e4:{p}")])))
+        .collect();
+    let mut s = 0x0123_4567_89ab_cdefu64;
+    let mut lcg = move || {
+        s = s
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        (s >> 33) as usize
+    };
+    let numbered = |text: &str, from: usize, n: usize| -> String {
+        text.lines()
+            .enumerate()
+            .skip(from)
+            .take(n)
+            .map(|(i, l)| format!("{:>6}\t{l}\n", i + 1))
+            .collect()
+    };
+    let (mut log, mut parent, mut out) = (String::new(), String::from("null"), Vec::new());
+    for step in 1..=300 {
+        let (path, text) = &sources[lcg() % sources.len()];
+        let lines = text.lines().count().max(1);
+        let (input, result) = match lcg() % 10 {
+            0..=2 => (
+                format!("{{\"file_path\":{}}}", json_str(path)),
+                numbered(text, 0, lines),
+            ),
+            3..=7 => {
+                let from = lcg() % lines;
+                let input = format!(
+                    "{{\"file_path\":{},\"offset\":{},\"limit\":40}}",
+                    json_str(path),
+                    from + 1
+                );
+                (input, numbered(text, from, 40))
+            }
+            _ => {
+                let line = text.lines().nth(lcg() % lines).unwrap_or("");
+                let word = line
+                    .split(|c: char| !c.is_alphanumeric() && c != '_')
+                    .find(|w| w.len() > 3)
+                    .unwrap_or("fn");
+                let hits: String = sources
+                    .iter()
+                    .flat_map(|(p, t)| {
+                        t.lines()
+                            .enumerate()
+                            .filter(|(_, l)| l.contains(word))
+                            .map(move |(i, l)| format!("{p}:{}:{l}\n", i + 1))
+                    })
+                    .take(30)
+                    .collect();
+                (format!("{{\"pattern\":{}}}", json_str(word)), hits)
+            }
+        };
+        let tool = if input.contains("pattern") {
+            "Grep"
+        } else {
+            "Read"
+        };
+        for (kind, body) in [
+            ("tool_use", format!("\"name\":\"{tool}\",\"input\":{input}")),
+            ("tool_result", format!("\"content\":{}", json_str(&result))),
+        ] {
+            let uuid = format!(
+                "{:08x}-{:04x}-{:04x}-{:04x}-{:08x}{:04x}",
+                lcg(),
+                lcg() & 0xffff,
+                lcg() & 0xffff,
+                lcg() & 0xffff,
+                lcg(),
+                lcg() & 0xffff
+            );
+            log += &format!(
+                "{{\"uuid\":\"{uuid}\",\"parentUuid\":{parent},\"type\":\"{kind}\",{body}}}\n"
+            );
+            parent = format!("\"{uuid}\"");
+        }
+        if step % 75 == 0 {
+            let mut snap: Vec<(String, Vec<u8>)> = sources
+                .iter()
+                .map(|(p, t)| (p.clone(), t.clone().into_bytes()))
+                .collect();
+            snap.push(("session.jsonl".to_string(), log.clone().into_bytes()));
+            out.push(snap);
+        }
+    }
+    out
+}
+
 /// procedure; author emails are left out.
 fn structured() -> Vec<Snapshot> {
     let root = repo_root();
@@ -238,6 +355,8 @@ fn json_str(s: &str) -> String {
         match ch {
             '"' => out.push_str("\\\""),
             '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\t' => out.push_str("\\t"),
             c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
             c => out.push(c),
         }
@@ -708,6 +827,7 @@ fn main() {
         ("repo-graph", repo_graph, true),
         ("generated", generated, false),
         ("structured", structured, false),
+        ("transcripts", transcripts, false),
     ];
     let (mut log_ratio, mut log_bytes, mut n, mut total_ms) = (0.0, 0.0, 0, 0);
     for (name, build, graph) in corpora {

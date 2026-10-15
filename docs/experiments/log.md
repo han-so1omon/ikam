@@ -682,3 +682,34 @@ Newest last. Format and rules: `README.md`.
   - Kept: the hook (`Repo::proposed_order`), and the order file it reads.
   - Added: the swap test as a standard step for proposer experiments (`docs/experiments/README.md`, step 5).
   - Ties to E017–E020: measured cost already beats every resemblance signal tried.
+
+### E055 transcript-corpus (benchmark change)
+- Branch / parent: exp/055-transcript-corpus / E051
+- Hypothesis (C7 in `docs/research/latent-reasoning.md`; the latent-CoT papers compress reasoning traces lossily): agent transcripts quote files, tool output and earlier turns verbatim. A store holding both the workspace and the transcript should dedup those quotes exactly, as slices of stored content.
+- Benchmark change: new corpus `transcripts` (10th) in `examples/bench.rs`, deterministic and with no real session data.
+  - Contents: the kernel's 20 source files pinned at 0ca74e4 (161,549 B), plus `session.jsonl`, a 300-step agent log.
+  - Session steps: whole-file Reads (30%), 40-line range Reads (50%) and Greps (20%), each over a random source file.
+  - Format, as real coding-agent logs are written: results quoted line-numbered (`%6d\t`) and JSON-escaped; every event carries a random uuid and its parent's.
+  - Snapshotted every 75 steps (4 versions; the session grows to 1,269,866 B).
+  - `json_str` now writes `\n` and `\t` as short escapes, as JSON encoders do. structured, the only other user of `json_str`, is byte-identical.
+- Result (two runs identical; clippy clean; every corpus exact with a clean fsck):
+  - transcripts: kernel 113,507 B vs zstd + dictionary 322,688 B. **vs_dict 0.3518, vs_dict_read 0.3715** (read 7,610,892 vs a 3,315,758 baseline).
+  - Score over 10 corpora: **0.3039** (bytes_score 0.2746). Not comparable with 0.2972 over 9.
+- Where the bytes go (diagnostic, not kept):
+  - The planner stores the *latest* session as one compressed blob, and earlier sessions as prefix slices of it. The kernel's lead over the baseline is this version dedup.
+  - No quote is stored as a slice of a source file. Line-number prefixes and JSON escaping break every byte run longer than one source line.
+  - Bound, computed on the latest session with zstd 19 (long window) in Python:
+
+    | how the latest session is compressed | bytes |
+    |---|---|
+    | alone | 75,821 |
+    | with the raw sources as context | 50,659 |
+    | with the sources line-numbered and escaped as quotes are (an oracle for a quote-aware function) | **24,250** |
+    | the sources themselves | 40,206 |
+
+  - A `quote` derivation (line-number and escape a slice of stored content) would let quotes be stored as functions of the files, saving up to about 51 K of the session's 76 K. That is about 45% of the corpus.
+  - Separately, compressing a content with *related stored content* as its zstd context, rather than the one trained dictionary, saves 33% even without the transform.
+- Verdict: **benchmark change kept.** It adds the workload C7 described, and shows exact dedup is blocked by quoting syntax, not by missing reuse.
+- Next hypotheses, both priced by read cost:
+  - a `quote` builtin or WASM function for line-numbered, escaped slices;
+  - related-content zstd context (delta against stored content).
