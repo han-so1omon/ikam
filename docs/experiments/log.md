@@ -767,3 +767,34 @@ Newest last. Format and rules: `README.md`.
 - Verdict: **kept** (a small gain).
   - The offline estimate overstated the gain because it priced one read per leaf; the read-priced planner accepts about a quarter of it.
   - A new storage invariant (a `Q` base must stay stored, as a dictionary must) is enforced at the one non-gc deletion site and tested.
+
+### E058 search-index (capability; reported, not scored)
+- Branch / parent: exp/058-search-index / E057
+- Hypothesis (E050: a coding agent's access to large files was dominated by grep scans, which decode everything): a trigram index (as in Google Code Search) lets a search decode only candidate contents. Its stored bytes pay for themselves once a workload runs enough searches per read pass.
+- Change:
+  - `src/search.rs`, three functions:
+    - `Repo::build_search_index(files)` stores a trigram index as ordinary content: file ids, then per trigram a delta-varint posting list. The ref `meta/search-index` names it.
+    - `Repo::search_index()` loads it.
+    - `Repo::search(pattern, files, index)` returns the files containing `pattern`.
+  - Search is exact whatever the index says: every candidate is decoded and scanned. Contents the index doesn't cover are always scanned. Patterns under 3 bytes scan everything.
+  - Test `indexed_search_matches_a_full_scan`.
+  - `examples/bench.rs` (reported, not scored): 200 deterministic grep-like queries per file corpus (an identifier from a random line, as in E050), measured after everything scored.
+  - It reports the decode cost per query with and without the index, the index's stored bytes, and whether both return the same files. The index's own decoding is counted once and amortised over the queries.
+- Result (two runs identical; tests, clippy and fmt clean): score **0.2920 unchanged**; every corpus byte-identical; indexed and full-scan results identical everywhere.
+
+  | corpus | decoded per query: scan -> indexed | index bytes | pays above (searches per read pass) |
+  |---|---|---|---|
+  | generated | 1.32 M -> 0.57 M (0.43) | 13,938 | 19 |
+  | repo-history | 30.7 M -> 9.3 M (0.30) | 731,983 | 34 |
+  | office | 48.1 M -> 16.4 M (0.34) | 1,201,155 | 38 |
+  | md | 2.14 M -> 0.41 M (0.19) | 111,826 | 65 |
+  | transcripts | 12.4 M -> 12.0 M (0.97) | 72,343 | 178 |
+  | pdf | 0.69 M -> 0.34 M (0.49) | 78,588 | 224 |
+  | structured | 20.95 M -> 20.90 M (1.00) | 27,927 | 575 |
+  | invoices, synthetic-history | no reduction (every file holds the queried words) | | never |
+
+  "Pays above" = index bytes / (0.001 x decode saved per query): the searches per full read pass at which the index costs less than the scans it avoids.
+- Verdict: **kept as a capability**; the score holds.
+  - E050's agent trace ran roughly 100 searches per read pass of the files it touched. At that rate the index would pay on generated, repo-history, office and md, but not on pdf, transcripts, structured, invoices or synthetic-history. There, words recur in every file, or the files that hold them are the big ones.
+  - Whether search belongs in the score is a decision about the workload, not something the benchmark can settle. The numbers above give its size.
+  - The index is large: full 32-byte ids, and a posting for every distinct trigram. It is bigger than the md store itself. Abbreviated ids, or indexing only rarer trigrams, are the obvious next levers if it is ever scored.
