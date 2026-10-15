@@ -28,6 +28,7 @@ How we improve the kernel: one fixed command, one score, hard gates, one hypothe
    - Never edit an experiment after its run has answered it. To try a variant, branch a child.
    - Grow downward: try a few options for one decision, then continue from the winner.
 5. **Run** the fixed command and save its output.
+   - For an external proposer (embedding order, LLM output, codebook), also run the swap test (E051). Rerun with the proposal removed, and with it shuffled. If every size is unchanged, the proposer carries no information for this corpus, whatever it costs to produce.
 6. **Record** a result entry in `docs/experiments/log.md` (format below), and update the research note's hypothesis status: confirmed, refuted or not applicable.
 7. **Keep or discard.**
    - A change is kept only if the score improves, or holds while adding a capability.
