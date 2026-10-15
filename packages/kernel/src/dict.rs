@@ -206,11 +206,6 @@ pub(crate) fn block_frames(bytes: &[u8], dict: &[u8], block: usize) -> Option<Ve
     Some(out)
 }
 
-/// The block size of a "K" encoding.
-pub(crate) fn block_size(encoded: &[u8]) -> Option<usize> {
-    varint(&mut encoded.get(1 + DICT_REF_LEN..)?).filter(|&b| b > 0)
-}
-
 /// The blocks of a `block_frames` body overlapping `start..end`, decoded:
 /// their first byte's offset in the content, and their bytes.
 fn unblock(mut body: &[u8], dict: &[u8], start: usize, end: usize) -> Option<(usize, Vec<u8>)> {

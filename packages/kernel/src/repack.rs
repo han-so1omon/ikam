@@ -21,10 +21,9 @@
 use std::cmp::Reverse;
 use std::collections::{BTreeSet, HashMap, HashSet};
 
-use crate::codec::read_weight;
 use crate::dict::{
-    DICT_REF, DICT_REF_LEN, MEASURE_LEVEL, STORE_LEVEL, block_frames, block_size, framer, is_plain,
-    object_tag, tree_content, zstd_frame,
+    DICT_REF, DICT_REF_LEN, MEASURE_LEVEL, STORE_LEVEL, block_frames, framer, is_plain, object_tag,
+    tree_content, zstd_frame,
 };
 use crate::group::{GROUP_REF_LEN, member_span};
 use crate::ingest::derivation_size;
@@ -60,7 +59,12 @@ impl<S: Store + Sync> Repo<S> {
         self.unshare_trees()?;
         self.gc()?;
         let (_, roots) = self.reachable()?;
-        let (content, _) = self.closure(roots, |d| !func::is_plan(&d.func))?;
+        let roots: Vec<Id> = roots
+            .into_iter()
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect();
+        let (content, _) = self.closure(roots.clone(), |d| !func::is_plan(&d.func))?;
         let mut files: Vec<(Id, Vec<u8>)> = content
             .iter()
             .map(|id| Ok((*id, self.read_content(id)?)))
@@ -104,15 +108,15 @@ impl<S: Store + Sync> Repo<S> {
         let mut fresh: Option<(f64, Repo<MemStore>)> = None;
         for plan in plans {
             let plan = plan?;
-            let cost = plan.plan_cost(&files)?;
+            let cost = plan.plan_cost(&roots)?;
             if fresh.as_ref().is_none_or(|(best, _)| cost < *best) {
                 fresh = Some((cost, plan));
             }
         }
         let (_, mut fresh) = fresh.expect("at least one plan");
-        fresh.recompress()?;
+        fresh.recompress(&roots)?;
         let (before, after) = (self.content_bytes()?, fresh.content_bytes()?);
-        if fresh.plan_cost(&files)? >= self.plan_cost(&files)? {
+        if fresh.plan_cost(&roots)? >= self.plan_cost(&roots)? {
             return Ok(Repacked {
                 before,
                 after: before,
@@ -309,10 +313,10 @@ impl<S: Store + Sync> Repo<S> {
     /// naming it. Plans are compared at the fast `MEASURE_LEVEL`; only the one
     /// kept pays for the slow level. Decoded content is checked against its
     /// id first.
-    pub(crate) fn recompress(&mut self) -> Result<(), Error> {
+    pub(crate) fn recompress(&mut self, roots: &[Id]) -> Result<(), Error> {
         self.level = STORE_LEVEL;
         let dict = self.dictionary().map(|(id, _)| *id);
-        let model = self.read_model()?;
+        let model = self.read_model(roots)?;
         let bases = self.related_bases(dict)?;
         let (mut used, mut related) = (HashSet::new(), HashSet::new());
         for id in self.store.ids()? {
@@ -388,20 +392,35 @@ impl<S: Store + Sync> Repo<S> {
         Ok(())
     }
 
-    /// How often each stored content is decoded when every file is read
-    /// once (the score's read model, see `ReadModel`).
-    pub(crate) fn read_model(&self) -> Result<ReadModel, Error> {
-        let mut uses: HashMap<Id, usize> = HashMap::new();
-        for d in self.ledger()?.by_output.values().flatten() {
+    /// How often each stored content is decoded when every root is read
+    /// once (the score's read model, see `ReadModel`): a root once for
+    /// itself, and any content once per read of each content whose read
+    /// evaluates a derivation naming it (E059). A read evaluates no
+    /// derivation of content stored plainly, else its first.
+    pub(crate) fn read_model(&self, roots: &[Id]) -> Result<ReadModel, Error> {
+        let mut readers: HashMap<Id, Vec<Id>> = HashMap::new();
+        for (output, ds) in &self.ledger()?.by_output {
+            if self.store.read(output).is_ok_and(|e| is_plain(&e)) {
+                continue;
+            }
             // A read caches what it decodes, so a source named by several
             // arguments of one derivation is decoded once for it (E048).
-            let sources: BTreeSet<Id> = d.args.iter().map(Arg::id).collect();
+            let sources: BTreeSet<Id> = ds
+                .iter()
+                .take(1)
+                .flat_map(|d| d.args.iter().map(Arg::id))
+                .collect();
             sources
                 .into_iter()
-                .for_each(|id| *uses.entry(id).or_default() += 1);
+                .for_each(|id| readers.entry(id).or_default().push(*output));
+        }
+        let roots: HashSet<Id> = roots.iter().copied().collect();
+        let mut times = HashMap::new();
+        for id in readers.keys().chain(&roots) {
+            read_times(*id, &roots, &readers, &mut times, 0);
         }
         let mut model = ReadModel {
-            uses,
+            times,
             groups: HashMap::new(),
         };
         for id in self.store.ids()? {
@@ -413,33 +432,19 @@ impl<S: Store + Sync> Repo<S> {
         Ok(model)
     }
 
-    /// Estimated cost of this store when every file of `files` is read
-    /// once: content bytes + `read_weight` x (bytes decoded, weighted by
-    /// codec, + bytes produced for files rebuilt by functions). The same
-    /// objective as the benchmark score, so plans are chosen by it.
-    pub(crate) fn plan_cost(&self, files: &[(Id, Vec<u8>)]) -> Result<f64, Error> {
-        let model = self.read_model()?;
-        let mut read = 0;
-        for id in self.store.ids()? {
-            let stored = self.store.read(&id)?;
-            if matches!(stored[0], b'Z' | b'Y' | b'X' | b'R' | b'P' | b'K' | b'Q') {
-                let len = self.decode_plain(&id, &stored)?.len();
-                read += match block_size(&stored) {
-                    Some(block) if stored[0] == b'K' => model.block_reads(&id, len, block),
-                    _ => read_weight(stored[0]) * model.reads(&id, len),
-                };
-                if stored[0] == b'Q' {
-                    let base = Id::from_bytes(stored[1..33].try_into().unwrap());
-                    read += model.events(&id) * self.related_base(&base)?.len();
-                }
-            }
+    /// Stored bytes + `read_weight` x the measured cost of reading every
+    /// root once: bytes decoded (weighted by codec) plus function work. The
+    /// benchmark's own objective, measured rather than modelled (E059), so
+    /// plans are chosen by it.
+    pub(crate) fn plan_cost(&self, roots: &[Id]) -> Result<f64, Error> {
+        let before = crate::dict::decode_cost();
+        let mut work = 0;
+        for id in roots {
+            let mut cx = Cx::default();
+            self.rebuild(id, &mut cx)?;
+            work += cx.work;
         }
-        for (id, bytes) in files {
-            let stored = self.store.read(id).ok();
-            if stored.is_none_or(|s| !is_plain(&s)) {
-                read += bytes.len() * model.times(id);
-            }
-        }
+        let read = crate::dict::decode_cost() - before + work;
         Ok(self.content_bytes()? as f64 + self.read_weight * read as f64)
     }
 
@@ -510,6 +515,29 @@ fn inputs_first<'a>(
         visit(i, files, hints, &at, &mut seen, &mut out);
     }
     out
+}
+
+/// Reads of `id` when every root is read once (see `Repo::read_model`),
+/// memoised; a cycle or a chain past `STACK_GUARD` counts no further.
+fn read_times(
+    id: Id,
+    roots: &HashSet<Id>,
+    readers: &HashMap<Id, Vec<Id>>,
+    memo: &mut HashMap<Id, usize>,
+    depth: usize,
+) -> usize {
+    if let Some(&n) = memo.get(&id) {
+        return n;
+    }
+    memo.insert(id, 0); // a cycle (malformed store) adds nothing
+    let mut n = roots.contains(&id) as usize;
+    if depth < crate::repo::STACK_GUARD {
+        for r in readers.get(&id).into_iter().flatten() {
+            n += read_times(*r, roots, readers, memo, depth + 1);
+        }
+    }
+    memo.insert(id, n);
+    n
 }
 
 /// Induce one template per cluster of similar `items`, offering each member
@@ -749,7 +777,7 @@ fn repeat_dictionary(samples: &[&[u8]], size: usize) -> Vec<u8> {
 /// template per filled document, a slice source per sliced document); a
 /// group up to each member's end per read of that member.
 pub(crate) struct ReadModel {
-    uses: HashMap<Id, usize>,
+    times: HashMap<Id, usize>,
     /// Per group prefix: each member's range and how often it is read.
     groups: HashMap<Vec<u8>, Vec<(usize, usize, usize)>>,
 }
@@ -803,7 +831,7 @@ const BLOCKS: [usize; 2] = [4 * 1024, 16 * 1024];
 
 impl ReadModel {
     pub(crate) fn times(&self, id: &Id) -> usize {
-        1 + self.uses.get(id).copied().unwrap_or(0)
+        self.times.get(id).copied().unwrap_or(0)
     }
 
     /// Bytes decoded from content `id` (of `len` bytes) to read every file
@@ -887,7 +915,8 @@ mod tests {
         repo.put_derivation(out, func::concat(), args)
             .unwrap()
             .unwrap();
-        assert_eq!(repo.read_model().unwrap().times(&source), 2);
+        let out = Id::of_content(out);
+        assert_eq!(repo.read_model(&[source, out]).unwrap().times(&source), 2);
     }
 
     /// Recompression at the storing level keeps every content readable,
@@ -914,7 +943,7 @@ mod tests {
             .collect();
         let size = |repo: &Repo<MemStore>, id: &Id| repo.store.read(id).unwrap().len();
         let before: Vec<usize> = ids.iter().map(|id| size(&repo, id)).collect();
-        repo.recompress().unwrap();
+        repo.recompress(&ids).unwrap();
         assert!(matches!(repo.store.read(&dict_id).unwrap()[0], b'B' | b'Z'));
         for ((id, d), b) in ids.iter().zip(&docs).zip(before) {
             assert_eq!(&repo.read_content(id).unwrap(), d);
