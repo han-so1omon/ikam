@@ -5,6 +5,9 @@
 //!   | "S" group[8] start:varint len:varint   (bytes of a group, see `group.rs`)
 //!   | "X" .lzma(bytes) | "R" brotli(bytes) | "P" ppmd(bytes)   (only from repack, see `codec.rs`)
 //!   | "K" dict[4] block count { frame_len } frames   (a group in blocks, only from repack)
+//!   | "Q" ref[32] zstd_with(ref's bytes)   (related content as the frame's
+//!     context, only from repack; the ref is never "Q" or "S", so decoding
+//!     never chains beyond one step)
 //! Identity is always over the uncompressed bytes, so the choice never
 //! changes an id. The dictionary is ordinary content, named by the ref
 //! `meta/zstd-dict`. Exact reuse (slices, templates) and this statistical
@@ -52,7 +55,7 @@ type DictRef = [u8; DICT_REF_LEN];
 pub(crate) fn is_plain(encoded: &[u8]) -> bool {
     matches!(
         encoded.first(),
-        Some(b'B' | b'Z' | b'Y' | b'X' | b'R' | b'P' | b'K' | b'S')
+        Some(b'B' | b'Z' | b'Y' | b'X' | b'R' | b'P' | b'K' | b'S' | b'Q')
     )
 }
 
@@ -62,6 +65,7 @@ pub(crate) fn is_plain(encoded: &[u8]) -> bool {
 pub(crate) fn needs(encoded: &[u8]) -> Option<&[u8]> {
     match encoded {
         [b'S', group @ ..] => group.get(..crate::group::GROUP_REF_LEN),
+        [b'Q', base @ ..] => base.get(..32),
         _ => dict_of(encoded).map(|_| {
             let at = if matches!(encoded[0], b'Y' | b'K') {
                 1
@@ -378,7 +382,7 @@ impl<S: Store> Repo<S> {
     /// output does.
     pub(crate) fn decode_plain(&self, id: &Id, encoded: &[u8]) -> Result<Vec<u8>, Error> {
         match encoded.first() {
-            Some(b'Y' | b'X' | b'R' | b'P') => {
+            Some(b'Y' | b'X' | b'R' | b'P' | b'Q') => {
                 self.decode_prefix(id, encoded, usize::MAX, &|b| Id::of_content(b) == *id)
             }
             Some(b'K') => {
@@ -407,9 +411,38 @@ impl<S: Store> Repo<S> {
             Some((b'R', r)) => codec::unbrotli_prefix(r, limit),
             Some((b'P', p)) => codec::unppmd_prefix(p, limit),
             Some((b'Y', _)) => return self.unzstd_with_dict(id, encoded, 1, limit, check),
+            Some((b'Q', rest)) => {
+                let (base, frame) = rest.split_at_checked(32).ok_or(Error::Corrupt(*id))?;
+                let base = self.related_base(&Id::from_bytes(base.try_into().unwrap()))?;
+                unzstd_prefix(frame, &base, limit)
+            }
             _ => return Err(Error::WrongKind(*id)),
         };
         out.filter(|b| check(b)).ok_or(Error::Corrupt(*id))
+    }
+
+    /// The bytes of `base`, the context of a "Q" encoding: stored in any
+    /// plain encoding but "Q" or "S" (one step, no chains), and verified.
+    pub(crate) fn related_base(&self, base: &Id) -> Result<Vec<u8>, Error> {
+        let stored = self.store.read(base)?;
+        if matches!(stored.first(), Some(b'Q' | b'S')) {
+            return Err(Error::Corrupt(*base));
+        }
+        let bytes = self.decode_plain(base, &stored)?;
+        (Id::of_content(&bytes) == *base)
+            .then_some(bytes)
+            .ok_or(Error::Corrupt(*base))
+    }
+
+    /// True if some stored "Q" encoding uses `id` as its context.
+    pub(crate) fn is_related_base(&self, id: &Id) -> Result<bool, Error> {
+        for other in self.store.ids()? {
+            let stored = self.store.read(&other)?;
+            if stored.first() == Some(&b'Q') && stored.get(1..33) == Some(&id.as_bytes()[..]) {
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
 
     /// The blocks of a "K" encoding overlapping `start..end`, if they pass
@@ -548,5 +581,34 @@ mod tests {
             repo.decode_plain(&id, &encoded).is_err(),
             "only the decoy is left"
         );
+    }
+    /// A "Q" encoding decodes against its stored context, gc keeps that
+    /// context, and a context that is itself "Q" is refused (no chains).
+    #[test]
+    fn related_context_decodes_one_step_only() {
+        let mut repo = Repo::new(MemStore::default());
+        let base: Vec<u8> = (0..4000u32)
+            .flat_map(|i| format!("row {} {}\n", i % 97, i * 7 % 13).into_bytes())
+            .collect();
+        let other = [&base[..], b"tail"].concat();
+        let b = repo.put_content(&base).unwrap().id;
+        let o = Id::of_content(&other);
+        let z = zstd_frame(&other, &base, STORE_LEVEL).unwrap();
+        repo.store
+            .write(o, &[&b"Q"[..], b.as_bytes(), &z].concat())
+            .unwrap();
+        assert_eq!(repo.read_content(&o).unwrap(), other);
+        assert_eq!(
+            needs(&repo.store.read(&o).unwrap()),
+            Some(&b.as_bytes()[..])
+        );
+        assert!(repo.is_related_base(&b).unwrap());
+        let third = [&other[..], b"more"].concat();
+        let t = Id::of_content(&third);
+        let z = zstd_frame(&third, &other, STORE_LEVEL).unwrap();
+        repo.store
+            .write(t, &[&b"Q"[..], o.as_bytes(), &z].concat())
+            .unwrap();
+        assert!(repo.read_content(&t).is_err());
     }
 }
