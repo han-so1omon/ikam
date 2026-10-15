@@ -639,3 +639,16 @@ Newest last. Format and rules: `README.md`.
 - Result (two runs identical): score 0.3097 -> **0.3062**; bytes_score 0.2712 (unchanged; every size byte-identical).
   - repo-graph: read_whole 5,024,570 -> **2,518,350** (2.5x the baseline's 1,006,283); vs_dict_read 0.2256 -> **0.2037**. Every other corpus is unchanged.
 - Verdict: **kept** (score improves; a read-path fix, no storage change). Graph reads still cost 2.5x the baseline. Remaining hypothesis: the planner's read model counts a graph chunk's content as read once, though each chunk is read once per distinct graph version that contains it, so it under-prices graph reads when grouping or blocking.
+
+### E045 compact-graph-chunks
+- Branch / parent: exp/045-compact-graph-chunks / E043
+- Hypothesis: graph reads cost 2.5x the baseline because the canonical chunk encoding is large: every count and string length is a 4-byte integer, every node label (sorted paths with long shared prefixes) is written in full, and every edge repeats its label (`imports`, `links`, `uses`). Front-coding labels against their neighbour, front-coding edge labels against the previous edge, and using varints shrinks what each graph read decodes, and the stored chunks (source: E044's finding that the remaining graph read cost is the decoded chunk size; front coding, as in E040's "front-coded graph labels" proposal and sorted-dictionary encodings in HDT, `docs/research/graph-storage.md`)
+- Change:
+  - `src/object.rs`: graph chunks set `COMPACT` (0x80) in their level byte. Counts and lengths are varints. Node labels and child first labels are front-coded against the previous one in the chunk (`put_front`: shared prefix length on a char boundary, then the rest). Edge labels are front-coded against the previous edge label in the chunk. Edge keys stay 8 bytes (edges name targets by key, so cycles are allowed).
+  - Decoding accepts both layouts, so stores written before E045 still read. A graph written now gets a different id than before E045 (an object's id is the hash of its canonical encoding).
+  - Test `graph_chunks_decode_in_both_layouts`: a pre-E045 chunk decodes to the same graph; the compact form round-trips and is smaller.
+- Result (two runs identical): score 0.3062 -> **0.3005**; bytes_score 0.2712 -> 0.2688.
+  - repo-graph: bytes 20,800 -> 19,293; read cost 2,518,350 -> **471,248** (0.47x the baseline's 1,006,283, from 2.5x); vs_dict 0.1834 -> 0.1701; vs_dict_read 0.2037 -> **0.1727**.
+  - generated: 4,260 -> 4,245 B (its function-library graph also uses graph chunks); vs_dict_read 0.0318 -> 0.0317.
+  - The other corpora are byte-identical. Time 79.9 s -> 87.0 s (not attributed; within run-to-run variation seen before, sizes unaffected).
+- Verdict: **kept**. Graph reads now cost less than decoding the baseline's edge lists. Object-format note: graph ids change for graphs written from now on; old graphs keep reading.
