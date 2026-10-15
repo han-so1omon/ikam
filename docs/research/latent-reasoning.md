@@ -118,10 +118,12 @@ So the latent-CoT literature can be read as ideas about *traces*: shorter traces
   - The idea: evaluate `fill` lazily, resolving each output piece through the levels as slices, without materialising intermediate templates. Read work then tracks the output size rather than the sum over levels.
   - It needs no new storage, much as E043 made graph reads single-pass.
   - First step: instrument which functions produce md's read work.
+  - **Status: refuted by E048, and redirected.** md's read cost is all group-prefix decoding (no function work), which the planner already prices within 1%. The same instrumentation found the planner over-pricing slice plans by 40–58%. Fixing that (one read per source per derivation) was kept: score 0.3005 -> 0.2972.
 - **C2: compression-induced concept nodes (graph structuring from what compresses together).**
   - Templates, groups and dictionaries are latent concepts the planner discovers and verifies: shared structure across instances, kept only because it saves bytes (MDL).
   - The idea: expose them as graph nodes (`instance-of` template, `member-of` group), so the storage plan yields semantic structure for free.
   - Test: `examples/relatedness.rs`. Do shared-template and shared-group edges predict the structural (53.4%) and same-company (26.5%) pairs better than seed candidates? Storage stays unchanged.
+  - **Status: partial (E049, on its branch).** Group membership is at chance. The member stored next to a file in its group matches measured gain on structural relatedness (52.8% vs 53.4% same filename) at no cost, but not same-company relatedness (8.7% vs 26.5%). It covers only grouped files. Template and slice concepts are untested, because md's plan has none.
 - **C3: operation / result split for programs (cf. CIRF's functional tokens versus result tokens).**
   - Anti-unify *programs* the way `template.rs` anti-unifies bytes: one shared program skeleton (the operation), with per-file parameters as fillers (the result).
   - E025's failures (server.log, mandelbrot) hinged on per-file constants. A skeleton plus parameter slots would let the LLM write the operation once while the kernel fits the parameters.
@@ -136,6 +138,7 @@ So the latent-CoT literature can be read as ideas about *traces*: shorter traces
 - **C6: agent workloads as the missing range-read evidence (cf. LaMR context pruning).**
   - Agents that filter their context read *slices* of stored content, not whole files. That is the range-heavy access pattern E047 found verified blocks need (range reads weighted 10x or more).
   - Proposal: record or simulate an agent read trace (grep, open file at line, follow a graph edge) as a benchmark workload, so that f is measured rather than assumed. A benchmark change.
+  - **Status: measured (E050, on its branch).** In a real coding-agent trace, files over 16 KiB were never read whole (41 range reads) but were grep-scanned 124 times. f = 0.33 when search decodes content, so verified blocks do not pay. The lever is search without decoding (next hypothesis).
 - **C7: reasoning transcripts as a corpus.**
   - Agent transcripts quote files, tool outputs and earlier turns verbatim. Each quote can be a slice derivation of content already stored.
   - Expected: large exact dedup, not the lossy token compression of the papers.
