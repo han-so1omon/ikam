@@ -735,3 +735,35 @@ Newest last. Format and rules: `README.md`.
 - Remaining:
   - The session costs about 12.4 M of read work per read pass. The planner still doesn't model WASM work (E048).
   - Earlier session versions are slices of the WASM-built latest.
+
+### E057 related-context
+- Branch / parent: exp/057-related-context / E056
+- Hypothesis (E055: the session compressed 33% smaller with the related sources as zstd context). Compressing a stored content with the most similar *other stored content* as its zstd context (a raw-content dictionary) captures similarity too fine for slices: matches shorter than the matcher's seeds, and shifted or edited text. The one trained dictionary is shared by everything and is small.
+- Offline estimate before building (diagnostic, not kept): for every leaf of at least 2 KiB, zstd 19 with its most similar leaf (by shared shingles) as context, against its current stored size.
+  - Savings: md 4.9 K, structured 9.7 K, repo-history 8.0 K, generated 1.4 K, repo-graph 1.2 K, transcripts 3.2 K.
+  - This ignored how often a read decodes the context.
+- Change:
+  - `src/dict.rs`: new plain encoding `"Q" base[32] zstd_with(base's bytes)`. Decoding reads `base` from its stored encoding, which must not be `Q` or `S`, so decoding is never more than one step and never cycles; the base is verified against its id. `needs` names the base, so gc keeps it.
+  - `src/repack.rs`, `recompress`:
+    - candidate bases are the contents stored as B/Z/Y (not the dictionary) of at least 2 KiB, indexed by content-defined 16-byte shingles;
+    - each content may take its most related base;
+    - cost = stored bytes + `read_weight` x (own decoding + the base's length per decode event);
+    - kept only if cheaper;
+    - a content used as a base never becomes `Q`, and a `Q` is never a base.
+  - `ReadModel::events` counts decode events; for a group that is one per member read. `plan_cost` prices a `Q`'s base decoding.
+  - `src/ingest.rs`: ingest never drops the stored copy of a content that a `Q` uses as context (`is_related_base`).
+  - Test `related_context_decodes_one_step_only`: a `Q` decodes, gc's `needs` names its base, and a `Q` whose base is a `Q` is refused.
+- Result (two runs identical; tests, clippy and fmt clean; every corpus exact with a clean fsck): score 0.2929 -> **0.2920**; bytes_score 0.2622 -> 0.2604.
+
+  | corpus | Q encodings | bytes | read | vs_dict_read |
+  |---|---|---|---|---|
+  | structured | 1 (17,844 B) | 107,607 -> 101,106 | 17.9 M -> 20.9 M | 0.1243 -> **0.1209** |
+  | repo-history | 14 | 910,278 -> 908,059 | 29.7 M -> 30.7 M | 0.7253 -> 0.7243 |
+  | repo-graph | 6 | 19,293 -> 19,213 | | 0.1727 -> 0.1721 |
+  | office | 2 | 170,571 -> 170,492 | | 0.5550 -> 0.5549 |
+
+  - md, pdf, invoices, synthetic-history, generated and transcripts are byte-identical. Their candidates were rejected by read pricing: md's two group frames would each decode the other, about 65 K, once per member read (127 reads).
+  - Time 89 s -> 93 s.
+- Verdict: **kept** (a small gain).
+  - The offline estimate overstated the gain because it priced one read per leaf; the read-priced planner accepts about a quarter of it.
+  - A new storage invariant (a `Q` base must stay stored, as a dictionary must) is enforced at the one non-gc deletion site and tested.

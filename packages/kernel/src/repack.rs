@@ -313,6 +313,8 @@ impl<S: Store + Sync> Repo<S> {
         self.level = STORE_LEVEL;
         let dict = self.dictionary().map(|(id, _)| *id);
         let model = self.read_model()?;
+        let bases = self.related_bases(dict)?;
+        let (mut used, mut related) = (HashSet::new(), HashSet::new());
         for id in self.store.ids()? {
             let stored = self.store.read(&id)?;
             let encoded = match stored.first() {
@@ -349,8 +351,26 @@ impl<S: Store + Sync> Repo<S> {
                             }
                         }
                     }
+                    // Or with related stored content as the frame's context
+                    // (E057): read costs that content's decoding too.
+                    if Some(id) != dict
+                        && !used.contains(&id)
+                        && let Some(base) = bases.most_related(&id, &bytes, &related)
+                        && let Some(z) = zstd_frame(&bytes, &base.1, STORE_LEVEL)
+                    {
+                        let q = [&b"Q"[..], base.0.as_bytes(), &z].concat();
+                        let q_cost = q.len() as f64
+                            + self.read_weight * (reads + model.events(&id) * base.1.len()) as f64;
+                        if q_cost < cost {
+                            (encoded, cost) = (q, q_cost);
+                            used.insert(base.0);
+                            related.insert(id);
+                        }
+                    }
                     if cost < self.cost(&stored, reads) {
                         self.store.replace(id, &encoded)?;
+                    } else {
+                        related.remove(&id);
                     }
                     continue;
                 }
@@ -402,12 +422,16 @@ impl<S: Store + Sync> Repo<S> {
         let mut read = 0;
         for id in self.store.ids()? {
             let stored = self.store.read(&id)?;
-            if matches!(stored[0], b'Z' | b'Y' | b'X' | b'R' | b'P' | b'K') {
+            if matches!(stored[0], b'Z' | b'Y' | b'X' | b'R' | b'P' | b'K' | b'Q') {
                 let len = self.decode_plain(&id, &stored)?.len();
                 read += match block_size(&stored) {
                     Some(block) if stored[0] == b'K' => model.block_reads(&id, len, block),
                     _ => read_weight(stored[0]) * model.reads(&id, len),
                 };
+                if stored[0] == b'Q' {
+                    let base = Id::from_bytes(stored[1..33].try_into().unwrap());
+                    read += model.events(&id) * self.related_base(&base)?.len();
+                }
             }
         }
         for (id, bytes) in files {
@@ -417,6 +441,26 @@ impl<S: Store + Sync> Repo<S> {
             }
         }
         Ok(self.content_bytes()? as f64 + self.read_weight * read as f64)
+    }
+
+    /// Contents stored plainly (not the dictionary) of at least
+    /// `RELATED_MIN` bytes: the candidate contexts of "Q" encodings.
+    fn related_bases(&self, dict: Option<Id>) -> Result<Bases, Error> {
+        let mut bases = Bases::default();
+        for id in self.store.ids()? {
+            let stored = self.store.read(&id)?;
+            if !matches!(stored[0], b'B' | b'Z' | b'Y') || Some(id) == dict {
+                continue;
+            }
+            let bytes = self.decode_plain(&id, &stored)?;
+            if bytes.len() >= RELATED_MIN && Id::of_content(&bytes) == id {
+                for h in shingles(&bytes) {
+                    bases.index.entry(h).or_default().push(bases.items.len());
+                }
+                bases.items.push((id, bytes));
+            }
+        }
+        Ok(bases)
     }
 
     pub(crate) fn content_bytes(&self) -> Result<usize, Error> {
@@ -710,6 +754,50 @@ pub(crate) struct ReadModel {
     groups: HashMap<Vec<u8>, Vec<(usize, usize, usize)>>,
 }
 
+/// Smallest content worth a related-content context (E057).
+const RELATED_MIN: usize = 2048;
+
+/// Candidate contexts for "Q" encodings, indexed by shingle.
+#[derive(Default)]
+struct Bases {
+    items: Vec<(Id, Vec<u8>)>,
+    index: HashMap<u64, Vec<usize>>,
+}
+
+impl Bases {
+    /// The candidate sharing the most shingles with `bytes` (not `id`
+    /// itself, nor any content already encoded against another).
+    fn most_related(&self, id: &Id, bytes: &[u8], related: &HashSet<Id>) -> Option<&(Id, Vec<u8>)> {
+        if bytes.len() < RELATED_MIN {
+            return None;
+        }
+        let mut shared: HashMap<usize, usize> = HashMap::new();
+        for h in shingles(bytes) {
+            for &i in self.index.get(&h).into_iter().flatten() {
+                *shared.entry(i).or_default() += 1;
+            }
+        }
+        let (i, _) = shared
+            .into_iter()
+            .filter(|&(i, _)| self.items[i].0 != *id && !related.contains(&self.items[i].0))
+            .max_by_key(|&(i, n)| (n, std::cmp::Reverse(i)))?;
+        Some(&self.items[i])
+    }
+}
+
+/// Content-defined 16-byte shingles (about 1 in 16 positions), FNV-1a.
+fn shingles(bytes: &[u8]) -> HashSet<u64> {
+    bytes
+        .windows(16)
+        .map(|w| {
+            w.iter().fold(0xcbf2_9ce4_8422_2325_u64, |h, &b| {
+                (h ^ b as u64).wrapping_mul(0x0100_0000_01b3)
+            })
+        })
+        .filter(|h| h % 16 == 0)
+        .collect()
+}
+
 /// Block sizes a group may be stored in (see `dict::block_frames`).
 const BLOCKS: [usize; 2] = [4 * 1024, 16 * 1024];
 
@@ -724,6 +812,15 @@ impl ReadModel {
         match self.groups.get(&id.as_bytes()[..GROUP_REF_LEN]) {
             Some(spans) => spans.iter().map(|&(_, end, n)| end * n).sum(),
             None => len * self.times(id),
+        }
+    }
+
+    /// How many times content `id` is decoded (from its start) when every
+    /// file is read once: once per member read for a group.
+    pub(crate) fn events(&self, id: &Id) -> usize {
+        match self.groups.get(&id.as_bytes()[..GROUP_REF_LEN]) {
+            Some(spans) => spans.iter().map(|&(_, _, n)| n).sum(),
+            None => self.times(id),
         }
     }
 
