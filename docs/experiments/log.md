@@ -669,3 +669,34 @@ Newest last. Format and rules: `README.md`.
   - repo-history: bytes 910,740 -> 910,278; read 29,451,124 -> 29,724,965; vs_dict_read 0.7255 -> 0.7253. Still over-predicted (35.2 M vs 29.7 M), cause not yet found.
   - Other corpora are byte-identical. Time 87.0 s -> 77.5 s.
 - Verdict: **kept**. Remaining model gaps: inner `fill` and WASM fuel work are unmodelled, and repo-history is still over-predicted. md's 12x read cost is the priced cost of grouping, not template work.
+
+### E050 agent-read-trace (workload measurement)
+- Branch / parent: exp/050-agent-read-trace / E048
+- Hypothesis (C6 in `docs/research/latent-reasoning.md`): agents that prune their context read *slices* of files. A coding agent's own reads would therefore show the range-heavy pattern that E047 found verified blocks need (a range read weighted at least 10x a whole-file read).
+- Measurement: `packages/kernel/workloads/agent_trace.py`.
+  - It classifies a real coding agent's tool calls as whole reads (`cat`, a full Read), range reads (`sed -n`, `head`/`tail`, a Read with offset/limit), or scans (grep/rg over the files or directories it covers). It prints counts only, no content.
+  - Input: this session's own transcript, which is the part recorded since the last context compaction: 298 shell calls of kernel work during E046–E049.
+  - Files are sized as they are now.
+
+  | files | distinct | whole reads | range reads | scanned by grep |
+  |---|---|---|---|---|
+  | all | 66 | 16 | 61 | 414 |
+  | > 16 KiB | 9 | 0 | 41 | 124 |
+  | > 64 KiB | 1 | 0 | 3 | 1 |
+
+  The range reads ask for a median of 38 lines (p90 91), which fits the bench's 4 KiB window.
+- Result:
+  - The agent reads small files whole and large files only in ranges: none of the 41 reads of files over 16 KiB was a whole read.
+  - But search dominates its access to large files: 124 grep scans against 41 range reads.
+  - **If search decodes content**, as a scan of stored content would today, then f = 41 / 124 = **0.33**, far below E047's threshold of 10. Verified blocks do not pay.
+  - **If search is served without decoding** (an index), large files are only ever range-read, about 4.6 times per file. Applying E047's per-leaf numbers with 4.6 range reads and no whole reads, blocks pay only marginally:
+    - structured at 64 KiB: +2.9K byte-equivalents;
+    - office at 4 KiB: +0.4K;
+    - repo-history at 64 KiB: −0.3K;
+    - every other size: negative.
+- Verdict: **measured; nothing built, and E047's verdict stands.** For a coding agent, the read-cost lever is search, not partial decoding: most large-file accesses are scans that decode everything.
+- Next hypothesis: answer content search from the store without decoding everything. Candidates are the seed index (`matcher::Index`) or an n-gram index stored as content. Its storage would be priced against the scans it saves.
+- Caveats:
+  - One agent (this one), one stretch of one session, one small repository.
+  - The command parsing is heuristic: piped greps over command output are not scans, and globs are resolved against today's tree.
+  - The transcript stays local; only counts are reported.
