@@ -24,3 +24,4 @@ A paper's claim stays *unverified for this kernel* until an experiment reproduce
 - `tree-metadata.md`: how git, Mercurial and dedup systems (Meister et al., FAST 2013) store versioned listings and fingerprint lists compactly.
 - `graph-storage.md`: graph stores compared (HugeGraph, Rama, TerminusDB, Dolt/Noms prolly trees, Datomic/XTDB, HDT, k²-trees, WebGraph, Kùzu, Neo4j) for a versioned, sliceable, deduplicating graph layer.
 - `semantic-grouping.md`: which signal (byte order, MinHash/seeds, NCD, embeddings, LLM) should decide which small contents are compressed together.
+- `verified-streaming.md`: BLAKE3 tree hashing, Bao and chunk groups, for verifying a slice of a stored leaf without decoding all of it.

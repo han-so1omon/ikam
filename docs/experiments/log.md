@@ -652,3 +652,34 @@ Newest last. Format and rules: `README.md`.
   - generated: 4,260 -> 4,245 B (its function-library graph also uses graph chunks); vs_dict_read 0.0318 -> 0.0317.
   - The other corpora are byte-identical. Time 79.9 s -> 87.0 s (not attributed; within run-to-run variation seen before, sizes unaffected).
 - Verdict: **kept**. Graph reads now cost less than decoding the baseline's edge lists. Object-format note: graph ids change for graphs written from now on; old graphs keep reading.
+
+### E046 verified-slice-blocks (offline, refuted)
+- Branch / parent: exp/046-verified-slice-blocks / E045
+- Hypothesis: a range read through a stored leaf decodes the whole leaf, because a leaf can only be checked against its id as a whole. If leaves were stored as zstd frames per power-of-two block, each block checked against its stored 32-byte BLAKE3 chaining value (and the chaining values merged into the root, which is the id), a slice would decode only the blocks it covers and stay verified. Sources:
+  - E041's finding that slice sources are decoded whole many times;
+  - BLAKE3 spec §2.1 and §6.4, Bao, bao-tree chunk groups, and the blake3 `hazmat` API (`docs/research/verified-streaming.md`).
+- Feasibility: ids are plain BLAKE3 of `"B" ++ bytes` (`src/id.rs`), so group chaining values merge to the id. The design and its verification argument are in the research note.
+- Measurement, offline:
+  - Temporary instrumentation in the read paths. Range leaves in `range.rs`, and `Range` arguments in `eval` and `fill_range`.
+  - It recorded every stored leaf decoded for a partial slice during the scored whole-file reads. The decoded size is counted once per file read, because a read caches it.
+  - It also recorded the blocks those slices cover, at 4, 16 and 64 KiB.
+  - Each leaf was compressed whole and per block (zstd 19, no dictionary).
+  - The instrumented run's score was unchanged (0.3005). The patch was not kept.
+
+  | corpus | leaves | decoded whole | slice bytes needed | covered by 4K / 16K / 64K blocks | bytes whole -> 4K / 16K / 64K blocks (+ CVs) |
+  |---|---|---|---|---|---|
+  | office | 12 | 2,528,676 | 355,939 | 2,406,064 / 2,528,676 / 2,528,676 | 7,596 -> 8,576 / 7,596 / 7,596 (+576 / 384 / 384) |
+  | repo-history | 61 | 617,889 | 154,656 | 577,790 / 613,890 / 617,889 | 139,956 -> 183,824 / 149,392 / 139,956 (+5,600 / 2,496 / 1,952) |
+  | structured | 9 | 6,024,655 | 3,441,444 | 5,324,285 / 5,451,261 / 5,801,883 | 117,287 -> 196,091 / 155,117 / 131,940 (+7,936 / 2,176 / 736) |
+
+  No other corpus decodes a stored leaf for a partial slice.
+- Result: a slice needs 14–57% of a leaf's bytes, but those bytes are spread across 88–100% of its blocks.
+  - At the score's read weight (0.001), the best case is structured at 4 KiB. It saves 700,370 bytes of decoding (700 byte-equivalents) and adds 86,740 bytes.
+  - At 64 KiB it saves 223 and adds 15,389.
+  - Office saves at most 123 and adds 1,556.
+  - Repo-history saves 40 and adds 49,468.
+  - Every corpus at every block size loses by two orders of magnitude or more.
+- Verdict: **refuted, nothing built** (the kernel is unchanged).
+  - The cost of verifying blocks (32 B each) is minor next to the compression lost by framing per block.
+  - Whole-file reads use most of each slice source.
+  - Partial verified reads would pay for small range reads (`read_4k`), which are reported but not scored. That is open hypothesis H2 in the note.
