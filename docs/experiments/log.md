@@ -837,3 +837,24 @@ Newest last. Format and rules: `README.md`.
   - transcripts: 72,592 -> 72,557 B.
   - Other corpora are byte-identical.
 - Verdict: **kept.** Repack is now a fixed point after one call, and its acceptance test is the score's objective. That is a precondition for any background or anytime optimisation loop (E052).
+
+### E061 search-index-size (refuted)
+- Branch / parent: exp/061-search-index-size / E060
+- Hypothesis (E058's open item, "indexing only rarer trigrams"): trigrams in more than half the contents narrow searches little but carry the longest posting lists. Keeping them only as a 3-byte "common" list, which constrains nothing, would shrink the index without losing much filtering. Search stays exact: a trigram neither listed nor common is in no content, and candidates are still decoded and checked.
+- Considered and not tried: shorter file ids in the index. The ids are 3–10% of its bytes, and with a prefix, exactness would depend on no two prefixes colliding. A missed candidate is a wrong answer, and unlike a dictionary prefix it can't be detected afterwards.
+- Change: `src/search.rs`. Common trigrams are stored without postings and skipped as constraints; a pattern made only of common trigrams scans everything. The test now covers a common trigram.
+  - The first WIP commit wrote no common section (the builder edit had not applied). The test caught it, and the runs were restarted after the fix.
+- Result (two runs identical; tests clean; score 0.2903 unchanged; search results identical to a full scan):
+
+  | corpus | index bytes | decoded per query, indexed | pays above (searches per read pass) |
+  |---|---|---|---|
+  | office | 1,201,155 -> 1,193,670 | 17.9 M -> 26.6 M | 35 -> 47 |
+  | repo-history | 731,983 -> 690,523 | 9.4 M -> 15.3 M | 34 -> 43 |
+  | generated | 13,938 -> 14,237 | 0.57 M -> 1.03 M | 19 -> 49 |
+  | md | 111,826 -> 111,255 | 0.413 M -> 0.413 M | 65 -> 65 |
+  | transcripts | 72,343 -> 64,703 | 10.77 M -> 10.84 M | 179 -> 196 |
+  | structured | 27,927 -> 25,296 | 20.90 M -> 20.95 M | 575 -> never |
+
+- Verdict: **refuted; not merged.**
+  - Common trigrams are few, so dropping them saves 0.5–16% of the index. They still filter real queries, because identifiers combine common trigrams with rare ones; dropping them leaves candidate sets larger.
+  - The index's size is in the many rare trigrams, which are also what makes it work. Further levers would compress the postings (bitmaps for dense lists, a dictionary for the trigram keys), not filter them.
