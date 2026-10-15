@@ -6,8 +6,12 @@
 //! contents the index does not cover are always scanned.
 //!
 //! The index is ordinary content (ref `meta/search-index`), encoded as
-//! `count:u32 { id[32] }` then, per trigram in order, `trigram[3]
-//! n:varint { delta:varint }` (content positions in the id list).
+//! `count:u32 { id[32] }`, `common:varint { trigram[3] }`, then per other
+//! trigram in order `trigram[3] n:varint { delta:varint }` (content
+//! positions in the id list). A common trigram (in more than half of the
+//! contents, E061) narrows little and costs the most, so it gets no list
+//! and constrains nothing; any trigram neither listed nor common is in no
+//! content.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 
@@ -21,6 +25,7 @@ pub const SEARCH_REF: &str = "meta/search-index";
 /// positions of the contents holding it.
 pub struct SearchIndex {
     files: Vec<Id>,
+    common: HashSet<[u8; 3]>,
     postings: HashMap<[u8; 3], Vec<usize>>,
 }
 
@@ -71,7 +76,14 @@ impl<S: Store> Repo<S> {
             .chunks(32)
             .map(|c| Id::from_bytes(c.try_into().unwrap()))
             .collect();
-        let (mut rest, mut postings) = (&bytes[4 + 32 * count..], HashMap::new());
+        let mut rest = &bytes[4 + 32 * count..];
+        let mut common = HashSet::new();
+        for _ in 0..varint(&mut rest).ok_or_else(bad)? {
+            let (t, tail) = rest.split_first_chunk::<3>().ok_or_else(bad)?;
+            common.insert(*t);
+            rest = tail;
+        }
+        let mut postings = HashMap::new();
         while let Some((t, tail)) = rest.split_first_chunk::<3>() {
             rest = tail;
             let n = varint(&mut rest).ok_or_else(bad)?;
@@ -81,7 +93,11 @@ impl<S: Store> Repo<S> {
             }
             postings.insert(*t, list);
         }
-        Ok(Some(SearchIndex { files, postings }))
+        Ok(Some(SearchIndex {
+            files,
+            common,
+            postings,
+        }))
     }
 
     /// The contents of `files` that contain `pattern`, and the decode work
@@ -97,14 +113,19 @@ impl<S: Store> Repo<S> {
                 let covered: HashSet<&Id> = index.files.iter().collect();
                 let mut hits: Option<HashSet<usize>> = None;
                 for w in pattern.windows(3) {
-                    let list = index.postings.get(&[w[0], w[1], w[2]]);
+                    let t = [w[0], w[1], w[2]];
+                    if index.common.contains(&t) {
+                        continue;
+                    }
+                    let list = index.postings.get(&t);
                     let set: HashSet<usize> = list.into_iter().flatten().copied().collect();
                     hits = Some(match hits {
                         Some(h) => h.intersection(&set).copied().collect(),
                         None => set,
                     });
                 }
-                let hits = hits.unwrap_or_default();
+                // Only common trigrams: no constraint, every content is a candidate.
+                let hits = hits.unwrap_or_else(|| (0..index.files.len()).collect());
                 let indexed = files.iter().filter(|id| covered.contains(id));
                 let unindexed = files.iter().filter(|id| !covered.contains(id));
                 let positions: HashMap<&Id, usize> = index
@@ -142,8 +163,8 @@ impl<S: Store> Repo<S> {
 mod tests {
     use crate::{MemStore, Repo};
 
-    /// Indexed and unindexed searches return the same contents, and the
-    /// index narrows what is decoded.
+    /// Indexed and unindexed searches return the same contents (common
+    /// trigrams included), and the index narrows what is decoded.
     #[test]
     fn indexed_search_matches_a_full_scan() {
         let mut repo = Repo::new(MemStore::default());
@@ -159,7 +180,8 @@ mod tests {
             .collect();
         repo.build_search_index(&ids[..3]).unwrap(); // the last is not indexed
         let index = repo.search_index().unwrap().unwrap();
-        for pattern in [&b"alpha"[..], b"beta", b"zeta", b"ta", b"none"] {
+        // "eta" is in every indexed content: a common trigram, no constraint.
+        for pattern in [&b"alpha"[..], b"beta", b"zeta", b"eta", b"ta", b"none"] {
             let full = repo.search(pattern, &ids, None).unwrap().0;
             let fast = repo.search(pattern, &ids, Some(&index)).unwrap().0;
             assert_eq!(full, fast, "{}", String::from_utf8_lossy(pattern));
