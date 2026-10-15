@@ -48,10 +48,14 @@ const DICT_SHORTLIST: usize = 4;
 
 impl<S: Store + Sync> Repo<S> {
     /// Re-plan storage of all live content (applied only if smaller and
-    /// verified), then rebuild the function library graph.
+    /// verified), then rebuild the function library graph. Trees whose
+    /// stored content the new plan no longer shares go back to object form
+    /// (as before a re-plan), so a second repack finds nothing left (E060).
     pub fn repack(&mut self) -> Result<Repacked, Error> {
         let repacked = self.replan_store()?;
         self.function_library()?;
+        self.unshare_trees()?;
+        self.gc()?;
         Ok(repacked)
     }
 
@@ -116,7 +120,18 @@ impl<S: Store + Sync> Repo<S> {
         let (_, mut fresh) = fresh.expect("at least one plan");
         fresh.recompress(&roots)?;
         let (before, after) = (self.content_bytes()?, fresh.content_bytes()?);
-        if fresh.plan_cost(&roots)? >= self.plan_cost(&roots)? {
+        // Accept by the whole store, as the score counts it: the objects
+        // that outlive the re-plan (trees, commits, graph chunks) move to the
+        // new dictionary too, so their sizes change with it (E060).
+        let (mut kept_now, mut kept_fresh) = (0, 0);
+        for (id, canonical) in self.lasting_objects()? {
+            if canonical.first() != Some(&b'D') {
+                kept_now += self.store.read(&id)?.len();
+                kept_fresh += fresh.encode_object(&canonical).len();
+            }
+        }
+        if fresh.plan_cost(&roots)? + kept_fresh as f64 >= self.plan_cost(&roots)? + kept_now as f64
+        {
             return Ok(Repacked {
                 before,
                 after: before,
