@@ -183,7 +183,9 @@ impl<S: Store + Sync> Repo<S> {
         if induce {
             induce_into(&mut fresh, files, &mut hints)?;
         }
-        for (id, bytes) in files {
+        // A fact's inputs go in before its output, so the fact can be
+        // verified as a candidate when the output is planned (E056).
+        for (id, bytes) in inputs_first(files, &hints) {
             fresh.put_content_with(bytes, 0, &hints[id])?;
         }
         // Re-record facts whose inputs survived the re-plan.
@@ -426,6 +428,44 @@ impl<S: Store + Sync> Repo<S> {
         }
         Ok(total)
     }
+}
+
+/// `files` (largest first) reordered so that every input of a hint comes
+/// before the content it rebuilds: depth-first over hint arguments.
+fn inputs_first<'a>(
+    files: &'a [(Id, Vec<u8>)],
+    hints: &HashMap<Id, Vec<Derivation>>,
+) -> Vec<&'a (Id, Vec<u8>)> {
+    let at: HashMap<Id, usize> = files
+        .iter()
+        .enumerate()
+        .map(|(i, (id, _))| (*id, i))
+        .collect();
+    let (mut out, mut seen) = (Vec::with_capacity(files.len()), HashSet::new());
+    fn visit<'a>(
+        i: usize,
+        files: &'a [(Id, Vec<u8>)],
+        hints: &HashMap<Id, Vec<Derivation>>,
+        at: &HashMap<Id, usize>,
+        seen: &mut HashSet<usize>,
+        out: &mut Vec<&'a (Id, Vec<u8>)>,
+    ) {
+        if !seen.insert(i) {
+            return;
+        }
+        for d in hints.get(&files[i].0).into_iter().flatten() {
+            for a in &d.args {
+                if let Some(&j) = at.get(&a.id()) {
+                    visit(j, files, hints, at, seen, out);
+                }
+            }
+        }
+        out.push(&files[i]);
+    }
+    for i in 0..files.len() {
+        visit(i, files, hints, &at, &mut seen, &mut out);
+    }
+    out
 }
 
 /// Induce one template per cluster of similar `items`, offering each member
@@ -705,6 +745,33 @@ impl ReadModel {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A fact's inputs are planned before the content it rebuilds, whatever
+    /// their sizes, so the fact can be verified as a candidate then (E056).
+    #[test]
+    fn replan_puts_fact_inputs_first() {
+        let (big, small, other) = (
+            Id::of_content(b"big"),
+            Id::of_content(b"s"),
+            Id::of_content(b"o"),
+        );
+        let files = vec![
+            (big, vec![0; 30]),
+            (other, vec![0; 20]),
+            (small, vec![0; 10]),
+        ];
+        let fact = Derivation {
+            output: big,
+            func: func::concat(),
+            args: vec![Arg::Whole(small)],
+        };
+        let hints = HashMap::from([(big, vec![fact]), (other, vec![]), (small, vec![])]);
+        let order: Vec<Id> = inputs_first(&files, &hints)
+            .iter()
+            .map(|(id, _)| *id)
+            .collect();
+        assert_eq!(order, vec![small, big, other]);
+    }
 
     /// A source named by several arguments of one derivation is decoded
     /// once when that derivation is read (reads cache what they decode), so

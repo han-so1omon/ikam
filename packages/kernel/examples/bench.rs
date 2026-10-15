@@ -437,6 +437,160 @@ type Candidate<'a> = (&'a str, &'a str, Id, f64, f64);
 /// zstd of the distinct function and argument contents chosen (one group) +
 /// read weight x decode work + zstd of each file left stored. Coordinate
 /// descent picks, per file, the form (or none) that lowers that total.
+/// Quoted-line runs (E056): text that quotes other files of its snapshot
+/// line by line, numbered and JSON-escaped, as agent transcripts do, is
+/// offered as `quote(ops, names, sources)` (`functions/quote/`). The kernel
+/// verifies each derivation; repack keeps it only if it pays.
+fn propose_quotes(repo: &mut Repo<MemStore>, snapshots: &[Snapshot]) {
+    let module =
+        std::fs::read(Path::new(env!("CARGO_MANIFEST_DIR")).join("functions/quote.wasm")).unwrap();
+    let Some(last) = snapshots.last() else { return };
+    let esc = |b: &[u8]| json_str(std::str::from_utf8(b).unwrap()).into_bytes();
+    for (t, (_, target)) in last.iter().enumerate() {
+        if target.len() < 64 * 1024 {
+            continue;
+        }
+        let sources: Vec<(&str, Vec<Vec<u8>>)> = last
+            .iter()
+            .enumerate()
+            .filter(|(i, (_, b))| *i != t && std::str::from_utf8(b).is_ok())
+            .map(|(_, (name, b))| {
+                let text = std::str::from_utf8(b).unwrap();
+                let lines = text
+                    .lines()
+                    .map(|l| {
+                        let e = esc(l.as_bytes());
+                        e[1..e.len() - 1].to_vec()
+                    })
+                    .collect();
+                (name.as_str(), lines)
+            })
+            .collect();
+        let (ops, quoted) = encode_quotes(target, &sources, |b| {
+            let e = esc(b);
+            e[1..e.len() - 1].to_vec()
+        });
+        if quoted < target.len() / 2 {
+            continue;
+        }
+        let names: String = sources.iter().map(|(n, _)| format!("{n}\n")).collect();
+        let func = repo.put_content(&module).unwrap().id;
+        let mut args = vec![
+            Arg::Whole(repo.put_content(&ops).unwrap().id),
+            Arg::Whole(repo.put_content(names.as_bytes()).unwrap().id),
+        ];
+        args.extend(
+            last.iter()
+                .enumerate()
+                .filter(|(i, (_, b))| *i != t && std::str::from_utf8(b).is_ok())
+                .map(|(_, (_, b))| Arg::Whole(Id::of_content(b))),
+        );
+        repo.put_derivation(target, func, args).unwrap();
+    }
+}
+
+/// The op stream of `functions/quote` for `target`, and how many of its
+/// bytes it quotes. Greedy: at each position the longest run of quoted lines.
+fn encode_quotes(
+    target: &[u8],
+    sources: &[(&str, Vec<Vec<u8>>)],
+    esc: impl Fn(&[u8]) -> Vec<u8>,
+) -> (Vec<u8>, usize) {
+    let put = |out: &mut Vec<u8>, mut n: usize| {
+        while n >= 0x80 {
+            out.push(n as u8 | 0x80);
+            n >>= 7;
+        }
+        out.push(n as u8);
+    };
+    // A run of `lines` from line `a` in either style, matched at `p`: its end.
+    let run = |p: usize, style: u8, s: usize, a: usize| -> (usize, usize) {
+        let (mut at, mut n) = (p, 0);
+        while let Some(line) = sources[s].1.get(a + n) {
+            let head = match style {
+                1 => format!("{:>6}\\t", a + n + 1).into_bytes(),
+                _ => [
+                    esc(sources[s].0.as_bytes()),
+                    format!(":{}:", a + n + 1).into_bytes(),
+                ]
+                .concat(),
+            };
+            let piece = [head, line.clone(), b"\\n".to_vec()].concat();
+            if !target[at..].starts_with(&piece) {
+                break;
+            }
+            (at, n) = (at + piece.len(), n + 1);
+        }
+        (at, n)
+    };
+    let number = |b: &[u8]| {
+        std::str::from_utf8(b)
+            .ok()?
+            .trim_start()
+            .parse::<usize>()
+            .ok()
+    };
+    let (mut ops, mut literal, mut quoted, mut p) = (Vec::new(), Vec::new(), 0, 0);
+    while p < target.len() {
+        let mut best: Option<(usize, u8, usize, usize, usize)> = None; // end, style, s, a, n
+        // Style 1: `{n:>6}\t` then the line.
+        if p + 8 <= target.len()
+            && &target[p + 6..p + 8] == b"\\t"
+            && let Some(n) = number(&target[p..p + 6]).filter(|&n| n > 0)
+        {
+            for s in 0..sources.len() {
+                let (end, k) = run(p, 1, s, n - 1);
+                if k > 0 && best.is_none_or(|b| end > b.0) {
+                    best = Some((end, 1, s, n - 1, k));
+                }
+            }
+        }
+        // Style 2: `{name}:{n}:` then the line.
+        for (s, (name, _)) in sources.iter().enumerate() {
+            let name = esc(name.as_bytes());
+            if target[p..].starts_with(&name) && target.get(p + name.len()) == Some(&b':') {
+                let digits = target[p + name.len() + 1..]
+                    .iter()
+                    .take_while(|b| b.is_ascii_digit())
+                    .count();
+                if let Some(n) = number(&target[p + name.len() + 1..p + name.len() + 1 + digits])
+                    .filter(|&n| n > 0)
+                {
+                    let (end, k) = run(p, 2, s, n - 1);
+                    if k > 0 && best.is_none_or(|b| end > b.0) {
+                        best = Some((end, 2, s, n - 1, k));
+                    }
+                }
+            }
+        }
+        match best {
+            Some((end, style, s, a, n)) => {
+                if !literal.is_empty() {
+                    ops.push(0);
+                    put(&mut ops, literal.len());
+                    ops.append(&mut literal);
+                }
+                ops.push(style);
+                for v in [s, a, n] {
+                    put(&mut ops, v);
+                }
+                quoted += end - p;
+                p = end;
+            }
+            None => {
+                literal.push(target[p]);
+                p += 1;
+            }
+        }
+    }
+    if !literal.is_empty() {
+        ops.push(0);
+        put(&mut ops, literal.len());
+        ops.append(&mut literal);
+    }
+    (ops, quoted)
+}
+
 /// The kernel verifies what is offered; repack keeps it only if it pays.
 fn propose_programs(repo: &mut Repo<MemStore>, snapshots: &[Snapshot]) {
     let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("functions");
@@ -841,6 +995,7 @@ fn main() {
         snapshots.iter().for_each(|s| commit(&mut repo, s, graph));
         let (ingest, ingest_ms) = (stored(&repo), t.elapsed().as_millis());
         propose_programs(&mut repo, &snapshots);
+        propose_quotes(&mut repo, &snapshots);
         let t = Instant::now();
         repo.proposed_order = proposed_order();
         repo.repack().unwrap();

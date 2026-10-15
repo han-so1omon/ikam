@@ -713,3 +713,25 @@ Newest last. Format and rules: `README.md`.
 - Next hypotheses, both priced by read cost:
   - a `quote` builtin or WASM function for line-numbered, escaped slices;
   - related-content zstd context (delta against stored content).
+
+### E056 quote-function
+- Branch / parent: exp/056-quote-function / E055
+- Hypothesis (E055's bound; C7 in `docs/research/latent-reasoning.md`): a transcript's quotes are its sources' lines, numbered and JSON-escaped. A function that rebuilds that formatting from the stored sources turns about 92% of the session into a short op stream. E055's zstd bound with the quoted sources as context was 24.3 K for the session, against 75.8 K alone.
+- Change:
+  - `functions/quote/` (no_std Rust, built to `functions/quote.wasm`, 5,283 B) implements `quote(ops, names, sources...)`. Its ops are: a literal run; lines `a..a+n` of source `s` as `{n:>6}\t{line}` (Read style); or as `{name}:{n}:{line}` (grep style). Every quoted line is JSON-escaped and ends in `\n`.
+  - `examples/bench.rs`: proposer `propose_quotes`. For a file of at least 64 KiB in the last snapshot, it greedily encodes the longest runs of quoted lines of the other files. It proposes the derivation through `put_derivation` (verified) only if at least half of the file is quoted.
+  - **Kernel fix**, `src/repack.rs`: `replan` re-ingested files largest first. So a fact's output (the 1.27 MB session) was planned before its inputs (op stream, sources) existed, and the fact could not be verified as a candidate. The output was then stored as slice plans with literal blobs, and the fact was kept *as well*. `inputs_first` now orders each fact's inputs before its output (depth-first over hint arguments). Test `replan_puts_fact_inputs_first`.
+- Steps measured:
+  - Proposer alone (fact recorded, but repack plans the session first): transcripts 113,507 -> 132,781 B (worse). The session's slice plan kept 74.6 K of literal blobs next to the fact's inputs.
+  - Also proposing prefix slices of the latest session for earlier versions changed nothing; repack re-derives plans.
+  - With `inputs_first`: **71,507 B**.
+  - Proposing quotes for every version instead of only the latest: 75,336 B, worse (four op streams and records). Latest only is kept.
+- Result (two runs identical; tests, clippy and fmt clean; every corpus exact with a clean fsck): score 0.3039 -> **0.2929**; bytes_score 0.2746 -> 0.2622.
+  - transcripts: 113,507 -> 71,507 B; read 7,610,892 -> 12,423,767 (the session is now rebuilt by WASM, priced); vs_dict 0.3518 -> **0.2216**; vs_dict_read 0.3715 -> **0.2575**.
+  - Every other corpus is byte-identical, including office and generated, whose facts now also have their inputs planned first.
+- Verdict: **kept.**
+  - The ordering fix is general: any proposer's fact (a program, a container, a quote) can now replace its output's plan during repack.
+  - The quote function is a proposed reconstruction function, not a kernel builtin; the kernel only verifies it.
+- Remaining:
+  - The session costs about 12.4 M of read work per read pass. The planner still doesn't model WASM work (E048).
+  - Earlier session versions are slices of the WASM-built latest.
