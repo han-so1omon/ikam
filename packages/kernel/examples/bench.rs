@@ -15,9 +15,11 @@
 //! baselines are file-level dedup + zstd per file, and file-level dedup +
 //! zstd with a dictionary trained on the corpus (dictionary size included).
 
+use std::alloc::{GlobalAlloc, Layout, System};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
 use std::time::Instant;
 
 use ikam_kernel::{
@@ -726,23 +728,7 @@ fn search_cost(repo: &Repo<MemStore>, snapshots: &[Snapshot]) -> (usize, bool) {
         .map(|(_, b)| (Id::of_content(b), b))
         .collect();
     let ids: Vec<Id> = files.keys().copied().collect();
-    let mut s = 0x1234_5678u64;
-    let mut lcg = move || {
-        s = s
-            .wrapping_mul(6364136223846793005)
-            .wrapping_add(1442695040888963407);
-        (s >> 33) as usize
-    };
-    let mut queries = Vec::new();
-    while queries.len() < 100 {
-        let text = String::from_utf8_lossy(files[&ids[lcg() % ids.len()]]);
-        let lines: Vec<&str> = text.lines().collect();
-        let line = lines.get(lcg() % lines.len().max(1)).copied().unwrap_or("");
-        let word = line
-            .split(|c: char| !c.is_alphanumeric() && c != '_')
-            .find(|w| w.len() > 3);
-        queries.push(word.unwrap_or("data").as_bytes().to_vec());
-    }
+    let mut queries = grep_queries(&files, 100);
     let before = ikam_kernel::decode_cost();
     let index = repo.search_index().unwrap();
     if index.is_none() {
@@ -761,6 +747,205 @@ fn search_cost(repo: &Repo<MemStore>, snapshots: &[Snapshot]) -> (usize, bool) {
         (ikam_kernel::decode_cost() - before + work) / queries.len(),
         exact,
     )
+}
+
+/// Deterministic grep-like queries (E058/E062): an identifier from a random
+/// line of a random distinct file, as the agent trace of E050 searched.
+fn grep_queries(files: &BTreeMap<Id, &Vec<u8>>, n: usize) -> Vec<Vec<u8>> {
+    let ids: Vec<&Id> = files.keys().collect();
+    let mut s = 0x1234_5678u64;
+    let mut lcg = move || {
+        s = s
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        (s >> 33) as usize
+    };
+    let mut queries = Vec::new();
+    while queries.len() < n {
+        let text = String::from_utf8_lossy(files[ids[lcg() % ids.len()]]);
+        let lines: Vec<&str> = text.lines().collect();
+        let line = lines.get(lcg() % lines.len().max(1)).copied().unwrap_or("");
+        let word = line
+            .split(|c: char| !c.is_alphanumeric() && c != '_')
+            .find(|w| w.len() > 3);
+        queries.push(word.unwrap_or("data").as_bytes().to_vec());
+    }
+    queries
+}
+
+/// Heap in use and its peak, counted by the bench's allocator (E063), so
+/// each operation's peak memory is measured, not estimated.
+struct Counting;
+
+static HEAP: AtomicUsize = AtomicUsize::new(0);
+static PEAK: AtomicUsize = AtomicUsize::new(0);
+
+unsafe impl GlobalAlloc for Counting {
+    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+        let p = unsafe { System.alloc(layout) };
+        if !p.is_null() {
+            let now = HEAP.fetch_add(layout.size(), Relaxed) + layout.size();
+            PEAK.fetch_max(now, Relaxed);
+        }
+        p
+    }
+    unsafe fn dealloc(&self, p: *mut u8, layout: Layout) {
+        unsafe { System.dealloc(p, layout) };
+        HEAP.fetch_sub(layout.size(), Relaxed);
+    }
+    unsafe fn realloc(&self, p: *mut u8, layout: Layout, size: usize) -> *mut u8 {
+        let q = unsafe { System.realloc(p, layout, size) };
+        if !q.is_null() {
+            let now = HEAP.fetch_add(size, Relaxed) + size - layout.size();
+            HEAP.fetch_sub(layout.size(), Relaxed);
+            PEAK.fetch_max(now, Relaxed);
+        }
+        q
+    }
+}
+
+#[global_allocator]
+static ALLOCATOR: Counting = Counting;
+
+/// One operation's real cost: wall time (median of `runs`) and peak heap
+/// above what was in use when it started (from the first run).
+#[derive(Clone, Copy)]
+struct Cost {
+    ms: f64,
+    peak: usize,
+}
+
+fn measure<T>(runs: usize, mut op: impl FnMut() -> T) -> (T, Cost) {
+    let start = HEAP.load(Relaxed);
+    PEAK.store(start, Relaxed);
+    let (mut out, mut times) = (None, Vec::new());
+    for _ in 0..runs.max(1) {
+        let t = Instant::now();
+        let r = op();
+        times.push(t.elapsed().as_secs_f64() * 1000.0);
+        out.get_or_insert(r);
+    }
+    times.sort_by(f64::total_cmp);
+    let peak = PEAK.load(Relaxed).saturating_sub(start);
+    (
+        out.unwrap(),
+        Cost {
+            ms: times[times.len() / 2],
+            peak,
+        },
+    )
+}
+
+fn ops_json(ops: &[(&str, Cost)]) -> String {
+    let fields: Vec<String> = ops
+        .iter()
+        .map(|(k, c)| format!("\"{k}\":{{\"ms\":{:.3},\"peak\":{}}}", c.ms, c.peak))
+        .collect();
+    format!("{{{}}}", fields.join(","))
+}
+
+/// Real time and peak memory of every read-side operation (E063, reported,
+/// not scored): the kernel's whole reads of every distinct file, a 4 KiB
+/// range read of each, one search (median of 3 queries), fsck, and for a
+/// graph corpus every distinct graph read; and the baseline's (zstd + its
+/// trained dictionary, as in `baselines`): decompress every file, a range
+/// read (decompress then slice), a search (decompress all, scan) and
+/// verification (decompress all, hash).
+fn operation_profile(
+    repo: &Repo<MemStore>,
+    snapshots: &[Snapshot],
+    graph: bool,
+) -> (String, String) {
+    let files: BTreeMap<Id, &Vec<u8>> = snapshots
+        .iter()
+        .flatten()
+        .map(|(_, b)| (Id::of_content(b), b))
+        .collect();
+    let ids: Vec<Id> = files.keys().copied().collect();
+    let queries = grep_queries(&files, 3);
+    let mut kernel = Vec::new();
+    if graph {
+        let mut graphs = BTreeSet::new();
+        for (_, c) in repo.log(repo.resolve("main").unwrap()).unwrap() {
+            if let Object::Tree(entries) = repo.get(&c.tree).unwrap() {
+                graphs.insert(entries[0].id);
+            }
+        }
+        let (_, c) = measure(3, || {
+            graphs
+                .iter()
+                .for_each(|g| drop(repo.graph_nodes(g).unwrap()))
+        });
+        kernel.push(("read", c));
+    } else {
+        let (_, c) = measure(3, || {
+            ids.iter()
+                .for_each(|id| drop(repo.read_content(id).unwrap()))
+        });
+        kernel.push(("read", c));
+        let (_, c) = measure(3, || {
+            for (id, b) in &files {
+                let n = b.len() as u64;
+                drop(repo.read_range(id, n / 2, (n - n / 2).min(4096)).unwrap());
+            }
+        });
+        kernel.push(("range", c));
+        let index = repo.search_index().unwrap();
+        let mut runs = queries.iter().cycle();
+        let (_, c) = measure(3, || {
+            repo.search(runs.next().unwrap(), &ids, index.as_ref())
+                .unwrap()
+        });
+        kernel.push(("search", c));
+    }
+    let (_, c) = measure(1, || repo.fsck().unwrap());
+    kernel.push(("fsck", c));
+    // Baseline: the corpus as `baselines` stores it.
+    let plain: Vec<&Vec<u8>> = files.values().copied().collect();
+    let total: usize = plain.iter().map(|b| b.len()).sum();
+    let dict =
+        zstd::dict::from_samples(&plain, (total / 10).clamp(4096, 112_640)).unwrap_or_default();
+    let mut c = zstd::bulk::Compressor::with_dictionary(3, &dict).unwrap();
+    let frames: Vec<(Vec<u8>, usize)> = plain
+        .iter()
+        .map(|b| (c.compress(b).unwrap(), b.len()))
+        .collect();
+    let mut d = zstd::bulk::Decompressor::with_dictionary(&dict).unwrap();
+    let mut decode_all = || -> Vec<Vec<u8>> {
+        frames
+            .iter()
+            .map(|(f, n)| d.decompress(f, *n).unwrap())
+            .collect()
+    };
+    let mut baseline = Vec::new();
+    let (_, c) = measure(3, || drop(decode_all()));
+    baseline.push(("read", c));
+    if !graph {
+        let (_, c) = measure(3, || {
+            decode_all()
+                .iter()
+                .map(|b| b[b.len() / 2..(b.len() / 2 + 4096).min(b.len())].to_vec())
+                .collect::<Vec<_>>()
+        });
+        baseline.push(("range", c));
+        let mut runs = queries.iter().cycle();
+        let (_, c) = measure(3, || {
+            let q = runs.next().unwrap();
+            decode_all()
+                .iter()
+                .filter(|b| b.windows(q.len()).any(|w| w == q.as_slice()))
+                .count()
+        });
+        baseline.push(("search", c));
+    }
+    let (_, c) = measure(1, || {
+        decode_all()
+            .iter()
+            .map(|b| *blake3::hash(b).as_bytes())
+            .collect::<Vec<_>>()
+    });
+    baseline.push(("fsck", c));
+    (ops_json(&kernel), ops_json(&baseline))
 }
 
 /// Read cost of a graph corpus (since E039): reading every distinct
@@ -1046,15 +1231,15 @@ fn main() {
         let snapshots = build();
         let input: usize = snapshots.iter().flatten().map(|(_, b)| b.len()).sum();
         let mut repo = Repo::new(MemStore::default());
-        let t = Instant::now();
-        snapshots.iter().for_each(|s| commit(&mut repo, s, graph));
-        let (ingest, ingest_ms) = (stored(&repo), t.elapsed().as_millis());
+        let ((), ingest_cost) = measure(1, || {
+            snapshots.iter().for_each(|s| commit(&mut repo, s, graph))
+        });
+        let (ingest, ingest_ms) = (stored(&repo), ingest_cost.ms as u128);
         propose_programs(&mut repo, &snapshots);
         propose_quotes(&mut repo, &snapshots);
-        let t = Instant::now();
         repo.proposed_order = proposed_order();
-        repo.repack().unwrap();
-        let (repack, repack_ms) = (stored(&repo), t.elapsed().as_millis());
+        let (_, repack_cost) = measure(1, || repo.repack().unwrap());
+        let (repack, repack_ms) = (stored(&repo), repack_cost.ms as u128);
         let exact = match graph {
             // Every version's graph, read back from its commit, is the one stored.
             true => repo
@@ -1080,7 +1265,15 @@ fn main() {
         };
         let exact = exact && range_exact;
         let fsck = repo.fsck().unwrap().is_empty();
-        let (zstd_files, zstd_dict) = baselines(&snapshots);
+        let ((zstd_files, zstd_dict), baseline_ingest) = measure(1, || baselines(&snapshots));
+        let (kernel_ops, baseline_ops) = operation_profile(&repo, &snapshots, graph);
+        let cost = |c: Cost| format!("{{\"ms\":{:.3},\"peak\":{}}}", c.ms, c.peak);
+        let ops = format!(
+            "{{\"kernel\":{{\"ingest\":{},\"repack\":{},\"ops\":{kernel_ops}}},\"baseline\":{{\"ingest\":{},\"ops\":{baseline_ops}}}}}",
+            cost(ingest_cost),
+            cost(repack_cost),
+            cost(baseline_ingest),
+        );
         let ratio = repack as f64 / zstd_dict as f64;
         // With read cost (E034): the baseline reads each distinct file by
         // decoding its zstd frame once; the kernel's read cost is
@@ -1104,7 +1297,7 @@ fn main() {
         let kinds = by_kind(&repo);
         if json {
             println!(
-                "{{\"corpus\":\"{name}\",\"input\":{input},\"ingest\":{ingest},\"repack\":{repack},\"ingest_ms\":{ingest_ms},\"repack_ms\":{repack_ms},\"zstd_files\":{zstd_files},\"zstd_dict\":{zstd_dict},\"vs_dict\":{ratio:.4},\"vs_dict_read\":{read_ratio:.4},\"vs_dict_search\":{search_ratio:.4},\"search\":{search},\"read_baseline\":{baseline_read},\"exact\":{exact},\"fsck\":{fsck},\"read_whole\":{read_whole},\"read_4k\":{read_4k},\"by_kind\":{kinds}}}"
+                "{{\"corpus\":\"{name}\",\"input\":{input},\"ingest\":{ingest},\"repack\":{repack},\"ingest_ms\":{ingest_ms},\"repack_ms\":{repack_ms},\"zstd_files\":{zstd_files},\"zstd_dict\":{zstd_dict},\"vs_dict\":{ratio:.4},\"vs_dict_read\":{read_ratio:.4},\"vs_dict_search\":{search_ratio:.4},\"search\":{search},\"read_baseline\":{baseline_read},\"exact\":{exact},\"fsck\":{fsck},\"read_whole\":{read_whole},\"read_4k\":{read_4k},\"ops\":{ops},\"by_kind\":{kinds}}}"
             );
         } else {
             println!(
