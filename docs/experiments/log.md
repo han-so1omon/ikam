@@ -682,3 +682,19 @@ Newest last. Format and rules: `README.md`.
   - Kept: the hook (`Repo::proposed_order`), and the order file it reads.
   - Added: the swap test as a standard step for proposer experiments (`docs/experiments/README.md`, step 5).
   - Ties to E017–E020: measured cost already beats every resemblance signal tried.
+
+### E052 repack-rounds (refuted)
+- Branch / parent: exp/052-repack-rounds / E051
+- Hypothesis (C5 in `docs/research/latent-reasoning.md`, after Huginn's convergence-based early exit): repack plans in one pass. Repeating it until the plan cost stops falling, as an anytime loop with a measured stopping rule, would find plans one pass misses: templates of templates, groups formed after induction, and the function library.
+- Measurement: the bench ran with three extra `repack()` calls after the first (temporary, not kept). It recorded total stored bytes and each round's `Repacked` (applied, before -> after) per corpus.
+- Result: score 0.2972 -> **0.2983 (worse)**; bytes_score 0.2672 (unchanged at 4 decimals).
+  - md, pdf, invoices, synthetic-history, repo-history and structured: every extra round re-plans, finds nothing smaller and applies nothing. One pass is already a fixed point.
+  - generated: round 2 saves 32 B (4,245 -> 4,213), then is stable. Likely cause [inference]: the function library is built after round 1's re-plan, so only round 2's re-plan can use it.
+  - repo-graph: round 2 *applies* a plan that repack's own accounting calls smaller (content and derivations 8,660 -> 6,131), but the total stored grows 19,293 -> 19,450.
+  - office: every extra round reports `applied` (162,647 -> 162,528) yet stored bytes don't change, so the apply is a no-op that repeats.
+  - Time 77 s -> 307 s.
+- Verdict: **refuted.** There is no depth to adapt, since repack converges in one pass except for 32 B on generated.
+- Two inconsistencies found, both open:
+  - Repack's acceptance test (content and derivation bytes) is not the score's objective (all stored bytes plus read cost). An iterated or anytime repack can therefore move backward, as repo-graph does.
+  - Office's `applied` is not idempotent.
+  - Either would need fixing before any background or anytime optimisation loop.
