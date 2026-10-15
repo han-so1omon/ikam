@@ -1,0 +1,18 @@
+[package]
+name = "ikam-quote"
+version = "0.1.0"
+edition = "2024"
+description = "Rebuilds text that quotes other content line by line (numbered, JSON-escaped), as a WASM reconstruction function"
+
+[lib]
+crate-type = ["cdylib"]
+path = "src/lib.rs"
+
+[profile.release]
+opt-level = "s"
+lto = true
+panic = "abort"
+codegen-units = 1
+
+# Built on its own (`cargo build --release --target wasm32-unknown-unknown`).
+[workspace]
