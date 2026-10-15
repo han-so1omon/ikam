@@ -652,3 +652,20 @@ Newest last. Format and rules: `README.md`.
   - generated: 4,260 -> 4,245 B (its function-library graph also uses graph chunks); vs_dict_read 0.0318 -> 0.0317.
   - The other corpora are byte-identical. Time 79.9 s -> 87.0 s (not attributed; within run-to-run variation seen before, sizes unaffected).
 - Verdict: **kept**. Graph reads now cost less than decoding the baseline's edge lists. Object-format note: graph ids change for graphs written from now on; old graphs keep reading.
+
+### E048 read-model-distinct-sources
+- Branch / parent: exp/048-lazy-fill / E045 (the E046 and E047 entries live on their branches)
+- Hypothesis, as first stated (C1 in `docs/research/latent-reasoning.md`, from latent-CoT "trace shortening"): md reads cost 12x their baseline because layered templates rebuild intermediate templates whole. Lazy `fill` would remove that work.
+- What instrumentation showed: the premise was wrong. Read work per function kind during the scored whole-file reads, plus the planner's predicted read cost (`plan_cost` minus bytes, over `read_weight`), against the measured cost:
+  - md, pdf and invoices are all decoding with no function work (md 2,135,673). The planner predicts this within 1% (2,155,935): grouped members decode their group up to their own end.
+  - Layered `fill` work exists only in synthetic-history (619,972), office (40,394) and structured (23,093).
+  - The planner **over-predicts** structured by 58% (32.4 M predicted vs 20.5 M measured) and repo-history by 40% (41.1 M vs 29.5 M). Cause: `read_model` charges a slice source once per derivation *argument*, but a read caches what it decodes, so a concat with many ranges of one source decodes it once.
+  - It under-predicts synthetic-history (1.17 M vs 2.06 M, the unmodelled inner `fill` work) and generated (0.73 M vs 1.32 M, WASM fuel).
+- Hypothesis, as tested: count a source once per derivation naming it. The planner then stops over-pricing slice plans and chooses cheaper ones.
+- Change: `src/repack.rs`, `read_model` counts distinct argument ids per derivation. Test `read_model_counts_a_source_once_per_derivation` fails without the fix (3 vs 2).
+- Result (two runs identical; tests, clippy and fmt clean; every corpus exact with a clean fsck): score 0.3005 -> **0.2972**; bytes_score 0.2688 -> 0.2672.
+  - structured: bytes 110,873 -> 107,607; read 20,525,163 -> 17,882,915; vs_dict_read 0.1301 -> **0.1243**. Prediction now 17.94 M vs 17.88 M measured.
+  - synthetic-history: bytes 16,083 -> 15,671; read 2,055,193 -> 1,494,074 (the layered fills are no longer chosen); vs_dict_read 0.2954 -> **0.2796**.
+  - repo-history: bytes 910,740 -> 910,278; read 29,451,124 -> 29,724,965; vs_dict_read 0.7255 -> 0.7253. Still over-predicted (35.2 M vs 29.7 M), cause not yet found.
+  - Other corpora are byte-identical. Time 87.0 s -> 77.5 s.
+- Verdict: **kept**. Remaining model gaps: inner `fill` and WASM fuel work are unmodelled, and repo-history is still over-predicted. md's 12x read cost is the priced cost of grouping, not template work.

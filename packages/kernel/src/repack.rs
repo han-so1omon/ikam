@@ -19,7 +19,7 @@
 //! re-recorded, and its inputs are kept.
 
 use std::cmp::Reverse;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 
 use crate::codec::read_weight;
 use crate::dict::{
@@ -303,7 +303,7 @@ impl<S: Store + Sync> Repo<S> {
     /// `STORE_LEVEL`, keeping a new encoding only if it costs less: stored
     /// bytes + `read_weight` x decode time, where a group is decoded up to
     /// each member's end per member read and any other content whole per
-    /// read; a content is read once, plus once per derivation argument
+    /// read; a content is read once, plus once per derivation
     /// naming it. Plans are compared at the fast `MEASURE_LEVEL`; only the one
     /// kept pays for the slow level. Decoded content is checked against its
     /// id first.
@@ -371,9 +371,12 @@ impl<S: Store + Sync> Repo<S> {
     pub(crate) fn read_model(&self) -> Result<ReadModel, Error> {
         let mut uses: HashMap<Id, usize> = HashMap::new();
         for d in self.ledger()?.by_output.values().flatten() {
-            d.args
-                .iter()
-                .for_each(|a| *uses.entry(a.id()).or_default() += 1);
+            // A read caches what it decodes, so a source named by several
+            // arguments of one derivation is decoded once for it (E048).
+            let sources: BTreeSet<Id> = d.args.iter().map(Arg::id).collect();
+            sources
+                .into_iter()
+                .for_each(|id| *uses.entry(id).or_default() += 1);
         }
         let mut model = ReadModel {
             uses,
@@ -658,7 +661,7 @@ fn repeat_dictionary(samples: &[&[u8]], size: usize) -> Vec<u8> {
 }
 
 /// How often stored content is decoded when every file is read once: a
-/// content once for itself plus once per derivation argument naming it (a
+/// content once for itself plus once per derivation naming it (a
 /// template per filled document, a slice source per sliced document); a
 /// group up to each member's end per read of that member.
 pub(crate) struct ReadModel {
@@ -702,6 +705,26 @@ impl ReadModel {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A source named by several arguments of one derivation is decoded
+    /// once when that derivation is read (reads cache what they decode), so
+    /// the read model counts it once (E048).
+    #[test]
+    fn read_model_counts_a_source_once_per_derivation() {
+        let mut repo = Repo::new(MemStore::default());
+        let source = repo.put_content(b"0123456789abcdefghij").unwrap().id;
+        let range = |start, len| Arg::Range {
+            id: source,
+            start,
+            len,
+        };
+        let out = b"0123cdefgh";
+        let args = vec![range(0, 4), range(12, 6)];
+        repo.put_derivation(out, func::concat(), args)
+            .unwrap()
+            .unwrap();
+        assert_eq!(repo.read_model().unwrap().times(&source), 2);
+    }
 
     /// Recompression at the storing level keeps every content readable,
     /// never grows an encoding, and keeps the dictionary itself out of
