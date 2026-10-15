@@ -180,6 +180,6 @@ Three things would make it concrete:
 | function library as a graph under `meta/functions` (functions, applications, measured savings and work) | built (E024) | capability; bytes reported |
 | LLM function writer and relation extractor (offline, outputs recorded) | proposed (needs an API key or a local model) | bytes saved per function and relation (measured `gain_bits`) |
 | per-family dictionaries from relations | proposed | office/md bytes |
-| `quote` derivation: line-numbered, JSON-escaped slices of stored content (E055 bound: about 45% of `transcripts`) | proposed | transcripts bytes and read |
-| related-content zstd context: compress against the stored content a file derives from (E055: -33% on the session without a transform) | proposed | bytes vs read cost on versioned corpora |
-| content search without decoding everything (E050: grep scans dominate an agent's reads of large files) | proposed | scan decode work per query vs index bytes |
+| `quote` derivation: line-numbered, JSON-escaped slices of stored content | built (E056; repack now plans a fact's inputs first) | transcripts 113,507 -> 71,507 B |
+| related-content zstd context (`Q` encoding: another stored content as the frame's context, one step) | built (E057) | score 0.2929 -> 0.2920; structured -6.5 K |
+| content search with an optional trigram index (exact: candidates are decoded and checked) | built (E058), reported, not scored | pays above 19-65 searches per read pass on generated, repo-history, office, md |
