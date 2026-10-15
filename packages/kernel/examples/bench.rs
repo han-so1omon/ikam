@@ -708,14 +708,18 @@ fn read_costs(repo: &Repo<MemStore>, snapshots: &[Snapshot]) -> (usize, usize, b
     (whole, window, exact)
 }
 
-/// Search cost per corpus (E058, reported, not scored): 200 deterministic
-/// grep-like queries (an identifier from a random line of a random file, as
-/// the agent trace of E050 searched), over every distinct file. Decode cost
-/// per query without an index (every file decoded and scanned) and with a
-/// trigram index (candidates only, plus the index's own decoding once,
-/// amortised over the queries); the index's stored bytes; and whether both
-/// return the same files. JSON fields to append.
-fn search_costs(repo: &mut Repo<MemStore>, snapshots: &[Snapshot]) -> String {
+/// Searches per full read pass of a file corpus in the score (E062): the
+/// rate of E050's agent trace, about 100 grep scans per pass over the files
+/// it read. A workload assumption, not a measurement of this corpus.
+const SEARCH_RATE: f64 = 100.0;
+
+/// The kernel's decode cost per search (E062): 100 deterministic grep-like
+/// queries (an identifier from a random line of a random file, as the agent
+/// trace of E050 searched) over every distinct file, through `Repo::search`
+/// with whatever index the store holds. Without an index every query decodes
+/// every file, so one query measures them all. Also whether every result
+/// equals a scan of the original bytes.
+fn search_cost(repo: &Repo<MemStore>, snapshots: &[Snapshot]) -> (usize, bool) {
     let files: BTreeMap<Id, &Vec<u8>> = snapshots
         .iter()
         .flatten()
@@ -730,7 +734,7 @@ fn search_costs(repo: &mut Repo<MemStore>, snapshots: &[Snapshot]) -> String {
         (s >> 33) as usize
     };
     let mut queries = Vec::new();
-    while queries.len() < 200 {
+    while queries.len() < 100 {
         let text = String::from_utf8_lossy(files[&ids[lcg() % ids.len()]]);
         let lines: Vec<&str> = text.lines().collect();
         let line = lines.get(lcg() % lines.len().max(1)).copied().unwrap_or("");
@@ -739,30 +743,23 @@ fn search_costs(repo: &mut Repo<MemStore>, snapshots: &[Snapshot]) -> String {
             .find(|w| w.len() > 3);
         queries.push(word.unwrap_or("data").as_bytes().to_vec());
     }
-    let run = |repo: &Repo<MemStore>, index: Option<&ikam_kernel::SearchIndex>| {
-        let before = ikam_kernel::decode_cost();
-        let (mut work, mut found) = (0, Vec::new());
-        for q in &queries {
-            let (hits, w) = repo.search(q, &ids, index).unwrap();
-            (work, found) = (work + w, [found, hits].concat());
-        }
-        (ikam_kernel::decode_cost() - before + work, found)
-    };
-    let (scan, full) = run(repo, None);
-    let index_id = repo.build_search_index(&ids).unwrap();
-    let index_bytes = ikam_kernel::Store::read(repo.store(), &index_id)
-        .unwrap()
-        .len();
     let before = ikam_kernel::decode_cost();
-    let index = repo.search_index().unwrap().unwrap();
-    let load = ikam_kernel::decode_cost() - before;
-    let (indexed, fast) = run(repo, Some(&index));
-    let n = queries.len();
-    format!(
-        ",\"search_scan\":{},\"search_indexed\":{},\"search_index_bytes\":{index_bytes},\"search_exact\":{}",
-        scan / n,
-        (indexed + load) / n,
-        full == fast
+    let index = repo.search_index().unwrap();
+    if index.is_none() {
+        queries.truncate(1);
+    }
+    let (mut work, mut exact) = (0, true);
+    for q in &queries {
+        let (hits, w) = repo.search(q, &ids, index.as_ref()).unwrap();
+        let expected: Vec<Id> = (ids.iter())
+            .filter(|id| files[id].windows(q.len()).any(|w| w == q.as_slice()))
+            .copied()
+            .collect();
+        (work, exact) = (work + w, exact && hits == expected);
+    }
+    (
+        (ikam_kernel::decode_cost() - before + work) / queries.len(),
+        exact,
     )
 }
 
@@ -1041,7 +1038,7 @@ fn main() {
         ("structured", structured, false),
         ("transcripts", transcripts, false),
     ];
-    let (mut log_ratio, mut log_bytes, mut n, mut total_ms) = (0.0, 0.0, 0, 0);
+    let (mut log_ratio, mut log_read, mut log_bytes, mut n, mut total_ms) = (0.0, 0.0, 0.0, 0, 0);
     for (name, build, graph) in corpora {
         if !only.is_empty() && !only.iter().any(|o| *o == name) {
             continue;
@@ -1093,16 +1090,21 @@ fn main() {
         let baseline_read = distinct_bytes(&snapshots);
         let read_ratio =
             (repack as f64 + w * read_whole as f64) / (zstd_dict as f64 + w * baseline_read as f64);
-        // Search (E058, reported, not scored): measured after everything
-        // scored, since building the index stores it.
-        let kinds = by_kind(&repo);
-        let search = match graph {
-            true => String::new(),
-            false => search_costs(&mut repo, &snapshots),
+        // With search (E062): `SEARCH_RATE` searches per read pass. The
+        // baseline searches by decoding every distinct file; the kernel
+        // through `Repo::search` (an index it stores is in `repack`).
+        let (search, search_exact) = match graph {
+            true => (0, true),
+            false => search_cost(&repo, &snapshots),
         };
+        let rate = if graph { 0.0 } else { SEARCH_RATE };
+        let search_ratio = (repack as f64 + w * (read_whole as f64 + rate * search as f64))
+            / (zstd_dict as f64 + w * (1.0 + rate) * baseline_read as f64);
+        let exact = exact && search_exact;
+        let kinds = by_kind(&repo);
         if json {
             println!(
-                "{{\"corpus\":\"{name}\",\"input\":{input},\"ingest\":{ingest},\"repack\":{repack},\"ingest_ms\":{ingest_ms},\"repack_ms\":{repack_ms},\"zstd_files\":{zstd_files},\"zstd_dict\":{zstd_dict},\"vs_dict\":{ratio:.4},\"vs_dict_read\":{read_ratio:.4},\"read_baseline\":{baseline_read},\"exact\":{exact},\"fsck\":{fsck},\"read_whole\":{read_whole},\"read_4k\":{read_4k}{search},\"by_kind\":{kinds}}}"
+                "{{\"corpus\":\"{name}\",\"input\":{input},\"ingest\":{ingest},\"repack\":{repack},\"ingest_ms\":{ingest_ms},\"repack_ms\":{repack_ms},\"zstd_files\":{zstd_files},\"zstd_dict\":{zstd_dict},\"vs_dict\":{ratio:.4},\"vs_dict_read\":{read_ratio:.4},\"vs_dict_search\":{search_ratio:.4},\"search\":{search},\"read_baseline\":{baseline_read},\"exact\":{exact},\"fsck\":{fsck},\"read_whole\":{read_whole},\"read_4k\":{read_4k},\"by_kind\":{kinds}}}"
             );
         } else {
             println!(
@@ -1112,27 +1114,31 @@ fn main() {
         }
         // Hard gates: an inexact or fsck-failing result is a failure, not a score.
         assert!(exact && fsck, "{name}: verification failed");
-        (log_ratio, log_bytes, n, total_ms) = (
-            log_ratio + read_ratio.ln(),
+        (log_ratio, log_read, log_bytes, n, total_ms) = (
+            log_ratio + search_ratio.ln(),
+            log_read + read_ratio.ln(),
             log_bytes + ratio.ln(),
             n + 1,
             total_ms + ingest_ms + repack_ms,
         );
     }
-    // The experiment score (since E034): geometric mean across corpora of
-    // (kernel bytes + read weight x read cost) / (trained-dictionary
-    // baseline bytes + read weight x its read cost); every corpus weighs the
-    // same; lower is better; below 1.0 beats the baseline. `bytes_score` is
-    // the score before E034 (bytes only), reported for continuity.
+    // The experiment score (since E062): geometric mean across corpora of
+    // (kernel bytes + read weight x (read cost + SEARCH_RATE x search cost))
+    // / (trained-dictionary baseline bytes + read weight x (1 + SEARCH_RATE)
+    // x its read cost); every corpus weighs the same; lower is better; below
+    // 1.0 beats the baseline. `read_score` is the score of E034-E061 (no
+    // search) and `bytes_score` the one before E034 (bytes only), reported
+    // for continuity.
     let score = (log_ratio / n.max(1) as f64).exp();
+    let read_score = (log_read / n.max(1) as f64).exp();
     let bytes_score = (log_bytes / n.max(1) as f64).exp();
     if json {
         println!(
-            "{{\"corpus\":\"_summary\",\"corpora\":{n},\"score\":{score:.4},\"bytes_score\":{bytes_score:.4},\"total_ms\":{total_ms}}}"
+            "{{\"corpus\":\"_summary\",\"corpora\":{n},\"score\":{score:.4},\"read_score\":{read_score:.4},\"bytes_score\":{bytes_score:.4},\"total_ms\":{total_ms}}}"
         );
     } else {
         println!(
-            "score (geometric mean of (repack + w*read) / (zstd+dict + w*read)) = {score:.4}, bytes only = {bytes_score:.4}, over {n} corpora, {total_ms} ms"
+            "score (geometric mean of (repack + w*(read + {SEARCH_RATE}*search)) / (zstd+dict + w*(1 + {SEARCH_RATE})*read)) = {score:.4}, without search = {read_score:.4}, bytes only = {bytes_score:.4}, over {n} corpora, {total_ms} ms"
         );
     }
 }

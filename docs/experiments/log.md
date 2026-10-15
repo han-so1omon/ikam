@@ -837,3 +837,39 @@ Newest last. Format and rules: `README.md`.
   - transcripts: 72,592 -> 72,557 B.
   - Other corpora are byte-identical.
 - Verdict: **kept.** Repack is now a fixed point after one call, and its acceptance test is the score's objective. That is a precondition for any background or anytime optimisation loop (E052).
+
+### E062 search-in-score (benchmark change)
+- Branch / parent: exp/062-search-in-score / E060
+- Decision (the user's): include search in the score. E058 measured search as reported, not scored. E050's agent trace ran about 100 grep scans per read pass over the files it touched, so `SEARCH_RATE = 100` searches per read pass. That is a workload assumption, and it is one named constant.
+- Benchmark change (`examples/bench.rs`, `docs/experiments/README.md`):
+  - Per file corpus the score is now `(repack + w x (read_whole + q x search)) / (zstd_dict + w x (1 + q) x read_baseline)`. The baseline searches by decoding every distinct file.
+  - `search` is the kernel's decode cost per query through `Repo::search`: 100 deterministic identifier queries, as in E058, using any index the store holds. Without an index every query decodes every file, so one query is measured.
+  - Every result must equal a scan of the original bytes (a new hard gate).
+  - Graph corpora have no search term.
+  - New fields: `vs_dict_search` and `search`; `_summary.read_score` keeps the E034–E061 score.
+  - E058's reported-only search fields are removed. The kernel API (`Repo::search`, `build_search_index`) stays. This change re-measures the current kernel, which stores no index.
+- Result (two runs identical; every corpus exact with a clean fsck; every search result exact): **score 1.5736**; read_score 0.2903 (unchanged); bytes_score 0.2586.
+
+  | corpus | vs_dict_read (no search) | vs_dict_search | search per query (= a full read pass) | baseline per query |
+  |---|---|---|---|---|
+  | md | 0.8858 | 2.971 | 2,135,673 | 177,939 |
+  | pdf | 0.8714 | 2.765 | 689,862 | 80,204 |
+  | office | 0.5524 | **8.018** | 51,883,141 | 2,802,002 |
+  | invoices | 0.3058 | 2.438 | 498,922 | 85,680 |
+  | synthetic-history | 0.2796 | 1.318 | 1,494,613 | 650,028 |
+  | repo-history | 0.7243 | 2.227 | 31,308,797 | 5,316,822 |
+  | repo-graph | 0.1644 | 0.1644 | (graph) | |
+  | generated | 0.0315 | 0.564 | 1,322,701 | 688,414 |
+  | structured | 0.1209 | 1.168 | 20,950,811 | 8,885,967 |
+  | transcripts | 0.2568 | 1.826 | 11,169,671 | 3,315,758 |
+
+- What this shows: with 100 searches per pass the score is dominated by read cost, and the kernel's per-file read cost is 2–18x the baseline's. Sources:
+  - group prefix decoding (md, pdf, invoices);
+  - container rebuilds (office: deflate-pack, 18x);
+  - slice sources and functions (repo-history, structured, transcripts).
+
+  The kernel loses to the baseline on 8 of 10 corpora (above 1.0); it still wins on repo-graph and generated.
+- Verdict: **benchmark change kept** (the user's decision). Scores are not comparable with E034–E061.
+- Next levers, under the new objective:
+  - The kernel stores and uses the trigram index when it pays. Per E058 it cuts search decode to 0.19–0.43x on md, office, repo-history and generated.
+  - The planner must weigh the search workload: today it optimises bytes plus one read pass, so it keeps plans that are cheap to store but costly to scan.
