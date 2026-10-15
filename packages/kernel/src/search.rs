@@ -47,7 +47,13 @@ impl<S: Store> Repo<S> {
         files
             .iter()
             .for_each(|id| out.extend_from_slice(id.as_bytes()));
-        for (t, list) in &postings {
+        let common: Vec<&[u8; 3]> = (postings.iter())
+            .filter(|(_, list)| 2 * list.len() > files.len())
+            .map(|(t, _)| t)
+            .collect();
+        put_varint(&mut out, common.len());
+        common.iter().for_each(|t| out.extend_from_slice(*t));
+        for (t, list) in postings.iter().filter(|(_, l)| 2 * l.len() <= files.len()) {
             out.extend_from_slice(t);
             put_varint(&mut out, list.len());
             let mut prev = 0;
