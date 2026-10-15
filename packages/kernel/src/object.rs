@@ -27,6 +27,7 @@
 //! all of them name the same bytes.
 //! Decoding is strict: `encode(decode(b)) == b` whenever it succeeds.
 
+use crate::group::{put_varint, varint};
 use crate::{Error, Id};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -320,14 +321,37 @@ fn decode_tree(r: &mut Reader) -> Result<Object, Error> {
     Ok(Object::Tree(entries))
 }
 
+/// Graph chunks (since E045) set `COMPACT` in the level byte: counts and
+/// lengths are varints, and node labels, child labels and edge labels are
+/// front-coded against the previous one in the chunk (shared prefix
+/// length, then the rest). Labels are sorted, so neighbours share long
+/// prefixes; edge labels repeat. Chunks without the flag (before E045)
+/// still decode.
+const COMPACT: u8 = 0x80;
+
+fn put_front(out: &mut Vec<u8>, prev: &str, s: &str) {
+    let mut shared = prev
+        .bytes()
+        .zip(s.bytes())
+        .take_while(|(a, b)| a == b)
+        .count();
+    while !s.is_char_boundary(shared) {
+        shared -= 1;
+    }
+    put_varint(out, shared);
+    put_varint(out, s.len() - shared);
+    out.extend_from_slice(&s.as_bytes()[shared..]);
+}
+
 fn encode_graph(out: &mut Vec<u8>, g: &Graph) {
     out.push(b'G');
+    let mut prev_edge = "";
     match g {
         Graph::Nodes(nodes) => {
-            out.push(0);
-            put_u32(out, nodes.len());
-            for n in nodes {
-                put_str(out, &n.label);
+            out.push(COMPACT);
+            put_varint(out, nodes.len());
+            for (i, n) in nodes.iter().enumerate() {
+                put_front(out, if i == 0 { "" } else { &nodes[i - 1].label }, &n.label);
                 match &n.target {
                     Target::None => out.push(0),
                     Target::Content(a) => {
@@ -339,18 +363,19 @@ fn encode_graph(out: &mut Vec<u8>, g: &Graph) {
                         out.extend_from_slice(id.as_bytes());
                     }
                 }
-                put_u32(out, n.edges.len());
+                put_varint(out, n.edges.len());
                 for e in &n.edges {
                     out.extend_from_slice(&e.to);
-                    put_str(out, &e.label);
+                    put_front(out, prev_edge, &e.label);
+                    prev_edge = &e.label;
                 }
             }
         }
         Graph::Children(level, children) => {
-            out.push(*level);
-            put_u32(out, children.len());
-            for (first, id) in children {
-                put_str(out, first);
+            out.push(COMPACT | level);
+            put_varint(out, children.len());
+            for (i, (first, id)) in children.iter().enumerate() {
+                put_front(out, if i == 0 { "" } else { &children[i - 1].0 }, first);
                 out.extend_from_slice(id.as_bytes());
             }
         }
@@ -358,7 +383,11 @@ fn encode_graph(out: &mut Vec<u8>, g: &Graph) {
 }
 
 fn decode_graph(r: &mut Reader) -> Result<Graph, Error> {
-    let g = match r.take(1)?[0] {
+    let tag = r.take(1)?[0];
+    if tag & COMPACT != 0 {
+        return check_graph(decode_compact(r, tag & !COMPACT)?);
+    }
+    let g = match tag {
         0 => Graph::Nodes(r.many(|r| {
             let label = r.string()?;
             let target = match r.take(1)?[0] {
@@ -391,6 +420,11 @@ fn decode_graph(r: &mut Reader) -> Result<Graph, Error> {
             Graph::Children(level, children)
         }
     };
+    check_graph(g)
+}
+
+/// Labels strictly ascending, as every chunk keeps them.
+fn check_graph(g: Graph) -> Result<Graph, Error> {
     let ascending = match &g {
         Graph::Nodes(n) => n.windows(2).all(|w| w[0].label < w[1].label),
         Graph::Children(_, c) => c.windows(2).all(|w| w[0].0 < w[1].0),
@@ -399,6 +433,53 @@ fn decode_graph(r: &mut Reader) -> Result<Graph, Error> {
         return Err(Error::Decode("graph labels not strictly ascending"));
     }
     Ok(g)
+}
+
+fn decode_compact(r: &mut Reader, level: u8) -> Result<Graph, Error> {
+    let n = r.varint()?;
+    let (mut prev, mut prev_edge) = (String::new(), String::new());
+    if level == 0 {
+        let mut nodes = Vec::with_capacity(n.min(r.0.len()));
+        for _ in 0..n {
+            let label = r.front(&prev)?;
+            let target = match r.take(1)?[0] {
+                0 => Target::None,
+                1 => Target::Content(r.arg()?),
+                2 => Target::Object(r.id()?),
+                _ => return Err(Error::Decode("unknown graph target")),
+            };
+            let m = r.varint()?;
+            let mut edges = Vec::with_capacity(m.min(r.0.len()));
+            for _ in 0..m {
+                let to = r.take(8)?.try_into().unwrap();
+                prev_edge = r.front(&prev_edge)?;
+                edges.push(Edge {
+                    to,
+                    label: prev_edge.clone(),
+                });
+            }
+            if edges.windows(2).any(|w| w[0] >= w[1]) {
+                return Err(Error::Decode("graph edges not strictly ascending"));
+            }
+            prev.clone_from(&label);
+            nodes.push(Node {
+                label,
+                target,
+                edges,
+            });
+        }
+        return Ok(Graph::Nodes(nodes));
+    }
+    let mut children = Vec::with_capacity(n.min(r.0.len()));
+    for _ in 0..n {
+        let first = r.front(&prev)?;
+        prev.clone_from(&first);
+        children.push((first, r.id()?));
+    }
+    if children.is_empty() {
+        return Err(Error::Decode("empty graph chunk"));
+    }
+    Ok(Graph::Children(level, children))
 }
 
 /// Edge label for a selector, keeping range offsets visible.
@@ -480,6 +561,22 @@ impl<'a> Reader<'a> {
         }
     }
 
+    fn varint(&mut self) -> Result<usize, Error> {
+        varint(&mut self.0).ok_or(Error::Decode("bad varint"))
+    }
+
+    /// A front-coded string (see `put_front`) after `prev`.
+    fn front(&mut self, prev: &str) -> Result<String, Error> {
+        let shared = self.varint()?;
+        let rest = self.varint()?;
+        let head = prev
+            .as_bytes()
+            .get(..shared)
+            .ok_or(Error::Decode("bad front coding"))?;
+        let bytes = [head, self.take(rest)?].concat();
+        String::from_utf8(bytes).map_err(|_| Error::Decode("string not utf-8"))
+    }
+
     fn string(&mut self) -> Result<String, Error> {
         let len = self.u32()?;
         String::from_utf8(self.take(len)?.to_vec()).map_err(|_| Error::Decode("string not utf-8"))
@@ -503,5 +600,53 @@ impl<'a> Reader<'a> {
         } else {
             Err(Error::Decode("trailing bytes"))
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Graph chunks written before E045 (fixed-width counts and full
+    /// labels) still decode to the same graph; the compact form round-trips
+    /// and is smaller.
+    #[test]
+    fn graph_chunks_decode_in_both_layouts() {
+        let node = |label: &str, to: &str| Node {
+            label: label.into(),
+            target: Target::None,
+            edges: vec![Edge {
+                to: crate::node_key(to),
+                label: "imports".into(),
+            }],
+        };
+        let g = Graph::Nodes(vec![
+            node("packages/kernel/src/dict.rs", "rs:group"),
+            node("packages/kernel/src/group.rs", "rs:dict"),
+            node("packages/kernel/src/repack.rs", "rs:group"),
+        ]);
+        let mut legacy = vec![b'G', 0];
+        let Graph::Nodes(nodes) = &g else {
+            unreachable!()
+        };
+        put_u32(&mut legacy, nodes.len());
+        for n in nodes {
+            put_str(&mut legacy, &n.label);
+            legacy.push(0);
+            put_u32(&mut legacy, n.edges.len());
+            for e in &n.edges {
+                legacy.extend_from_slice(&e.to);
+                put_str(&mut legacy, &e.label);
+            }
+        }
+        assert_eq!(Object::decode(&legacy).unwrap(), Object::Graph(g.clone()));
+        let compact = Object::Graph(g.clone()).encode();
+        assert_eq!(Object::decode(&compact).unwrap(), Object::Graph(g));
+        assert!(
+            compact.len() < legacy.len(),
+            "{} >= {}",
+            compact.len(),
+            legacy.len()
+        );
     }
 }
