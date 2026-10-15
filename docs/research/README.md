@@ -24,3 +24,4 @@ A paper's claim stays *unverified for this kernel* until an experiment reproduce
 - `tree-metadata.md`: how git, Mercurial and dedup systems (Meister et al., FAST 2013) store versioned listings and fingerprint lists compactly.
 - `graph-storage.md`: graph stores compared (HugeGraph, Rama, TerminusDB, Dolt/Noms prolly trees, Datomic/XTDB, HDT, k²-trees, WebGraph, Kùzu, Neo4j) for a versioned, sliceable, deduplicating graph layer.
 - `semantic-grouping.md`: which signal (byte order, MinHash/seeds, NCD, embeddings, LLM) should decide which small contents are compressed together.
+- `latent-reasoning.md`: latent chain-of-thought (Coconut, CODI, CoLaR, VQ reasoning codes, looped depth) and where it can act as a proposer for grouping, claims, program writing and filtering. It is never stored truth.
