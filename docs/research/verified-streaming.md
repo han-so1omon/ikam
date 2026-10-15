@@ -35,7 +35,10 @@ Question: a range read through a stored leaf (a slice source) decodes the whole 
 ## Hypotheses
 
 - H1: blocked, verified slice sources lower the scored read cost by more than they add in bytes. Source: §6.4 and chunk groups. **Refuted by E046** (offline): slices cover 88–100% of a leaf's blocks per whole-file read, so the read saved is 100–200× smaller than the bytes added, on every corpus that has partial leaf reads.
-- H2: blocked leaves cut the cost of small range reads (`read_4k`), where a slice covers few blocks. **Open.** `read_4k` is reported, not scored, so the benchmark doesn't measure this.
+- H2: blocked leaves cut the cost of small range reads (`read_4k`), where a slice covers few blocks. **Conditional, measured offline in E047.**
+  - With one 4 KiB range read per whole-file read, it doesn't pay. The best case is one office leaf, a net of 108 byte-equivalents.
+  - It pays only if range reads are weighted at least 10 times a whole-file read: at 16–64 KiB blocks, structured nets 18–25K and repo-history 2.3–2.5K byte-equivalents.
+  - No workload in the benchmark shows range reads that frequent, so nothing was built. Revisit if a range-heavy access pattern is added to the score (for example agents or graph queries reading slices).
 
 ## Unknowns
 

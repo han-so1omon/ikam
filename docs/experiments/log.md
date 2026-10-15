@@ -683,3 +683,39 @@ Newest last. Format and rules: `README.md`.
   - The cost of verifying blocks (32 B each) is minor next to the compression lost by framing per block.
   - Whole-file reads use most of each slice source.
   - Partial verified reads would pay for small range reads (`read_4k`), which are reported but not scored. That is open hypothesis H2 in the note.
+- Correction (E047): the "decoded whole" column above counts leaf length.
+  - That overstates leaves stored raw (`B`, no decode cost) or as group members (already decoded to the member's end). It also ignores per-codec read weights.
+  - E047 re-measures with each leaf's measured decode cost: whole-read savings of 122,612 (office), 161,698 (repo-history) and 700,370 (structured) at 4 KiB blocks.
+  - The verdict is unchanged.
+
+### E047 range-read-blocks (offline, conditional)
+- Branch / parent: exp/047-range-read-blocks / E046
+- Hypothesis: E046's open point (H2 in `docs/research/verified-streaming.md`). A 4 KiB range read through a large compressed leaf decodes all of it. Blocked leaves with per-block BLAKE3 chaining values would decode only one or two blocks, so verified blocks pay for range reads even though they don't pay for whole-file reads (source: E046; BLAKE3 spec §6.4).
+- Measurement, offline. E046's instrumentation was extended, then reverted; the instrumented runs still scored 0.3005.
+  - It recorded the stored leaves decoded for a partial slice in both of the benchmark's reads: whole-file and the 4 KiB window from each file's middle.
+  - Each leaf's real decode cost was measured with `decode_cost`. This fixes E046's use of leaf length; see E046's correction.
+  - Only leaves stored compressed (Z, Y, R, X, P) and larger than a block are eligible. Raw leaves cost nothing to decode, and group members already decode partially.
+  - Blocks sit on the hashed input `"B" ++ bytes`.
+  - Added bytes = the stored size scaled by (sum of per-block zstd-19 sizes / whole zstd-19 size, no dictionary), plus 32 B per block.
+  - Net per leaf = 0.001 x (saved on whole reads + f x saved on window reads) - added bytes. Only leaves with a positive net count, which is what a planner would keep. f is how much a range read weighs against a whole-file read; f = 0 is the current score.
+
+  | corpus | block | leaves | saved, whole reads | saved, window reads | bytes added | net at f = 0 / 1 / 10 / 100 |
+  |---|---|---|---|---|---|---|
+  | office | 4K | 1 | 122,612 | 122,612 | 137 | 0 / 108 / 1,212 / 12,247 |
+  | repo-history | 4K | 42 | 161,698 | 1,158,135 | 72,636 | 0 / 0 / 0 / 59,369 |
+  | repo-history | 16K | 17 | 128,930 | 852,911 | 20,424 | 0 / 0 / 2,261 / 67,996 |
+  | repo-history | 64K | 2 | 0 | 364,713 | 1,997 | 0 / 0 / 2,539 / 34,474 |
+  | structured | 4K | 3 | 700,370 | 3,892,100 | 76,010 | 0 / 0 / 0 / 313,900 |
+  | structured | 16K | 3 | 573,394 | 3,773,316 | 34,434 | 0 / 0 / 18,259 / 343,471 |
+  | structured | 64K | 3 | 222,771 | 3,471,845 | 13,073 | 0 / 0 / 25,406 / 334,334 |
+
+  Other corpora have no eligible leaf: their partial reads go through raw leaves, group members or derived content.
+- Result:
+  - Range reads gain much more from blocks than whole reads do. Structured's window reads would decode 3.5–3.9 M fewer bytes.
+  - But one range read per file is worth at most 108 byte-equivalents (office).
+  - Blocks pay only if range reads weigh at least 10x a whole-file read (structured +18–25K, repo-history +2.3–2.5K byte-equivalents at 16–64 KiB). At 100x they pay broadly (structured about +330K).
+- Verdict: **conditional, nothing built.**
+  - Under the current score (f = 0) and at f = 1, H2 doesn't pay.
+  - Whether range reads should weigh at least 10x is a question about the workload, not something the benchmark can answer. No access pattern measured so far supports it.
+  - If a range-heavy workload is added to the score, the design in the research note is ready, and the numbers above give its expected size.
+
