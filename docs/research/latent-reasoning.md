@@ -105,6 +105,49 @@ Not applicable:
 - Latent traces or plans as stored content: not verifiable and not economical.
 - Latent compression of reasoning transcripts as a storage method. If transcripts become a corpus (a benchmark change), byte-level grouping and dictionaries apply.
 
+## Creative directions (speculative)
+
+The idea here is a reframing, not adopting latent models. IKAM's derivation DAG already *is* an explicit, verified "chain of thought" that produces each file:
+- `concat` of slices, `fill` of templates and WASM programs are the reasoning steps;
+- the stored bytes are the premises.
+
+So the latent-CoT literature can be read as ideas about *traces*: shorter traces, internalised traces, adaptive depth, plans versus steps. Each idea below is an inference, and none has been measured.
+
+- **C1: trace shortening on the read path (cf. Coconut and CODI: skip the explicit intermediate steps).**
+  - The evidence: E045's md reads cost 2,135,673 against a 177,939 baseline (12x). Possible cause [unverified]: layered templates rebuild each intermediate template whole before filling it.
+  - The idea: evaluate `fill` lazily, resolving each output piece through the levels as slices, without materialising intermediate templates. Read work then tracks the output size rather than the sum over levels.
+  - It needs no new storage, much as E043 made graph reads single-pass.
+  - First step: instrument which functions produce md's read work.
+- **C2: compression-induced concept nodes (graph structuring from what compresses together).**
+  - Templates, groups and dictionaries are latent concepts the planner discovers and verifies: shared structure across instances, kept only because it saves bytes (MDL).
+  - The idea: expose them as graph nodes (`instance-of` template, `member-of` group), so the storage plan yields semantic structure for free.
+  - Test: `examples/relatedness.rs`. Do shared-template and shared-group edges predict the structural (53.4%) and same-company (26.5%) pairs better than seed candidates? Storage stays unchanged.
+- **C3: operation / result split for programs (cf. CIRF's functional tokens versus result tokens).**
+  - Anti-unify *programs* the way `template.rs` anti-unifies bytes: one shared program skeleton (the operation), with per-file parameters as fillers (the result).
+  - E025's failures (server.log, mandelbrot) hinged on per-file constants. A skeleton plus parameter slots would let the LLM write the operation once while the kernel fits the parameters.
+  - Measure: `generated` bytes and programs reproduced exactly.
+- **C4: plan-first ingest (cf. R-Capsule and PLaT: compress the plan, sample, verify).**
+  - The idea: a cheap proposer emits a small plan for a new file, for example "version N+1 of F with edits at lines a..b" or "instance of template T". The kernel realises it exactly or rejects it. Today ingest searches by seeds.
+  - Measure: ingest time, and bytes at equal score. A failed plan falls back to search, so correctness is unaffected.
+- **C5: adaptive repack depth (cf. Huginn's convergence exit).**
+  - The idea: run repack's induce, group and recompress rounds until the plan cost stops falling, per region rather than globally, spending effort where cost still drops.
+  - Every round's plan is content-addressed, so rounds cache.
+  - This is the "background optimisation" question raised earlier, reduced to an anytime loop with a measured stopping rule.
+- **C6: agent workloads as the missing range-read evidence (cf. LaMR context pruning).**
+  - Agents that filter their context read *slices* of stored content, not whole files. That is the range-heavy access pattern E047 found verified blocks need (range reads weighted 10x or more).
+  - Proposal: record or simulate an agent read trace (grep, open file at line, follow a graph edge) as a benchmark workload, so that f is measured rather than assumed. A benchmark change.
+- **C7: reasoning transcripts as a corpus.**
+  - Agent transcripts quote files, tool outputs and earlier turns verbatim. Each quote can be a slice derivation of content already stored.
+  - Expected: large exact dedup, not the lossy token compression of the papers.
+  - Needs a corpus with no secrets or personal data (synthetic or opt-in). A benchmark change.
+- **C8: the swap test as a proposer diagnostic (from "Do Latent Tokens Think?").**
+  - Swap a proposer's output between corpora, or shuffle it within one. If bytes don't move, the proposer carries no information specific to the instance.
+  - A cheap ablation to add to every proposer experiment (embeddings, LLM order, codebooks).
+- **C9 (far-out): model state as content.**
+  - Prompt and KV caches are already prefix-addressed in inference servers.
+  - IKAM could store them with ids that include (model, hardware, precision), since exact reproduction holds only within that tuple.
+  - Out of scope for the kernel today; noted for the architecture plan.
+
 ## Unknowns
 
 - No paper found measures latent or embedding similarity against compressed bytes.
