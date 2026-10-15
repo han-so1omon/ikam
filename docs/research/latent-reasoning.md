@@ -128,13 +128,16 @@ So the latent-CoT literature can be read as ideas about *traces*: shorter traces
   - Anti-unify *programs* the way `template.rs` anti-unifies bytes: one shared program skeleton (the operation), with per-file parameters as fillers (the result).
   - E025's failures (server.log, mandelbrot) hinged on per-file constants. A skeleton plus parameter slots would let the LLM write the operation once while the kernel fits the parameters.
   - Measure: `generated` bytes and programs reproduced exactly.
+  - **Status: not applicable (E053, analysis).** The mandelbrot attempts produced broken programs, not wrong constants. server.log's 64-bit seed can't be fitted from its residues. No current corpus has a family of files sharing one procedure.
 - **C4: plan-first ingest (cf. R-Capsule and PLaT: compress the plan, sample, verify).**
   - The idea: a cheap proposer emits a small plan for a new file, for example "version N+1 of F with edits at lines a..b" or "instance of template T". The kernel realises it exactly or rejects it. Today ingest searches by seeds.
   - Measure: ingest time, and bytes at equal score. A failed plan falls back to search, so correctness is unaffected.
+  - **Status: refuted as a score lever (E054).** Ingest is 3% of run time and repack re-plans. Kept slices come 99.7% from the same path, but mostly not from the previous version, because the planner picks a shared base.
 - **C5: adaptive repack depth (cf. Huginn's convergence exit).**
   - The idea: run repack's induce, group and recompress rounds until the plan cost stops falling, per region rather than globally, spending effort where cost still drops.
   - Every round's plan is content-addressed, so rounds cache.
   - This is the "background optimisation" question raised earlier, reduced to an anytime loop with a measured stopping rule.
+  - **Status: refuted (E052).** Repack is a fixed point after one pass on 7 of 9 corpora. A second pass saves 32 B on generated but grows repo-graph, because repack's acceptance test isn't the score.
 - **C6: agent workloads as the missing range-read evidence (cf. LaMR context pruning).**
   - Agents that filter their context read *slices* of stored content, not whole files. That is the range-heavy access pattern E047 found verified blocks need (range reads weighted 10x or more).
   - Proposal: record or simulate an agent read trace (grep, open file at line, follow a graph edge) as a benchmark workload, so that f is measured rather than assumed. A benchmark change.
@@ -143,13 +146,16 @@ So the latent-CoT literature can be read as ideas about *traces*: shorter traces
   - Agent transcripts quote files, tool outputs and earlier turns verbatim. Each quote can be a slice derivation of content already stored.
   - Expected: large exact dedup, not the lossy token compression of the papers.
   - Needs a corpus with no secrets or personal data (synthetic or opt-in). A benchmark change.
+  - **Status: corpus added (E055, kept as a benchmark change).** The kernel dedups session versions but no quotes: line numbers and JSON escaping break byte runs. A `quote` derivation could save up to about 45% of the corpus (zstd bound with the quoted sources as context).
 - **C8: the swap test as a proposer diagnostic (from "Do Latent Tokens Think?").**
   - Swap a proposer's output between corpora, or shuffle it within one. If bytes don't move, the proposer carries no information specific to the instance.
   - A cheap ablation to add to every proposer experiment (embeddings, LLM order, codebooks).
+  - **Status: applied (E051), now a protocol step.** Removing, shuffling or reversing the embedding order leaves every corpus byte-identical, so that proposer has no effect.
 - **C9 (far-out): model state as content.**
   - Prompt and KV caches are already prefix-addressed in inference servers.
   - IKAM could store them with ids that include (model, hardware, precision), since exact reproduction holds only within that tuple.
   - Out of scope for the kernel today; noted for the architecture plan.
+  - **Status: noted** in `docs/plans/2026-10-06-system-architecture.md` with the exactness constraint and what would make it concrete. Not built.
 
 ## Unknowns
 

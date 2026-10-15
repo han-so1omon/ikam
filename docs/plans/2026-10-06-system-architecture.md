@@ -151,6 +151,17 @@ flowchart LR
 
 With range reads, the evaluator can price **decode work actually needed** for a given access pattern (whole files, or segments named in the graph), instead of today's proxy (bytes produced by derivations, decompression unpriced).
 
+## Model state as content (far-out, not planned; C9 in `docs/research/latent-reasoning.md`)
+
+Inference servers already address prompt and KV caches by prefix. The kernel could store them too, as content and derivations. The catch is the exactness law: a KV cache is reproducible only for one (model weights, inference code, hardware, numeric precision) tuple. BF16 and FP16 runs on the same prompts diverge in 49–100% of cases (`docs/research/kernel-direction.md`).
+
+So any such derivation would have to name that tuple in its function id, and fsck could only re-verify it on matching hardware. Until the kernel has a reason to hold model state, this stays a note.
+
+Three things would make it concrete:
+- a deterministic inference function that the kernel can run (CPU, fixed precision);
+- a workload of repeated prompt prefixes;
+- a measurement of prefix dedup against storing the caches whole.
+
 ## What exists and what is next
 
 | step | status | measure |
@@ -169,3 +180,6 @@ With range reads, the evaluator can price **decode work actually needed** for a 
 | function library as a graph under `meta/functions` (functions, applications, measured savings and work) | built (E024) | capability; bytes reported |
 | LLM function writer and relation extractor (offline, outputs recorded) | proposed (needs an API key or a local model) | bytes saved per function and relation (measured `gain_bits`) |
 | per-family dictionaries from relations | proposed | office/md bytes |
+| `quote` derivation: line-numbered, JSON-escaped slices of stored content (E055 bound: about 45% of `transcripts`) | proposed | transcripts bytes and read |
+| related-content zstd context: compress against the stored content a file derives from (E055: -33% on the session without a transform) | proposed | bytes vs read cost on versioned corpora |
+| content search without decoding everything (E050: grep scans dominate an agent's reads of large files) | proposed | scan decode work per query vs index bytes |
