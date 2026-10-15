@@ -819,3 +819,21 @@ Newest last. Format and rules: `README.md`.
   - repo-history: 908,059 -> 907,329 B; vs_dict_read 0.7243, unchanged at 4 decimals.
   - Other corpora are byte-identical. Time 93 s -> 106 s (each candidate plan is now read once to price it).
 - Verdict: **kept.** Plans are compared on the measured objective, and the per-content model no longer over-counts intermediates.
+
+### E060 repack-acceptance
+- Branch / parent: exp/060-repack-acceptance / E059
+- Hypothesis (open since E052): repack accepted a re-plan by content and derivation bytes plus read cost, but the score counts the whole store. The objects that outlive a re-plan (trees, commits, graph chunks) are re-encoded under the new plan's dictionary, so a re-plan that shrinks content could grow the store: repo-graph grew 19,293 -> 19,450 on a second repack in E052. Office reported `applied` on every repack while its store stayed the same.
+- Reproduced on E059 with three repacks per corpus (temporary bench change):
+  - office is now idempotent; E059's measured `plan_cost` fixed its repeated no-op apply.
+  - repo-graph still applies a second re-plan whose content shrinks (8,660 -> 6,131) while the store grows (19,213 -> 19,450), then re-applies it on the third.
+  - generated (-32 B) and transcripts (-35 B) shrink on the second repack without re-planning, through the tree unsharing and gc that start every repack.
+- Change, all in `src/repack.rs`:
+  - The acceptance test adds, on both sides, the stored size of every lasting non-derivation object: its current size now, and its size encoded under the fresh plan's dictionary.
+  - `repack` ends with `unshare_trees` and `gc`. Trees whose content the new plan no longer shares go back to object form within the same repack, instead of at the next one.
+  - With both, a second and a third repack change nothing on any corpus (`applied false`, every size equal).
+- Result (two runs identical; tests, clippy and fmt clean; every corpus exact with a clean fsck; search results identical): score 0.2918 -> **0.2903**; bytes_score 0.2600 -> 0.2586.
+  - repo-graph: 19,213 -> 18,348 B; vs_dict_read 0.1721 -> **0.1644**.
+  - generated: 4,245 -> 4,213 B.
+  - transcripts: 72,592 -> 72,557 B.
+  - Other corpora are byte-identical.
+- Verdict: **kept.** Repack is now a fixed point after one call, and its acceptance test is the score's objective. That is a precondition for any background or anytime optimisation loop (E052).
