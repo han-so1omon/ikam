@@ -669,3 +669,16 @@ Newest last. Format and rules: `README.md`.
   - repo-history: bytes 910,740 -> 910,278; read 29,451,124 -> 29,724,965; vs_dict_read 0.7255 -> 0.7253. Still over-predicted (35.2 M vs 29.7 M), cause not yet found.
   - Other corpora are byte-identical. Time 87.0 s -> 77.5 s.
 - Verdict: **kept**. Remaining model gaps: inner `fill` and WASM fuel work are unmodelled, and repo-history is still over-predicted. md's 12x read cost is the priced cost of grouping, not template work.
+
+### E051 proposer-swap-test
+- Branch / parent: exp/051-proposer-swap-test / E048
+- Hypothesis (C8 in `docs/research/latent-reasoning.md`, after "Do Latent Tokens Think?" arXiv:2512.21711). A proposer only carries instance-specific information if swapping or removing its output changes the result. Applied to the committed embedding order (`semantic/order.txt`, 1,498 ids, E019), which repack offers as one grouping proposal among five.
+- Measurement: the bench was rerun with the proposal removed, shuffled (fixed seed), and reversed. These were temporary bench variants and were not kept. A diagnostic in `group_small` printed, per grouping pass, how many items the order covers and what each of the five proposals would save.
+- Result: **every corpus is byte-identical in all three variants** (score 0.2972, the same read costs, all exact).
+  - The order covers md (333 of 333 items per pass) and repo-history (62–658 of about 700–800 per pass).
+  - In md it never wins a pass.
+  - In repo-history it wins some passes, by up to 6% (75,642 vs 71,738). Those passes belong to candidate re-plans that lose on `plan_cost`, so the final store never contains its groups.
+- Verdict: **refuted for every current corpus.** The embedding proposer has no effect on what is stored.
+  - Kept: the hook (`Repo::proposed_order`), and the order file it reads.
+  - Added: the swap test as a standard step for proposer experiments (`docs/experiments/README.md`, step 5).
+  - Ties to E017–E020: measured cost already beats every resemblance signal tried.
