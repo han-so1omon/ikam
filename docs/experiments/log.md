@@ -873,3 +873,49 @@ Newest last. Format and rules: `README.md`.
 - Next levers, under the new objective:
   - The kernel stores and uses the trigram index when it pays. Per E058 it cuts search decode to 0.19–0.43x on md, office, repo-history and generated.
   - The planner must weigh the search workload: today it optimises bytes plus one read pass, so it keeps plans that are cheap to store but costly to scan.
+
+### E063 operation-profile (benchmark change, reported, not scored)
+- Branch / parent: exp/063-operation-profile / E062
+- Why (the user's direction): the score must account for the full set of operations and for real time and space, not proxies. Until now it counted stored bytes plus two proxies: decoded bytes and function work. Those proxies leave out ingest, repack and verification, and they never measured time or memory.
+- Benchmark change (`examples/bench.rs`), reported per corpus under `ops`, not scored:
+  - A counting global allocator measures each operation's peak heap above its start.
+  - Every operation's wall time is measured (median of 3 for reads; one run for ingest, repack and fsck), for the kernel and for the baseline. The baseline is the corpus as `baselines` stores it: zstd 3 with a trained dictionary.
+  - Operations:
+    - ingest (the baseline's is dictionary training plus compression);
+    - repack (kernel only);
+    - read every distinct file;
+    - a 4 KiB range read of each file (the baseline decompresses, then slices);
+    - one search (the baseline decompresses all files and scans);
+    - fsck (the baseline decompresses all files and hashes them with BLAKE3);
+    - for repo-graph, reading every distinct graph.
+  - Times vary between runs: about ±15% between two runs. Every scored field was identical across the two runs.
+- Result, median ms, kernel vs baseline (two runs; every corpus exact with a clean fsck; score 1.5736 unchanged):
+
+  | corpus | ingest | repack | read all | range all | search | fsck | kernel peak (read) | baseline peak (read) |
+  |---|---|---|---|---|---|---|---|---|
+  | md | 96 vs 36 | 5,573 | 18.7 vs 0.41 (45x) | 20.6 vs 0.45 | 18.6 vs 0.96 | 20.5 vs 0.74 | 88 KB | 186 KB |
+  | pdf | 25 vs 14 | 814 | 1.8 vs 0.11 (16x) | 1.6 vs 0.12 | 1.9 vs 0.34 | 2.7 vs 0.19 | 79 KB | 81 KB |
+  | office | 1,541 vs 142 | 38,836 | 458 vs 0.81 (**569x**) | 461 vs 0.81 | 474 vs 9.9 | 542 vs 1.8 | 2.3 MB | 2.8 MB |
+  | invoices | 36 vs 8.5 | 721 | 1.0 vs 0.04 (27x) | 1.1 vs 0.04 | 1.0 vs 0.03 | 1.3 vs 0.09 | 68 KB | 86 KB |
+  | synthetic-history | 26 vs 39 | 564 | 2.5 vs 0.07 (36x) | 1.8 vs 0.08 | 2.7 vs 0.59 | 3.2 vs 0.26 | 126 KB | 651 KB |
+  | repo-history | 711 vs 425 | 43,408 | 103 vs 8.7 (12x) | 98 vs 8.9 | 110 vs 14.3 | 141 vs 10.3 | 375 KB | 5.3 MB |
+  | repo-graph | 92 vs 52 | 720 | 14.9 vs 0.64 (23x) | | | 4.9 vs 0.61 | 192 KB | 1.0 MB |
+  | generated | 13 vs 6.8 | 6,405 | 366 vs 1.2 (**308x**) | 388 vs 0.82 | 392 vs 3.0 | 409 vs 1.2 | **67 MB** | 0.7 MB |
+  | structured | 267 vs 336 | 7,675 | 20.7 vs 5.1 (4x) | 14.3 vs 4.3 | 20.5 vs 4.7 | 19.6 vs 6.2 | 2.2 MB | 8.9 MB |
+  | transcripts | 77 vs 119 | 4,239 | 347 vs 1.5 (**233x**) | 352 vs 1.3 | 359 vs 1.5 | 387 vs 1.9 | 11 MB | 3.3 MB |
+
+- What the real numbers show:
+  - **The decode proxy badly understates real read time.** Read cost ratios, kernel over baseline:
+
+    | corpus | proxy | real |
+    |---|---|---|
+    | office | 18x | 569x |
+    | generated | 1.9x | 308x |
+    | transcripts | 3.4x | 233x |
+    | md | 12x | 45x |
+
+    WASM interpretation is the main reason (generated, transcripts' quote function). Its fuel/1000 pricing is two orders of magnitude too low. Rebuilding zips (deflate re-compression) explains office. Fixed per-read overheads (ledger lookups, verification hashing, groups) explain the rest.
+  - Range reads are no faster than whole reads in the kernel, because leaves decode whole (E046/E047).
+  - The kernel uses less read memory than the baseline on most corpora (it streams group prefixes and keeps no decoded corpus). The exceptions are generated (67 MB, WASM program memory) and transcripts (11 MB).
+  - Ingest and repack are slower everywhere. Repack takes up to 43 s, against a baseline with no maintenance step.
+- Verdict: **benchmark change kept** (measurement only). How these costs combine into the score is still to decide.
