@@ -183,3 +183,5 @@ Three things would make it concrete:
 | `quote` derivation: line-numbered, JSON-escaped slices of stored content | built (E056; repack now plans a fact's inputs first) | transcripts 113,507 -> 71,507 B |
 | related-content zstd context (`Q` encoding: another stored content as the frame's context, one step) | built (E057) | score 0.2929 -> 0.2920; structured -6.5 K |
 | content search with an optional trigram index (exact: candidates are decoded and checked) | built (E058), reported, not scored | pays above 19-65 searches per read pass on generated, repo-history, office, md |
+| planner prices plans by the measured read term; repack accepts by the whole store and is a fixed point after one call | built (E059, E060) | score 0.2920 -> 0.2903 |
+| smaller search index | dropping common trigrams refuted (E061, on its branch); next: compress postings (bitmaps, key dictionary) | index bytes vs decode per query |
