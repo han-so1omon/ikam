@@ -48,7 +48,8 @@ const DICT_SHORTLIST: usize = 4;
 
 impl<S: Store + Sync> Repo<S> {
     /// Re-plan storage of all live content (applied only if smaller and
-    /// verified), then rebuild the function library graph. Trees whose
+    /// verified), then rebuild the function library graph, and store a search
+    /// index if it pays for the described search workload. Trees whose
     /// stored content the new plan no longer shares go back to object form
     /// (as before a re-plan), so a second repack finds nothing left (E060).
     pub fn repack(&mut self) -> Result<Repacked, Error> {
@@ -56,6 +57,14 @@ impl<S: Store + Sync> Repo<S> {
         self.function_library()?;
         self.unshare_trees()?;
         self.gc()?;
+        // A search index, if it pays for the described workload (E065).
+        let (_, roots) = self.reachable()?;
+        let roots: Vec<Id> = roots
+            .into_iter()
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect();
+        self.plan_search_index(&roots)?;
         Ok(repacked)
     }
 
