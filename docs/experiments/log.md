@@ -1035,3 +1035,38 @@ Newest last. Format and rules: `README.md`.
 - Profile (callgrind, md reads after repack): reads are almost all zstd's own sequence decoding, of group prefixes. Each md file sits in a group, and reading it decodes the group up to its end. Dictionary loading was a small share, which is why this gain is small.
 - Verdict: **kept** (a small gain).
 - Next: the planner's `read_weight` (0.001 stored bytes per decoded byte) is far from what the cost model implies under the heavy workload, roughly 50. So it keeps trading reads for bytes, as groups do, where storage is nearly free.
+
+### E069 read-weight-from-cost
+- Branch / parent: exp/069-read-weight-from-cost / E068
+- Hypothesis: E068's profile showed md reads spend their time decoding group prefixes. That is a storage-for-reads trade the planner makes because `read_weight` = 0.001 stored bytes per decoded byte. Under E064's heavy workload at list prices, one decoded byte per read costs about 1 ns of CPU ($1.1e-14), and a content is decoded about 101,000 times a month (1,000 read passes plus 100,000 searches without an index), against $2.3e-11 per stored byte-month. The rate the score implies is therefore about 49, not 0.001. Given that rate, the planner should stop trading reads for bytes.
+- Change:
+  - `examples/bench.rs`: `READ_WEIGHT` is derived from the cost model's constants (decodes per month x `DECODE_SECONDS_PER_BYTE` = 1 ns, from E063's baseline reads at 0.6–2.3 ns/B, x CPU price / storage price) = 48.8, and set as the planner's `read_weight`. The kernel's default stays 0.001.
+  - `src/dict.rs`: `encode_cheapest` also considers raw storage (`B`), which it never did.
+  - Raw reads are priced, not free:
+    - measured here, zstd decodes at 2.2 ns/B, BLAKE3 verification costs 0.25 ns/B and copying 0.02 ns/B, so a verified raw read costs about 1/8 of a zstd decode;
+    - `codec::read_weight(b'B')` = 1/8 (now `f64`); decode cost counts raw bytes at 1/8;
+    - counting is in eighth-units, rounded per call (`count_decode`), so a read counts the same whatever ran before. A first version divided a running total and made the proxies differ by a few units between runs; that was caught by the determinism check and fixed.
+  - With raw reads first priced at 0 (an intermediate version), the search-index decision saw scans as free and dropped office's index (office 0.41 -> 1.29). Pricing them at 1/8 restored it.
+- Result (two runs; tests, clippy and fmt clean; every corpus exact with a clean fsck; every search exact; deterministic fields identical across runs): score 10.58 / 10.30 -> **0.78 / 0.76**. For the first time the kernel costs less than the baseline overall. bytes_score 0.45 -> 5.23: under this workload it stores about 5x the baseline's bytes, by choice.
+
+  | corpus | cost ratio | bytes (zstd+dict) |
+  |---|---|---|
+  | md | 2.44 -> **0.30 / 0.27** | 177,959 -> 301,753 (76,892) |
+  | pdf | 5.33 -> **0.17** | 20,853 -> 163,266 (24,643) |
+  | office | 9.9 / 11.0 -> **0.24 / 0.25** | 1.37 M -> 4.08 M (0.39 M) |
+  | invoices | 33 -> 3.70 | 3,662 -> 86,608 (13,519) |
+  | synthetic-history | 4.9 -> 1.37 | 15,671 -> 662,387 (60,744) |
+  | repo-history | 3.9 -> **0.39** | 1.75 M -> 6.14 M (1.29 M) |
+  | repo-graph | 17.7 -> 11.6 | 18,348 -> 50,013 (113,441) |
+  | generated | 34 / 28 -> **0.26** | 26,260 -> 714,745 (175,017) |
+  | structured | 3.9 -> **0.91 / 0.85** | 0.10 M -> 8.93 M (1.00 M) |
+  | transcripts | 94 / 77 -> 1.21 / 1.06 | 72,557 -> 3.42 M (0.32 M) |
+
+  Plans now store most files raw (`B`). Zips are stored rather than re-deflated, generated's and transcripts' outputs are stored rather than recomputed by WASM, and groups and templates are gone. Search indexes are kept where they pay.
+- What it means: under a heavy workload at list prices, the kernel's best plan for hot data is to store it raw, with verified reads and an index for search. Compression, templates, slices and programs pay only when reads are rare. The planner now takes that trade-off from the workload (`read_weight`), not a constant: with the default 0.001 it plans for space, as before.
+- Verdict: **kept.**
+- Remaining above 1.0:
+  - invoices 3.7: per-file overhead on 30 tiny files, and every search scans all of them;
+  - repo-graph 11.6: graph reads;
+  - synthetic-history 1.37;
+  - transcripts 1.1–1.2.
