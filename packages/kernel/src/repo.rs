@@ -91,6 +91,11 @@ pub struct Repo<S: Store> {
     /// it is used when it saves bytes, and never affects what is stored
     /// otherwise or how anything is rebuilt.
     pub proposed_order: Vec<Id>,
+    /// The search workload, as the caller describes it (E065): searches per
+    /// read pass, and sample queries. Repack stores a search index only if it
+    /// pays for this workload; with a rate of 0 (the default) it never does.
+    pub search_rate: f64,
+    pub search_sample: Vec<Vec<u8>>,
     /// zstd level new encodings use (`dict::MEASURE_LEVEL` unless
     /// `recompress` is running).
     pub(crate) level: i32,
@@ -106,6 +111,8 @@ impl<S: Store> Repo<S> {
             bytes_written: 0,
             read_weight: DEFAULT_READ_WEIGHT,
             proposed_order: Vec::new(),
+            search_rate: 0.0,
+            search_sample: Vec::new(),
             level: crate::dict::MEASURE_LEVEL,
         }
     }

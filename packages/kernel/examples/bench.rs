@@ -715,6 +715,12 @@ fn read_costs(repo: &Repo<MemStore>, snapshots: &[Snapshot]) -> (usize, usize, b
 /// it read. A workload assumption, not a measurement of this corpus.
 const SEARCH_RATE: f64 = 100.0;
 
+/// Query seeds: the scored queries, and the different sample the kernel is
+/// given to decide whether a search index pays (E065), so the decision is
+/// not tuned on the queries it is scored on.
+const SCORED_QUERIES: u64 = 0x1234_5678;
+const SAMPLE_QUERIES: u64 = 0x9e37_79b9;
+
 /// The kernel's decode cost per search (E062): 100 deterministic grep-like
 /// queries (an identifier from a random line of a random file, as the agent
 /// trace of E050 searched) over every distinct file, through `Repo::search`
@@ -728,7 +734,7 @@ fn search_cost(repo: &Repo<MemStore>, snapshots: &[Snapshot]) -> (usize, bool) {
         .map(|(_, b)| (Id::of_content(b), b))
         .collect();
     let ids: Vec<Id> = files.keys().copied().collect();
-    let mut queries = grep_queries(&files, 100);
+    let mut queries = grep_queries(&files, 100, SCORED_QUERIES);
     let before = ikam_kernel::decode_cost();
     let index = repo.search_index().unwrap();
     if index.is_none() {
@@ -751,9 +757,9 @@ fn search_cost(repo: &Repo<MemStore>, snapshots: &[Snapshot]) -> (usize, bool) {
 
 /// Deterministic grep-like queries (E058/E062): an identifier from a random
 /// line of a random distinct file, as the agent trace of E050 searched.
-fn grep_queries(files: &BTreeMap<Id, &Vec<u8>>, n: usize) -> Vec<Vec<u8>> {
+fn grep_queries(files: &BTreeMap<Id, &Vec<u8>>, n: usize, seed: u64) -> Vec<Vec<u8>> {
     let ids: Vec<&Id> = files.keys().collect();
-    let mut s = 0x1234_5678u64;
+    let mut s = seed;
     let mut lcg = move || {
         s = s
             .wrapping_mul(6364136223846793005)
@@ -881,7 +887,7 @@ fn operation_profile(repo: &Repo<MemStore>, snapshots: &[Snapshot], graph: bool)
         .map(|(_, b)| (Id::of_content(b), b))
         .collect();
     let ids: Vec<Id> = files.keys().copied().collect();
-    let queries = grep_queries(&files, 3);
+    let queries = grep_queries(&files, 3, SCORED_QUERIES);
     let mut kernel = Vec::new();
     if graph {
         let mut graphs = BTreeSet::new();
@@ -1308,6 +1314,14 @@ fn main() {
         propose_programs(&mut repo, &snapshots);
         propose_quotes(&mut repo, &snapshots);
         repo.proposed_order = proposed_order();
+        if !graph {
+            // The workload, as the kernel is told it (E065).
+            let files: BTreeMap<Id, &Vec<u8>> = (snapshots.iter().flatten())
+                .map(|(_, b)| (Id::of_content(b), b))
+                .collect();
+            repo.search_rate = SEARCH_RATE;
+            repo.search_sample = grep_queries(&files, 20, SAMPLE_QUERIES);
+        }
         let (_, repack_cost) = measure(1, || repo.repack().unwrap());
         let (repack, repack_ms) = (stored(&repo), repack_cost.ms as u128);
         let exact = match graph {
