@@ -161,16 +161,22 @@ thread_local! {
 
 /// Decode cost of reads on this thread so far, in zstd-equivalent bytes:
 /// bytes decompressed from stored frames, each weighted by its codec's
-/// decode time relative to zstd (`codec::*_READ`). The part of a read the
-/// evaluator's work (function output) leaves out. A measurement for
-/// benchmarks; the difference between two calls is what one read cost.
+/// decode time relative to zstd (`codec::*_READ`), and since E069 bytes
+/// read as stored at 1/8 (copying and verifying them: BLAKE3 measured at
+/// 0.25 ns/B against zstd's 2.2). The part of a read the evaluator's work
+/// (function output) leaves out. A measurement for benchmarks; the
+/// difference between two calls is what one read cost.
 pub fn decode_cost() -> usize {
-    DECOMPRESSED.with(|d| d.get())
+    DECOMPRESSED.with(|d| d.get()) / DECODE_UNITS
 }
 
-/// Count `n` bytes decoded by a codec `weight` times slower than zstd.
-pub(crate) fn count_decode(n: usize, weight: usize) {
-    DECOMPRESSED.with(|d| d.set(d.get() + n * weight));
+/// Counting units per zstd-equivalent byte, so cheaper-than-zstd reads
+/// count in whole units.
+pub(crate) const DECODE_UNITS: usize = 8;
+
+/// Count `n` bytes read at `units` (`DECODE_UNITS` per zstd-equivalent byte).
+pub(crate) fn count_decode(n: usize, units: usize) {
+    DECOMPRESSED.with(|d| d.set(d.get() + n * units));
 }
 
 /// A dictionary to decode with: raw bytes (loaded per frame), or prepared
@@ -224,7 +230,7 @@ pub(crate) fn unzstd_prefix_with(frame: &[u8], dict: Dict, limit: usize) -> Opti
         }
     }
     out.truncate(limit);
-    count_decode(out.len(), 1);
+    count_decode(out.len(), DECODE_UNITS);
     Some(out)
 }
 
@@ -264,7 +270,10 @@ fn unblock(mut body: &[u8], dict: Dict, start: usize, end: usize) -> Option<(usi
 
 fn decode_basic(id: &Id, encoded: &[u8]) -> Result<Vec<u8>, Error> {
     match encoded.split_first() {
-        Some((b'B', bytes)) => Ok(bytes.to_vec()),
+        Some((b'B', bytes)) => {
+            count_decode(bytes.len(), 1);
+            Ok(bytes.to_vec())
+        }
         Some((b'Z', z)) => unzstd_frame(z, &[]).ok_or(Error::Corrupt(*id)),
         _ => Err(Error::WrongKind(*id)),
     }
@@ -313,12 +322,17 @@ impl<S: Store> Repo<S> {
         best
     }
 
-    /// The cheapest plain encoding of `bytes` among zstd (at the repo's
+    /// The cheapest plain encoding of `bytes` among raw, zstd (at the repo's
     /// level) and the active `codec::CODECS`, for what repack keeps: stored bytes +
     /// `read_weight` x the codec's decode time x `reads` (bytes decoded to
     /// read everything once, see `Repo::recompress`).
     pub(crate) fn encode_cheapest(&self, bytes: &[u8], reads: usize) -> Vec<u8> {
         let mut best = self.encode_plain(bytes);
+        // Stored as is: more bytes, nothing to decode (E069).
+        let raw = [&b"B"[..], bytes].concat();
+        if self.cost(&raw, reads) < self.cost(&best, reads) {
+            best = raw;
+        }
         for (tag, encode, _) in codec::CODECS.iter().filter(|c| c.2) {
             if let Some(c) = encode(bytes) {
                 let c = [&[*tag][..], &c].concat();
@@ -333,8 +347,8 @@ impl<S: Store> Repo<S> {
     /// Stored bytes + `read_weight` x decode time of a plain encoding that
     /// is decoded for `reads` bytes.
     pub(crate) fn cost(&self, encoded: &[u8], reads: usize) -> f64 {
-        let weight = encoded.first().map_or(1, |t| codec::read_weight(*t));
-        encoded.len() as f64 + self.read_weight * (weight * reads) as f64
+        let weight = encoded.first().map_or(1.0, |t| codec::read_weight(*t));
+        encoded.len() as f64 + self.read_weight * weight * reads as f64
     }
 
     /// The smallest plain encoding of `bytes`.
@@ -439,7 +453,11 @@ impl<S: Store> Repo<S> {
         check: &dyn Fn(&[u8]) -> bool,
     ) -> Result<Vec<u8>, Error> {
         let out = match encoded.split_first() {
-            Some((b'B', bytes)) => Some(bytes[..limit.min(bytes.len())].to_vec()),
+            Some((b'B', bytes)) => {
+                let out = bytes[..limit.min(bytes.len())].to_vec();
+                count_decode(out.len(), 1);
+                Some(out)
+            }
             Some((b'Z', z)) => unzstd_prefix(z, &[], limit),
             Some((b'X', x)) => codec::unxz_prefix(x, limit),
             Some((b'R', r)) => codec::unbrotli_prefix(r, limit),

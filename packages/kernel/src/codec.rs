@@ -32,12 +32,16 @@ pub(crate) const CODECS: [(u8, Encoder, bool); 3] =
     [(b'X', xz, false), (b'R', brotli, true), (b'P', ppmd, false)];
 
 /// Decode time per byte of a plain encoding, relative to zstd.
-pub(crate) fn read_weight(tag: u8) -> usize {
+pub(crate) fn read_weight(tag: u8) -> f64 {
     match tag {
-        b'X' => XZ_READ,
-        b'R' => BROTLI_READ,
-        b'P' => PPMD_READ,
-        _ => 1,
+        b'X' => XZ_READ as f64,
+        b'R' => BROTLI_READ as f64,
+        b'P' => PPMD_READ as f64,
+        // Stored bytes are copied and verified, not decoded: 1/8 of zstd
+        // (E069; BLAKE3 0.25 ns/B against zstd's 2.2), as `decode_cost`
+        // counts them.
+        b'B' => 1.0 / crate::dict::DECODE_UNITS as f64,
+        _ => 1.0,
     }
 }
 
@@ -117,7 +121,7 @@ pub(crate) fn unppmd_prefix(data: &[u8], limit: usize) -> Option<Vec<u8>> {
 fn read_prefix(r: impl Read, limit: usize, weight: usize) -> Option<Vec<u8>> {
     let mut out = Vec::new();
     r.take(limit as u64).read_to_end(&mut out).ok()?;
-    crate::dict::count_decode(out.len(), weight);
+    crate::dict::count_decode(out.len(), weight * crate::dict::DECODE_UNITS);
     Some(out)
 }
 

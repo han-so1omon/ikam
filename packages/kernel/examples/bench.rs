@@ -979,6 +979,19 @@ const STORAGE_USD_PER_GB_MONTH: f64 = 0.023;
 const CPU_USD_PER_HOUR: f64 = 0.04;
 const RAM_USD_PER_GB_HOUR: f64 = 0.005;
 
+/// CPU time per decoded byte, for the planner's exchange rate (E069): about
+/// 1 ns, from E063's baseline reads (zstd with a dictionary: 0.6 to 2.3 ns per
+/// byte across corpora). A fixed constant, so plans stay deterministic.
+const DECODE_SECONDS_PER_BYTE: f64 = 1e-9;
+
+/// The planner's `read_weight` implied by the score (E069): stored bytes
+/// worth one decoded byte, when a content is decoded once per read pass and
+/// once per search (the upper bound, without an index) under `MONTHLY`, at
+/// the list prices. About 49.
+const READ_WEIGHT: f64 =
+    (1_000.0 + 1_000.0 * SEARCH_RATE) * DECODE_SECONDS_PER_BYTE * (CPU_USD_PER_HOUR / 3600.0)
+        / (STORAGE_USD_PER_GB_MONTH / 1e9);
+
 /// The heavy workload the score assumes (E064), per corpus per month: its
 /// history written once, a repack and a verification daily (since E067 the
 /// first repack, then 29 of a store left as the last repack left it), 1,000 read
@@ -1309,6 +1322,7 @@ fn main() {
         let snapshots = build();
         let input: usize = snapshots.iter().flatten().map(|(_, b)| b.len()).sum();
         let mut repo = Repo::new(MemStore::default());
+        repo.read_weight = READ_WEIGHT;
         let ((), ingest_cost) = measure(1, || {
             snapshots.iter().for_each(|s| commit(&mut repo, s, graph))
         });
