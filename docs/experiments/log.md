@@ -1125,3 +1125,23 @@ Newest last. Format and rules: `README.md`.
   - The baseline verifies nothing on read.
 - Verdict: **kept** (a fairness correction that also speeds up the kernel). The score definition is unchanged, but values before E072 overstate the kernel against an equal-effort baseline.
 - Open question for the user: should every read keep re-verifying, or should content be verified once when it is loaded from storage? See the report.
+
+### E073 graph-read-baseline (benchmark correction)
+- Branch / parent: exp/073-graph-baseline / E072
+- Hypothesis: on repo-graph the comparison is unfair to the kernel. The kernel's graph read returns every version's `Vec<Node>`, but the baseline's "read" only decompressed the edge lists and never turned them into a graph. A fair baseline decompresses each edge list and then parses it with `graph_of`, the same function that builds the graphs the kernel stores. That yields the `Vec<Node>` the kernel's read returns, which the exactness gate already checks against `graph_of`.
+- Change: in `examples/bench.rs`, `operation_profile`'s baseline read parses each decoded edge list with `graph_of` when the corpus is a graph. No kernel change. File corpora are untouched.
+- Result (two runs; clippy and fmt clean; every corpus exact with a clean fsck; sizes and deterministic fields identical to E072): score 1.2412 / 1.2814 -> **0.9688 / 0.9938**. **Not comparable as an improvement**: only the baseline's repo-graph read changed.
+
+  | repo-graph | E072 | E073 |
+  |---|---|---|
+  | baseline read, CPU per pass | 0.41 ms | 10.1 ms |
+  | baseline read, peak heap | 1.0 MB | 3.0 MB |
+  | kernel read, CPU per pass | 7.8–8.9 ms | 7.6–7.7 ms |
+  | cost ratio | 13.17 / 11.82 | **0.774 / 0.770** |
+
+  Other corpora moved only by run-to-run noise (md 0.48 / 0.67, the widest).
+- What it shows:
+  - The kernel's chunked graph read (332 KB decoded into nodes) is about 25% cheaper in CPU than decompressing and parsing the 1 MB of edge lists. It also has a smaller heap peak (0.19 MB against 3.0 MB).
+  - repo-graph was the single largest term in the score. It now favours the kernel.
+- Remaining corpora above 1.0: synthetic-history (4.2–4.4), invoices (2.8), office (1.9–2.1), transcripts (1.1–1.3). E072 named the cause: the kernel verifies every read with BLAKE3, and the baseline verifies nothing.
+- Verdict: **kept** (benchmark correction). Score values before E073 overstate repo-graph's cost.
