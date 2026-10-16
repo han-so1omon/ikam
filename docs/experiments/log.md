@@ -997,3 +997,28 @@ Newest last. Format and rules: `README.md`.
   - generated: 52.2 / 50.5 -> **32.4 / 31.8**.
   - Other corpora are within run-to-run noise, and their sizes are identical.
 - Verdict: **kept.**
+
+### E067 repack-unchanged
+- Branch / parent: exp/067-repack-unchanged / E066
+- Hypothesis: the workload repacks daily, but between ingests the store is exactly as the last repack left it. Repack is a fixed point (E060), so repacks 2–30 can only redo the same work and keep the same plan. A persistent fingerprint of what a repack depends on lets them return at once.
+- Benchmark change (part 1): `MONTHLY` prices the first repack once plus 29 repacks of the store the first left (`repack_again`), each measured, instead of 30 times the first. Alone, with the E066 kernel: score 15.57 -> 15.41 (within noise). A second repack cost about as much CPU as the first: md 16.7 s, office 92.1 s, repo-history 93.9 s. repo-graph's was already cheaper (0.4 s against 1.5 s), so its ratio moved 84 -> 37.
+- Kernel change (part 2), `src/repack.rs`:
+  - `repack` starts by comparing `repack_fingerprint()` with the ref `meta/repacked`, and returns at once if they match. Otherwise it runs, then stores the fingerprint of the store it leaves.
+  - The fingerprint is a BLAKE3 hash of every stored id, every ref except its own, and the planner's settings (`read_weight`, `search_rate`, `search_sample`, `proposed_order`). Stored encodings change only inside repack, so ids and refs capture every change between two repacks.
+  - The ref holds the fingerprint itself, not a stored object; reachability and gc ignore ids they cannot read.
+  - Test `repack_skips_an_unchanged_store`: a skipped repack changes nothing; a new commit changes the fingerprint and the next repack runs.
+- Result (two runs with part 2; tests, clippy and fmt clean; every corpus exact with a clean fsck; deterministic fields identical): score 15.57 (E066) -> 15.41 (part 1 only) -> **10.79 / 10.82** (-30%).
+  - A repack of an unchanged store now costs 0.07–0.9 ms of CPU (was 0.4–94 s).
+
+  | corpus | cost ratio |
+  |---|---|
+  | md | 8.1 -> 2.7 |
+  | office | 13.3 -> 10.3 / 10.9 |
+  | invoices | 45.3 -> 34.4 / 35.1 |
+  | repo-history | 5.9 -> 4.1 / 3.9 |
+  | repo-graph | 84 -> 19 |
+  | generated | 32 -> 28.5 / 28.8 |
+  | pdf | 7.3 -> 5.5 |
+
+  - synthetic-history, structured and transcripts: unchanged within noise (search-dominated).
+- Verdict: **kept.**
