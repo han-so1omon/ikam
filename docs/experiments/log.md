@@ -1100,3 +1100,28 @@ Newest last. Format and rules: `README.md`.
   - invoices: 3.70 / 3.68 -> **2.86 / 2.83** (search 102 -> 76 µs), beyond its spread in both runs.
   - transcripts 1.21 / 1.06 -> 1.07 / 1.09. Every other corpus is within noise.
 - Verdict: **kept, but it does not meet the score rule.** The score improves beyond the previous two-run spread on only one run; the other ties. It is kept as a pure speedup with no regression and a consistent per-corpus gain. Stated here so the exception is visible.
+
+### E072 memmem-search (benchmark correction and kernel change)
+- Branch / parent: exp/072-memmem-search / E071
+- Hypothesis: both the kernel's `search` and the baseline's searched each content with a naive window comparison (O(n x m)). With content now stored raw (E069), that scan is a large share of search time on both sides. A real substring search (`memchr::memmem`, already a kernel dependency) speeds up both, and the comparison stays fair only if both use it.
+- Change: `src/search.rs` uses a `memmem::Finder` built once per query. `examples/bench.rs` makes the baseline's search use the same. The exactness oracle keeps the naive scan, as an independent check.
+- Result (two runs; tests, clippy and fmt clean; every corpus exact with a clean fsck; every search exact; sizes and deterministic fields identical to E071): score 0.7618 / 0.7552 -> **1.2412 / 1.2814**. **Not comparable as an improvement**: the baseline's searches got much faster.
+
+  | corpus | search CPU per query, kernel | search CPU per query, baseline | cost ratio |
+  |---|---|---|---|
+  | office | 1.10 -> 0.30 ms | 8.21 -> 0.54 ms | 0.23 -> 1.94 / 2.09 |
+  | md | 0.10 -> 0.10 ms | 0.85 -> 0.37 ms | 0.30 -> 0.66 / 0.68 |
+  | synthetic-history | 0.74 -> 0.25 ms | 0.56 -> 0.07 ms | 1.40 -> 4.21 / 3.07 |
+  | generated | 0.56 -> 0.22 ms | 2.49 -> 0.78 ms | 0.27 -> 0.44 |
+  | pdf | 0.04 -> 0.02 ms | 0.33 -> 0.11 ms | 0.20 -> 0.40 |
+  | repo-history | 4.08 -> 2.69 ms | 14.3 -> 11.7 ms | 0.36 -> 0.32 / 0.48 |
+  | structured | 3.49 -> 3.26 ms | 4.50 -> 5.83 ms | 0.90 -> 0.67 / 0.87 |
+  | transcripts | 1.52 -> 1.28 ms | 1.56 -> 1.29 ms | 1.08 -> 1.11 / 1.13 |
+  | invoices | unchanged | unchanged | 2.85 -> 2.80 / 2.77 |
+
+- What it shows:
+  - Part of E069–E071's apparent lead came from the baseline's naive scan, not from the kernel.
+  - With equal scanning, what separates kernel and baseline on raw-stored content is mostly the kernel's BLAKE3 verification of every read: 0.18–0.9 ns/B, against zstd decoding highly repetitive text at under 0.2 ns/B (synthetic-history: 650 KB decoded in 0.07 ms).
+  - The baseline verifies nothing on read.
+- Verdict: **kept** (a fairness correction that also speeds up the kernel). The score definition is unchanged, but values before E072 overstate the kernel against an equal-effort baseline.
+- Open question for the user: should every read keep re-verifying, or should content be verified once when it is loaded from storage? See the report.
