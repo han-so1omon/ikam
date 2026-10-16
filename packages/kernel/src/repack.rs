@@ -53,6 +53,18 @@ impl<S: Store + Sync> Repo<S> {
     /// stored content the new plan no longer shares go back to object form
     /// (as before a re-plan), so a second repack finds nothing left (E060).
     pub fn repack(&mut self) -> Result<Repacked, Error> {
+        // A repack of a store the last repack left unchanged, with the same
+        // settings, would redo the same work and keep the same plan: repack
+        // is a fixed point (E060). Skip it (E067).
+        let unchanged = self.store.get_ref(REPACKED_REF)? == Some(self.repack_fingerprint()?);
+        if unchanged {
+            let bytes = self.content_bytes()?;
+            return Ok(Repacked {
+                before: bytes,
+                after: bytes,
+                applied: false,
+            });
+        }
         let repacked = self.replan_store()?;
         self.function_library()?;
         self.unshare_trees()?;
@@ -65,7 +77,38 @@ impl<S: Store + Sync> Repo<S> {
             .into_iter()
             .collect();
         self.plan_search_index(&roots)?;
+        let (current, done) = (
+            self.store.get_ref(REPACKED_REF)?,
+            self.repack_fingerprint()?,
+        );
+        self.store.set_ref(REPACKED_REF, current, done)?;
         Ok(repacked)
+    }
+
+    /// What a repack depends on: every stored id, every ref but
+    /// `REPACKED_REF`, and the planner's settings. Stored encodings change
+    /// only inside repack, so ids and refs capture every change between two.
+    fn repack_fingerprint(&self) -> Result<Id, Error> {
+        let mut h = blake3::Hasher::new();
+        let mut ids = self.store.ids()?;
+        ids.sort();
+        for id in &ids {
+            h.update(id.as_bytes());
+        }
+        let mut refs = self.store.refs()?;
+        refs.sort();
+        for (name, id) in refs.iter().filter(|(n, _)| n != REPACKED_REF) {
+            h.update(name.as_bytes()).update(&[0]).update(id.as_bytes());
+        }
+        h.update(&self.read_weight.to_le_bytes())
+            .update(&self.search_rate.to_le_bytes());
+        for q in &self.search_sample {
+            h.update(&(q.len() as u64).to_le_bytes()).update(q);
+        }
+        for id in &self.proposed_order {
+            h.update(id.as_bytes());
+        }
+        Ok(Id::from_bytes(*h.finalize().as_bytes()))
     }
 
     fn replan_store(&mut self) -> Result<Repacked, Error> {
@@ -806,6 +849,10 @@ pub(crate) struct ReadModel {
     groups: HashMap<Vec<u8>, Vec<(usize, usize, usize)>>,
 }
 
+/// Names the fingerprint of the store as the last repack left it (E067).
+/// The ref holds the fingerprint itself, not a stored object.
+const REPACKED_REF: &str = "meta/repacked";
+
 /// Smallest content worth a related-content context (E057).
 const RELATED_MIN: usize = 2048;
 
@@ -894,6 +941,38 @@ impl ReadModel {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A repack of a store the last repack left unchanged is skipped; any
+    /// change to the store makes the next repack run again (E067).
+    #[test]
+    fn repack_skips_an_unchanged_store() {
+        let mut repo = Repo::new(MemStore::default());
+        let commit = |repo: &mut Repo<MemStore>, text: &[u8]| {
+            let id = repo.put_content(text).unwrap().id;
+            let entry = crate::TreeEntry {
+                name: "a".into(),
+                kind: crate::Kind::File,
+                id,
+            };
+            let tree = repo.put(&Object::tree(vec![entry]).unwrap()).unwrap();
+            repo.commit("main", tree, "").unwrap();
+        };
+        commit(&mut repo, &b"some text that repeats; ".repeat(50));
+        repo.repack().unwrap();
+        let done = repo.store.get_ref(REPACKED_REF).unwrap();
+        assert_eq!(done, Some(repo.repack_fingerprint().unwrap()));
+        let ids = repo.store.ids().unwrap();
+        repo.repack().unwrap();
+        assert_eq!(
+            repo.store.ids().unwrap(),
+            ids,
+            "a skipped repack changes nothing"
+        );
+        commit(&mut repo, &b"other text that repeats; ".repeat(50));
+        assert_ne!(Some(repo.repack_fingerprint().unwrap()), done);
+        repo.repack().unwrap();
+        assert_ne!(repo.store.get_ref(REPACKED_REF).unwrap(), done);
+    }
 
     /// A fact's inputs are planned before the content it rebuilds, whatever
     /// their sizes, so the fact can be verified as a candidate then (E056).
