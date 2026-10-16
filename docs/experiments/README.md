@@ -45,11 +45,32 @@ How we improve the kernel: one fixed command, one score, hard gates, one hypothe
    - Grow downward: try a few options for one decision, then continue from the winner.
 5. **Run** the fixed command and save its output.
    - For an external proposer (embedding order, LLM output, codebook), also run the swap test (E051). Rerun with the proposal removed, and with it shuffled. If every size is unchanged, the proposer carries no information for this corpus, whatever it costs to produce.
-6. **Record** a result entry in `docs/experiments/log.md` (format below), and update the research note's hypothesis status: confirmed, refuted or not applicable.
+6. **Record** a result entry in `docs/experiments/log.md` (format below), add or update its row in `docs/experiments/registry.tsv` (see "Relevance"), and update the research note's hypothesis status: confirmed, refuted or not applicable.
 7. **Keep or discard.**
    - A change is kept only if the score improves, or holds while adding a capability.
    - Kept changes merge into the working branch.
    - Discarded ones stay recorded: a refuted hypothesis is a result.
+
+## Relevance (since E069)
+
+The score has changed meaning three times: bytes only (E000–E033), bytes plus reads (E034–E061), a search proxy (E062–E063), and monthly cost (E064 on). A verdict reached under one objective may not hold under another. `registry.tsv` records, for every experiment:
+- its kind and verdict;
+- where it is recorded (`main`, or the branch holding its only log entry);
+- the objective it was measured under;
+- the mechanisms it touched;
+- whether its verdict hinges on the objective's storage-versus-read weights (`weight_sensitive`).
+
+From those, `examples/registry.rs` derives:
+- **relevance:** `current` (measured under the current objective), `holds` (no storage-versus-read trade-off in its verdict, such as a fix or a pure speedup), `stale`, or `reference` (benchmark changes);
+- **action for stale entries:** `ablate` a kept mechanism (measure what it still contributes under the current objective, and delete it if nothing), or `retest` a rejected one;
+- **priority:** `high` if it touches a mechanism that matters under the current objective (`WEIGHTY`).
+
+The registry is also stored in IKAM itself: `cargo run --release --example registry [STORE_DIR]` (default `target/experiments.ikam`) commits it as a versioned graph. Experiments, objectives, mechanisms, verdicts, relevance and actions are nodes; each experiment's log entry is stored as content. The tool then prints the stale list read back from the stored graph and checks the store with fsck. Each run with a changed registry commits a new version, so how relevance shifts over time is kept as history.
+
+Workflow:
+- Every new experiment adds a row.
+- A rerun updates the row's `objective` (and its verdict, if it changed) and adds a log entry that names the original.
+- When the score's objective changes, set `CURRENT` (and `WEIGHTY`) in `examples/registry.rs`.
 
 ## Result entry format (`log.md`)
 
