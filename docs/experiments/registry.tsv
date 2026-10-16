@@ -1,0 +1,72 @@
+# Experiment registry (see docs/experiments/README.md, "Relevance"). One row per experiment.
+# id	slug	kind	verdict	recorded	objective	mechanisms	weight_sensitive	note
+E000	baseline	benchmark	reference	main	bytes	benchmark	no	first measurement
+E001	accounting	capability	kept	main	bytes	accounting	no	stored-bytes accounting
+E002	compressed-objects	change	kept	main	bytes	compression,objects	yes	zstd for structural objects
+E003	dictionary	change	kept	main	bytes	compression,dictionary	yes	shared trained dictionary
+E004	framing	change	kept	main	bytes	encoding	yes	compact framing
+E005	trees-as-content	change	kept	main	bytes	trees,slices	yes	trees stored as sliceable content
+E006	abbreviated-ids	change	kept	main	bytes	trees,encoding	yes	abbreviated ids in trees
+E007	parallel-repack	change	kept	main	bytes	repack,speed	no	repack plans in parallel
+E008	repeat-dictionary	change	kept	main	bytes	compression,dictionary	yes	repeat-based dictionary
+E009	nested-trees	benchmark	reference	main	bytes	benchmark	no	snapshots as nested trees
+E010	small-trees	change	kept	main	bytes	trees,encoding	yes	cheap small trees
+E011	graph-objects	capability	kept	main	bytes	graph	no	versioned graph objects
+E012	graph-corpus	benchmark	reference	main	bytes	benchmark	no	repo-graph corpus
+E013	reference-adjacency	probe	refuted	main	bytes	graph,compression	yes	WebGraph reference lists
+E014	short-edge-keys	probe	not-applicable	main	bytes	graph,encoding	yes	shorter edge keys
+E015	magicless-frames	change	kept	main	bytes	encoding	no	frames without magic or headers
+E016	solid-groups	change	kept	main	bytes	grouping	yes	small contents compressed together
+E017	seed-similarity-groups	change	kept	main	bytes	grouping,proposer	yes	seed-similarity grouping
+E018	marginal-cost-groups	change	kept	main	bytes	grouping,proposer	yes	grouping by measured cost
+E019	embedding-proposer	capability	kept	main	bytes	grouping,proposer	yes	embedding order proposer
+E020	byte-order-cost-groups	change	kept	main	bytes	grouping,proposer	yes	byte-order shortlist
+E021	generated-corpus	benchmark	reference	main	bytes	benchmark	no	generated corpus
+E022	interpreter-programs	change	kept	main	bytes	programs	yes	interpreter plus bytecode programs
+E023	compiled-programs	change	kept	main	bytes	programs,speed	yes	programs compiled to WASM
+E024	function-library	capability	kept	main	bytes	programs,graph	no	function library graph; fuel cap
+E025	llm-programs	change	discarded	main	bytes	programs,llm	yes	LLM-written programs
+E026	grouping-aware-proposer	change	kept	main	bytes	programs,proposer	yes	joint program pricing
+E027	order-independent-pricing	change	kept	main	bytes	measurement	no	pricing correction
+E028	range-reads	capability	kept	main	bytes	read-path	no	range reads through plans
+E029	seekable-groups	change	discarded	exp/029-seekable-groups	bytes	grouping,blocks	yes	later confirmed under reads (E037)
+E030	zstd-level	change	kept	main	bytes	compression,codec	no	store at zstd 19
+E031	codec-candidates	change	kept	main	bytes	codec	yes	xz and brotli candidates
+E032	domain-transforms	analysis	refuted	exp/032-domain-transforms	bytes	transforms	yes	transforms before the coder
+E033	ppmd-codec	change	kept	main	bytes	codec	yes	PPMd codec
+E034	read-cost-score	benchmark	reference	main	read	benchmark	no	score counts reads
+E035	read-priced-codecs	change	kept	main	read	codec,planner	yes	codecs priced by reads
+E036	one-objective	change	kept	main	read	planner	no	one objective everywhere
+E037	seekable-groups-read-aware	change	kept	main	read	grouping,blocks	yes	blocked groups
+E038	archive-slow-codecs	change	kept	main	read	codec	yes	slow codecs archived
+E039	graph-read-cost	benchmark	reference	main	read	benchmark	no	graph reads scored
+E040	structured-corpus	benchmark	reference	main	read	benchmark	no	structured corpus
+E041	structured-transforms	analysis	refuted	exp/041-structured-transforms	read	transforms	yes	column transforms
+E042	graph-reads-distinct	benchmark	reference	main	read	benchmark	no	graph read measurement fixed
+E043	graph-single-pass	change	kept	main	read	graph,read-path	no	graph nodes in one pass
+E044	graph-read-model	change	discarded	exp/044-graph-read-model	read	graph,planner	yes	graph read model
+E045	compact-graph-chunks	change	kept	main	read	graph,encoding	no	front-coded graph chunks
+E046	verified-slice-blocks	analysis	refuted	exp/046-verified-slice-blocks	read	read-path,blocks	yes	BLAKE3 verified blocks
+E047	range-read-blocks	analysis	conditional	exp/047-range-read-blocks	read	read-path,blocks	yes	pays if range reads weigh 10x
+E048	read-model-distinct-sources	change	kept	main	read	planner	no	read model counts sources once
+E049	storage-plan-concepts	measurement	partial	exp/049-concept-edges	read	relatedness	no	plan structure as relatedness
+E050	agent-read-trace	measurement	measured	exp/050-agent-read-trace	read	workload	no	agent reads: search dominates
+E051	proposer-swap-test	measurement	refuted	main	read	proposer	yes	embedding proposer has no effect
+E052	repack-rounds	change	refuted	exp/052-repack-rounds	read	repack	no	repack converges in one pass
+E053	program-skeletons	analysis	not-applicable	exp/053-program-skeletons	read	programs	no	fitted program parameters
+E054	plan-first-ingest	measurement	refuted	exp/054-plan-first-ingest	read	ingest	no	version plans from paths
+E055	transcript-corpus	benchmark	reference	main	read	benchmark	no	transcripts corpus
+E056	quote-function	change	kept	main	read	programs,repack	yes	quote function; fact inputs first
+E057	related-context	change	kept	main	read	compression	yes	related content as zstd context
+E058	search-index	capability	kept	main	read	search	no	trigram search index
+E059	measured-plan-cost	change	kept	main	read	planner	no	plans priced by measured reads
+E060	repack-acceptance	change	kept	main	read	repack	no	repack accepts by whole store
+E061	search-index-size	change	refuted	exp/061-search-index-size	read	search	yes	drop common trigrams
+E062	search-in-score	benchmark	reference	main	search-proxy	benchmark	no	search in the proxy score
+E063	operation-profile	benchmark	reference	main	search-proxy	benchmark	no	real time and memory measured
+E064	cost-score	benchmark	reference	main	cost	benchmark	no	monthly cost score
+E065	search-index-decision	change	kept	main	cost	search	no	index kept when it pays
+E066	wasm-speed	change	kept	main	cost	programs,speed	no	wasmi auto-dispatch
+E067	repack-unchanged	change	kept	main	cost	repack	no	unchanged store skips repack
+E068	prepared-dictionary	change	kept	main	cost	dictionary,read-path	no	prepared zstd dictionaries
+E069	read-weight-from-cost	change	kept	main	cost	planner	no	planner read weight from cost model
