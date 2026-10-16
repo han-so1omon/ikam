@@ -1070,3 +1070,33 @@ Newest last. Format and rules: `README.md`.
   - repo-graph 11.6: graph reads;
   - synthetic-history 1.37;
   - transcripts 1.1–1.2.
+
+### E070 experiment-registry (process)
+- Branch / parent: exp/070-experiment-registry / E069
+- Why (the user's direction): the score has changed meaning three times, so many past verdicts may not hold any more. Which ones are still relevant, and which are worth rerunning, should be tracked, ideally in IKAM itself.
+- Change:
+  - `docs/experiments/registry.tsv`: one row per experiment (E000–E069), giving its kind, verdict, where it is recorded, the objective it was measured under, the mechanisms it touched, and whether its verdict depends on the storage-versus-read weights.
+  - `examples/registry.rs` derives relevance (current, holds, stale, reference) and a rerun action for stale entries (ablate kept mechanisms, retest rejected ones), with a priority. It commits the registry as a versioned IKAM graph to a filesystem store (experiments, objectives, mechanisms and statuses as nodes; each log entry as content), reads the stale list back from the stored graph, and checks the store with fsck.
+  - Workflow in `docs/experiments/README.md`, "Relevance".
+- Result: under the cost objective, 5 experiments are current, 20 hold, 12 are benchmark references and 33 are stale.
+  - Ablate, high priority (6): E022, E023, E026, E035, E037, E056.
+  - Retest, high priority (8): E013, E014, E025, E029, E044, E046, E047, E061.
+  - Low priority: 16 to ablate, 3 to retest (mostly compression, which is nearly free under this workload).
+  - A rerun with an unchanged registry adds no new version.
+- Verdict: **kept** (process; no kernel change).
+
+### E071 contiguous-id-hash
+- Branch / parent: exp/071-contiguous-id-hash / E070
+- Hypothesis (callgrind of a search over 30 small raw files: 88% of the CPU is BLAKE3 verification, mostly `ChunkState::update`): `Id::of_content` fed BLAKE3 the 1-byte `"B"` prefix and then the content. That forces the first 1 KiB chunk through the byte-wise chunk path. Measured per byte:
+
+  | content size | prefix then bytes | one buffer |
+  |---|---|---|
+  | 5 KiB | 0.91 ns | 0.49 ns |
+  | 16 KiB | 0.43 ns | 0.20 ns |
+  | 1 MiB | 0.18 ns | 0.28 ns (the copy costs more than it saves) |
+
+- Change, `src/id.rs`: contents up to 256 KiB are hashed as one copied `"B" ++ bytes` buffer; larger ones as before. The ids are unchanged. Test `content_id_is_the_blob_id_at_every_size` covers both paths and their boundary.
+- Result (two runs; tests, clippy and fmt clean; every corpus exact with a clean fsck; sizes and deterministic fields identical to E069): score 0.7804 / 0.7552 -> **0.7618 / 0.7552**.
+  - invoices: 3.70 / 3.68 -> **2.86 / 2.83** (search 102 -> 76 µs), beyond its spread in both runs.
+  - transcripts 1.21 / 1.06 -> 1.07 / 1.09. Every other corpus is within noise.
+- Verdict: **kept, but it does not meet the score rule.** The score improves beyond the previous two-run spread on only one run; the other ties. It is kept as a pure speedup with no regression and a consistent per-corpus gain. Stated here so the exception is visible.
