@@ -1022,3 +1022,16 @@ Newest last. Format and rules: `README.md`.
 
   - synthetic-history, structured and transcripts: unchanged within noise (search-dominated).
 - Verdict: **kept.**
+
+### E068 prepared-dictionary
+- Branch / parent: exp/068-prepared-dictionary / E067
+- Hypothesis: every decode with the shared dictionary called zstd's `load_dictionary`, rebuilding its tables from about 100 KB each time, while the baseline prepares its dictionary once. Most md content and every group frame decode with the dictionary.
+- Change, `src/dict.rs`:
+  - Dictionaries are prepared once per process, per dictionary id (`prepared`, a zstd `DDict`), and decoding references the prepared one (`Dict::Prepared`).
+  - Prefix decoding drives zstd's streaming API directly, because the reader adapter cannot borrow a prepared dictionary. Raw dictionaries (a `Q` encoding's base) still load per frame.
+- Result (two runs; tests, clippy and fmt clean; every corpus exact with a clean fsck; deterministic fields identical across runs and to E067): score 10.79 / 10.82 -> **10.58 / 10.30**.
+  - md 2.73 -> 2.43; invoices 34.4 -> 33.0; pdf 5.5 -> 5.3; repo-graph 19.0 -> 17.7.
+  - generated (28.5 -> 34.2 / 28.3) and transcripts (92 -> 94 / 77): WASM-dominated, within their noise.
+- Profile (callgrind, md reads after repack): reads are almost all zstd's own sequence decoding, of group prefixes. Each md file sits in a group, and reading it decodes the group up to its end. Dictionary loading was a small share, which is why this gain is small.
+- Verdict: **kept** (a small gain).
+- Next: the planner's `read_weight` (0.001 stored bytes per decoded byte) is far from what the cost model implies under the heavy workload, roughly 50. So it keeps trading reads for bytes, as groups do, where storage is nearly free.
