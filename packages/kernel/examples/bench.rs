@@ -955,10 +955,11 @@ fn operation_profile(repo: &Repo<MemStore>, snapshots: &[Snapshot], graph: bool)
         baseline.push(("range", c));
         let mut runs = queries.iter().cycle();
         let (_, c) = measure(5, || {
-            let q = runs.next().unwrap();
+            // The same substring search as the kernel's (E072).
+            let finder = memchr::memmem::Finder::new(runs.next().unwrap());
             decode_all()
                 .iter()
-                .filter(|b| b.windows(q.len()).any(|w| w == q.as_slice()))
+                .filter(|b| finder.find(b).is_some())
                 .count()
         });
         baseline.push(("search", c));

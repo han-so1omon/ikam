@@ -142,11 +142,13 @@ impl<S: Store> Repo<S> {
             }
             None => files.to_vec(),
         };
+        // A substring search built once per query (E072).
+        let finder = memchr::memmem::Finder::new(pattern);
         let mut cx = Cx::default();
         let mut out = Vec::new();
         for id in candidates {
             let bytes = self.rebuild(&id, &mut cx)?;
-            if pattern.is_empty() || bytes.windows(pattern.len()).any(|w| w == pattern) {
+            if finder.find(&bytes).is_some() {
                 out.push(id);
             }
             cx.known.clear();
