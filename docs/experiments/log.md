@@ -981,3 +981,19 @@ Newest last. Format and rules: `README.md`.
   - transcripts (224x) and generated (52x): WASM interpretation;
   - repo-graph (81x): daily repack;
   - invoices (45x): every search decodes all, and every file holds the query.
+
+### E066 wasm-speed
+- Branch / parent: exp/066-wasm-speed / E065
+- Hypothesis (E063/E064: WASM interpretation dominates transcripts' and generated's cost): the interpreter was built with wasmi's `portable-dispatch`, which its documentation describes as compiling universally "at the cost of execution performance". Tail-call dispatch (`auto-dispatch`) should run the same modules faster with the same outputs. A second cost was that every call built an engine and recompiled its module.
+- Change:
+  - `Cargo.toml`: wasmi features `["auto-dispatch", "deterministic"]` (was `portable-dispatch`).
+  - `src/wasm.rs`: compiled modules are cached per process by content hash (compiling is pure); each call still instantiates fresh, with its own fuel.
+  - Measured separately on generated and transcripts:
+    - the cache alone changed read time by 0–16% (transcripts 359 -> 302 ms; generated unchanged);
+    - `auto-dispatch` cut reads 2.2–2.6x (generated 392 -> 172 ms, transcripts 302 -> 135 ms) and halved repack.
+- Note: fuel totals depend slightly on the dispatch mode. Function work (bytes + fuel/1000) moved by 17 units on generated (1,322,701 -> 1,322,684) and 100 on transcripts. Outputs are identical (every exactness gate passes), and stored functions use a tiny fraction of the 2^30 fuel budget. This is documented in `wasm.rs`.
+- Result (two runs; tests, clippy and fmt clean; every corpus exact with a clean fsck; deterministic fields identical across runs): score 18.59 / 18.52 -> **15.57 / 15.84** (-15%).
+  - transcripts: 223.8 / 220.0 -> **87.2 / 71.8**.
+  - generated: 52.2 / 50.5 -> **32.4 / 31.8**.
+  - Other corpora are within run-to-run noise, and their sizes are identical.
+- Verdict: **kept.**
