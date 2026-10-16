@@ -943,7 +943,12 @@ fn operation_profile(repo: &Repo<MemStore>, snapshots: &[Snapshot], graph: bool)
             .collect()
     };
     let mut baseline = Vec::new();
-    let (_, c) = measure(5, || drop(decode_all()));
+    // A graph read parses each edge list into the nodes the kernel's graph
+    // read returns (E073: before, the baseline only decompressed).
+    let (_, c) = measure(5, || match graph {
+        true => drop(decode_all().iter().map(|b| graph_of(b)).collect::<Vec<_>>()),
+        false => drop(decode_all()),
+    });
     baseline.push(("read", c));
     if !graph {
         let (_, c) = measure(5, || {
