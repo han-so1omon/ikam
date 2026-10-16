@@ -5,9 +5,17 @@
 //! bounded by fuel and memory. Under those rules the same module and inputs
 //! give the same output everywhere, which reconstruction requires.
 //!
+//! wasmi runs with `auto-dispatch` (tail-call dispatch where the build
+//! supports it; E066: 2.2-2.6x faster than `portable-dispatch`). Outputs do
+//! not depend on the dispatch mode; fuel totals differ by under 0.01%
+//! between modes, far inside `FUEL`'s margin for every stored function.
+//!
 //! ABI: export `memory`, `alloc(len: i32) -> ptr: i32`, and
 //! `run(ptr: i32, len: i32) -> i64` returning `(out_ptr << 32) | out_len`.
 //! The input is `count:u32 { len:u32 bytes }` (big-endian), one per argument.
+
+use std::collections::HashMap;
+use std::sync::{Mutex, OnceLock};
 
 use wasmi::{Config, Engine, Linker, Module, StoreLimits, StoreLimitsBuilder};
 
@@ -26,13 +34,32 @@ const FUEL: u64 = 1 << 30;
 pub const FUEL_PER_WORK: u64 = 1_000;
 const MAX_MEMORY: usize = 256 << 20;
 
-/// Run `module` on `args`: its output and the fuel it spent.
-pub fn run(module: &[u8], args: &[Vec<u8>]) -> Result<(Vec<u8>, u64), Error> {
-    let fail = |e: &dyn std::fmt::Display| Error::Exec(format!("wasm: {e}"));
+/// Compiled modules by content hash (E066): compiling (validation and
+/// translation) is pure, so a module is compiled once per process and each
+/// call only instantiates it, with fresh state and its own fuel.
+fn compiled(module: &[u8]) -> Result<(Engine, Module), Error> {
+    type Cache = Mutex<HashMap<[u8; 32], (Engine, Module)>>;
+    static CACHE: OnceLock<Cache> = OnceLock::new();
+    let key = *blake3::hash(module).as_bytes();
+    let cache = CACHE.get_or_init(Cache::default);
+    if let Some(hit) = cache.lock().unwrap().get(&key) {
+        return Ok(hit.clone());
+    }
     let mut config = Config::default();
     config.floats(false).consume_fuel(true);
     let engine = Engine::new(&config);
-    let module = Module::new(&engine, module).map_err(|e| fail(&e))?;
+    let compiled = Module::new(&engine, module).map_err(|e| Error::Exec(format!("wasm: {e}")))?;
+    cache
+        .lock()
+        .unwrap()
+        .insert(key, (engine.clone(), compiled.clone()));
+    Ok((engine, compiled))
+}
+
+/// Run `module` on `args`: its output and the fuel it spent.
+pub fn run(module: &[u8], args: &[Vec<u8>]) -> Result<(Vec<u8>, u64), Error> {
+    let fail = |e: &dyn std::fmt::Display| Error::Exec(format!("wasm: {e}"));
+    let (engine, module) = compiled(module)?;
     if module.imports().next().is_some() {
         return Err(Error::Exec("wasm: modules may not import anything".into()));
     }
