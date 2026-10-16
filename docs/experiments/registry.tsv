@@ -70,3 +70,5 @@ E066	wasm-speed	change	kept	main	cost	programs,speed	no	wasmi auto-dispatch
 E067	repack-unchanged	change	kept	main	cost	repack	no	unchanged store skips repack
 E068	prepared-dictionary	change	kept	main	cost	dictionary,read-path	no	prepared zstd dictionaries
 E069	read-weight-from-cost	change	kept	main	cost	planner	no	planner read weight from cost model
+E070	experiment-registry	capability	kept	main	cost	process	no	experiment relevance registry in IKAM
+E071	contiguous-id-hash	change	kept	main	cost	read-path,speed	no	contiguous BLAKE3 for small content ids
