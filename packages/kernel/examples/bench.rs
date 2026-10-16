@@ -807,39 +807,60 @@ unsafe impl GlobalAlloc for Counting {
 #[global_allocator]
 static ALLOCATOR: Counting = Counting;
 
-/// One operation's real cost: wall time (median of `runs`) and peak heap
-/// above what was in use when it started (from the first run).
+/// One operation's real cost: wall and CPU time (median of at least
+/// `runs`; repeated operations run for at least 300 ms) and peak heap above
+/// what was in use when it started.
 #[derive(Clone, Copy)]
 struct Cost {
     ms: f64,
+    /// Process CPU time, all threads (what compute is billed by).
+    cpu_ms: f64,
     peak: usize,
+}
+
+/// Process CPU time so far, all threads, in ms.
+fn cpu_ms() -> f64 {
+    let mut t = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    unsafe { libc::clock_gettime(libc::CLOCK_PROCESS_CPUTIME_ID, &mut t) };
+    t.tv_sec as f64 * 1000.0 + t.tv_nsec as f64 / 1e6
 }
 
 fn measure<T>(runs: usize, mut op: impl FnMut() -> T) -> (T, Cost) {
     let start = HEAP.load(Relaxed);
     PEAK.store(start, Relaxed);
-    let (mut out, mut times) = (None, Vec::new());
-    for _ in 0..runs.max(1) {
-        let t = Instant::now();
+    let (mut out, mut times, mut cpus) = (None, Vec::new(), Vec::new());
+    // Fast operations repeat until they have run 300 ms (at most 1,000
+    // times), so a median of many runs damps timer noise (E064).
+    let mut i = 0;
+    while i < runs.max(1) || (runs > 1 && i < 1000 && times.iter().sum::<f64>() < 300.0) {
+        i += 1;
+        let (t, c) = (Instant::now(), cpu_ms());
         let r = op();
         times.push(t.elapsed().as_secs_f64() * 1000.0);
+        cpus.push(cpu_ms() - c);
         out.get_or_insert(r);
     }
     times.sort_by(f64::total_cmp);
+    cpus.sort_by(f64::total_cmp);
     let peak = PEAK.load(Relaxed).saturating_sub(start);
-    (
-        out.unwrap(),
-        Cost {
-            ms: times[times.len() / 2],
-            peak,
-        },
+    let (ms, cpu_ms) = (times[times.len() / 2], cpus[cpus.len() / 2]);
+    (out.unwrap(), Cost { ms, cpu_ms, peak })
+}
+
+fn cost_json(c: Cost) -> String {
+    format!(
+        "{{\"ms\":{:.3},\"cpu_ms\":{:.3},\"peak\":{}}}",
+        c.ms, c.cpu_ms, c.peak
     )
 }
 
 fn ops_json(ops: &[(&str, Cost)]) -> String {
     let fields: Vec<String> = ops
         .iter()
-        .map(|(k, c)| format!("\"{k}\":{{\"ms\":{:.3},\"peak\":{}}}", c.ms, c.peak))
+        .map(|(k, c)| format!("\"{k}\":{}", cost_json(*c)))
         .collect();
     format!("{{{}}}", fields.join(","))
 }
@@ -851,11 +872,9 @@ fn ops_json(ops: &[(&str, Cost)]) -> String {
 /// trained dictionary, as in `baselines`): decompress every file, a range
 /// read (decompress then slice), a search (decompress all, scan) and
 /// verification (decompress all, hash).
-fn operation_profile(
-    repo: &Repo<MemStore>,
-    snapshots: &[Snapshot],
-    graph: bool,
-) -> (String, String) {
+type Ops = Vec<(&'static str, Cost)>;
+
+fn operation_profile(repo: &Repo<MemStore>, snapshots: &[Snapshot], graph: bool) -> (Ops, Ops) {
     let files: BTreeMap<Id, &Vec<u8>> = snapshots
         .iter()
         .flatten()
@@ -871,19 +890,19 @@ fn operation_profile(
                 graphs.insert(entries[0].id);
             }
         }
-        let (_, c) = measure(3, || {
+        let (_, c) = measure(5, || {
             graphs
                 .iter()
                 .for_each(|g| drop(repo.graph_nodes(g).unwrap()))
         });
         kernel.push(("read", c));
     } else {
-        let (_, c) = measure(3, || {
+        let (_, c) = measure(5, || {
             ids.iter()
                 .for_each(|id| drop(repo.read_content(id).unwrap()))
         });
         kernel.push(("read", c));
-        let (_, c) = measure(3, || {
+        let (_, c) = measure(5, || {
             for (id, b) in &files {
                 let n = b.len() as u64;
                 drop(repo.read_range(id, n / 2, (n - n / 2).min(4096)).unwrap());
@@ -892,7 +911,7 @@ fn operation_profile(
         kernel.push(("range", c));
         let index = repo.search_index().unwrap();
         let mut runs = queries.iter().cycle();
-        let (_, c) = measure(3, || {
+        let (_, c) = measure(5, || {
             repo.search(runs.next().unwrap(), &ids, index.as_ref())
                 .unwrap()
         });
@@ -918,10 +937,10 @@ fn operation_profile(
             .collect()
     };
     let mut baseline = Vec::new();
-    let (_, c) = measure(3, || drop(decode_all()));
+    let (_, c) = measure(5, || drop(decode_all()));
     baseline.push(("read", c));
     if !graph {
-        let (_, c) = measure(3, || {
+        let (_, c) = measure(5, || {
             decode_all()
                 .iter()
                 .map(|b| b[b.len() / 2..(b.len() / 2 + 4096).min(b.len())].to_vec())
@@ -929,7 +948,7 @@ fn operation_profile(
         });
         baseline.push(("range", c));
         let mut runs = queries.iter().cycle();
-        let (_, c) = measure(3, || {
+        let (_, c) = measure(5, || {
             let q = runs.next().unwrap();
             decode_all()
                 .iter()
@@ -945,7 +964,57 @@ fn operation_profile(
             .collect::<Vec<_>>()
     });
     baseline.push(("fsck", c));
-    (ops_json(&kernel), ops_json(&baseline))
+    (kernel, baseline)
+}
+
+/// List prices the score uses (E064; approximate cloud on-demand prices,
+/// late 2026): object storage, one vCPU, and memory.
+const STORAGE_USD_PER_GB_MONTH: f64 = 0.023;
+const CPU_USD_PER_HOUR: f64 = 0.04;
+const RAM_USD_PER_GB_HOUR: f64 = 0.005;
+
+/// The heavy workload the score assumes (E064), per corpus per month: its
+/// history written once, a repack and a verification daily, 1,000 read
+/// passes over every file (and 1,000 range reads of each), and
+/// `SEARCH_RATE` searches per read pass (E050). A graph corpus's read is
+/// reading every version's graph. A workload assumption, not a measurement.
+const MONTHLY: [(&str, f64); 6] = [
+    ("ingest", 1.0),
+    ("repack", 30.0),
+    ("read", 1_000.0),
+    ("range", 1_000.0),
+    ("search", 1_000.0 * SEARCH_RATE),
+    ("fsck", 30.0),
+];
+
+/// Monthly cost in USD of storing `bytes` and running `ops` at the
+/// `MONTHLY` rates: CPU time plus peak memory held for the operation's wall
+/// time, each at its list price. Per part, then the total.
+fn monthly_cost(bytes: usize, ops: &[(&str, Cost)]) -> (Vec<(String, f64)>, f64) {
+    let mut parts = vec![(
+        "storage".to_string(),
+        bytes as f64 / 1e9 * STORAGE_USD_PER_GB_MONTH,
+    )];
+    for (op, c) in ops {
+        let times = MONTHLY
+            .iter()
+            .find(|(o, _)| o == op)
+            .map_or(0.0, |(_, n)| *n);
+        let hours = |ms: f64| ms / 3_600_000.0;
+        let usd = hours(c.cpu_ms) * CPU_USD_PER_HOUR
+            + c.peak as f64 / 1e9 * hours(c.ms) * RAM_USD_PER_GB_HOUR;
+        parts.push((op.to_string(), times * usd));
+    }
+    let total = parts.iter().map(|(_, v)| v).sum();
+    (parts, total)
+}
+
+fn parts_json(parts: &[(String, f64)]) -> String {
+    let f: Vec<String> = parts
+        .iter()
+        .map(|(k, v)| format!("\"{k}\":{v:.9}"))
+        .collect();
+    format!("{{{}}}", f.join(","))
 }
 
 /// Read cost of a graph corpus (since E039): reading every distinct
@@ -1223,7 +1292,8 @@ fn main() {
         ("structured", structured, false),
         ("transcripts", transcripts, false),
     ];
-    let (mut log_ratio, mut log_read, mut log_bytes, mut n, mut total_ms) = (0.0, 0.0, 0.0, 0, 0);
+    let (mut log_cost, mut log_ratio, mut log_read, mut log_bytes, mut n, mut total_ms) =
+        (0.0, 0.0, 0.0, 0.0, 0, 0);
     for (name, build, graph) in corpora {
         if !only.is_empty() && !only.iter().any(|o| *o == name) {
             continue;
@@ -1266,13 +1336,20 @@ fn main() {
         let exact = exact && range_exact;
         let fsck = repo.fsck().unwrap().is_empty();
         let ((zstd_files, zstd_dict), baseline_ingest) = measure(1, || baselines(&snapshots));
-        let (kernel_ops, baseline_ops) = operation_profile(&repo, &snapshots, graph);
-        let cost = |c: Cost| format!("{{\"ms\":{:.3},\"peak\":{}}}", c.ms, c.peak);
+        let (mut kernel_ops, mut baseline_ops) = operation_profile(&repo, &snapshots, graph);
+        kernel_ops.splice(0..0, [("ingest", ingest_cost), ("repack", repack_cost)]);
+        baseline_ops.insert(0, ("ingest", baseline_ingest));
+        // The score (E064): monthly cost under the heavy workload, kernel
+        // against baseline, with real CPU time, memory and storage.
+        let (kernel_parts, kernel_usd) = monthly_cost(repack, &kernel_ops);
+        let (baseline_parts, baseline_usd) = monthly_cost(zstd_dict, &baseline_ops);
+        let cost_ratio = kernel_usd / baseline_usd;
         let ops = format!(
-            "{{\"kernel\":{{\"ingest\":{},\"repack\":{},\"ops\":{kernel_ops}}},\"baseline\":{{\"ingest\":{},\"ops\":{baseline_ops}}}}}",
-            cost(ingest_cost),
-            cost(repack_cost),
-            cost(baseline_ingest),
+            "{{\"kernel\":{},\"baseline\":{},\"kernel_usd\":{},\"baseline_usd\":{}}}",
+            ops_json(&kernel_ops),
+            ops_json(&baseline_ops),
+            parts_json(&kernel_parts),
+            parts_json(&baseline_parts),
         );
         let ratio = repack as f64 / zstd_dict as f64;
         // With read cost (E034): the baseline reads each distinct file by
@@ -1297,7 +1374,7 @@ fn main() {
         let kinds = by_kind(&repo);
         if json {
             println!(
-                "{{\"corpus\":\"{name}\",\"input\":{input},\"ingest\":{ingest},\"repack\":{repack},\"ingest_ms\":{ingest_ms},\"repack_ms\":{repack_ms},\"zstd_files\":{zstd_files},\"zstd_dict\":{zstd_dict},\"vs_dict\":{ratio:.4},\"vs_dict_read\":{read_ratio:.4},\"vs_dict_search\":{search_ratio:.4},\"search\":{search},\"read_baseline\":{baseline_read},\"exact\":{exact},\"fsck\":{fsck},\"read_whole\":{read_whole},\"read_4k\":{read_4k},\"ops\":{ops},\"by_kind\":{kinds}}}"
+                "{{\"corpus\":\"{name}\",\"input\":{input},\"ingest\":{ingest},\"repack\":{repack},\"ingest_ms\":{ingest_ms},\"repack_ms\":{repack_ms},\"zstd_files\":{zstd_files},\"zstd_dict\":{zstd_dict},\"vs_dict\":{ratio:.4},\"vs_dict_read\":{read_ratio:.4},\"vs_dict_search\":{search_ratio:.4},\"vs_baseline_cost\":{cost_ratio:.4},\"search\":{search},\"read_baseline\":{baseline_read},\"exact\":{exact},\"fsck\":{fsck},\"read_whole\":{read_whole},\"read_4k\":{read_4k},\"ops\":{ops},\"by_kind\":{kinds}}}"
             );
         } else {
             println!(
@@ -1307,7 +1384,8 @@ fn main() {
         }
         // Hard gates: an inexact or fsck-failing result is a failure, not a score.
         assert!(exact && fsck, "{name}: verification failed");
-        (log_ratio, log_read, log_bytes, n, total_ms) = (
+        (log_cost, log_ratio, log_read, log_bytes, n, total_ms) = (
+            log_cost + cost_ratio.ln(),
             log_ratio + search_ratio.ln(),
             log_read + read_ratio.ln(),
             log_bytes + ratio.ln(),
@@ -1315,23 +1393,25 @@ fn main() {
             total_ms + ingest_ms + repack_ms,
         );
     }
-    // The experiment score (since E062): geometric mean across corpora of
-    // (kernel bytes + read weight x (read cost + SEARCH_RATE x search cost))
-    // / (trained-dictionary baseline bytes + read weight x (1 + SEARCH_RATE)
-    // x its read cost); every corpus weighs the same; lower is better; below
-    // 1.0 beats the baseline. `read_score` is the score of E034-E061 (no
-    // search) and `bytes_score` the one before E034 (bytes only), reported
-    // for continuity.
-    let score = (log_ratio / n.max(1) as f64).exp();
+    // The experiment score (since E064): geometric mean across corpora of
+    // the kernel's monthly cost over the baseline's (`monthly_cost`: real
+    // CPU time, memory and storage at list prices, under the heavy
+    // `MONTHLY` workload); every corpus weighs the same; lower is better;
+    // below 1.0 beats the baseline. Reported for continuity, all
+    // deterministic proxies: `proxy_score` (E062: bytes + weighted decode
+    // work, with search), `read_score` (E034-E061, no search) and
+    // `bytes_score` (before E034, bytes only).
+    let score = (log_cost / n.max(1) as f64).exp();
+    let proxy_score = (log_ratio / n.max(1) as f64).exp();
     let read_score = (log_read / n.max(1) as f64).exp();
     let bytes_score = (log_bytes / n.max(1) as f64).exp();
     if json {
         println!(
-            "{{\"corpus\":\"_summary\",\"corpora\":{n},\"score\":{score:.4},\"read_score\":{read_score:.4},\"bytes_score\":{bytes_score:.4},\"total_ms\":{total_ms}}}"
+            "{{\"corpus\":\"_summary\",\"corpora\":{n},\"score\":{score:.4},\"proxy_score\":{proxy_score:.4},\"read_score\":{read_score:.4},\"bytes_score\":{bytes_score:.4},\"total_ms\":{total_ms}}}"
         );
     } else {
         println!(
-            "score (geometric mean of (repack + w*(read + {SEARCH_RATE}*search)) / (zstd+dict + w*(1 + {SEARCH_RATE})*read)) = {score:.4}, without search = {read_score:.4}, bytes only = {bytes_score:.4}, over {n} corpora, {total_ms} ms"
+            "score (geometric mean of monthly cost / baseline's, heavy workload) = {score:.4}; proxies: with search = {proxy_score:.4}, without = {read_score:.4}, bytes only = {bytes_score:.4}; over {n} corpora, {total_ms} ms"
         );
     }
 }

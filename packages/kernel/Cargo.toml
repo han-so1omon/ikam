@@ -19,6 +19,7 @@ xz2 = { version = "=0.1.7", features = ["static"] }
 zstd = { version = "0.14.0", features = ["experimental"] }
 
 [dev-dependencies]
+libc = "=0.2.189"
 proptest = "1.11.0"
 tempfile = "3.27.0"
 wat = "1.260.0"

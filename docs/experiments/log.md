@@ -919,3 +919,38 @@ Newest last. Format and rules: `README.md`.
   - The kernel uses less read memory than the baseline on most corpora (it streams group prefixes and keeps no decoded corpus). The exceptions are generated (67 MB, WASM program memory) and transcripts (11 MB).
   - Ingest and repack are slower everywhere. Repack takes up to 43 s, against a baseline with no maintenance step.
 - Verdict: **benchmark change kept** (measurement only). How these costs combine into the score is still to decide.
+
+### E064 cost-score (benchmark change)
+- Branch / parent: exp/064-cost-score / E063
+- Decision (the user's direction: account for the full set of operations and real time and space efficiency; workload "assume heavy"): the score becomes a **monthly cost** model in real units, replacing proxy weights chosen by hand.
+- Benchmark change (`examples/bench.rs`, `docs/experiments/README.md`):
+  - Per corpus, cost = stored bytes x storage price + the sum over operations of (times per month x (CPU time x CPU price + peak heap x wall time x memory price)).
+  - Prices: $0.023 per GB-month, $0.04 per vCPU-hour, $0.005 per GB-hour (approximate cloud list prices).
+  - Heavy workload `MONTHLY`, per corpus: ingest 1, repack 30, fsck 30, read passes 1,000, range reads 1,000 per file, searches 100,000 (100 per read pass, E050).
+  - Score = geometric mean of kernel cost over baseline cost.
+  - CPU time is process CPU across all threads (`clock_gettime(CLOCK_PROCESS_CPUTIME_ID)`, via `libc` as a dev-dependency already in the lockfile). Repack plans in parallel: one md repack used 15.5 s of CPU in 5.1 s of wall time.
+  - Repeated operations run at least 5 times and 300 ms, and the median is used. With 3 runs, timer noise on sub-millisecond baseline operations left run-to-run spreads of up to 32% per corpus. With 5 runs and 300 ms it is 0.2–4.8% per corpus and 1.5% on the score.
+  - Protocol: keep a change only if the score improves by more than the two-run spread on both runs. Sizes and deterministic proxies must still match exactly. `proxy_score` (E062), `read_score` and `bytes_score` are still reported.
+- Result (two runs; every corpus exact with a clean fsck; every search result exact): **score 28.97 / 28.55**; proxy_score 1.5736.
+
+  | corpus | kernel / baseline cost | kernel $/month | baseline $/month | kernel's largest parts |
+  |---|---|---|---|---|
+  | md | 26.4 | 0.0247 | 0.00095 | search 0.0192, repack 0.0051 |
+  | pdf | 7.5 | 0.0026 | 0.00039 | search 0.0020, repack 0.0006 |
+  | office | 65.1 | 0.59 | 0.0090 | search 0.55, repack 0.027 |
+  | invoices | 44.7 | 0.0015 | 0.000034 | search 0.0012, repack 0.0003 |
+  | synthetic-history | 5.7 | 0.0037 | 0.00087 | search 0.0032 |
+  | repo-history | 9.4 | 0.150 | 0.0162 | search 0.117, repack 0.031 |
+  | repo-graph | 83.0 | 0.00064 | 0.000008 | repack 0.0005, graph read 0.0001 |
+  | generated | 160.6 | 0.44 | 0.0028 | search 0.43 (WASM) |
+  | structured | 4.8 | 0.0239 | 0.0051 | search 0.0196, repack 0.0040 |
+  | transcripts | 212.8 | 0.39 | 0.0018 | search 0.38 (WASM quote) |
+
+  The ratios come from the second-iteration run (5 runs and 300 ms floor); the dollar figures from the first run (3 runs).
+- What the model says:
+  - **Storage is negligible under a heavy workload at list prices**: at most $0.00003 per corpus-month on either side. The kernel's smaller stores save about $0.00002 a month at most.
+  - The kernel costs 5–213x the baseline, almost entirely in CPU time:
+    - searches, which without an index decode everything, through WASM programs (generated, transcripts), zip rebuilds (office) and group prefixes (md, invoices);
+    - daily repack, which costs more than all of the baseline's operations together on md, repo-graph, repo-history and office.
+  - Under this objective the levers are: read speed (compile WASM to native rather than interpret it, avoid rebuilding containers on read, cheaper verification); search without decoding (E058's index); and the cost of repack itself. Further byte savings are worth nearly nothing at these prices.
+- Verdict: **benchmark change kept** (the user's decision). Scores are not comparable with E062 or E034–E061.
