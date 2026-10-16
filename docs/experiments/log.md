@@ -954,3 +954,30 @@ Newest last. Format and rules: `README.md`.
     - daily repack, which costs more than all of the baseline's operations together on md, repo-graph, repo-history and office.
   - Under this objective the levers are: read speed (compile WASM to native rather than interpret it, avoid rebuilding containers on read, cheaper verification); search without decoding (E058's index); and the cost of repack itself. Further byte savings are worth nearly nothing at these prices.
 - Verdict: **benchmark change kept** (the user's decision). Scores are not comparable with E062 or E034–E061.
+
+### E065 search-index-decision
+- Branch / parent: exp/065-search-index-decision / E064
+- Hypothesis: under E064's heavy workload (100 searches per read pass), most of the kernel's cost is searches that decode every file. A trigram index (E058) cuts that on md, office, repo-history and generated. The kernel should decide for itself when to keep one, from a workload description.
+- Change:
+  - `src/repo.rs`: `Repo::search_rate` (searches per read pass, default 0) and `Repo::search_sample` (sample queries), set by the caller as `read_weight` is.
+  - `src/search.rs`: `plan_search_index(files)` encodes an index in memory and measures the sample queries' decode work with it, and one query's without (a scan's work does not depend on the query). It stores the index only if its stored bytes + `read_weight` x rate x indexed work < `read_weight` x rate x scan work. That is deterministic and priced by the planner's own weight.
+  - `encode_index` and `decode_index` are split out of `build_search_index` and `search_index`.
+  - `src/repack.rs`: repack ends with `plan_search_index` over the reachable root files.
+  - Test `index_is_kept_only_when_it_pays`.
+  - `examples/bench.rs`: for file corpora, the kernel is told `SEARCH_RATE` and 20 sample queries from a different seed than the 100 scored ones, so the decision is not tuned on the scored queries.
+- Result (two runs; every corpus exact with a clean fsck; every search result exact; deterministic fields identical): score 28.97 / 28.55 -> **18.59 / 18.52** (-36%, far beyond the 1.5% spread); proxy_score 1.5736 -> 1.3421.
+
+  | corpus | index kept | bytes | decode per search | cost ratio |
+  |---|---|---|---|---|
+  | md | yes | 66,133 -> 177,959 | 2.14 M -> 0.44 M | 26.4 -> **8.4** |
+  | office | yes | 165,802 -> 1,366,957 | 51.9 M -> 18.8 M | 65.1 -> **12.5** |
+  | repo-history | yes | 907,329 -> 1,748,904 | 31.3 M -> 10.0 M | 9.4 -> **6.2** |
+  | generated | yes | 4,213 -> 26,260 | 1.32 M -> 0.57 M | 160.6 -> **52.2** |
+  | pdf, invoices, synthetic-history, structured, transcripts | no (does not pay) | unchanged | unchanged | unchanged within noise |
+
+  The index's bytes cost nearly nothing at list prices (office's 1.2 MB index is about $0.00003 a month), while the searches it narrows were most of the cost.
+- Verdict: **kept.**
+- Remaining cost leaders:
+  - transcripts (224x) and generated (52x): WASM interpretation;
+  - repo-graph (81x): daily repack;
+  - invoices (45x): every search decodes all, and every file holds the query.
