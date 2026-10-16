@@ -237,6 +237,7 @@ dependencies = [
  "blake3",
  "brotli",
  "flate2",
+ "libc",
  "libz-sys",
  "memchr",
  "ppmd-rust",

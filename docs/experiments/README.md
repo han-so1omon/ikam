@@ -8,13 +8,27 @@ How we improve the kernel: one fixed command, one score, hard gates, one hypothe
   - It prints one JSON line per corpus, then a `_summary` line.
   - Never pass extra flags or environment variables to vary behaviour. Change committed code instead.
 - **Benchmark changes** (corpus or how it is committed) are their own log entries that re-measure the current kernel, and scores across them are not compared. Since E009 snapshots are committed as nested trees; since E012 there are 7 corpora, including a versioned graph (`repo-graph`); E021 added `generated` (8) and E040 `structured` (9: CSV, NDJSON and JSON exports of the repository's history), and E055 `transcripts` (10: a coding agent's JSONL session log quoting the kernel's own sources, snapshotted as it grows).
-- **Score:** the `_summary.score`. Since E062 it is the geometric mean over corpora of `(repack bytes + w x (read cost + q x search cost)) / (zstd+trained-dictionary baseline bytes + w x (1 + q) x baseline read cost)`, with `w = DEFAULT_READ_WEIGHT` (the planner's own weight) and `q = SEARCH_RATE = 100` searches per read pass (the rate of E050's agent trace; a workload assumption).
-  - Search cost (`search`) is the kernel's decode cost per grep-like query (100 deterministic identifier queries) through `Repo::search`, with any index the store holds; the baseline searches by decoding every distinct file. Graph corpora have no search term. Every search result must equal a scan of the original bytes (a hard gate).
-  - Read cost (`read_whole`) is what reading every distinct file once costs: decoded bytes weighted by each codec's decode time relative to zstd (`codec::*_READ`, measured by `codec_decode_speeds`), plus function work. The baseline's (`read_baseline`) is decoding each distinct file once with zstd. For graph corpora (since E039; distinct graphs since E042) the kernel's read cost is reading every distinct version's graph once (`graph_nodes`), and the baseline's is decoding each distinct version's edge list once.
-  - `read_score` is the score of E034–E061 (no search) and `bytes_score` the one before E034 (bytes only), both still reported. Scores across E034 and E062 are not comparable.
+- **Score:** the `_summary.score`. Since E064 it is the geometric mean over corpora of the kernel's **monthly cost** over the baseline's (zstd + trained dictionary), under a stated workload at list prices:
+  - `cost = stored bytes x storage price + sum over operations (times per month x (CPU time x CPU price + peak memory x wall time x memory price))`.
+  - Prices (`examples/bench.rs`): storage $0.023 per GB-month, CPU $0.04 per vCPU-hour, memory $0.005 per GB-hour (approximate cloud on-demand list prices).
+  - Workload `MONTHLY` ("heavy", per corpus per month):
+    - ingest once;
+    - repack and fsck daily (30 each);
+    - 1,000 read passes over every file and 1,000 range reads of each;
+    - 100 searches per read pass (100,000);
+    - for a graph corpus, a read pass reads every version's graph.
+  - Everything is measured, not modelled:
+    - CPU time is process CPU time across all threads;
+    - memory is peak heap from a counting allocator;
+    - storage is stored bytes;
+    - the baseline's operations are measured the same way: dictionary training and compression for ingest, decompression for reads, decompress and scan for search, decompress and hash for fsck.
+  - Per corpus: `vs_baseline_cost`, with each side's cost by part under `ops.kernel_usd` and `ops.baseline_usd`.
+  - **Timing noise:** repeated operations run at least 5 times and at least 300 ms, and the median is used. Two runs agree within about 5% per corpus and 1.5% overall, but never byte-for-byte.
+  - A change is kept only if the score improves by more than the spread of two runs on both runs. Sizes and the deterministic proxies below must still be identical across runs.
+  - `proxy_score` (E062: bytes + 0.001 x (decoded bytes + 100 x search)), `read_score` (E034–E061) and `bytes_score` (before E034) are deterministic and still reported. Scores across E034, E062 and E064 are not comparable.
   - Lower is better; below 1.0 means the kernel beats a strong conventional baseline.
   - Every corpus weighs the same, whatever its size.
-- **Hard gates:** every file must reconstruct byte-for-byte and `fsck` must be clean, or the run aborts. A failing gate is a failed experiment, never a score.
+- **Hard gates:** every file must reconstruct byte-for-byte, every search result must equal a scan of the original bytes, and `fsck` must be clean, or the run aborts. A failing gate is a failed experiment, never a score.
 - **Reported, not scored:** per-corpus bytes, `vs_dict` ratios and times; since E028, read costs (`read_whole`, `read_4k`: bytes decompressed + bytes produced by functions, over every distinct file, for whole reads and 4 KiB range reads; deterministic).
   - Sizes are deterministic and reproduce exactly. Times are noisy.
   - A change that worsens time by more than 2× must say so in its result.
