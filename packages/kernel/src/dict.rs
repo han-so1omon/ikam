@@ -37,7 +37,10 @@
 //! versions share bytes. Only these: derivation records must stay readable
 //! without the ledger they make up.
 
-use std::io::Read;
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex, OnceLock};
+
+use zstd::zstd_safe::DDict;
 
 use crate::group::{put_varint, varint};
 use crate::{Error, Id, Repo, Store, codec};
@@ -170,21 +173,57 @@ pub(crate) fn count_decode(n: usize, weight: usize) {
     DECOMPRESSED.with(|d| d.set(d.get() + n * weight));
 }
 
+/// A dictionary to decode with: raw bytes (loaded per frame), or prepared
+/// once per process (E068: loading rebuilds zstd's tables, which costs more
+/// than decoding a small frame).
+#[derive(Clone, Copy)]
+pub(crate) enum Dict<'a> {
+    Raw(&'a [u8]),
+    Prepared(&'a DDict<'static>),
+}
+
+/// `dict` (content `id`) prepared for decoding, built once per process.
+pub(crate) fn prepared(id: &Id, dict: &[u8]) -> Arc<DDict<'static>> {
+    type Cache = Mutex<HashMap<Id, Arc<DDict<'static>>>>;
+    static CACHE: OnceLock<Cache> = OnceLock::new();
+    let mut cache = CACHE.get_or_init(Cache::default).lock().unwrap();
+    cache
+        .entry(*id)
+        .or_insert_with(|| Arc::new(DDict::create(dict)))
+        .clone()
+}
+
 /// Decode at most the first `limit` bytes of a frame: zstd decodes
 /// sequentially, so a prefix costs only its own length.
 pub(crate) fn unzstd_prefix(frame: &[u8], dict: &[u8], limit: usize) -> Option<Vec<u8>> {
-    use zstd::zstd_safe::{DCtx, DParameter, FrameFormat};
+    unzstd_prefix_with(frame, Dict::Raw(dict), limit)
+}
+
+pub(crate) fn unzstd_prefix_with(frame: &[u8], dict: Dict, limit: usize) -> Option<Vec<u8>> {
+    use zstd::zstd_safe::{DCtx, DParameter, FrameFormat, InBuffer, OutBuffer};
     let mut ctx = DCtx::create();
     ctx.set_parameter(DParameter::Format(FrameFormat::Magicless))
         .ok()?;
-    if !dict.is_empty() {
-        ctx.load_dictionary(dict).ok()?;
+    match dict {
+        Dict::Raw([]) => {}
+        Dict::Raw(raw) => drop(ctx.load_dictionary(raw).ok()?),
+        Dict::Prepared(ddict) => drop(ctx.ref_ddict(ddict).ok()?),
     }
-    let mut out = Vec::new();
-    zstd::stream::read::Decoder::with_context(frame, &mut ctx)
-        .take(limit as u64)
-        .read_to_end(&mut out)
-        .ok()?;
+    // Stream until the frame ends or `limit` bytes are out.
+    let (mut out, mut input, mut chunk) = (Vec::new(), InBuffer::around(frame), [0u8; 1 << 16]);
+    while out.len() < limit {
+        let mut buf = OutBuffer::around(&mut chunk[..]);
+        let left = ctx.decompress_stream(&mut buf, &mut input).ok()?;
+        let n = buf.pos();
+        out.extend_from_slice(&chunk[..n]);
+        if left == 0 {
+            break; // the frame is complete
+        }
+        if n == 0 && input.pos() == frame.len() {
+            return None; // truncated
+        }
+    }
+    out.truncate(limit);
     count_decode(out.len(), 1);
     Some(out)
 }
@@ -208,7 +247,7 @@ pub(crate) fn block_frames(bytes: &[u8], dict: &[u8], block: usize) -> Option<Ve
 
 /// The blocks of a `block_frames` body overlapping `start..end`, decoded:
 /// their first byte's offset in the content, and their bytes.
-fn unblock(mut body: &[u8], dict: &[u8], start: usize, end: usize) -> Option<(usize, Vec<u8>)> {
+fn unblock(mut body: &[u8], dict: Dict, start: usize, end: usize) -> Option<(usize, Vec<u8>)> {
     let (block, count) = (varint(&mut body).filter(|&b| b > 0)?, varint(&mut body)?);
     let lens: Vec<usize> = (0..count)
         .map(|_| varint(&mut body))
@@ -217,7 +256,7 @@ fn unblock(mut body: &[u8], dict: &[u8], start: usize, end: usize) -> Option<(us
     let mut at = lens[..first].iter().sum::<usize>();
     let mut out = Vec::new();
     for &n in lens.get(first..last)? {
-        out.extend(unzstd_frame(body.get(at..at + n)?, dict)?);
+        out.extend(unzstd_prefix_with(body.get(at..at + n)?, dict, usize::MAX)?);
         at += n;
     }
     Some((first * block, out))
@@ -452,7 +491,7 @@ impl<S: Store> Repo<S> {
         check: &dyn Fn(usize, &[u8]) -> bool,
     ) -> Result<(usize, Vec<u8>), Error> {
         let body = encoded.get(1 + DICT_REF_LEN..).ok_or(Error::Corrupt(*id))?;
-        let decode = |d: &[u8]| unblock(body, d, start, end).filter(|(o, b)| check(*o, b));
+        let decode = |d: Dict| unblock(body, d, start, end).filter(|(o, b)| check(*o, b));
         self.with_dict(id, encoded, &decode)
     }
 
@@ -468,7 +507,7 @@ impl<S: Store> Repo<S> {
     ) -> Result<Vec<u8>, Error> {
         let frame = &encoded[at + DICT_REF_LEN..];
         self.with_dict(id, encoded, &|d| {
-            unzstd_prefix(frame, d, limit).filter(|out| check(out))
+            unzstd_prefix_with(frame, d, limit).filter(|out| check(out))
         })
     }
 
@@ -479,19 +518,19 @@ impl<S: Store> Repo<S> {
         &self,
         id: &Id,
         encoded: &[u8],
-        attempt: &dyn Fn(&[u8]) -> Option<T>,
+        attempt: &dyn Fn(Dict) -> Option<T>,
     ) -> Result<T, Error> {
         let dict = dict_of(encoded).ok_or(Error::Corrupt(*id))?;
         if let Some((current, bytes)) = self.dictionary()
             && names(&dict, current)
-            && let Some(out) = attempt(bytes)
+            && let Some(out) = attempt(Dict::Prepared(&prepared(current, bytes)))
         {
             return Ok(out);
         }
         for candidate in &self.store.ids_with_prefix(&dict)? {
             if let Ok(bytes) = decode_basic(candidate, &self.store.read(candidate)?)
                 && Id::of_content(&bytes) == *candidate
-                && let Some(out) = attempt(&bytes)
+                && let Some(out) = attempt(Dict::Prepared(&prepared(candidate, &bytes)))
             {
                 return Ok(out);
             }
