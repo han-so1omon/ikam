@@ -23,6 +23,7 @@ How we improve the kernel: one fixed command, one score, hard gates, one hypothe
     - storage is stored bytes;
     - the baseline's operations are measured the same way: dictionary training and compression for ingest, decompression for reads, decompress and scan for search, decompress and hash for fsck.
   - Per corpus: `vs_baseline_cost`, with each side's cost by part under `ops.kernel_usd` and `ops.baseline_usd`.
+  - The planner is given the exchange rate the score implies (E069). `read_weight = (1,000 + 100,000 decodes per month) x 1 ns per decoded byte x the CPU price / the storage price`, about 49 stored bytes per decoded byte. Decode cost counts zstd bytes at 1, bytes read as stored at 1/8 (BLAKE3 verification 0.25 ns/B against zstd's 2.2), and the other codecs by their measured weights.
   - **Timing noise:** repeated operations run at least 5 times and at least 300 ms, and the median is used. Two runs agree within about 5% per corpus and 1.5% overall, but never byte-for-byte.
   - A change is kept only if the score improves by more than the spread of two runs on both runs. Sizes and the deterministic proxies below must still be identical across runs.
   - `proxy_score` (E062: bytes + 0.001 x (decoded bytes + 100 x search)), `read_score` (E034–E061) and `bytes_score` (before E034) are deterministic and still reported. Scores across E034, E062 and E064 are not comparable.
