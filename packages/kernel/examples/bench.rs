@@ -980,13 +980,15 @@ const CPU_USD_PER_HOUR: f64 = 0.04;
 const RAM_USD_PER_GB_HOUR: f64 = 0.005;
 
 /// The heavy workload the score assumes (E064), per corpus per month: its
-/// history written once, a repack and a verification daily, 1,000 read
+/// history written once, a repack and a verification daily (since E067 the
+/// first repack, then 29 of a store left as the last repack left it), 1,000 read
 /// passes over every file (and 1,000 range reads of each), and
 /// `SEARCH_RATE` searches per read pass (E050). A graph corpus's read is
 /// reading every version's graph. A workload assumption, not a measurement.
-const MONTHLY: [(&str, f64); 6] = [
+const MONTHLY: [(&str, f64); 7] = [
     ("ingest", 1.0),
-    ("repack", 30.0),
+    ("repack", 1.0),
+    ("repack_again", 29.0),
     ("read", 1_000.0),
     ("range", 1_000.0),
     ("search", 1_000.0 * SEARCH_RATE),
@@ -1323,6 +1325,8 @@ fn main() {
             repo.search_sample = grep_queries(&files, 20, SAMPLE_QUERIES);
         }
         let (_, repack_cost) = measure(1, || repo.repack().unwrap());
+        // A daily repack mostly finds the store as the last one left it (E067).
+        let (_, repack_again) = measure(1, || repo.repack().unwrap());
         let (repack, repack_ms) = (stored(&repo), repack_cost.ms as u128);
         let exact = match graph {
             // Every version's graph, read back from its commit, is the one stored.
@@ -1351,7 +1355,14 @@ fn main() {
         let fsck = repo.fsck().unwrap().is_empty();
         let ((zstd_files, zstd_dict), baseline_ingest) = measure(1, || baselines(&snapshots));
         let (mut kernel_ops, mut baseline_ops) = operation_profile(&repo, &snapshots, graph);
-        kernel_ops.splice(0..0, [("ingest", ingest_cost), ("repack", repack_cost)]);
+        kernel_ops.splice(
+            0..0,
+            [
+                ("ingest", ingest_cost),
+                ("repack", repack_cost),
+                ("repack_again", repack_again),
+            ],
+        );
         baseline_ops.insert(0, ("ingest", baseline_ingest));
         // The score (E064): monthly cost under the heavy workload, kernel
         // against baseline, with real CPU time, memory and storage.
