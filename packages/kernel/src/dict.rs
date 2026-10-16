@@ -167,16 +167,18 @@ thread_local! {
 /// (function output) leaves out. A measurement for benchmarks; the
 /// difference between two calls is what one read cost.
 pub fn decode_cost() -> usize {
-    DECOMPRESSED.with(|d| d.get()) / DECODE_UNITS
+    DECOMPRESSED.with(|d| d.get())
 }
 
 /// Counting units per zstd-equivalent byte, so cheaper-than-zstd reads
 /// count in whole units.
 pub(crate) const DECODE_UNITS: usize = 8;
 
-/// Count `n` bytes read at `units` (`DECODE_UNITS` per zstd-equivalent byte).
+/// Count `n` bytes read at `units` (`DECODE_UNITS` per zstd-equivalent
+/// byte), rounded per call, so a read counts the same whatever came before.
 pub(crate) fn count_decode(n: usize, units: usize) {
-    DECOMPRESSED.with(|d| d.set(d.get() + n * units));
+    let cost = (n * units + DECODE_UNITS / 2) / DECODE_UNITS;
+    DECOMPRESSED.with(|d| d.set(d.get() + cost));
 }
 
 /// A dictionary to decode with: raw bytes (loaded per frame), or prepared
