@@ -38,9 +38,11 @@ pub(crate) fn read_weight(tag: u8) -> f64 {
         b'R' => BROTLI_READ as f64,
         b'P' => PPMD_READ as f64,
         // Stored bytes are copied and verified, not decoded: 1/8 of zstd
-        // (E069; BLAKE3 0.25 ns/B against zstd's 2.2), as `decode_cost`
+        // (E069; BLAKE3 0.25 ns/B against zstd's 2.2), or 1/64 with a CRC
+        // instead (E074; copy and CRC-32 about 0.03 ns/B), as `decode_cost`
         // counts them.
-        b'B' => 1.0 / crate::dict::DECODE_UNITS as f64,
+        b'B' => crate::dict::RAW_UNITS as f64 / crate::dict::DECODE_UNITS as f64,
+        b'W' => crate::dict::CHECKED_UNITS as f64 / crate::dict::DECODE_UNITS as f64,
         _ => 1.0,
     }
 }

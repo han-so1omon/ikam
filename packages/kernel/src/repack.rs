@@ -389,7 +389,7 @@ impl<S: Store + Sync> Repo<S> {
         for id in self.store.ids()? {
             let stored = self.store.read(&id)?;
             let encoded = match stored.first() {
-                Some(b'B' | b'Z' | b'Y') => {
+                Some(b'B' | b'W' | b'Z' | b'Y') => {
                     let bytes = self.decode_plain(&id, &stored)?;
                     if Id::of_content(&bytes) != id {
                         return Err(Error::Corrupt(id));
@@ -521,7 +521,7 @@ impl<S: Store + Sync> Repo<S> {
         let mut bases = Bases::default();
         for id in self.store.ids()? {
             let stored = self.store.read(&id)?;
-            if !matches!(stored[0], b'B' | b'Z' | b'Y') || Some(id) == dict {
+            if !matches!(stored[0], b'B' | b'W' | b'Z' | b'Y') || Some(id) == dict {
                 continue;
             }
             let bytes = self.decode_plain(&id, &stored)?;

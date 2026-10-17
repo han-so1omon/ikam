@@ -269,7 +269,11 @@ impl<S: Store> Repo<S> {
         let mut err = Error::NotFound(*id);
         match self.store.read(id) {
             Ok(encoded) => match self.decode_plain(id, &encoded) {
-                Ok(bytes) if Id::of_content(&bytes) == *id => return self.remember(id, bytes, cx),
+                Ok(bytes)
+                    if crate::dict::self_verified(&encoded) || Id::of_content(&bytes) == *id =>
+                {
+                    return self.remember(id, bytes, cx);
+                }
                 Ok(_) | Err(Error::Corrupt(_)) => err = Error::Corrupt(*id),
                 Err(e) => return Err(e),
             },

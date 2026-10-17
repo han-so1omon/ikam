@@ -2,6 +2,7 @@
 //!
 //! Stored bytes are encoded as the smallest of:
 //!   "B" bytes | "Z" zstd(bytes) | "Y" dict[4] zstd_with_dict(bytes)
+//!   | "W" crc32[4] bytes   (stored as is with its own check, only from repack)
 //!   | "S" group[8] start:varint len:varint   (bytes of a group, see `group.rs`)
 //!   | "X" .lzma(bytes) | "R" brotli(bytes) | "P" ppmd(bytes)   (only from repack, see `codec.rs`)
 //!   | "K" dict[4] block count { frame_len } frames   (a group in blocks, only from repack)
@@ -58,8 +59,34 @@ type DictRef = [u8; DICT_REF_LEN];
 pub(crate) fn is_plain(encoded: &[u8]) -> bool {
     matches!(
         encoded.first(),
-        Some(b'B' | b'Z' | b'Y' | b'X' | b'R' | b'P' | b'K' | b'S' | b'Q')
+        Some(b'B' | b'W' | b'Z' | b'Y' | b'X' | b'R' | b'P' | b'K' | b'S' | b'Q')
     )
+}
+
+/// `bytes` stored as is with a CRC-32: "W" crc32_le[4] bytes (E074). A read
+/// checks the CRC instead of hashing the bytes against their id: it catches
+/// damaged storage for about the cost of a copy, where BLAKE3 costs 10-20x
+/// more. It does not catch bytes swapped on purpose (fsck still hashes them
+/// all); what binds the bytes to their id is that repack verified them
+/// before writing the encoding.
+pub(crate) fn checked_raw(bytes: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(bytes.len() + 5);
+    out.push(b'W');
+    out.extend_from_slice(&crc32fast::hash(bytes).to_le_bytes());
+    out.extend_from_slice(bytes);
+    out
+}
+
+/// The bytes of a "W" body, if its CRC matches.
+fn unchecked_raw(body: &[u8]) -> Option<&[u8]> {
+    let (crc, bytes) = body.split_at_checked(4)?;
+    (crc32fast::hash(bytes).to_le_bytes() == crc).then_some(bytes)
+}
+
+/// True if decoding `encoded` already verified its output (by the
+/// encoding's own check), so a read need not hash it against its id.
+pub(crate) fn self_verified(encoded: &[u8]) -> bool {
+    encoded.first() == Some(&b'W')
 }
 
 /// The id prefix of the stored content an encoding cannot be decoded
@@ -172,7 +199,11 @@ pub fn decode_cost() -> usize {
 
 /// Counting units per zstd-equivalent byte, so cheaper-than-zstd reads
 /// count in whole units.
-pub(crate) const DECODE_UNITS: usize = 8;
+pub(crate) const DECODE_UNITS: usize = 64;
+/// Units per byte stored as is: copied and hashed ("B", 1/8 of zstd) or
+/// copied and CRC-checked ("W", 1/64; see `codec::read_weight`).
+pub(crate) const RAW_UNITS: usize = DECODE_UNITS / 8;
+pub(crate) const CHECKED_UNITS: usize = 1;
 
 /// Count `n` bytes read at `units` (`DECODE_UNITS` per zstd-equivalent
 /// byte), rounded per call, so a read counts the same whatever came before.
@@ -273,7 +304,12 @@ fn unblock(mut body: &[u8], dict: Dict, start: usize, end: usize) -> Option<(usi
 fn decode_basic(id: &Id, encoded: &[u8]) -> Result<Vec<u8>, Error> {
     match encoded.split_first() {
         Some((b'B', bytes)) => {
-            count_decode(bytes.len(), 1);
+            count_decode(bytes.len(), RAW_UNITS);
+            Ok(bytes.to_vec())
+        }
+        Some((b'W', body)) => {
+            let bytes = unchecked_raw(body).ok_or(Error::Corrupt(*id))?;
+            count_decode(bytes.len(), CHECKED_UNITS);
             Ok(bytes.to_vec())
         }
         Some((b'Z', z)) => unzstd_frame(z, &[]).ok_or(Error::Corrupt(*id)),
@@ -330,10 +366,12 @@ impl<S: Store> Repo<S> {
     /// read everything once, see `Repo::recompress`).
     pub(crate) fn encode_cheapest(&self, bytes: &[u8], reads: usize) -> Vec<u8> {
         let mut best = self.encode_plain(bytes);
-        // Stored as is: more bytes, nothing to decode (E069).
-        let raw = [&b"B"[..], bytes].concat();
-        if self.cost(&raw, reads) < self.cost(&best, reads) {
-            best = raw;
+        // Stored as is: more bytes, nothing to decode (E069); with a CRC,
+        // 4 bytes more and a cheaper check on read (E074).
+        for raw in [[&b"B"[..], bytes].concat(), checked_raw(bytes)] {
+            if self.cost(&raw, reads) < self.cost(&best, reads) {
+                best = raw;
+            }
         }
         for (tag, encode, _) in codec::CODECS.iter().filter(|c| c.2) {
             if let Some(c) = encode(bytes) {
@@ -444,7 +482,7 @@ impl<S: Store> Repo<S> {
         }
     }
 
-    /// The first `limit` bytes of a plain encoding ("B", "Z", "Y", "X", "R" or "P"), if
+    /// The first `limit` bytes of a plain encoding ("B", "W", "Z", "Y", "X", "R", "P" or "Q"), if
     /// they pass `check`. Nothing here verifies the whole content's id, so
     /// `check` must verify what the caller uses (a group member's own id).
     pub(crate) fn decode_prefix(
@@ -457,9 +495,14 @@ impl<S: Store> Repo<S> {
         let out = match encoded.split_first() {
             Some((b'B', bytes)) => {
                 let out = bytes[..limit.min(bytes.len())].to_vec();
-                count_decode(out.len(), 1);
+                count_decode(out.len(), RAW_UNITS);
                 Some(out)
             }
+            // The CRC covers the whole body, so the whole body is checked.
+            Some((b'W', body)) => unchecked_raw(body).map(|bytes| {
+                count_decode(bytes.len(), CHECKED_UNITS);
+                bytes[..limit.min(bytes.len())].to_vec()
+            }),
             Some((b'Z', z)) => unzstd_prefix(z, &[], limit),
             Some((b'X', x)) => codec::unxz_prefix(x, limit),
             Some((b'R', r)) => codec::unbrotli_prefix(r, limit),
@@ -591,7 +634,10 @@ mod tests {
             .flat_map(|i| format!("row {i}: some words {}\n", i % 17).into_bytes())
             .collect();
         let hot = repo.encode_cheapest(&text, 1 << 40);
-        assert!(matches!(hot[0], b'Z' | b'B'), "a hot frame keeps zstd");
+        assert!(
+            matches!(hot[0], b'Z' | b'B' | b'W'),
+            "a hot frame keeps zstd"
+        );
         let cold = repo.encode_cheapest(&text, 0);
         assert!(cold.len() <= hot.len());
         assert_eq!(
@@ -600,6 +646,26 @@ mod tests {
         );
     }
     use crate::MemStore;
+
+    /// A "W" read checks its CRC, not the id (E074): damage is an error,
+    /// and only fsck, which hashes every content, sees bytes swapped with a
+    /// matching CRC.
+    #[test]
+    fn checked_raw_reads_check_their_crc() {
+        let mut repo = Repo::new(MemStore::default());
+        let text = b"some stored text".to_vec();
+        let id = repo.put_content(&text).unwrap().id;
+        repo.store.replace(id, &checked_raw(&text)).unwrap();
+        assert_eq!(repo.read_content(&id).unwrap(), text);
+        let mut damaged = checked_raw(&text);
+        damaged[7] ^= 1;
+        repo.store.replace(id, &damaged).unwrap();
+        assert!(matches!(repo.read_content(&id), Err(Error::Corrupt(_))));
+        repo.store
+            .replace(id, &checked_raw(b"other bytes"))
+            .unwrap();
+        assert!(!repo.fsck().unwrap().is_empty());
+    }
 
     fn sample(n: usize) -> Vec<u8> {
         (0..n)
