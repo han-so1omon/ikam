@@ -3,9 +3,11 @@
 //! Laws (tested in tests/):
 //! - `read_content(put_content(x).id) == x`, and the id is `Id::of_content(x)`
 //!   however `x` is stored: as bytes, or only through derivations.
-//! - Every result is checked against its id. A corrupt stored copy falls
-//!   through to the id's derivations; if none reproduces the bytes, the read
-//!   fails. Corruption is an error, never data.
+//! - Every result is checked against its id, or, for bytes stored as is
+//!   with a CRC ("W", E074), against that CRC: repack verified them against
+//!   their id before writing it, and fsck hashes them. A corrupt stored copy
+//!   falls through to the id's derivations; if none reproduces the bytes,
+//!   the read fails. Corruption is an error, never data.
 //! - Derivations enter the ledger only after they reproduce their output.
 
 use std::collections::{BTreeMap, HashMap};
