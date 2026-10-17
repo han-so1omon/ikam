@@ -250,7 +250,7 @@ impl<S: Store> Repo<S> {
         let mut items: Vec<(Vec<u8>, Id, usize)> = Vec::new();
         for id in self.store.ids()? {
             let stored = self.store.read(&id)?;
-            if matches!(stored.first(), Some(b'B' | b'Z' | b'Y')) && Some(id) != dict {
+            if matches!(stored.first(), Some(b'B' | b'W' | b'Z' | b'Y')) && Some(id) != dict {
                 let bytes = self.decode_plain(&id, &stored)?;
                 if !bytes.is_empty() && bytes.len() < GROUP_SIZE {
                     items.push((bytes, id, stored.len()));
