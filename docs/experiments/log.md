@@ -1145,3 +1145,36 @@ Newest last. Format and rules: `README.md`.
   - repo-graph was the single largest term in the score. It now favours the kernel.
 - Remaining corpora above 1.0: synthetic-history (4.2–4.4), invoices (2.8), office (1.9–2.1), transcripts (1.1–1.3). E072 named the cause: the kernel verifies every read with BLAKE3, and the baseline verifies nothing.
 - Verdict: **kept** (benchmark correction). Score values before E073 overstate repo-graph's cost.
+
+### E074 checked-raw (verification chosen per encoding)
+- Branch / parent: exp/074-checked-raw / E073
+- Hypothesis: E072 found that most of the kernel's remaining read cost on content stored raw (E069) is the BLAKE3 hash every read computes against the id (0.17–1.1 ns/B measured, against 0.012–0.044 ns/B for CRC-32 and 0.01–0.06 ns/B for the copy itself; microbenchmark on this machine, 512 B to 1 MiB). The user chose option 3: content stored as is is checked with a fast checksum, while decoded and derived content keeps BLAKE3. If the checksum belongs to the encoding, the planner can price it like any other decode cost.
+- Change:
+  - New plain encoding `"W" crc32_le[4] bytes` (`dict::checked_raw`).
+  - A read checks the CRC, and `rebuild` skips the id hash for it (`dict::self_verified`). A damaged body reads as `Corrupt`, so the read falls through to derivations as before.
+  - `encode_cheapest` offers it alongside "B". It costs 4 bytes more and is priced at a read weight of 1/64 of zstd, against 1/8 for "B". `DECODE_UNITS` went from 8 to 64 so that 1/64 counts in whole units; "B" counts are unchanged.
+  - Repack and grouping treat "W" like "B".
+  - fsck still hashes every content with BLAKE3.
+  - `crc32fast` (already in the lockfile through flate2) is now a direct, pinned dependency.
+  - New test `checked_raw_reads_check_their_crc`: damage is an error, and fsck catches bytes swapped under a matching CRC.
+- What it does not protect against: bytes swapped on purpose, with a matching CRC, in the store. A read returns them until fsck runs (30 times a month under `MONTHLY`). Accepted by the user as option 3.
+- Result (two runs; tests, clippy and fmt clean; every corpus exact with a clean fsck; every search exact; deterministic fields identical across runs): score 0.9688 / 0.9938 -> **0.6271 / 0.6061**. Stored bytes grew 4 B per "W" object, at most 0.44% (md, 301,753 -> 303,085). bytes_score 5.2310 -> 5.2350; proxy_score 3.4269 -> 3.4084.
+
+  | corpus | E073 | E074 | kernel read pass CPU |
+  |---|---|---|---|
+  | invoices | 2.817 / 2.796 | **0.800 / 0.771** | 0.075 -> 0.013 ms |
+  | synthetic-history | 4.179 / 4.363 | **1.689 / 1.662** | 0.236 -> 0.066–0.079 ms |
+  | office | 2.089 / 1.867 | **1.661 / 1.632** | 1.31 -> 0.42 ms |
+  | transcripts | 1.263 / 1.138 | **0.670 / 0.678** | 1.34 -> 0.72–0.75 ms |
+  | structured | 0.890 / 0.883 | 0.522 / 0.497 | 3.48 -> 1.51–1.54 ms |
+  | generated | 0.444 / 0.420 | 0.288 / 0.259 | 0.26 -> 0.11 ms |
+  | pdf | 0.410 / 0.491 | 0.337 / 0.333 | 0.10 -> 0.02 ms |
+  | repo-history | 0.392 / 0.386 | 0.265 / 0.226 | 3.71 -> 1.44–1.48 ms |
+  | md | 0.477 / 0.669 | 0.604 / 0.630 (within E073's spread) | 0.33 -> 0.10 ms |
+  | repo-graph | 0.774 / 0.770 | 0.770 / 0.771 (graph chunks are objects, still hashed) | unchanged |
+
+- What it shows:
+  - The planner chose "W" for every content it stores raw. "B" remains only for a 1-byte content in repo-history.
+  - Two corpora are still above 1.0: office and synthetic-history (each about 1.65).
+- Seen while reading the code, not changed here (one hypothesis per branch): for "Y", "Q", "X", "R" and "P", `decode_plain` checks the decoded bytes against the id, and then `rebuild` hashes them a second time. That is two BLAKE3 passes per read of compressed content.
+- Verdict: **kept**. Improves beyond the two-run spread on both runs.
