@@ -85,14 +85,16 @@ fn unchecked_raw(body: &[u8]) -> Option<&[u8]> {
 
 /// True if `decode_plain` already verified the output of `encoded`, so a
 /// read need not hash it again (E075: reads of these hashed it twice). "W"
-/// checks its CRC (E074); the others check the bytes against the id while
-/// decoding (to pick among dictionaries or bases, or a group member's own
-/// id). Only "B" and "Z" come back unverified.
+/// checks its CRC (E074), a checksummed frame zstd's checksum (E076); the
+/// others check the bytes against the id while decoding (to pick among
+/// dictionaries or bases, or a group member's own id). Only "B" and a "Z"
+/// without a checksum come back unverified.
 pub(crate) fn self_verified(encoded: &[u8]) -> bool {
-    matches!(
-        encoded.first(),
-        Some(b'W' | b'Y' | b'X' | b'R' | b'P' | b'Q' | b'K' | b'S')
-    )
+    frame_checked(encoded)
+        || matches!(
+            encoded.first(),
+            Some(b'W' | b'Y' | b'X' | b'R' | b'P' | b'Q' | b'K' | b'S')
+        )
 }
 
 /// The id prefix of the stored content an encoding cannot be decoded
@@ -144,13 +146,30 @@ pub(crate) fn names(prefix: &[u8], id: &Id) -> bool {
     id.as_bytes().starts_with(prefix)
 }
 
-/// zstd at `level` in the kernel's frame format: no magic number, content size,
-/// checksum or dictionary id. The encoding around a frame already says what
-/// it is, and decoded bytes are always checked against their id, so those
-/// fields would only repeat what is known (up to ~10 B per stored object).
+/// zstd at `level` in the kernel's frame format: no magic number, content size
+/// or dictionary id. The encoding around a frame already says what it is, so
+/// those fields would only repeat what is known. Frames repack keeps
+/// (`STORE_LEVEL`) carry zstd's content checksum (E076): zstd checks it
+/// against the decoded bytes, so a whole read is verified for the cost of
+/// XXH64 instead of BLAKE3 (see `frame_checked`). The checksum is of the
+/// bytes encoded, which every writer has hashed into the id.
 /// `dict` empty means no dictionary.
 pub(crate) fn zstd_frame(bytes: &[u8], dict: &[u8], level: i32) -> Option<Vec<u8>> {
-    framer_at(dict, level)?.compress(bytes).ok()
+    framer_at(dict, level, level == STORE_LEVEL)?
+        .compress(bytes)
+        .ok()
+}
+
+/// True if a "Z", "Y" or "Q" encoding's frame carries zstd's content
+/// checksum (bit 2 of a magicless frame's header descriptor).
+pub(crate) fn frame_checked(encoded: &[u8]) -> bool {
+    let at = match encoded.first() {
+        Some(b'Z') => 1,
+        Some(b'Y') => 1 + DICT_REF_LEN,
+        Some(b'Q') => 33,
+        _ => return false,
+    };
+    encoded.get(at).is_some_and(|h| h & 0x04 != 0)
 }
 
 /// zstd level for estimates (growing groups, scoring dictionaries, comparing
@@ -163,10 +182,10 @@ pub(crate) const STORE_LEVEL: i32 = 19;
 /// A compressor for `zstd_frame`'s format at `MEASURE_LEVEL`, reusable
 /// across many inputs.
 pub(crate) fn framer(dict: &[u8]) -> Option<zstd::bulk::Compressor<'static>> {
-    framer_at(dict, MEASURE_LEVEL)
+    framer_at(dict, MEASURE_LEVEL, false)
 }
 
-fn framer_at(dict: &[u8], level: i32) -> Option<zstd::bulk::Compressor<'static>> {
+fn framer_at(dict: &[u8], level: i32, checksum: bool) -> Option<zstd::bulk::Compressor<'static>> {
     use zstd::zstd_safe::{CParameter, FrameFormat};
     let mut c = match dict.is_empty() {
         true => zstd::bulk::Compressor::new(level).ok()?,
@@ -175,7 +194,7 @@ fn framer_at(dict: &[u8], level: i32) -> Option<zstd::bulk::Compressor<'static>>
     for p in [
         CParameter::Format(FrameFormat::Magicless),
         CParameter::ContentSizeFlag(false),
-        CParameter::ChecksumFlag(false),
+        CParameter::ChecksumFlag(checksum),
         CParameter::DictIdFlag(false),
     ] {
         c.set_parameter(p).ok()?;
@@ -278,9 +297,11 @@ pub(crate) fn unzstd_prefix_with(frame: &[u8], dict: Dict, limit: usize) -> Opti
 /// with `dict`, so a member read decodes only the blocks it overlaps (as in
 /// zstd's seekable format). Stored as "K" dict[4] body.
 pub(crate) fn block_frames(bytes: &[u8], dict: &[u8], block: usize) -> Option<Vec<u8>> {
+    // Blocks are read in part, where a checksum is never reached.
+    let mut framer = framer_at(dict, STORE_LEVEL, false)?;
     let frames: Vec<Vec<u8>> = bytes
         .chunks(block)
-        .map(|c| zstd_frame(c, dict, STORE_LEVEL))
+        .map(|c| framer.compress(c).ok())
         .collect::<Option<_>>()?;
     let mut out = Vec::new();
     put_varint(&mut out, block);
@@ -476,7 +497,12 @@ impl<S: Store> Repo<S> {
     pub(crate) fn decode_plain(&self, id: &Id, encoded: &[u8]) -> Result<Vec<u8>, Error> {
         match encoded.first() {
             Some(b'Y' | b'X' | b'R' | b'P' | b'Q') => {
-                self.decode_prefix(id, encoded, usize::MAX, &|b| Id::of_content(b) == *id)
+                // A whole checksummed frame is checked by zstd, which also
+                // rejects a wrong dictionary or base.
+                let checked = frame_checked(encoded);
+                self.decode_prefix(id, encoded, usize::MAX, &|b| {
+                    checked || Id::of_content(b) == *id
+                })
             }
             Some(b'K') => {
                 let whole = |_: usize, b: &[u8]| Id::of_content(b) == *id;
@@ -531,7 +557,7 @@ impl<S: Store> Repo<S> {
             return Err(Error::Corrupt(*base));
         }
         let bytes = self.decode_plain(base, &stored)?;
-        (Id::of_content(&bytes) == *base)
+        (self_verified(&stored) || Id::of_content(&bytes) == *base)
             .then_some(bytes)
             .ok_or(Error::Corrupt(*base))
     }
@@ -671,6 +697,37 @@ mod tests {
             repo.store.replace(id, &wrong).unwrap();
             assert!(matches!(repo.read_content(&id), Err(Error::Corrupt(_))));
         }
+    }
+
+    /// A frame repack keeps carries zstd's checksum, and a read relies on it
+    /// instead of the id (E076): damage is an error; fsck, which hashes
+    /// every content, sees another content's frame swapped in.
+    #[test]
+    fn checksummed_frames_are_checked_by_zstd() {
+        let mut repo = Repo::new(MemStore::default());
+        let text: Vec<u8> = (0..400)
+            .flat_map(|i| format!("row {i}\n").into_bytes())
+            .collect();
+        let id = repo.put_content(&text).unwrap().id;
+        let frame = [&b"Z"[..], &zstd_frame(&text, &[], STORE_LEVEL).unwrap()].concat();
+        assert!(frame_checked(&frame) && self_verified(&frame));
+        assert!(!frame_checked(
+            &[&b"Z"[..], &zstd_frame(&text, &[], MEASURE_LEVEL).unwrap()].concat()
+        ));
+        repo.store.replace(id, &frame).unwrap();
+        assert_eq!(repo.read_content(&id).unwrap(), text);
+        let mut damaged = frame.clone();
+        let last = damaged.len() - 6;
+        damaged[last] ^= 0x10;
+        repo.store.replace(id, &damaged).unwrap();
+        assert!(matches!(repo.read_content(&id), Err(Error::Corrupt(_))));
+        let other = [
+            &b"Z"[..],
+            &zstd_frame(b"other bytes", &[], STORE_LEVEL).unwrap(),
+        ]
+        .concat();
+        repo.store.replace(id, &other).unwrap();
+        assert!(!repo.fsck().unwrap().is_empty());
     }
 
     /// A "W" read checks its CRC, not the id (E074): damage is an error,
