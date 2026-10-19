@@ -83,10 +83,16 @@ fn unchecked_raw(body: &[u8]) -> Option<&[u8]> {
     (crc32fast::hash(bytes).to_le_bytes() == crc).then_some(bytes)
 }
 
-/// True if decoding `encoded` already verified its output (by the
-/// encoding's own check), so a read need not hash it against its id.
+/// True if `decode_plain` already verified the output of `encoded`, so a
+/// read need not hash it again (E075: reads of these hashed it twice). "W"
+/// checks its CRC (E074); the others check the bytes against the id while
+/// decoding (to pick among dictionaries or bases, or a group member's own
+/// id). Only "B" and "Z" come back unverified.
 pub(crate) fn self_verified(encoded: &[u8]) -> bool {
-    encoded.first() == Some(&b'W')
+    matches!(
+        encoded.first(),
+        Some(b'W' | b'Y' | b'X' | b'R' | b'P' | b'Q' | b'K' | b'S')
+    )
 }
 
 /// The id prefix of the stored content an encoding cannot be decoded
@@ -465,9 +471,8 @@ impl<S: Store> Repo<S> {
         self.decode_object(id, self.store.read(id)?)
     }
 
-    /// Decode any plain encoding. Unverified (callers check the result
-    /// against its id), except that a dictionary is accepted only if its
-    /// output does.
+    /// Decode any plain encoding. Verified against `id` for the encodings
+    /// `self_verified` names; callers check the others ("B", "Z").
     pub(crate) fn decode_plain(&self, id: &Id, encoded: &[u8]) -> Result<Vec<u8>, Error> {
         match encoded.first() {
             Some(b'Y' | b'X' | b'R' | b'P' | b'Q') => {
@@ -646,6 +651,27 @@ mod tests {
         );
     }
     use crate::MemStore;
+
+    /// Encodings that `self_verified` names are read without a second hash
+    /// (E075), so their decoding must reject well-formed bytes of another
+    /// content.
+    #[test]
+    fn self_verified_encodings_reject_other_content() {
+        let mut repo = Repo::new(MemStore::default());
+        let text: Vec<u8> = (0..500)
+            .flat_map(|i| format!("a {i}\n").into_bytes())
+            .collect();
+        let other: Vec<u8> = (0..500)
+            .flat_map(|i| format!("b {i}\n").into_bytes())
+            .collect();
+        let id = repo.put_content(&text).unwrap().id;
+        for (tag, encode, _) in codec::CODECS {
+            let wrong = [&[tag][..], &encode(&other).unwrap()].concat();
+            assert!(self_verified(&wrong));
+            repo.store.replace(id, &wrong).unwrap();
+            assert!(matches!(repo.read_content(&id), Err(Error::Corrupt(_))));
+        }
+    }
 
     /// A "W" read checks its CRC, not the id (E074): damage is an error,
     /// and only fsck, which hashes every content, sees bytes swapped with a
