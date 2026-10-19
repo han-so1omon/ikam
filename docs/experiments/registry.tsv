@@ -75,3 +75,4 @@ E071	contiguous-id-hash	change	kept	main	cost	read-path,speed	no	contiguous BLAK
 E072	memmem-search	benchmark	reference	main	cost	search,benchmark	no	equal substring search in kernel and baseline
 E073	graph-read-baseline	benchmark	reference	main	cost	graph,benchmark	no	baseline graph read parses edge lists into nodes
 E074	checked-raw	change	kept	main	cost	read-path,verification	no	raw bytes with a CRC-32 checked on read; fsck keeps BLAKE3
+E075	single-hash	change	kept	main	cost	read-path,verification	no	no second hash for encodings decode already verified (neutral)
