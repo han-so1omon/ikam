@@ -1185,3 +1185,28 @@ Newest last. Format and rules: `README.md`.
 - Change: `dict::self_verified` names those encodings as well as "W", and `rebuild` does not hash their output again. Only "B" and "Z" come back from `decode_plain` unverified. New test `self_verified_encodings_reject_other_content`: well-formed frames of another content, stored under an id, read as `Corrupt` for every codec in the table.
 - Result (two runs; tests, clippy and fmt clean; every corpus exact with a clean fsck; every search exact; sizes and every deterministic field identical to E074): score 0.6271 / 0.6061 -> 0.6076 / 0.5900. **Not beyond the two-run spread on both runs**: run 1 (0.6076) is above E074's better run (0.6061). Read CPU per pass is unchanged within noise on every corpus. As expected, under the E069 read weight the hot content is stored raw ("W"), and compressed content is rarely read in the workload.
 - Verdict: **kept**, stated as not a measured improvement (as with E071). It removes redundant work without changing what a read guarantees.
+
+### E076 frame-checksum (zstd's own check per frame)
+- Branch / parent: exp/076-frame-checksum / E075
+- Plan change, stated before the work: E074's report proposed "proofs at admission plus leaf checks, with explicit promotion" (a decoder-version fingerprint, recorded by repack). Reading the code showed a simpler mechanism. A zstd frame can carry its content checksum, which zstd checks against the decoded bytes on every whole read. The checksum is computed over the bytes that were encoded, and every writer has hashed those bytes into the id. So each frame binds itself to its id when written and re-checks the reconstruction on every read, whatever decoder version runs. No proof store or version fingerprint is needed for zstd frames. Promotion and fingerprint machinery would matter only for encodings that cannot check themselves (derivations, i.e. program outputs). It was not built, because nothing measured shows it would pay (see below).
+- Hypothesis: frames that repack keeps carry zstd's checksum (4 B each). Reads of "Z", "Y" and "Q" accept it instead of BLAKE3, the same pattern as E074's "W".
+- Change:
+  - Frames written at `STORE_LEVEL` carry the checksum. Block frames ("K") do not, because blocks are read in part.
+  - `frame_checked` reads the header bit. `self_verified` includes checksummed "Z". Decoding "Y" and "Q" skips the id check when the frame is checksummed, and the checksum also rejects a wrong dictionary or base.
+  - `related_base` no longer re-hashes a verified base.
+  - fsck still hashes everything.
+  - New test `checksummed_frames_are_checked_by_zstd`.
+- Result (two runs; tests and clippy clean; every corpus exact with a clean fsck; every search exact): score 0.6076 / 0.5900 -> 0.5983 / 0.6026, **within noise**. Read CPU per pass is unchanged on every corpus. Stored bytes went up by 4–393 B per corpus: tree objects' frames also got checksums they never use.
+- What it shows: under the E069 read weight, hot content is stored raw ("W"), so compressed frames are rarely read in this workload. The same reasoning says a derivation-proof step (the "E077" proposed in the report) would not pay now: reads build almost nothing through derivations. Where the kernel's monthly cost now goes (E076 run 1, share of kernel cost):
+
+  | corpus | ratio | top costs |
+  |---|---|---|
+  | office | 1.60 | repack 73%, search 14%, storage 10% |
+  | synthetic-history | 1.68 | search 58%, repack 29%, storage 11% |
+  | md | 0.67 | repack 62%, search 33% |
+  | transcripts | 0.66 | search 80% |
+  | structured | 0.53 | search 71%, repack 20% |
+  | repo-graph | 0.50 | graph read 96% |
+
+  The baseline's cost is 96–98% search on every file corpus. So the kernel's remaining levers are the first monthly repack and search, not verification.
+- Verdict: **discarded** (neutral, with more bytes). Kept on its branch. It would pay under a workload that reads compressed content often, for example a colder read weight or an archive profile.
