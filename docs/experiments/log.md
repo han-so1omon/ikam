@@ -1178,3 +1178,10 @@ Newest last. Format and rules: `README.md`.
   - Two corpora are still above 1.0: office and synthetic-history (each about 1.65).
 - Seen while reading the code, not changed here (one hypothesis per branch): for "Y", "Q", "X", "R" and "P", `decode_plain` checks the decoded bytes against the id, and then `rebuild` hashes them a second time. That is two BLAKE3 passes per read of compressed content.
 - Verdict: **kept**. Improves beyond the two-run spread on both runs.
+
+### E075 single-hash (one verification per read of compressed content)
+- Branch / parent: exp/075-single-hash / E074
+- Hypothesis: for "Y", "Q", "X", "R", "P", "K" and "S", `decode_plain` already checks the decoded bytes against the id. That check picks the right dictionary or base, or checks a group member's own id. `rebuild` then hashed the same bytes again. Skipping the second hash saves one BLAKE3 pass per read of compressed content, with the same guarantee.
+- Change: `dict::self_verified` names those encodings as well as "W", and `rebuild` does not hash their output again. Only "B" and "Z" come back from `decode_plain` unverified. New test `self_verified_encodings_reject_other_content`: well-formed frames of another content, stored under an id, read as `Corrupt` for every codec in the table.
+- Result (two runs; tests, clippy and fmt clean; every corpus exact with a clean fsck; every search exact; sizes and every deterministic field identical to E074): score 0.6271 / 0.6061 -> 0.6076 / 0.5900. **Not beyond the two-run spread on both runs**: run 1 (0.6076) is above E074's better run (0.6061). Read CPU per pass is unchanged within noise on every corpus. As expected, under the E069 read weight the hot content is stored raw ("W"), and compressed content is rarely read in the workload.
+- Verdict: **kept**, stated as not a measured improvement (as with E071). It removes redundant work without changing what a read guarantees.
