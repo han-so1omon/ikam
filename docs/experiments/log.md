@@ -1420,3 +1420,31 @@ Newest last. Format and rules: `README.md`.
 
     The whole bench ran in 38.7 / 38.4 s, against 109.3 / 107.5 s.
 - Verdict: **kept** (identical output, much less CPU; the score's noise hides it, as with E071 and E075).
+
+### E089 chunk-search (search what is shared once)
+- Branch / parent: exp/089-chunk-search / E088
+- Hypothesis: after E087–E088, search is the largest kernel cost on most corpora (62–85%), and several corpora are versions of the same data. A search that scans each distinct content-defined chunk once, plus each distinct seam between neighbouring chunks, does work in proportion to the distinct bytes rather than the total. Exact by construction: every chunk but a content's last is at least `MIN_CHUNK` (256 B) and longer patterns fall back to a scan, so a match lies inside a chunk or across one seam.
+- Change (`src/search.rs`):
+  - A second index kind next to trigrams, stored under the same ref. A gear-hash content-defined chunking (256 B to 8 KiB, about 1 KiB average). Each distinct chunk is owned by the largest content holding it.
+  - Contents that own under a quarter of their own bytes (a version's few new chunks) have those chunks kept inside the index, so they are not read at search time.
+  - When loaded, the distinct seams and the contents behind each chunk and seam are derived. A query scans each once and marks the contents behind each hit.
+  - Planning picks none, trigrams or chunks by the existing cost (stored bytes + read weight x search rate x measured work). Two planning fixes:
+    - **Scans are now priced.** Each scanned byte counts 2/64 of a zstd byte (memmem measured at about 0.08 ns/B against zstd's 2.2). Before, scanning content stored as is cost the planner almost nothing.
+    - A chunk index must also beat the alternative by 25% (`CHUNK_MARGIN`). On transcripts the work units estimated chunks 5% cheaper than trigrams, while measured they were 16% slower; elsewhere both estimate and measurement put chunks 75–90% cheaper.
+  - New test `chunk_search_matches_a_full_scan`: patterns in chunks, across every seam of a version, longer than a chunk, and in uncovered contents.
+- Intermediate runs (recorded, not kept):
+  - Without scan pricing, no chunk index was ever chosen.
+  - With scans priced on only one path (a partial edit), chunk indexes were chosen where they were slower: invalid, rerun.
+  - Without inlining, every synthetic-history version owned its new tail and was read in full: search did not speed up.
+  - Without the margin, transcripts went 0.65 -> 1.0.
+- Result (two runs; tests, clippy and fmt clean; every corpus exact with a clean fsck; every search exact): score 0.4323 / 0.4149 -> **0.3465 / 0.3595**. Beyond the spread on both runs.
+
+  | corpus | search CPU per query | cost ratio |
+  |---|---|---|
+  | synthetic-history | 0.069 -> 0.022 ms | 1.36 / 1.41 -> **0.65 / 0.70** |
+  | structured | 1.54 -> 0.31 / 0.35 ms | 0.43 / 0.38 -> **0.13 / 0.14** |
+  | transcripts (trigrams kept) | 0.73 -> 0.70 ms | 0.65 / 0.67 -> 0.52 / 0.62 (noise) |
+
+  Index bytes: synthetic-history +1,427 B, structured +3,560 B (its trigram index replaced). **For the first time, no corpus costs more than the baseline.** The highest is office at 0.80 / 0.82.
+- What it shows: dedup pays in compute as well as storage. Search work follows distinct bytes once the shared structure is known.
+- Verdict: **kept**.
