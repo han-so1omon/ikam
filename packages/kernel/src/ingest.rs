@@ -198,7 +198,9 @@ impl<S: Store> Repo<S> {
         bytes: &[u8],
         depth: usize,
     ) -> Result<Option<Candidate>, Error> {
-        let Some((manifest, members)) = container::plan_zip(bytes) else {
+        let Some((manifest, members)) =
+            container::plan_zip(bytes).or_else(|| container::plan_zlib(bytes))
+        else {
             return Ok(None);
         };
         // Members are stored whatever is chosen: they are content in their

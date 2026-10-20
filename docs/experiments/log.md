@@ -1240,3 +1240,52 @@ Newest last. Format and rules: `README.md`.
   - multiformat's bytes are 87% pdf (763,683 kernel B). The kernel expands zip members but not PDF streams, so its fonts and content stay deflated and opaque.
 - Next hypotheses, one per branch: E078 larger dictionaries; E079 several dictionaries by clustering; E080 PDF streams expanded like zip members; then cross-format context (md as the zstd context of its html and docx).
 - Verdict: **reference** (analysis; adds `examples/cross.rs` and `fixtures/multiformat`, 3.0 MB).
+
+### E078 larger-dictionary (dictionaries up to 1 MiB)
+- Branch / parent: exp/078-larger-dictionary (not kept; a one-line change) / E077
+- Hypothesis: E077's probe estimated one 300 KB dictionary 5.7% smaller than the 112,640 B cap on the cases' mixed samples. Raise the cap of the dictionary sizes tried (`total / 100, / 30, / 10`) to 1 MiB; each size is still chosen only if the re-plans find it smaller.
+- Result (`examples/cross.rs`, read weight 0.001):
+  - cases: unchanged (one store 400,092 B). The planner still chose a 41,888 B dictionary for the mixed store, against 158,618 B of dictionaries across the five per-type stores.
+  - multiformat: one store 894,449 -> 890,702; pdf store 763,683 -> 769,884.
+- What it shows: the limit is one dictionary serving five kinds of content, not its size.
+- Verdict: **discarded** (mixed, within 0.7%). Not benchmarked: the north-star measurement already refutes it.
+
+### E079 dictionary-clusters (a dictionary per cluster of content)
+- Branch / parent: exp/079-dictionary-clusters / E077
+- Hypothesis: a store of mixed content needs several dictionaries. Change:
+  - Repack clusters the samples in two, split first by their first bytes, then reassigned to the dictionary (zstd-trained per round) that compresses them best, for 3 rounds.
+  - Each cluster's dictionary is chosen as the single one is.
+  - The clustered plan is offered only if estimated more than 3% smaller.
+  - Further dictionaries live under a new ref `meta/zstd-dicts` (a content listing their ids). `compress` tries each, and a "Y" read finds them by prefix, cached.
+  - Grouping, Q bases, recompress, prune and ingest's deletes all treat every dictionary as the current one.
+  - New test `further_dictionaries_encode_and_decode`.
+- Result (`examples/cross.rs`, read weight 0.001):
+  - cases office store 162,293 -> 167,591 (+3.3%), data 51,736 -> 53,194; split total 385,960 -> 392,716.
+  - multiformat office 62,608 -> 55,024 (-12%).
+  - **Both one-graph stores unchanged.** Their clustered estimate (643,540) never beat the best single dictionary's (632,616).
+  - Earlier rounds with raw (untrained) dictionaries formed worse clusters (estimates up to 30% worse).
+- What it shows: two-way clustering does not match five kinds of content, and the zstd-only estimate (no dedup, level 3) misleads the choice. A cluster count chosen by measured gain (bisecting while it pays) is untested.
+- Verdict: **discarded** (does not reach its hypothesis; mixed per store). Code on its branch.
+
+### E080 zlib-streams (deflate streams inside any file expanded)
+- Branch / parent: exp/080-zlib-streams / E077
+- Hypothesis: multiformat's bytes are 87% PDF, and the kernel expands zip members but not the zlib streams inside other files. A probe (`docs/research/recompression.md`) found that 255 of the 24 PDFs' 275 FlateDecode streams re-deflate exactly with zlib, and that the inflated streams compress solid to 138,390 B (from 843,494 B deflated). Expanding them as members of the existing `deflate-pack` function should shrink the PDFs and let shared fonts and content dedup across files.
+- Change:
+  - New `container::plan_zlib`: a valid zlib header, a deflate stream that ends, and the Adler-32 after it matching the inflated bytes (at least 64 B). Each stream that re-deflates exactly at some zlib level becomes a member. Header and checksum stay literal.
+  - `plan_zip` and `plan_zlib` share one manifest builder. Ingest tries `plan_zip`, then `plan_zlib`.
+  - No new function: `deflate-pack` already rebuilds "literal segments + deflate at a recorded level".
+  - No file type is named.
+  - New test `zlib_streams_expand_and_rebuild`.
+- Result:
+  - `examples/cross.rs` (read weight 0.001), multiformat:
+
+    | | before | after |
+    |---|---|---|
+    | pdf store | 763,683 | **437,094 (-43%)** |
+    | split total | 881,988 | 555,399 |
+    | one store | 894,449 | **554,151 (-38%)** |
+    | one store vs baseline | 0.79x | **0.49x** |
+
+    One graph is now 0.2% smaller than the per-type stores (was 1.4% larger). The cases corpus is unchanged: its PDFs (reportlab) have no deflate streams.
+  - Bench (two runs; tests, clippy and fmt clean; every corpus exact with a clean fsck; every stored size and deterministic field identical to E075): score 0.6181 / 0.6001 against 0.6076 / 0.5900, within noise. No bench corpus holds a planable zlib stream: office goes through `plan_zip`, and images are not in the bench. Ingest time unchanged.
+- Verdict: **kept** (neutral on the bench, -38% on the north-star corpus).
