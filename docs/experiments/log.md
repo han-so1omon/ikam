@@ -1358,3 +1358,13 @@ Newest last. Format and rules: `README.md`.
     - With it, repack CPU is equal or lower: transcripts 6,871 -> 5,795 ms, invoices 795 -> 625 ms. Under the heavy read weight, most contexts are ruled out before compression.
 - What it shows: much less than the probe, because most html and md contents are members of groups ("S"), and recompress never considers Q or M for group members. Grouping is decided before, and by bytes alone. Next: let grouping compete with the context encodings.
 - Verdict: **kept**.
+
+### E085 context-before-groups (keep context-encodable contents out of groups)
+- Branch / parent: exp/085-context-before-groups (not kept) / E084
+- Hypothesis: E084's "M" rarely applied because grouping comes first: in multiformat's one store, all 24 html and all 24 md files were group members ("S"), which recompress never gives a context. Before grouping, reserve (keep plain) each content whose Q or M estimate (MEASURE_LEVEL, read-priced) costs under 0.4 of its cost alone, together with the contexts it would use.
+- Result (`examples/cross.rs`, read weight 0.001):
+  - The reserve worked as intended per file. In the one store, 11 html and 12 md files became "M", at 300–1,400 B each, against about 9 KB of html raw. Many contexts were another format's content: docx XML and pdf members holding the same words.
+  - Totals got worse: multiformat one store 377,488 -> 378,638, cases one store 391,496 -> 396,922. Office split 162,273 -> 158,035.
+  - The groups left behind lost members that gave them context, and the reserved contexts must stay plain (no chains).
+- What it shows: the context graph has to be chosen jointly (which contents serve as plain hubs, which are encoded against them), not greedily in store order with a fixed threshold.
+- Verdict: **discarded**.
