@@ -148,10 +148,15 @@ impl<S: Store + Sync> Repo<S> {
         // Plans are independent: build them in parallel, then compare them in
         // a fixed order, so the choice never depends on scheduling.
         let dicts = train_dictionaries(&stored, DICT_SHORTLIST);
-        let options: Vec<(Option<&[u8]>, bool)> = (dicts.iter().map(|d| Some(d.as_slice())))
-            .chain([None])
+        // Without a dictionary, re-planned without induction only (E090):
+        // the plan a graph's reads need, at a quarter of the re-plans.
+        let mut options: Vec<(Option<&[u8]>, bool)> = (dicts.iter().map(|d| Some(d.as_slice())))
             .flat_map(|d| [(d, false), (d, true)])
             .collect();
+        options.push((None, false));
+        if dicts.is_empty() {
+            options.push((None, true));
+        }
         let plans: Vec<Result<Repo<MemStore>, Error>> = std::thread::scope(|scope| {
             let workers: Vec<_> = (options.iter())
                 .map(|&(d, induce)| {
