@@ -120,7 +120,7 @@ impl<S: Store> Repo<S> {
         // A dictionary, or the context of a "Q" encoding, is decoded from its
         // stored bytes and must stay stored.
         if let Some(old) = c.drop
-            && Some(old) != self.dictionary().map(|(id, _)| *id)
+            && !self.is_dictionary(&old)
             && !self.is_related_base(&old)?
         {
             self.store.delete(&old)?;
@@ -336,8 +336,7 @@ impl<S: Store> Repo<S> {
         let Ok(y_bytes) = self.decode_plain(&y, &stored) else {
             return Ok(None);
         };
-        let is_dict = self.dictionary().is_some_and(|(d, _)| *d == y);
-        if is_dict
+        if self.is_dictionary(&y)
             || !self.derivations(&y)?.is_empty()
             || template::decode_parts(&y_bytes).is_some()
         {

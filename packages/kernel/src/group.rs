@@ -246,11 +246,11 @@ impl<S: Store> Repo<S> {
     /// written only if it and its member entries are smaller than the
     /// members' current encodings.
     pub(crate) fn group_small(&mut self) -> Result<(), Error> {
-        let dict = self.dictionary().map(|(id, _)| *id);
         let mut items: Vec<(Vec<u8>, Id, usize)> = Vec::new();
         for id in self.store.ids()? {
             let stored = self.store.read(&id)?;
-            if matches!(stored.first(), Some(b'B' | b'W' | b'Z' | b'Y')) && Some(id) != dict {
+            if matches!(stored.first(), Some(b'B' | b'W' | b'Z' | b'Y')) && !self.is_dictionary(&id)
+            {
                 let bytes = self.decode_plain(&id, &stored)?;
                 if !bytes.is_empty() && bytes.len() < GROUP_SIZE {
                     items.push((bytes, id, stored.len()));

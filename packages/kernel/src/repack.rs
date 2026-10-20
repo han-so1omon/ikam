@@ -22,8 +22,8 @@ use std::cmp::Reverse;
 use std::collections::{BTreeSet, HashMap, HashSet};
 
 use crate::dict::{
-    DICT_REF, DICT_REF_LEN, MEASURE_LEVEL, STORE_LEVEL, block_frames, framer, is_plain, object_tag,
-    tree_content, zstd_frame,
+    DICT_REF, DICT_REF_LEN, DICTS_REF, MEASURE_LEVEL, STORE_LEVEL, block_frames, framer, is_plain,
+    object_tag, tree_content, zstd_frame,
 };
 use crate::group::{GROUP_REF_LEN, member_span};
 use crate::ingest::derivation_size;
@@ -145,15 +145,20 @@ impl<S: Store + Sync> Repo<S> {
         // Plans are independent: build them in parallel, then compare them in
         // a fixed order, so the choice never depends on scheduling.
         let dicts = train_dictionaries(&stored, DICT_SHORTLIST);
-        let options: Vec<(Option<&[u8]>, bool)> = (dicts.iter().map(|d| Some(d.as_slice())))
-            .chain([None])
-            .flat_map(|d| [(d, false), (d, true)])
+        // Mixed sources may compress better with a dictionary per kind (E079).
+        let clusters = dicts
+            .first()
+            .map_or_else(Vec::new, |best| cluster_dictionaries(&stored, best));
+        let options: Vec<(Vec<&[u8]>, bool)> = (dicts.iter().map(|d| vec![d.as_slice()]))
+            .chain([vec![]])
+            .chain((!clusters.is_empty()).then(|| clusters.iter().map(Vec::as_slice).collect()))
+            .flat_map(|d| [(d.clone(), false), (d, true)])
             .collect();
         let plans: Vec<Result<Repo<MemStore>, Error>> = std::thread::scope(|scope| {
             let workers: Vec<_> = (options.iter())
-                .map(|&(d, induce)| {
+                .map(|(d, induce)| {
                     let (this, files) = (&*self, &files);
-                    scope.spawn(move || this.replan(files, induce, d))
+                    scope.spawn(move || this.replan(files, *induce, d))
                 })
                 .collect();
             workers
@@ -209,6 +214,16 @@ impl<S: Store + Sync> Repo<S> {
             let current = self.store.get_ref(DICT_REF)?;
             self.store.set_ref(DICT_REF, current, *dict)?;
         }
+        match fresh.store.get_ref(DICTS_REF)? {
+            Some(list) => {
+                let current = self.store.get_ref(DICTS_REF)?;
+                self.store.set_ref(DICTS_REF, current, list)?;
+            }
+            None if self.store.get_ref(DICTS_REF)?.is_some() => {
+                self.set_extra_dictionaries(Vec::new())?;
+            }
+            None => {}
+        }
         self.reset_projections();
         // Objects the re-plan did not rebuild move to the new dictionary.
         self.level = STORE_LEVEL;
@@ -232,13 +247,16 @@ impl<S: Store + Sync> Repo<S> {
         &self,
         files: &[(Id, Vec<u8>)],
         induce: bool,
-        dict: Option<&[u8]>,
+        dicts: &[&[u8]],
     ) -> Result<Repo<MemStore>, Error> {
         let mut fresh = Repo::new(MemStore::default());
         fresh.read_weight = self.read_weight;
         fresh.proposed_order = self.proposed_order.clone();
-        if let Some(dict) = dict {
-            fresh.set_dictionary(dict.to_vec())?;
+        if let Some((first, rest)) = dicts.split_first() {
+            fresh.set_dictionary(first.to_vec())?;
+            if !rest.is_empty() {
+                fresh.set_extra_dictionaries(rest.iter().map(|d| d.to_vec()).collect())?;
+            }
         }
         let mut hints: HashMap<Id, Vec<Derivation>> = HashMap::new();
         for (id, _) in files {
@@ -290,9 +308,8 @@ impl<S: Store + Sync> Repo<S> {
     fn prune(&mut self, files: &[(Id, Vec<u8>)]) -> Result<(), Error> {
         let (content, records) =
             self.closure(files.iter().map(|(id, _)| *id).collect(), |_| true)?;
-        let dict = self.dictionary().map(|(id, _)| *id);
         for id in self.store.ids()? {
-            if !content.contains(&id) && !records.contains(&id) && Some(id) != dict {
+            if !content.contains(&id) && !records.contains(&id) && !self.is_dictionary(&id) {
                 self.store.delete(&id)?;
             }
         }
@@ -382,9 +399,8 @@ impl<S: Store + Sync> Repo<S> {
     /// id first.
     pub(crate) fn recompress(&mut self, roots: &[Id]) -> Result<(), Error> {
         self.level = STORE_LEVEL;
-        let dict = self.dictionary().map(|(id, _)| *id);
         let model = self.read_model(roots)?;
-        let bases = self.related_bases(dict)?;
+        let bases = self.related_bases()?;
         let (mut used, mut related) = (HashSet::new(), HashSet::new());
         for id in self.store.ids()? {
             let stored = self.store.read(&id)?;
@@ -395,7 +411,7 @@ impl<S: Store + Sync> Repo<S> {
                         return Err(Error::Corrupt(id));
                     }
                     let reads = model.reads(&id, bytes.len());
-                    let mut encoded = match Some(id) == dict {
+                    let mut encoded = match self.is_dictionary(&id) {
                         // A dictionary is never encoded against a dictionary.
                         true => zstd_frame(&bytes, &[], STORE_LEVEL)
                             .map_or(stored.clone(), |z| [&b"Z"[..], &z].concat()),
@@ -424,7 +440,7 @@ impl<S: Store + Sync> Repo<S> {
                     }
                     // Or with related stored content as the frame's context
                     // (E057): read costs that content's decoding too.
-                    if Some(id) != dict
+                    if !self.is_dictionary(&id)
                         && !used.contains(&id)
                         && let Some(base) = bases.most_related(&id, &bytes, &related)
                         && let Some(z) = zstd_frame(&bytes, &base.1, STORE_LEVEL)
@@ -517,11 +533,11 @@ impl<S: Store + Sync> Repo<S> {
 
     /// Contents stored plainly (not the dictionary) of at least
     /// `RELATED_MIN` bytes: the candidate contexts of "Q" encodings.
-    fn related_bases(&self, dict: Option<Id>) -> Result<Bases, Error> {
+    fn related_bases(&self) -> Result<Bases, Error> {
         let mut bases = Bases::default();
         for id in self.store.ids()? {
             let stored = self.store.read(&id)?;
-            if !matches!(stored[0], b'B' | b'W' | b'Z' | b'Y') || Some(id) == dict {
+            if !matches!(stored[0], b'B' | b'W' | b'Z' | b'Y') || self.is_dictionary(&id) {
                 continue;
             }
             let bytes = self.decode_plain(&id, &stored)?;
@@ -756,6 +772,72 @@ fn train_dictionaries(samples: &[&[u8]], k: usize) -> Vec<Vec<u8>> {
         }
     }
     shortlist.into_iter().map(|i| ranked[i].2.clone()).collect()
+}
+
+/// Dictionaries for samples of different kinds (E079), or none: the samples
+/// split in two by their first bytes, then each moved to the dictionary
+/// that compresses it best, for `ROUNDS` rounds of cheap raw dictionaries
+/// (`raw_dictionary`); then one trained dictionary per cluster. Offered to
+/// the planner only if estimated (`dictionary_cost`) to beat `best`, the
+/// best single dictionary, by more than `CLUSTER_GAIN`: a re-plan costs
+/// repack time. Two clusters only: more did not converge in the E077 probe.
+fn cluster_dictionaries(samples: &[&[u8]], best: &[u8]) -> Vec<Vec<u8>> {
+    const ROUNDS: usize = 3;
+    const CLUSTER_GAIN: f64 = 0.03;
+    let samples: Vec<&[u8]> = samples.iter().copied().filter(|b| !b.is_empty()).collect();
+    let n = samples.len();
+    if n < 16 {
+        return vec![];
+    }
+    let mut order: Vec<usize> = (0..n).collect();
+    order.sort_by_key(|&i| (&samples[i][..samples[i].len().min(8)], i));
+    let mut assign = vec![0; n];
+    order
+        .iter()
+        .enumerate()
+        .for_each(|(j, &i)| assign[i] = 2 * j / n);
+    let members = |assign: &[usize], c: usize| -> Vec<&[u8]> {
+        (0..n)
+            .filter(|&i| assign[i] == c)
+            .map(|i| samples[i])
+            .collect()
+    };
+    let size = |g: &[&[u8]]| (g.iter().map(|b| b.len()).sum::<usize>() / 30).clamp(4096, 112_640);
+    for _ in 0..ROUNDS {
+        let dicts: Vec<Vec<u8>> = (0..2)
+            .map(|c| {
+                let g = members(&assign, c);
+                zstd::dict::from_samples(&g, size(&g)).unwrap_or_else(|_| raw_dictionary(&g, size(&g)))
+            })
+            .collect();
+        let Some(mut framers) = dicts.iter().map(|d| framer(d)).collect::<Option<Vec<_>>>() else {
+            return vec![];
+        };
+        for (i, s) in samples.iter().enumerate() {
+            let mut len = |c: usize| framers[c].compress(s).map_or(usize::MAX, |z| z.len());
+            assign[i] = usize::from(len(1) < len(0));
+        }
+    }
+    let groups = [members(&assign, 0), members(&assign, 1)];
+    if groups.iter().any(|g| g.len() < 8) {
+        eprintln!("cluster: degenerate {} {}", groups[0].len(), groups[1].len());
+        return vec![];
+    }
+    // Each cluster's dictionary is chosen as the single one is.
+    let dicts: Vec<Vec<u8>> = groups
+        .iter()
+        .filter_map(|g| train_dictionaries(g, 1).into_iter().next())
+        .collect();
+    let estimate = |g: &[&[u8]], d: &[u8]| dictionary_cost(g, d).unwrap_or(usize::MAX);
+    let (Some(single), [a, b]) = (dictionary_cost(&samples, best), dicts.as_slice()) else {
+        return vec![];
+    };
+    let clustered = estimate(&groups[0], a).saturating_add(estimate(&groups[1], b));
+    eprintln!("cluster: n {} groups {} {} single {single} clustered {clustered}", n, groups[0].len(), groups[1].len());
+    match (clustered as f64) < single as f64 * (1.0 - CLUSTER_GAIN) {
+        true => dicts,
+        false => vec![],
+    }
 }
 
 /// Estimated stored size of `samples` given `dict` (empty: none): the
@@ -1074,7 +1156,7 @@ mod tests {
             .map(|d| (Id::of_content(&d), d))
             .collect();
         let plan = Repo::new(MemStore::default())
-            .replan(&files, true, None)
+            .replan(&files, true, &[])
             .unwrap();
         let templates: Vec<Id> = files
             .iter()
@@ -1140,7 +1222,7 @@ mod tests {
             .map(|d| (Id::of_content(d.as_bytes()), d.into_bytes()))
             .collect();
         let plan = Repo::new(MemStore::default())
-            .replan(&files, true, None)
+            .replan(&files, true, &[])
             .unwrap();
         let fill_of = |id: &Id| {
             plan.derivations(id)

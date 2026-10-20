@@ -83,6 +83,7 @@ pub struct Repo<S: Store> {
     ledger: OnceLock<Ledger>,
     /// Current shared dictionary (see `dict.rs`), loaded on first use.
     pub(crate) dict: OnceLock<Option<(Id, Vec<u8>)>>,
+    pub(crate) extra_dicts: OnceLock<Vec<(Id, Vec<u8>)>>,
     /// Encoded bytes newly written through this handle.
     pub bytes_written: usize,
     /// Evaluator weight of decode work against storage when choosing plans:
@@ -110,6 +111,7 @@ impl<S: Store> Repo<S> {
             index: None,
             ledger: OnceLock::new(),
             dict: OnceLock::new(),
+            extra_dicts: OnceLock::new(),
             bytes_written: 0,
             read_weight: DEFAULT_READ_WEIGHT,
             proposed_order: Vec::new(),
@@ -146,6 +148,7 @@ impl<S: Store> Repo<S> {
         self.index = None;
         self.ledger = OnceLock::new();
         self.dict = OnceLock::new();
+        self.extra_dicts = OnceLock::new();
     }
 
     /// Every recorded derivation of `id`.
