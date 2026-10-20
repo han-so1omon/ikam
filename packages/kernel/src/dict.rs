@@ -47,6 +47,9 @@ use crate::group::{put_varint, varint};
 use crate::{Error, Id, Repo, Store, codec};
 
 pub(crate) const DICT_REF: &str = "meta/zstd-dict";
+/// Ref to a content listing further dictionaries' ids (32 B each; E079):
+/// contents of different kinds compress better with their own.
+pub(crate) const DICTS_REF: &str = "meta/zstd-dicts";
 /// Mode-byte flag: a tree body with abbreviated ids (see `abbrev.rs`).
 const ABBREVIATED: u8 = 0x80;
 /// Mode: an uncompressed body (only worth it abbreviated).
@@ -335,12 +338,67 @@ impl<S: Store> Repo<S> {
             .as_ref()
     }
 
+    /// Dictionaries beyond the current one (E079), each readable and
+    /// verified; one that cannot be read is left out.
+    pub(crate) fn extra_dictionaries(&self) -> &[(Id, Vec<u8>)] {
+        self.extra_dicts.get_or_init(|| {
+            let read = |id: &Id| {
+                let bytes = decode_basic(id, &self.store.read(id).ok()?).ok()?;
+                (Id::of_content(&bytes) == *id).then_some(bytes)
+            };
+            let Some(list) = self
+                .store
+                .get_ref(DICTS_REF)
+                .ok()
+                .flatten()
+                .and_then(|l| read(&l))
+            else {
+                return Vec::new();
+            };
+            (list.chunks_exact(32))
+                .map(|c| Id::from_bytes(c.try_into().unwrap()))
+                .filter_map(|id| Some((id, read(&id)?)))
+                .collect()
+        })
+    }
+
+    /// True if `id` is the current or a further dictionary, or their list:
+    /// stored as "B" or "Z", so they decode without a dictionary.
+    pub(crate) fn is_dictionary(&self, id: &Id) -> bool {
+        self.dictionary().is_some_and(|(d, _)| d == id)
+            || self.extra_dictionaries().iter().any(|(d, _)| d == id)
+            || self.store.get_ref(DICTS_REF).ok().flatten() == Some(*id)
+    }
+
+    /// Store `dicts` as content and make them the further dictionaries.
+    pub(crate) fn set_extra_dictionaries(&mut self, dicts: Vec<Vec<u8>>) -> Result<(), Error> {
+        let mut list = Vec::new();
+        let mut kept = Vec::new();
+        for dict in dicts {
+            let id = self.store_dictionary(&dict)?;
+            list.extend_from_slice(id.as_bytes());
+            kept.push((id, dict));
+        }
+        let list_id = self.store_dictionary(&list)?;
+        let current = self.store.get_ref(DICTS_REF)?;
+        self.store.set_ref(DICTS_REF, current, list_id)?;
+        self.extra_dicts = kept.into();
+        Ok(())
+    }
+
+    /// Store a dictionary (or the list of them) as "B" or "Z", which
+    /// decode without a dictionary.
+    fn store_dictionary(&mut self, dict: &[u8]) -> Result<Id, Error> {
+        let id = Id::of_content(dict);
+        let z = zstd_frame(dict, &[], self.level).filter(|z| z.len() < dict.len());
+        let encoded = z.map_or_else(|| [&b"B"[..], dict].concat(), |z| [&b"Z"[..], &z].concat());
+        self.write(id, &encoded)?;
+        Ok(id)
+    }
+
     /// Store `dict` as content and make it the current dictionary.
     pub(crate) fn set_dictionary(&mut self, dict: Vec<u8>) -> Result<Id, Error> {
-        let id = Id::of_content(&dict);
-        let z = zstd_frame(&dict, &[], self.level).filter(|z| z.len() < dict.len());
-        let encoded = z.map_or_else(|| [&b"B"[..], &dict].concat(), |z| [&b"Z"[..], &z].concat());
-        self.write(id, &encoded)?;
+        let id = self.store_dictionary(&dict)?;
         let current = self.store.get_ref(DICT_REF)?;
         self.store.set_ref(DICT_REF, current, id)?;
         self.dict = Some((id, dict)).into();
@@ -357,11 +415,16 @@ impl<S: Store> Repo<S> {
         {
             best = Some((None, z));
         }
-        if let Some((id, dict)) = self.dictionary()
-            && let Some(z) = zstd_frame(bytes, dict, self.level)
-            && z.len() + DICT_REF_LEN < best.as_ref().map_or(bytes.len(), |b| b.1.len())
-        {
-            best = Some((Some(*id), z));
+        let dicts = self
+            .dictionary()
+            .into_iter()
+            .chain(self.extra_dictionaries());
+        for (id, dict) in dicts {
+            if let Some(z) = zstd_frame(bytes, dict, self.level)
+                && z.len() + DICT_REF_LEN < best.as_ref().map_or(bytes.len(), |b| b.1.len())
+            {
+                best = Some((Some(*id), z));
+            }
         }
         best
     }
@@ -589,11 +652,16 @@ impl<S: Store> Repo<S> {
         attempt: &dyn Fn(Dict) -> Option<T>,
     ) -> Result<T, Error> {
         let dict = dict_of(encoded).ok_or(Error::Corrupt(*id))?;
-        if let Some((current, bytes)) = self.dictionary()
-            && names(&dict, current)
-            && let Some(out) = attempt(Dict::Prepared(&prepared(current, bytes)))
-        {
-            return Ok(out);
+        let known = self
+            .dictionary()
+            .into_iter()
+            .chain(self.extra_dictionaries());
+        for (current, bytes) in known {
+            if names(&dict, current)
+                && let Some(out) = attempt(Dict::Prepared(&prepared(current, bytes)))
+            {
+                return Ok(out);
+            }
         }
         for candidate in &self.store.ids_with_prefix(&dict)? {
             if let Ok(bytes) = decode_basic(candidate, &self.store.read(candidate)?)
@@ -651,6 +719,31 @@ mod tests {
         );
     }
     use crate::MemStore;
+
+    /// Content of another kind compresses with a further dictionary (E079),
+    /// which decodes like the current one and is never itself encoded
+    /// against a dictionary.
+    #[test]
+    fn further_dictionaries_encode_and_decode() {
+        let mut repo = Repo::new(MemStore::default());
+        let prose = |i: usize| format!("Paragraph {i}: the quarterly review covers revenue.\n");
+        let rows = |i: usize| format!("{{\"id\": {i}, \"sku\": \"A-{}\", \"qty\": 3}}\n", i * 7);
+        let sample = |f: &dyn Fn(usize) -> String| (0..400).map(f).collect::<String>().into_bytes();
+        repo.set_dictionary(sample(&prose)).unwrap();
+        repo.set_extra_dictionaries(vec![sample(&rows)]).unwrap();
+        let extra = repo.extra_dictionaries()[0].0;
+        assert!(repo.is_dictionary(&extra));
+        let text: Vec<u8> = (900..960).map(rows).collect::<String>().into_bytes();
+        let id = repo.put_content(&text).unwrap().id;
+        let stored = repo.store.read(&id).unwrap();
+        assert_eq!(
+            dict_of(&stored),
+            Some(extra.as_bytes()[..DICT_REF_LEN].try_into().unwrap())
+        );
+        repo.reset_projections();
+        assert_eq!(repo.read_content(&id).unwrap(), text);
+        assert!(repo.fsck().unwrap().is_empty());
+    }
 
     /// Encodings that `self_verified` names are read without a second hash
     /// (E075), so their decoding must reject well-formed bytes of another

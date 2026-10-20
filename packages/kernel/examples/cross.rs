@@ -71,6 +71,13 @@ fn kernel(files: &[&(String, Vec<u8>)], read_weight: f64) -> usize {
     let tree = repo.put(&Object::tree(entries).unwrap()).unwrap();
     repo.commit("main", tree, "").unwrap();
     repo.repack().unwrap();
+    if let Some(d) = repo.store().get_ref("meta/zstd-dict").unwrap() {
+        eprintln!(
+            "dict {} B for {} files",
+            repo.read_content(&d).unwrap().len(),
+            files.len()
+        );
+    }
     assert!(
         files
             .iter()
@@ -78,12 +85,14 @@ fn kernel(files: &[&(String, Vec<u8>)], read_weight: f64) -> usize {
     );
     assert!(repo.fsck().unwrap().is_empty());
     let store = repo.store();
-    store
-        .ids()
-        .unwrap()
-        .iter()
-        .map(|id| store.read(id).unwrap().len())
-        .sum()
+    let mut kinds: BTreeMap<char, (usize, usize)> = BTreeMap::new();
+    for id in store.ids().unwrap() {
+        let e = store.read(&id).unwrap();
+        let k = kinds.entry(e[0] as char).or_default();
+        (k.0, k.1) = (k.0 + 1, k.1 + e.len());
+    }
+    eprintln!("  kinds {kinds:?}");
+    kinds.values().map(|k| k.1).sum()
 }
 
 /// zstd 3 with a dictionary trained on `files` (as the bench's baseline).
