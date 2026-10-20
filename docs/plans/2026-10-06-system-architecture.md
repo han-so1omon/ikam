@@ -193,3 +193,9 @@ Three things would make it concrete:
 | content search with an optional trigram index (exact: candidates are decoded and checked) | built (E058), reported, not scored | pays above 19-65 searches per read pass on generated, repo-history, office, md |
 | planner prices plans by the measured read term; repack accepts by the whole store and is a fixed point after one call | built (E059, E060) | score 0.2920 -> 0.2903 |
 | smaller search index | dropping common trigrams refuted (E061, on its branch); next: compress postings (bitmaps, key dictionary) | index bytes vs decode per query |
+| verification chosen per encoding: raw bytes with a CRC-32 ("W"), one hash per compressed read | built (E074, E075); zstd frame checksums tried and discarded while hot content is raw (E076) | score 0.97 -> 0.61 |
+| cross-source measurement: one graph against per-type stores (`examples/cross.rs`), and the `multiformat` corpus scored as one graph | built (E077, E081) | north star: one graph should be smaller than the per-type stores |
+| deflate streams inside any file expanded (zlib streams, PDF FlateDecode, at memLevel 8 or 9) | built (E080, E083) | multiformat one graph 894,449 -> 382,635 B (0.34x the baseline) |
+| two complementary contexts ("M": a content shaped like it plus its words in another format) | built (E084); joint choice of context hubs vs groups open (E085 refuted) | cases one graph -2.1%, multiformat -1.3% |
+| several dictionaries for mixed stores | refuted as tried (E078 larger, E079 two clusters) | one graph still uses one dictionary |
+| repack cost: one dictionary re-planned (E087), codecs skipped when their decode cost alone loses (E088) | built | score 0.58 -> 0.43; repack CPU -60% to -90% |
