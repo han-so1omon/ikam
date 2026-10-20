@@ -1368,3 +1368,31 @@ Newest last. Format and rules: `README.md`.
   - The groups left behind lost members that gave them context, and the reserved contexts must stay plain (no chains).
 - What it shows: the context graph has to be chosen jointly (which contents serve as plain hubs, which are encoded against them), not greedily in store order with a fixed threshold.
 - Verdict: **discarded**.
+
+### E086 shared-container-plans (container plans computed once per repack)
+- Branch / parent: exp/086-shared-container-plans (not kept) / E084
+- Hypothesis: profiling office's repack with timers inside the 12 parallel re-plans attributed 4–8.6 s of each re-plan's ingest to container planning (inflate plus the deflate level search, which E083 doubled). All 12 re-plans compute the same plans.
+- Change tried: a per-repack cache of `plan_zip` / `plan_zlib` results by content id, shared by the re-plans. First filled lazily, then precomputed in parallel before the re-plans start.
+- Result (bench, two runs each; stored bytes identical): office repack CPU 61.3 / 63.8 s -> 57.6 / 60.3 s (lazy) and 62.2 / 62.2 s (precomputed). No gain beyond noise.
+- What it shows: the timers were wrong. Twelve threads on 4 cores inflate per-thread wall time about 3x. Re-profiled with the re-plans run one at a time, each office re-plan takes 4–5.4 s: ingest 3.2–4.1 s, mostly members' slice and template candidates, which differ per re-plan. Container planning itself is small.
+- Verdict: **discarded**.
+
+### E087 fewer-replans (one dictionary re-planned, not five)
+- Branch / parent: exp/087-fewer-replans / E084
+- Hypothesis: the sequential profile (E086) shows every corpus runs 12 trial re-plans: 5 dictionaries (the 4 best estimates plus the best of each construction) and none, each with and without template induction. Each re-plan re-ingests the whole store. They are most of repack: office 56 of 64 s, repo-history 60 of 80 s, md 12 of 13 s. Repack is the largest kernel cost under the score. Re-plan only the best-estimated dictionary (and none), 4 re-plans instead of 12, and accept that the estimate (which ignores dedup) sometimes ranks wrong.
+- Change: `DICT_SHORTLIST` 4 -> 1, and `train_dictionaries` no longer adds the best of each construction.
+- Result (two runs; tests, clippy and fmt clean; every corpus exact with a clean fsck; every search exact): score 0.5829 / 0.5924 -> **0.4287 / 0.4930**. Improved beyond the spread on both runs.
+
+  | corpus | repack CPU | cost ratio | stored bytes |
+  |---|---|---|---|
+  | office | 61.3 / 63.8 -> 25.1 / 24.8 s | 1.62 / 1.75 -> **0.65 / 0.93** | = |
+  | repo-history | 84.9 / 84.6 -> 34.6 / 35.3 s | 0.22 / 0.23 -> 0.12 / 0.19 | -20,794 |
+  | multiformat | 42.4 / 41.9 -> 19.3 / 19.0 s | 0.36 / 0.38 -> 0.24 / 0.24 | -7,853 |
+  | md | 13.3 / 14.8 -> 4.7 / 4.7 s | 0.62 / 0.63 -> 0.36 / 0.42 | = |
+  | pdf | 2.2 / 1.9 -> 1.1 / 1.3 s | 0.44 / 0.34 -> 0.27 / 0.27 | -948 |
+  | structured | 45.5 / 44.2 -> 41.0 / 39.4 s (recompress dominates) | 0.51 / 0.46 -> 0.45 / 0.51 | -1,162 |
+
+  Fewer candidates gave *smaller* stores on four corpora: the re-plans are compared at the fast measuring level, and the plan that wins there is not always smallest after recompress at the store level. bytes_score 5.2273 -> 5.2222.
+- `examples/cross.rs` (read weight 0.001): one-graph stores unchanged (cases 391,496, multiformat 377,488). Per-type stores slightly larger (code 89,045 -> 92,499, md 63,305 -> 65,593), so the measured cross-type saving is now 0.0% and 2.0%.
+- Remaining above 1.0: synthetic-history only (1.65 / 1.61).
+- Verdict: **kept**.

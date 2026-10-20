@@ -86,3 +86,5 @@ E082	solid-groups	change	discarded	exp/082-solid-groups	cost	grouping,cross-sour
 E083	deflate-memlevel	change	kept	main	cost	containers,cross-source	no	zlib memLevel 9 streams reproduced; multiformat -31%
 E084	two-base-context	change	kept	main	cost	cross-source,encoding	yes	M: shape + words contexts; cases -2.1%, multiformat -1.3%
 E085	context-before-groups	change	discarded	exp/085-context-before-groups	cost	grouping,cross-source	yes	reserve context-encodable contents from groups; worse in total
+E086	shared-container-plans	change	discarded	exp/086-shared-container-plans	cost	repack,speed	no	container plans shared across re-plans; no CPU gain
+E087	fewer-replans	change	kept	main	cost	repack,speed,dictionary	no	one dictionary re-planned; repack CPU -60%, score 0.43/0.49

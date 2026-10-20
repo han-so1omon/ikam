@@ -43,8 +43,11 @@ pub struct Repacked {
     pub applied: bool,
 }
 
-/// Dictionary candidates re-planned in full per repack (best estimates).
-const DICT_SHORTLIST: usize = 4;
+/// Dictionary candidates re-planned in full per repack: the best estimate
+/// only (E087). Each re-plan re-ingests the whole store, most of a repack's
+/// CPU; with four best estimates plus the best of each construction, five
+/// dictionaries were re-planned.
+const DICT_SHORTLIST: usize = 1;
 
 impl<S: Store + Sync> Repo<S> {
     /// Re-plan storage of all live content (applied only if smaller and
@@ -741,13 +744,13 @@ fn template_groups(files: &[(Id, Vec<u8>)]) -> Vec<Vec<usize>> {
 }
 
 /// Candidate zstd dictionaries for `samples`, each estimated to save more
-/// than its own size: the `k` best estimates, plus the best of each
-/// construction not among them. Candidates are trained (COVER, zstd's
-/// trainer), raw evenly spaced pieces of the samples (relative Lempel-Ziv)
-/// and raw pieces of the most repeated content, at a few sizes: no
-/// construction or size wins on every corpus (COVER can return a tiny
-/// dictionary when asked for a large one). The estimate ignores dedup, so
-/// the re-plans decide among the shortlist, and every construction gets one.
+/// than its own size: the `k` best estimates. Candidates are trained
+/// (COVER, zstd's trainer), raw evenly spaced pieces of the samples
+/// (relative Lempel-Ziv) and raw pieces of the most repeated content, at a
+/// few sizes: no construction or size wins on every corpus (COVER can
+/// return a tiny dictionary when asked for a large one). The estimate
+/// ignores dedup; until E087 the best of each construction was also
+/// re-planned in full, so the re-plans decided.
 fn train_dictionaries(samples: &[&[u8]], k: usize) -> Vec<Vec<u8>> {
     let samples: Vec<&[u8]> = samples.iter().copied().filter(|b| !b.is_empty()).collect();
     let total: usize = samples.iter().map(|b| b.len()).sum();
@@ -772,15 +775,7 @@ fn train_dictionaries(samples: &[&[u8]], k: usize) -> Vec<Vec<u8>> {
         }
     }
     ranked.sort();
-    let mut shortlist: Vec<usize> = (0..k.min(ranked.len())).collect();
-    for construction in 0..3 {
-        if let Some(i) = ranked.iter().position(|r| r.1 == construction)
-            && !shortlist.contains(&i)
-        {
-            shortlist.push(i);
-        }
-    }
-    shortlist.into_iter().map(|i| ranked[i].2.clone()).collect()
+    ranked.into_iter().take(k).map(|r| r.2).collect()
 }
 
 /// Estimated stored size of `samples` given `dict` (empty: none): the
