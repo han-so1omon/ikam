@@ -412,6 +412,11 @@ impl<S: Store + Sync> Repo<S> {
                         && let Some((dict_id, dict_bytes)) = self.dictionary()
                     {
                         for block in BLOCKS.into_iter().filter(|&b| b < bytes.len()) {
+                            let floor = self.read_weight
+                                * model.block_reads(&id, bytes.len(), block) as f64;
+                            if floor >= cost {
+                                continue;
+                            }
                             let Some(body) = block_frames(&bytes, dict_bytes, block) else {
                                 continue;
                             };
