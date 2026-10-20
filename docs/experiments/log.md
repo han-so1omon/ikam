@@ -1448,3 +1448,15 @@ Newest last. Format and rules: `README.md`.
   Index bytes: synthetic-history +1,427 B, structured +3,560 B (its trigram index replaced). **For the first time, no corpus costs more than the baseline.** The highest is office at 0.80 / 0.82.
 - What it shows: dedup pays in compute as well as storage. Search work follows distinct bytes once the shared structure is known.
 - Verdict: **kept**.
+
+### E090 three-replans (no dictionary re-planned once, not twice)
+- Branch / parent: exp/090-two-replans / E089
+- Hypothesis: of E087's 4 re-plans (the best dictionary or none, each with and without template induction), the no-dictionary plans rarely win. Dropping them cuts repack CPU again.
+- Tried first: no dictionary re-planned only when no dictionary is estimated to pay (2 re-plans).
+  - Repack CPU fell 20–45%.
+  - But repo-graph lost the plan its graph reads need: stored bytes fell 50,013 -> 20,296, yet graph reads got slower, cost ratio 0.67 / 0.69 -> 1.07 / 0.79. md grew 999 B, and the score (0.3530 / 0.3217) was not beyond the spread.
+- Kept: no dictionary re-planned without induction only, so 3 re-plans (4 when no dictionary pays).
+- Result (two runs; tests and clippy clean; every corpus exact with a clean fsck; every search exact; **every stored size and deterministic field identical to E089**: the dropped plan never won):
+  - Score 0.3465 / 0.3595 -> 0.3393 / 0.3466. Run 2 is 0.0001 above E089's better run, so not beyond the spread on both runs.
+  - Repack CPU: office 18.7 -> 15.5 s, repo-history 20.4 -> 17.3 s, multiformat 11.6 -> 9.8 s, md 4.0 -> 3.4 s, generated 1.9 -> 1.5 s.
+- Verdict: **kept** (identical output, less CPU).

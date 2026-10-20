@@ -90,3 +90,4 @@ E086	shared-container-plans	change	discarded	exp/086-shared-container-plans	cost
 E087	fewer-replans	change	kept	main	cost	repack,speed,dictionary	no	one dictionary re-planned; repack CPU -60%, score 0.43/0.49
 E088	prune-codecs	change	kept	main	cost	repack,speed	no	codecs skipped when decode cost alone loses; identical bytes, repack CPU -25 to -90%
 E089	chunk-search	change	kept	main	cost	search,cross-source	yes	search each distinct chunk and seam once; score 0.43 -> 0.35, all corpora <= 1
+E090	three-replans	change	kept	main	cost	repack,speed	no	no-dictionary plan re-planned once; identical bytes, repack CPU -10 to -25%
