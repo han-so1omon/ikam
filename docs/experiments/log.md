@@ -1396,3 +1396,27 @@ Newest last. Format and rules: `README.md`.
 - `examples/cross.rs` (read weight 0.001): one-graph stores unchanged (cases 391,496, multiformat 377,488). Per-type stores slightly larger (code 89,045 -> 92,499, md 63,305 -> 65,593), so the measured cross-type saving is now 0.0% and 2.0%.
 - Remaining above 1.0: synthetic-history only (1.65 / 1.61).
 - Verdict: **kept**.
+
+### E088 prune-codecs (no codec run whose decode cost alone loses)
+- Branch / parent: exp/088-prune-codecs / E087
+- Hypothesis: after E087, recompress dominates some repacks (structured: 38 of 41 s). Under the heavy read weight, hot content ends up stored raw ("W"), yet `encode_cheapest` first compresses it with zstd at the store level (19) and brotli, and repack tries block frames for groups. A candidate's read cost (read weight x its decode weight x the bytes it decodes) is a lower bound on its total cost. When that bound already exceeds the best candidate's cost, the candidate cannot win, so it need not be built.
+- Change:
+  - `encode_cheapest` now evaluates the raw encodings ("B", "W") first, then builds zstd (`encode_plain`) and each active codec only if its decode-cost floor is below the best so far.
+  - The block ("K") trials in recompress skip a block size the same way.
+  - The pruning is exact: a skipped candidate could only have lost.
+- Result (two runs; tests, clippy and fmt clean; every corpus exact with a clean fsck; every search exact; **every stored size and deterministic field identical to E087**):
+  - Score 0.4287 / 0.4930 -> 0.4323 / 0.4149. Run 1 is not below E087's better run, so this is **not beyond the spread on both runs**.
+  - Repack CPU:
+
+    | corpus | before | after |
+    |---|---|---|
+    | structured | 41.0 / 39.4 s | **4.4 / 4.2 s** |
+    | repo-history | 34.6 / 35.3 s | 20.5 / 19.3 s |
+    | transcripts | 5.8 / 6.1 s | 2.7 / 2.7 s |
+    | generated | 3.4 / 3.7 s | 1.8 / 1.8 s |
+    | office | 25.1 / 24.8 s | 18.7 / 18.6 s |
+    | synthetic-history | 2.5 / 2.3 s | 0.9 / 1.2 s |
+    | multiformat | 19.3 / 19.0 s | 13.8 / 12.6 s |
+
+    The whole bench ran in 38.7 / 38.4 s, against 109.3 / 107.5 s.
+- Verdict: **kept** (identical output, much less CPU; the score's noise hides it, as with E071 and E075).

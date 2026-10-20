@@ -392,15 +392,27 @@ impl<S: Store> Repo<S> {
     /// `read_weight` x the codec's decode time x `reads` (bytes decoded to
     /// read everything once, see `Repo::recompress`).
     pub(crate) fn encode_cheapest(&self, bytes: &[u8], reads: usize) -> Vec<u8> {
-        let mut best = self.encode_plain(bytes);
         // Stored as is: more bytes, nothing to decode (E069); with a CRC,
         // 4 bytes more and a cheaper check on read (E074).
-        for raw in [[&b"B"[..], bytes].concat(), checked_raw(bytes)] {
-            if self.cost(&raw, reads) < self.cost(&best, reads) {
-                best = raw;
+        let mut best = [&b"B"[..], bytes].concat();
+        let checked = checked_raw(bytes);
+        if self.cost(&checked, reads) < self.cost(&best, reads) {
+            best = checked;
+        }
+        // A codec whose decode cost alone is above the best so far is never
+        // run (E088): under heavy reads, compressing hot content at the
+        // store level was most of a recompress, only to keep it raw.
+        let floor = |tag: u8| self.read_weight * codec::read_weight(tag) * reads as f64;
+        if floor(b'Z') < self.cost(&best, reads) {
+            let plain = self.encode_plain(bytes);
+            if self.cost(&plain, reads) < self.cost(&best, reads) {
+                best = plain;
             }
         }
         for (tag, encode, _) in codec::CODECS.iter().filter(|c| c.2) {
+            if floor(*tag) >= self.cost(&best, reads) {
+                continue;
+            }
             if let Some(c) = encode(bytes) {
                 let c = [&[*tag][..], &c].concat();
                 if self.cost(&c, reads) < self.cost(&best, reads) {
