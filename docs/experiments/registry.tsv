@@ -82,3 +82,5 @@ E078	larger-dictionary	change	discarded	exp/078-larger-dictionary	cost	dictionar
 E079	dictionary-clusters	change	discarded	exp/079-dictionary-clusters	cost	dictionary,cross-source	yes	two clustered dictionaries; one-graph store unchanged
 E080	zlib-streams	change	kept	main	cost	containers,cross-source	no	zlib streams in any file expanded; multiformat -38%
 E081	multiformat-corpus	benchmark	reference	main	cost	benchmark,cross-source	no	multiformat scored as one graph; 11-corpus score 0.57
+E082	solid-groups	change	discarded	exp/082-solid-groups	cost	grouping,cross-source	yes	groups up to 4 MiB; rejected by read pricing
+E083	deflate-memlevel	change	kept	main	cost	containers,cross-source	no	zlib memLevel 9 streams reproduced; multiformat -31%

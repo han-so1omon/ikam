@@ -1298,3 +1298,33 @@ Newest last. Format and rules: `README.md`.
   - Its first repack costs 43–47 s of CPU at a 124 MB heap peak, 73–78% of its kernel cost.
 - What it shows: under the heavy, uniform workload, storage is about 15% of the kernel's cost on this corpus, so the score barely sees compression or cross-type sharing. Progress on the north star is therefore also measured by `examples/cross.rs` at read weight 0.001 (storage only), reported beside the score.
 - Verdict: **kept** (benchmark change; reference for the 11-corpus score).
+
+### E082 solid-groups (larger groups, priced by reads)
+- Branch / parent: exp/082-solid-groups (not kept) / E081
+- Hypothesis: multiformat's PDF store (437,094 B after E080) is about twice a solid zstd 19 of the same expanded content (217,863 B, Python probe). Its 24 similar manifests and its fonts are compressed one object at a time. Groups are capped at 64 KiB, but `plan_group` already prices group reads (decode up to the member's end) by the read weight, so larger groups could be left to the planner.
+- Change tried: the seed proposers also build groups of up to 4 MiB, then 256 KiB and 1 MiB; contents up to 4 MiB were eligible. The measured proposers were unchanged.
+- Result (`examples/cross.rs`, read weight 0.001):
+  - 4 MiB: one group per store, rejected by `plan_group` every time. Reading each member decodes the group up to it: n^2/2 x the member size, about 500 MB for 349 members, which at weight 0.001 outweighs any saving.
+  - 256 KiB and 1 MiB: pdf 437,094 -> 441,068 and office 62,608 -> 62,017. Within noise; the one store unchanged.
+- Verdict: **discarded**. Under the read model, solid context across large contents does not pay as groups.
+
+### E083 deflate-memlevel (zlib memLevel 9 streams reproduced)
+- Branch / parent: exp/083-deflate-memlevel / E081
+- Hypothesis: of multiformat's 275 PDF streams, the 19 that `plan_zlib` left literal (195,945 B deflated, the largest: fonts) all re-deflate exactly with zlib at level 6 and **memLevel 9** (Python probe over memLevel 1–9 and strategies 0–4; the other 256 are memLevel 8). flate2 fixes memLevel at 8. Reproducing memLevel 9 should expand them too.
+- Change:
+  - `deflate` takes manifest levels 0–19. Levels 10–19 are zlib levels 0–9 at memLevel 9, through the pinned zlib directly (`libz_sys::deflateInit2_`). This is the kernel's first `unsafe`: a 30-line wrapper with zlib's own allocators.
+  - The format is backward compatible: `pack` rejected levels above 9 before, so no stored manifest holds one.
+  - `deflate_output_is_pinned` now pins all 20 outputs (`GOLDEN_MEM9`) and checks each inflates back.
+  - Each level is tried at memLevel 8 first, then 9.
+- Result:
+  - `examples/cross.rs` (read weight 0.001), multiformat:
+
+    | | before | after |
+    |---|---|---|
+    | pdf store | 437,094 | **268,472 (-39%)** |
+    | one store | 554,151 | **382,635 (-31%)** |
+    | one store vs baseline | 0.49x | **0.34x** |
+
+    That is within 11% of a solid zstd 19 (long) over all the expanded content (345,208 B). One graph is 1.1% smaller than the per-type stores. The cases corpus is unchanged.
+  - Bench (two runs; tests, clippy and fmt clean; every corpus exact with a clean fsck; every stored size identical to E081): score 0.6120 / 0.5858 against 0.5717 / 0.5788. Within noise, with a wider spread than usual in this pair of runs (repo-graph 0.70–1.06 on unchanged bytes). Ingest and repack times are within run-to-run variation, office included.
+- Verdict: **kept** (neutral on the bench, -31% on the north-star corpus).
