@@ -159,11 +159,12 @@ impl<S: Store> Repo<S> {
         // object their id prefix may name.
         let mut dicts: Vec<Vec<u8>> = Vec::new();
         for id in content.iter().chain(&objects) {
-            if let Ok(encoded) = self.store.read(id)
-                && let Some(prefix) = needs(&encoded)
-                && !dicts.iter().any(|d| d == prefix)
-            {
-                dicts.push(prefix.to_vec());
+            if let Ok(encoded) = self.store.read(id) {
+                for prefix in needs(&encoded) {
+                    if !dicts.iter().any(|d| d == prefix) {
+                        dicts.push(prefix.to_vec());
+                    }
+                }
             }
         }
         for id in self.store.ids()? {
