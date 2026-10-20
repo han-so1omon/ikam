@@ -423,18 +423,43 @@ impl<S: Store + Sync> Repo<S> {
                         }
                     }
                     // Or with related stored content as the frame's context
-                    // (E057): read costs that content's decoding too.
+                    // (E057), or two complementary contents (E084): read
+                    // costs their decoding too.
+                    // A context's read cost alone can rule it out: then no
+                    // frame is built (most contents when reads are heavy).
+                    let floor = |context: usize| {
+                        self.read_weight * (reads + model.events(&id) * context) as f64
+                    };
                     if Some(id) != dict
                         && !used.contains(&id)
-                        && let Some(base) = bases.most_related(&id, &bytes, &related)
-                        && let Some(z) = zstd_frame(&bytes, &base.1, STORE_LEVEL)
+                        && let Some(first) = bases.most_related(&id, &bytes, &related)
+                        && floor(first.1.len()) < cost
                     {
-                        let q = [&b"Q"[..], base.0.as_bytes(), &z].concat();
-                        let q_cost = q.len() as f64
-                            + self.read_weight * (reads + model.events(&id) * base.1.len()) as f64;
-                        if q_cost < cost {
-                            (encoded, cost) = (q, q_cost);
-                            used.insert(base.0);
+                        let second = bases.complement(&id, &bytes, &related, first);
+                        let options = [Some(vec![first]), second.map(|s| vec![first, s])];
+                        let mut chosen = None;
+                        for refs in options.into_iter().flatten() {
+                            if floor(refs.iter().map(|b| b.1.len()).sum()) >= cost {
+                                continue;
+                            }
+                            let context: Vec<u8> = refs.iter().flat_map(|b| b.1.clone()).collect();
+                            let Some(z) = zstd_frame(&bytes, &context, STORE_LEVEL) else {
+                                continue;
+                            };
+                            let mut q = vec![if refs.len() == 1 { b'Q' } else { b'M' }];
+                            refs.iter()
+                                .for_each(|b| q.extend_from_slice(b.0.as_bytes()));
+                            q.extend_from_slice(&z);
+                            let q_cost = q.len() as f64
+                                + self.read_weight
+                                    * (reads + model.events(&id) * context.len()) as f64;
+                            if q_cost < cost {
+                                (encoded, cost) = (q, q_cost);
+                                chosen = Some(refs.iter().map(|b| b.0).collect::<Vec<_>>());
+                            }
+                        }
+                        if let Some(refs) = chosen {
+                            used.extend(refs);
                             related.insert(id);
                         }
                     }
@@ -879,6 +904,33 @@ impl Bases {
         let (i, _) = shared
             .into_iter()
             .filter(|&(i, _)| self.items[i].0 != *id && !related.contains(&self.items[i].0))
+            .max_by_key(|&(i, n)| (n, std::cmp::Reverse(i)))?;
+        Some(&self.items[i])
+    }
+
+    /// The candidate sharing the most of `bytes`' shingles that `first`
+    /// lacks (greedy cover, E084): with `first` shaped like `bytes`, often
+    /// the same words in another format.
+    fn complement(
+        &self,
+        id: &Id,
+        bytes: &[u8],
+        related: &HashSet<Id>,
+        first: &(Id, Vec<u8>),
+    ) -> Option<&(Id, Vec<u8>)> {
+        let covered = shingles(&first.1);
+        let mut shared: HashMap<usize, usize> = HashMap::new();
+        for h in shingles(bytes).difference(&covered) {
+            for &i in self.index.get(h).into_iter().flatten() {
+                *shared.entry(i).or_default() += 1;
+            }
+        }
+        let (i, _) = shared
+            .into_iter()
+            .filter(|&(i, _)| {
+                let c = &self.items[i].0;
+                c != id && *c != first.0 && !related.contains(c)
+            })
             .max_by_key(|&(i, n)| (n, std::cmp::Reverse(i)))?;
         Some(&self.items[i])
     }

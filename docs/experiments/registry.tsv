@@ -84,3 +84,4 @@ E080	zlib-streams	change	kept	main	cost	containers,cross-source	no	zlib streams 
 E081	multiformat-corpus	benchmark	reference	main	cost	benchmark,cross-source	no	multiformat scored as one graph; 11-corpus score 0.57
 E082	solid-groups	change	discarded	exp/082-solid-groups	cost	grouping,cross-source	yes	groups up to 4 MiB; rejected by read pricing
 E083	deflate-memlevel	change	kept	main	cost	containers,cross-source	no	zlib memLevel 9 streams reproduced; multiformat -31%
+E084	two-base-context	change	kept	main	cost	cross-source,encoding	yes	M: shape + words contexts; cases -2.1%, multiformat -1.3%

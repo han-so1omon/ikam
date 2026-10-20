@@ -1328,3 +1328,33 @@ Newest last. Format and rules: `README.md`.
     That is within 11% of a solid zstd 19 (long) over all the expanded content (345,208 B). One graph is 1.1% smaller than the per-type stores. The cases corpus is unchanged.
   - Bench (two runs; tests, clippy and fmt clean; every corpus exact with a clean fsck; every stored size identical to E081): score 0.6120 / 0.5858 against 0.5717 / 0.5788. Within noise, with a wider spread than usual in this pair of runs (repo-graph 0.70–1.06 on unchanged bytes). Ingest and repack times are within run-to-run variation, office included.
 - Verdict: **kept** (neutral on the bench, -31% on the north-star corpus).
+
+### E084 two-base-context ("M": a shape context and a words context)
+- Branch / parent: exp/084-two-base-context / E083
+- Hypothesis: a content in one format shares its *structure* with other contents of that format and its *words* with the same text in another format. A probe (Python zstandard, level 19, raw-content dictionaries; multiformat) measured both together, against the same-format context alone:
+
+  | content | alone | same-format neighbour | own md | both |
+  |---|---|---|---|---|
+  | html | 84,067 | 35,607 | 52,092 | **12,781** |
+  | docx `word/document.xml` | 70,436 | 40,992 | 38,361 | **17,219** |
+
+  A "Q" frame has one context, so two contexts should capture information shared across formats.
+- Change:
+  - New plain encoding `"M" ref[32] ref[32] frame`: zstd with both contents (in order) as a raw-content dictionary. Bases are as for "Q": never "Q", "M" or "S", so decoding goes one step.
+  - Base choice: the first base is the most related (shingles), as before. The second is `Bases::complement`, the candidate sharing the most of the content's shingles that the first lacks (a greedy cover). No format is named.
+  - Recompress prices Q and M like every encoding (bytes + read weight x the bytes decoded, contexts included) and keeps the cheapest. It now skips building a frame whose read cost alone exceeds the current encoding's cost: exact pruning, same choices.
+  - `needs` returns every prefix an encoding needs. gc, ingest's base guard and `is_related_base` cover both contexts.
+  - New test `two_contexts_decode_and_are_kept`.
+- Result:
+  - `examples/cross.rs` (read weight 0.001):
+
+    | | before | after |
+    |---|---|---|
+    | cases, one store | 400,092 | **391,496 (-2.1%; one graph now 1.4% above split, was 3.7%)** |
+    | multiformat, one store | 382,635 | **377,488 (-1.3%; 0.34x the baseline)** |
+
+  - Bench (two runs; tests, clippy and fmt clean; every corpus exact with a clean fsck; every stored size identical): score 0.5829 / 0.5924 against E083's 0.6120 / 0.5858, within noise.
+    - Without the pruning, repack CPU rose 5–15%.
+    - With it, repack CPU is equal or lower: transcripts 6,871 -> 5,795 ms, invoices 795 -> 625 ms. Under the heavy read weight, most contexts are ruled out before compression.
+- What it shows: much less than the probe, because most html and md contents are members of groups ("S"), and recompress never considers Q or M for group members. Grouping is decided before, and by bytes alone. Next: let grouping compete with the context encodings.
+- Verdict: **kept**.

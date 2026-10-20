@@ -7,8 +7,11 @@
 //!   | "X" .lzma(bytes) | "R" brotli(bytes) | "P" ppmd(bytes)   (only from repack, see `codec.rs`)
 //!   | "K" dict[4] block count { frame_len } frames   (a group in blocks, only from repack)
 //!   | "Q" ref[32] zstd_with(ref's bytes)   (related content as the frame's
-//!     context, only from repack; the ref is never "Q" or "S", so decoding
-//!     never chains beyond one step)
+//!     context, only from repack; the ref is never "Q", "M" or "S", so
+//!     decoding never chains beyond one step)
+//!   | "M" ref[32] ref[32] zstd_with(both refs' bytes, in order)   (two
+//!     complementary contexts, E084: one shaped like the content, one
+//!     holding its words in another format; refs as for "Q")
 //! Identity is always over the uncompressed bytes, so the choice never
 //! changes an id. The dictionary is ordinary content, named by the ref
 //! `meta/zstd-dict`. Exact reuse (slices, templates) and this statistical
@@ -59,7 +62,7 @@ type DictRef = [u8; DICT_REF_LEN];
 pub(crate) fn is_plain(encoded: &[u8]) -> bool {
     matches!(
         encoded.first(),
-        Some(b'B' | b'W' | b'Z' | b'Y' | b'X' | b'R' | b'P' | b'K' | b'S' | b'Q')
+        Some(b'B' | b'W' | b'Z' | b'Y' | b'X' | b'R' | b'P' | b'K' | b'S' | b'Q' | b'M')
     )
 }
 
@@ -91,26 +94,44 @@ fn unchecked_raw(body: &[u8]) -> Option<&[u8]> {
 pub(crate) fn self_verified(encoded: &[u8]) -> bool {
     matches!(
         encoded.first(),
-        Some(b'W' | b'Y' | b'X' | b'R' | b'P' | b'Q' | b'K' | b'S')
+        Some(b'W' | b'Y' | b'X' | b'R' | b'P' | b'Q' | b'M' | b'K' | b'S')
     )
 }
 
-/// The id prefix of the stored content an encoding cannot be decoded
-/// without (its dictionary, or its group), if any. gc keeps every object
-/// the prefix names.
-pub(crate) fn needs(encoded: &[u8]) -> Option<&[u8]> {
+/// The id prefixes of the stored contents an encoding cannot be decoded
+/// without (its dictionary, group or contexts). gc keeps every object a
+/// prefix names.
+pub(crate) fn needs(encoded: &[u8]) -> Vec<&[u8]> {
     match encoded {
-        [b'S', group @ ..] => group.get(..crate::group::GROUP_REF_LEN),
-        [b'Q', base @ ..] => base.get(..32),
-        _ => dict_of(encoded).map(|_| {
-            let at = if matches!(encoded[0], b'Y' | b'K') {
-                1
-            } else {
-                2
-            };
-            &encoded[at..at + DICT_REF_LEN]
-        }),
+        [b'S', group @ ..] => group
+            .get(..crate::group::GROUP_REF_LEN)
+            .into_iter()
+            .collect(),
+        [b'Q' | b'M', ..] => contexts(encoded),
+        _ => dict_of(encoded)
+            .map(|_| {
+                let at = if matches!(encoded[0], b'Y' | b'K') {
+                    1
+                } else {
+                    2
+                };
+                &encoded[at..at + DICT_REF_LEN]
+            })
+            .into_iter()
+            .collect(),
     }
+}
+
+/// The context ids of a "Q" (one) or "M" (two) encoding.
+pub(crate) fn contexts(encoded: &[u8]) -> Vec<&[u8]> {
+    let n = match encoded.first() {
+        Some(b'Q') => 1,
+        Some(b'M') => 2,
+        _ => 0,
+    };
+    (0..n)
+        .filter_map(|i| encoded.get(1 + 32 * i..1 + 32 * (i + 1)))
+        .collect()
 }
 
 /// The kind of a stored object ("T", "C", "D" or "L"), however it is
@@ -475,7 +496,7 @@ impl<S: Store> Repo<S> {
     /// `self_verified` names; callers check the others ("B", "Z").
     pub(crate) fn decode_plain(&self, id: &Id, encoded: &[u8]) -> Result<Vec<u8>, Error> {
         match encoded.first() {
-            Some(b'Y' | b'X' | b'R' | b'P' | b'Q') => {
+            Some(b'Y' | b'X' | b'R' | b'P' | b'Q' | b'M') => {
                 self.decode_prefix(id, encoded, usize::MAX, &|b| Id::of_content(b) == *id)
             }
             Some(b'K') => {
@@ -513,21 +534,29 @@ impl<S: Store> Repo<S> {
             Some((b'R', r)) => codec::unbrotli_prefix(r, limit),
             Some((b'P', p)) => codec::unppmd_prefix(p, limit),
             Some((b'Y', _)) => return self.unzstd_with_dict(id, encoded, 1, limit, check),
-            Some((b'Q', rest)) => {
-                let (base, frame) = rest.split_at_checked(32).ok_or(Error::Corrupt(*id))?;
-                let base = self.related_base(&Id::from_bytes(base.try_into().unwrap()))?;
-                unzstd_prefix(frame, &base, limit)
+            Some((b'Q' | b'M', _)) => {
+                let refs = contexts(encoded);
+                let frame = encoded
+                    .get(1 + 32 * refs.len()..)
+                    .ok_or(Error::Corrupt(*id))?;
+                let mut context = Vec::new();
+                for r in &refs {
+                    let r = Id::from_bytes((*r).try_into().map_err(|_| Error::Corrupt(*id))?);
+                    context.extend(self.related_base(&r)?);
+                }
+                unzstd_prefix(frame, &context, limit)
             }
             _ => return Err(Error::WrongKind(*id)),
         };
         out.filter(|b| check(b)).ok_or(Error::Corrupt(*id))
     }
 
-    /// The bytes of `base`, the context of a "Q" encoding: stored in any
-    /// plain encoding but "Q" or "S" (one step, no chains), and verified.
+    /// The bytes of `base`, a context of a "Q" or "M" encoding: stored in
+    /// any plain encoding but "Q", "M" or "S" (one step, no chains), and
+    /// verified.
     pub(crate) fn related_base(&self, base: &Id) -> Result<Vec<u8>, Error> {
         let stored = self.store.read(base)?;
-        if matches!(stored.first(), Some(b'Q' | b'S')) {
+        if matches!(stored.first(), Some(b'Q' | b'M' | b'S')) {
             return Err(Error::Corrupt(*base));
         }
         let bytes = self.decode_plain(base, &stored)?;
@@ -536,11 +565,11 @@ impl<S: Store> Repo<S> {
             .ok_or(Error::Corrupt(*base))
     }
 
-    /// True if some stored "Q" encoding uses `id` as its context.
+    /// True if some stored "Q" or "M" encoding uses `id` as a context.
     pub(crate) fn is_related_base(&self, id: &Id) -> Result<bool, Error> {
         for other in self.store.ids()? {
             let stored = self.store.read(&other)?;
-            if stored.first() == Some(&b'Q') && stored.get(1..33) == Some(&id.as_bytes()[..]) {
+            if contexts(&stored).contains(&&id.as_bytes()[..]) {
                 return Ok(true);
             }
         }
@@ -652,6 +681,36 @@ mod tests {
     }
     use crate::MemStore;
 
+    /// An "M" frame decodes with both contexts, in order; gc and ingest
+    /// keep both (E084).
+    #[test]
+    fn two_contexts_decode_and_are_kept() {
+        let mut repo = Repo::new(MemStore::default());
+        let shape: Vec<u8> = (0..300)
+            .flat_map(|i| format!("<p class=\"x\">{i}</p>\n").into_bytes())
+            .collect();
+        let words: Vec<u8> = (0..300)
+            .flat_map(|i| format!("word{} ", i * 13).into_bytes())
+            .collect();
+        let (a, b) = (
+            repo.put_content(&shape).unwrap().id,
+            repo.put_content(&words).unwrap().id,
+        );
+        let text: Vec<u8> = (0..300)
+            .flat_map(|i| format!("<p class=\"x\">word{}</p>\n", i * 13).into_bytes())
+            .collect();
+        let t = repo.put_content(&text).unwrap().id;
+        let z = zstd_frame(&text, &[&shape[..], &words[..]].concat(), STORE_LEVEL).unwrap();
+        repo.store
+            .replace(t, &[&b"M"[..], a.as_bytes(), b.as_bytes(), &z].concat())
+            .unwrap();
+        assert_eq!(repo.read_content(&t).unwrap(), text);
+        let stored = repo.store.read(&t).unwrap();
+        assert_eq!(needs(&stored), vec![&a.as_bytes()[..], &b.as_bytes()[..]]);
+        assert!(repo.is_related_base(&a).unwrap() && repo.is_related_base(&b).unwrap());
+        assert!(repo.fsck().unwrap().is_empty());
+    }
+
     /// Encodings that `self_verified` names are read without a second hash
     /// (E075), so their decoding must reject well-formed bytes of another
     /// content.
@@ -746,7 +805,7 @@ mod tests {
         assert_eq!(repo.read_content(&o).unwrap(), other);
         assert_eq!(
             needs(&repo.store.read(&o).unwrap()),
-            Some(&b.as_bytes()[..])
+            vec![&b.as_bytes()[..]]
         );
         assert!(repo.is_related_base(&b).unwrap());
         let third = [&other[..], b"more"].concat();
