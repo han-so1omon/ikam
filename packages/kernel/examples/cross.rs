@@ -77,13 +77,16 @@ fn kernel(files: &[&(String, Vec<u8>)], read_weight: f64) -> usize {
             .all(|(_, b)| repo.read_content(&Id::of_content(b)).unwrap() == *b)
     );
     assert!(repo.fsck().unwrap().is_empty());
+    // Stored objects by encoding tag, to stderr: where the bytes are.
     let store = repo.store();
-    store
-        .ids()
-        .unwrap()
-        .iter()
-        .map(|id| store.read(id).unwrap().len())
-        .sum()
+    let mut kinds: BTreeMap<char, (usize, usize)> = BTreeMap::new();
+    for id in store.ids().unwrap() {
+        let e = store.read(&id).unwrap();
+        let k = kinds.entry(e[0] as char).or_default();
+        (k.0, k.1) = (k.0 + 1, k.1 + e.len());
+    }
+    eprintln!("  {} files: {kinds:?}", files.len());
+    kinds.values().map(|k| k.1).sum()
 }
 
 /// zstd 3 with a dictionary trained on `files` (as the bench's baseline).

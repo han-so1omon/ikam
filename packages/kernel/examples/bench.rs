@@ -67,6 +67,15 @@ fn fixtures(exts: &[&str]) -> Vec<Snapshot> {
     })]
 }
 
+/// The same text in four formats, stored as one graph (since E081): the
+/// fixture cases' idea.md, each also rendered to html and docx (pandoc) and
+/// pdf (LibreOffice); see `fixtures/multiformat`. The north star's case:
+/// information shared across file types should be stored once.
+fn multiformat() -> Vec<Snapshot> {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures/multiformat");
+    vec![walk(&root, &|p| p.extension().is_some_and(|e| e != "txt"))]
+}
+
 /// 21 revisions of a spec: one appended phrase per revision, a new section
 /// every fifth.
 fn synthetic_history() -> Vec<Snapshot> {
@@ -1318,6 +1327,7 @@ fn main() {
         ("generated", generated, false),
         ("structured", structured, false),
         ("transcripts", transcripts, false),
+        ("multiformat", multiformat, false),
     ];
     let (mut log_cost, mut log_ratio, mut log_read, mut log_bytes, mut n, mut total_ms) =
         (0.0, 0.0, 0.0, 0.0, 0, 0);
