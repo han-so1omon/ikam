@@ -1,0 +1,295 @@
+<!DOCTYPE html>
+<html xmlns="http://www.w3.org/1999/xhtml" lang="" xml:lang="">
+<head>
+  <meta charset="utf-8" />
+  <meta name="generator" content="pandoc" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=yes" />
+  <title>s-manufacturing-v01</title>
+  <style>
+    html {
+      color: #1a1a1a;
+      background-color: #fdfdfd;
+    }
+    body {
+      margin: 0 auto;
+      max-width: 36em;
+      padding-left: 50px;
+      padding-right: 50px;
+      padding-top: 50px;
+      padding-bottom: 50px;
+      hyphens: auto;
+      overflow-wrap: break-word;
+      text-rendering: optimizeLegibility;
+      font-kerning: normal;
+    }
+    @media (max-width: 600px) {
+      body {
+        font-size: 0.9em;
+        padding: 12px;
+      }
+      h1 {
+        font-size: 1.8em;
+      }
+    }
+    @media print {
+      html {
+        background-color: white;
+      }
+      body {
+        background-color: transparent;
+        color: black;
+        font-size: 12pt;
+      }
+      p, h2, h3 {
+        orphans: 3;
+        widows: 3;
+      }
+      h2, h3, h4 {
+        page-break-after: avoid;
+      }
+    }
+    p {
+      margin: 1em 0;
+    }
+    a {
+      color: #1a1a1a;
+    }
+    a:visited {
+      color: #1a1a1a;
+    }
+    img {
+      max-width: 100%;
+    }
+    h1, h2, h3, h4, h5, h6 {
+      margin-top: 1.4em;
+    }
+    h5, h6 {
+      font-size: 1em;
+      font-style: italic;
+    }
+    h6 {
+      font-weight: normal;
+    }
+    ol, ul {
+      padding-left: 1.7em;
+      margin-top: 1em;
+    }
+    li > ol, li > ul {
+      margin-top: 0;
+    }
+    blockquote {
+      margin: 1em 0 1em 1.7em;
+      padding-left: 1em;
+      border-left: 2px solid #e6e6e6;
+      color: #606060;
+    }
+    code {
+      font-family: Menlo, Monaco, Consolas, 'Lucida Console', monospace;
+      font-size: 85%;
+      margin: 0;
+      hyphens: manual;
+    }
+    pre {
+      margin: 1em 0;
+      overflow: auto;
+    }
+    pre code {
+      padding: 0;
+      overflow: visible;
+      overflow-wrap: normal;
+    }
+    .sourceCode {
+     background-color: transparent;
+     overflow: visible;
+    }
+    hr {
+      background-color: #1a1a1a;
+      border: none;
+      height: 1px;
+      margin: 1em 0;
+    }
+    table {
+      margin: 1em 0;
+      border-collapse: collapse;
+      width: 100%;
+      overflow-x: auto;
+      display: block;
+      font-variant-numeric: lining-nums tabular-nums;
+    }
+    table caption {
+      margin-bottom: 0.75em;
+    }
+    tbody {
+      margin-top: 0.5em;
+      border-top: 1px solid #1a1a1a;
+      border-bottom: 1px solid #1a1a1a;
+    }
+    th {
+      border-top: 1px solid #1a1a1a;
+      padding: 0.25em 0.5em 0.25em 0.5em;
+    }
+    td {
+      padding: 0.125em 0.5em 0.25em 0.5em;
+    }
+    header {
+      margin-bottom: 4em;
+      text-align: center;
+    }
+    #TOC li {
+      list-style: none;
+    }
+    #TOC ul {
+      padding-left: 1.3em;
+    }
+    #TOC > ul {
+      padding-left: 0;
+    }
+    #TOC a:not(:hover) {
+      text-decoration: none;
+    }
+    code{white-space: pre-wrap;}
+    span.smallcaps{font-variant: small-caps;}
+    div.columns{display: flex; gap: min(4vw, 1.5em);}
+    div.column{flex: auto; overflow-x: auto;}
+    div.hanging-indent{margin-left: 1.5em; text-indent: -1.5em;}
+    /* The extra [class] is a hack that increases specificity enough to
+       override a similar rule in reveal.js */
+    ul.task-list[class]{list-style: none;}
+    ul.task-list li input[type="checkbox"] {
+      font-size: inherit;
+      width: 0.8em;
+      margin: 0 0.8em 0.2em -1.6em;
+      vertical-align: middle;
+    }
+    .display.math{display: block; text-align: center; margin: 0.5rem auto;}
+  </style>
+</head>
+<body>
+<h1 id="ikam-benchmark-case-spec-idea.md">IKAM Benchmark Case Spec
+(idea.md)</h1>
+<h2 id="identity">Identity</h2>
+<ul>
+<li>Case ID: s-manufacturing-v01</li>
+<li>Business name: Ridgeway Metal Works</li>
+<li>Industry / domain: Manufacturing (small metal fabrication +
+short-run parts)</li>
+<li>Business model: Job shop (quoted work + repeat customers)</li>
+<li>Locations / operating region: Spokane, WA (single shop)</li>
+<li>Size tier: s</li>
+<li>Org maturity: practical, low overhead</li>
+</ul>
+<h2 id="high-level-description">High-level description</h2>
+<ul>
+<li>One-liner: A small fab shop that runs on a few spreadsheets, a
+whiteboard schedule, and tribal knowledge.</li>
+</ul>
+<h2 id="operating-model">Operating model</h2>
+<ul>
+<li>Functions:
+<ul>
+<li>Shop floor</li>
+<li>Quoting</li>
+<li>Purchasing</li>
+<li>QA (light)</li>
+<li>Bookkeeping</li>
+</ul></li>
+<li>Key roles:
+<ul>
+<li>Hank Miller — Owner</li>
+<li>Zoe Park — Office/Operations</li>
+<li>Eli Reyes — Lead Fabricator</li>
+<li>“North Ledger” — bookkeeper</li>
+</ul></li>
+</ul>
+<h2 id="chaos-profile-new-pick-tracked">Chaos profile (new pick;
+tracked)</h2>
+<ul>
+<li>Overall chaos level (1–5): <strong>2</strong></li>
+<li>Rationale: small shop; docs are sparse but consistent.</li>
+<li>Where chaos lives:
+<ul class="task-list">
+<li><label><input type="checkbox" checked="" />informal
+scheduling</label></li>
+<li><label><input type="checkbox" checked="" />inventory counts
+manual</label></li>
+<li><label><input type="checkbox" />major version sprawl</label></li>
+</ul></li>
+</ul>
+<h2 id="intentional-contradictions">Intentional contradictions</h2>
+<ul>
+<li>Deliberate contradictions: <strong>no</strong></li>
+<li>Minor friction:
+<ul>
+<li>Material cost assumptions differ between quote and actual invoice
+due to steel price change.</li>
+</ul></li>
+</ul>
+<h2 id="artifact-set">Artifact set</h2>
+<h3 id="strategy-identity">Strategy + identity</h3>
+<ul>
+<li>mission-vision-values.md</li>
+<li>brand-guide.md</li>
+<li>high-level-strategy-2026.md</li>
+</ul>
+<h3 id="salesquoting">Sales/quoting</h3>
+<ul>
+<li>capabilities-one-pager.pdf</li>
+<li>quote-template.xlsx</li>
+<li>sample-quote-bracket-run.pdf</li>
+<li>customer-list.json</li>
+</ul>
+<h3 id="ops">Ops</h3>
+<ul>
+<li>job-board-snapshot-2026-02.json</li>
+<li>production-schedule-2026-02.xlsx</li>
+<li>vendor-list.json</li>
+<li>inventory-count-sheet.xlsx</li>
+<li>incident-log-2026-q1.xlsx</li>
+</ul>
+<h3 id="finance">Finance</h3>
+<ul>
+<li>quarterly-revenue-history-2024-2025.xlsx</li>
+<li>projected-revenue-2026.xlsx</li>
+<li>job-costing-sample.xlsx</li>
+<li>kpi-definitions.json</li>
+</ul>
+<h3 id="templates">Templates</h3>
+<ul>
+<li>supplier-evaluation-template.md</li>
+<li>nonconformance-report-template.md</li>
+<li>customer-intake-form.json</li>
+</ul>
+<h3 id="word-documents-.docx">Word documents (.docx)</h3>
+<ul>
+<li>ops-brief-2026-q1.docx</li>
+</ul>
+<h3 id="images-mixed-generated">Images (mixed; generated)</h3>
+<p>Documentation: - assets/images/README.md</p>
+<p>Folders: - assets/images/logos/ - assets/images/people/ -
+assets/images/shop/ - assets/images/products/ -
+assets/images/diagrams/</p>
+<p>Metadata: - assets/images/prompts.jsonl</p>
+<p>Targets (exact): - logos: 4 - people: 8 - shop: 8 - products: 12 -
+diagrams: 8</p>
+<h3 id="word-documents-.docx-1">Word documents (.docx)</h3>
+<ul>
+<li>ops-brief-2026-q1.docx</li>
+</ul>
+<h2 id="timeline-of-significant-events">Timeline of significant
+events</h2>
+<ul>
+<li>2024-03: New laser cutter added.</li>
+<li>2025-08: Repeat customer increases volume.</li>
+<li>2026-01: Steel price bump impacts quotes.</li>
+</ul>
+<h2 id="benchmark-goals-ikam">Benchmark goals (IKAM)</h2>
+<ul>
+<li>Queries:
+<ol type="1">
+<li>“What jobs are in progress and what’s next?”</li>
+<li>“What vendors supply steel and what are lead times?”</li>
+<li>“Why did job margin differ from the quote?”</li>
+</ol></li>
+</ul>
+</body>
+</html>

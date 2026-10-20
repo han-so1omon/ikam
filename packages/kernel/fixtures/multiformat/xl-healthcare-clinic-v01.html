@@ -1,0 +1,367 @@
+<!DOCTYPE html>
+<html xmlns="http://www.w3.org/1999/xhtml" lang="" xml:lang="">
+<head>
+  <meta charset="utf-8" />
+  <meta name="generator" content="pandoc" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=yes" />
+  <title>xl-healthcare-clinic-v01</title>
+  <style>
+    html {
+      color: #1a1a1a;
+      background-color: #fdfdfd;
+    }
+    body {
+      margin: 0 auto;
+      max-width: 36em;
+      padding-left: 50px;
+      padding-right: 50px;
+      padding-top: 50px;
+      padding-bottom: 50px;
+      hyphens: auto;
+      overflow-wrap: break-word;
+      text-rendering: optimizeLegibility;
+      font-kerning: normal;
+    }
+    @media (max-width: 600px) {
+      body {
+        font-size: 0.9em;
+        padding: 12px;
+      }
+      h1 {
+        font-size: 1.8em;
+      }
+    }
+    @media print {
+      html {
+        background-color: white;
+      }
+      body {
+        background-color: transparent;
+        color: black;
+        font-size: 12pt;
+      }
+      p, h2, h3 {
+        orphans: 3;
+        widows: 3;
+      }
+      h2, h3, h4 {
+        page-break-after: avoid;
+      }
+    }
+    p {
+      margin: 1em 0;
+    }
+    a {
+      color: #1a1a1a;
+    }
+    a:visited {
+      color: #1a1a1a;
+    }
+    img {
+      max-width: 100%;
+    }
+    h1, h2, h3, h4, h5, h6 {
+      margin-top: 1.4em;
+    }
+    h5, h6 {
+      font-size: 1em;
+      font-style: italic;
+    }
+    h6 {
+      font-weight: normal;
+    }
+    ol, ul {
+      padding-left: 1.7em;
+      margin-top: 1em;
+    }
+    li > ol, li > ul {
+      margin-top: 0;
+    }
+    blockquote {
+      margin: 1em 0 1em 1.7em;
+      padding-left: 1em;
+      border-left: 2px solid #e6e6e6;
+      color: #606060;
+    }
+    code {
+      font-family: Menlo, Monaco, Consolas, 'Lucida Console', monospace;
+      font-size: 85%;
+      margin: 0;
+      hyphens: manual;
+    }
+    pre {
+      margin: 1em 0;
+      overflow: auto;
+    }
+    pre code {
+      padding: 0;
+      overflow: visible;
+      overflow-wrap: normal;
+    }
+    .sourceCode {
+     background-color: transparent;
+     overflow: visible;
+    }
+    hr {
+      background-color: #1a1a1a;
+      border: none;
+      height: 1px;
+      margin: 1em 0;
+    }
+    table {
+      margin: 1em 0;
+      border-collapse: collapse;
+      width: 100%;
+      overflow-x: auto;
+      display: block;
+      font-variant-numeric: lining-nums tabular-nums;
+    }
+    table caption {
+      margin-bottom: 0.75em;
+    }
+    tbody {
+      margin-top: 0.5em;
+      border-top: 1px solid #1a1a1a;
+      border-bottom: 1px solid #1a1a1a;
+    }
+    th {
+      border-top: 1px solid #1a1a1a;
+      padding: 0.25em 0.5em 0.25em 0.5em;
+    }
+    td {
+      padding: 0.125em 0.5em 0.25em 0.5em;
+    }
+    header {
+      margin-bottom: 4em;
+      text-align: center;
+    }
+    #TOC li {
+      list-style: none;
+    }
+    #TOC ul {
+      padding-left: 1.3em;
+    }
+    #TOC > ul {
+      padding-left: 0;
+    }
+    #TOC a:not(:hover) {
+      text-decoration: none;
+    }
+    code{white-space: pre-wrap;}
+    span.smallcaps{font-variant: small-caps;}
+    div.columns{display: flex; gap: min(4vw, 1.5em);}
+    div.column{flex: auto; overflow-x: auto;}
+    div.hanging-indent{margin-left: 1.5em; text-indent: -1.5em;}
+    /* The extra [class] is a hack that increases specificity enough to
+       override a similar rule in reveal.js */
+    ul.task-list[class]{list-style: none;}
+    ul.task-list li input[type="checkbox"] {
+      font-size: inherit;
+      width: 0.8em;
+      margin: 0 0.8em 0.2em -1.6em;
+      vertical-align: middle;
+    }
+    .display.math{display: block; text-align: center; margin: 0.5rem auto;}
+  </style>
+</head>
+<body>
+<h1 id="ikam-benchmark-case-spec-idea.md">IKAM Benchmark Case Spec
+(idea.md)</h1>
+<h2 id="identity">Identity</h2>
+<ul>
+<li>Case ID: xl-healthcare-clinic-v01</li>
+<li>Business name: Harborview Family Clinics Network (HFCN)</li>
+<li>Industry / domain: Healthcare clinic network (primary care + urgent
+care + a few specialty services)</li>
+<li>Business model: Insurance billing + membership pilot + occupational
+health contracts</li>
+<li>Locations / operating region: Greater Phoenix, AZ (9 clinics) +
+central billing office</li>
+<li>Size tier: xl</li>
+<li>Org maturity: heavy policy surface + uneven on-the-ground
+adherence</li>
+</ul>
+<h2 id="high-level-description">High-level description</h2>
+<ul>
+<li>One-liner: A regional clinic network with lots of policies,
+templates, and compliance requirements — and lots of day-to-day
+operational drift.</li>
+<li>Services:
+<ul>
+<li>Primary care</li>
+<li>Urgent care</li>
+<li>Occupational health</li>
+<li>Basic labs / referrals</li>
+</ul></li>
+</ul>
+<h2 id="operating-model">Operating model</h2>
+<ul>
+<li>Functions:
+<ul>
+<li>Clinic operations (site directors)</li>
+<li>Medical staff</li>
+<li>Revenue cycle / billing</li>
+<li>Compliance / privacy</li>
+<li>HR</li>
+<li>Marketing</li>
+<li>Finance</li>
+</ul></li>
+<li>Key roles (named people + titles):
+<ul>
+<li>Dr. Renee Lawson — Chief Medical Officer</li>
+<li>Marco Diaz — COO</li>
+<li>Tara Nguyen — Director of Revenue Cycle</li>
+<li>Omar Shah — Compliance Officer</li>
+<li>Jenna Cole — HR Director</li>
+<li>Vinh Tran — Finance Lead</li>
+</ul></li>
+</ul>
+<h2 id="chaos-profile-new-pick-tracked">Chaos profile (new pick;
+tracked)</h2>
+<ul>
+<li>Overall chaos level (1–5): <strong>4</strong></li>
+<li>Rationale: many sites + billing complexity + policy drift + multiple
+systems.</li>
+<li>Where chaos lives:
+<ul class="task-list">
+<li><label><input type="checkbox" checked="" />conflicting metrics
+(no-show rate, collections, patient volume)</label></li>
+<li><label><input type="checkbox" checked="" />version sprawl (policies,
+intake forms, training decks)</label></li>
+<li><label><input type="checkbox" checked="" />shadow spreadsheets
+(staffing, denials, no-show tracking)</label></li>
+<li><label><input type="checkbox" checked="" />messy meeting notes (site
+director calls)</label></li>
+<li><label><input type="checkbox" checked="" />missing docs
+(postmortems; incomplete audit trails)</label></li>
+<li><label><input type="checkbox" checked="" />naming drift (program
+names, clinic nicknames)</label></li>
+</ul></li>
+</ul>
+<h2 id="intentional-contradictions">Intentional contradictions</h2>
+<ol type="1">
+<li>No-show rate:
+<ul>
+<li>Ops dashboard says 7.5%</li>
+<li>Site director report says 10–12% (definition differs; includes late
+cancels)</li>
+</ul></li>
+<li>Collections:
+<ul>
+<li>Finance summary reports 94% collections</li>
+<li>Revenue cycle tracker shows 89% (excludes one-off catch-up
+payments)</li>
+</ul></li>
+<li>Privacy training:
+<ul>
+<li>Policy says annual training required by Jan 31</li>
+<li>HR tracker shows many staff incomplete; compliance memo claims “on
+track”</li>
+</ul></li>
+<li>Membership pilot naming:
+<ul>
+<li>“Harborview+” vs “ClinicPlus” vs “DirectCare Pilot”</li>
+</ul></li>
+</ol>
+<h2 id="artifact-set">Artifact set</h2>
+<h3 id="strategy-identity">Strategy + identity</h3>
+<ul>
+<li>mission-vision-values.md</li>
+<li>brand-guide.md</li>
+<li>high-level-strategy-2026.md</li>
+<li>org-structure.json</li>
+</ul>
+<h3 id="clinical-ops">Clinical ops</h3>
+<ul>
+<li>clinic-ops-handbook-v2.md</li>
+<li>clinic-ops-handbook-v3.md (draft)</li>
+<li>staffing-model.xlsx</li>
+<li>site-director-scorecard-2026-01.xlsx</li>
+<li>incident-log-2026-q1.xlsx</li>
+</ul>
+<h3 id="revenue-cycle-billing">Revenue cycle / billing</h3>
+<ul>
+<li>kpi-definitions.json</li>
+<li>denials-tracker-2026-01.xlsx</li>
+<li>billing-process-map.md</li>
+<li>payer-mix-2025.xlsx</li>
+</ul>
+<h3 id="compliance-privacy">Compliance / privacy</h3>
+<ul>
+<li>privacy-policy-v3.md</li>
+<li>privacy-policy-v4.md (updated but not fully rolled out)</li>
+<li>audit-memo-2026-02.pdf</li>
+<li>hipaa-training-tracker-2026.xlsx</li>
+</ul>
+<h3 id="finance">Finance</h3>
+<ul>
+<li>quarterly-revenue-history-2024-2025.xlsx</li>
+<li>projected-revenue-2026.xlsx</li>
+<li>collections-summary-2026-01.xlsx</li>
+<li>board-update-2026-02.pdf</li>
+</ul>
+<h3 id="hr">HR</h3>
+<ul>
+<li>hiring-plan-2026.xlsx</li>
+<li>performance-review-template.md</li>
+<li>employee-handbook-excerpt.pdf</li>
+</ul>
+<h3 id="marketing">Marketing</h3>
+<ul>
+<li>marketing-pitch-deck.pptx</li>
+<li>service-line-one-pager.pdf</li>
+<li>messaging-pillars.md</li>
+</ul>
+<h3 id="meetings-notes">Meetings + notes</h3>
+<ul>
+<li>site-director-call-2026-01-11.md</li>
+<li>site-director-call-2026-02-08.md</li>
+<li>voice-note-transcript-2026-02-14.md</li>
+</ul>
+<h3 id="evaluation-templates">Evaluation templates</h3>
+<ul>
+<li>patient-complaint-template.md</li>
+<li>incident-report-template.md</li>
+<li>new-hire-onboarding-checklist.md</li>
+<li>patient-intake-form.json</li>
+</ul>
+<h3 id="word-documents-.docx">Word documents (.docx)</h3>
+<ul>
+<li>network-report-2026-01.docx</li>
+</ul>
+<h3 id="images-mixed-generated">Images (mixed; generated)</h3>
+<p>Documentation: - assets/images/README.md</p>
+<p>Folders: - assets/images/logos/ - assets/images/people/ -
+assets/images/clinics/ - assets/images/diagrams/ -
+assets/images/social/</p>
+<p>Metadata: - assets/images/prompts.jsonl</p>
+<p>Targets (exact): - logos: 10 - people: 30 - clinics: 15 - diagrams:
+20 - social: 10</p>
+<h3 id="word-documents-.docx-1">Word documents (.docx)</h3>
+<ul>
+<li>network-report-2026-01.docx</li>
+</ul>
+<h2 id="timeline-of-significant-events">Timeline of significant
+events</h2>
+<ul>
+<li>2024-02: Acquired 2 urgent care sites (integration pain).</li>
+<li>2024-09: Revenue cycle system change; denials spike.</li>
+<li>2025-04: Membership pilot launched (name varies).</li>
+<li>2025-11: Privacy audit findings; policy v4 drafted.</li>
+<li>2026-01: Ops handbook v3 draft circulated; sites still use v2.</li>
+<li>2026-02: Board update uses optimistic collections definition.</li>
+</ul>
+<h2 id="benchmark-goals-ikam">Benchmark goals (IKAM)</h2>
+<ul>
+<li>Queries:
+<ol type="1">
+<li>“What is the real no-show rate and why does it differ across
+reports?”</li>
+<li>“What privacy policy version is in effect vs in use?”</li>
+<li>“How do collections metrics differ and what’s the correct
+value?”</li>
+<li>“What is the membership pilot called and how is it performing?”</li>
+</ol></li>
+</ul>
+</body>
+</html>

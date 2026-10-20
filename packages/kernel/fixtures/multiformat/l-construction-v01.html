@@ -1,0 +1,325 @@
+<!DOCTYPE html>
+<html xmlns="http://www.w3.org/1999/xhtml" lang="" xml:lang="">
+<head>
+  <meta charset="utf-8" />
+  <meta name="generator" content="pandoc" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=yes" />
+  <title>l-construction-v01</title>
+  <style>
+    html {
+      color: #1a1a1a;
+      background-color: #fdfdfd;
+    }
+    body {
+      margin: 0 auto;
+      max-width: 36em;
+      padding-left: 50px;
+      padding-right: 50px;
+      padding-top: 50px;
+      padding-bottom: 50px;
+      hyphens: auto;
+      overflow-wrap: break-word;
+      text-rendering: optimizeLegibility;
+      font-kerning: normal;
+    }
+    @media (max-width: 600px) {
+      body {
+        font-size: 0.9em;
+        padding: 12px;
+      }
+      h1 {
+        font-size: 1.8em;
+      }
+    }
+    @media print {
+      html {
+        background-color: white;
+      }
+      body {
+        background-color: transparent;
+        color: black;
+        font-size: 12pt;
+      }
+      p, h2, h3 {
+        orphans: 3;
+        widows: 3;
+      }
+      h2, h3, h4 {
+        page-break-after: avoid;
+      }
+    }
+    p {
+      margin: 1em 0;
+    }
+    a {
+      color: #1a1a1a;
+    }
+    a:visited {
+      color: #1a1a1a;
+    }
+    img {
+      max-width: 100%;
+    }
+    h1, h2, h3, h4, h5, h6 {
+      margin-top: 1.4em;
+    }
+    h5, h6 {
+      font-size: 1em;
+      font-style: italic;
+    }
+    h6 {
+      font-weight: normal;
+    }
+    ol, ul {
+      padding-left: 1.7em;
+      margin-top: 1em;
+    }
+    li > ol, li > ul {
+      margin-top: 0;
+    }
+    blockquote {
+      margin: 1em 0 1em 1.7em;
+      padding-left: 1em;
+      border-left: 2px solid #e6e6e6;
+      color: #606060;
+    }
+    code {
+      font-family: Menlo, Monaco, Consolas, 'Lucida Console', monospace;
+      font-size: 85%;
+      margin: 0;
+      hyphens: manual;
+    }
+    pre {
+      margin: 1em 0;
+      overflow: auto;
+    }
+    pre code {
+      padding: 0;
+      overflow: visible;
+      overflow-wrap: normal;
+    }
+    .sourceCode {
+     background-color: transparent;
+     overflow: visible;
+    }
+    hr {
+      background-color: #1a1a1a;
+      border: none;
+      height: 1px;
+      margin: 1em 0;
+    }
+    table {
+      margin: 1em 0;
+      border-collapse: collapse;
+      width: 100%;
+      overflow-x: auto;
+      display: block;
+      font-variant-numeric: lining-nums tabular-nums;
+    }
+    table caption {
+      margin-bottom: 0.75em;
+    }
+    tbody {
+      margin-top: 0.5em;
+      border-top: 1px solid #1a1a1a;
+      border-bottom: 1px solid #1a1a1a;
+    }
+    th {
+      border-top: 1px solid #1a1a1a;
+      padding: 0.25em 0.5em 0.25em 0.5em;
+    }
+    td {
+      padding: 0.125em 0.5em 0.25em 0.5em;
+    }
+    header {
+      margin-bottom: 4em;
+      text-align: center;
+    }
+    #TOC li {
+      list-style: none;
+    }
+    #TOC ul {
+      padding-left: 1.3em;
+    }
+    #TOC > ul {
+      padding-left: 0;
+    }
+    #TOC a:not(:hover) {
+      text-decoration: none;
+    }
+    code{white-space: pre-wrap;}
+    span.smallcaps{font-variant: small-caps;}
+    div.columns{display: flex; gap: min(4vw, 1.5em);}
+    div.column{flex: auto; overflow-x: auto;}
+    div.hanging-indent{margin-left: 1.5em; text-indent: -1.5em;}
+    /* The extra [class] is a hack that increases specificity enough to
+       override a similar rule in reveal.js */
+    ul.task-list[class]{list-style: none;}
+    ul.task-list li input[type="checkbox"] {
+      font-size: inherit;
+      width: 0.8em;
+      margin: 0 0.8em 0.2em -1.6em;
+      vertical-align: middle;
+    }
+    .display.math{display: block; text-align: center; margin: 0.5rem auto;}
+  </style>
+</head>
+<body>
+<h1 id="ikam-benchmark-case-spec-idea.md">IKAM Benchmark Case Spec
+(idea.md)</h1>
+<h2 id="identity">Identity</h2>
+<ul>
+<li>Case ID: l-construction-v01</li>
+<li>Business name: Ironwood Ridge Constructors</li>
+<li>Industry / domain: Construction (commercial GC + tenant
+improvements)</li>
+<li>Business model: project-based (GMP + fixed bid) + small service
+team</li>
+<li>Locations / operating region: Southwest US (AZ/NM), 2 offices</li>
+<li>Size tier: l</li>
+<li>Org maturity: established, but lots of project variance and
+spreadsheet reality</li>
+</ul>
+<h2 id="high-level-description">High-level description</h2>
+<ul>
+<li>One-liner: A large-ish regional GC with many active jobs and
+predictable mess: schedule drift, CO confusion, and PM forecasts that
+don’t match accounting.</li>
+</ul>
+<h2 id="operating-model">Operating model</h2>
+<ul>
+<li>Functions:
+<ul>
+<li>Precon/estimating</li>
+<li>Operations (PMs + supers)</li>
+<li>Safety</li>
+<li>Accounting/WIP</li>
+<li>Procurement</li>
+<li>Legal/contracts (light)</li>
+</ul></li>
+<li>Key roles:
+<ul>
+<li>Erin Caldwell — President</li>
+<li>Mateo Reyes — VP Operations</li>
+<li>Kira Olsen — Director of Precon</li>
+<li>Nolan Price — Controller</li>
+<li>Leah Kim — Safety Manager</li>
+</ul></li>
+</ul>
+<h2 id="chaos-profile-new-pick-tracked">Chaos profile (new pick;
+tracked)</h2>
+<ul>
+<li>Overall chaos level (1–5): <strong>4</strong></li>
+<li>Rationale: many moving parts, but fewer systems than XL; still
+multiple truths.</li>
+<li>Where chaos lives:
+<ul class="task-list">
+<li><label><input type="checkbox" checked="" />schedule versions (owner
+vs internal)</label></li>
+<li><label><input type="checkbox" checked="" />CO totals (approved vs
+pending vs forecast)</label></li>
+<li><label><input type="checkbox" checked="" />job-cost forecast vs
+WIP</label></li>
+<li><label><input type="checkbox" checked="" />RFI/submittal tracking
+outside the main PM system</label></li>
+</ul></li>
+</ul>
+<h2 id="intentional-contradictions">Intentional contradictions</h2>
+<ol type="1">
+<li>Substantial Completion:
+<ul>
+<li>Owner update email: 2026-10-18</li>
+<li>Internal schedule: 2026-11-05 (weather + inspections)</li>
+</ul></li>
+<li>Change Orders:
+<ul>
+<li>CO log approved totals: $740k</li>
+<li>Exec summary says $1.05M (includes pending)</li>
+</ul></li>
+<li>Margin:
+<ul>
+<li>PM forecast: 6.2%</li>
+<li>WIP report: 4.6%</li>
+</ul></li>
+</ol>
+<h2 id="artifact-set">Artifact set</h2>
+<h3 id="strategy-identity">Strategy + identity</h3>
+<ul>
+<li>mission-vision-values.md</li>
+<li>brand-guide.md</li>
+<li>high-level-strategy-2026.md</li>
+<li>org-structure.json</li>
+</ul>
+<h3 id="estimating-contracts">Estimating + contracts</h3>
+<ul>
+<li>company-capabilities-one-pager.pdf</li>
+<li>estimate-template.xlsx</li>
+<li>contract-summary-ownerletter.pdf</li>
+</ul>
+<h3 id="delivery-primary-project">Delivery (primary project)</h3>
+<p>Project: Desert Vista Medical Office (Job #DV-3291) -
+project-plan-desert-vista.md - master-schedule-desert-vista.xlsx -
+owner-update-email-2026-09-12.md - lookahead-schedule-desert-vista.xlsx
+- rfi-log-desert-vista.xlsx - submittal-log-desert-vista.xlsx -
+change-order-log-desert-vista.xlsx -
+meeting-notes-desert-vista-2026-09-06.md -
+meeting-notes-desert-vista-2026-10-04.md -
+exec-summary-email-2026-10-05.md</p>
+<h3 id="finance">Finance</h3>
+<ul>
+<li>job-costing-desert-vista.xlsx</li>
+<li>wip-report-2026-09.xlsx</li>
+<li>accounts-receivable-2026-09.xlsx</li>
+<li>quarterly-revenue-history-2024-2025.xlsx</li>
+<li>projected-revenue-2026.xlsx</li>
+<li>kpi-definitions.json</li>
+</ul>
+<h3 id="safety-quality">Safety + quality</h3>
+<ul>
+<li>safety-walk-template.md</li>
+<li>safety-incident-log-2026.xlsx</li>
+<li>qaqc-punchlist-template.xlsx</li>
+</ul>
+<h3 id="templates">Templates</h3>
+<ul>
+<li>rfi-template.md</li>
+<li>subcontractor-evaluation-template.md</li>
+<li>owner-change-request-form.json</li>
+</ul>
+<h3 id="word-documents-.docx">Word documents (.docx)</h3>
+<ul>
+<li>milestone-report-2026-02-20.docx</li>
+</ul>
+<h3 id="images-mixed-generated">Images (mixed; generated)</h3>
+<p>Documentation: - assets/images/README.md</p>
+<p>Folders: - assets/images/logos/ - assets/images/people/ -
+assets/images/site/ - assets/images/diagrams/ -
+assets/images/social/</p>
+<p>Metadata: - assets/images/prompts.jsonl</p>
+<p>Targets (exact): - logos: 8 - people: 18 - site: 26 - diagrams: 16 -
+social: 8</p>
+<h3 id="word-documents-.docx-1">Word documents (.docx)</h3>
+<ul>
+<li>milestone-report-2026-02-20.docx</li>
+</ul>
+<h2 id="timeline-of-significant-events">Timeline of significant
+events</h2>
+<ul>
+<li>2025-07: Expanded into TI work; more parallel jobs.</li>
+<li>2026-08: Desert Vista long-lead MEP equipment slips.</li>
+<li>2026-09: Owner requests earlier substantial completion.</li>
+<li>2026-10: CO totals and margin questioned in exec review.</li>
+</ul>
+<h2 id="benchmark-goals-ikam">Benchmark goals (IKAM)</h2>
+<ul>
+<li>Queries:
+<ol type="1">
+<li>“What’s the latest substantial completion date and why do sources
+differ?”</li>
+<li>“Approved vs pending CO totals — what’s the real number?”</li>
+<li>“Reconcile PM forecast margin vs accounting WIP.”</li>
+<li>“Top open RFIs/submittals and owners.”</li>
+</ol></li>
+</ul>
+</body>
+</html>

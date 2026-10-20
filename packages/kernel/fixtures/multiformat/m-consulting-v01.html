@@ -1,0 +1,439 @@
+<!DOCTYPE html>
+<html xmlns="http://www.w3.org/1999/xhtml" lang="" xml:lang="">
+<head>
+  <meta charset="utf-8" />
+  <meta name="generator" content="pandoc" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=yes" />
+  <title>m-consulting-v01</title>
+  <style>
+    html {
+      color: #1a1a1a;
+      background-color: #fdfdfd;
+    }
+    body {
+      margin: 0 auto;
+      max-width: 36em;
+      padding-left: 50px;
+      padding-right: 50px;
+      padding-top: 50px;
+      padding-bottom: 50px;
+      hyphens: auto;
+      overflow-wrap: break-word;
+      text-rendering: optimizeLegibility;
+      font-kerning: normal;
+    }
+    @media (max-width: 600px) {
+      body {
+        font-size: 0.9em;
+        padding: 12px;
+      }
+      h1 {
+        font-size: 1.8em;
+      }
+    }
+    @media print {
+      html {
+        background-color: white;
+      }
+      body {
+        background-color: transparent;
+        color: black;
+        font-size: 12pt;
+      }
+      p, h2, h3 {
+        orphans: 3;
+        widows: 3;
+      }
+      h2, h3, h4 {
+        page-break-after: avoid;
+      }
+    }
+    p {
+      margin: 1em 0;
+    }
+    a {
+      color: #1a1a1a;
+    }
+    a:visited {
+      color: #1a1a1a;
+    }
+    img {
+      max-width: 100%;
+    }
+    h1, h2, h3, h4, h5, h6 {
+      margin-top: 1.4em;
+    }
+    h5, h6 {
+      font-size: 1em;
+      font-style: italic;
+    }
+    h6 {
+      font-weight: normal;
+    }
+    ol, ul {
+      padding-left: 1.7em;
+      margin-top: 1em;
+    }
+    li > ol, li > ul {
+      margin-top: 0;
+    }
+    blockquote {
+      margin: 1em 0 1em 1.7em;
+      padding-left: 1em;
+      border-left: 2px solid #e6e6e6;
+      color: #606060;
+    }
+    code {
+      font-family: Menlo, Monaco, Consolas, 'Lucida Console', monospace;
+      font-size: 85%;
+      margin: 0;
+      hyphens: manual;
+    }
+    pre {
+      margin: 1em 0;
+      overflow: auto;
+    }
+    pre code {
+      padding: 0;
+      overflow: visible;
+      overflow-wrap: normal;
+    }
+    .sourceCode {
+     background-color: transparent;
+     overflow: visible;
+    }
+    hr {
+      background-color: #1a1a1a;
+      border: none;
+      height: 1px;
+      margin: 1em 0;
+    }
+    table {
+      margin: 1em 0;
+      border-collapse: collapse;
+      width: 100%;
+      overflow-x: auto;
+      display: block;
+      font-variant-numeric: lining-nums tabular-nums;
+    }
+    table caption {
+      margin-bottom: 0.75em;
+    }
+    tbody {
+      margin-top: 0.5em;
+      border-top: 1px solid #1a1a1a;
+      border-bottom: 1px solid #1a1a1a;
+    }
+    th {
+      border-top: 1px solid #1a1a1a;
+      padding: 0.25em 0.5em 0.25em 0.5em;
+    }
+    td {
+      padding: 0.125em 0.5em 0.25em 0.5em;
+    }
+    header {
+      margin-bottom: 4em;
+      text-align: center;
+    }
+    #TOC li {
+      list-style: none;
+    }
+    #TOC ul {
+      padding-left: 1.3em;
+    }
+    #TOC > ul {
+      padding-left: 0;
+    }
+    #TOC a:not(:hover) {
+      text-decoration: none;
+    }
+    code{white-space: pre-wrap;}
+    span.smallcaps{font-variant: small-caps;}
+    div.columns{display: flex; gap: min(4vw, 1.5em);}
+    div.column{flex: auto; overflow-x: auto;}
+    div.hanging-indent{margin-left: 1.5em; text-indent: -1.5em;}
+    /* The extra [class] is a hack that increases specificity enough to
+       override a similar rule in reveal.js */
+    ul.task-list[class]{list-style: none;}
+    ul.task-list li input[type="checkbox"] {
+      font-size: inherit;
+      width: 0.8em;
+      margin: 0 0.8em 0.2em -1.6em;
+      vertical-align: middle;
+    }
+    .display.math{display: block; text-align: center; margin: 0.5rem auto;}
+  </style>
+</head>
+<body>
+<h1 id="ikam-benchmark-case-spec-idea.md">IKAM Benchmark Case Spec
+(idea.md)</h1>
+<h2 id="identity">Identity</h2>
+<ul>
+<li>Case ID: m-consulting-v01</li>
+<li>Business name: Northlake Advisory Group (NAG)</li>
+<li>Industry / domain: Consulting (operations + finance transformation
+for mid-market firms)</li>
+<li>Business model: Services (retainers + fixed-scope projects)</li>
+<li>Locations / operating region: Seattle, WA + remote (US)</li>
+<li>Size tier: m</li>
+<li>Org maturity: process-emerging (some templates, uneven
+adoption)</li>
+</ul>
+<h2 id="high-level-description">High-level description</h2>
+<ul>
+<li>One-liner: A mid-sized consulting firm helping mid-market companies
+fix operational bottlenecks, reporting, and cost structure.</li>
+<li>What they deliver:
+<ul>
+<li>Diagnostic engagements (2–4 weeks)</li>
+<li>90-day transformation sprints</li>
+<li>Ongoing advisory retainers</li>
+</ul></li>
+<li>Target customers:
+<ul>
+<li>Manufacturing, logistics, healthcare services (mid-market)</li>
+</ul></li>
+<li>Differentiators:
+<ul>
+<li>Practical, spreadsheet-driven, “get it done” approach</li>
+<li>Strong operator bench (ex-industry)</li>
+</ul></li>
+</ul>
+<h2 id="operating-model">Operating model</h2>
+<ul>
+<li>Teams / functions:
+<ul>
+<li>Partners</li>
+<li>Delivery (consultants)</li>
+<li>Analytics (light)</li>
+<li>Sales/BD</li>
+<li>Ops/Admin</li>
+</ul></li>
+<li>Key roles (named people + titles):
+<ul>
+<li>Elena Park — Managing Partner</li>
+<li>Ravi Desai — Partner, Growth</li>
+<li>Casey Nguyen — Engagement Manager</li>
+<li>Morgan Lee — Senior Consultant</li>
+<li>Priya Shah — Analyst</li>
+<li>Jo Alvarez — Ops Manager</li>
+</ul></li>
+<li>Tools (realism anchors):
+<ul>
+<li>Docs: Google Drive + exported PDFs</li>
+<li>Spreadsheets: Excel</li>
+<li>CRM-ish: HubSpot (partial)</li>
+<li>Project tracking: mixed (some Jira, some Monday, lots of
+ad-hoc)</li>
+<li>Meetings: Zoom + notes in docs</li>
+</ul></li>
+</ul>
+<h2 id="chaos-profile-different-from-s-local-retail-v01">Chaos profile
+(different from s-local-retail-v01)</h2>
+<ul>
+<li>Overall chaos level (1–5): <strong>4</strong></li>
+<li>Why: many parallel clients + reuse of templates + time pressure →
+version sprawl.</li>
+<li>Where chaos lives:
+<ul class="task-list">
+<li><label><input type="checkbox" checked="" />naming conventions
+(clients have codenames + legal names)</label></li>
+<li><label><input type="checkbox" checked="" />versioning / duplicates
+(decks reused, “copy of copy”)</label></li>
+<li><label><input type="checkbox" checked="" />conflicting metrics
+(client-provided numbers vs consultant-derived)</label></li>
+<li><label><input type="checkbox" checked="" />stale strategy/roadmap
+(internal GTM doc trails reality)</label></li>
+<li><label><input type="checkbox" checked="" />missing documents (some
+engagements missing closeout)</label></li>
+<li><label><input type="checkbox" checked="" />shadow spreadsheets
+(personal files outside shared drive)</label></li>
+<li><label><input type="checkbox" checked="" />messy meeting notes
+(action items lost, owners unclear)</label></li>
+<li><label><input type="checkbox" checked="" />unclear ownership/RACI
+(partners override process)</label></li>
+</ul></li>
+</ul>
+<h2 id="intentional-contradictions-to-include">Intentional
+contradictions to include</h2>
+<ol type="1">
+<li>Revenue recognition vs pipeline:
+<ul>
+<li>Finance summary recognizes a project in Q3</li>
+<li>Pipeline report still lists it as “At risk / not closed”</li>
+</ul></li>
+<li>Client naming:
+<ul>
+<li>“Evergreen Transport” vs “Evergreen Logistics LLC” vs codename
+“PINECONE”</li>
+</ul></li>
+<li>Delivery methodology:
+<ul>
+<li>Ops handbook says “two-week sprints”</li>
+<li>Actual engagement artifacts show irregular cadence and ad-hoc
+milestones</li>
+</ul></li>
+<li>Headcount/utilization:
+<ul>
+<li>Staffing plan counts 18 consultants</li>
+<li>HR roster shows 16 FTE + 4 contractors (not all billable)</li>
+</ul></li>
+</ol>
+<h2 id="financial-shape-benchmark-intent">Financial shape (benchmark
+intent)</h2>
+<ul>
+<li>Currency: USD</li>
+<li>Revenue streams:
+<ul>
+<li>Fixed-scope project fees</li>
+<li>Retainers</li>
+<li>Training workshops</li>
+</ul></li>
+<li>Cost centers:
+<ul>
+<li>Labor</li>
+<li>Travel (declining)</li>
+<li>Subcontractors</li>
+<li>Sales/marketing</li>
+</ul></li>
+<li>Reporting cadence:
+<ul>
+<li>Monthly internal</li>
+<li>Quarterly board-style update</li>
+</ul></li>
+</ul>
+<h2 id="artifact-set-what-documents-should-exist">Artifact set (what
+documents should exist)</h2>
+<p>Include a mix of Markdown, JSON, XLSX, PPTX, and PDF.</p>
+<h3 id="strategy-identity">Strategy + identity</h3>
+<ul>
+<li>mission-vision-values.md</li>
+<li>brand-guide.md (palette + tone + slide style guidance)</li>
+<li>high-level-strategy-2026.md</li>
+<li>service-lines.md</li>
+</ul>
+<h3 id="marketing-sales">Marketing + sales</h3>
+<ul>
+<li>marketing-pitch-deck.pptx</li>
+<li>case-study-one-pager.pdf</li>
+<li>proposal-template.docx (or md if docx not used)</li>
+<li>messaging-pillars.md</li>
+<li>lead-list.json</li>
+</ul>
+<h3 id="finance-pipeline">Finance + pipeline</h3>
+<ul>
+<li>projected-revenue-2026.xlsx</li>
+<li>quarterly-revenue-history-2024-2025.xlsx</li>
+<li>pipeline-report-2025-q3.xlsx</li>
+<li>utilization-tracker-2025-h2.xlsx</li>
+<li>kpi-definitions.json</li>
+</ul>
+<h3 id="delivery-project-ops">Delivery / project ops</h3>
+<ul>
+<li>engagement-playbook.md</li>
+<li>sample-engagement-PINECONE/ (folder)
+<ul>
+<li>statement-of-work.pdf</li>
+<li>kickoff-notes.md</li>
+<li>weekly-status-2025-08-15.md</li>
+<li>weekly-status-2025-08-29.md</li>
+<li>deliverable-cost-model.xlsx</li>
+<li>deliverable-deck-v1.pptx</li>
+<li>deliverable-deck-v3-FINAL.pptx</li>
+<li>closeout-summary.md (intentionally missing in some cases)</li>
+</ul></li>
+</ul>
+<h3 id="meetings-notes">Meetings + notes</h3>
+<ul>
+<li>all-hands-notes-2025-09-03.md</li>
+<li>partner-meeting-notes-2025-10-10.md</li>
+<li>voice-note-transcript-2025-10-21.md</li>
+</ul>
+<h3 id="evaluation-templates">Evaluation templates</h3>
+<ul>
+<li>client-intake-form.json</li>
+<li>engagement-retro-template.md</li>
+<li>consultant-performance-rubric.md</li>
+</ul>
+<h3 id="word-documents-.docx">Word documents (.docx)</h3>
+<ul>
+<li>engagement-status-2026-02-10.docx</li>
+</ul>
+<h3 id="images-mixed-generated">Images (mixed; generated)</h3>
+<p>Documentation: - assets/images/README.md</p>
+<p>Folders: - assets/images/logos/ - assets/images/people/ -
+assets/images/social/ - assets/images/diagrams/</p>
+<p>Metadata: - assets/images/prompts.jsonl</p>
+<p>Targets (exact for this case): - logos: 6 - people: 18 - social: 24 -
+diagrams: 12 (consulting-style frameworks, charts, swimlanes;
+illustrative)</p>
+<h2 id="entity-glossary-for-knowledge-graph-grounding">Entity glossary
+(for knowledge graph grounding)</h2>
+<ul>
+<li>People: Elena Park, Ravi Desai, Casey Nguyen, Morgan Lee, Priya
+Shah, Jo Alvarez</li>
+<li>Teams: Partners, Delivery, Analytics, Ops</li>
+<li>Clients (canonical + aliases):
+<ul>
+<li>Evergreen Transport / Evergreen Logistics LLC / PINECONE</li>
+<li>3–5 additional clients with aliases</li>
+</ul></li>
+<li>Services:
+<ul>
+<li>Ops diagnostic</li>
+<li>Finance transformation</li>
+<li>Cost model + pricing</li>
+</ul></li>
+<li>Projects/initiatives:
+<ul>
+<li>2026 GTM refresh</li>
+<li>Template cleanup (attempt)</li>
+</ul></li>
+<li>KPIs:
+<ul>
+<li>Booked revenue, recognized revenue</li>
+<li>Pipeline by stage</li>
+<li>Utilization %</li>
+<li>Gross margin</li>
+</ul></li>
+</ul>
+<h3 id="word-documents-.docx-1">Word documents (.docx)</h3>
+<ul>
+<li>engagement-status-2026-02-10.docx</li>
+</ul>
+<h2 id="timeline-of-significant-events">Timeline of significant
+events</h2>
+<ul>
+<li>2024-02: Elena becomes Managing Partner (promotion).</li>
+<li>2024-09: Launch “90-day sprint” offer (marketing says standardized;
+delivery varies).</li>
+<li>2025-03: Layoffs (2) + hiring freeze; later quietly adds
+contractors.</li>
+<li>2025-07: Wins Evergreen (PINECONE) engagement; client naming sprawl
+begins.</li>
+<li>2025-08: Internal template overhaul attempt; produces
+duplicates.</li>
+<li>2025-10: Partner conflict on pricing; proposal template
+diverges.</li>
+<li>2025-12: Big year-end push; utilization tracker becomes
+unreliable.</li>
+<li>2026-01: GTM refresh draft circulated but not adopted.</li>
+</ul>
+<h2 id="benchmark-goals-ikam">Benchmark goals (IKAM)</h2>
+<ul>
+<li>Queries:
+<ol type="1">
+<li>“What is the true status of PINECONE: closed/won vs at-risk?”</li>
+<li>“Reconcile recognized revenue vs pipeline for Q3 2025.”</li>
+<li>“What delivery methodology is actually used?”</li>
+<li>“Who are the key people and what roles changed over time?”</li>
+</ol></li>
+<li>Ambiguities IKAM must resolve/flag:
+<ul>
+<li>multiple client names/codenames</li>
+<li>deck version conflicts</li>
+<li>missing closeout artifact</li>
+</ul></li>
+</ul>
+</body>
+</html>

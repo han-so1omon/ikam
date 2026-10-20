@@ -1,0 +1,334 @@
+<!DOCTYPE html>
+<html xmlns="http://www.w3.org/1999/xhtml" lang="" xml:lang="">
+<head>
+  <meta charset="utf-8" />
+  <meta name="generator" content="pandoc" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=yes" />
+  <title>xl-construction-v01</title>
+  <style>
+    html {
+      color: #1a1a1a;
+      background-color: #fdfdfd;
+    }
+    body {
+      margin: 0 auto;
+      max-width: 36em;
+      padding-left: 50px;
+      padding-right: 50px;
+      padding-top: 50px;
+      padding-bottom: 50px;
+      hyphens: auto;
+      overflow-wrap: break-word;
+      text-rendering: optimizeLegibility;
+      font-kerning: normal;
+    }
+    @media (max-width: 600px) {
+      body {
+        font-size: 0.9em;
+        padding: 12px;
+      }
+      h1 {
+        font-size: 1.8em;
+      }
+    }
+    @media print {
+      html {
+        background-color: white;
+      }
+      body {
+        background-color: transparent;
+        color: black;
+        font-size: 12pt;
+      }
+      p, h2, h3 {
+        orphans: 3;
+        widows: 3;
+      }
+      h2, h3, h4 {
+        page-break-after: avoid;
+      }
+    }
+    p {
+      margin: 1em 0;
+    }
+    a {
+      color: #1a1a1a;
+    }
+    a:visited {
+      color: #1a1a1a;
+    }
+    img {
+      max-width: 100%;
+    }
+    h1, h2, h3, h4, h5, h6 {
+      margin-top: 1.4em;
+    }
+    h5, h6 {
+      font-size: 1em;
+      font-style: italic;
+    }
+    h6 {
+      font-weight: normal;
+    }
+    ol, ul {
+      padding-left: 1.7em;
+      margin-top: 1em;
+    }
+    li > ol, li > ul {
+      margin-top: 0;
+    }
+    blockquote {
+      margin: 1em 0 1em 1.7em;
+      padding-left: 1em;
+      border-left: 2px solid #e6e6e6;
+      color: #606060;
+    }
+    code {
+      font-family: Menlo, Monaco, Consolas, 'Lucida Console', monospace;
+      font-size: 85%;
+      margin: 0;
+      hyphens: manual;
+    }
+    pre {
+      margin: 1em 0;
+      overflow: auto;
+    }
+    pre code {
+      padding: 0;
+      overflow: visible;
+      overflow-wrap: normal;
+    }
+    .sourceCode {
+     background-color: transparent;
+     overflow: visible;
+    }
+    hr {
+      background-color: #1a1a1a;
+      border: none;
+      height: 1px;
+      margin: 1em 0;
+    }
+    table {
+      margin: 1em 0;
+      border-collapse: collapse;
+      width: 100%;
+      overflow-x: auto;
+      display: block;
+      font-variant-numeric: lining-nums tabular-nums;
+    }
+    table caption {
+      margin-bottom: 0.75em;
+    }
+    tbody {
+      margin-top: 0.5em;
+      border-top: 1px solid #1a1a1a;
+      border-bottom: 1px solid #1a1a1a;
+    }
+    th {
+      border-top: 1px solid #1a1a1a;
+      padding: 0.25em 0.5em 0.25em 0.5em;
+    }
+    td {
+      padding: 0.125em 0.5em 0.25em 0.5em;
+    }
+    header {
+      margin-bottom: 4em;
+      text-align: center;
+    }
+    #TOC li {
+      list-style: none;
+    }
+    #TOC ul {
+      padding-left: 1.3em;
+    }
+    #TOC > ul {
+      padding-left: 0;
+    }
+    #TOC a:not(:hover) {
+      text-decoration: none;
+    }
+    code{white-space: pre-wrap;}
+    span.smallcaps{font-variant: small-caps;}
+    div.columns{display: flex; gap: min(4vw, 1.5em);}
+    div.column{flex: auto; overflow-x: auto;}
+    div.hanging-indent{margin-left: 1.5em; text-indent: -1.5em;}
+    /* The extra [class] is a hack that increases specificity enough to
+       override a similar rule in reveal.js */
+    ul.task-list[class]{list-style: none;}
+    ul.task-list li input[type="checkbox"] {
+      font-size: inherit;
+      width: 0.8em;
+      margin: 0 0.8em 0.2em -1.6em;
+      vertical-align: middle;
+    }
+    .display.math{display: block; text-align: center; margin: 0.5rem auto;}
+  </style>
+</head>
+<body>
+<h1 id="ikam-benchmark-case-spec-idea.md">IKAM Benchmark Case Spec
+(idea.md)</h1>
+<h2 id="identity">Identity</h2>
+<ul>
+<li>Case ID: xl-construction-v01</li>
+<li>Business name: SummitSpan Builders Group</li>
+<li>Industry / domain: Construction (commercial GC + multifamily + light
+civil)</li>
+<li>Business model: Project-based (GMP, design-build, fixed bid) +
+service division</li>
+<li>Locations / operating region: Pacific Northwest (regional), 4
+offices</li>
+<li>Size tier: xl</li>
+<li>Org maturity: heavy process surface + constant exceptions</li>
+</ul>
+<h2 id="high-level-description">High-level description</h2>
+<ul>
+<li>One-liner: A large regional GC with many concurrent projects, lots
+of documentation, and multiple parallel tracking systems.</li>
+</ul>
+<h2 id="operating-model">Operating model</h2>
+<ul>
+<li>Functions:
+<ul>
+<li>Precon/estimating</li>
+<li>PMO</li>
+<li>Project teams (PMs, supers)</li>
+<li>Safety</li>
+<li>Quality</li>
+<li>Accounting/WIP</li>
+<li>Legal/Contracts</li>
+<li>HR</li>
+</ul></li>
+<li>Key roles:
+<ul>
+<li>Dana Whitfield — CEO</li>
+<li>Marcus Lee — COO</li>
+<li>Priya Nair — VP Precon</li>
+<li>Elena Ortiz — VP Operations</li>
+<li>Sam Cho — Controller</li>
+<li>Tasha Reed — Safety Director</li>
+</ul></li>
+</ul>
+<h2 id="chaos-profile-new-pick-tracked">Chaos profile (new pick;
+tracked)</h2>
+<ul>
+<li>Overall chaos level (1–5): <strong>5</strong></li>
+<li>Rationale: many projects, many systems, conflicting definitions and
+version sprawl.</li>
+<li>Where chaos lives:
+<ul class="task-list">
+<li><label><input type="checkbox" checked="" />schedule version drift
+(P6 vs Excel vs meeting notes)</label></li>
+<li><label><input type="checkbox" checked="" />change order totals
+(approved vs pending vs forecast)</label></li>
+<li><label><input type="checkbox" checked="" />cost-to-complete
+differences (PM forecast vs accounting WIP)</label></li>
+<li><label><input type="checkbox" checked="" />RFI/submittal tracking in
+shadow sheets</label></li>
+<li><label><input type="checkbox" checked="" />messy meeting notes and
+emails</label></li>
+<li><label><input type="checkbox" checked="" />inconsistent project
+naming and job numbers</label></li>
+</ul></li>
+</ul>
+<h2 id="intentional-contradictions">Intentional contradictions</h2>
+<ol type="1">
+<li>Substantial Completion date:
+<ul>
+<li>PM weekly notes say 2026-07-15</li>
+<li>Master schedule shows 2026-08-02 (re-baselined)</li>
+</ul></li>
+<li>Change orders:
+<ul>
+<li>CO log sums approved to $2.1M</li>
+<li>Exec summary claims $2.6M (includes pending)</li>
+</ul></li>
+<li>Margin:
+<ul>
+<li>PM forecast shows 5.5% fee</li>
+<li>Accounting WIP implies 3.8% margin</li>
+</ul></li>
+</ol>
+<h2 id="artifact-set">Artifact set</h2>
+<h3 id="strategy-identity">Strategy + identity</h3>
+<ul>
+<li>mission-vision-values.md</li>
+<li>brand-guide.md</li>
+<li>high-level-strategy-2026.md</li>
+<li>org-structure.json</li>
+</ul>
+<h3 id="estimating-contracts">Estimating + contracts</h3>
+<ul>
+<li>company-capabilities-one-pager.pdf</li>
+<li>estimate-template.xlsx</li>
+<li>sample-estimate-multifamily-riverwalk.pdf</li>
+<li>contract-summary-multifamily-riverwalk.pdf</li>
+</ul>
+<h3 id="delivery-primary-project">Delivery (primary project)</h3>
+<p>Project: Multifamily — Riverwalk (Job #RW-4412) -
+project-plan-riverwalk.md - master-schedule-riverwalk.xlsx -
+lookahead-schedule-riverwalk.xlsx - rfi-log-riverwalk.xlsx -
+submittal-log-riverwalk.xlsx - change-order-log-riverwalk.xlsx -
+meeting-notes-riverwalk-2026-05-08.md -
+meeting-notes-riverwalk-2026-06-05.md -
+meeting-notes-riverwalk-2026-07-03.md -
+exec-summary-email-2026-07-04.md</p>
+<h3 id="finance">Finance</h3>
+<ul>
+<li>quarterly-revenue-history-2024-2025.xlsx</li>
+<li>projected-revenue-2026.xlsx</li>
+<li>job-costing-riverwalk.xlsx</li>
+<li>wip-report-2026-06.xlsx</li>
+<li>accounts-receivable-2026-06.xlsx</li>
+<li>kpi-definitions.json</li>
+</ul>
+<h3 id="safety-quality">Safety + quality</h3>
+<ul>
+<li>safety-walk-template.md</li>
+<li>incident-report-template.md</li>
+<li>safety-incident-log-2026.xlsx</li>
+<li>qaqc-punchlist-template.xlsx</li>
+</ul>
+<h3 id="templates">Templates</h3>
+<ul>
+<li>subcontractor-evaluation-template.md</li>
+<li>owner-change-request-form.json</li>
+<li>rfi-template.md</li>
+</ul>
+<h3 id="word-documents-.docx">Word documents (.docx)</h3>
+<ul>
+<li>enterprise-project-summary-2026-02.docx</li>
+</ul>
+<h3 id="images-mixed-generated">Images (mixed; generated)</h3>
+<p>Documentation: - assets/images/README.md</p>
+<p>Folders: - assets/images/logos/ - assets/images/people/ -
+assets/images/site/ - assets/images/diagrams/ -
+assets/images/social/</p>
+<p>Metadata: - assets/images/prompts.jsonl</p>
+<p>Targets (exact): - logos: 8 - people: 20 - site: 30 - diagrams: 18 -
+social: 10</p>
+<h3 id="word-documents-.docx-1">Word documents (.docx)</h3>
+<ul>
+<li>enterprise-project-summary-2026-02.docx</li>
+</ul>
+<h2 id="timeline-of-significant-events">Timeline of significant
+events</h2>
+<ul>
+<li>2024-10: ERP/WIP reporting overhaul (definition drift begins).</li>
+<li>2025-05: New safety director (more standardized safety walks).</li>
+<li>2026-04: Riverwalk project hits long-lead window issue.</li>
+<li>2026-06: Schedule re-baseline.</li>
+<li>2026-07: Exec pushes for accurate CO totals.</li>
+</ul>
+<h2 id="benchmark-goals-ikam">Benchmark goals (IKAM)</h2>
+<ul>
+<li>Queries:
+<ol type="1">
+<li>“What is the latest substantial completion date and why does it
+differ?”</li>
+<li>“What are approved vs pending change orders and true totals?”</li>
+<li>“Reconcile PM forecast margin vs accounting WIP.”</li>
+<li>“Top open RFIs/submittals and owners.”</li>
+</ol></li>
+</ul>
+</body>
+</html>

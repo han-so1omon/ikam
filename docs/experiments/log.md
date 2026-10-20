@@ -1210,3 +1210,33 @@ Newest last. Format and rules: `README.md`.
 
   The baseline's cost is 96–98% search on every file corpus. So the kernel's remaining levers are the first monthly repack and search, not verification.
 - Verdict: **discarded** (neutral, with more bytes). Kept on its branch. It would pay under a workload that reads compressed content often, for example a colder read weight or an archive profile.
+
+### E077 cross-source (analysis: one graph against one store per file type)
+- Branch / parent: exp/077-cross-source / E076 (main at 03fa78a)
+- Question: does storing different file types in **one** graph let the kernel share information across them (the north star in `docs/plans/2026-10-06-system-architecture.md`)? The bench cannot answer this: it stores md, pdf and office as separate corpora.
+- Method:
+  - New `examples/cross.rs` (an analysis, not scored). Each corpus is stored once as one repository and once as one repository per file type, then repacked; the kernel's stored bytes are compared. The baseline (zstd 3 with a trained dictionary) is split and combined the same way.
+  - Exactness and fsck are asserted.
+  - Two corpora:
+    - the fixture cases' documents: md, pdf, docx/xlsx/pptx, json, py, 4.9 MB; images left out;
+    - new `fixtures/multiformat`: each of the 24 cases' `idea.md` also rendered to html and docx by pandoc 3.1.3, and to pdf (docx through LibreOffice 24.2), 2.9 MB. The same text in four formats.
+  - Literal overlap in multiformat (16-byte shingles of the md text found verbatim): html 43%, docx `word/document.xml` (inflated) 46%, pdf content streams (inflated) 0%. The PDF text is glyph-coded.
+- Result at read weight 0.001 (storage only):
+
+  | corpus | kernel per type | kernel one store | baseline per type | baseline one store |
+  |---|---|---|---|---|
+  | cases | 385,960 | **400,092 (+3.7%)** | 797,709 | 870,159 (+9.1%) |
+  | multiformat | 881,988 | **894,449 (+1.4%)** | 1,123,952 | 1,125,583 (+0.1%) |
+
+  At the bench's read weight (48.8) on cases, nearly everything is stored raw: 4,853,079 split and 4,827,003 one store (-0.5%), against the baseline's 797,709 and 870,159. Under the heavy workload, storage hardly matters, so that weight cannot show compression.
+- What it shows:
+  - The kernel already stores both corpora at 0.48x and 0.78x of the baseline.
+  - **One graph is worse than separate stores.** The opposite of the goal.
+  - A zstd-only probe (Python zstandard, level 3, no dedup) on the cases' stored samples (office members inflated), against 613,904 B for one dictionary capped at 112,640 B as now:
+    - one larger dictionary of about 300 KB: 578,637 B (-5.7%);
+    - one dictionary per file type, used only where it pays: 534,198 B (-13%);
+    - two dictionaries, samples reassigned to the one that compresses them best (no file types given): 534,779 B (-12.9%, the same as knowing the types);
+    - three or more clusters did not converge with this simple reassignment.
+  - multiformat's bytes are 87% pdf (763,683 kernel B). The kernel expands zip members but not PDF streams, so its fonts and content stay deflated and opaque.
+- Next hypotheses, one per branch: E078 larger dictionaries; E079 several dictionaries by clustering; E080 PDF streams expanded like zip members; then cross-format context (md as the zstd context of its html and docx).
+- Verdict: **reference** (analysis; adds `examples/cross.rs` and `fixtures/multiformat`, 3.0 MB).
