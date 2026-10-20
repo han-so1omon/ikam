@@ -1,0 +1,524 @@
+<!DOCTYPE html>
+<html xmlns="http://www.w3.org/1999/xhtml" lang="" xml:lang="">
+<head>
+  <meta charset="utf-8" />
+  <meta name="generator" content="pandoc" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=yes" />
+  <title>s-local-retail-v01</title>
+  <style>
+    html {
+      color: #1a1a1a;
+      background-color: #fdfdfd;
+    }
+    body {
+      margin: 0 auto;
+      max-width: 36em;
+      padding-left: 50px;
+      padding-right: 50px;
+      padding-top: 50px;
+      padding-bottom: 50px;
+      hyphens: auto;
+      overflow-wrap: break-word;
+      text-rendering: optimizeLegibility;
+      font-kerning: normal;
+    }
+    @media (max-width: 600px) {
+      body {
+        font-size: 0.9em;
+        padding: 12px;
+      }
+      h1 {
+        font-size: 1.8em;
+      }
+    }
+    @media print {
+      html {
+        background-color: white;
+      }
+      body {
+        background-color: transparent;
+        color: black;
+        font-size: 12pt;
+      }
+      p, h2, h3 {
+        orphans: 3;
+        widows: 3;
+      }
+      h2, h3, h4 {
+        page-break-after: avoid;
+      }
+    }
+    p {
+      margin: 1em 0;
+    }
+    a {
+      color: #1a1a1a;
+    }
+    a:visited {
+      color: #1a1a1a;
+    }
+    img {
+      max-width: 100%;
+    }
+    h1, h2, h3, h4, h5, h6 {
+      margin-top: 1.4em;
+    }
+    h5, h6 {
+      font-size: 1em;
+      font-style: italic;
+    }
+    h6 {
+      font-weight: normal;
+    }
+    ol, ul {
+      padding-left: 1.7em;
+      margin-top: 1em;
+    }
+    li > ol, li > ul {
+      margin-top: 0;
+    }
+    blockquote {
+      margin: 1em 0 1em 1.7em;
+      padding-left: 1em;
+      border-left: 2px solid #e6e6e6;
+      color: #606060;
+    }
+    code {
+      font-family: Menlo, Monaco, Consolas, 'Lucida Console', monospace;
+      font-size: 85%;
+      margin: 0;
+      hyphens: manual;
+    }
+    pre {
+      margin: 1em 0;
+      overflow: auto;
+    }
+    pre code {
+      padding: 0;
+      overflow: visible;
+      overflow-wrap: normal;
+    }
+    .sourceCode {
+     background-color: transparent;
+     overflow: visible;
+    }
+    hr {
+      background-color: #1a1a1a;
+      border: none;
+      height: 1px;
+      margin: 1em 0;
+    }
+    table {
+      margin: 1em 0;
+      border-collapse: collapse;
+      width: 100%;
+      overflow-x: auto;
+      display: block;
+      font-variant-numeric: lining-nums tabular-nums;
+    }
+    table caption {
+      margin-bottom: 0.75em;
+    }
+    tbody {
+      margin-top: 0.5em;
+      border-top: 1px solid #1a1a1a;
+      border-bottom: 1px solid #1a1a1a;
+    }
+    th {
+      border-top: 1px solid #1a1a1a;
+      padding: 0.25em 0.5em 0.25em 0.5em;
+    }
+    td {
+      padding: 0.125em 0.5em 0.25em 0.5em;
+    }
+    header {
+      margin-bottom: 4em;
+      text-align: center;
+    }
+    #TOC li {
+      list-style: none;
+    }
+    #TOC ul {
+      padding-left: 1.3em;
+    }
+    #TOC > ul {
+      padding-left: 0;
+    }
+    #TOC a:not(:hover) {
+      text-decoration: none;
+    }
+    code{white-space: pre-wrap;}
+    span.smallcaps{font-variant: small-caps;}
+    div.columns{display: flex; gap: min(4vw, 1.5em);}
+    div.column{flex: auto; overflow-x: auto;}
+    div.hanging-indent{margin-left: 1.5em; text-indent: -1.5em;}
+    /* The extra [class] is a hack that increases specificity enough to
+       override a similar rule in reveal.js */
+    ul.task-list[class]{list-style: none;}
+    ul.task-list li input[type="checkbox"] {
+      font-size: inherit;
+      width: 0.8em;
+      margin: 0 0.8em 0.2em -1.6em;
+      vertical-align: middle;
+    }
+    .display.math{display: block; text-align: center; margin: 0.5rem auto;}
+  </style>
+</head>
+<body>
+<h1 id="ikam-benchmark-case-spec-.idea">IKAM Benchmark Case Spec
+(.idea)</h1>
+<h2 id="identity">Identity</h2>
+<ul>
+<li>Case ID: s-local-retail-v01</li>
+<li>Business name: Bramble &amp; Bitters</li>
+<li>Industry / domain: Local retail (specialty foods + gifts)</li>
+<li>Business model: Product retail + small subscription boxes + local
+corporate gift bundles</li>
+<li>Locations / operating region: Oakland, CA (one storefront) + ship-to
+(CA/US limited)</li>
+<li>Size tier: s</li>
+<li>Org maturity: emerging (owner-led, light process)</li>
+</ul>
+<h2 id="high-level-description">High-level description</h2>
+<ul>
+<li>One-liner: A neighborhood specialty shop selling small-batch pantry
+items, giftable goods, and seasonal subscription boxes.</li>
+<li>What they sell / deliver:
+<ul>
+<li>In-store retail: jams, hot sauces, chocolates, tea/coffee
+accessories, gift bundles</li>
+<li>Online: seasonal boxes, limited shipping, local delivery</li>
+<li>Corporate: small “thank you” gift packs for local companies</li>
+</ul></li>
+<li>Target customers:
+<ul>
+<li>Local foot traffic (30–55)</li>
+<li>Gift buyers (holidays, birthdays)</li>
+<li>Local small businesses ordering employee gifts</li>
+</ul></li>
+<li>Competitors / alternatives:
+<ul>
+<li>Other boutiques</li>
+<li>Farmers markets</li>
+<li>Big-box + Amazon gift bundles</li>
+</ul></li>
+<li>Differentiators:
+<ul>
+<li>Curated selection, rotating local makers</li>
+<li>Friendly in-store experience</li>
+<li>Seasonal curation + “tasting notes” style product descriptions</li>
+</ul></li>
+</ul>
+<h2 id="operating-model">Operating model</h2>
+<ul>
+<li>Teams / functions:
+<ul>
+<li>Owner/GM</li>
+<li>Retail ops (part-time)</li>
+<li>Marketing (contractor)</li>
+<li>Bookkeeping (external)</li>
+</ul></li>
+<li>Key roles (named people + titles):
+<ul>
+<li>Maya Chen — Owner / General Manager</li>
+<li>Jordan Reyes — Shift Lead (part-time → promoted)</li>
+<li>Talia Singh — Marketing Contractor (social + email)</li>
+<li>“North Ledger LLC” — Bookkeeping firm</li>
+</ul></li>
+<li>Tools (realism anchors):
+<ul>
+<li>POS: Square</li>
+<li>Email: Google Workspace</li>
+<li>Docs: Google Drive + exported PDFs</li>
+<li>Social: Instagram, occasional TikTok</li>
+<li>Light project tracking: a shared “To Do” note + occasional kanban
+screenshot</li>
+</ul></li>
+</ul>
+<h2 id="chaos-profile-level-3-deliberate-contradictions">Chaos profile
+(level 3; deliberate contradictions)</h2>
+<ul>
+<li>Overall chaos level (1–5): 3</li>
+<li>Where chaos lives:
+<ul class="task-list">
+<li><label><input type="checkbox" checked="" />naming conventions
+(products/projects have 2–3 names)</label></li>
+<li><label><input type="checkbox" checked="" />versioning / duplicates
+(multiple “final” pitch decks)</label></li>
+<li><label><input type="checkbox" checked="" />conflicting metrics
+(revenue differs by doc source)</label></li>
+<li><label><input type="checkbox" checked="" />stale strategy/roadmap
+(holiday plan not updated after pivot)</label></li>
+<li><label><input type="checkbox" />missing documents (most exist, but
+some are partial)</label></li>
+<li><label><input type="checkbox" checked="" />shadow IT / side
+spreadsheets (inventory + gifting kept in separate sheets)</label></li>
+<li><label><input type="checkbox" checked="" />messy meeting notes
+(voice-note transcriptions, informal bullets)</label></li>
+<li><label><input type="checkbox" />unclear ownership/RACI (small team;
+mostly clear)</label></li>
+</ul></li>
+<li>Intentional contradictions to include across artifacts:
+<ol type="1">
+<li>2025 Q4 revenue:
+<ul>
+<li>Pitch deck claims: $310k</li>
+<li>Bookkeeping summary shows: $286k</li>
+<li>POS export totals: $295k (excludes returns handled manually)</li>
+</ul></li>
+<li>Subscription program name:
+<ul>
+<li>“Seasonal Pantry Box” vs “Bramble Box” vs “Quarterly Crate”</li>
+</ul></li>
+<li>Product margin:
+<ul>
+<li>Strategy doc states target gross margin 52%</li>
+<li>Finance sheet uses 48% blended margin assumption</li>
+</ul></li>
+<li>Headcount:
+<ul>
+<li>Brand one-pager lists “5 employees” (counts contractors)</li>
+<li>HR notes list 3 staff + 1 contractor</li>
+</ul></li>
+</ol></li>
+</ul>
+<h2 id="financial-shape-benchmark-intent">Financial shape (benchmark
+intent)</h2>
+<ul>
+<li>Currency: USD</li>
+<li>Revenue streams:
+<ul>
+<li>In-store retail</li>
+<li>Online orders (shipping + local delivery)</li>
+<li>Subscription boxes</li>
+<li>Corporate gifting bundles</li>
+</ul></li>
+<li>Cost centers:
+<ul>
+<li>COGS (makers/vendors)</li>
+<li>Rent + utilities</li>
+<li>Labor</li>
+<li>Packaging + shipping</li>
+<li>Marketing spend</li>
+</ul></li>
+<li>Reporting cadence:
+<ul>
+<li>Formal: quarterly (bookkeeper)</li>
+<li>Informal: monthly “gut check” notes by owner</li>
+</ul></li>
+</ul>
+<h2 id="artifact-set-what-documents-should-exist">Artifact set (what
+documents should exist)</h2>
+<p>Generate documents with a mix of polish and mess. Include both
+Markdown and JSON.</p>
+<h3 id="strategy-identity">Strategy + identity</h3>
+<ul>
+<li>mission-vision-values.md</li>
+<li>brand-guide.md (lightweight; includes tone, colors as names not
+hex)</li>
+<li>high-level-strategy-2026.md</li>
+<li>annual-goals-okrs-2026.md</li>
+</ul>
+<h3 id="marketing-sales">Marketing + sales</h3>
+<ul>
+<li>marketing-pitch-deck.pptx (v1)</li>
+<li>marketing-pitch-deck-final-final.pptx (v2, with slightly different
+numbers)</li>
+<li>messaging-pillars.md</li>
+<li>customer-personas.md</li>
+<li>corporate-gifting-one-pager.pdf (exported; may be dated)</li>
+</ul>
+<h3 id="finance">Finance</h3>
+<ul>
+<li>projected-revenue-2026.xlsx</li>
+<li>quarterly-revenue-history-2024-2025.xlsx</li>
+<li>bookkeeping-q4-2025-summary.pdf</li>
+<li>pos-export-2025-q4.json (raw-ish export)</li>
+<li>kpi-definitions.json (definitions + formulas as strings)</li>
+</ul>
+<h3 id="ops-planning">Ops + planning</h3>
+<ul>
+<li>roadmap-2026-h1.md</li>
+<li>inventory-plan-spring-2026.xlsx</li>
+<li>vendor-list.json</li>
+<li>prior-development-cycles.md (describes how they run “sprints” around
+holidays)</li>
+</ul>
+<h3 id="meetings-notes">Meetings + notes</h3>
+<ul>
+<li>meeting-notes-2025-10-15.md (vendor planning)</li>
+<li>meeting-notes-2025-11-20.md (holiday staffing)</li>
+<li>voice-note-transcript-2026-01-07.md (owner ramble; high signal)</li>
+</ul>
+<h3 id="evaluation-templates">Evaluation templates</h3>
+<ul>
+<li>vendor-evaluation-template.md</li>
+<li>corporate-order-intake-form.json</li>
+<li>campaign-postmortem-template.md</li>
+</ul>
+<h3 id="word-documents-.docx">Word documents (.docx)</h3>
+<ul>
+<li>holiday-recap-2025.docx</li>
+<li>spring-promo-brief-2026.docx</li>
+</ul>
+<h3 id="images-mixed-generated">Images (mixed; generated)</h3>
+<p>Generate a case-consistent image pack for benchmarking multimodal
+ingestion.</p>
+<p>Documentation: - assets/images/README.md (house style, safety
+constraints, naming)</p>
+<p>Folder convention: - assets/images/products/ -
+assets/images/storefront/ - assets/images/people/ -
+assets/images/social/ - assets/images/logos/</p>
+<p>Metadata (required): - assets/images/prompts.jsonl (one JSON object
+per line) - required keys: id, out_path, kind, prompt, negative_prompt,
+model, sampler, steps, guidance, width, height, seed, created_at -
+optional keys: style_tags, notes, source_case_id</p>
+<p>Targets (approx): - products: 30–50 (photoreal-ish) - storefront:
+5–10 (photoreal-ish) - people: 10–20 (staff headshots; clearly
+synthetic) - social: 20–40 (illustrative + photo-mixed templates) -
+logos: 5–10 (flat/illustrative variations)</p>
+<h2 id="entity-glossary-for-knowledge-graph-grounding">Entity glossary
+(for knowledge graph grounding)</h2>
+<ul>
+<li>People:
+<ul>
+<li>Maya Chen</li>
+<li>Jordan Reyes</li>
+<li>Talia Singh</li>
+<li>(North Ledger LLC — org)</li>
+</ul></li>
+<li>Teams/functions:
+<ul>
+<li>Retail Ops</li>
+<li>Marketing</li>
+<li>Bookkeeping</li>
+</ul></li>
+<li>Products/services:
+<ul>
+<li>Subscription boxes (aliases listed above)</li>
+<li>Corporate gift bundles</li>
+<li>In-store curated retail assortment</li>
+</ul></li>
+<li>Customers:
+<ul>
+<li>Walk-in retail customers (aggregate)</li>
+<li>A few named corporate clients (3–5)</li>
+</ul></li>
+<li>Vendors:
+<ul>
+<li>10–15 local makers (some with duplicate names / LLC vs brand)</li>
+</ul></li>
+<li>Projects/initiatives:
+<ul>
+<li>Holiday 2025 push</li>
+<li>“Subscription refresh” (aka Box Revamp)</li>
+<li>Local delivery pilot</li>
+</ul></li>
+<li>KPIs/metrics:
+<ul>
+<li>Revenue (POS vs bookkeeping)</li>
+<li>Gross margin</li>
+<li>Average order value (AOV)</li>
+<li>Subscription churn (rough)</li>
+<li>Corporate order lead time</li>
+</ul></li>
+</ul>
+<h3 id="word-documents-.docx-1">Word documents (.docx)</h3>
+<ul>
+<li>holiday-recap-2025.docx</li>
+<li>spring-promo-brief-2026.docx</li>
+</ul>
+<h2 id="timeline-of-significant-events-required">Timeline of significant
+events (required)</h2>
+<ul>
+<li>2024-03: Opened storefront (soft launch) — Maya — references in
+origin story + early revenue notes.</li>
+<li>2024-08: First corporate gifting order (Bayworks Co.) — created a
+simple intake spreadsheet.</li>
+<li>2025-02: Hired Jordan as part-time associate — later becomes shift
+lead.</li>
+<li>2025-06: Switched packaging vendor after cost increase — affects
+margin assumptions.</li>
+<li>2025-09: Launched subscription program (name varies) — early churn
+noted informally.</li>
+<li>2025-11: Holiday staffing crunch — added two seasonal associates
+(names appear inconsistently).</li>
+<li>2025-12: Big holiday season; returns handled manually for a week due
+to Square workflow issue — explains POS vs bookkeeping mismatch.</li>
+<li>2026-01: Marketing contractor Talia engaged (trial) — changes voice
++ cadence; brand guide updated but not propagated.</li>
+<li>2026-02: Pivot: reduce shipping footprint (only CA + nearby) due to
+fulfillment pain — roadmap doc partially updated.</li>
+</ul>
+<h2 id="benchmark-goals-ikam">Benchmark goals (IKAM)</h2>
+<ul>
+<li>Queries IKAM should answer:
+<ol type="1">
+<li>“What is the subscription program called, and when did it launch?”
+(should return aliases + launch month + confidence)</li>
+<li>“Why do Q4 2025 revenue numbers disagree?” (should attribute to
+source definitions/returns)</li>
+<li>“What are 2026 H1 priorities and who owns them?”</li>
+<li>“Which vendors are highest risk and why?” (from evaluations +
+notes)</li>
+</ol></li>
+<li>Hard queries (cross-doc reasoning):
+<ul>
+<li>Connect staffing timeline to service levels and corporate order lead
+time.</li>
+<li>Reconcile margin target vs margin used in projections.</li>
+</ul></li>
+<li>Ambiguities IKAM must resolve (or flag):
+<ul>
+<li>POS export vs bookkeeping totals</li>
+<li>Contractor vs employee counting</li>
+<li>Project codenames (“Subscription refresh” vs “Box Revamp”)</li>
+</ul></li>
+</ul>
+<h2 id="dedup-opportunities-explicit-cas-anchors">Dedup opportunities
+(explicit CAS anchors)</h2>
+<p>To force measurable fragment dedup in this case, repeat the exact
+canonical snippets below across multiple artifacts (Markdown, JSON, PDF
+source markdown, and slides notes) instead of paraphrasing.</p>
+<ul>
+<li>Canonical people block (copy verbatim in 5+ files):
+<ul>
+<li><code>Maya Chen | Owner / General Manager</code></li>
+<li><code>Jordan Reyes | Shift Lead</code></li>
+<li><code>Talia Singh | Marketing Contractor</code></li>
+<li><code>North Ledger LLC | Bookkeeping</code></li>
+</ul></li>
+<li>Canonical KPI block (copy verbatim in 4+ files):
+<ul>
+<li><code>Q4 2025 Revenue (POS): 295000</code></li>
+<li><code>Q4 2025 Revenue (Bookkeeping): 286000</code></li>
+<li><code>Q4 2025 Revenue (Pitch): 310000</code></li>
+<li><code>Target Gross Margin: 52%</code></li>
+<li><code>Projection Gross Margin: 48%</code></li>
+</ul></li>
+<li>Canonical initiative alias block (copy verbatim in 4+ files):
+<ul>
+<li><code>Subscription Program Aliases: Seasonal Pantry Box | Bramble Box | Quarterly Crate</code></li>
+<li><code>Initiative Alias: Subscription Refresh | Box Revamp</code></li>
+</ul></li>
+<li>Canonical contradiction explanation line (copy verbatim in 3+
+files):
+<ul>
+<li><code>Returns were processed manually for one week in Dec 2025, causing POS and bookkeeping variance.</code></li>
+</ul></li>
+<li>Canonical ownership line for roadmap rows (copy verbatim in 3+
+files):
+<ul>
+<li><code>Owner: Maya Chen; Support: Jordan Reyes; Advisor: Talia Singh</code></li>
+</ul></li>
+</ul>
+<p>Additional candidates from the current case directory worth
+normalizing into repeated canonical snippets: - Packaging vendor switch
+event (currently phrased differently across notes/strategy/roadmap) -
+Shipping footprint pivot (<code>CA + nearby</code>) references -
+Corporate gifting lead-time language (<code>intake</code>,
+<code>fulfillment</code>, <code>approval</code>) across templates and
+one-pager - Subscription churn phrasing between voice notes and KPI
+definitions</p>
+</body>
+</html>

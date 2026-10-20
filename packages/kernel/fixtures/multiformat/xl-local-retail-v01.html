@@ -1,0 +1,352 @@
+<!DOCTYPE html>
+<html xmlns="http://www.w3.org/1999/xhtml" lang="" xml:lang="">
+<head>
+  <meta charset="utf-8" />
+  <meta name="generator" content="pandoc" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=yes" />
+  <title>xl-local-retail-v01</title>
+  <style>
+    html {
+      color: #1a1a1a;
+      background-color: #fdfdfd;
+    }
+    body {
+      margin: 0 auto;
+      max-width: 36em;
+      padding-left: 50px;
+      padding-right: 50px;
+      padding-top: 50px;
+      padding-bottom: 50px;
+      hyphens: auto;
+      overflow-wrap: break-word;
+      text-rendering: optimizeLegibility;
+      font-kerning: normal;
+    }
+    @media (max-width: 600px) {
+      body {
+        font-size: 0.9em;
+        padding: 12px;
+      }
+      h1 {
+        font-size: 1.8em;
+      }
+    }
+    @media print {
+      html {
+        background-color: white;
+      }
+      body {
+        background-color: transparent;
+        color: black;
+        font-size: 12pt;
+      }
+      p, h2, h3 {
+        orphans: 3;
+        widows: 3;
+      }
+      h2, h3, h4 {
+        page-break-after: avoid;
+      }
+    }
+    p {
+      margin: 1em 0;
+    }
+    a {
+      color: #1a1a1a;
+    }
+    a:visited {
+      color: #1a1a1a;
+    }
+    img {
+      max-width: 100%;
+    }
+    h1, h2, h3, h4, h5, h6 {
+      margin-top: 1.4em;
+    }
+    h5, h6 {
+      font-size: 1em;
+      font-style: italic;
+    }
+    h6 {
+      font-weight: normal;
+    }
+    ol, ul {
+      padding-left: 1.7em;
+      margin-top: 1em;
+    }
+    li > ol, li > ul {
+      margin-top: 0;
+    }
+    blockquote {
+      margin: 1em 0 1em 1.7em;
+      padding-left: 1em;
+      border-left: 2px solid #e6e6e6;
+      color: #606060;
+    }
+    code {
+      font-family: Menlo, Monaco, Consolas, 'Lucida Console', monospace;
+      font-size: 85%;
+      margin: 0;
+      hyphens: manual;
+    }
+    pre {
+      margin: 1em 0;
+      overflow: auto;
+    }
+    pre code {
+      padding: 0;
+      overflow: visible;
+      overflow-wrap: normal;
+    }
+    .sourceCode {
+     background-color: transparent;
+     overflow: visible;
+    }
+    hr {
+      background-color: #1a1a1a;
+      border: none;
+      height: 1px;
+      margin: 1em 0;
+    }
+    table {
+      margin: 1em 0;
+      border-collapse: collapse;
+      width: 100%;
+      overflow-x: auto;
+      display: block;
+      font-variant-numeric: lining-nums tabular-nums;
+    }
+    table caption {
+      margin-bottom: 0.75em;
+    }
+    tbody {
+      margin-top: 0.5em;
+      border-top: 1px solid #1a1a1a;
+      border-bottom: 1px solid #1a1a1a;
+    }
+    th {
+      border-top: 1px solid #1a1a1a;
+      padding: 0.25em 0.5em 0.25em 0.5em;
+    }
+    td {
+      padding: 0.125em 0.5em 0.25em 0.5em;
+    }
+    header {
+      margin-bottom: 4em;
+      text-align: center;
+    }
+    #TOC li {
+      list-style: none;
+    }
+    #TOC ul {
+      padding-left: 1.3em;
+    }
+    #TOC > ul {
+      padding-left: 0;
+    }
+    #TOC a:not(:hover) {
+      text-decoration: none;
+    }
+    code{white-space: pre-wrap;}
+    span.smallcaps{font-variant: small-caps;}
+    div.columns{display: flex; gap: min(4vw, 1.5em);}
+    div.column{flex: auto; overflow-x: auto;}
+    div.hanging-indent{margin-left: 1.5em; text-indent: -1.5em;}
+    /* The extra [class] is a hack that increases specificity enough to
+       override a similar rule in reveal.js */
+    ul.task-list[class]{list-style: none;}
+    ul.task-list li input[type="checkbox"] {
+      font-size: inherit;
+      width: 0.8em;
+      margin: 0 0.8em 0.2em -1.6em;
+      vertical-align: middle;
+    }
+    .display.math{display: block; text-align: center; margin: 0.5rem auto;}
+  </style>
+</head>
+<body>
+<h1 id="ikam-benchmark-case-spec-idea.md">IKAM Benchmark Case Spec
+(idea.md)</h1>
+<h2 id="identity">Identity</h2>
+<ul>
+<li>Case ID: xl-local-retail-v01</li>
+<li>Business name: Sunbeam Market Collective</li>
+<li>Industry / domain: Local retail (multi-location specialty grocery +
+prepared foods)</li>
+<li>Business model: Retail + catering + subscription meal kits
+(pilot)</li>
+<li>Locations / operating region: Bay Area, CA (6 locations) +
+commissary kitchen</li>
+<li>Size tier: xl</li>
+<li>Org maturity: corporate surface area (policies, templates) + messy
+reality</li>
+</ul>
+<h2 id="high-level-description">High-level description</h2>
+<ul>
+<li>One-liner: A fast-growing specialty grocer with multiple stores, a
+commissary, and a half-built subscription program.</li>
+<li>What they sell:
+<ul>
+<li>In-store grocery + prepared foods</li>
+<li>Catering trays + corporate lunches</li>
+<li>Meal-kit subscription pilot</li>
+</ul></li>
+</ul>
+<h2 id="operating-model">Operating model</h2>
+<ul>
+<li>Functions:
+<ul>
+<li>Store ops (6 store managers)</li>
+<li>Merchandising</li>
+<li>Marketing</li>
+<li>Finance</li>
+<li>HR</li>
+<li>Supply chain</li>
+<li>Commissary kitchen</li>
+</ul></li>
+<li>Key roles (named people + titles):
+<ul>
+<li>Camille Torres — COO</li>
+<li>Jonah Feld — CFO</li>
+<li>Imani Brooks — Director of Marketing</li>
+<li>Wes Park — Director of Supply Chain</li>
+<li>Hana Kim — HR Lead</li>
+<li>(Store managers) Priya, Marco, Elena, Devon, Sam, Tori</li>
+</ul></li>
+</ul>
+<h2 id="chaos-profile-new-pick-tracked">Chaos profile (new pick;
+tracked)</h2>
+<ul>
+<li>Overall chaos level (1–5): <strong>5</strong></li>
+<li>Rationale: multi-location operations + many systems + frequent
+promotions.</li>
+<li>Where chaos lives:
+<ul class="task-list">
+<li><label><input type="checkbox" checked="" />conflicting metrics (same
+KPI defined differently by store ops vs finance)</label></li>
+<li><label><input type="checkbox" checked="" />version sprawl (promo
+calendars, brand guides, SOPs)</label></li>
+<li><label><input type="checkbox" checked="" />shadow spreadsheets
+(waste logs, labor scheduling)</label></li>
+<li><label><input type="checkbox" checked="" />messy meeting notes
+(store calls)</label></li>
+<li><label><input type="checkbox" checked="" />missing docs
+(postmortems, some SOP signoffs)</label></li>
+<li><label><input type="checkbox" checked="" />naming drift (product
+lines and promo names)</label></li>
+</ul></li>
+</ul>
+<h2 id="intentional-contradictions">Intentional contradictions</h2>
+<ol type="1">
+<li>Revenue reporting:
+<ul>
+<li>Weekly store ops report shows higher revenue (gross) than finance
+net (returns/voids)</li>
+</ul></li>
+<li>Waste:
+<ul>
+<li>Commissary waste log claims waste down 20%</li>
+<li>Finance shrink summary shows waste/shrink flat</li>
+</ul></li>
+<li>Subscription program naming:
+<ul>
+<li>“Sunbeam Kits” vs “Market Box” vs “Meal Club”</li>
+</ul></li>
+<li>Headcount:
+<ul>
+<li>HR roster counts 240 employees</li>
+<li>Ops staffing plan claims 265 (includes temps)</li>
+</ul></li>
+</ol>
+<h2 id="artifact-set">Artifact set</h2>
+<h3 id="strategy-identity">Strategy + identity</h3>
+<ul>
+<li>mission-vision-values.md</li>
+<li>brand-guide.md</li>
+<li>high-level-strategy-2026.md</li>
+<li>org-structure.json</li>
+</ul>
+<h3 id="marketing-merchandising">Marketing + merchandising</h3>
+<ul>
+<li>marketing-pitch-deck.pptx</li>
+<li>promo-calendar-2026-h1.xlsx</li>
+<li>campaign-brief-spring.md</li>
+<li>messaging-pillars.md</li>
+<li>product-style-guide.md</li>
+</ul>
+<h3 id="finance">Finance</h3>
+<ul>
+<li>quarterly-revenue-history-2024-2025.xlsx</li>
+<li>projected-revenue-2026.xlsx</li>
+<li>store-performance-weekly-2026-02.xlsx</li>
+<li>shrink-waste-summary-2025.xlsx</li>
+<li>kpi-definitions.json</li>
+</ul>
+<h3 id="ops-supply-chain">Ops + supply chain</h3>
+<ul>
+<li>vendor-list.json</li>
+<li>inventory-replenishment-plan.xlsx</li>
+<li>labor-scheduling-template.xlsx</li>
+<li>sop-prepared-foods-v2.md</li>
+<li>sop-prepared-foods-v3.md (draft rollout)</li>
+<li>incident-log-2026-q1.xlsx</li>
+</ul>
+<h3 id="hr">HR</h3>
+<ul>
+<li>hiring-plan-2026.xlsx</li>
+<li>employee-handbook-excerpt.pdf</li>
+<li>performance-review-template.md</li>
+</ul>
+<h3 id="meetings-notes">Meetings + notes</h3>
+<ul>
+<li>store-manager-call-2026-01-08.md</li>
+<li>store-manager-call-2026-02-05.md</li>
+<li>voice-note-transcript-2026-02-12.md</li>
+</ul>
+<h3 id="evaluation-templates">Evaluation templates</h3>
+<ul>
+<li>vendor-scorecard-template.md</li>
+<li>promo-postmortem-template.md</li>
+<li>catering-order-intake-form.json</li>
+</ul>
+<h3 id="word-documents-.docx">Word documents (.docx)</h3>
+<ul>
+<li>weekly-ops-report-2026-02-15.docx</li>
+</ul>
+<h3 id="images-mixed-generated">Images (mixed; generated)</h3>
+<p>Documentation: - assets/images/README.md</p>
+<p>Folders: - assets/images/logos/ - assets/images/people/ -
+assets/images/products/ - assets/images/stores/ - assets/images/social/
+- assets/images/diagrams/</p>
+<p>Metadata: - assets/images/prompts.jsonl</p>
+<p>Targets (exact): - logos: 10 - people: 35 - products: 40 - stores: 15
+- social: 25 - diagrams: 20</p>
+<h3 id="word-documents-.docx-1">Word documents (.docx)</h3>
+<ul>
+<li>weekly-ops-report-2026-02-15.docx</li>
+</ul>
+<h2 id="timeline-of-significant-events">Timeline of significant
+events</h2>
+<ul>
+<li>2024-03: Opened location #4; supply chain strain begins.</li>
+<li>2024-10: Commissary kitchen launched; waste tracking split across
+teams.</li>
+<li>2025-05: Meal-kit pilot launched (name varies).</li>
+<li>2025-11: Holiday promo incident (stockout + customer
+complaints).</li>
+<li>2026-01: SOP v3 drafted but stores still use v2.</li>
+<li>2026-02: CFO pushes KPI definition registry; adoption uneven.</li>
+</ul>
+<h2 id="benchmark-goals-ikam">Benchmark goals (IKAM)</h2>
+<ul>
+<li>Queries:
+<ol type="1">
+<li>“What is the subscription program called and what’s its
+status?”</li>
+<li>“Why do revenue numbers differ between store ops and finance?”</li>
+<li>“Which locations are underperforming and why?”</li>
+<li>“What SOP version is actually in use for prepared foods?”</li>
+</ol></li>
+</ul>
+</body>
+</html>

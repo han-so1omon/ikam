@@ -1,0 +1,377 @@
+<!DOCTYPE html>
+<html xmlns="http://www.w3.org/1999/xhtml" lang="" xml:lang="">
+<head>
+  <meta charset="utf-8" />
+  <meta name="generator" content="pandoc" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=yes" />
+  <title>l-manufacturing-v01</title>
+  <style>
+    html {
+      color: #1a1a1a;
+      background-color: #fdfdfd;
+    }
+    body {
+      margin: 0 auto;
+      max-width: 36em;
+      padding-left: 50px;
+      padding-right: 50px;
+      padding-top: 50px;
+      padding-bottom: 50px;
+      hyphens: auto;
+      overflow-wrap: break-word;
+      text-rendering: optimizeLegibility;
+      font-kerning: normal;
+    }
+    @media (max-width: 600px) {
+      body {
+        font-size: 0.9em;
+        padding: 12px;
+      }
+      h1 {
+        font-size: 1.8em;
+      }
+    }
+    @media print {
+      html {
+        background-color: white;
+      }
+      body {
+        background-color: transparent;
+        color: black;
+        font-size: 12pt;
+      }
+      p, h2, h3 {
+        orphans: 3;
+        widows: 3;
+      }
+      h2, h3, h4 {
+        page-break-after: avoid;
+      }
+    }
+    p {
+      margin: 1em 0;
+    }
+    a {
+      color: #1a1a1a;
+    }
+    a:visited {
+      color: #1a1a1a;
+    }
+    img {
+      max-width: 100%;
+    }
+    h1, h2, h3, h4, h5, h6 {
+      margin-top: 1.4em;
+    }
+    h5, h6 {
+      font-size: 1em;
+      font-style: italic;
+    }
+    h6 {
+      font-weight: normal;
+    }
+    ol, ul {
+      padding-left: 1.7em;
+      margin-top: 1em;
+    }
+    li > ol, li > ul {
+      margin-top: 0;
+    }
+    blockquote {
+      margin: 1em 0 1em 1.7em;
+      padding-left: 1em;
+      border-left: 2px solid #e6e6e6;
+      color: #606060;
+    }
+    code {
+      font-family: Menlo, Monaco, Consolas, 'Lucida Console', monospace;
+      font-size: 85%;
+      margin: 0;
+      hyphens: manual;
+    }
+    pre {
+      margin: 1em 0;
+      overflow: auto;
+    }
+    pre code {
+      padding: 0;
+      overflow: visible;
+      overflow-wrap: normal;
+    }
+    .sourceCode {
+     background-color: transparent;
+     overflow: visible;
+    }
+    hr {
+      background-color: #1a1a1a;
+      border: none;
+      height: 1px;
+      margin: 1em 0;
+    }
+    table {
+      margin: 1em 0;
+      border-collapse: collapse;
+      width: 100%;
+      overflow-x: auto;
+      display: block;
+      font-variant-numeric: lining-nums tabular-nums;
+    }
+    table caption {
+      margin-bottom: 0.75em;
+    }
+    tbody {
+      margin-top: 0.5em;
+      border-top: 1px solid #1a1a1a;
+      border-bottom: 1px solid #1a1a1a;
+    }
+    th {
+      border-top: 1px solid #1a1a1a;
+      padding: 0.25em 0.5em 0.25em 0.5em;
+    }
+    td {
+      padding: 0.125em 0.5em 0.25em 0.5em;
+    }
+    header {
+      margin-bottom: 4em;
+      text-align: center;
+    }
+    #TOC li {
+      list-style: none;
+    }
+    #TOC ul {
+      padding-left: 1.3em;
+    }
+    #TOC > ul {
+      padding-left: 0;
+    }
+    #TOC a:not(:hover) {
+      text-decoration: none;
+    }
+    code{white-space: pre-wrap;}
+    span.smallcaps{font-variant: small-caps;}
+    div.columns{display: flex; gap: min(4vw, 1.5em);}
+    div.column{flex: auto; overflow-x: auto;}
+    div.hanging-indent{margin-left: 1.5em; text-indent: -1.5em;}
+    /* The extra [class] is a hack that increases specificity enough to
+       override a similar rule in reveal.js */
+    ul.task-list[class]{list-style: none;}
+    ul.task-list li input[type="checkbox"] {
+      font-size: inherit;
+      width: 0.8em;
+      margin: 0 0.8em 0.2em -1.6em;
+      vertical-align: middle;
+    }
+    .display.math{display: block; text-align: center; margin: 0.5rem auto;}
+  </style>
+</head>
+<body>
+<h1 id="ikam-benchmark-case-spec-idea.md">IKAM Benchmark Case Spec
+(idea.md)</h1>
+<h2 id="identity">Identity</h2>
+<ul>
+<li>Case ID: l-manufacturing-v01</li>
+<li>Business name: Cascadia Fasteners &amp; Forming (CFF)</li>
+<li>Industry / domain: Manufacturing (metal fasteners + small formed
+components)</li>
+<li>Business model: B2B supply (contract manufacturing + catalog
+SKUs)</li>
+<li>Locations / operating region: Tacoma, WA (main plant) + 3PL
+warehouse (Kent, WA)</li>
+<li>Size tier: l</li>
+<li>Org maturity: process-driven (ISO-ish instincts), but paperwork
+drifts</li>
+</ul>
+<h2 id="high-level-description">High-level description</h2>
+<ul>
+<li>One-liner: A regional manufacturer producing standard and custom
+fasteners/components for construction, HVAC, and light industrial
+customers.</li>
+<li>What they sell:
+<ul>
+<li>Standard SKUs (bolts, brackets, clips)</li>
+<li>Custom runs (small formed parts)</li>
+<li>Kitting/packaging for distributors</li>
+</ul></li>
+<li>Target customers:
+<ul>
+<li>Distributors</li>
+<li>Construction supply</li>
+<li>OEMs (HVAC, equipment)</li>
+</ul></li>
+<li>Differentiators:
+<ul>
+<li>Short lead times for custom runs</li>
+<li>Practical engineering support</li>
+<li>Reliable documentation (in theory)</li>
+</ul></li>
+</ul>
+<h2 id="operating-model">Operating model</h2>
+<ul>
+<li>Functions:
+<ul>
+<li>Plant ops (stamping/forming)</li>
+<li>QA</li>
+<li>Procurement</li>
+<li>Sales/CS</li>
+<li>Finance</li>
+<li>Engineering (light)</li>
+</ul></li>
+<li>Key roles (named people + titles):
+<ul>
+<li>Dana Whitaker — GM</li>
+<li>Luis Ortega — Plant Manager</li>
+<li>Anika Patel — QA Manager</li>
+<li>Samir Khan — Procurement Lead</li>
+<li>Renee Brooks — Finance Controller</li>
+<li>Jun Park — Sales Director</li>
+</ul></li>
+</ul>
+<h2 id="chaos-profile-new-pick-tracked">Chaos profile (new pick;
+tracked)</h2>
+<ul>
+<li>Overall chaos level (1–5): <strong>2</strong></li>
+<li>Rationale: most processes exist and are followed, but cross-system
+reconciliation is imperfect.</li>
+<li>Where chaos lives:
+<ul class="task-list">
+<li><label><input type="checkbox" checked="" />conflicting metrics (ERP
+vs spreadsheet rollups)</label></li>
+<li><label><input type="checkbox" checked="" />versioning drift (SOP
+revisions not propagated)</label></li>
+<li><label><input type="checkbox" />naming conventions (mostly
+consistent)</label></li>
+<li><label><input type="checkbox" />missing documents
+(rare)</label></li>
+<li><label><input type="checkbox" checked="" />shadow spreadsheets
+(inventory adjustments / expedite tracker)</label></li>
+<li><label><input type="checkbox" />messy meeting notes (generally
+structured)</label></li>
+</ul></li>
+</ul>
+<h2
+id="intentional-contradictions-smaller-than-chaos4-case-but-real">Intentional
+contradictions (smaller than chaos=4 case, but real)</h2>
+<ol type="1">
+<li>Inventory valuation:
+<ul>
+<li>Finance sheet uses standard cost</li>
+<li>Ops adjustment log uses last purchase price for some SKUs</li>
+</ul></li>
+<li>On-time delivery (OTD):
+<ul>
+<li>Customer scorecard shows 96%</li>
+<li>Internal dashboard shows 92% (different definition re: partial
+shipments)</li>
+</ul></li>
+<li>Scrap rate:
+<ul>
+<li>QA report excludes rework</li>
+<li>Ops report includes rework as scrap</li>
+</ul></li>
+</ol>
+<h2 id="artifact-set-what-documents-should-exist">Artifact set (what
+documents should exist)</h2>
+<p>Mix of Markdown, JSON, XLSX, PPTX, and PDF.</p>
+<h3 id="strategy-identity">Strategy + identity</h3>
+<ul>
+<li>mission-vision-values.md</li>
+<li>brand-guide.md (tone + palette + slide guidance)</li>
+<li>high-level-strategy-2026.md</li>
+<li>product-catalog-overview.md</li>
+</ul>
+<h3 id="sales-customer">Sales + customer</h3>
+<ul>
+<li>marketing-pitch-deck.pptx</li>
+<li>customer-scorecard-2025-q4.pdf</li>
+<li>top-customers.json</li>
+<li>price-list-2026-q1.xlsx</li>
+</ul>
+<h3 id="finance">Finance</h3>
+<ul>
+<li>quarterly-revenue-history-2024-2025.xlsx</li>
+<li>projected-revenue-2026.xlsx</li>
+<li>inventory-valuation-2025-12.xlsx</li>
+<li>capex-plan-2026.xlsx</li>
+<li>kpi-definitions.json</li>
+</ul>
+<h3 id="ops-qa">Ops + QA</h3>
+<ul>
+<li>production-plan-2026-h1.xlsx</li>
+<li>qa-incidents-log-2025.xlsx</li>
+<li>sop-press-line-setup-v3.md</li>
+<li>sop-press-line-setup-v4.md (updated but not fully adopted)</li>
+<li>vendor-list.json</li>
+</ul>
+<h3 id="meetings-planning">Meetings + planning</h3>
+<ul>
+<li>weekly-ops-review-2025-12-03.md</li>
+<li>weekly-ops-review-2026-01-14.md</li>
+<li>voice-note-transcript-2026-01-22.md</li>
+</ul>
+<h3 id="evaluation-templates">Evaluation templates</h3>
+<ul>
+<li>supplier-evaluation-template.md</li>
+<li>nonconformance-report-template.md</li>
+<li>expedite-request-form.json</li>
+</ul>
+<h3 id="word-documents-.docx">Word documents (.docx)</h3>
+<ul>
+<li>production-summary-2026-01.docx</li>
+</ul>
+<h3 id="images-mixed-generated">Images (mixed; generated)</h3>
+<p>Documentation: - assets/images/README.md</p>
+<p>Folders: - assets/images/logos/ - assets/images/people/ -
+assets/images/facility/ - assets/images/products/ -
+assets/images/diagrams/ - assets/images/social/</p>
+<p>Metadata: - assets/images/prompts.jsonl</p>
+<p>Targets (exact for this case): - logos: 5 - people: 15 - facility: 10
+- products: 25 - diagrams: 15 - social: 10</p>
+<h2 id="entity-glossary-kg-grounding">Entity glossary (KG
+grounding)</h2>
+<ul>
+<li>People: Dana Whitaker, Luis Ortega, Anika Patel, Samir Khan, Renee
+Brooks, Jun Park</li>
+<li>Sites: Tacoma Plant, Kent 3PL</li>
+<li>Machines: Press Line 2, Press Line 4, Tumbler A</li>
+<li>SKUs: BOLT-M8-30, BRKT-L-02, CLIP-HVAC-07, (plus 10–15 more)</li>
+<li>Vendors: steel coil suppliers, plating vendor, packaging vendor</li>
+<li>Customers: 8–12 named accounts (distributors + OEMs)</li>
+<li>KPIs: OTD, scrap rate, rework rate, inventory turns, gross
+margin</li>
+</ul>
+<h3 id="word-documents-.docx-1">Word documents (.docx)</h3>
+<ul>
+<li>production-summary-2026-01.docx</li>
+</ul>
+<h2 id="timeline-of-significant-events">Timeline of significant
+events</h2>
+<ul>
+<li>2024-05: GM change (Dana appointed).</li>
+<li>2024-11: New plating vendor onboarded; early quality issue.</li>
+<li>2025-04: Press Line 4 added (capacity increase).</li>
+<li>2025-09: Customer complaint spike about delayed partial shipments
+(definition dispute begins).</li>
+<li>2025-12: Year-end inventory adjustments done in spreadsheet; finance
+disagrees on valuation method.</li>
+<li>2026-01: SOP v4 drafted for press setup but floor still using
+v3.</li>
+<li>2026-02: Capex request for QA measurement equipment.</li>
+</ul>
+<h2 id="benchmark-goals-ikam">Benchmark goals (IKAM)</h2>
+<ul>
+<li>Queries:
+<ol type="1">
+<li>“What is the current SOP for press line setup, and which version is
+actually used?”</li>
+<li>“Why do OTD metrics disagree (96% vs 92%)?”</li>
+<li>“What vendors are highest risk and why?”</li>
+<li>“Reconcile inventory valuation differences.”</li>
+</ol></li>
+<li>Ambiguities to resolve/flag:
+<ul>
+<li>definitions (OTD, scrap)</li>
+<li>SOP version adoption vs publication</li>
+</ul></li>
+</ul>
+</body>
+</html>

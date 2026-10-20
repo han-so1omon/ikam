@@ -1,0 +1,319 @@
+<!DOCTYPE html>
+<html xmlns="http://www.w3.org/1999/xhtml" lang="" xml:lang="">
+<head>
+  <meta charset="utf-8" />
+  <meta name="generator" content="pandoc" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=yes" />
+  <title>xl-consulting-v01</title>
+  <style>
+    html {
+      color: #1a1a1a;
+      background-color: #fdfdfd;
+    }
+    body {
+      margin: 0 auto;
+      max-width: 36em;
+      padding-left: 50px;
+      padding-right: 50px;
+      padding-top: 50px;
+      padding-bottom: 50px;
+      hyphens: auto;
+      overflow-wrap: break-word;
+      text-rendering: optimizeLegibility;
+      font-kerning: normal;
+    }
+    @media (max-width: 600px) {
+      body {
+        font-size: 0.9em;
+        padding: 12px;
+      }
+      h1 {
+        font-size: 1.8em;
+      }
+    }
+    @media print {
+      html {
+        background-color: white;
+      }
+      body {
+        background-color: transparent;
+        color: black;
+        font-size: 12pt;
+      }
+      p, h2, h3 {
+        orphans: 3;
+        widows: 3;
+      }
+      h2, h3, h4 {
+        page-break-after: avoid;
+      }
+    }
+    p {
+      margin: 1em 0;
+    }
+    a {
+      color: #1a1a1a;
+    }
+    a:visited {
+      color: #1a1a1a;
+    }
+    img {
+      max-width: 100%;
+    }
+    h1, h2, h3, h4, h5, h6 {
+      margin-top: 1.4em;
+    }
+    h5, h6 {
+      font-size: 1em;
+      font-style: italic;
+    }
+    h6 {
+      font-weight: normal;
+    }
+    ol, ul {
+      padding-left: 1.7em;
+      margin-top: 1em;
+    }
+    li > ol, li > ul {
+      margin-top: 0;
+    }
+    blockquote {
+      margin: 1em 0 1em 1.7em;
+      padding-left: 1em;
+      border-left: 2px solid #e6e6e6;
+      color: #606060;
+    }
+    code {
+      font-family: Menlo, Monaco, Consolas, 'Lucida Console', monospace;
+      font-size: 85%;
+      margin: 0;
+      hyphens: manual;
+    }
+    pre {
+      margin: 1em 0;
+      overflow: auto;
+    }
+    pre code {
+      padding: 0;
+      overflow: visible;
+      overflow-wrap: normal;
+    }
+    .sourceCode {
+     background-color: transparent;
+     overflow: visible;
+    }
+    hr {
+      background-color: #1a1a1a;
+      border: none;
+      height: 1px;
+      margin: 1em 0;
+    }
+    table {
+      margin: 1em 0;
+      border-collapse: collapse;
+      width: 100%;
+      overflow-x: auto;
+      display: block;
+      font-variant-numeric: lining-nums tabular-nums;
+    }
+    table caption {
+      margin-bottom: 0.75em;
+    }
+    tbody {
+      margin-top: 0.5em;
+      border-top: 1px solid #1a1a1a;
+      border-bottom: 1px solid #1a1a1a;
+    }
+    th {
+      border-top: 1px solid #1a1a1a;
+      padding: 0.25em 0.5em 0.25em 0.5em;
+    }
+    td {
+      padding: 0.125em 0.5em 0.25em 0.5em;
+    }
+    header {
+      margin-bottom: 4em;
+      text-align: center;
+    }
+    #TOC li {
+      list-style: none;
+    }
+    #TOC ul {
+      padding-left: 1.3em;
+    }
+    #TOC > ul {
+      padding-left: 0;
+    }
+    #TOC a:not(:hover) {
+      text-decoration: none;
+    }
+    code{white-space: pre-wrap;}
+    span.smallcaps{font-variant: small-caps;}
+    div.columns{display: flex; gap: min(4vw, 1.5em);}
+    div.column{flex: auto; overflow-x: auto;}
+    div.hanging-indent{margin-left: 1.5em; text-indent: -1.5em;}
+    /* The extra [class] is a hack that increases specificity enough to
+       override a similar rule in reveal.js */
+    ul.task-list[class]{list-style: none;}
+    ul.task-list li input[type="checkbox"] {
+      font-size: inherit;
+      width: 0.8em;
+      margin: 0 0.8em 0.2em -1.6em;
+      vertical-align: middle;
+    }
+    .display.math{display: block; text-align: center; margin: 0.5rem auto;}
+  </style>
+</head>
+<body>
+<h1 id="ikam-benchmark-case-spec-idea.md">IKAM Benchmark Case Spec
+(idea.md)</h1>
+<h2 id="identity">Identity</h2>
+<ul>
+<li>Case ID: xl-consulting-v01</li>
+<li>Business name: Alderpoint Strategy &amp; Operations (ASO)</li>
+<li>Industry / domain: Consulting (enterprise strategy + ops
+transformation)</li>
+<li>Business model: project-based advisory + PMO + analytics
+enablement</li>
+<li>Locations / operating region: North America (multi-office)</li>
+<li>Size tier: xl</li>
+<li>Org maturity: huge template surface area + multiple practice groups
++ version sprawl</li>
+</ul>
+<h2 id="high-level-description">High-level description</h2>
+<ul>
+<li>One-liner: A large consulting firm running multiple workstreams for
+a client program, with conflicting numbers across decks, trackers, and
+finance.</li>
+</ul>
+<h2 id="operating-model">Operating model</h2>
+<ul>
+<li>Functions:
+<ul>
+<li>Delivery (workstreams)</li>
+<li>Sales/BD</li>
+<li>Finance</li>
+<li>Knowledge management</li>
+<li>People ops</li>
+</ul></li>
+<li>Key roles:
+<ul>
+<li>Colleen Park — Managing Partner</li>
+<li>Devin Holt — Program Director</li>
+<li>Mira Shah — Workstream Lead (Ops)</li>
+<li>Andre Kim — Workstream Lead (Finance)</li>
+<li>Talia Reed — PMO Lead</li>
+<li>Jordan Vega — Finance Ops</li>
+</ul></li>
+</ul>
+<h2 id="chaos-profile-new-pick-tracked">Chaos profile (new pick;
+tracked)</h2>
+<ul>
+<li>Overall chaos level (1–5): <strong>5</strong></li>
+<li>Rationale: many documents, many “final” versions, and inconsistent
+KPI / savings math.</li>
+<li>Where chaos lives:
+<ul class="task-list">
+<li><label><input type="checkbox" checked="" />savings definitions
+(gross vs net, annualized vs run-rate)</label></li>
+<li><label><input type="checkbox" checked="" />milestone dates differ
+across RAID log vs deck vs email</label></li>
+<li><label><input type="checkbox" checked="" />timesheets vs invoices vs
+revenue recognition</label></li>
+<li><label><input type="checkbox" checked="" />staffing plans drift
+weekly</label></li>
+</ul></li>
+</ul>
+<h2 id="intentional-contradictions">Intentional contradictions</h2>
+<ol type="1">
+<li>Savings:
+<ul>
+<li>Exec deck shows $18.4M annualized savings</li>
+<li>Finance model shows $14.9M net savings (different baseline +
+one-time costs)</li>
+</ul></li>
+<li>Milestone date:
+<ul>
+<li>RAID log says phase 1 complete 2026-03-15</li>
+<li>Email says 2026-03-29 (re-baseline)</li>
+</ul></li>
+<li>Billing:
+<ul>
+<li>Timesheet totals 2,120 hours</li>
+<li>Invoice bills 1,980 hours (write-offs + cap)</li>
+</ul></li>
+</ol>
+<h2 id="artifact-set">Artifact set</h2>
+<h3 id="firm-identity">Firm identity</h3>
+<ul>
+<li>mission-vision-values.md</li>
+<li>brand-guide.md</li>
+<li>practice-catalog.pdf</li>
+<li>org-structure.json</li>
+</ul>
+<h3 id="client-program-primary">Client program (primary)</h3>
+<p>Client: GraniteWorks Utilities Program: Operations Transformation
+2026 - sow-master.pdf - msa.pdf - statement-of-work-change-log.xlsx -
+program-charter.md - pmo-raID-log.xlsx - master-program-plan-2026.xlsx -
+exec-deck-2026-03.pptx - workstream-deck-ops-v7.pptx -
+workstream-deck-finance-v5.pptx - client-email-thread-2026-03-18.md</p>
+<h3 id="analytics-savings">Analytics + savings</h3>
+<ul>
+<li>savings-model-2026.xlsx</li>
+<li>benefits-tracker-2026-03.xlsx</li>
+<li>kpi-definitions.json</li>
+</ul>
+<h3 id="finance-delivery-ops">Finance + delivery ops</h3>
+<ul>
+<li>timesheet-2026-03.xlsx</li>
+<li>invoice-summary-2026-03.pdf</li>
+<li>revenue-history-2024-2025.xlsx</li>
+<li>pipeline-enterprise.xlsx</li>
+</ul>
+<h3 id="knowledge-management">Knowledge management</h3>
+<ul>
+<li>deliverable-index.json</li>
+<li>slide-template-guidelines.md</li>
+</ul>
+<h3 id="templates">Templates</h3>
+<ul>
+<li>meeting-notes-template.md</li>
+<li>raid-template.md</li>
+<li>issue-escalation-template.md</li>
+</ul>
+<h3 id="word-documents-.docx">Word documents (.docx)</h3>
+<ul>
+<li>q4-impact-summary-2025.docx</li>
+</ul>
+<h3 id="images-mixed-generated">Images (mixed; generated)</h3>
+<p>Documentation: - assets/images/README.md</p>
+<p>Folders: - assets/images/logos/ - assets/images/people/ -
+assets/images/office/ - assets/images/diagrams/ -
+assets/images/social/</p>
+<p>Metadata: - assets/images/prompts.jsonl</p>
+<p>Targets (exact): - logos: 8 - people: 24 - office: 14 - diagrams: 18
+- social: 10</p>
+<h3 id="word-documents-.docx-1">Word documents (.docx)</h3>
+<ul>
+<li>q4-impact-summary-2025.docx</li>
+</ul>
+<h2 id="timeline-of-significant-events">Timeline of significant
+events</h2>
+<ul>
+<li>2025-12: ASO wins GraniteWorks program.</li>
+<li>2026-02: Baseline finalized (but later disputed).</li>
+<li>2026-03: Phase 1 milestone re-baselined.</li>
+</ul>
+<h2 id="benchmark-goals-ikam">Benchmark goals (IKAM)</h2>
+<ul>
+<li>Queries:
+<ol type="1">
+<li>“What’s the true savings number and how is it defined?”</li>
+<li>“What is the current phase 1 milestone date and why does it
+differ?”</li>
+<li>“Why do billed hours differ from timesheets?”</li>
+<li>“Which deck versions are the latest across workstreams?”</li>
+</ol></li>
+</ul>
+</body>
+</html>

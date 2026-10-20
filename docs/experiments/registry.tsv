@@ -77,3 +77,4 @@ E073	graph-read-baseline	benchmark	reference	main	cost	graph,benchmark	no	baseli
 E074	checked-raw	change	kept	main	cost	read-path,verification	no	raw bytes with a CRC-32 checked on read; fsck keeps BLAKE3
 E075	single-hash	change	kept	main	cost	read-path,verification	no	no second hash for encodings decode already verified (neutral)
 E076	frame-checksum	change	discarded	exp/076-frame-checksum	cost	read-path,verification	yes	zstd checksum per frame; neutral while hot content is raw
+E077	cross-source	analysis	reference	main	cost	dictionary,cross-source	yes	one graph is 1.4-3.7% larger than per-type stores at storage weight

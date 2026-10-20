@@ -1,0 +1,312 @@
+<!DOCTYPE html>
+<html xmlns="http://www.w3.org/1999/xhtml" lang="" xml:lang="">
+<head>
+  <meta charset="utf-8" />
+  <meta name="generator" content="pandoc" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=yes" />
+  <title>m-manufacturing-v01</title>
+  <style>
+    html {
+      color: #1a1a1a;
+      background-color: #fdfdfd;
+    }
+    body {
+      margin: 0 auto;
+      max-width: 36em;
+      padding-left: 50px;
+      padding-right: 50px;
+      padding-top: 50px;
+      padding-bottom: 50px;
+      hyphens: auto;
+      overflow-wrap: break-word;
+      text-rendering: optimizeLegibility;
+      font-kerning: normal;
+    }
+    @media (max-width: 600px) {
+      body {
+        font-size: 0.9em;
+        padding: 12px;
+      }
+      h1 {
+        font-size: 1.8em;
+      }
+    }
+    @media print {
+      html {
+        background-color: white;
+      }
+      body {
+        background-color: transparent;
+        color: black;
+        font-size: 12pt;
+      }
+      p, h2, h3 {
+        orphans: 3;
+        widows: 3;
+      }
+      h2, h3, h4 {
+        page-break-after: avoid;
+      }
+    }
+    p {
+      margin: 1em 0;
+    }
+    a {
+      color: #1a1a1a;
+    }
+    a:visited {
+      color: #1a1a1a;
+    }
+    img {
+      max-width: 100%;
+    }
+    h1, h2, h3, h4, h5, h6 {
+      margin-top: 1.4em;
+    }
+    h5, h6 {
+      font-size: 1em;
+      font-style: italic;
+    }
+    h6 {
+      font-weight: normal;
+    }
+    ol, ul {
+      padding-left: 1.7em;
+      margin-top: 1em;
+    }
+    li > ol, li > ul {
+      margin-top: 0;
+    }
+    blockquote {
+      margin: 1em 0 1em 1.7em;
+      padding-left: 1em;
+      border-left: 2px solid #e6e6e6;
+      color: #606060;
+    }
+    code {
+      font-family: Menlo, Monaco, Consolas, 'Lucida Console', monospace;
+      font-size: 85%;
+      margin: 0;
+      hyphens: manual;
+    }
+    pre {
+      margin: 1em 0;
+      overflow: auto;
+    }
+    pre code {
+      padding: 0;
+      overflow: visible;
+      overflow-wrap: normal;
+    }
+    .sourceCode {
+     background-color: transparent;
+     overflow: visible;
+    }
+    hr {
+      background-color: #1a1a1a;
+      border: none;
+      height: 1px;
+      margin: 1em 0;
+    }
+    table {
+      margin: 1em 0;
+      border-collapse: collapse;
+      width: 100%;
+      overflow-x: auto;
+      display: block;
+      font-variant-numeric: lining-nums tabular-nums;
+    }
+    table caption {
+      margin-bottom: 0.75em;
+    }
+    tbody {
+      margin-top: 0.5em;
+      border-top: 1px solid #1a1a1a;
+      border-bottom: 1px solid #1a1a1a;
+    }
+    th {
+      border-top: 1px solid #1a1a1a;
+      padding: 0.25em 0.5em 0.25em 0.5em;
+    }
+    td {
+      padding: 0.125em 0.5em 0.25em 0.5em;
+    }
+    header {
+      margin-bottom: 4em;
+      text-align: center;
+    }
+    #TOC li {
+      list-style: none;
+    }
+    #TOC ul {
+      padding-left: 1.3em;
+    }
+    #TOC > ul {
+      padding-left: 0;
+    }
+    #TOC a:not(:hover) {
+      text-decoration: none;
+    }
+    code{white-space: pre-wrap;}
+    span.smallcaps{font-variant: small-caps;}
+    div.columns{display: flex; gap: min(4vw, 1.5em);}
+    div.column{flex: auto; overflow-x: auto;}
+    div.hanging-indent{margin-left: 1.5em; text-indent: -1.5em;}
+    /* The extra [class] is a hack that increases specificity enough to
+       override a similar rule in reveal.js */
+    ul.task-list[class]{list-style: none;}
+    ul.task-list li input[type="checkbox"] {
+      font-size: inherit;
+      width: 0.8em;
+      margin: 0 0.8em 0.2em -1.6em;
+      vertical-align: middle;
+    }
+    .display.math{display: block; text-align: center; margin: 0.5rem auto;}
+  </style>
+</head>
+<body>
+<h1 id="ikam-benchmark-case-spec-idea.md">IKAM Benchmark Case Spec
+(idea.md)</h1>
+<h2 id="identity">Identity</h2>
+<ul>
+<li>Case ID: m-manufacturing-v01</li>
+<li>Business name: Northpoint Packaging &amp; Plastics</li>
+<li>Industry / domain: Manufacturing (packaging components: trays,
+inserts, custom plastic parts)</li>
+<li>Business model: B2B supply + custom runs</li>
+<li>Locations / operating region: Columbus, OH (plant + warehouse)</li>
+<li>Size tier: m</li>
+<li>Org maturity: process-emerging; ERP + lots of side spreadsheets</li>
+</ul>
+<h2 id="high-level-description">High-level description</h2>
+<ul>
+<li>One-liner: A mid-sized manufacturer juggling forecast volatility,
+scrap/rework, and vendor lead times.</li>
+</ul>
+<h2 id="operating-model">Operating model</h2>
+<ul>
+<li>Functions:
+<ul>
+<li>Plant ops</li>
+<li>QA</li>
+<li>Procurement</li>
+<li>Planning</li>
+<li>Sales/CS</li>
+<li>Finance</li>
+</ul></li>
+<li>Key roles:
+<ul>
+<li>Simone Grant — GM</li>
+<li>Luis Park — Plant Manager</li>
+<li>Anya Chen — QA Lead</li>
+<li>Derek Rao — Procurement</li>
+<li>Maya Ortiz — Planner</li>
+<li>Jordan Blake — Finance</li>
+</ul></li>
+</ul>
+<h2 id="chaos-profile-new-pick-tracked">Chaos profile (new pick;
+tracked)</h2>
+<ul>
+<li>Overall chaos level (1–5): <strong>3</strong></li>
+<li>Rationale: some structure, but multiple systems and definition
+drift.</li>
+<li>Where chaos lives:
+<ul class="task-list">
+<li><label><input type="checkbox" checked="" />scrap vs rework
+definitions differ between ops and QA</label></li>
+<li><label><input type="checkbox" checked="" />inventory adjustments
+kept in side sheet</label></li>
+<li><label><input type="checkbox" checked="" />vendor lead time tracking
+inconsistent</label></li>
+<li><label><input type="checkbox" checked="" />forecast vs actual
+disagreements</label></li>
+</ul></li>
+</ul>
+<h2 id="intentional-contradictions">Intentional contradictions</h2>
+<ul>
+<li>Moderate:
+<ol type="1">
+<li>Scrap rate: QA excludes rework; ops includes.</li>
+<li>Inventory valuation: finance uses standard cost; ops uses last
+purchase for resin.</li>
+<li>On-time delivery: customer scorecard counts partial shipments as
+on-time.</li>
+</ol></li>
+</ul>
+<h2 id="artifact-set">Artifact set</h2>
+<h3 id="strategy-identity">Strategy + identity</h3>
+<ul>
+<li>mission-vision-values.md</li>
+<li>brand-guide.md</li>
+<li>high-level-strategy-2026.md</li>
+</ul>
+<h3 id="sales-customer">Sales + customer</h3>
+<ul>
+<li>marketing-pitch-deck.pptx</li>
+<li>customer-scorecard-2025-q4.pdf</li>
+<li>top-customers.json</li>
+</ul>
+<h3 id="finance">Finance</h3>
+<ul>
+<li>quarterly-revenue-history-2024-2025.xlsx</li>
+<li>projected-revenue-2026.xlsx</li>
+<li>inventory-valuation-2025-12.xlsx</li>
+<li>kpi-definitions.json</li>
+</ul>
+<h3 id="ops-qa">Ops + QA</h3>
+<ul>
+<li>production-plan-2026-h1.xlsx</li>
+<li>qa-incidents-log-2025.xlsx</li>
+<li>scrap-rework-tracker-2026-01.xlsx</li>
+<li>sop-line-changeover-v2.md</li>
+<li>sop-line-changeover-v3.md (draft)</li>
+<li>vendor-list.json</li>
+</ul>
+<h3 id="meetings-notes">Meetings + notes</h3>
+<ul>
+<li>weekly-ops-review-2026-01-06.md</li>
+<li>weekly-ops-review-2026-02-03.md</li>
+<li>voice-note-transcript-2026-02-04.md</li>
+</ul>
+<h3 id="templates">Templates</h3>
+<ul>
+<li>supplier-evaluation-template.md</li>
+<li>nonconformance-report-template.md</li>
+<li>expedite-request-form.json</li>
+</ul>
+<h3 id="word-documents-.docx">Word documents (.docx)</h3>
+<ul>
+<li>ops-review-2026-02.docx</li>
+</ul>
+<h3 id="images-mixed-generated">Images (mixed; generated)</h3>
+<p>Documentation: - assets/images/README.md</p>
+<p>Folders: - assets/images/logos/ - assets/images/people/ -
+assets/images/facility/ - assets/images/products/ -
+assets/images/diagrams/ - assets/images/social/</p>
+<p>Metadata: - assets/images/prompts.jsonl</p>
+<p>Targets (exact): - logos: 6 - people: 18 - facility: 10 - products:
+20 - diagrams: 12 - social: 8</p>
+<h3 id="word-documents-.docx-1">Word documents (.docx)</h3>
+<ul>
+<li>ops-review-2026-02.docx</li>
+</ul>
+<h2 id="timeline-of-significant-events">Timeline of significant
+events</h2>
+<ul>
+<li>2024-09: Resin supplier change after cost spike.</li>
+<li>2025-04: New line added; changeover SOP drafted.</li>
+<li>2025-11: Customer complaints on partial shipments.</li>
+<li>2026-01: QA tightens incident logging; ops tracker still old.</li>
+</ul>
+<h2 id="benchmark-goals-ikam">Benchmark goals (IKAM)</h2>
+<ul>
+<li>Queries:
+<ol type="1">
+<li>“What is scrap rate and why do QA and ops disagree?”</li>
+<li>“Which vendors are highest risk?”</li>
+<li>“Why do inventory valuation methods differ?”</li>
+<li>“What SOP version is actually used for changeover?”</li>
+</ol></li>
+</ul>
+</body>
+</html>

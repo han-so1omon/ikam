@@ -1,0 +1,328 @@
+<!DOCTYPE html>
+<html xmlns="http://www.w3.org/1999/xhtml" lang="" xml:lang="">
+<head>
+  <meta charset="utf-8" />
+  <meta name="generator" content="pandoc" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=yes" />
+  <title>l-software-v01</title>
+  <style>
+    html {
+      color: #1a1a1a;
+      background-color: #fdfdfd;
+    }
+    body {
+      margin: 0 auto;
+      max-width: 36em;
+      padding-left: 50px;
+      padding-right: 50px;
+      padding-top: 50px;
+      padding-bottom: 50px;
+      hyphens: auto;
+      overflow-wrap: break-word;
+      text-rendering: optimizeLegibility;
+      font-kerning: normal;
+    }
+    @media (max-width: 600px) {
+      body {
+        font-size: 0.9em;
+        padding: 12px;
+      }
+      h1 {
+        font-size: 1.8em;
+      }
+    }
+    @media print {
+      html {
+        background-color: white;
+      }
+      body {
+        background-color: transparent;
+        color: black;
+        font-size: 12pt;
+      }
+      p, h2, h3 {
+        orphans: 3;
+        widows: 3;
+      }
+      h2, h3, h4 {
+        page-break-after: avoid;
+      }
+    }
+    p {
+      margin: 1em 0;
+    }
+    a {
+      color: #1a1a1a;
+    }
+    a:visited {
+      color: #1a1a1a;
+    }
+    img {
+      max-width: 100%;
+    }
+    h1, h2, h3, h4, h5, h6 {
+      margin-top: 1.4em;
+    }
+    h5, h6 {
+      font-size: 1em;
+      font-style: italic;
+    }
+    h6 {
+      font-weight: normal;
+    }
+    ol, ul {
+      padding-left: 1.7em;
+      margin-top: 1em;
+    }
+    li > ol, li > ul {
+      margin-top: 0;
+    }
+    blockquote {
+      margin: 1em 0 1em 1.7em;
+      padding-left: 1em;
+      border-left: 2px solid #e6e6e6;
+      color: #606060;
+    }
+    code {
+      font-family: Menlo, Monaco, Consolas, 'Lucida Console', monospace;
+      font-size: 85%;
+      margin: 0;
+      hyphens: manual;
+    }
+    pre {
+      margin: 1em 0;
+      overflow: auto;
+    }
+    pre code {
+      padding: 0;
+      overflow: visible;
+      overflow-wrap: normal;
+    }
+    .sourceCode {
+     background-color: transparent;
+     overflow: visible;
+    }
+    hr {
+      background-color: #1a1a1a;
+      border: none;
+      height: 1px;
+      margin: 1em 0;
+    }
+    table {
+      margin: 1em 0;
+      border-collapse: collapse;
+      width: 100%;
+      overflow-x: auto;
+      display: block;
+      font-variant-numeric: lining-nums tabular-nums;
+    }
+    table caption {
+      margin-bottom: 0.75em;
+    }
+    tbody {
+      margin-top: 0.5em;
+      border-top: 1px solid #1a1a1a;
+      border-bottom: 1px solid #1a1a1a;
+    }
+    th {
+      border-top: 1px solid #1a1a1a;
+      padding: 0.25em 0.5em 0.25em 0.5em;
+    }
+    td {
+      padding: 0.125em 0.5em 0.25em 0.5em;
+    }
+    header {
+      margin-bottom: 4em;
+      text-align: center;
+    }
+    #TOC li {
+      list-style: none;
+    }
+    #TOC ul {
+      padding-left: 1.3em;
+    }
+    #TOC > ul {
+      padding-left: 0;
+    }
+    #TOC a:not(:hover) {
+      text-decoration: none;
+    }
+    code{white-space: pre-wrap;}
+    span.smallcaps{font-variant: small-caps;}
+    div.columns{display: flex; gap: min(4vw, 1.5em);}
+    div.column{flex: auto; overflow-x: auto;}
+    div.hanging-indent{margin-left: 1.5em; text-indent: -1.5em;}
+    /* The extra [class] is a hack that increases specificity enough to
+       override a similar rule in reveal.js */
+    ul.task-list[class]{list-style: none;}
+    ul.task-list li input[type="checkbox"] {
+      font-size: inherit;
+      width: 0.8em;
+      margin: 0 0.8em 0.2em -1.6em;
+      vertical-align: middle;
+    }
+    .display.math{display: block; text-align: center; margin: 0.5rem auto;}
+  </style>
+</head>
+<body>
+<h1 id="ikam-benchmark-case-spec-idea.md">IKAM Benchmark Case Spec
+(idea.md)</h1>
+<h2 id="identity">Identity</h2>
+<ul>
+<li>Case ID: l-software-v01</li>
+<li>Business name: QuillStack Systems</li>
+<li>Industry / domain: Software (B2B workflow + reporting)</li>
+<li>Business model: SaaS subscription</li>
+<li>Locations / operating region: Remote-first (US)</li>
+<li>Size tier: l</li>
+<li>Org maturity: process-emerging (real product org, not
+enterprise)</li>
+</ul>
+<h2 id="high-level-description">High-level description</h2>
+<ul>
+<li>One-liner: A mature-ish SaaS company with a platform product,
+regular releases, and occasional incident-driven chaos.</li>
+</ul>
+<h2 id="operating-model">Operating model</h2>
+<ul>
+<li>Functions:
+<ul>
+<li>Product</li>
+<li>Engineering</li>
+<li>Customer Success</li>
+<li>Sales</li>
+<li>Security</li>
+<li>Finance</li>
+</ul></li>
+<li>Key roles:
+<ul>
+<li>Paige Turner — CEO</li>
+<li>Arman Liu — CTO</li>
+<li>Chloe Reyes — Head of Product</li>
+<li>Devin Shaw — Eng Manager</li>
+<li>Nia Brooks — Security Lead</li>
+<li>Morgan Patel — Finance Lead</li>
+</ul></li>
+</ul>
+<h2 id="chaos-profile-new-pick-tracked">Chaos profile (new pick;
+tracked)</h2>
+<ul>
+<li>Overall chaos level (1–5): <strong>4</strong></li>
+<li>Rationale: lots of product artifacts + Jira + docs; version drift
+and KPI definition mismatches.</li>
+<li>Where chaos lives:
+<ul class="task-list">
+<li><label><input type="checkbox" checked="" />PRD version
+sprawl</label></li>
+<li><label><input type="checkbox" checked="" />roadmap vs delivery
+drift</label></li>
+<li><label><input type="checkbox" checked="" />KPI definition mismatch
+(MAU/active accounts)</label></li>
+<li><label><input type="checkbox" checked="" />incident docs
+inconsistent</label></li>
+</ul></li>
+</ul>
+<h2 id="intentional-contradictions">Intentional contradictions</h2>
+<ol type="1">
+<li>Roadmap:
+<ul>
+<li>Roadmap deck says Feature “Fable” ships in May</li>
+<li>Sprint log shows it pushed to June</li>
+</ul></li>
+<li>KPI:
+<ul>
+<li>CS dashboard uses “active accounts”</li>
+<li>Finance uses “billable accounts”</li>
+</ul></li>
+<li>Incident:
+<ul>
+<li>Postmortem says third-party API outage</li>
+<li>Metrics show internal queue saturation</li>
+</ul></li>
+</ol>
+<h2 id="artifact-set">Artifact set</h2>
+<h3 id="strategy-identity">Strategy + identity</h3>
+<ul>
+<li>mission-vision-values.md</li>
+<li>brand-guide.md</li>
+<li>high-level-strategy-2026.md</li>
+<li>org-chart.json</li>
+</ul>
+<h3 id="product">Product</h3>
+<ul>
+<li>product-overview.md</li>
+<li>roadmap-2026-h1.pptx</li>
+<li>prd-fable-v1.md</li>
+<li>prd-fable-v4-FINAL.md</li>
+<li>release-notes-2025-q4.md</li>
+</ul>
+<h3 id="engineering">Engineering</h3>
+<ul>
+<li>sprint-log-2026-q1.xlsx</li>
+<li>kanban-snapshot-2026-02.json</li>
+<li>runbook-queue-saturation.md</li>
+<li>incident-2026-02-11-postmortem.md</li>
+<li>incident-2026-02-11-metrics.json</li>
+</ul>
+<h3 id="sales-cs">Sales + CS</h3>
+<ul>
+<li>sales-deck.pptx</li>
+<li>cs-qbr-template.pptx</li>
+<li>top-customers.json</li>
+<li>pipeline-2026-q2.xlsx</li>
+<li>renewal-risk.xlsx</li>
+</ul>
+<h3 id="finance">Finance</h3>
+<ul>
+<li>quarterly-revenue-history-2024-2025.xlsx</li>
+<li>arr-model-2026.xlsx</li>
+<li>kpi-definitions.json</li>
+</ul>
+<h3 id="meetings-notes">Meetings + notes</h3>
+<ul>
+<li>exec-notes-2026-02-01.md</li>
+<li>product-review-notes-2026-02-18.md</li>
+<li>voice-note-transcript-2026-02-20.md</li>
+</ul>
+<h3 id="evaluation-templates">Evaluation templates</h3>
+<ul>
+<li>incident-postmortem-template.md</li>
+<li>prd-template.md</li>
+<li>customer-intake-form.json</li>
+</ul>
+<h3 id="word-documents-.docx">Word documents (.docx)</h3>
+<ul>
+<li>feature-fable-update-2026-02-18.docx</li>
+</ul>
+<h3 id="images-mixed-generated">Images (mixed; generated)</h3>
+<p>Documentation: - assets/images/README.md</p>
+<p>Folders: - assets/images/logos/ - assets/images/people/ -
+assets/images/product-ui/ - assets/images/diagrams/ -
+assets/images/social/</p>
+<p>Metadata: - assets/images/prompts.jsonl</p>
+<p>Targets (exact): - logos: 7 - people: 22 - product-ui: 20 - diagrams:
+16 - social: 8</p>
+<h3 id="word-documents-.docx-1">Word documents (.docx)</h3>
+<ul>
+<li>feature-fable-update-2026-02-18.docx</li>
+</ul>
+<h2 id="timeline-of-significant-events">Timeline of significant
+events</h2>
+<ul>
+<li>2025-10: Reorg: platform team split.</li>
+<li>2025-12: Feature Fable scope expands.</li>
+<li>2026-02-11: Queue saturation incident.</li>
+<li>2026-02-20: Finance debates active vs billable accounts
+definition.</li>
+</ul>
+<h2 id="benchmark-goals-ikam">Benchmark goals (IKAM)</h2>
+<ul>
+<li>Queries:
+<ol type="1">
+<li>“What is Feature Fable status and ship date?”</li>
+<li>“What caused the 2026-02-11 incident?”</li>
+<li>“What is the definition of active vs billable accounts?”</li>
+</ol></li>
+</ul>
+</body>
+</html>

@@ -1,0 +1,388 @@
+<!DOCTYPE html>
+<html xmlns="http://www.w3.org/1999/xhtml" lang="" xml:lang="">
+<head>
+  <meta charset="utf-8" />
+  <meta name="generator" content="pandoc" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=yes" />
+  <title>xl-software-v01</title>
+  <style>
+    html {
+      color: #1a1a1a;
+      background-color: #fdfdfd;
+    }
+    body {
+      margin: 0 auto;
+      max-width: 36em;
+      padding-left: 50px;
+      padding-right: 50px;
+      padding-top: 50px;
+      padding-bottom: 50px;
+      hyphens: auto;
+      overflow-wrap: break-word;
+      text-rendering: optimizeLegibility;
+      font-kerning: normal;
+    }
+    @media (max-width: 600px) {
+      body {
+        font-size: 0.9em;
+        padding: 12px;
+      }
+      h1 {
+        font-size: 1.8em;
+      }
+    }
+    @media print {
+      html {
+        background-color: white;
+      }
+      body {
+        background-color: transparent;
+        color: black;
+        font-size: 12pt;
+      }
+      p, h2, h3 {
+        orphans: 3;
+        widows: 3;
+      }
+      h2, h3, h4 {
+        page-break-after: avoid;
+      }
+    }
+    p {
+      margin: 1em 0;
+    }
+    a {
+      color: #1a1a1a;
+    }
+    a:visited {
+      color: #1a1a1a;
+    }
+    img {
+      max-width: 100%;
+    }
+    h1, h2, h3, h4, h5, h6 {
+      margin-top: 1.4em;
+    }
+    h5, h6 {
+      font-size: 1em;
+      font-style: italic;
+    }
+    h6 {
+      font-weight: normal;
+    }
+    ol, ul {
+      padding-left: 1.7em;
+      margin-top: 1em;
+    }
+    li > ol, li > ul {
+      margin-top: 0;
+    }
+    blockquote {
+      margin: 1em 0 1em 1.7em;
+      padding-left: 1em;
+      border-left: 2px solid #e6e6e6;
+      color: #606060;
+    }
+    code {
+      font-family: Menlo, Monaco, Consolas, 'Lucida Console', monospace;
+      font-size: 85%;
+      margin: 0;
+      hyphens: manual;
+    }
+    pre {
+      margin: 1em 0;
+      overflow: auto;
+    }
+    pre code {
+      padding: 0;
+      overflow: visible;
+      overflow-wrap: normal;
+    }
+    .sourceCode {
+     background-color: transparent;
+     overflow: visible;
+    }
+    hr {
+      background-color: #1a1a1a;
+      border: none;
+      height: 1px;
+      margin: 1em 0;
+    }
+    table {
+      margin: 1em 0;
+      border-collapse: collapse;
+      width: 100%;
+      overflow-x: auto;
+      display: block;
+      font-variant-numeric: lining-nums tabular-nums;
+    }
+    table caption {
+      margin-bottom: 0.75em;
+    }
+    tbody {
+      margin-top: 0.5em;
+      border-top: 1px solid #1a1a1a;
+      border-bottom: 1px solid #1a1a1a;
+    }
+    th {
+      border-top: 1px solid #1a1a1a;
+      padding: 0.25em 0.5em 0.25em 0.5em;
+    }
+    td {
+      padding: 0.125em 0.5em 0.25em 0.5em;
+    }
+    header {
+      margin-bottom: 4em;
+      text-align: center;
+    }
+    #TOC li {
+      list-style: none;
+    }
+    #TOC ul {
+      padding-left: 1.3em;
+    }
+    #TOC > ul {
+      padding-left: 0;
+    }
+    #TOC a:not(:hover) {
+      text-decoration: none;
+    }
+    code{white-space: pre-wrap;}
+    span.smallcaps{font-variant: small-caps;}
+    div.columns{display: flex; gap: min(4vw, 1.5em);}
+    div.column{flex: auto; overflow-x: auto;}
+    div.hanging-indent{margin-left: 1.5em; text-indent: -1.5em;}
+    /* The extra [class] is a hack that increases specificity enough to
+       override a similar rule in reveal.js */
+    ul.task-list[class]{list-style: none;}
+    ul.task-list li input[type="checkbox"] {
+      font-size: inherit;
+      width: 0.8em;
+      margin: 0 0.8em 0.2em -1.6em;
+      vertical-align: middle;
+    }
+    .display.math{display: block; text-align: center; margin: 0.5rem auto;}
+  </style>
+</head>
+<body>
+<h1 id="ikam-benchmark-case-spec-idea.md">IKAM Benchmark Case Spec
+(idea.md)</h1>
+<h2 id="identity">Identity</h2>
+<ul>
+<li>Case ID: xl-software-v01</li>
+<li>Business name: Meridian SignalWorks</li>
+<li>Industry / domain: Software (B2B data + workflow platform)</li>
+<li>Business model: SaaS subscription + usage-based add-ons</li>
+<li>Locations / operating region: Distributed (US/EU) —
+remote-first</li>
+<li>Size tier: xl</li>
+<li>Org maturity: bureaucratic surface area + startup habits
+underneath</li>
+</ul>
+<h2 id="high-level-description">High-level description</h2>
+<ul>
+<li>One-liner: A B2B platform that ingests operational signals (events,
+logs, documents), normalizes them, and powers workflow automation +
+reporting for regulated-ish mid-market customers.</li>
+<li>Primary customers:
+<ul>
+<li>Fintech ops teams</li>
+<li>Healthcare services (non-clinical ops)</li>
+<li>Logistics &amp; marketplaces</li>
+</ul></li>
+</ul>
+<h2 id="operating-model">Operating model</h2>
+<ul>
+<li>Functions:
+<ul>
+<li>Product</li>
+<li>Engineering (platform + apps)</li>
+<li>Data/ML</li>
+<li>Sales</li>
+<li>Customer Success</li>
+<li>Security/Compliance</li>
+<li>Finance</li>
+</ul></li>
+<li>Key roles (named people + titles):
+<ul>
+<li>Harper Lin — CEO</li>
+<li>Theo Ramirez — CTO</li>
+<li>Mina Okafor — VP Product</li>
+<li>Jules Chen — Director, Platform Eng</li>
+<li>Sana Iqbal — Head of Security</li>
+<li>Owen Patel — Head of CS</li>
+<li>Riley Morgan — Finance Lead</li>
+</ul></li>
+</ul>
+<h2 id="chaos-profile-new-pick-tracked">Chaos profile (new pick;
+tracked)</h2>
+<ul>
+<li>Overall chaos level (1–5): <strong>5</strong></li>
+<li>Rationale: enterprise-scale doc sprawl + multiple sources of truth +
+fast changes.</li>
+<li>Where chaos lives:
+<ul class="task-list">
+<li><label><input type="checkbox" checked="" />naming conventions
+(feature names vs codenames vs SKUs)</label></li>
+<li><label><input type="checkbox" checked="" />versioning / duplicates
+(PRDs, decks, policies)</label></li>
+<li><label><input type="checkbox" checked="" />conflicting metrics (ARR,
+NRR, MAU definitions)</label></li>
+<li><label><input type="checkbox" checked="" />stale strategy/roadmap
+(roadmap slides lag Jira)</label></li>
+<li><label><input type="checkbox" checked="" />missing documents
+(postmortems, decisions)</label></li>
+<li><label><input type="checkbox" checked="" />shadow systems (side
+spreadsheets, personal notes)</label></li>
+<li><label><input type="checkbox" checked="" />messy meeting notes
+(mixed quality)</label></li>
+<li><label><input type="checkbox" checked="" />unclear ownership/RACI
+(matrix org, frequent reorg)</label></li>
+</ul></li>
+</ul>
+<h2 id="intentional-contradictions-to-include">Intentional
+contradictions to include</h2>
+<ol type="1">
+<li>ARR discrepancy:
+<ul>
+<li>Board deck says $24.8M ARR</li>
+<li>Finance model says $23.9M ARR (excludes churned annual prepaid)</li>
+</ul></li>
+<li>Roadmap conflict:
+<ul>
+<li>Public roadmap says Feature “Orchid” ships Q2</li>
+<li>Internal Jira epic slipped to Q3</li>
+</ul></li>
+<li>Incident narrative conflict:
+<ul>
+<li>Postmortem blames upstream vendor latency</li>
+<li>Metrics dashboard shows internal queue backlog as primary
+driver</li>
+</ul></li>
+<li>Security policy drift:
+<ul>
+<li>Policy doc says 90-day key rotation</li>
+<li>Engineering runbook uses 180-day cadence</li>
+</ul></li>
+</ol>
+<h2 id="artifact-set-what-documents-should-exist">Artifact set (what
+documents should exist)</h2>
+<p>Mix of Markdown, JSON, XLSX, PPTX, and PDF.</p>
+<h3 id="strategy-identity">Strategy + identity</h3>
+<ul>
+<li>mission-vision-values.md</li>
+<li>brand-guide.md</li>
+<li>high-level-strategy-2026.md</li>
+<li>org-chart.json</li>
+</ul>
+<h3 id="product-roadmap">Product + roadmap</h3>
+<ul>
+<li>product-overview.md</li>
+<li>roadmap-2026-h1.pptx</li>
+<li>prd-orchid-v1.md</li>
+<li>prd-orchid-v3-FINAL.md</li>
+<li>release-notes-2025-q4.md</li>
+</ul>
+<h3 id="engineering-delivery">Engineering + delivery</h3>
+<ul>
+<li>sprint-log-2025-q4.xlsx</li>
+<li>kanban-snapshot-2026-01.json</li>
+<li>architecture-overview.md</li>
+<li>runbook-queue-backlog.md</li>
+<li>incident-2026-01-17-postmortem.md</li>
+<li>incident-2026-01-17-metrics.json</li>
+</ul>
+<h3 id="sales-cs">Sales + CS</h3>
+<ul>
+<li>sales-deck-v2.pptx</li>
+<li>top-customers.json</li>
+<li>pipeline-2026-q1.xlsx</li>
+<li>customer-renewal-risk.xlsx</li>
+<li>cs-qbr-template.pptx</li>
+</ul>
+<h3 id="finance">Finance</h3>
+<ul>
+<li>quarterly-revenue-history-2024-2025.xlsx</li>
+<li>arr-model-2026.xlsx</li>
+<li>board-update-2026-02.pdf</li>
+<li>kpi-definitions.json</li>
+</ul>
+<h3 id="securitycompliance">Security/Compliance</h3>
+<ul>
+<li>security-policy-access-control.md</li>
+<li>key-rotation-runbook.md</li>
+<li>vendor-risk-register.xlsx</li>
+</ul>
+<h3 id="meetings-notes">Meetings + notes</h3>
+<ul>
+<li>exec-notes-2026-01-05.md</li>
+<li>product-review-notes-2026-01-19.md</li>
+<li>voice-note-transcript-2026-02-02.md</li>
+</ul>
+<h3 id="evaluation-templates">Evaluation templates</h3>
+<ul>
+<li>incident-postmortem-template.md</li>
+<li>prd-template.md</li>
+<li>customer-intake-form.json</li>
+</ul>
+<h3 id="word-documents-.docx">Word documents (.docx)</h3>
+<ul>
+<li>arr-reconciliation-memo-2026-02.docx</li>
+<li>product-milestone-update-2026-02.docx</li>
+</ul>
+<h3 id="images-mixed-generated">Images (mixed; generated)</h3>
+<p>Documentation: - assets/images/README.md</p>
+<p>Folders: - assets/images/logos/ - assets/images/people/ -
+assets/images/product-ui/ - assets/images/diagrams/ -
+assets/images/social/</p>
+<p>Metadata: - assets/images/prompts.jsonl</p>
+<p>Targets (exact for this case): - logos: 8 - people: 30 - product-ui:
+30 (synthetic UI screenshots/illustrations) - diagrams: 25
+(architecture, dashboards, incident timelines) - social: 12</p>
+<h2 id="entity-glossary-kg-grounding">Entity glossary (KG
+grounding)</h2>
+<ul>
+<li>People: Harper Lin, Theo Ramirez, Mina Okafor, Jules Chen, Sana
+Iqbal, Owen Patel, Riley Morgan</li>
+<li>Teams: Platform Eng, App Eng, Security, Product, CS, Sales</li>
+<li>Products/Modules: Meridian Core, Meridian Automations, Meridian
+Insights</li>
+<li>Features: Orchid (codename), QueueGuard (internal), Atlas Metrics
+(dashboard)</li>
+<li>Customers: 10–15 named accounts with aliases</li>
+<li>KPIs: ARR, NRR, MAU, DAU, churn, incident MTTR</li>
+</ul>
+<h3 id="word-documents-.docx-1">Word documents (.docx)</h3>
+<ul>
+<li>arr-reconciliation-memo-2026-02.docx</li>
+<li>product-milestone-update-2026-02.docx</li>
+</ul>
+<h2 id="timeline-of-significant-events">Timeline of significant
+events</h2>
+<ul>
+<li>2024-06: Reorg: Platform split into Platform + Data teams.</li>
+<li>2024-11: Security audit finding: access review cadence unclear.</li>
+<li>2025-03: Pricing change: usage-based add-on introduced.</li>
+<li>2025-08: Major customer churn event (NRR narrative shifts).</li>
+<li>2025-12: Feature Orchid scope expanded.</li>
+<li>2026-01-17: Queue backlog incident; competing narratives.</li>
+<li>2026-02-01: Board update prepared; ARR discrepancy appears.</li>
+</ul>
+<h2 id="benchmark-goals-ikam">Benchmark goals (IKAM)</h2>
+<ul>
+<li>Queries:
+<ol type="1">
+<li>“What is the real ARR and why do numbers differ across docs?”</li>
+<li>“What is Feature Orchid status and shipping timeline?”</li>
+<li>“What caused the 2026-01-17 incident?”</li>
+<li>“What is the key rotation policy vs what is practiced?”</li>
+</ol></li>
+<li>Ambiguities to resolve/flag:
+<ul>
+<li>PRD version conflicts</li>
+<li>KPI definition mismatch</li>
+<li>policy vs runbook drift</li>
+</ul></li>
+</ul>
+</body>
+</html>

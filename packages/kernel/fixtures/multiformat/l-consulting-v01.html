@@ -1,0 +1,344 @@
+<!DOCTYPE html>
+<html xmlns="http://www.w3.org/1999/xhtml" lang="" xml:lang="">
+<head>
+  <meta charset="utf-8" />
+  <meta name="generator" content="pandoc" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=yes" />
+  <title>l-consulting-v01</title>
+  <style>
+    html {
+      color: #1a1a1a;
+      background-color: #fdfdfd;
+    }
+    body {
+      margin: 0 auto;
+      max-width: 36em;
+      padding-left: 50px;
+      padding-right: 50px;
+      padding-top: 50px;
+      padding-bottom: 50px;
+      hyphens: auto;
+      overflow-wrap: break-word;
+      text-rendering: optimizeLegibility;
+      font-kerning: normal;
+    }
+    @media (max-width: 600px) {
+      body {
+        font-size: 0.9em;
+        padding: 12px;
+      }
+      h1 {
+        font-size: 1.8em;
+      }
+    }
+    @media print {
+      html {
+        background-color: white;
+      }
+      body {
+        background-color: transparent;
+        color: black;
+        font-size: 12pt;
+      }
+      p, h2, h3 {
+        orphans: 3;
+        widows: 3;
+      }
+      h2, h3, h4 {
+        page-break-after: avoid;
+      }
+    }
+    p {
+      margin: 1em 0;
+    }
+    a {
+      color: #1a1a1a;
+    }
+    a:visited {
+      color: #1a1a1a;
+    }
+    img {
+      max-width: 100%;
+    }
+    h1, h2, h3, h4, h5, h6 {
+      margin-top: 1.4em;
+    }
+    h5, h6 {
+      font-size: 1em;
+      font-style: italic;
+    }
+    h6 {
+      font-weight: normal;
+    }
+    ol, ul {
+      padding-left: 1.7em;
+      margin-top: 1em;
+    }
+    li > ol, li > ul {
+      margin-top: 0;
+    }
+    blockquote {
+      margin: 1em 0 1em 1.7em;
+      padding-left: 1em;
+      border-left: 2px solid #e6e6e6;
+      color: #606060;
+    }
+    code {
+      font-family: Menlo, Monaco, Consolas, 'Lucida Console', monospace;
+      font-size: 85%;
+      margin: 0;
+      hyphens: manual;
+    }
+    pre {
+      margin: 1em 0;
+      overflow: auto;
+    }
+    pre code {
+      padding: 0;
+      overflow: visible;
+      overflow-wrap: normal;
+    }
+    .sourceCode {
+     background-color: transparent;
+     overflow: visible;
+    }
+    hr {
+      background-color: #1a1a1a;
+      border: none;
+      height: 1px;
+      margin: 1em 0;
+    }
+    table {
+      margin: 1em 0;
+      border-collapse: collapse;
+      width: 100%;
+      overflow-x: auto;
+      display: block;
+      font-variant-numeric: lining-nums tabular-nums;
+    }
+    table caption {
+      margin-bottom: 0.75em;
+    }
+    tbody {
+      margin-top: 0.5em;
+      border-top: 1px solid #1a1a1a;
+      border-bottom: 1px solid #1a1a1a;
+    }
+    th {
+      border-top: 1px solid #1a1a1a;
+      padding: 0.25em 0.5em 0.25em 0.5em;
+    }
+    td {
+      padding: 0.125em 0.5em 0.25em 0.5em;
+    }
+    header {
+      margin-bottom: 4em;
+      text-align: center;
+    }
+    #TOC li {
+      list-style: none;
+    }
+    #TOC ul {
+      padding-left: 1.3em;
+    }
+    #TOC > ul {
+      padding-left: 0;
+    }
+    #TOC a:not(:hover) {
+      text-decoration: none;
+    }
+    code{white-space: pre-wrap;}
+    span.smallcaps{font-variant: small-caps;}
+    div.columns{display: flex; gap: min(4vw, 1.5em);}
+    div.column{flex: auto; overflow-x: auto;}
+    div.hanging-indent{margin-left: 1.5em; text-indent: -1.5em;}
+    /* The extra [class] is a hack that increases specificity enough to
+       override a similar rule in reveal.js */
+    ul.task-list[class]{list-style: none;}
+    ul.task-list li input[type="checkbox"] {
+      font-size: inherit;
+      width: 0.8em;
+      margin: 0 0.8em 0.2em -1.6em;
+      vertical-align: middle;
+    }
+    .display.math{display: block; text-align: center; margin: 0.5rem auto;}
+  </style>
+</head>
+<body>
+<h1 id="ikam-benchmark-case-spec-idea.md">IKAM Benchmark Case Spec
+(idea.md)</h1>
+<h2 id="identity">Identity</h2>
+<ul>
+<li>Case ID: l-consulting-v01</li>
+<li>Business name: Greybridge Partners</li>
+<li>Industry / domain: Consulting (strategy + operations +
+turnaround)</li>
+<li>Business model: Services (retainers + success fees + fixed-scope
+diagnostics)</li>
+<li>Locations / operating region: Chicago, IL + travel (US)</li>
+<li>Size tier: l</li>
+<li>Org maturity: process-heavy externally, internally fragmented</li>
+</ul>
+<h2 id="high-level-description">High-level description</h2>
+<ul>
+<li>One-liner: A larger consulting firm with multiple practices and a
+lot of internal artifacts; client work is structured, internal ops are
+messy.</li>
+<li>Practices:
+<ul>
+<li>Turnaround / restructuring</li>
+<li>Ops excellence</li>
+<li>Pricing + cost transformation</li>
+<li>PMO</li>
+</ul></li>
+</ul>
+<h2 id="operating-model">Operating model</h2>
+<ul>
+<li>Functions:
+<ul>
+<li>Partners</li>
+<li>Practice leads</li>
+<li>Delivery teams</li>
+<li>Research</li>
+<li>Finance</li>
+<li>Talent/HR</li>
+</ul></li>
+<li>Key roles:
+<ul>
+<li>Marisol Vega — Managing Partner</li>
+<li>Grant Ellison — Partner, Turnaround</li>
+<li>Ayesha Rahman — Partner, Ops</li>
+<li>Tomás Silva — Director, PMO</li>
+<li>Nina Cho — Finance Director</li>
+<li>Evan Price — Talent Lead</li>
+</ul></li>
+</ul>
+<h2 id="chaos-profile-new-pick-tracked">Chaos profile (new pick;
+tracked)</h2>
+<ul>
+<li>Overall chaos level (1–5): <strong>4</strong></li>
+<li>Rationale: tons of artifacts + template reuse + multiple practices →
+contradiction-prone.</li>
+<li>Where chaos lives:
+<ul class="task-list">
+<li><label><input type="checkbox" checked="" />versioning and duplicates
+(decks, SOWs, case studies)</label></li>
+<li><label><input type="checkbox" checked="" />conflicting metrics
+(utilization, margin, success fees)</label></li>
+<li><label><input type="checkbox" checked="" />naming drift (client
+aliases, practice names)</label></li>
+<li><label><input type="checkbox" checked="" />stale strategy (GTM doc
+behind reality)</label></li>
+<li><label><input type="checkbox" checked="" />shadow spreadsheets
+(utilization “truth” kept by finance)</label></li>
+<li><label><input type="checkbox" checked="" />messy meeting notes
+(partners + practice leads)</label></li>
+</ul></li>
+</ul>
+<h2 id="intentional-contradictions">Intentional contradictions</h2>
+<ol type="1">
+<li>Utilization:
+<ul>
+<li>Practice dashboard says 78%</li>
+<li>Finance tracker says 71% (excludes non-billable “internal”
+work)</li>
+</ul></li>
+<li>Pipeline:
+<ul>
+<li>CRM export shows deal as “Proposal”</li>
+<li>Partner meeting notes say “verbally won”</li>
+</ul></li>
+<li>Success fee accounting:
+<ul>
+<li>Case study claims $1.2M success fee</li>
+<li>Finance summary books $0.9M (timing + contingencies)</li>
+</ul></li>
+</ol>
+<h2 id="artifact-set">Artifact set</h2>
+<h3 id="strategy-identity">Strategy + identity</h3>
+<ul>
+<li>mission-vision-values.md</li>
+<li>brand-guide.md</li>
+<li>high-level-strategy-2026.md</li>
+<li>practices-overview.md</li>
+</ul>
+<h3 id="marketing-sales">Marketing + sales</h3>
+<ul>
+<li>marketing-pitch-deck.pptx</li>
+<li>case-studies-portfolio.pdf</li>
+<li>proposal-template.md</li>
+<li>lead-list.json</li>
+<li>messaging-pillars.md</li>
+</ul>
+<h3 id="finance-pipeline">Finance + pipeline</h3>
+<ul>
+<li>quarterly-revenue-history-2024-2025.xlsx</li>
+<li>projected-revenue-2026.xlsx</li>
+<li>pipeline-report-2026-q1.xlsx</li>
+<li>utilization-tracker-2025.xlsx</li>
+<li>kpi-definitions.json</li>
+</ul>
+<h3 id="delivery-sample-engagement">Delivery (sample engagement)</h3>
+<ul>
+<li>sample-engagement-IRONCLAD/ (folder)
+<ul>
+<li>statement-of-work.pdf</li>
+<li>kickoff-notes.md</li>
+<li>weekly-status-2026-01-12.md</li>
+<li>weekly-status-2026-01-26.md</li>
+<li>deliverable-turnaround-plan-v1.pptx</li>
+<li>deliverable-turnaround-plan-v4-FINAL.pptx</li>
+<li>benefits-tracker.xlsx</li>
+<li>closeout-summary.md (may be incomplete)</li>
+</ul></li>
+</ul>
+<h3 id="meetings-notes">Meetings + notes</h3>
+<ul>
+<li>partner-meeting-notes-2026-02-03.md</li>
+<li>practice-leads-notes-2026-02-10.md</li>
+<li>voice-note-transcript-2026-02-18.md</li>
+</ul>
+<h3 id="evaluation-templates">Evaluation templates</h3>
+<ul>
+<li>client-intake-form.json</li>
+<li>engagement-retro-template.md</li>
+<li>consultant-performance-rubric.md</li>
+</ul>
+<h3 id="word-documents-.docx">Word documents (.docx)</h3>
+<ul>
+<li>practice-performance-2026-01.docx</li>
+</ul>
+<h3 id="images-mixed-generated">Images (mixed; generated)</h3>
+<p>Documentation: - assets/images/README.md</p>
+<p>Folders: - assets/images/logos/ - assets/images/people/ -
+assets/images/social/ - assets/images/diagrams/</p>
+<p>Metadata: - assets/images/prompts.jsonl</p>
+<p>Targets (exact): - logos: 6 - people: 22 - social: 18 - diagrams:
+18</p>
+<h3 id="word-documents-.docx-1">Word documents (.docx)</h3>
+<ul>
+<li>practice-performance-2026-01.docx</li>
+</ul>
+<h2 id="timeline-of-significant-events">Timeline of significant
+events</h2>
+<ul>
+<li>2024-01: Managing Partner change (Marisol).</li>
+<li>2024-07: New Turnaround practice launched; overlaps with Ops.</li>
+<li>2025-03: Finance rolls out new utilization definition (not
+adopted).</li>
+<li>2025-11: Big success-fee case closes; marketing claims larger
+number.</li>
+<li>2026-02: Practice conflict on pipeline truth.</li>
+</ul>
+<h2 id="benchmark-goals-ikam">Benchmark goals (IKAM)</h2>
+<ul>
+<li>Queries:
+<ol type="1">
+<li>“What is real utilization and why do numbers differ?”</li>
+<li>“Which deals are actually won vs just in CRM?”</li>
+<li>“What success fees exist and how are they recognized?”</li>
+<li>“Find the latest FINAL deliverable deck for IRONCLAD.”</li>
+</ol></li>
+</ul>
+</body>
+</html>
