@@ -1289,3 +1289,12 @@ Newest last. Format and rules: `README.md`.
     One graph is now 0.2% smaller than the per-type stores (was 1.4% larger). The cases corpus is unchanged: its PDFs (reportlab) have no deflate streams.
   - Bench (two runs; tests, clippy and fmt clean; every corpus exact with a clean fsck; every stored size and deterministic field identical to E075): score 0.6181 / 0.6001 against 0.6076 / 0.5900, within noise. No bench corpus holds a planable zlib stream: office goes through `plan_zip`, and images are not in the bench. Ingest time unchanged.
 - Verdict: **kept** (neutral on the bench, -38% on the north-star corpus).
+
+### E081 multiformat-corpus (benchmark change: the north-star corpus is scored)
+- Branch / parent: exp/081-multiformat-corpus / E080
+- Change: the bench adds corpus `multiformat` (`fixtures/multiformat`, 96 files of the same 24 texts in md, html, docx and pdf), stored as **one** graph. It is the first scored corpus that mixes file types in one store. `examples/cross.rs` prints each store's bytes by encoding to stderr.
+- Result (two runs; every corpus exact with a clean fsck; the other ten corpora's sizes and deterministic fields identical to E080): score over **11** corpora 0.5717 / 0.5788. Not comparable with earlier scores, which are over 10.
+  - multiformat cost ratio 0.374 / 0.381. Under the heavy workload, the kernel stores all 96 files raw ("W", 2,879,743 B) plus a search index (2,916,522 B), 5,797,532 B in all against the baseline's 1,125,583 B. Search is 99% of the baseline's monthly cost (1,000 read passes x 100 searches over 2.9 MB).
+  - Its first repack costs 43–47 s of CPU at a 124 MB heap peak, 73–78% of its kernel cost.
+- What it shows: under the heavy, uniform workload, storage is about 15% of the kernel's cost on this corpus, so the score barely sees compression or cross-type sharing. Progress on the north star is therefore also measured by `examples/cross.rs` at read weight 0.001 (storage only), reported beside the score.
+- Verdict: **kept** (benchmark change; reference for the 11-corpus score).
