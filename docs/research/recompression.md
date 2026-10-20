@@ -25,3 +25,7 @@ Neither has been reproduced here beyond the zlib-level search below.
 
 - E080 adds `container::plan_zlib`. It finds zlib streams anywhere: a valid header, a deflate stream that ends, and a matching Adler-32 after it. Each stream that re-deflates exactly at some zlib level is planned as a member of the existing `deflate-pack` function. No file type is named.
 - Open: the 20 streams that zlib levels do not reproduce (a preflate-style diff), gzip framing, and PNG IDAT split across chunks.
+
+## E083
+
+The 20 streams the first probe could not reproduce were 19 streams written at zlib level 6 with **memLevel 9** (LibreOffice's fonts), plus a probe artifact. A wider probe (memLevel 1–9, strategies 0–4) reproduces all 275. The kernel now reproduces memLevel 9 through the pinned zlib.

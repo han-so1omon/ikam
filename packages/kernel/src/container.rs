@@ -9,6 +9,9 @@
 //! verifies the whole reconstruction before accepting it.
 //!
 //! Manifest: count:u32 { 0 len:u32 bytes | 1 member:u32 level:u8 }
+//! where level 0-9 is zlib's level at memLevel 8 (zlib's default), and
+//! 10-19 the same levels at memLevel 9 (E083: LibreOffice writes PDF fonts
+//! so).
 //!
 //! `plan_zlib` (E080) finds zlib streams anywhere in a file (PDF
 //! FlateDecode streams, PNG data, embedded objects): a valid zlib header,
@@ -25,8 +28,12 @@ use flate2::write::DeflateEncoder;
 
 use crate::Error;
 
-/// Levels to try, most common first (zlib's default is 6).
-const LEVELS: [u8; 10] = [6, 4, 5, 1, 2, 3, 7, 8, 9, 0];
+/// Levels to try, most common first (zlib's default is 6), at memLevel 8
+/// and then 9 (`MEM9` added; see the manifest).
+const LEVELS: [u8; 20] = [
+    6, 4, 5, 1, 2, 3, 7, 8, 9, 0, 16, 14, 15, 11, 12, 13, 17, 18, 19, 10,
+];
+const MEM9: u8 = 10;
 /// Never inflate a member beyond this many bytes (zip-bomb guard).
 const MAX_MEMBER: usize = 1 << 30;
 
@@ -35,10 +42,63 @@ enum Segment<'a> {
     Deflate { member: u32, level: u8 },
 }
 
+/// Raw deflate of `data` at a manifest level (0-19, see the manifest).
 pub fn deflate(data: &[u8], level: u8) -> Vec<u8> {
+    if level >= MEM9 {
+        return deflate_mem9(data, level - MEM9);
+    }
     let mut enc = DeflateEncoder::new(Vec::new(), Compression::new(level.into()));
     enc.write_all(data).expect("writing to a Vec cannot fail");
     enc.finish().expect("writing to a Vec cannot fail")
+}
+
+/// Raw deflate at zlib `level` with memLevel 9, through the pinned zlib
+/// directly: flate2 fixes memLevel at 8.
+fn deflate_mem9(data: &[u8], level: u8) -> Vec<u8> {
+    use libz_sys as z;
+    use std::ffi::{c_uint, c_void};
+    unsafe extern "C" {
+        fn calloc(n: usize, size: usize) -> *mut c_void;
+        fn free(p: *mut c_void);
+    }
+    unsafe extern "C" fn zalloc(_: *mut c_void, n: c_uint, size: c_uint) -> *mut c_void {
+        unsafe { calloc(n as usize, size as usize) }
+    }
+    unsafe extern "C" fn zfree(_: *mut c_void, p: *mut c_void) {
+        unsafe { free(p) }
+    }
+    let mut s = z::z_stream {
+        next_in: data.as_ptr().cast_mut(),
+        avail_in: c_uint::try_from(data.len()).expect("members are below 4 GiB"),
+        total_in: 0,
+        next_out: std::ptr::null_mut(),
+        avail_out: 0,
+        total_out: 0,
+        msg: std::ptr::null_mut(),
+        state: std::ptr::null_mut(),
+        zalloc,
+        zfree,
+        opaque: std::ptr::null_mut(),
+        data_type: 0,
+        adler: 0,
+        reserved: 0,
+    };
+    // SAFETY: `s` is a zeroed stream with valid allocators; zlib reads only
+    // `data` and writes only within `out`, sized by `deflateBound` so one
+    // Z_FINISH call completes; the stream is ended before `s` is dropped.
+    unsafe {
+        let size = std::mem::size_of::<z::z_stream>() as i32;
+        let init = z::deflateInit2_(&mut s, level.into(), 8, -15, 9, 0, z::zlibVersion(), size);
+        assert_eq!(init, 0, "deflateInit2 failed");
+        let mut out = vec![0u8; z::deflateBound(&mut s, data.len() as _) as usize];
+        (s.next_out, s.avail_out) = (out.as_mut_ptr(), out.len() as c_uint);
+        let done = z::deflate(&mut s, 4); // Z_FINISH
+        let n = s.total_out as usize;
+        z::deflateEnd(&mut s);
+        assert_eq!(done, 1, "deflate did not finish"); // Z_STREAM_END
+        out.truncate(n);
+        out
+    }
 }
 
 fn inflate(stream: &[u8], expected: usize) -> Option<Vec<u8>> {
@@ -227,7 +287,7 @@ pub fn pack(args: &[Vec<u8>]) -> Result<Vec<u8>, Error> {
             1 => {
                 let member = members.get(m.u32().ok_or_else(bad)?).ok_or_else(bad)?;
                 let level = m.take(1).ok_or_else(bad)?[0];
-                if level > 9 {
+                if level > 19 {
                     return Err(bad());
                 }
                 out.extend_from_slice(&deflate(member, level));
@@ -278,10 +338,13 @@ mod tests {
             state ^= state << 17;
             input.extend_from_slice(words[(state % 10) as usize].as_bytes());
         }
-        let got: Vec<String> = (0..=9)
+        let got: Vec<String> = (0..=19)
             .map(|l| Id::of(&deflate(&input, l)).to_hex()[..16].to_string())
             .collect();
-        assert_eq!(got, GOLDEN);
+        assert_eq!(got[..10], GOLDEN);
+        assert_eq!(got[10..], GOLDEN_MEM9);
+        let back = |l| inflate(&deflate(&input, l), input.len()).unwrap();
+        assert!((0..=19).all(|l| back(l) == input));
     }
 
     /// zlib streams anywhere in a file (here as a PDF holds them) are
@@ -311,6 +374,19 @@ mod tests {
         assert_eq!(pack(&args).unwrap(), pdf);
         assert!(plan_zlib(b"x\x9c not a stream, just text with a header").is_none());
     }
+
+    const GOLDEN_MEM9: [&str; 10] = [
+        "2f67743f12a102c2",
+        "e846ff82f7a97f27",
+        "8aa0adf771c4e0c9",
+        "5e20802f45c32457",
+        "7b2d3bc0d1e880c1",
+        "ff6d980e075f8029",
+        "fb2aba5f7c9064ff",
+        "6494c74d184c6dd7",
+        "4afffe21e6e10699",
+        "4afffe21e6e10699",
+    ];
 
     const GOLDEN: [&str; 10] = [
         "a1bce5b0daf407a9",
