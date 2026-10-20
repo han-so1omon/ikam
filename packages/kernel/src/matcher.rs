@@ -34,7 +34,7 @@ pub enum Part {
     Existing { src: Id, start: usize, len: usize },
 }
 
-const GEAR: [u64; 256] = {
+pub(crate) const GEAR: [u64; 256] = {
     let mut table = [0u64; 256];
     let mut state = 0x9e37_79b9_7f4a_7c15u64;
     let mut i = 0;
