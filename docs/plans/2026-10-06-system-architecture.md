@@ -6,6 +6,14 @@ Status: proposal. Parts marked **built** exist on `feature/rust-kernel` (experim
 
 Every file is stored as verified, content-addressed bytes. **How** its bytes are stored (whole, sliced, templated, grouped, derived by a function) is a replaceable plan, chosen by measured size and read cost. The **meaning** of content (relations, entities, versions, render structure) is a separate, versioned graph layer. Semantic proposers, including LLMs, write into that layer. The planner turns the layer's relations into candidate derivations, and only what is verified byte-exactly and measured to pay is kept. Meaning can therefore guide storage but never corrupt it.
 
+## North star (the user's stated goal, 2026-10-20)
+
+Take in data from arbitrary sources (files or streams) and organize it automatically into **one graph** that:
+- reproduces every original byte-exactly;
+- compresses highly efficiently **across** sources. Information shared between elements, including elements of different file types (the same facts in a markdown note, a docx, a pdf and a spreadsheet), is stored once.
+
+What this means for the benchmark: per-type corpora (md, pdf and office stored separately) cannot show cross-type sharing. The measurement has to ingest mixed sources into one store and compare it with the sum of the separate stores and with the baseline (E077 onward).
+
 ## Layers
 
 ```mermaid
