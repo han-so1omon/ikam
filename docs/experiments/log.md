@@ -1540,3 +1540,24 @@ Newest last. Format and rules: `README.md`.
 - Result (two runs; every corpus exact with a clean fsck): score 0.2696 / 0.2846 against E094's 0.2659 / 0.2608, within noise. Only transcripts changed: stored 3,646,238 -> 3,601,823 B (smaller without quotes), cost ratio 0.512 / 0.427 -> 0.465 / 0.395 (slightly better without).
 - What it shows: under the heavy workload the quote derivation no longer pays. The planner still takes it, so it slightly misprices the derivation's reads. It still pays under bytes (E056).
 - Verdict: **reference**. E056's registry row now holds only under bytes; the quote function stays as a capability for cold data.
+
+### E096 ablate-programs (registry rerun: E022/E023 under the cost objective)
+- Branch / parent: exp/096-ablate-programs (not kept; a one-line ablation) / E094
+- Question: do the generated corpus's programs (E022 interpreter, E023 compiled WASM) still pay under the cost score?
+- Result (generated only, two runs each, against two runs without the ablation): cost ratio 0.171 / 0.155 -> **0.065 / 0.075** without programs. Under the heavy workload the contents are stored raw either way, so the programs survive only as ledger facts. They cost storage (their WASM modules, 94,401 B as "Y") and fsck CPU (117–130 ms, 30 fsck a month): fsck re-executes every derivation. Without them: fsck 0.6 ms, repack 0.9 -> 0.1 s.
+- What it shows: under the cost objective, facts that are not used to rebuild anything are paid for mostly by fsck re-executing them. This led to E097.
+- Verdict: **reference** (the programs stay: they are the graph's record of how content was made, and they pay under bytes).
+
+### E097 fsck-load-bearing (fsck re-evaluates only derivations reads depend on)
+- Branch / parent: exp/097-fsck-load-bearing / E094
+- Hypothesis: fsck evaluates every derivation and compares the result with its output id. When the output is also stored, three things make that evaluation unnecessary for reads: reads use the stored copy first, the same fsck hashes that copy, and a read that does go through a derivation checks its output hash anyway. Re-evaluating such facts (E096: WASM programs, 117–130 ms per fsck) can be dropped from the routine check.
+- Change:
+  - `fsck` evaluates a derivation only when its output is not stored. Every record is still hash-checked, and every stored content verified.
+  - New `fsck_deep` also evaluates every derivation. The CLI's `fsck` command runs it, as its documented purpose is checking after dependency upgrades.
+- **Guarantee change, stated:** a fact that has gone stale (for example an interpreter upgrade changing a program's output) but is not used for reads is no longer caught by the routine fsck. It is caught by `fsck_deep`, and by any read or repack that depends on it, since both verify outputs.
+- Result (two runs; tests, clippy and fmt clean; every corpus exact with a clean fsck; every search exact; **every stored size and deterministic field identical to E094**):
+  - Score 0.2659 / 0.2608 -> 0.2710 / 0.2670, within noise.
+  - generated fsck 155 -> 1.1 ms, cost ratio 0.153 / 0.145 -> **0.076 / 0.091**; transcripts fsck 32 -> 3.8 ms; multiformat fsck 33 -> 22 ms.
+  - The score's movement comes from timing noise on unchanged work, much of it on the baseline side (repo-graph baseline read 8.5–11.9 ms across runs; structured baseline search 3.0–4.0 ms).
+- Note: the bench's run-to-run spread (about ±0.02 on the score) now hides per-corpus effects of this size. A longer minimum timing per operation would narrow it, at the cost of bench time (a benchmark change, not made here).
+- Verdict: **kept** (identical output; a large effect on generated; the guarantee change is above).
