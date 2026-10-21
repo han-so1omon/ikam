@@ -95,3 +95,4 @@ E091	groups-vs-contexts	change	discarded	exp/091-groups-vs-contexts	cost	groupin
 E092	futile-plans	change	kept	main	cost	repack,speed,ingest	no	slice/template search skipped when read work alone loses; identical output, ingest -70-98%, score 0.35 -> 0.31
 E093	read-priced-objects	change	kept	main	cost	graph,read-path,planner	no	graph chunks priced by reads; repo-graph 0.80 -> 0.40
 E094	chunk-trigrams	change	kept	main	cost	search	yes	trigram postings per distinct chunk; score 0.30 -> 0.26
+E095	ablate-quotes	ablation	reference	main	cost	programs	no	E056 quotes do not pay under cost (transcripts slightly better without)

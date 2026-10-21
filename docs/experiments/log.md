@@ -1532,3 +1532,11 @@ Newest last. Format and rules: `README.md`.
 
   The indexes are larger, and the planner chose them because, under the heavy workload, the searches they save cost more than the storage. `examples/cross.rs` sets no search workload and is unaffected.
 - Verdict: **kept**.
+
+### E095 ablate-quotes (registry rerun: E056 under the cost objective)
+- Branch / parent: exp/095-ablate-quotes (not kept; a one-line ablation) / E094
+- Question (registry, high-priority ablation): does E056's quote function still pay under the cost score? It was measured under bytes (transcripts 113,507 -> 71,507 B).
+- Change tried: the bench no longer proposes quotes (`propose_quotes` not called).
+- Result (two runs; every corpus exact with a clean fsck): score 0.2696 / 0.2846 against E094's 0.2659 / 0.2608, within noise. Only transcripts changed: stored 3,646,238 -> 3,601,823 B (smaller without quotes), cost ratio 0.512 / 0.427 -> 0.465 / 0.395 (slightly better without).
+- What it shows: under the heavy workload the quote derivation no longer pays. The planner still takes it, so it slightly misprices the derivation's reads. It still pays under bytes (E056).
+- Verdict: **reference**. E056's registry row now holds only under bytes; the quote function stays as a capability for cold data.
