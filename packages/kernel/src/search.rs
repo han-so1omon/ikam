@@ -17,6 +17,11 @@
 //! last is at least `MIN_CHUNK` bytes and patterns are no longer. Encoded
 //! as `CHUNKS count:u32 { id[32] } n:varint { owner offset len }` then per
 //! content `n:varint { chunk }` (varints).
+//!
+//! With trigrams (E094, first byte `CHUNK_TRIGRAMS`), the chunk index also
+//! keeps each trigram's chunks, and each seam's context (up to `SEAM_CTX`
+//! bytes on each side). A pattern of 3 to `SEAM_CTX + 1` bytes then scans
+//! only the chunks holding all its trigrams, and the seam contexts.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 
@@ -43,6 +48,10 @@ struct Chunks {
     /// `(owner, offset, len)`; owner `files.len()` means `inline[offset..]`.
     table: Vec<(usize, usize, usize)>,
     inline: Vec<u8>,
+    /// Per trigram, its chunks; and per seam its context (E094). Empty
+    /// without trigrams.
+    postings: HashMap<[u8; 3], Vec<usize>>,
+    seam_ctx: Vec<Vec<u8>>,
     seams: Vec<(usize, usize)>,
     chunk_files: Vec<Vec<usize>>,
     seam_files: Vec<Vec<usize>>,
@@ -77,6 +86,8 @@ impl Chunks {
         Chunks {
             table,
             inline,
+            postings: HashMap::new(),
+            seam_ctx: Vec::new(),
             seams,
             chunk_files,
             seam_files,
@@ -87,6 +98,11 @@ impl Chunks {
 /// First byte of a chunk index (a trigram index starts with a big-endian
 /// count, never this large).
 const CHUNKS: u8 = 0xc1;
+/// First byte of a chunk index with trigrams (E094).
+const CHUNK_TRIGRAMS: u8 = 0xc2;
+/// Bytes of context kept on each side of a seam: patterns up to one more
+/// are answered from trigrams.
+const SEAM_CTX: usize = 31;
 /// Chunk sizes: at least `MIN_CHUNK` (and patterns up to it are answered
 /// from chunks), about 1 KiB on average, at most `MAX_CHUNK`.
 const MIN_CHUNK: usize = 256;
@@ -163,7 +179,12 @@ impl<S: Store> Repo<S> {
         // units mispriced it by about 20% on transcripts (estimated 5%
         // cheaper than trigrams, measured 16% slower), where on structured
         // and synthetic-history it is estimated and measured 75-90% cheaper.
-        for bytes in [self.encode_index(files)?, self.encode_chunks(files)?] {
+        let options = [
+            self.encode_index(files)?,
+            self.encode_chunks(files, false)?,
+            self.encode_chunks(files, true)?,
+        ];
+        for bytes in options {
             let index = decode_index(&bytes)?;
             let margin = if index.chunks.is_some() {
                 CHUNK_MARGIN
@@ -187,7 +208,7 @@ impl<S: Store> Repo<S> {
     /// The chunk index of `files` (see the module documentation). A chunk is
     /// owned by the first content holding it, largest contents first, so
     /// few contents are read to search them all.
-    fn encode_chunks(&self, files: &[Id]) -> Result<Vec<u8>, Error> {
+    fn encode_chunks(&self, files: &[Id], trigrams: bool) -> Result<Vec<u8>, Error> {
         let texts: Vec<Vec<u8>> = files
             .iter()
             .map(|id| self.read_content(id))
@@ -217,7 +238,7 @@ impl<S: Store> Repo<S> {
             .iter()
             .for_each(|&(owner, _, len)| owned[owner] += len);
         let inline = |owner: usize| owned[owner] * INLINE_SHARE < texts[owner].len();
-        let mut out = vec![CHUNKS];
+        let mut out = vec![if trigrams { CHUNK_TRIGRAMS } else { CHUNKS }];
         out.extend_from_slice(&(files.len() as u32).to_be_bytes());
         files
             .iter()
@@ -238,6 +259,37 @@ impl<S: Store> Repo<S> {
         for list in &contents {
             put_varint(&mut out, list.len());
             list.iter().for_each(|&c| put_varint(&mut out, c));
+        }
+        if trigrams {
+            let bytes = |c: usize| {
+                let (owner, offset, len) = table[c];
+                &texts[owner][offset..offset + len]
+            };
+            let mut postings: BTreeMap<[u8; 3], Vec<usize>> = BTreeMap::new();
+            for c in 0..table.len() {
+                let set: HashSet<[u8; 3]> =
+                    bytes(c).windows(3).map(|w| [w[0], w[1], w[2]]).collect();
+                set.into_iter()
+                    .for_each(|t| postings.entry(t).or_default().push(c));
+            }
+            put_varint(&mut out, postings.len());
+            for (t, list) in &mut postings {
+                list.sort_unstable();
+                out.extend_from_slice(t);
+                put_varint(&mut out, list.len());
+                let mut prev = 0;
+                for &c in list.iter() {
+                    put_varint(&mut out, c - prev);
+                    prev = c;
+                }
+            }
+            // Seam contexts, in the order `Chunks::new` derives seams.
+            let seams = Chunks::new(table.clone(), Vec::new(), contents.clone()).seams;
+            for (a, b) in seams {
+                let (a, b) = (bytes(a), bytes(b));
+                out.extend_from_slice(&a[a.len().saturating_sub(SEAM_CTX)..]);
+                out.extend_from_slice(&b[..b.len().min(SEAM_CTX)]);
+            }
         }
         Ok(out)
     }
@@ -342,6 +394,9 @@ impl<S: Store> Repo<S> {
         covered: &[Id],
         chunks: &Chunks,
     ) -> Result<(Vec<Id>, usize), Error> {
+        if !chunks.seam_ctx.is_empty() && (3..=SEAM_CTX + 1).contains(&pattern.len()) {
+            return self.search_chunk_trigrams(pattern, files, covered, chunks);
+        }
         let finder = memchr::memmem::Finder::new(pattern);
         let position: HashMap<&Id, usize> =
             covered.iter().enumerate().map(|(i, id)| (id, i)).collect();
@@ -403,12 +458,84 @@ impl<S: Store> Repo<S> {
         }
         Ok((out, cx.work))
     }
+
+    /// `search` through a chunk index with trigrams (E094): only the chunks
+    /// holding every trigram of the pattern, and every seam's context.
+    fn search_chunk_trigrams(
+        &self,
+        pattern: &[u8],
+        files: &[Id],
+        covered: &[Id],
+        chunks: &Chunks,
+    ) -> Result<(Vec<Id>, usize), Error> {
+        let finder = memchr::memmem::Finder::new(pattern);
+        let mut candidates: Option<Vec<usize>> = None;
+        for w in pattern.windows(3) {
+            let list = chunks
+                .postings
+                .get(&[w[0], w[1], w[2]])
+                .map_or(&[][..], Vec::as_slice);
+            candidates = Some(match candidates {
+                None => list.to_vec(),
+                Some(c) => c
+                    .into_iter()
+                    .filter(|x| list.binary_search(x).is_ok())
+                    .collect(),
+            });
+        }
+        let (mut cx, mut owners) = (Cx::default(), HashMap::new());
+        let mut found = vec![false; covered.len()];
+        for c in candidates.unwrap_or_default() {
+            let (owner, offset, len) = chunks.table[c];
+            let source = match owner == covered.len() {
+                true => &chunks.inline,
+                false => {
+                    if let std::collections::hash_map::Entry::Vacant(e) = owners.entry(owner) {
+                        e.insert(self.rebuild(&covered[owner], &mut cx)?);
+                        cx.known.clear();
+                    }
+                    &owners[&owner]
+                }
+            };
+            let bytes = source.get(offset..offset + len).unwrap_or_default();
+            crate::dict::count_decode(bytes.len(), SCAN_UNITS);
+            if finder.find(bytes).is_some() {
+                chunks.chunk_files[c].iter().for_each(|&f| found[f] = true);
+            }
+        }
+        for (s, ctx) in chunks.seam_ctx.iter().enumerate() {
+            crate::dict::count_decode(ctx.len(), SCAN_UNITS);
+            if finder.find(ctx).is_some() {
+                chunks.seam_files[s].iter().for_each(|&f| found[f] = true);
+            }
+        }
+        let position: HashMap<&Id, usize> =
+            covered.iter().enumerate().map(|(i, id)| (id, i)).collect();
+        let mut out = Vec::new();
+        for id in files {
+            let hit = match position.get(id) {
+                Some(&i) => found[i],
+                None => {
+                    let bytes = self.rebuild(id, &mut cx)?;
+                    cx.known.clear();
+                    crate::dict::count_decode(bytes.len(), SCAN_UNITS);
+                    finder.find(&bytes).is_some()
+                }
+            };
+            if hit {
+                out.push(*id);
+            }
+        }
+        Ok((out, cx.work))
+    }
 }
 
 fn decode_index(bytes: &[u8]) -> Result<SearchIndex, Error> {
     let bad = || Error::Decode("search index");
-    if bytes.first() == Some(&CHUNKS) {
-        return decode_chunks(&bytes[1..]).ok_or_else(bad);
+    match bytes.first() {
+        Some(&CHUNKS) => return decode_chunks(&bytes[1..], false).ok_or_else(bad),
+        Some(&CHUNK_TRIGRAMS) => return decode_chunks(&bytes[1..], true).ok_or_else(bad),
+        _ => {}
     }
     let count = u32::from_be_bytes(bytes.get(..4).ok_or_else(bad)?.try_into().unwrap()) as usize;
     let ids = bytes.get(4..4 + 32 * count).ok_or_else(bad)?;
@@ -433,7 +560,7 @@ fn decode_index(bytes: &[u8]) -> Result<SearchIndex, Error> {
     })
 }
 
-fn decode_chunks(bytes: &[u8]) -> Option<SearchIndex> {
+fn decode_chunks(bytes: &[u8], trigrams: bool) -> Option<SearchIndex> {
     let count = u32::from_be_bytes(bytes.get(..4)?.try_into().ok()?) as usize;
     let ids = bytes.get(4..4 + 32 * count)?;
     let files: Vec<Id> = ids
@@ -464,10 +591,31 @@ fn decode_chunks(bytes: &[u8]) -> Option<SearchIndex> {
         })
         .collect::<Option<Vec<Vec<usize>>>>()?;
     let owners_ok = table.iter().all(|&(owner, _, _)| owner <= count);
+    let mut chunks = Chunks::new(table, inline, contents);
+    if trigrams {
+        for _ in 0..varint(&mut rest)? {
+            let (t, tail) = rest.split_first_chunk::<3>()?;
+            rest = tail;
+            let k = varint(&mut rest)?;
+            let mut list = Vec::with_capacity(k);
+            for _ in 0..k {
+                let c = list.last().copied().unwrap_or(0) + varint(&mut rest)?;
+                list.push(c);
+            }
+            list.last().is_none_or(|&c| c < n).then_some(())?;
+            chunks.postings.insert(*t, list);
+        }
+        for &(a, b) in &chunks.seams {
+            let len = chunks.table[a].2.min(SEAM_CTX) + chunks.table[b].2.min(SEAM_CTX);
+            let (ctx, tail) = rest.split_at_checked(len)?;
+            chunks.seam_ctx.push(ctx.to_vec());
+            rest = tail;
+        }
+    }
     (rest.is_empty() && owners_ok).then_some(SearchIndex {
         files,
         postings: HashMap::new(),
-        chunks: Some(Chunks::new(table, inline, contents)),
+        chunks: Some(chunks),
     })
 }
 
@@ -522,7 +670,9 @@ mod tests {
             .iter()
             .map(|t| repo.put_content(t).unwrap().id)
             .collect();
-        let index = super::decode_index(&repo.encode_chunks(&ids[..10]).unwrap()).unwrap();
+        let index = super::decode_index(&repo.encode_chunks(&ids[..10], false).unwrap()).unwrap();
+        let with_trigrams =
+            super::decode_index(&repo.encode_chunks(&ids[..10], true).unwrap()).unwrap();
         let chunks = index.chunks.as_ref().unwrap();
         assert!(
             chunks.chunk_files.iter().any(|f| f.len() > 1),
@@ -538,18 +688,23 @@ mod tests {
             b"9",
         ] {
             let full = repo.search(pattern, &ids, None).unwrap().0;
-            let fast = repo.search(pattern, &ids, Some(&index)).unwrap().0;
-            assert_eq!(full, fast, "{}", String::from_utf8_lossy(pattern));
+            for index in [&index, &with_trigrams] {
+                let fast = repo.search(pattern, &ids, Some(index)).unwrap().0;
+                assert_eq!(full, fast, "{}", String::from_utf8_lossy(pattern));
+            }
         }
-        // Every seam: a pattern straddling each chunk end of the last version.
+        // Every seam: patterns straddling each chunk end of the last version,
+        // up to the longest the trigram path answers.
         let last = &versions[9];
         for end in super::chunk_ends(last) {
-            if end > 8 && end + 8 <= last.len() {
-                let pattern = &last[end - 8..end + 8];
-                assert_eq!(
-                    repo.search(pattern, &ids, None).unwrap().0,
-                    repo.search(pattern, &ids, Some(&index)).unwrap().0
-                );
+            for (before, after) in [(8, 8), (1, 31), (31, 1), (16, 16)] {
+                if end > before && end + after <= last.len() {
+                    let pattern = &last[end - before..end + after];
+                    let full = repo.search(pattern, &ids, None).unwrap().0;
+                    for index in [&index, &with_trigrams] {
+                        assert_eq!(full, repo.search(pattern, &ids, Some(index)).unwrap().0);
+                    }
+                }
             }
         }
     }
