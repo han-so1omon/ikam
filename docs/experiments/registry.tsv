@@ -93,3 +93,4 @@ E089	chunk-search	change	kept	main	cost	search,cross-source	yes	search each dist
 E090	three-replans	change	kept	main	cost	repack,speed	no	no-dictionary plan re-planned once; identical bytes, repack CPU -10 to -25%
 E091	groups-vs-contexts	change	discarded	exp/091-groups-vs-contexts	cost	grouping,cross-source	yes	dissolve groups when contexts cost less; bytes-neutral, trades bytes for reads
 E092	futile-plans	change	kept	main	cost	repack,speed,ingest	no	slice/template search skipped when read work alone loses; identical output, ingest -70-98%, score 0.35 -> 0.31
+E093	read-priced-objects	change	kept	main	cost	graph,read-path,planner	no	graph chunks priced by reads; repo-graph 0.80 -> 0.40

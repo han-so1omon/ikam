@@ -449,6 +449,18 @@ impl<S: Store> Repo<S> {
         let short = (tag == b'T')
             .then(|| self.abbreviate(rest).ok().flatten())
             .flatten();
+        // A graph chunk is decoded by every read of its graph (once per read
+        // pass): its encodings are priced by that decoding too, as content
+        // is (E093). Other objects are not read by the workload: by size.
+        let reads = if tag == b'G' { canonical.len() } else { 0 };
+        let cost = |encoded: &[u8]| {
+            let decode = match encoded[0].is_ascii_uppercase() {
+                true => 0.0, // canonical: read as stored
+                false if encoded[1] & !ABBREVIATED == RAW => 1.0 / DECODE_UNITS as f64,
+                false => 1.0,
+            };
+            encoded.len() as f64 + self.read_weight * decode * reads as f64
+        };
         let tag = tag.to_ascii_lowercase();
         let mut best = canonical.to_vec();
         let bodies = [(0, Some(rest)), (ABBREVIATED, short.as_deref())];
@@ -461,7 +473,7 @@ impl<S: Store> Repo<S> {
                 // Too small to compress: abbreviation alone may still pay.
                 None => [&[tag, flag | RAW][..], body].concat(),
             };
-            if encoded.len() < best.len() {
+            if cost(&encoded) < cost(&best) {
                 best = encoded;
             }
         }
