@@ -19,7 +19,7 @@
 //! re-recorded, and its inputs are kept.
 
 use std::cmp::Reverse;
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use crate::dict::{
     DICT_REF, DICT_REF_LEN, MEASURE_LEVEL, STORE_LEVEL, block_frames, framer, is_plain, object_tag,
@@ -392,7 +392,7 @@ impl<S: Store + Sync> Repo<S> {
         self.level = STORE_LEVEL;
         let dict = self.dictionary().map(|(id, _)| *id);
         let model = self.read_model(roots)?;
-        let bases = self.related_bases(dict)?;
+        let mut bases = self.related_bases(dict)?;
         let (mut used, mut related) = (HashSet::new(), HashSet::new());
         for id in self.store.ids()? {
             let stored = self.store.read(&id)?;
@@ -436,45 +436,21 @@ impl<S: Store + Sync> Repo<S> {
                         }
                     }
                     // Or with related stored content as the frame's context
-                    // (E057), or two complementary contents (E084): read
-                    // costs their decoding too.
-                    // A context's read cost alone can rule it out: then no
-                    // frame is built (most contents when reads are heavy).
-                    let floor = |context: usize| {
-                        self.read_weight * (reads + model.events(&id) * context) as f64
-                    };
+                    // (E057), or two complementary contents (E084).
                     if Some(id) != dict
                         && !used.contains(&id)
-                        && let Some(first) = bases.most_related(&id, &bytes, &related)
-                        && floor(first.1.len()) < cost
+                        && let Some((q, q_cost, refs)) = self.context_encoding(
+                            &id,
+                            &bytes,
+                            (reads, model.events(&id)),
+                            cost,
+                            &bases,
+                            &related,
+                        )
                     {
-                        let second = bases.complement(&id, &bytes, &related, first);
-                        let options = [Some(vec![first]), second.map(|s| vec![first, s])];
-                        let mut chosen = None;
-                        for refs in options.into_iter().flatten() {
-                            if floor(refs.iter().map(|b| b.1.len()).sum()) >= cost {
-                                continue;
-                            }
-                            let context: Vec<u8> = refs.iter().flat_map(|b| b.1.clone()).collect();
-                            let Some(z) = zstd_frame(&bytes, &context, STORE_LEVEL) else {
-                                continue;
-                            };
-                            let mut q = vec![if refs.len() == 1 { b'Q' } else { b'M' }];
-                            refs.iter()
-                                .for_each(|b| q.extend_from_slice(b.0.as_bytes()));
-                            q.extend_from_slice(&z);
-                            let q_cost = q.len() as f64
-                                + self.read_weight
-                                    * (reads + model.events(&id) * context.len()) as f64;
-                            if q_cost < cost {
-                                (encoded, cost) = (q, q_cost);
-                                chosen = Some(refs.iter().map(|b| b.0).collect::<Vec<_>>());
-                            }
-                        }
-                        if let Some(refs) = chosen {
-                            used.extend(refs);
-                            related.insert(id);
-                        }
+                        (encoded, cost) = (q, q_cost);
+                        used.extend(refs);
+                        related.insert(id);
                     }
                     if cost < self.cost(&stored, reads) {
                         self.store.replace(id, &encoded)?;
@@ -492,9 +468,158 @@ impl<S: Store + Sync> Repo<S> {
                 self.store.replace(id, &encoded)?;
             }
         }
+        self.dissolve_groups(&model, &mut bases, &mut used, &mut related)?;
         self.level = MEASURE_LEVEL;
         self.reset_projections();
         Ok(())
+    }
+
+    /// The cheapest context encoding of `bytes` ("Q" with one related
+    /// content as the frame's context, E057; "M" with two complementary
+    /// ones, E084) if it costs less than `cost`: the encoding, its cost and
+    /// its contexts. Reads cost the contexts' decoding too (`reads` bytes,
+    /// `events` decodes from the start), and a context whose read cost alone
+    /// loses is never compressed against.
+    fn context_encoding(
+        &self,
+        id: &Id,
+        bytes: &[u8],
+        (reads, events): (usize, usize),
+        mut cost: f64,
+        bases: &Bases,
+        related: &HashSet<Id>,
+    ) -> Option<(Vec<u8>, f64, Vec<Id>)> {
+        let floor = |context: usize| self.read_weight * (reads + events * context) as f64;
+        let first = bases.most_related(id, bytes, related)?;
+        if floor(first.1.len()) >= cost {
+            return None;
+        }
+        let second = bases.complement(id, bytes, related, first);
+        let mut chosen = None;
+        for refs in [Some(vec![first]), second.map(|s| vec![first, s])]
+            .into_iter()
+            .flatten()
+        {
+            let size: usize = refs.iter().map(|b| b.1.len()).sum();
+            if floor(size) >= cost {
+                continue;
+            }
+            let context: Vec<u8> = refs.iter().flat_map(|b| b.1.iter().copied()).collect();
+            let Some(z) = zstd_frame(bytes, &context, STORE_LEVEL) else {
+                continue;
+            };
+            let mut q = vec![if refs.len() == 1 { b'Q' } else { b'M' }];
+            refs.iter()
+                .for_each(|b| q.extend_from_slice(b.0.as_bytes()));
+            q.extend_from_slice(&z);
+            let q_cost = q.len() as f64 + floor(size);
+            if q_cost < cost {
+                cost = q_cost;
+                chosen = Some((q, q_cost, refs.iter().map(|b| b.0).collect()));
+            }
+        }
+        chosen
+    }
+
+    /// Groups against context encodings (E091): grouping is decided in the
+    /// re-plan, by bytes, before contexts exist, so a group can hold
+    /// contents a context would store smaller. A group is dissolved when
+    /// its members, each at its cheapest (plain or with contexts), cost
+    /// less than the group and its entries; dissolved members stored plain
+    /// become contexts for the groups after them.
+    fn dissolve_groups(
+        &mut self,
+        model: &ReadModel,
+        bases: &mut Bases,
+        used: &mut HashSet<Id>,
+        related: &mut HashSet<Id>,
+    ) -> Result<(), Error> {
+        let mut groups: BTreeMap<Vec<u8>, Vec<Member>> = BTreeMap::new();
+        for id in self.store.ids()? {
+            let stored = self.store.read(&id)?;
+            if let Some((prefix, start, end)) = crate::group::member_span(&stored) {
+                let entry = (id, start, end - start, stored.len());
+                groups.entry(prefix.to_vec()).or_default().push(entry);
+            }
+        }
+        for (prefix, members) in groups {
+            let Some((group, stored, bytes)) = self.group_of(&prefix, &members)? else {
+                continue;
+            };
+            if used.contains(&group) {
+                continue;
+            }
+            // The group itself, deleted if dissolved, is no context here.
+            let mut excluded = related.clone();
+            excluded.insert(group);
+            let entries: usize = members.iter().map(|m| m.3).sum();
+            let grouped = self.cost(&stored, model.reads(&group, bytes.len())) + entries as f64;
+            let (mut alone, mut plan) = (0.0, Vec::new());
+            for &(m, start, len, _) in &members {
+                let member = &bytes[start..start + len];
+                let reads = model.reads(&m, len);
+                let mut encoded = self.encode_cheapest(member, reads);
+                let mut cost = self.cost(&encoded, reads);
+                let mut refs = Vec::new();
+                if !used.contains(&m)
+                    && let Some(c) = self.context_encoding(
+                        &m,
+                        member,
+                        (reads, model.events(&m)),
+                        cost,
+                        bases,
+                        &excluded,
+                    )
+                {
+                    (encoded, cost, refs) = c;
+                }
+                alone += cost;
+                plan.push((m, encoded, refs, member.to_vec()));
+            }
+            if alone >= grouped {
+                continue;
+            }
+            for (m, encoded, refs, member) in plan {
+                self.store.replace(m, &encoded)?;
+                match refs.is_empty() {
+                    true => bases.add(m, member),
+                    false => {
+                        used.extend(refs);
+                        related.insert(m);
+                    }
+                }
+            }
+            self.store.delete(&group)?;
+            related.insert(group); // never a context again
+        }
+        Ok(())
+    }
+
+    /// The group content an id prefix names whose bytes hold every member:
+    /// its id, stored encoding and bytes.
+    fn group_of(
+        &self,
+        prefix: &[u8],
+        members: &[Member],
+    ) -> Result<Option<(Id, Vec<u8>, Vec<u8>)>, Error> {
+        for group in self.store.ids_with_prefix(prefix)? {
+            let stored = self.store.read(&group)?;
+            if !matches!(stored.first(), Some(b'B' | b'W' | b'Z' | b'Y' | b'K')) {
+                continue;
+            }
+            let Ok(bytes) = self.decode_plain(&group, &stored) else {
+                continue;
+            };
+            let holds = |&(m, start, len, _): &Member| {
+                bytes
+                    .get(start..start + len)
+                    .is_some_and(|b| Id::of_content(b) == m)
+            };
+            if Id::of_content(&bytes) == group && members.iter().all(holds) {
+                return Ok(Some((group, stored, bytes)));
+            }
+        }
+        Ok(None)
     }
 
     /// How often each stored content is decoded when every root is read
@@ -563,11 +688,8 @@ impl<S: Store + Sync> Repo<S> {
                 continue;
             }
             let bytes = self.decode_plain(&id, &stored)?;
-            if bytes.len() >= RELATED_MIN && Id::of_content(&bytes) == id {
-                for h in shingles(&bytes) {
-                    bases.index.entry(h).or_default().push(bases.items.len());
-                }
-                bases.items.push((id, bytes));
+            if Id::of_content(&bytes) == id {
+                bases.add(id, bytes);
             }
         }
         Ok(bases)
@@ -886,6 +1008,10 @@ const REPACKED_REF: &str = "meta/repacked";
 /// Smallest content worth a related-content context (E057).
 const RELATED_MIN: usize = 2048;
 
+/// A group member: its id, start and length in the group, and its entry's
+/// stored length.
+type Member = (Id, usize, usize, usize);
+
 /// Candidate contexts for "Q" encodings, indexed by shingle.
 #[derive(Default)]
 struct Bases {
@@ -894,6 +1020,16 @@ struct Bases {
 }
 
 impl Bases {
+    /// Add a candidate, if at least `RELATED_MIN` bytes.
+    fn add(&mut self, id: Id, bytes: Vec<u8>) {
+        if bytes.len() >= RELATED_MIN {
+            for h in shingles(&bytes) {
+                self.index.entry(h).or_default().push(self.items.len());
+            }
+            self.items.push((id, bytes));
+        }
+    }
+
     /// The candidate sharing the most shingles with `bytes` (not `id`
     /// itself, nor any content already encoded against another).
     fn most_related(&self, id: &Id, bytes: &[u8], related: &HashSet<Id>) -> Option<&(Id, Vec<u8>)> {
