@@ -848,7 +848,9 @@ fn measure<T>(runs: usize, mut op: impl FnMut() -> T) -> (T, Cost) {
     PEAK.store(start, Relaxed);
     let (mut out, mut times, mut cpus) = (None, Vec::new(), Vec::new());
     // Fast operations repeat until they have run 300 ms (at most 1,000
-    // times), so a median of many runs damps timer noise (E064).
+    // times). Since E098 the fastest run is taken, not the median: on a
+    // shared machine noise only ever adds time, and medians of identical
+    // work still differed by up to 30% between bench runs.
     let mut i = 0;
     while i < runs.max(1) || (runs > 1 && i < 1000 && times.iter().sum::<f64>() < 300.0) {
         i += 1;
@@ -861,7 +863,7 @@ fn measure<T>(runs: usize, mut op: impl FnMut() -> T) -> (T, Cost) {
     times.sort_by(f64::total_cmp);
     cpus.sort_by(f64::total_cmp);
     let peak = PEAK.load(Relaxed).saturating_sub(start);
-    let (ms, cpu_ms) = (times[times.len() / 2], cpus[cpus.len() / 2]);
+    let (ms, cpu_ms) = (times[0], cpus[0]);
     (out.unwrap(), Cost { ms, cpu_ms, peak })
 }
 
@@ -991,6 +993,9 @@ fn operation_profile(repo: &Repo<MemStore>, snapshots: &[Snapshot], graph: bool)
 /// List prices the score uses (E064; approximate cloud on-demand prices,
 /// late 2026): object storage, one vCPU, and memory.
 const STORAGE_USD_PER_GB_MONTH: f64 = 0.023;
+
+/// Fresh stores ingested and repacked per corpus, the fastest kept (E098).
+const PIPELINE_RUNS: usize = 3;
 const CPU_USD_PER_HOUR: f64 = 0.04;
 const RAM_USD_PER_GB_HOUR: f64 = 0.005;
 
@@ -1337,26 +1342,44 @@ fn main() {
         }
         let snapshots = build();
         let input: usize = snapshots.iter().flatten().map(|(_, b)| b.len()).sum();
-        let mut repo = Repo::new(MemStore::default());
-        repo.read_weight = READ_WEIGHT;
-        let ((), ingest_cost) = measure(1, || {
-            snapshots.iter().for_each(|s| commit(&mut repo, s, graph))
-        });
-        let (ingest, ingest_ms) = (stored(&repo), ingest_cost.ms as u128);
-        propose_programs(&mut repo, &snapshots);
-        propose_quotes(&mut repo, &snapshots);
-        repo.proposed_order = proposed_order();
-        if !graph {
-            // The workload, as the kernel is told it (E065).
-            let files: BTreeMap<Id, &Vec<u8>> = (snapshots.iter().flatten())
-                .map(|(_, b)| (Id::of_content(b), b))
-                .collect();
-            repo.search_rate = SEARCH_RATE;
-            repo.search_sample = grep_queries(&files, 20, SAMPLE_QUERIES);
+        // Ingest and repack run once per store, so they are measured on
+        // `PIPELINE_RUNS` fresh stores and the fastest of each kept (E098);
+        // the stores are identical (the planner is deterministic).
+        let (mut kept, mut ingest) = (None, 0);
+        let fastest = |a: Cost, b: Cost| if b.cpu_ms < a.cpu_ms { b } else { a };
+        for _ in 0..PIPELINE_RUNS {
+            let mut repo = Repo::new(MemStore::default());
+            repo.read_weight = READ_WEIGHT;
+            let ((), ingest_cost) = measure(1, || {
+                snapshots.iter().for_each(|s| commit(&mut repo, s, graph))
+            });
+            ingest = stored(&repo);
+            propose_programs(&mut repo, &snapshots);
+            propose_quotes(&mut repo, &snapshots);
+            repo.proposed_order = proposed_order();
+            if !graph {
+                // The workload, as the kernel is told it (E065).
+                let files: BTreeMap<Id, &Vec<u8>> = (snapshots.iter().flatten())
+                    .map(|(_, b)| (Id::of_content(b), b))
+                    .collect();
+                repo.search_rate = SEARCH_RATE;
+                repo.search_sample = grep_queries(&files, 20, SAMPLE_QUERIES);
+            }
+            let (_, repack_cost) = measure(1, || repo.repack().unwrap());
+            // A daily repack mostly finds the store as the last one left it (E067).
+            let (_, repack_again) = measure(1, || repo.repack().unwrap());
+            kept = Some(match kept {
+                None => (repo, ingest_cost, repack_cost, repack_again),
+                Some((r, i, p, a)) => (
+                    r,
+                    fastest(i, ingest_cost),
+                    fastest(p, repack_cost),
+                    fastest(a, repack_again),
+                ),
+            });
         }
-        let (_, repack_cost) = measure(1, || repo.repack().unwrap());
-        // A daily repack mostly finds the store as the last one left it (E067).
-        let (_, repack_again) = measure(1, || repo.repack().unwrap());
+        let (repo, ingest_cost, repack_cost, repack_again) = kept.unwrap();
+        let ingest_ms = ingest_cost.ms as u128;
         let (repack, repack_ms) = (stored(&repo), repack_cost.ms as u128);
         let exact = match graph {
             // Every version's graph, read back from its commit, is the one stored.
