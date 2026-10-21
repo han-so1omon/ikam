@@ -199,3 +199,7 @@ Three things would make it concrete:
 | two complementary contexts ("M": a content shaped like it plus its words in another format) | built (E084); joint choice of context hubs vs groups open (E085 refuted) | cases one graph -2.1%, multiformat -1.3% |
 | several dictionaries for mixed stores | refuted as tried (E078 larger, E079 two clusters) | one graph still uses one dictionary |
 | repack cost: one dictionary re-planned (E087), codecs skipped when their decode cost alone loses (E088) | built | score 0.58 -> 0.43; repack CPU -60% to -90% |
+| search over shared structure: chunk index (each distinct chunk and seam once, E089), trigram postings per chunk (E094); scans priced in planning | built | score 0.43 -> 0.26; structured search 1.5 -> 0.3 ms, transcripts 0.8 -> 0.4 ms |
+| plans the read weight rules out are not searched for (slices, templates, induced re-plans, E092; fewer re-plans, E090) | built | identical output; ingest CPU -70% to -98% |
+| graph chunks priced by their reads (E093) | built | repo-graph 0.80 -> 0.40 |
+| groups dissolved for context encodings (E091) | refuted for bytes (groups already capture it) | weight 0: -0.13% |
