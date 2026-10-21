@@ -1460,3 +1460,18 @@ Newest last. Format and rules: `README.md`.
   - Score 0.3465 / 0.3595 -> 0.3393 / 0.3466. Run 2 is 0.0001 above E089's better run, so not beyond the spread on both runs.
   - Repack CPU: office 18.7 -> 15.5 s, repo-history 20.4 -> 17.3 s, multiformat 11.6 -> 9.8 s, md 4.0 -> 3.4 s, generated 1.9 -> 1.5 s.
 - Verdict: **kept** (identical output, less CPU).
+
+### E091 groups-vs-contexts (dissolve a group when contexts store its members cheaper)
+- Branch / parent: exp/091-groups-vs-contexts / E090. The joint choice of shared contexts against groups, approved by the user after E085.
+- Hypothesis: E085 failed because grouping is decided in the re-plan, by bytes, before contexts exist, and its reserve heuristic was greedy. Instead, after recompress has given every plain content its cheapest encoding (Q and M included), revisit each group:
+  - price each member at its cheapest alone (plain, or against contexts, excluding the group itself);
+  - dissolve the group if the members cost less than the group plus its entries, read cost included;
+  - dissolved members stored plain become contexts for later groups.
+- Change: `context_encoding` (the Q/M trial factored out of recompress, same behaviour), `dissolve_groups`, `group_of`. A first version let a member take its own group as context, then deleted the group: the graph law test caught it.
+- Result:
+  - Bench (two runs; every corpus exact with a clean fsck; every search exact; **every stored size identical to E090**: under the heavy weight no group is dissolved): score 0.3503 / 0.3598 against 0.3393 / 0.3466, within noise.
+  - `examples/cross.rs` at read weight 0.001: multiformat one store 377,488 -> 370,139 (-1.9%); cases one store 391,496 -> 398,481 (+1.8%).
+  - Instrumented on the cases' PDF store: a group of 35 members (13,343 B stored) was dissolved for +1,035 B, because reading it costs 1.1 MB of decoding per read pass, which outweighs the bytes even at 0.001. So the weight-0.001 numbers include reads. The docs called them "storage only"; corrected in README.
+  - At weight 0 (bytes alone), E091 changes almost nothing: multiformat one store 369,519 -> 369,040, cases identical. At weight 0, one graph is already smaller than the per-type stores: cases 352,338 against 358,181 (-1.6%), multiformat 369,519 against 380,717 (-2.9%).
+- What it shows: for bytes, groups already capture most of what a second context would give, and dissolving them trades bytes for reads.
+- Verdict: **discarded** (neutral on the bench and on bytes). Code on its branch.
