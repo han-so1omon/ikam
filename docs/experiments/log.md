@@ -1496,3 +1496,17 @@ Newest last. Format and rules: `README.md`.
   The bench ran in 20.7 / 20.5 s, against 31.4 / 31.6 s.
 - What it shows: under the heavy workload, most of the planner's search was for plans the cost model could never pick. Pricing them before searching removes that work without changing a byte. At low read weights (archives, `examples/cross.rs`) every candidate is still searched.
 - Verdict: **kept**.
+
+### E093 read-priced-objects (graph chunks priced by their reads)
+- Branch / parent: exp/093-read-priced-objects / E092
+- Hypothesis: repo-graph's cost is 96% graph reads (6.85 ms per read pass against the baseline's 8.84 ms). Instrumented, each graph-chunk read splits into about 20 us decompressing the object frame, 18 us parsing nodes and 2 us hashing. Objects (trees, commits, graph chunks) are encoded by size alone, while content has been priced by its reads since E069. A graph chunk is decoded by every read of its graph, so pricing its encodings by that decode should store hot chunks as they are.
+- Change: `encode_object` chooses a graph chunk's encoding by stored bytes + read weight x decode weight x canonical length:
+  - canonical (stored as is): 0;
+  - raw mode: 1/64;
+  - zstd modes: 1.
+  - Other objects stay chosen by size: the workload does not read them.
+- Result (two runs; tests and clippy clean; every corpus exact with a clean fsck; every search exact): score 0.3221 / 0.3032 -> 0.2943 / 0.3077. Run 2 is not below E092's better run, so **not beyond the spread on both runs**.
+  - repo-graph read 6.85 -> 3.27 ms, cost ratio 0.785 / 0.809 -> **0.399 / 0.399**. Stored bytes 50,013 -> 95,215: chunks stored as they are.
+  - generated and transcripts change by a few hundred bytes (their function-library graphs).
+  - The other corpora's movement in run 2 (synthetic-history 0.70, office 0.52) is on unchanged bytes.
+- Verdict: **kept**. The effect on its target is far beyond noise; the score's spread hides it on one run.
