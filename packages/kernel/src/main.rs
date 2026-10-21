@@ -124,7 +124,7 @@ fn run(store_dir: &str, args: &mut Vec<String>) -> Result<(), String> {
             }
         }
         Some("fsck") => {
-            let failures = repo.fsck().map_err(err)?;
+            let failures = repo.fsck_deep().map_err(err)?;
             for (id, e) in &failures {
                 println!("{id} {e}");
             }

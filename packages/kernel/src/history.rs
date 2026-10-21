@@ -49,17 +49,27 @@ impl<S: Store> Repo<S> {
     }
 
     /// Re-verify every stored object: stored content against its id,
-    /// trees/commits/derivations against their hash, and every derivation by
-    /// evaluating it. Run after upgrading dependencies that reconstruction
-    /// relies on. Returns the failing object ids.
+    /// trees/commits/derivations against their hash, and every derivation a
+    /// read depends on (its output not stored) by evaluating it (E097).
+    /// Returns the failing object ids.
     pub fn fsck(&self) -> Result<Vec<(Id, Error)>, Error> {
+        self.check_store(false)
+    }
+
+    /// `fsck`, also evaluating every derivation whose output is stored. Run
+    /// after upgrading dependencies that reconstruction relies on.
+    pub fn fsck_deep(&self) -> Result<Vec<(Id, Error)>, Error> {
+        self.check_store(true)
+    }
+
+    fn check_store(&self, deep: bool) -> Result<Vec<(Id, Error)>, Error> {
         let mut failures = Vec::new();
         for id in self.store.ids()? {
             let encoded = self.store.read(&id)?;
             let result = match self.decode_plain(&id, &encoded) {
                 Ok(bytes) if Id::of_content(&bytes) == id => Ok(()),
                 Ok(_) => Err(Error::Corrupt(id)),
-                Err(Error::WrongKind(_)) => self.check_object(&id),
+                Err(Error::WrongKind(_)) => self.check_object(&id, deep),
                 Err(e) => Err(e),
             };
             if let Err(e) = result {
@@ -69,8 +79,14 @@ impl<S: Store> Repo<S> {
         Ok(failures)
     }
 
-    fn check_object(&self, id: &Id) -> Result<(), Error> {
-        if let Object::Derivation(d) = self.get(id)? {
+    /// A derivation is re-evaluated only if its output is not stored, or
+    /// `deep` (E097): reads use a stored output first, and fsck hashes it; a
+    /// read through a derivation checks its output anyway. Every record is
+    /// still hash-checked.
+    fn check_object(&self, id: &Id, deep: bool) -> Result<(), Error> {
+        if let Object::Derivation(d) = self.get(id)?
+            && (deep || !self.store.has(&d.output))
+        {
             let out = self.eval(&d.func, &d.args, &mut Cx::default())?;
             if Id::of_content(&out) != d.output {
                 return Err(Error::Corrupt(*id));
