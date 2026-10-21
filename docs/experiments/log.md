@@ -1561,3 +1561,25 @@ Newest last. Format and rules: `README.md`.
   - The score's movement comes from timing noise on unchanged work, much of it on the baseline side (repo-graph baseline read 8.5–11.9 ms across runs; structured baseline search 3.0–4.0 ms).
 - Note: the bench's run-to-run spread (about ±0.02 on the score) now hides per-corpus effects of this size. A longer minimum timing per operation would narrow it, at the cost of bench time (a benchmark change, not made here).
 - Verdict: **kept** (identical output; a large effect on generated; the guarantee change is above).
+
+### E098 min-timing (benchmark change: fastest runs, ingest and repack repeated)
+- Branch / parent: exp/098-min-timing / E097
+- Problem: at score 0.26, the bench's spread (about ±0.02 between two runs) hid per-corpus effects of 10–50% (E093, E097). Much of it came from timings of identical work: repo-graph's baseline read varied 8.5–11.9 ms, structured's baseline search 3.0–4.0 ms. Ingest and repack, a large share of several corpora's cost, were measured once.
+- Change (`examples/bench.rs`):
+  - `measure` takes the fastest run instead of the median. On a shared machine noise only adds time.
+  - Each corpus is ingested and repacked on `PIPELINE_RUNS` = 3 fresh stores, keeping each operation's fastest run. The stores are identical, since the planner is deterministic.
+- Result (three runs each; every corpus exact with a clean fsck; every stored size identical):
+
+  | | median timing (E097) | fastest run only | fastest + 3 pipelines |
+  |---|---|---|---|
+  | score | 0.2710 / 0.2670 | 0.2390 / 0.2473 / 0.2460 | **0.2426 / 0.2397 / 0.2444** (2.0%) |
+  | md | 0.26–0.31 | 0.226–0.276 (22%) | 0.275–0.276 (0%) |
+  | generated | | 0.044–0.055 (23%) | 0.046–0.048 (4%) |
+  | structured | 0.13–0.20 | 0.147–0.169 (15%) | 0.138–0.142 (3%) |
+  | transcripts | 0.43–0.52 | 0.384–0.468 (22%) | 0.392–0.416 (6%) |
+  | multiformat | | 0.151–0.170 (13%) | 0.134–0.141 (5%) |
+  | repo-graph | 0.31–0.43 | 0.402–0.408 (1%) | 0.400–0.408 (2%) |
+
+  Still noisy: office (11%) and invoices (22%; its searches take 0.012 ms). The bench now takes 24 s, against 21 s.
+- Scores before and after E098 are not comparable: fastest runs are lower than medians on both sides.
+- Verdict: **kept** (benchmark change; reference score 0.24).

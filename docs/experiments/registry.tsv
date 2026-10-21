@@ -98,3 +98,4 @@ E094	chunk-trigrams	change	kept	main	cost	search	yes	trigram postings per distin
 E095	ablate-quotes	ablation	reference	main	cost	programs	no	E056 quotes do not pay under cost (transcripts slightly better without)
 E096	ablate-programs	ablation	reference	main	cost	programs	no	unused program facts cost fsck CPU; led to E097
 E097	fsck-load-bearing	change	kept	main	cost	verification,speed	no	fsck evaluates only derivations reads depend on; fsck_deep for upgrades
+E098	min-timing	benchmark	reference	main	cost	benchmark	no	fastest-run timing; ingest/repack on 3 fresh stores; spread 2%
