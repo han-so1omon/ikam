@@ -1510,3 +1510,25 @@ Newest last. Format and rules: `README.md`.
   - generated and transcripts change by a few hundred bytes (their function-library graphs).
   - The other corpora's movement in run 2 (synthetic-history 0.70, office 0.52) is on unchanged bytes.
 - Verdict: **kept**. The effect on its target is far beyond noise; the score's spread hides it on one run.
+
+### E094 chunk-trigrams (trigram postings per distinct chunk)
+- Branch / parent: exp/094-chunk-trigrams / E093
+- Hypothesis: transcripts' cost is 87% search, and its snapshots are cumulative. A word appears in every snapshot after its first use, so the per-file trigram index narrows to many files and each is scanned whole. E089's chunk index scans every distinct chunk. Combining them, trigram postings per distinct chunk would let a query scan only the few chunks holding all its trigrams, plus the seams, read from short stored contexts.
+- Change (`src/search.rs`):
+  - A third index kind (first byte `CHUNK_TRIGRAMS`): the chunk index, plus each trigram's chunk list, plus each seam's context (up to 31 bytes from each side).
+  - A pattern of 3 to 32 bytes scans the candidate chunks (reading only their owners) and every seam context. Longer patterns use the chunk scan.
+  - Exact: a match of up to 32 bytes lies inside one chunk, which then holds all its trigrams, or across one seam, inside that seam's context.
+  - Planning chooses among trigrams, chunks and chunks with trigrams; both chunk kinds keep E089's 25% margin.
+  - The chunk test now checks the new kind too, with patterns of 2–32 bytes straddling every seam.
+- Result (two runs; tests, clippy and fmt clean; every corpus exact with a clean fsck; every search exact): score 0.2943 / 0.3077 -> **0.2659 / 0.2608**. Beyond the spread on both runs.
+
+  | corpus | search CPU per query | index bytes (stored total) | cost ratio |
+  |---|---|---|---|
+  | transcripts | 0.79 -> 0.47 / 0.40 ms | 3,420,300 -> 3,646,238 | 0.83 / 0.74 -> **0.51 / 0.43** |
+  | office | 0.113 -> 0.039 / 0.040 ms | 4,082,673 -> 4,230,763 | 0.43 / 0.52 -> **0.35 / 0.33** |
+  | generated | 0.087 -> 0.031 / 0.033 ms | 715,119 -> 786,932 | 0.22 / 0.24 -> **0.15 / 0.15** |
+  | repo-history | 1.02 -> 0.93 / 0.86 ms | 6,117,398 -> 6,711,935 | 0.17 / 0.12 -> 0.16 / 0.14 |
+  | multiformat | 0.065 -> 0.053 ms | 5,789,679 -> 6,459,599 | 0.12 / 0.15 -> 0.15 / 0.15 |
+
+  The indexes are larger, and the planner chose them because, under the heavy workload, the searches they save cost more than the storage. `examples/cross.rs` sets no search workload and is unaffected.
+- Verdict: **kept**.
