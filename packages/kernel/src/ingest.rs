@@ -86,8 +86,14 @@ impl<S: Store> Repo<S> {
         if depth < MAX_UNPACK_DEPTH {
             candidates.extend(self.container_candidate(bytes, depth)?);
         }
-        candidates.extend(self.slice_candidate(bytes)?);
-        candidates.extend(self.template_candidates(bytes)?);
+        // A slice or template plan rebuilds the whole content, so its read
+        // work is at least its length: when that alone costs more than
+        // storing it plain, the plan cannot win and is not searched for
+        // (E092; the heavy read weight, every content).
+        if self.read_weight * (bytes.len() as f64) < plain.len() as f64 {
+            candidates.extend(self.slice_candidate(bytes)?);
+            candidates.extend(self.template_candidates(bytes)?);
+        }
         let best = candidates
             .into_iter()
             .map(|c| (c.cost as f64 + self.read_weight * c.work as f64, c))

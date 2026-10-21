@@ -1475,3 +1475,24 @@ Newest last. Format and rules: `README.md`.
   - At weight 0 (bytes alone), E091 changes almost nothing: multiformat one store 369,519 -> 369,040, cases identical. At weight 0, one graph is already smaller than the per-type stores: cases 352,338 against 358,181 (-1.6%), multiformat 369,519 against 380,717 (-2.9%).
 - What it shows: for bytes, groups already capture most of what a second context would give, and dissolving them trades bytes for reads.
 - Verdict: **discarded** (neutral on the bench and on bytes). Code on its branch.
+
+### E092 futile-plans (no slice or template search when its read work alone loses)
+- Branch / parent: exp/092-futile-plans / E091's parent (main at c21e308)
+- Hypothesis: under the cost score almost every content ends up stored raw. The bench's stores hold no slice or template plans (concat/fill derivations), only "W", a few "Y"/"Z", and the programs and quote facts. Yet ingest and every re-plan search every content for slices and templates, and one re-plan in three exists only for template induction. A slice or template plan rebuilds the whole content, so its read work is at least the content's length. At read weight w, its cost is at least w x len, and ingest keeps a candidate only if its cost is below the plain encoding's length. When w x len >= the plain length, no such plan can win.
+- Change:
+  - Ingest skips `slice_candidate` and `template_candidates` when `read_weight x len >= plain length`. Container candidates (which expose members as content) and hints (facts) are unchanged.
+  - Repack skips the induced re-plans when `read_weight >= 2`: a plain encoding is at most one byte longer than its content, so no plan can win then.
+  - Both are exact pruning.
+- Result (two runs; tests, clippy and fmt clean; every corpus exact with a clean fsck; every search exact; **every stored size, ingest size and deterministic field identical to E091**): score 0.3503 / 0.3598 -> **0.3221 / 0.3032**. Beyond the spread on both runs.
+
+  | corpus | ingest CPU | repack CPU | cost ratio |
+  |---|---|---|---|
+  | office | 2,116 -> 686 ms | 11.9 -> 4.6 s | 0.49 / 0.75 -> **0.43 / 0.42** |
+  | multiformat | 1,157 -> 292 ms | 8.1 -> 3.1 / 3.5 s | 0.18 / 0.20 -> 0.15 / 0.15 |
+  | repo-history | 670 -> 126 ms | 14.4 -> 8.6 / 8.1 s | 0.15 / 0.14 -> 0.16 / 0.14 |
+  | md | 88 -> 11 ms | 2.7 -> 1.6 s | 0.35 / 0.34 -> 0.30 / 0.18 |
+  | structured | 329 -> 31 ms | 3.3 -> 2.3 s | 0.17 / 0.14 -> 0.15 / 0.14 |
+
+  The bench ran in 20.7 / 20.5 s, against 31.4 / 31.6 s.
+- What it shows: under the heavy workload, most of the planner's search was for plans the cost model could never pick. Pricing them before searching removes that work without changing a byte. At low read weights (archives, `examples/cross.rs`) every candidate is still searched.
+- Verdict: **kept**.

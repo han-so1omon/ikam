@@ -150,11 +150,19 @@ impl<S: Store + Sync> Repo<S> {
         let dicts = train_dictionaries(&stored, DICT_SHORTLIST);
         // Without a dictionary, re-planned without induction only (E090):
         // the plan a graph's reads need, at a quarter of the re-plans.
+        // Induced templates are plans like any other: futile when even a
+        // one-byte content's read work costs more than storing it plain
+        // (E092: a plain encoding is at most one byte longer).
+        let induce: &[bool] = if self.read_weight >= 2.0 {
+            &[false]
+        } else {
+            &[false, true]
+        };
         let mut options: Vec<(Option<&[u8]>, bool)> = (dicts.iter().map(|d| Some(d.as_slice())))
-            .flat_map(|d| [(d, false), (d, true)])
+            .flat_map(|d| induce.iter().map(move |&i| (d, i)))
             .collect();
         options.push((None, false));
-        if dicts.is_empty() {
+        if dicts.is_empty() && induce.len() > 1 {
             options.push((None, true));
         }
         let plans: Vec<Result<Repo<MemStore>, Error>> = std::thread::scope(|scope| {
