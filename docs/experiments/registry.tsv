@@ -101,3 +101,4 @@ E097	fsck-load-bearing	change	kept	main	cost	verification,speed	no	fsck evaluate
 E098	min-timing	benchmark	reference	main	cost	benchmark	no	fastest-run timing; ingest/repack on 3 fresh stores; spread 2%
 E099	north-score	benchmark	reference	main	north	benchmark,cross-source	no	north score (one-graph bytes, archive weight 0.00097) gated beside cost; reference 0.3879; cross.rs folded in
 E100	tables-corpus	benchmark	reference	main	north	benchmark,cross-source	no	north/tables: 24 workbooks as xlsx, csv, json, md, docx, pdf; north reference 0.3154 on three corpora
+E101	byte-accounting	measurement	kept	main	north	benchmark,cross-source	no	roles per north one-store; exact cross-type sharing 0 on tables and multiformat; PDF text 23% of multiformat; tables facts 13%

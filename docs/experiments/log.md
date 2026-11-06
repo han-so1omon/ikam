@@ -1623,3 +1623,36 @@ Newest last. Format and rules: `README.md`.
   - Bench wall time here 356 -> 378 s; the north corpora take 108 s of it.
 - Scores before and after E100 are not compared: the north reference moves from two corpora to three.
 - Verdict: **kept** (benchmark change; north reference 0.3154 on three corpora).
+
+### E101 byte-accounting (measurement: where the one-graph bytes go)
+- Branch / parent: exp/101-byte-accounting / E100 (main at 4e04d23)
+- Question: the one graph is only 3% smaller than the per-type stores (E100). Is that because cross-type sharing is hard, or because shared facts are a small part of the bytes? Like E001 for the hot corpora, account for every stored byte of each north one-store.
+- Change (`examples/bench.rs` only; no kernel change; reported, not scored):
+  - Each north line gets `roles`: `{"role":[bytes,shared,mixed]}` over every object of the one-store, summing to its stored bytes (rounding aside).
+  - Roles: facts (`text:md`, `text:data`, `text:html`, `text:code`, `office:sheet-cells` for worksheet and shared-strings XML, `office:docx-body` for `word/document.xml`, `pdf:text-stream` for content streams with BT/Tf/ET) and format (`pdf:font`, `pdf:cmap`, `pdf:structure`, `office:parts`, `office:zip`, `dictionary`, `functions`, `structure:*` by object kind).
+  - Attribution: every file is walked through its derivations and Q/M contexts. A part takes the role its own bytes show (`sniff`: font magic, `begincmap`, Office XML roots, the zstd dictionary and function library by their refs), else its parent's, so slices inherit. A group's stored bytes are split over its members by each member's size compressed alone (zstd 19). Objects no walk reaches are sniffed alone.
+  - `shared`: bytes of objects reached from files of two or more families, that is information the one graph stores once across types. `mixed`: bytes of groups whose members come from two or more families (different types compressed together).
+- Result (two runs; every corpus exact with a clean fsck; every stored size and north line identical across runs and to E100; north 0.3154 both runs; cost 0.2527 / 0.2544, within E100's 0.2378 / 0.2531):
+
+  | role | tables (134,415) | multiformat (376,398) | cases (391,496) |
+  |---|---:|---:|---:|
+  | facts: text (md, data, html, code) | 3,948 | 48,550 | 163,221 |
+  | facts: office sheet cells, docx body | 7,645 | 27,876 | 40,375 |
+  | facts: pdf text streams | 5,587 | **85,010** | 0 |
+  | facts total | 17,180 (12.8%) | 161,436 (42.9%) | 203,596 (52.0%) |
+  | dictionary | **29,587 (22.0%)** | 30,708 | 11,827 |
+  | pdf fonts | 24,224 (18.0%) | 45,895 | 0 |
+  | derivation records | 21,105 (15.7%) | 23,344 | **69,105 (17.7%)** |
+  | pdf structure | 16,437 | **95,450 (25.4%)** | 18,092 |
+  | pdf cmaps | 5,261 | 11,186 | 0 |
+  | office parts and zip | 18,839 | 7,121 | 76,005 |
+  | trees, commits | 1,784 | 1,258 | 12,870 |
+
+  - **Exact sharing across types is zero on tables and multiformat.** No object is reached from two families. On cases 50,177 B are (md 35,637 and code 14,540: the same text as a markdown and a code file), plus the 11,827 B dictionary.
+  - What sharing there is comes from **mixed groups**: 40% of tables' bytes (53,770) and 27% of multiformat's (102,703) sit in groups whose members span families. That is statistical context, not information stored once.
+  - In cases the "pdf text" row is 0 because its PDFs' content streams are not recognized by the sniff (their text operators differ from LibreOffice's); they count as `pdf:structure`.
+- What it shows:
+  - On **tables**, facts are 13% of the one graph. The records in csv, json and md together take 3,948 B, plus 2,316 B of sheet cells. A perfect record-set derivation across csv, json, md and the sheet (the planned E102) could save at most about 1–3 KB there, against about 100 B per derivation record. That is 0.3–0.7% of the north score, at or under its 0.5% tolerance, before overhead.
+  - On **multiformat**, the same 24 texts are stored four times: md 24,719, html 23,831, docx body 27,876 and **PDF text 85,010** B. The PDF text is the largest single fact role in any north corpus and shares nothing literal with the others (E077: 0% shingle overlap, glyph-coded). Decoding it is the largest cross-type lever measured (E103 in the plan).
+  - Format overhead the baseline also pays dominates tables: the trained dictionary alone is 22% of its one graph, fonts 18%, derivation records 16%.
+- Verdict: **kept** (measurement capability; both scores hold).

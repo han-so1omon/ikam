@@ -1376,7 +1376,7 @@ fn family(name: &str) -> &'static str {
 /// Bytes the kernel stores for `files` in one repository planned at
 /// `ARCHIVE_READ_WEIGHT`, after repack, and the repack's cost. Every file
 /// must read back byte-exact and fsck must be clean (the hard gates).
-fn north_store(name: &str, files: &[&(String, Vec<u8>)]) -> (usize, Cost) {
+fn north_store(name: &str, files: &[&(String, Vec<u8>)]) -> (usize, Cost, Repo<MemStore>) {
     let mut repo = Repo::new(MemStore::default());
     repo.read_weight = ARCHIVE_READ_WEIGHT;
     let entries: Vec<TreeEntry> = files
@@ -1395,7 +1395,7 @@ fn north_store(name: &str, files: &[&(String, Vec<u8>)]) -> (usize, Cost) {
         .all(|(_, b)| repo.read_content(&Id::of_content(b)).unwrap() == *b);
     let fsck = repo.fsck().unwrap().is_empty();
     assert!(exact && fsck, "{name}: verification failed");
-    (stored(&repo), repack)
+    (stored(&repo), repack, repo)
 }
 
 /// The distinct contents of `files`, as the baseline stores them.
@@ -1403,6 +1403,196 @@ fn distinct<'a>(files: &[&'a (String, Vec<u8>)]) -> Vec<&'a Vec<u8>> {
     let unique: BTreeMap<Id, &Vec<u8>> =
         files.iter().map(|(_, b)| (Id::of_content(b), b)).collect();
     unique.into_values().collect()
+}
+
+/// The role of a file in a north corpus, from its name (E101).
+fn file_role(name: &str) -> &'static str {
+    match family(name) {
+        "md" => "text:md",
+        "data" => "text:data",
+        "html" => "text:html",
+        "code" => "text:code",
+        "pdf" => "pdf:structure",
+        "office" => "office:zip",
+        _ => "text:other",
+    }
+}
+
+/// A role a content's own bytes show, if they show one (E101). Slices
+/// rarely do, so they inherit their parent's.
+fn sniff(b: &[u8]) -> Option<&'static str> {
+    let has = |n: &[u8]| b.windows(n.len()).any(|w| w == n);
+    let office = b.starts_with(b"<") && has(b"schemas.openxmlformats.org");
+    let xml = |roots: &[&[u8]]| office && roots.iter().any(|r| has(r));
+    if b.starts_with(&[0x37, 0xA4, 0x30, 0xEC]) {
+        Some("dictionary")
+    } else if b.len() > 12
+        && [&[0, 1, 0, 0][..], b"true", b"OTTO"]
+            .iter()
+            .any(|m| b.starts_with(m))
+    {
+        Some("pdf:font")
+    } else if has(b"begincmap") {
+        Some("pdf:cmap")
+    } else if b.starts_with(b"%PDF") {
+        Some("pdf:structure")
+    } else if b.starts_with(b"PK\x03\x04") {
+        Some("office:zip")
+    } else if xml(&[b"<w:document"]) {
+        Some("office:docx-body")
+    } else if xml(&[b"<worksheet", b"<sst"]) {
+        Some("office:sheet-cells")
+    } else if office {
+        Some("office:parts")
+    } else if has(b" Tf") && has(b"BT") && has(b"ET") {
+        Some("pdf:text-stream")
+    } else {
+        None
+    }
+}
+
+/// E101: where a one-graph store's bytes go. Each stored object is charged
+/// to a role (what its bytes are: facts such as `text:*`, `office:docx-body`,
+/// `office:sheet-cells` and `pdf:text-stream`, or format), found by walking
+/// every file through its derivations and contexts: a part takes the role
+/// its own bytes show, else its parent's. A group's bytes are split over its
+/// members by length; objects no walk reaches are sniffed alone. The second
+/// number is the bytes of objects reached from files of two or more
+/// families: what the one graph stores once across file types. The third is
+/// the bytes of groups whose members come from two or more families: content
+/// of different types compressed together. Reported, not scored.
+/// `{"role":[bytes,shared,mixed],...}`.
+fn roles(repo: &Repo<MemStore>, files: &[&(String, Vec<u8>)]) -> String {
+    let store = repo.store();
+    let encoded: BTreeMap<Id, Vec<u8>> = store
+        .ids()
+        .unwrap()
+        .into_iter()
+        .map(|id| (id, store.read(&id).unwrap()))
+        .collect();
+    let plain = |e: &[u8]| e.first().is_some_and(|t| b"BWZYXRPKSQM".contains(t));
+    let mut shown: BTreeMap<Id, Option<&'static str>> = BTreeMap::new();
+    let mut role: BTreeMap<Id, &'static str> = BTreeMap::new();
+    for (r, name) in [
+        ("dictionary", "meta/zstd-dict"),
+        ("functions", "meta/functions"),
+    ] {
+        if let Some(id) = store.get_ref(name).unwrap() {
+            role.insert(id, r);
+        }
+    }
+    let mut fams: BTreeMap<Id, BTreeSet<&'static str>> = BTreeMap::new();
+    for (name, bytes) in files {
+        let fam = family(name);
+        let mut seen = BTreeSet::new();
+        let mut stack = vec![(Id::of_content(bytes), file_role(name))];
+        while let Some((id, parent)) = stack.pop() {
+            if !seen.insert(id) {
+                continue;
+            }
+            let own = *shown
+                .entry(id)
+                .or_insert_with(|| repo.read_content(&id).ok().and_then(|b| sniff(&b)));
+            let r = *role.entry(id).or_insert(own.unwrap_or(parent));
+            fams.entry(id).or_default().insert(fam);
+            for d in repo.derivations(&id).unwrap() {
+                stack.extend(d.args.iter().map(|a| (a.id(), r)));
+                stack.push((d.func, "functions"));
+            }
+            if let Some(e) = encoded.get(&id).filter(|e| matches!(e[0], b'Q' | b'M')) {
+                let n = if e[0] == b'Q' { 1 } else { 2 };
+                for i in 0..n {
+                    let at = 1 + 32 * i;
+                    stack.push((Id::from_bytes(e[at..at + 32].try_into().unwrap()), r));
+                }
+            }
+        }
+    }
+    // Group members: group prefix -> (member, length).
+    let mut members: BTreeMap<&[u8], Vec<(Id, usize)>> = BTreeMap::new();
+    for (id, e) in &encoded {
+        if e[0] == b'S' {
+            let mut rest = &e[9..];
+            let _start = varint(&mut rest);
+            members
+                .entry(&e[1..9])
+                .or_default()
+                .push((*id, varint(&mut rest)));
+        }
+    }
+    let mut out: BTreeMap<&'static str, (f64, f64, f64)> = BTreeMap::new();
+    let mut structure: BTreeMap<&'static str, f64> = BTreeMap::new();
+    let mut charge = |id: &Id, bytes: f64, mixed: bool| {
+        let r = role.get(id).copied().unwrap_or_else(|| {
+            repo.read_content(id)
+                .ok()
+                .and_then(|b| sniff(&b))
+                .unwrap_or("unreached")
+        });
+        let shared = fams.get(id).is_some_and(|f| f.len() > 1);
+        let e = out.entry(r).or_default();
+        e.0 += bytes;
+        e.1 += if shared { bytes } else { 0.0 };
+        e.2 += if mixed { bytes } else { 0.0 };
+    };
+    for (id, e) in &encoded {
+        let len = e.len() as f64;
+        if !plain(e) {
+            let kind: &'static str = match e[0].to_ascii_uppercase() {
+                b'T' => "structure:trees",
+                b'C' => "structure:commits",
+                b'D' => "structure:derivations",
+                b'L' => "structure:claims",
+                _ => "structure:graphs",
+            };
+            *structure.entry(kind).or_default() += len;
+        } else if let Some(ms) = members.get(&id.as_bytes()[..8]) {
+            // Each member's share: its size compressed alone, a stand-in for
+            // what it would cost outside the group.
+            let alone: Vec<f64> = ms
+                .iter()
+                .map(|(m, _)| {
+                    zstd::bulk::compress(&repo.read_content(m).unwrap(), 19)
+                        .unwrap()
+                        .len() as f64
+                })
+                .collect();
+            let total: f64 = alone.iter().sum();
+            let spanned: BTreeSet<&str> = ms
+                .iter()
+                .flat_map(|(m, _)| fams.get(m).into_iter().flatten().copied())
+                .collect();
+            ms.iter()
+                .zip(&alone)
+                .for_each(|((m, _), a)| charge(m, len * a / total.max(1.0), spanned.len() > 1));
+        } else {
+            charge(id, len, false);
+        }
+    }
+    structure
+        .into_iter()
+        .for_each(|(k, b)| out.entry(k).or_default().0 += b);
+    let parts: Vec<String> = out
+        .iter()
+        .map(|(r, (b, s, m))| format!("\"{r}\":[{},{},{}]", b.round(), s.round(), m.round()))
+        .collect();
+    format!("{{{}}}", parts.join(","))
+}
+
+/// LEB128 varint, as group member entries store their ranges.
+fn varint(b: &mut &[u8]) -> usize {
+    let mut n = 0;
+    for shift in (0..64).step_by(7) {
+        let Some((&byte, rest)) = b.split_first() else {
+            break;
+        };
+        *b = rest;
+        n |= ((byte & 0x7f) as usize) << shift;
+        if byte < 0x80 {
+            break;
+        }
+    }
+    n
 }
 
 /// One north corpus: the kernel and the baseline over every file as one
@@ -1414,13 +1604,14 @@ fn north_run(name: &str, all: &Snapshot, json: bool) -> (usize, usize, usize, us
         .for_each(|f| by_family.entry(family(&f.0)).or_default().push(f));
     let (mut split_k, mut split_b, mut families) = (0, 0, Vec::new());
     for (fam, files) in &by_family {
-        let (k, _) = north_store(name, files);
+        let (k, _, _) = north_store(name, files);
         let b = with_dict(&distinct(files));
         (split_k, split_b) = (split_k + k, split_b + b);
         families.push(format!("\"{fam}\":[{},{k},{b}]", files.len()));
     }
     let refs: Vec<&(String, Vec<u8>)> = all.iter().collect();
-    let (k, repack) = north_store(name, &refs);
+    let (k, repack, repo) = north_store(name, &refs);
+    let roles = roles(&repo, &refs);
     let b = with_dict(&distinct(&refs));
     let input: usize = all.iter().map(|f| f.1.len()).sum();
     let (ratio, share_k, share_b) = (
@@ -1430,7 +1621,7 @@ fn north_run(name: &str, all: &Snapshot, json: bool) -> (usize, usize, usize, us
     );
     if json {
         println!(
-            "{{\"corpus\":\"{name}\",\"files\":{},\"input\":{input},\"kernel\":{k},\"baseline\":{b},\"vs_dict\":{ratio:.4},\"kernel_split\":{split_k},\"baseline_split\":{split_b},\"sharing_kernel\":{share_k:.4},\"sharing_baseline\":{share_b:.4},\"families\":{{{}}},\"repack\":{},\"exact\":true,\"fsck\":true}}",
+            "{{\"corpus\":\"{name}\",\"files\":{},\"input\":{input},\"kernel\":{k},\"baseline\":{b},\"vs_dict\":{ratio:.4},\"kernel_split\":{split_k},\"baseline_split\":{split_b},\"sharing_kernel\":{share_k:.4},\"sharing_baseline\":{share_b:.4},\"families\":{{{}}},\"roles\":{roles},\"repack\":{},\"exact\":true,\"fsck\":true}}",
             all.len(),
             families.join(","),
             cost_json(repack)

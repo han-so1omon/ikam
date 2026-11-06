@@ -47,6 +47,7 @@ The north star is one graph across file types: information shared between a spre
 - **Reported beside it:**
   - `sharing_kernel` and `sharing_baseline`: one store over the sum of the per-family stores. Below 1.0 means one graph pays, the north star in one number.
   - The guard: each one-store repack's CPU time and peak memory, and their totals on `_north`, so a bytes win bought with CPU shows.
+  - `roles` (since E101): the one-store's bytes by role (facts such as `text:*`, `office:docx-body`, `pdf:text-stream`; format such as `pdf:font`, `dictionary`, `structure:derivations`), each with the bytes reached from two or more families (stored once across types) and the bytes in groups spanning families.
 - **Gates:** the same as the cost score. Every file of every store must read back byte-exact and fsck must be clean, or the run aborts.
 - **Keep rule:** a change is kept when one score improves beyond its tolerance on both runs and the other does not get worse beyond its tolerance. The cost score's tolerance is its spread (about 2%); the north score's is `NORTH_TOLERANCE`, a fixed 0.5%. Adding a capability while both hold also counts.
 - `bench -- north` runs only the north corpora; `bench -- north/cases` runs one. With a filter, scores over a subset are not the score.
