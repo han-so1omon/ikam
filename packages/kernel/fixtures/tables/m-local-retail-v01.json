@@ -1,0 +1,14 @@
+[
+  {
+    "Date": "2026-01-18",
+    "Location": "Online",
+    "Incident": "Fulfillment backlog",
+    "Severity": "Med"
+  },
+  {
+    "Date": "2026-02-04",
+    "Location": "East",
+    "Incident": "POS outage 20m",
+    "Severity": "Low"
+  }
+]

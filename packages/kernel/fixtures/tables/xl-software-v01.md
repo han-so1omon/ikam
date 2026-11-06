@@ -1,0 +1,10 @@
+# arr-model-2026
+
+From `xl-software-v01/arr-model-2026.xlsx`, first sheet.
+
+| Customer | MRR | Annual Prepaid? | Churned? | ARR (board) | ARR (finance) |
+|---|---|---|---|---|---|
+| Evergreen Ledger | $620,000 | Y | N | $7,440,000 | $7,440,000 |
+| Harborline Health Services | $410,000 | N | N | $4,920,000 | $4,920,000 |
+| Cascadia Freight Ops | $360,000 | Y | Y | $4,320,000 | $0 |
+|  |  |  | TOTAL | Err:522 | Err:522 |

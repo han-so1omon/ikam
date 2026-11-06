@@ -1608,3 +1608,18 @@ Newest last. Format and rules: `README.md`.
   - Against `cross 0.001` on E098: identical bytes for code, md, pdf, html; data 51,701 -> 50,685 and office 162,273 -> 160,713 per-type, multiformat one graph 377,488 -> 376,398, from the slightly lower weight (0.00097 against 0.001).
   - The north corpora add about 70 s to the bench here (+25%), mostly the five per-type and one one-store repacks per corpus at low weight.
 - Verdict: **kept** (benchmark change; north reference 0.3879 on two corpora; the cost reference is unchanged).
+
+### E100 tables-corpus (benchmark change: the same records as a table and as a document)
+- Branch / parent: exp/100-tables-corpus / E099
+- Problem: the north star names spreadsheets, but neither north corpus has the same facts as a table and as prose. Office files in `north/cases` are different documents from its csv-less data files.
+- Change:
+  - `fixtures/tables`: each of the 24 fixture cases' first workbook by path (24 workbooks, 121,074 B) as xlsx, csv (LibreOffice, first sheet, formulas evaluated), json (the csv as row objects), md (a heading and a pipe table), docx (pandoc) and pdf (LibreOffice): 144 files, 1,181,083 B, committed as generated with `render.py` and `README.md.txt`. One TOTAL row keeps LibreOffice's Err:522 (a circular reference in the source workbook).
+  - `examples/bench.rs`: `north/tables`, and csv in the data family. The cost score does not get this corpus.
+  - Experiments README: the corpus in the north score section.
+- Result (two runs; every corpus exact with a clean fsck; tests pass; every hot stored size and the two older north lines identical to E099):
+  - north/tables: one graph 134,415 B against the baseline's 644,479 (**0.2086**). Sharing: the kernel's one graph is 7.0% smaller than its per-type stores (144,512), the baseline's 4.9% smaller (677,326). By family (kernel / baseline): data 4,524 / 7,307, md 2,805 / 5,819, office 54,128 / 80,216, pdf 83,055 / 583,984.
+  - North score on three corpora: **0.3154** both runs (sharing kernel 0.9706, baseline 1.0130).
+  - Cost score 0.2378 / 0.2531, within the spread of E099's 0.2507 / 0.2390.
+  - Bench wall time here 356 -> 378 s; the north corpora take 108 s of it.
+- Scores before and after E100 are not compared: the north reference moves from two corpora to three.
+- Verdict: **kept** (benchmark change; north reference 0.3154 on three corpora).

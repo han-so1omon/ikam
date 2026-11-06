@@ -1,0 +1,57 @@
+[
+  {
+    "SKU": "JAM-ALM-08",
+    "Item name": "Almond Apricot Jam (8oz)",
+    "Vendor": "Sunfield Preserves",
+    "Category": "Pantry",
+    "Reorder point": 12,
+    "Target stock": 36,
+    "Unit cost": 5.1,
+    "Retail price": 12,
+    "Notes": "Top seller; label changed (old: 'Apricot-Almond')"
+  },
+  {
+    "SKU": "SCE-HOT-05",
+    "Item name": "Smoked Chili Hot Sauce",
+    "Vendor": "Oak Ember Foods",
+    "Category": "Pantry",
+    "Reorder point": 10,
+    "Target stock": 24,
+    "Unit cost": 4.4,
+    "Retail price": 11,
+    "Notes": "Seasonal spike"
+  },
+  {
+    "SKU": "CHO-SEA-01",
+    "Item name": "Sea Salt Dark Chocolate",
+    "Vendor": "Nightjar Chocolate",
+    "Category": "Sweets",
+    "Reorder point": 20,
+    "Target stock": 60,
+    "Unit cost": 2.2,
+    "Retail price": 6.5,
+    "Notes": "Bundle-friendly"
+  },
+  {
+    "SKU": "TEA-JSM-10",
+    "Item name": "Jasmine Pearl Tea (tin)",
+    "Vendor": "Juniper & Co.",
+    "Category": "Beverage",
+    "Reorder point": 6,
+    "Target stock": 18,
+    "Unit cost": 7.8,
+    "Retail price": 18,
+    "Notes": "Slow mover but high margin"
+  },
+  {
+    "SKU": "GFT-CORP-01",
+    "Item name": "Corporate Mini Gift Pack",
+    "Vendor": "(Assembled)",
+    "Category": "Gifts",
+    "Reorder point": 8,
+    "Target stock": 25,
+    "Unit cost": 14.5,
+    "Retail price": 35,
+    "Notes": "COGS varies by contents"
+  }
+]

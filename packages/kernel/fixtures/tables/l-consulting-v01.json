@@ -1,0 +1,18 @@
+[
+  {
+    "Account": "Ironclad Industries",
+    "Codename": "IRONCLAD",
+    "Stage": "Proposal",
+    "Amount": "$650,000",
+    "Probability": "60%",
+    "Weighted": "$390,000"
+  },
+  {
+    "Account": "Lakefront Packaging",
+    "Codename": "FOIL",
+    "Stage": "Discovery",
+    "Amount": "$420,000",
+    "Probability": "35%",
+    "Weighted": "$147,000"
+  }
+]

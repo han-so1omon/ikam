@@ -1,0 +1,11 @@
+# inventory-plan-spring-2026
+
+From `s-local-retail-v01/inventory-plan-spring-2026.xlsx`, first sheet.
+
+| SKU | Item name | Vendor | Category | Reorder point | Target stock | Unit cost | Retail price | Notes |
+|---|---|---|---|---|---|---|---|---|
+| JAM-ALM-08 | Almond Apricot Jam (8oz) | Sunfield Preserves | Pantry | 12 | 36 | 5.1 | 12 | Top seller; label changed (old: 'Apricot-Almond') |
+| SCE-HOT-05 | Smoked Chili Hot Sauce | Oak Ember Foods | Pantry | 10 | 24 | 4.4 | 11 | Seasonal spike |
+| CHO-SEA-01 | Sea Salt Dark Chocolate | Nightjar Chocolate | Sweets | 20 | 60 | 2.2 | 6.5 | Bundle-friendly |
+| TEA-JSM-10 | Jasmine Pearl Tea (tin) | Juniper & Co. | Beverage | 6 | 18 | 7.8 | 18 | Slow mover but high margin |
+| GFT-CORP-01 | Corporate Mini Gift Pack | (Assembled) | Gifts | 8 | 25 | 14.5 | 35 | COGS varies by contents |

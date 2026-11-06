@@ -1,0 +1,8 @@
+# capex-plan-2026
+
+From `l-manufacturing-v01/capex-plan-2026.xlsx`, first sheet.
+
+| Item | Dept | Cost | Justification | Status |
+|---|---|---|---|---|
+| Optical comparator | QA | $45,000 | Reduce measurement ambiguity; supports SOP v4 | Requested |
+| Die maintenance kit | Ops | $12,000 | Reduce setup time + scrap | Approved |

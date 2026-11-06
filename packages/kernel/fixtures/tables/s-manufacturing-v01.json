@@ -1,0 +1,12 @@
+[
+  {
+    "Date": "2026-01-22",
+    "Incident": "Laser cutter down 3h",
+    "Severity": "Med"
+  },
+  {
+    "Date": "2026-02-05",
+    "Incident": "Material late delivery",
+    "Severity": "Low"
+  }
+]

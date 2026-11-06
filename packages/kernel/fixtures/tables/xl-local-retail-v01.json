@@ -1,0 +1,15 @@
+[
+  {
+    "Dept": "Commissary",
+    "Role": "Prep cook",
+    "Count": 6,
+    "Priority": "High"
+  },
+  {
+    "Dept": "Stores",
+    "Role": "Shift lead",
+    "Count": 4,
+    "Priority": "Med",
+    "Notes": "temps counted differently"
+  }
+]

@@ -1,0 +1,31 @@
+[
+  {
+    "Customer": "Evergreen Ledger",
+    "MRR": "$620,000",
+    "Annual Prepaid?": "Y",
+    "Churned?": "N",
+    "ARR (board)": "$7,440,000",
+    "ARR (finance)": "$7,440,000"
+  },
+  {
+    "Customer": "Harborline Health Services",
+    "MRR": "$410,000",
+    "Annual Prepaid?": "N",
+    "Churned?": "N",
+    "ARR (board)": "$4,920,000",
+    "ARR (finance)": "$4,920,000"
+  },
+  {
+    "Customer": "Cascadia Freight Ops",
+    "MRR": "$360,000",
+    "Annual Prepaid?": "Y",
+    "Churned?": "Y",
+    "ARR (board)": "$4,320,000",
+    "ARR (finance)": "$0"
+  },
+  {
+    "Churned?": "TOTAL",
+    "ARR (board)": "Err:522",
+    "ARR (finance)": "Err:522"
+  }
+]

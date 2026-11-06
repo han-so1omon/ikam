@@ -1,0 +1,12 @@
+[
+  {
+    "Metric": "Collections (finance)",
+    "Value": "94.0%",
+    "Definition": "incl catch-up"
+  },
+  {
+    "Metric": "Collections (revcycle)",
+    "Value": "89.0%",
+    "Definition": "excl catch-up"
+  }
+]

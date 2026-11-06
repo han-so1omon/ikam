@@ -1,0 +1,17 @@
+[
+  {
+    "Client": "Cedar St ADU",
+    "Invoice": "INV-1042",
+    "Invoice Date": "2026-02-05",
+    "Amount": "$38,000",
+    "Received Date": "2026-02-12",
+    "Status": "Paid"
+  },
+  {
+    "Client": "Hawthorne Kitchen",
+    "Invoice": "INV-1037",
+    "Invoice Date": "2026-01-28",
+    "Amount": "$22,000",
+    "Status": "Open"
+  }
+]

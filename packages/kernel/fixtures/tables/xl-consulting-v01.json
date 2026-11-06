@@ -1,0 +1,12 @@
+[
+  {
+    "Metric": "Annualized savings",
+    "Value": "$18,400,000",
+    "Definition": "gross (exec deck)"
+  },
+  {
+    "Metric": "Net savings",
+    "Value": "$14,900,000",
+    "Definition": "net (finance model)"
+  }
+]

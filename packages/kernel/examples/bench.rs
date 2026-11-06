@@ -1349,13 +1349,24 @@ fn north_multiformat() -> Snapshot {
     multiformat().concat()
 }
 
+/// The same records in six formats (since E100, `fixtures/tables`): each
+/// fixture case's first workbook as xlsx, csv, json, a markdown table, and
+/// docx and pdf rendered from it. The north star's spreadsheet case: the
+/// same facts as a table and as a document.
+fn north_tables() -> Snapshot {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures/tables");
+    walk(&root, &|p| {
+        p.extension().is_some_and(|e| e != "txt" && e != "py")
+    })
+}
+
 /// The file type a per-type store holds: office formats share one.
 fn family(name: &str) -> &'static str {
     match name.rsplit('.').next().unwrap() {
         "md" => "md",
         "pdf" => "pdf",
         "docx" | "xlsx" | "pptx" => "office",
-        "json" | "jsonl" => "data",
+        "json" | "jsonl" | "csv" => "data",
         "py" => "code",
         "html" => "html",
         _ => "log",
@@ -1632,6 +1643,7 @@ fn main() {
     let north: Vec<NorthCorpus> = vec![
         ("north/cases", north_cases),
         ("north/multiformat", north_multiformat),
+        ("north/tables", north_tables),
     ];
     let (mut log_north, mut log_share_k, mut log_share_b, mut m) = (0.0, 0.0, 0.0, 0);
     let (mut cpu_ms, mut peak, mut north_ms) = (0.0, 0, 0.0);

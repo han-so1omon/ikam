@@ -1,0 +1,17 @@
+[
+  {
+    "Client": "Pine St Retail",
+    "Invoice": "INV-2201",
+    "Invoice Date": "2026-02-04",
+    "Amount": "$185,000",
+    "Received Date": "2026-02-28",
+    "Status": "Paid"
+  },
+  {
+    "Client": "Ballard Office TI",
+    "Invoice": "INV-2192",
+    "Invoice Date": "2026-01-26",
+    "Amount": "$97,000",
+    "Status": "Open"
+  }
+]

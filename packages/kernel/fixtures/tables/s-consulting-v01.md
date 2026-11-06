@@ -1,0 +1,8 @@
+# pipeline
+
+From `s-consulting-v01/pipeline.xlsx`, first sheet.
+
+| Client | Stage | Close | Value | Probability | Weighted |
+|---|---|---|---|---|---|
+| Mesa Dental Group | Proposal | 2026-03-15 | $65,000 | 45% | $29,250 |
+| Skyline Foods | Discovery | 2026-04-10 | $90,000 | 30% | $27,000 |

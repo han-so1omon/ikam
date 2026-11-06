@@ -1,0 +1,16 @@
+[
+  {
+    "Item": "Optical comparator",
+    "Dept": "QA",
+    "Cost": "$45,000",
+    "Justification": "Reduce measurement ambiguity; supports SOP v4",
+    "Status": "Requested"
+  },
+  {
+    "Item": "Die maintenance kit",
+    "Dept": "Ops",
+    "Cost": "$12,000",
+    "Justification": "Reduce setup time + scrap",
+    "Status": "Approved"
+  }
+]

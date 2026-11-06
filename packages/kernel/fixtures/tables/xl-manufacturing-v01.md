@@ -1,0 +1,8 @@
+# capa-tracker-2026
+
+From `xl-manufacturing-v01/capa-tracker-2026.xlsx`, first sheet.
+
+| CAPA | Opened | Owner | Due | Status | Notes |
+|---|---|---|---|---|---|
+| CAPA-102 | 2026-01-05 | Amina | 2026-02-15 | Open | overdue risk |
+| CAPA-099 | 2025-12-12 | Luis | 2026-01-31 | Overdue |  |

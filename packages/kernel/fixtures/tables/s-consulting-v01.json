@@ -1,0 +1,18 @@
+[
+  {
+    "Client": "Mesa Dental Group",
+    "Stage": "Proposal",
+    "Close": "2026-03-15",
+    "Value": "$65,000",
+    "Probability": "45%",
+    "Weighted": "$29,250"
+  },
+  {
+    "Client": "Skyline Foods",
+    "Stage": "Discovery",
+    "Close": "2026-04-10",
+    "Value": "$90,000",
+    "Probability": "30%",
+    "Weighted": "$27,000"
+  }
+]

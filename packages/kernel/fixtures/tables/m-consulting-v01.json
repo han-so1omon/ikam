@@ -1,0 +1,36 @@
+[
+  {
+    "Account": "Evergreen Logistics LLC",
+    "Codename": "PINECONE",
+    "Stage": "At risk",
+    "Probability": "45%",
+    "Est Close": "2025-07-12",
+    "Amount": "$180,000",
+    "Weighted": "$81,000",
+    "Notes": "Delivery started; CRM not updated"
+  },
+  {
+    "Account": "Harborview Medical Services",
+    "Codename": "MARLIN",
+    "Stage": "Discovery",
+    "Probability": "35%",
+    "Est Close": "2025-09-30",
+    "Amount": "$95,000",
+    "Weighted": "$33,250",
+    "Notes": "Waiting on data access"
+  },
+  {
+    "Account": "Cascadia Components",
+    "Codename": "RIVET",
+    "Stage": "Qualified",
+    "Probability": "25%",
+    "Est Close": "2025-10-28",
+    "Amount": "$120,000",
+    "Weighted": "$30,000",
+    "Notes": "Pricing sensitivity"
+  },
+  {
+    "Est Close": "Total weighted",
+    "Weighted": "$144,250"
+  }
+]

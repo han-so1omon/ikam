@@ -1,0 +1,15 @@
+[
+  {
+    "Date": "2026-01-22",
+    "Location": "Online",
+    "Incident": "Shipping delay spike",
+    "Severity": "Med",
+    "Notes": "carrier issue"
+  },
+  {
+    "Date": "2026-02-03",
+    "Location": "Silver Lake",
+    "Incident": "POS outage 30m",
+    "Severity": "Low"
+  }
+]
