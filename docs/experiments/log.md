@@ -1656,3 +1656,20 @@ Newest last. Format and rules: `README.md`.
   - On **multiformat**, the same 24 texts are stored four times: md 24,719, html 23,831, docx body 27,876 and **PDF text 85,010** B. The PDF text is the largest single fact role in any north corpus and shares nothing literal with the others (E077: 0% shingle overlap, glyph-coded). Decoding it is the largest cross-type lever measured (E103 in the plan).
   - Format overhead the baseline also pays dominates tables: the trained dictionary alone is 22% of its one graph, fonts 18%, derivation records 16%.
 - Verdict: **kept** (measurement capability; both scores hold).
+
+### E102 pdf-text-layer (a PDF page's content stream as the text it shows)
+- Branch / parent: exp/102-pdf-text-layer / E101 (exp/101-byte-accounting)
+- Hypothesis: E101 found PDF text streams the largest fact role of multiformat (85,010 B) and sharing nothing literal with the md, html and docx copies of the same texts, because they draw glyph codes of subset fonts (`<0102...>Tj`). Decoding them through each font's `/ToUnicode` CMap and storing the text as one content per PDF lets the existing compression contexts find the same words in the other formats.
+- Change (kernel; `src/pdftext.rs`, `src/container.rs`):
+  - `pdftext::plan` splits a content stream into a skeleton (the stream with each decodable hex string replaced by an escape, its font and its length in characters) and its text (UTF-8, one line per text operator). A string is replaced only if encoding its text back through the CMap (longest match, lowest code first) gives its codes exactly; anything else stays verbatim. `build` inverts it.
+  - `pdftext::content_fonts` relates zlib members to PDF objects (pages' `/Contents`, `/Resources`, `/Font`, fonts' `/ToUnicode`); `plan_zlib_at` now reports each member's offset.
+  - For a `%PDF`, `plan_zlib` replaces the decodable content-stream members by one skeleton member and one text member and a new manifest segment, `2 level skeleton-span text-span fonts cmap-members`. The whole plan is checked to rebuild the file before it is offered; ingest verifies it as before. No new function id and no new derivation record: older manifests read the same.
+  - Tried first and dropped: a builtin `pdf-text/1` derivation per content stream. Ingest never chose it per stream (each alone stored plain was smaller), and forced as a fact it saved 16,610 B on multiformat but added 22 KB of derivation records (six 32-byte ids per stream).
+- Result (two runs; every corpus exact with a clean fsck; tests, clippy and fmt clean; every hot stored size identical to E101):
+  - north/multiformat: 376,398 -> **332,403** B (0.3344 -> **0.2953**). PDF text streams 85,010 -> 31,272 B (skeletons), with the text members counted under `pdf:structure` by E101's sniff (95,450 -> 104,722). md 24,719 -> 19,628 and html 23,831 -> 20,292 now compress against the PDF text. Derivation records 23,344 -> 32,839.
+  - Sharing on multiformat: one graph 6.0% smaller than per-type stores (0.9396), from 2.3% (0.9768).
+  - north/tables: 134,415 -> 135,551 B (0.2086 -> 0.2103, +0.8%). Its 24 PDFs have 5,994 B of text in all: the skeleton and text members and their manifest entries cost about as much as they save (pdf text streams -2,279 B, fonts and zip +4,778 B as groups re-formed).
+  - north/cases: unchanged (391,496); its PDFs' content streams do not decode through this path.
+  - North score **0.3154 -> 0.3035** both runs (-3.8%, tolerance 0.5%). Cost score 0.2504 / 0.2527, within E101's 0.2527 / 0.2544.
+- Verdict: **kept** (north improves beyond tolerance on both runs, cost holds).
+- Next: the text member's role in the accounting (a `pdf:text` role); a per-PDF choice between the layered and plain plans would recover tables' 0.8%.

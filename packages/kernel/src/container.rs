@@ -8,8 +8,13 @@
 //! otherwise its compressed bytes stay in the manifest. The caller still
 //! verifies the whole reconstruction before accepting it.
 //!
-//! Manifest: count:u32 { 0 len:u32 bytes | 1 member:u32 level:u8 }
-//! where level 0-9 is zlib's level at memLevel 8 (zlib's default), and
+//! Manifest: count:u32 { 0 len:u32 bytes | 1 member:u32 level:u8
+//! | 2 level:u8 skeleton:u32 start:u32 len:u32 text:u32 start:u32 len:u32
+//!   fonts:u8 cmap:u32* }
+//! where a `2` segment (E102) is a PDF content stream rebuilt from spans of
+//! a skeleton member and a text member and its fonts' CMap members
+//! (`pdftext.rs`), then deflated at `level`;
+//! and level 0-9 is zlib's level at memLevel 8 (zlib's default), and
 //! 10-19 the same levels at memLevel 9 (E083: LibreOffice writes PDF fonts
 //! so).
 //!
@@ -20,13 +25,14 @@
 //! file unchanged. No file type is named: any bytes holding reproducible
 //! zlib streams are planned the same way.
 
+use std::collections::HashMap;
 use std::io::{Read, Write};
 
 use flate2::Compression;
 use flate2::read::DeflateDecoder;
 use flate2::write::DeflateEncoder;
 
-use crate::Error;
+use crate::{Error, pdftext};
 
 /// Levels to try, most common first (zlib's default is 6), at memLevel 8
 /// and then 9 (`MEM9` added; see the manifest).
@@ -157,7 +163,7 @@ pub fn plan_zip(bytes: &[u8]) -> Option<(Vec<u8>, Vec<Vec<u8>>)> {
     let streams = member_streams(bytes)?
         .into_iter()
         .filter_map(|(start, end, size)| Some((start, end, inflate(&bytes[start..end], size)?)));
-    manifest(bytes, streams)
+    manifest(bytes, streams, None)
 }
 
 /// Smallest inflated stream `plan_zlib` expands: shorter ones gain less
@@ -165,8 +171,141 @@ pub fn plan_zip(bytes: &[u8]) -> Option<(Vec<u8>, Vec<Vec<u8>>)> {
 const MIN_ZLIB: usize = 64;
 
 /// `(manifest, members)` for the zlib streams in `bytes` that re-deflate
-/// exactly, if any.
+/// exactly, if any. In a PDF, page content streams whose text decodes
+/// through their fonts' CMaps become text-layer segments (E102).
 pub fn plan_zlib(bytes: &[u8]) -> Option<(Vec<u8>, Vec<Vec<u8>>)> {
+    let (manifest, members, starts) = plan_zlib_at(bytes)?;
+    if bytes.starts_with(b"%PDF")
+        && let Some(plan) = text_layers(bytes, &manifest, &members, &starts)
+    {
+        return Some(plan);
+    }
+    Some((manifest, members))
+}
+
+/// The plan with the PDF's decodable content streams replaced by one
+/// skeleton member and one text member (`pdftext.rs`), each stream a
+/// segment naming its spans of both and its fonts' CMap members: the text
+/// of every page is one content, like the same document in another
+/// format, and costs no derivation record of its own. `None` if no stream
+/// decodes or the plan does not rebuild `bytes`.
+fn text_layers(
+    bytes: &[u8],
+    manifest: &[u8],
+    members: &[Vec<u8>],
+    starts: &[usize],
+) -> Option<(Vec<u8>, Vec<Vec<u8>>)> {
+    let fonts = pdftext::content_fonts(bytes, starts);
+    let mut parsed: HashMap<usize, Option<pdftext::CMap>> = HashMap::new();
+    for f in fonts.iter().flatten() {
+        parsed
+            .entry(f.1)
+            .or_insert_with(|| pdftext::CMap::parse(&members[f.1]));
+    }
+    let (mut skeleton, mut text) = (Vec::new(), Vec::new());
+    // Per layered member: (skeleton span, text span, CMap members).
+    let mut layers: HashMap<usize, Layer> = HashMap::new();
+    for (k, f) in fonts.iter().enumerate() {
+        let named: Vec<(&[u8], usize, &pdftext::CMap)> = f
+            .iter()
+            .filter_map(|(name, m)| Some((name.as_slice(), *m, parsed[m].as_ref()?)))
+            .collect();
+        let cmaps: Vec<(&[u8], &pdftext::CMap)> = named.iter().map(|(n, _, c)| (*n, *c)).collect();
+        if named.is_empty() || layers.len() >= MAX_LAYERS {
+            continue;
+        }
+        let Some((s, t, used)) = pdftext::plan(&members[k], &cmaps) else {
+            continue;
+        };
+        layers.insert(
+            k,
+            (
+                [skeleton.len(), s.len()],
+                [text.len(), t.len()],
+                used.iter().map(|&u| named[u].1).collect(),
+            ),
+        );
+        skeleton.extend_from_slice(&s);
+        text.extend_from_slice(&t);
+    }
+    if layers.is_empty() {
+        return None;
+    }
+    // Members: the others in order, then the skeleton and the text.
+    let mut renumber = vec![None; members.len()];
+    let mut kept = Vec::new();
+    for (k, m) in members.iter().enumerate() {
+        if !layers.contains_key(&k) {
+            renumber[k] = Some(kept.len() as u32);
+            kept.push(m.clone());
+        }
+    }
+    let (skel_member, text_member) = (kept.len() as u32, kept.len() as u32 + 1);
+    kept.push(skeleton);
+    kept.push(text);
+    let mut m = Cursor(manifest);
+    let count = m.u32()?;
+    let mut out = (count as u32).to_be_bytes().to_vec();
+    for _ in 0..count {
+        match m.take(1)?[0] {
+            0 => {
+                let len = m.u32()?;
+                out.push(0);
+                out.extend_from_slice(&(len as u32).to_be_bytes());
+                out.extend_from_slice(m.take(len)?);
+            }
+            _ => {
+                let member = m.u32()?;
+                let level = m.take(1)?[0];
+                match layers.get(&member) {
+                    None => {
+                        out.push(1);
+                        out.extend_from_slice(&renumber[member]?.to_be_bytes());
+                        out.push(level);
+                    }
+                    Some((s, t, cmaps)) => {
+                        out.extend_from_slice(&[2, level]);
+                        for n in [
+                            skel_member,
+                            s[0] as u32,
+                            s[1] as u32,
+                            text_member,
+                            t[0] as u32,
+                            t[1] as u32,
+                        ] {
+                            out.extend_from_slice(&n.to_be_bytes());
+                        }
+                        out.push(cmaps.len() as u8);
+                        for &c in cmaps {
+                            out.extend_from_slice(&renumber[c]?.to_be_bytes());
+                        }
+                    }
+                }
+            }
+        }
+    }
+    let mut args = vec![out];
+    args.extend(kept);
+    if pack(&args).ok()? != bytes {
+        return None;
+    }
+    let members = args.split_off(1);
+    Some((args.pop()?, members))
+}
+
+/// A layered stream: its skeleton span, text span and CMap members.
+type Layer = ([usize; 2], [usize; 2], Vec<usize>);
+
+/// A zlib plan with each member's stream offset.
+type ZlibPlan = (Vec<u8>, Vec<Vec<u8>>, Vec<usize>);
+
+/// Layered streams per PDF; also bounds a manifest's font counts (u8).
+const MAX_LAYERS: usize = 1 << 20;
+
+/// `plan_zlib`, with the offset in `bytes` of each member's zlib stream
+/// (its header), so a caller can relate members to the file's structure
+/// (E102: PDF objects).
+pub fn plan_zlib_at(bytes: &[u8]) -> Option<ZlibPlan> {
     let mut found = Vec::new();
     let mut i = 0;
     while i + 2 < bytes.len() {
@@ -178,7 +317,9 @@ pub fn plan_zlib(bytes: &[u8]) -> Option<(Vec<u8>, Vec<Vec<u8>>)> {
             None => i += 1,
         }
     }
-    manifest(bytes, found.into_iter())
+    let mut starts = Vec::new();
+    let (manifest, members) = manifest(bytes, found.into_iter(), Some(&mut starts))?;
+    Some((manifest, members, starts))
 }
 
 /// A zlib stream at the start of `b`: the deflate stream's length and its
@@ -235,6 +376,7 @@ fn adler32(data: &[u8]) -> u32 {
 fn manifest(
     bytes: &[u8],
     streams: impl Iterator<Item = (usize, usize, Vec<u8>)>,
+    mut starts: Option<&mut Vec<usize>>,
 ) -> Option<(Vec<u8>, Vec<Vec<u8>>)> {
     let (mut segments, mut members, mut cursor) = (Vec::new(), Vec::new(), 0);
     for (start, end, data) in streams {
@@ -248,6 +390,9 @@ fn manifest(
             level,
         });
         members.push(data);
+        if let Some(starts) = starts.as_deref_mut() {
+            starts.push(start - 2);
+        }
         cursor = end;
     }
     if members.is_empty() {
@@ -278,6 +423,7 @@ pub fn pack(args: &[Vec<u8>]) -> Result<Vec<u8>, Error> {
     let (manifest, members) = args.split_first().ok_or_else(bad)?;
     let mut m = Cursor(manifest);
     let mut out = Vec::new();
+    let mut cmaps: HashMap<usize, pdftext::CMap> = HashMap::new();
     for _ in 0..m.u32().ok_or_else(bad)? {
         match m.take(1).ok_or_else(bad)?[0] {
             0 => {
@@ -291,6 +437,32 @@ pub fn pack(args: &[Vec<u8>]) -> Result<Vec<u8>, Error> {
                     return Err(bad());
                 }
                 out.extend_from_slice(&deflate(member, level));
+            }
+            2 => {
+                let level = m.take(1).ok_or_else(bad)?[0];
+                let mut span = || -> Result<&[u8], Error> {
+                    let member = members.get(m.u32().ok_or_else(bad)?).ok_or_else(bad)?;
+                    let (start, len) = (m.u32().ok_or_else(bad)?, m.u32().ok_or_else(bad)?);
+                    member
+                        .get(start..start.checked_add(len).ok_or_else(bad)?)
+                        .ok_or_else(bad)
+                };
+                let (skeleton, text) = (span()?, span()?);
+                let n = m.take(1).ok_or_else(bad)?[0];
+                let mut fonts = Vec::new();
+                for _ in 0..n {
+                    let k = m.u32().ok_or_else(bad)?;
+                    if let std::collections::hash_map::Entry::Vacant(e) = cmaps.entry(k) {
+                        let cmap = pdftext::CMap::parse(members.get(k).ok_or_else(bad)?);
+                        e.insert(cmap.ok_or_else(bad)?);
+                    }
+                    fonts.push(k);
+                }
+                let fonts: Vec<&pdftext::CMap> = fonts.iter().map(|k| &cmaps[k]).collect();
+                if level > 19 {
+                    return Err(bad());
+                }
+                out.extend_from_slice(&deflate(&pdftext::build(skeleton, text, &fonts)?, level));
             }
             _ => return Err(bad()),
         }

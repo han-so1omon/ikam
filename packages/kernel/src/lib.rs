@@ -19,6 +19,7 @@ mod ingest;
 mod library;
 pub mod matcher;
 mod object;
+mod pdftext;
 mod range;
 mod repack;
 mod repo;

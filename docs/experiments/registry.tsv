@@ -102,3 +102,4 @@ E098	min-timing	benchmark	reference	main	cost	benchmark	no	fastest-run timing; i
 E099	north-score	benchmark	reference	main	north	benchmark,cross-source	no	north score (one-graph bytes, archive weight 0.00097) gated beside cost; reference 0.3879; cross.rs folded in
 E100	tables-corpus	benchmark	reference	main	north	benchmark,cross-source	no	north/tables: 24 workbooks as xlsx, csv, json, md, docx, pdf; north reference 0.3154 on three corpora
 E101	byte-accounting	measurement	kept	main	north	benchmark,cross-source	no	roles per north one-store; exact cross-type sharing 0 on tables and multiformat; PDF text 23% of multiformat; tables facts 13%
+E102	pdf-text-layer	change	kept	main	north	container,cross-source	no	PDF content streams split into skeleton + UTF-8 text (via ToUnicode) as deflate-pack segment 2; multiformat 0.3344 -> 0.2953; north 0.3154 -> 0.3035; tables +0.8%
