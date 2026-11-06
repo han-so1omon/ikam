@@ -36,8 +36,11 @@ Benchmark (deterministic corpora from this repo, verified exact, with zstd basel
 cargo run --release --example bench               # table
 cargo run --release --example bench -- --json     # one JSON line per corpus
 cargo run --release --example bench -- invoices pdf   # a subset while iterating
+cargo run --release --example bench -- north     # only the north corpora (one graph across file types)
 mise run experiment                               # the fixed experiment command (docs/experiments)
 ```
+
+It prints two scores against zstd with a trained dictionary: a cost score (monthly cost under a heavy read workload) and a north score (bytes of mixed-type corpora stored as one graph under an archive workload).
 
 A file's id is the BLAKE3 hash of its content and never depends on how it is stored. Its bytes may be stored (zstd-compressed when smaller), or it may exist only through derivations, for example:
 - `concat` of byte ranges of other content, found by extending matches byte-by-byte

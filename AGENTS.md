@@ -67,7 +67,7 @@ When uncertain, explicitly state unknowns, tradeoffs, and confidence level.
 
 Changes to how `packages/kernel` chunks, deduplicates, compresses or reconstructs data follow `docs/experiments/README.md`:
 - **One fixed command:** `cargo run --release --example bench -- --json`.
-- **One score:** geometric mean of kernel / trained-dictionary bytes.
+- **Two scores, both against zstd with a trained dictionary:** the cost score (monthly cost under a heavy read workload) and the north score (bytes of mixed-type corpora stored as one graph under an archive workload). Keep a change when one improves and the other holds.
 - **Hard gates:** byte-exact reconstruction and a clean fsck.
 - **One hypothesis per branch.**
 - **Every result is recorded** in `docs/experiments/log.md`.

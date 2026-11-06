@@ -15,8 +15,9 @@ use std::path::Path;
 
 use ikam_kernel::{Arg, Edge, FsStore, Kind, Node, Object, Repo, Target, TreeEntry, node_key};
 
-/// The objective the score measures now. Change it with the score.
-const CURRENT: &str = "cost";
+/// The objectives the scores measure now (since E099: the cost score and the
+/// north score). Change them with the scores.
+const CURRENT: [&str; 2] = ["cost", "north"];
 
 /// Mechanisms that matter under the current objective (heavy workload at
 /// list prices: CPU time dominates, storage is nearly free; E064, E069).
@@ -49,7 +50,7 @@ impl Row {
     fn relevance(&self) -> &'static str {
         match () {
             _ if self.kind == "benchmark" => "reference",
-            _ if self.objective == CURRENT => "current",
+            _ if CURRENT.contains(&self.objective.as_str()) => "current",
             _ if !self.weight_sensitive => "holds",
             _ => "stale",
         }
@@ -184,7 +185,10 @@ fn main() {
             .unwrap()
             .len()
     );
-    println!("relevance under the {CURRENT} objective: {counts:?}");
+    println!(
+        "relevance under the {} objectives: {counts:?}",
+        CURRENT.join(" and ")
+    );
     for (action, priority) in [
         ("ablate", "high"),
         ("retest", "high"),

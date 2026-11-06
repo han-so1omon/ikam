@@ -1583,3 +1583,28 @@ Newest last. Format and rules: `README.md`.
   Still noisy: office (11%) and invoices (22%; its searches take 0.012 ms). The bench now takes 24 s, against 21 s.
 - Scores before and after E098 are not comparable: fastest runs are lower than medians on both sides.
 - Verdict: **kept** (benchmark change; reference score 0.24).
+
+### E099 north-score (benchmark change: the one-graph goal becomes a gated second score)
+- Branch / parent: exp/099-north-score / E098
+- Problem: the north star (one graph across file types, shared facts stored once) was measured only by `examples/cross.rs`, which nothing required anyone to run. Under the heavy workload storage is a small share of cost, so the cost score barely sees compression or sharing across types: E095 and E096 found quotes and programs lose under cost but still save bytes, and E081's multiformat store was 5.8 MB of raw files and an index against the baseline's 1.1 MB. `cross` also ran at the heavy weight (48.8) when given no argument, though this README said 0.001.
+- Change:
+  - `examples/bench.rs`: a north score after the cost score, in the same command. Each north corpus is stored as one repository and as one repository per file family, planned at `ARCHIVE_READ_WEIGHT`, repacked, read back byte-exact and fsck-checked (the hard gates), against zstd 3 with a dictionary trained on the same files. `ARCHIVE_READ_WEIGHT` uses `READ_WEIGHT`'s formula (E069) with `ARCHIVE_READS` = 2 decodes a month (an archive workload: ingest once, repack weekly, fsck monthly, two read passes, no search), about 0.00097. One line per north corpus (`north/cases`, `north/multiformat`: bytes, `vs_dict`, per-family split, `sharing_kernel`, `sharing_baseline`, the one-store repack's cost), then `_north` (`north_score`, geometric means of sharing, repack CPU and peak memory totals). `bench -- north` runs only these. The trained-dictionary baseline is factored into `with_dict`, shared by both scores. `_summary` is no longer printed when a filter ran no hot corpus.
+  - `examples/cross.rs` deleted; the bench does its job, and its default-weight bug goes with it.
+  - `examples/registry.rs`: `CURRENT` is `cost` and `north`. `registry.tsv`: E078, E079, E082, E084, E085 and E091, judged with `cross` at 0.001, are retagged objective `north`.
+  - Docs: a "North score" section and the keep rule in this README (keep when either score improves beyond its tolerance on both runs and the other holds: cost about 2%, north 0.5%), AGENTS.md, SKILL.md, the kernel README, the architecture plan.
+- Result (this machine, slower than the one E098 was measured on; E098 rerun once here for comparison; every corpus exact with a clean fsck; every hot stored size identical to E098):
+
+  | | E098 (rerun here) | E099 run 1 | E099 run 2 |
+  |---|---|---|---|
+  | cost score | 0.2511 | 0.2507 | 0.2390 |
+  | north score | | **0.3879** | **0.3879** |
+  | north/cases one graph / baseline | | 391,496 / 870,159 (0.4499) | identical |
+  | north/multiformat one graph / baseline | | 376,398 / 1,125,583 (0.3344) | identical |
+  | sharing kernel / baseline (geometric mean) | | 0.9914 / 1.0452 | identical |
+  | bench wall time | 284 s | 356 s | 355 s |
+
+  - The north lines are identical byte for byte across runs, apart from repack timings (one-store repack CPU 28.4 s cases, 27.1 s multiformat).
+  - Sharing: one graph is 2.3% smaller than the per-type stores on multiformat, 0.6% larger on cases. The baseline's one store is 9.1% larger than its per-type stores on cases and 0.2% on multiformat: one dictionary over mixed types hurts it.
+  - Against `cross 0.001` on E098: identical bytes for code, md, pdf, html; data 51,701 -> 50,685 and office 162,273 -> 160,713 per-type, multiformat one graph 377,488 -> 376,398, from the slightly lower weight (0.00097 against 0.001).
+  - The north corpora add about 70 s to the bench here (+25%), mostly the five per-type and one one-store repacks per corpus at low weight.
+- Verdict: **kept** (benchmark change; north reference 0.3879 on two corpora; the cost reference is unchanged).

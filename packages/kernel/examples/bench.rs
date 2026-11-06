@@ -4,10 +4,15 @@
 //!   cargo run --release --example bench -- --json  # one JSON object per corpus
 //!   cargo run --release --example bench -- pdf md  # only corpora named so
 //!
+//!   cargo run --release --example bench -- north  # only the north corpora
+//!
 //! This is the fixed experiment command (docs/experiments/README.md): vary
-//! code, never flags. The last line is the score: the geometric mean over
-//! corpora of kernel bytes / trained-dictionary baseline bytes (lower is
-//! better). Inexact or fsck-failing results abort the run.
+//! code, never flags. It prints two scores, both lower-is-better geometric
+//! means against zstd with a trained dictionary: the `_summary` line's cost
+//! score (monthly cost under a heavy read workload, since E064) and the
+//! `_north` line's north score (bytes of mixed-type corpora stored as one
+//! graph under a cold workload, since E099). Inexact or fsck-failing results
+//! abort the run.
 //!
 //! Every corpus is built deterministically from this repository. Each run
 //! ingests the corpus snapshot by snapshot (one commit each), repacks, then
@@ -1290,16 +1295,142 @@ fn baselines(snapshots: &[Snapshot]) -> (usize, usize) {
         .iter()
         .map(|b| zstd::bulk::compress(b, 3).unwrap().len())
         .sum();
+    (per_file, with_dict(&files))
+}
+
+/// zstd 3 with a dictionary trained on `files` (distinct contents),
+/// dictionary included: the baseline both scores compare against.
+fn with_dict(files: &[&Vec<u8>]) -> usize {
     let total: usize = files.iter().map(|b| b.len()).sum();
     let dict =
-        zstd::dict::from_samples(&files, (total / 10).clamp(4096, 112_640)).unwrap_or_default();
+        zstd::dict::from_samples(files, (total / 10).clamp(4096, 112_640)).unwrap_or_default();
     let mut c = zstd::bulk::Compressor::with_dictionary(3, &dict).unwrap();
-    let with_dict = dict.len()
+    dict.len()
         + files
             .iter()
             .map(|b| c.compress(b).unwrap().len())
-            .sum::<usize>();
-    (per_file, with_dict)
+            .sum::<usize>()
+}
+
+/// Read passes a month under the archive workload the north score assumes
+/// (E099): ingested once, repacked weekly, verified monthly, read twice, no
+/// search. A workload assumption, not a measurement.
+const ARCHIVE_READS: f64 = 2.0;
+
+/// The planner's `read_weight` for the north corpora (E099): `READ_WEIGHT`'s
+/// formula (E069) with `ARCHIVE_READS` decodes a month in place of the heavy
+/// workload's. About 0.00097 stored bytes per decoded byte.
+const ARCHIVE_READ_WEIGHT: f64 =
+    ARCHIVE_READS * DECODE_SECONDS_PER_BYTE * (CPU_USD_PER_HOUR / 3600.0)
+        / (STORAGE_USD_PER_GB_MONTH / 1e9);
+
+/// How much the north score may worsen before a change counts as worse
+/// (E099). It is deterministic, so this is a fixed margin, not a spread.
+const NORTH_TOLERANCE: f64 = 0.005;
+
+/// The north corpora (since E099, from `examples/cross.rs`, E077): mixed
+/// file types whose shared facts one graph should store once.
+type NorthCorpus = (&'static str, fn() -> Snapshot);
+
+/// The fixture cases' documents (md, pdf, office, data, code, html, logs;
+/// images left out).
+fn north_cases() -> Snapshot {
+    let keep = [
+        "md", "pdf", "docx", "xlsx", "pptx", "json", "jsonl", "log", "py", "html",
+    ];
+    walk(&repo_root().join("tests/fixtures/cases"), &|p| {
+        !p.to_string_lossy().contains("_image_tools")
+            && p.extension().is_some_and(|e| keep.iter().any(|k| e == *k))
+    })
+}
+
+/// The same 24 texts as md, html, docx and pdf (`fixtures/multiformat`).
+fn north_multiformat() -> Snapshot {
+    multiformat().concat()
+}
+
+/// The file type a per-type store holds: office formats share one.
+fn family(name: &str) -> &'static str {
+    match name.rsplit('.').next().unwrap() {
+        "md" => "md",
+        "pdf" => "pdf",
+        "docx" | "xlsx" | "pptx" => "office",
+        "json" | "jsonl" => "data",
+        "py" => "code",
+        "html" => "html",
+        _ => "log",
+    }
+}
+
+/// Bytes the kernel stores for `files` in one repository planned at
+/// `ARCHIVE_READ_WEIGHT`, after repack, and the repack's cost. Every file
+/// must read back byte-exact and fsck must be clean (the hard gates).
+fn north_store(name: &str, files: &[&(String, Vec<u8>)]) -> (usize, Cost) {
+    let mut repo = Repo::new(MemStore::default());
+    repo.read_weight = ARCHIVE_READ_WEIGHT;
+    let entries: Vec<TreeEntry> = files
+        .iter()
+        .map(|(file, bytes)| TreeEntry {
+            name: file.replace('/', "|"),
+            kind: Kind::File,
+            id: repo.put_content(bytes).unwrap().id,
+        })
+        .collect();
+    let tree = repo.put(&Object::tree(entries).unwrap()).unwrap();
+    repo.commit("main", tree, "").unwrap();
+    let (_, repack) = measure(1, || repo.repack().unwrap());
+    let exact = files
+        .iter()
+        .all(|(_, b)| repo.read_content(&Id::of_content(b)).unwrap() == *b);
+    let fsck = repo.fsck().unwrap().is_empty();
+    assert!(exact && fsck, "{name}: verification failed");
+    (stored(&repo), repack)
+}
+
+/// The distinct contents of `files`, as the baseline stores them.
+fn distinct<'a>(files: &[&'a (String, Vec<u8>)]) -> Vec<&'a Vec<u8>> {
+    let unique: BTreeMap<Id, &Vec<u8>> =
+        files.iter().map(|(_, b)| (Id::of_content(b), b)).collect();
+    unique.into_values().collect()
+}
+
+/// One north corpus: the kernel and the baseline over every file as one
+/// store, and as one store per `family`. Returns (kernel one store, baseline
+/// one store, kernel per-type sum, baseline per-type sum, one-store repack).
+fn north_run(name: &str, all: &Snapshot, json: bool) -> (usize, usize, usize, usize, Cost) {
+    let mut by_family: BTreeMap<&str, Vec<&(String, Vec<u8>)>> = BTreeMap::new();
+    all.iter()
+        .for_each(|f| by_family.entry(family(&f.0)).or_default().push(f));
+    let (mut split_k, mut split_b, mut families) = (0, 0, Vec::new());
+    for (fam, files) in &by_family {
+        let (k, _) = north_store(name, files);
+        let b = with_dict(&distinct(files));
+        (split_k, split_b) = (split_k + k, split_b + b);
+        families.push(format!("\"{fam}\":[{},{k},{b}]", files.len()));
+    }
+    let refs: Vec<&(String, Vec<u8>)> = all.iter().collect();
+    let (k, repack) = north_store(name, &refs);
+    let b = with_dict(&distinct(&refs));
+    let input: usize = all.iter().map(|f| f.1.len()).sum();
+    let (ratio, share_k, share_b) = (
+        k as f64 / b as f64,
+        k as f64 / split_k as f64,
+        b as f64 / split_b as f64,
+    );
+    if json {
+        println!(
+            "{{\"corpus\":\"{name}\",\"files\":{},\"input\":{input},\"kernel\":{k},\"baseline\":{b},\"vs_dict\":{ratio:.4},\"kernel_split\":{split_k},\"baseline_split\":{split_b},\"sharing_kernel\":{share_k:.4},\"sharing_baseline\":{share_b:.4},\"families\":{{{}}},\"repack\":{},\"exact\":true,\"fsck\":true}}",
+            all.len(),
+            families.join(","),
+            cost_json(repack)
+        );
+    } else {
+        println!(
+            "{name:<18} input={input:>9} kernel={k:>8} zstd+dict={b:>8}  vs_dict={ratio:.3}  sharing kernel={share_k:.3} baseline={share_b:.3}  repack {:.0} ms  exact=true fsck=true",
+            repack.ms
+        );
+    }
+    (k, b, split_k, split_b, repack)
 }
 
 fn main() {
@@ -1483,13 +1614,51 @@ fn main() {
     let proxy_score = (log_ratio / n.max(1) as f64).exp();
     let read_score = (log_read / n.max(1) as f64).exp();
     let bytes_score = (log_bytes / n.max(1) as f64).exp();
-    if json {
+    if n > 0 && json {
         println!(
             "{{\"corpus\":\"_summary\",\"corpora\":{n},\"score\":{score:.4},\"proxy_score\":{proxy_score:.4},\"read_score\":{read_score:.4},\"bytes_score\":{bytes_score:.4},\"total_ms\":{total_ms}}}"
         );
-    } else {
+    } else if n > 0 {
         println!(
             "score (geometric mean of monthly cost / baseline's, heavy workload) = {score:.4}; proxies: with search = {proxy_score:.4}, without = {read_score:.4}, bytes only = {bytes_score:.4}; over {n} corpora, {total_ms} ms"
+        );
+    }
+
+    // The north score (since E099): each north corpus stored as one graph
+    // under the archive workload, against the baseline over the same files.
+    // Bytes only, so deterministic. `sharing` is one store over the sum of
+    // per-type stores (below 1.0: one graph pays); the guard is the one-store
+    // repacks' CPU time and peak memory, so a bytes win bought with CPU shows.
+    let north: Vec<NorthCorpus> = vec![
+        ("north/cases", north_cases),
+        ("north/multiformat", north_multiformat),
+    ];
+    let (mut log_north, mut log_share_k, mut log_share_b, mut m) = (0.0, 0.0, 0.0, 0);
+    let (mut cpu_ms, mut peak, mut north_ms) = (0.0, 0, 0.0);
+    for (name, build) in north {
+        if !only.is_empty() && !only.iter().any(|o| *o == name || *o == "north") {
+            continue;
+        }
+        let started = Instant::now();
+        let (k, b, split_k, split_b, repack) = north_run(name, &build(), json);
+        log_north += (k as f64 / b as f64).ln();
+        log_share_k += (k as f64 / split_k as f64).ln();
+        log_share_b += (b as f64 / split_b as f64).ln();
+        (cpu_ms, peak, m) = (cpu_ms + repack.cpu_ms, peak.max(repack.peak), m + 1);
+        north_ms += started.elapsed().as_secs_f64() * 1000.0;
+    }
+    if m == 0 {
+        return;
+    }
+    let mean = |log: f64| (log / m as f64).exp();
+    let (north_score, share_k, share_b) = (mean(log_north), mean(log_share_k), mean(log_share_b));
+    if json {
+        println!(
+            "{{\"corpus\":\"_north\",\"corpora\":{m},\"north_score\":{north_score:.4},\"sharing_kernel\":{share_k:.4},\"sharing_baseline\":{share_b:.4},\"read_weight\":{ARCHIVE_READ_WEIGHT:.6},\"tolerance\":{NORTH_TOLERANCE},\"repack_cpu_ms\":{cpu_ms:.0},\"repack_peak\":{peak},\"total_ms\":{north_ms:.0}}}"
+        );
+    } else {
+        println!(
+            "north score (geometric mean of one-graph bytes / baseline's, archive workload) = {north_score:.4}; sharing: kernel {share_k:.4}, baseline {share_b:.4}; repack {cpu_ms:.0} ms CPU, peak {peak} B; over {m} corpora, {north_ms:.0} ms"
         );
     }
 }

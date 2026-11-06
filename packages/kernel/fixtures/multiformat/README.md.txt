@@ -4,4 +4,5 @@ rendered to:
   docx: pandoc 3.1.3, `pandoc X.md -o X.docx`
   pdf:  LibreOffice 24.2.7.2, `soffice --headless --convert-to pdf X.docx`
 Committed as generated, so the corpus does not depend on tool versions.
-Used by examples/cross.rs (E077).
+Used by examples/bench.rs: the multiformat corpus (E081) and north/multiformat
+(E099; examples/cross.rs before, E077).

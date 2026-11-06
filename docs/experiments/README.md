@@ -5,11 +5,11 @@ How we improve the kernel: one fixed command, one score, hard gates, one hypothe
 ## The contract
 
 - **Run command (fixed, identical on every experiment):** `cd packages/kernel && cargo run --release --example bench -- --json`, also available as `mise run experiment`.
-  - It prints one JSON line per corpus, then a `_summary` line.
+  - It prints one JSON line per corpus, then a `_summary` line, then one line per north corpus (`north/...`) and a `_north` line.
   - Never pass extra flags or environment variables to vary behaviour. Change committed code instead.
 - **Benchmark changes** (corpus or how it is committed) are their own log entries that re-measure the current kernel, and scores across them are not compared. Since E009 snapshots are committed as nested trees; since E012 there are 7 corpora, including a versioned graph (`repo-graph`); E021 added `generated` (8) and E040 `structured` (9: CSV, NDJSON and JSON exports of the repository's history), and E055 `transcripts` (10: a coding agent's JSONL session log quoting the kernel's own sources, snapshotted as it grows). E081 added `multiformat` (11: the same 24 texts as md, html, docx and pdf, stored as **one** graph).
-- **North-star measurement (since E077, reported beside the score):** `cargo run --release --example cross [read_weight]` stores the fixture cases' documents and `fixtures/multiformat` both as one graph and as one store per file type, at read weight 0.001 unless given. That weight still prices reads a little: decoding a group up to each member can outweigh a kilobyte (E091). `cross 0` prices bytes alone. It reports the kernel's and the baseline's bytes. Under the heavy workload, storage is a small share of cost, so the score barely sees compression or sharing across file types. This measurement does.
-- **Score:** the `_summary.score`. Since E064 it is the geometric mean over corpora of the kernel's **monthly cost** over the baseline's (zstd + trained dictionary), under a stated workload at list prices:
+- **Two scores (since E099):** the command prints a cost score (`_summary.score`) and a north score (`_north.north_score`). Both are lower-is-better geometric means against zstd with a trained dictionary, and both are gated. See "North score" below.
+- **Cost score:** the `_summary.score`. Since E064 it is the geometric mean over corpora of the kernel's **monthly cost** over the baseline's (zstd + trained dictionary), under a stated workload at list prices:
   - `cost = stored bytes x storage price + sum over operations (times per month x (CPU time x CPU price + peak memory x wall time x memory price))`.
   - Prices (`examples/bench.rs`): storage $0.023 per GB-month, CPU $0.04 per vCPU-hour, memory $0.005 per GB-hour (approximate cloud on-demand list prices).
   - Workload `MONTHLY` ("heavy", per corpus per month):
@@ -26,7 +26,7 @@ How we improve the kernel: one fixed command, one score, hard gates, one hypothe
   - Per corpus: `vs_baseline_cost`, with each side's cost by part under `ops.kernel_usd` and `ops.baseline_usd`.
   - The planner is given the exchange rate the score implies (E069). `read_weight = (1,000 + 100,000 decodes per month) x 1 ns per decoded byte x the CPU price / the storage price`, about 49 stored bytes per decoded byte. Decode cost counts zstd bytes at 1, bytes read as stored at 1/8 (BLAKE3 verification 0.25 ns/B against zstd's 2.2), bytes stored with a CRC-32 ("W", E074) at 1/64, and the other codecs by their measured weights.
   - **Timing noise:** repeated operations run at least 5 times and at least 300 ms. Since E098 the *fastest* run is used (noise only adds time), and ingest and repack, which run once per store, are measured on 3 fresh stores with the fastest kept. Three runs then agree within about 2% overall and 0–6% on most corpora (office about 11%; invoices' 0.012 ms searches about 20%), but never byte-for-byte.
-  - A change is kept only if the score improves by more than the spread of two runs on both runs. Sizes and the deterministic proxies below must still be identical across runs.
+  - Its spread between runs is about 2% (E098). Sizes and the deterministic proxies below must be identical across runs.
   - `proxy_score` (E062: bytes + 0.001 x (decoded bytes + 100 x search)), `read_score` (E034–E061) and `bytes_score` (before E034) are deterministic and still reported. Scores across E034, E062 and E064 are not comparable.
   - Lower is better; below 1.0 means the kernel beats a strong conventional baseline.
   - Every corpus weighs the same, whatever its size.
@@ -35,6 +35,22 @@ How we improve the kernel: one fixed command, one score, hard gates, one hypothe
   - Sizes are deterministic and reproduce exactly. Times are noisy.
   - A change that worsens time by more than 2× must say so in its result.
 - **Tunables live in code** (constants such as `DEFAULT_READ_WEIGHT`, `GAP_DIFF`, `STAR_CANDIDATES`, dictionary sizing, the zstd levels `MEASURE_LEVEL` and `STORE_LEVEL`). An experiment edits them on its branch.
+
+
+## North score (since E099)
+
+The north star is one graph across file types: information shared between a spreadsheet, a report and its PDF should be stored once. Under the heavy workload storage is a small share of cost, so the cost score barely sees compression or sharing across types (E081, E095, E096). The north score measures it, in the same command.
+
+- **Definition:** for each north corpus, the kernel stores every file as **one** repository, planned at the archive read weight, then repacks. `north_score` is the geometric mean over north corpora of those stored bytes over the baseline's for the same files as one store (file dedup, then zstd 3 with a dictionary trained on them, dictionary included). Bytes only, so it is deterministic: two runs must print identical north lines.
+- **Corpora:** `north/cases` (the fixture cases' documents: md, pdf, office, json, code, html; images left out) and `north/multiformat` (the same 24 texts as md, html, docx and pdf). Each line also reports every file family stored on its own.
+- **Archive weight:** `ARCHIVE_READ_WEIGHT` in `examples/bench.rs`, from `READ_WEIGHT`'s formula (E069) with a cold workload: ingest once, repack weekly, fsck monthly, `ARCHIVE_READS` = 2 read passes a month, no search. That gives about 0.00097 stored bytes per decoded byte. Weight 0 is not used, because it lets a plan take any amount of decode work for a byte. To sweep the weight, an experiment edits `ARCHIVE_READS` on its branch.
+- **Reported beside it:**
+  - `sharing_kernel` and `sharing_baseline`: one store over the sum of the per-family stores. Below 1.0 means one graph pays, the north star in one number.
+  - The guard: each one-store repack's CPU time and peak memory, and their totals on `_north`, so a bytes win bought with CPU shows.
+- **Gates:** the same as the cost score. Every file of every store must read back byte-exact and fsck must be clean, or the run aborts.
+- **Keep rule:** a change is kept when one score improves beyond its tolerance on both runs and the other does not get worse beyond its tolerance. The cost score's tolerance is its spread (about 2%); the north score's is `NORTH_TOLERANCE`, a fixed 0.5%. Adding a capability while both hold also counts.
+- `bench -- north` runs only the north corpora; `bench -- north/cases` runs one. With a filter, scores over a subset are not the score.
+- Before E099 this was `examples/cross.rs` (E077), reported but never gated, whose default weight was the heavy workload's 48.8 despite this README saying 0.001. Verdicts measured with it (E078, E079, E082, E084, E085, E091) are tagged objective `north` in the registry.
 
 ## The loop
 
@@ -48,13 +64,13 @@ How we improve the kernel: one fixed command, one score, hard gates, one hypothe
    - For an external proposer (embedding order, LLM output, codebook), also run the swap test (E051). Rerun with the proposal removed, and with it shuffled. If every size is unchanged, the proposer carries no information for this corpus, whatever it costs to produce.
 6. **Record** a result entry in `docs/experiments/log.md` (format below), add or update its row in `docs/experiments/registry.tsv` (see "Relevance"), and update the research note's hypothesis status: confirmed, refuted or not applicable.
 7. **Keep or discard.**
-   - A change is kept only if the score improves, or holds while adding a capability.
+   - A change is kept when either score improves beyond its tolerance on both runs and the other holds within its tolerance (cost about 2%, north 0.5%), or when both hold while it adds a capability.
    - Kept changes merge into the working branch.
    - Discarded ones stay recorded: a refuted hypothesis is a result.
 
 ## Relevance (since E069)
 
-The score has changed meaning three times: bytes only (E000–E033), bytes plus reads (E034–E061), a search proxy (E062–E063), and monthly cost (E064 on). A verdict reached under one objective may not hold under another. `registry.tsv` records, for every experiment:
+The score has changed meaning three times: bytes only (E000–E033), bytes plus reads (E034–E061), a search proxy (E062–E063), and monthly cost (E064 on). Since E099 there are two current objectives: `cost` and `north` (one-graph bytes under the archive workload). A verdict reached under one objective may not hold under another. `registry.tsv` records, for every experiment:
 - its kind and verdict;
 - where it is recorded (`main`, or the branch holding its only log entry);
 - the objective it was measured under;
@@ -71,7 +87,7 @@ The registry is also stored in IKAM itself: `cargo run --release --example regis
 Workflow:
 - Every new experiment adds a row.
 - A rerun updates the row's `objective` (and its verdict, if it changed) and adds a log entry that names the original.
-- When the score's objective changes, set `CURRENT` (and `WEIGHTY`) in `examples/registry.rs`.
+- When a score's objective changes, update `CURRENT` (and `WEIGHTY`) in `examples/registry.rs`.
 
 ## Result entry format (`log.md`)
 
@@ -80,7 +96,7 @@ Workflow:
 - Branch / parent: exp/<nnn>-<slug> / E<parent>
 - Hypothesis: <one sentence> (source: <paper id or measurement>)
 - Change: <files and what changed>
-- Result: score <old> -> <new>; per corpus vs_dict: md a->b, pdf ..., office ..., invoices ..., synthetic ..., repo ...; time <total_ms>
+- Result: score <old> -> <new>; north score <old> -> <new>; per corpus vs_dict: md a->b, pdf ..., office ..., invoices ..., synthetic ..., repo ...; time <total_ms>
 - Verdict: kept | discarded | inconclusive, and why
 ```
 
