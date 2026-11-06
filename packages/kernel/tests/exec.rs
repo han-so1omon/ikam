@@ -132,7 +132,8 @@ fn semantic_dedup_records_a_verified_function_application() {
     assert_eq!(put.id, Id::of_content(&y));
     assert_eq!(
         repo.bytes_written - before,
-        1 + 32 + 32 + 4 + 33,
+        // Short record (E104): tag, mode, output, short WASM id, count, short arg.
+        2 + 32 + (1 + 8) + 1 + (1 + 8),
         "one derivation record"
     );
     assert_eq!(repo.read_content(&put.id).unwrap(), y);

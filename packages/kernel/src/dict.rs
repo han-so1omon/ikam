@@ -446,9 +446,13 @@ impl<S: Store> Repo<S> {
         let Some((&tag, rest)) = canonical.split_first() else {
             return canonical.to_vec();
         };
-        let short = (tag == b'T')
-            .then(|| self.abbreviate(rest).ok().flatten())
-            .flatten();
+        let short = match tag {
+            b'T' => self.abbreviate(rest).ok().flatten(),
+            b'D' => crate::abbrev::abbreviate_derivation(rest, &|p| self.ids_with_prefix(p))
+                .ok()
+                .flatten(),
+            _ => None,
+        };
         // A graph chunk is decoded by every read of its graph (once per read
         // pass): its encodings are priced by that decoding too, as content
         // is (E093). Other objects are not read by the workload: by size.
@@ -484,13 +488,25 @@ impl<S: Store> Repo<S> {
     /// unchanged. Unverified (callers check the result against its id),
     /// except that a dictionary is accepted only if its output does.
     pub(crate) fn decode_object(&self, id: &Id, encoded: Vec<u8>) -> Result<Vec<u8>, Error> {
+        self.decode_object_with(id, encoded, &|p| self.ids_with_prefix(p))
+    }
+
+    /// `decode_object`, resolving a derivation record's short ids with
+    /// `resolve` (the ledger is built with the outputs read so far).
+    pub(crate) fn decode_object_with(
+        &self,
+        id: &Id,
+        encoded: Vec<u8>,
+        resolve: crate::abbrev::Resolve,
+    ) -> Result<Vec<u8>, Error> {
         let (Some(tag), [t, mode, z @ ..]) = (object_tag(&encoded), encoded.as_slice()) else {
             return Ok(encoded);
         };
         // Canonical encoding from a decompressed body.
         let finish = |rest: Vec<u8>| -> Result<Vec<u8>, Error> {
-            let rest = match mode & ABBREVIATED {
-                0 => rest,
+            let rest = match (mode & ABBREVIATED, tag) {
+                (0, _) => rest,
+                (_, b'D') => crate::abbrev::expand_derivation(id, &rest, resolve)?,
                 _ => self.expand(id, &rest)?,
             };
             Ok([&[tag][..], &rest].concat())
@@ -509,6 +525,24 @@ impl<S: Store> Repo<S> {
                 None => Ok(encoded),
             },
         }
+    }
+
+    /// The output a stored derivation record names, without resolving its
+    /// short ids: it comes first in both forms (`abbrev.rs`).
+    pub(crate) fn derivation_output(&self, id: &Id, encoded: &[u8]) -> Option<Id> {
+        let body = match encoded {
+            [b'D', rest @ ..] => rest.to_vec(),
+            [b'd', mode, z @ ..] => match mode & !ABBREVIATED {
+                0 => unzstd_frame(z, &[])?,
+                1 => self
+                    .unzstd_with_dict(id, encoded, 2, usize::MAX, &|rest| rest.len() >= 32)
+                    .ok()?,
+                RAW => z.to_vec(),
+                _ => return None,
+            },
+            _ => return None,
+        };
+        Some(Id::from_bytes(body.get(..32)?.try_into().ok()?))
     }
 
     /// Read a stored object's canonical encoding (see `decode_object`).

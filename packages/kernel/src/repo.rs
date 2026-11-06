@@ -128,11 +128,34 @@ impl<S: Store> Repo<S> {
             return Ok(ledger);
         }
         let mut ledger = Ledger::default();
+        // Records' outputs first: short records resolve their arguments
+        // against stored ids and these (E104, `abbrev.rs`).
+        let mut records = Vec::new();
+        let mut outputs = std::collections::BTreeSet::new();
         for id in self.store.ids()? {
-            if object_tag(&self.store.read(&id)?) != Some(b'D') {
+            let encoded = self.store.read(&id)?;
+            if object_tag(&encoded) != Some(b'D') {
                 continue;
             }
-            let encoded = self.read_object(&id)?;
+            outputs.extend(self.derivation_output(&id, &encoded));
+            records.push((id, encoded));
+        }
+        let resolve = |prefix: &[u8]| -> Result<Vec<Id>, Error> {
+            let mut out = self.store.ids_with_prefix(prefix)?;
+            let start =
+                Id::from_bytes(std::array::from_fn(|i| prefix.get(i).copied().unwrap_or(0)));
+            for id in outputs
+                .range(start..)
+                .take_while(|id| id.as_bytes().starts_with(prefix))
+            {
+                if !out.contains(id) {
+                    out.push(*id);
+                }
+            }
+            Ok(out)
+        };
+        for (id, stored) in records {
+            let encoded = self.decode_object_with(&id, stored, &resolve)?;
             if Id::of(&encoded) == id
                 && let Object::Derivation(d) = Object::decode(&encoded)?
             {

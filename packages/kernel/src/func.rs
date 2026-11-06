@@ -24,6 +24,21 @@ pub fn fill() -> Id {
     builtin("fill/1")
 }
 
+/// Builtins by index, for short derivation records (`abbrev.rs`). Stored
+/// records depend on this order: only append.
+const BUILTINS: [&str; 3] = ["concat/1", "deflate-pack/1", "fill/1"];
+
+pub(crate) fn builtin_index(func: &Id) -> Option<u8> {
+    BUILTINS
+        .iter()
+        .position(|n| builtin(n) == *func)
+        .map(|k| k as u8)
+}
+
+pub(crate) fn builtin_at(k: u8) -> Option<Id> {
+    BUILTINS.get(usize::from(k)).map(|n| builtin(n))
+}
+
 /// Storage plans: derivations ingest and repack choose and may replace.
 /// Every other derivation is a fact that repack preserves.
 pub fn is_plan(func: &Id) -> bool {

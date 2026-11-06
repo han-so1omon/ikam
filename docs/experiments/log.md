@@ -1673,3 +1673,20 @@ Newest last. Format and rules: `README.md`.
   - North score **0.3154 -> 0.3035** both runs (-3.8%, tolerance 0.5%). Cost score 0.2504 / 0.2527, within E101's 0.2527 / 0.2544.
 - Verdict: **kept** (north improves beyond tolerance on both runs, cost holds).
 - Next: the text member's role in the accounting (a `pdf:text` role); a per-PDF choice between the layered and plain plans would recover tables' 0.8%.
+
+### E104 short-derivation-ids (derivation records with abbreviated ids)
+- Branch / parent: exp/104-short-derivation-ids / E102 (main at 05628e2)
+- Hypothesis: derivation records are 16% of tables' one graph, 10% of multiformat's and 18% of cases' (E101), and nearly all of a record is 32-byte ids that do not compress (E103: 102 B for a one-argument record). Trees already store resolvable ids as 8-byte prefixes (`abbrev.rs`). Doing the same for records shrinks every one.
+- Change (kernel; `src/abbrev.rs`, `src/dict.rs`, `src/repo.rs`, `src/func.rs`):
+  - Short record form after the tag: the output whole; the function as a one-byte builtin index (`func::BUILTINS`, append-only), an 8-byte prefix (a stored WASM module) or whole; a varint count; each argument's kind with a short-id flag, its id as an 8-byte prefix when exactly one stored or derivable id has it, else whole; range offsets as varints. Flagged by the `ABBREVIATED` mode bit, as trees are; stored only when smaller.
+  - Decoding tries the prefixes' candidates and accepts only the canonical encoding that hashes to the record's id, so a later prefix collision costs a retry, never exactness.
+  - The ledger is built from the records, and "derivable" means "a record's output". So outputs stay whole and the ledger reads in two passes: every record's output first (`derivation_output`, no resolution needed), then each record expanded against stored ids and those outputs.
+  - `tests/exec.rs`: the one-record size it asserts goes from 102 to 53 B.
+- Result (four runs, every corpus exact with a clean fsck; tests, clippy and fmt clean):
+  - north/tables 135,551 -> **122,678** B (0.2103 -> 0.1904); records 22,234 -> 9,361.
+  - north/multiformat 332,403 -> **310,415** (0.2953 -> 0.2758); records 32,839 -> 10,851.
+  - north/cases 391,496 -> **361,242** (0.4499 -> 0.4151); records 69,105 -> 38,851.
+  - North score **0.3035 -> 0.2793** on every run (-8.0%, tolerance 0.5%). Sharing: kernel 0.9589 -> 0.9624 (records shrink in the per-type stores too).
+  - Hot stored sizes identical to E102 or smaller (generated -125 B, transcripts -553 B); `proxy_score` 3.8200 -> 3.8199, `read_score` 5.7268 -> 5.7266, `bytes_score` 5.7623 -> 5.7621.
+  - Cost score **0.2646 / 0.2630 / 0.2594 / 0.2589** against main's 0.2504 / 0.2527 / 0.2414 / 0.2474 in runs alternated with it: about 4.5% higher, beyond its 2% spread. The rise is in measured time only. Its largest part is office (median 0.337 -> 0.418, from ingest). Office ingest executes the same work as on main: 10,039 M instructions on main, 10,037 M with E104 under callgrind. Wall time over the whole bench is lower (19.7 -> 19.6 s).
+- Verdict: **pending**. North improves beyond tolerance on every run. The cost score does not hold by the keep rule's letter, although every deterministic measure holds or improves and the slower runs execute the same instructions (most likely code layout). Kept on its branch until that call is made.
