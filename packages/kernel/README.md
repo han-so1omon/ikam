@@ -30,6 +30,21 @@ cargo run --release -- repack                      # re-plan all storage (only i
 
 The store lives in `.ikam` by default; override it with `--store DIR`.
 
+Working with a corpus:
+
+```sh
+ikam --store S ingest DIR -m "msg"   # commit DIR, repack, verify every file; prints sizes and times
+ikam --store S ls main:sub/dir       # list a directory (-r for every file)
+ikam --store S grep "text"           # files containing text, also inside docx XML and PDF text
+ikam --store S stats                 # objects and bytes by kind and encoding
+ikam --store S cat main:path/file    # REV:PATH, a hex id or a unique prefix work everywhere
+ikam --store S serve                 # browse, read and search at http://127.0.0.1:8737/
+```
+
+`--short-records` stores derivation records with short ids (smaller, for
+archives; see `docs/experiments/options.md`). Real-world corpora and how the
+kernel does on them: `realworld/README.md`.
+
 Benchmark (deterministic corpora from this repo, verified exact, with zstd baselines):
 
 ```sh

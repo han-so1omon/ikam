@@ -81,6 +81,6 @@ other work beside it, a 5% spread with identical bytes); on, it is E104
 (north 0.2793, cost 0.2646).
 
 **When to turn it on**: archives and cold stores, where bytes are the cost
-(north -8%). **When to leave it off**: until a run shows the read path's
-prefix lookups cost nothing at the heavy workload; reads resolve each short
-id against the store, which on a disk store is a directory lookup.
+(north -8%). **When to leave it off**: hot stores, until a run shows the extra work
+costs nothing there; building the ledger resolves every short id against
+the store's ids (a second pass over the records).

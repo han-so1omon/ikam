@@ -27,7 +27,7 @@ wat = "1.260.0"
 
 [[bin]]
 name = "ikam"
-path = "src/main.rs"
+path = "src/bin/ikam/main.rs"
 
 # Dependencies (wasmi, zlib, zstd) are far slower unoptimized; tests run them heavily.
 [profile.dev.package."*"]

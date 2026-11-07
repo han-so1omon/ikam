@@ -1694,3 +1694,27 @@ Newest last. Format and rules: `README.md`.
   - Off (two runs): every corpus byte-identical to main (all hot sizes, north/tables 135,551, multiformat 332,403, cases 391,496), north 0.3035, cost score 0.2484 / 0.2608. The second off run, with unrelated downloads running beside it, moved the cost score by 5% with identical bytes: the same size as the rise attributed to E104.
   - On (one run): north 0.2793 and every size as in E104's runs; cost score 0.2646.
   - Verdict: **kept**, as an option (a capability added while both scores hold by default). The trade-off and the other settings are mapped in `options.md`.
+
+### E105 realworld-corpora (real files, and a corpus interface)
+- Branch / parent: exp/105-realworld-corpora / E104 option (exp/104-short-derivation-ids at 232c6d1)
+- Question: every score so far is on fixtures and generated corpora. How does the kernel do on files nobody made for it, and can someone ingest, browse and search a corpus without writing code?
+- Corpora (`packages/kernel/realworld/fetch.py`, PyPI releases pinned and sha256-checked; nothing downloaded is run): the test documents python-docx (47 docx), python-pptx (68 pptx) and pypdf (72 pdf) ship; spreadsheets and ODF files from pyexcel-xlsx, python-calamine and odfpy (41); vega_datasets' data (20 csv/json/tsv); eight requests wheels and eight click sdists (one snapshot per release). GitHub-hosted corpora were left out: this session may only read repositories attached to it.
+- Measurement (`examples/realworld.rs`, read weight 0.001, short records off): one fresh store per corpus, one commit (or one per release), repack, every file read back byte for byte, fsck; against zstd 3 with a trained dictionary (the bench's baseline), zstd 19 per file, and solid zstd 19 (long window) and xz 9 over all distinct files (`tar | zstd`, `tar | xz`, with no random access).
+
+| Corpus | Files | Distinct bytes | Kernel | zstd 3 + dict | zstd 19 solid | xz 9 solid | vs best | Repack |
+|---|---|---|---|---|---|---|---|---|
+| docx | 47 | 1,155,108 | **563,619** | 850,034 | 629,167 | 629,492 | 0.896 | 7.2 s |
+| pptx | 68 | 7,698,823 | **2,930,435** | 3,999,469 | 3,125,139 | 3,126,372 | 0.938 | 18.4 s |
+| pdf | 72 | 15,345,736 | **4,826,271** | 6,336,442 | 5,210,576 | 5,029,704 | 0.960 | 66.8 s |
+| sheets | 41 | 514,981 | **243,778** | 377,618 | 350,338 | 351,652 | 0.696 | 8.2 s |
+| tables | 20 | 865,188 | 134,229 | 265,065 | 147,537 | **126,524** | 1.061 | 1.9 s |
+| requests wheels (8 releases) | 8 | 501,909 | **96,865** | 380,610 | 270,003 | 270,780 | 0.359 | 3.9 s |
+| click sdists (8 releases) | 8 | 2,411,765 | 2,149,467 | 2,390,433 | **2,114,069** | 2,114,752 | 1.017 | 2.0 s |
+
+  - Every corpus exact with a clean fsck.
+  - The kernel is smaller than the smallest archiver on five of seven, while keeping per-file random access the solid archives lack. The zip-based formats gain most: wheels 0.36 of the best archiver (zip members expanded, then shared across releases), sheets 0.70.
+  - It loses on click's sdists (1.017): they are tar.gz, and gzip members are not expanded (`plan_zlib` looks only for zlib headers), so eight releases of mostly identical source share nothing. Next: E106.
+  - It loses to xz on vega's tables (1.061), mostly two large JSON/CSV files where xz's model beats zstd's.
+  - Repack time grows with the PDF corpus (67 s for 15 MB); the planner tries many plans per file.
+- Interface (`src/bin/ikam/`): the `ikam` CLI gains `ingest DIR` (commit, repack, fsck and a byte-for-byte check of every file, with what it cost), `ls REV[:PATH] [-r]`, `grep TEXT [REV]` (also inside the parts the kernel stores separately: a docx's XML, a PDF's text layer), `stats` (objects and bytes by kind and encoding), `REV:PATH` and hex-prefix arguments everywhere, `--short-records`, and `serve [PORT]`: a read-only local web page on 127.0.0.1 to browse commits and trees, read or download files, see how each is stored (bytes, or a verified derivation and its inputs), search, and see what the store holds. `realworld/cli.sh DIR` runs ingest, ls, grep, stats and a checkout compared with `diff -r`.
+- Verdict: **reference** (measurement and capability; no storage change, so the bench is unchanged).
