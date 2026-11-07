@@ -21,8 +21,10 @@
 //! `plan_zlib` (E080) finds zlib streams anywhere in a file (PDF
 //! FlateDecode streams, PNG data, embedded objects): a valid zlib header,
 //! a deflate stream that ends, and the Adler-32 that follows matching the
-//! inflated bytes. Header and checksum stay literal, so `pack` rebuilds the
-//! file unchanged. No file type is named: any bytes holding reproducible
+//! inflated bytes. It finds gzip members the same way (E106: .tar.gz, .gz):
+//! a valid gzip header, and the CRC-32 and size that follow matching.
+//! Headers and checksums stay literal, so `pack` rebuilds the file
+//! unchanged. No file type is named: any bytes holding reproducible
 //! zlib streams are planned the same way.
 
 use std::collections::HashMap;
@@ -309,10 +311,14 @@ pub fn plan_zlib_at(bytes: &[u8]) -> Option<ZlibPlan> {
     let mut found = Vec::new();
     let mut i = 0;
     while i + 2 < bytes.len() {
-        match zlib_stream(&bytes[i..]) {
-            Some((n, data)) => {
-                found.push((i + 2, i + 2 + n, data));
-                i += 2 + n + 4;
+        let b = &bytes[i..];
+        match zlib_stream(b)
+            .map(|(n, d)| (2, n, d, 4))
+            .or_else(|| gzip_stream(b))
+        {
+            Some((head, n, data, tail)) => {
+                found.push((i + head, i + head + n, data));
+                i += head + n + tail;
             }
             None => i += 1,
         }
@@ -334,6 +340,44 @@ fn zlib_stream(b: &[u8]) -> Option<(usize, Vec<u8>)> {
     {
         return None;
     }
+    let (n, out) = inflate_raw(&b[2..])?;
+    let adler = u32::from_be_bytes(b.get(2 + n..2 + n + 4)?.try_into().ok()?);
+    (out.len() >= MIN_ZLIB && adler32(&out) == adler).then_some((n, out))
+}
+
+/// A gzip member at the start of `b` (E106: .tar.gz, .gz, HTTP bodies):
+/// header length, deflate stream length, inflated bytes and trailer length,
+/// if the header is valid, the stream ends, and the CRC-32 and size after
+/// it match. Header and trailer stay literal, as a zlib stream's do.
+fn gzip_stream(b: &[u8]) -> Option<(usize, usize, Vec<u8>, usize)> {
+    if !b.starts_with(&[0x1f, 0x8b, 8]) || b.get(3)? & 0xe0 != 0 {
+        return None;
+    }
+    let flags = b[3];
+    let mut head = 10;
+    if flags & 4 != 0 {
+        let x = b.get(head..head + 2)?;
+        head += 2 + usize::from(u16::from_le_bytes([x[0], x[1]]));
+    }
+    for bit in [8, 16] {
+        if flags & bit != 0 {
+            head += memchr::memchr(0, b.get(head..)?)? + 1;
+        }
+    }
+    if flags & 2 != 0 {
+        head += 2;
+    }
+    let (n, out) = inflate_raw(b.get(head..)?)?;
+    let trailer = b.get(head + n..head + n + 8)?;
+    let crc = u32::from_le_bytes(trailer[..4].try_into().ok()?);
+    let size = u32::from_le_bytes(trailer[4..].try_into().ok()?);
+    (out.len() >= MIN_ZLIB && crc32fast::hash(&out) == crc && out.len() as u32 == size)
+        .then_some((head, n, out, 8))
+}
+
+/// A raw deflate stream at the start of `b`: its length and inflated bytes,
+/// if it ends within `MAX_MEMBER` bytes of output.
+fn inflate_raw(b: &[u8]) -> Option<(usize, Vec<u8>)> {
     let mut inflater = flate2::Decompress::new(false);
     let mut out = Vec::with_capacity(4096);
     loop {
@@ -342,7 +386,7 @@ fn zlib_stream(b: &[u8]) -> Option<(usize, Vec<u8>)> {
         }
         let consumed = inflater.total_in() as usize;
         let status = inflater
-            .decompress_vec(&b[2 + consumed..], &mut out, flate2::FlushDecompress::None)
+            .decompress_vec(&b[consumed..], &mut out, flate2::FlushDecompress::None)
             .ok()?;
         if status == flate2::Status::StreamEnd {
             break;
@@ -353,9 +397,7 @@ fn zlib_stream(b: &[u8]) -> Option<(usize, Vec<u8>)> {
             return None;
         }
     }
-    let n = inflater.total_in() as usize;
-    let adler = u32::from_be_bytes(b.get(2 + n..2 + n + 4)?.try_into().ok()?);
-    (out.len() >= MIN_ZLIB && adler32(&out) == adler).then_some((n, out))
+    Some((inflater.total_in() as usize, out))
 }
 
 fn adler32(data: &[u8]) -> u32 {
@@ -545,6 +587,34 @@ mod tests {
         let args: Vec<Vec<u8>> = [vec![manifest], members].concat();
         assert_eq!(pack(&args).unwrap(), pdf);
         assert!(plan_zlib(b"x\x9c not a stream, just text with a header").is_none());
+    }
+
+    /// gzip members (a .tar.gz, with a file name in the header; and two
+    /// members back to back) are expanded and rebuilt byte-exactly; a
+    /// member whose CRC does not match stays literal (E106).
+    #[test]
+    fn gzip_members_expand_and_rebuild() {
+        let gz = |data: &[u8], name: &[u8]| {
+            let mut e = flate2::GzBuilder::new()
+                .filename(name)
+                .mtime(1_700_000_000)
+                .write(Vec::new(), Compression::new(9));
+            e.write_all(data).unwrap();
+            e.finish().unwrap()
+        };
+        let tar: Vec<u8> = (0..400)
+            .flat_map(|i| format!("src/click/core_{i}.py\0def f{i}(): return {i}\n").into_bytes())
+            .collect();
+        let more = b"a second member, long enough to be worth expanding: ".repeat(4);
+        let file = [gz(&tar, b"click-8.1.7.tar"), gz(&more, b"b")].concat();
+        let (manifest, members) = plan_zlib(&file).unwrap();
+        assert_eq!(members, vec![tar.clone(), more.to_vec()]);
+        let args: Vec<Vec<u8>> = [vec![manifest], members].concat();
+        assert_eq!(pack(&args).unwrap(), file);
+        let mut bad = gz(&tar, b"x");
+        let n = bad.len();
+        bad[n - 8] ^= 1; // CRC-32
+        assert!(plan_zlib(&bad).is_none());
     }
 
     const GOLDEN_MEM9: [&str; 10] = [
