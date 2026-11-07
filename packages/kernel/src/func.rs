@@ -51,11 +51,16 @@ pub fn is_builtin(func: &Id) -> bool {
 
 /// Run `func` on `args`: its output and the decode work it took (bytes
 /// produced, plus measured WASM fuel; see `wasm::FUEL_PER_WORK`).
-pub fn run(func: &Id, module: Option<&[u8]>, args: &[Vec<u8>]) -> Result<(Vec<u8>, usize), Error> {
+pub fn run(
+    func: &Id,
+    module: Option<&[u8]>,
+    args: &[Vec<u8>],
+    memo: Option<&container::DeflateMemo>,
+) -> Result<(Vec<u8>, usize), Error> {
     let out = if *func == concat() {
         args.concat()
     } else if *func == deflate_pack() {
-        container::pack(args)?
+        container::pack(args, memo)?
     } else if *func == fill() {
         template::fill(args)?
     } else {

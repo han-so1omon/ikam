@@ -59,6 +59,13 @@ impl<S: Store + Sync> Repo<S> {
     /// stored content the new plan no longer shares go back to object form
     /// (as before a re-plan), so a second repack finds nothing left (E060).
     pub fn repack(&mut self) -> Result<Repacked, Error> {
+        self.deflate_memo = Some(Default::default());
+        let repacked = self.repack_with_memo();
+        self.deflate_memo = None;
+        repacked
+    }
+
+    fn repack_with_memo(&mut self) -> Result<Repacked, Error> {
         // A repack of a store the last repack left unchanged, with the same
         // settings, would redo the same work and keep the same plan: repack
         // is a fixed point (E060). Skip it (E067).
@@ -113,6 +120,11 @@ impl<S: Store + Sync> Repo<S> {
         }
         for id in &self.proposed_order {
             h.update(id.as_bytes());
+        }
+        // Only when set, so stores repacked before it existed keep their mark.
+        if self.slow_codec_max != usize::MAX {
+            h.update(b"slow_codec_max")
+                .update(&self.slow_codec_max.to_le_bytes());
         }
         Ok(Id::from_bytes(*h.finalize().as_bytes()))
     }
@@ -256,6 +268,8 @@ impl<S: Store + Sync> Repo<S> {
         let mut fresh = Repo::new(MemStore::default());
         fresh.read_weight = self.read_weight;
         fresh.short_records = self.short_records;
+        fresh.slow_codec_max = self.slow_codec_max;
+        fresh.deflate_memo = self.deflate_memo.clone();
         fresh.proposed_order = self.proposed_order.clone();
         if let Some(dict) = dict {
             fresh.set_dictionary(dict.to_vec())?;
@@ -832,9 +846,13 @@ fn template_groups(files: &[(Id, Vec<u8>)]) -> Vec<Vec<usize>> {
 fn train_dictionaries(samples: &[&[u8]], k: usize) -> Vec<Vec<u8>> {
     let samples: Vec<&[u8]> = samples.iter().copied().filter(|b| !b.is_empty()).collect();
     let total: usize = samples.iter().map(|b| b.len()).sum();
-    let Some(alone) = dictionary_cost(&samples, &[]).filter(|_| samples.len() >= 8) else {
+    // Each sample's size without a dictionary, once for every candidate
+    // (E109: the large samples of source archives were compressed again per
+    // candidate).
+    let Some(sizes) = alone_sizes(&samples).filter(|_| samples.len() >= 8) else {
         return vec![];
     };
+    let alone: usize = sizes.iter().sum();
     // (estimate, construction, dictionary)
     let mut ranked = Vec::new();
     for size in [total / 100, total / 30, total / 10].map(|s| s.clamp(4096, 112_640)) {
@@ -845,7 +863,7 @@ fn train_dictionaries(samples: &[&[u8]], k: usize) -> Vec<Vec<u8>> {
         ];
         for (construction, dict) in built.into_iter().enumerate() {
             if let Some(dict) = dict
-                && let Some(cost) = dictionary_cost(&samples, &dict).filter(|&c| c < alone)
+                && let Some(cost) = dictionary_cost(&samples, &sizes, &dict).filter(|&c| c < alone)
                 && !ranked.iter().any(|(_, _, d)| *d == dict)
             {
                 ranked.push((cost, construction, dict));
@@ -856,22 +874,25 @@ fn train_dictionaries(samples: &[&[u8]], k: usize) -> Vec<Vec<u8>> {
     ranked.into_iter().take(k).map(|r| r.2).collect()
 }
 
-/// Estimated stored size of `samples` given `dict` (empty: none): the
-/// dictionary plus each sample's smallest encoding, a dictionary encoding
-/// paying for the id it names.
-fn dictionary_cost(samples: &[&[u8]], dict: &[u8]) -> Option<usize> {
-    let (mut alone, mut given) = (framer(&[])?, framer(dict)?);
+/// Estimated stored size of `samples` given `dict`: the dictionary plus each
+/// sample's smallest encoding (`alone`: its size without one), a dictionary
+/// encoding paying for the id it names.
+fn dictionary_cost(samples: &[&[u8]], alone: &[usize], dict: &[u8]) -> Option<usize> {
+    let mut given = framer(dict)?;
     let mut cost = dict.len();
-    for b in samples {
-        let z = alone.compress(b).map_or(b.len(), |z| z.len().min(b.len()));
-        cost += match dict.is_empty() {
-            true => z,
-            false => given
-                .compress(b)
-                .map_or(z, |d| (d.len() + DICT_REF_LEN).min(z)),
-        };
+    for (b, &z) in samples.iter().zip(alone) {
+        cost += given
+            .compress(b)
+            .map_or(z, |d| (d.len() + DICT_REF_LEN).min(z));
     }
     Some(cost)
+}
+
+/// Each sample's smallest encoding without a dictionary.
+fn alone_sizes(samples: &[&[u8]]) -> Option<Vec<usize>> {
+    let mut alone = framer(&[])?;
+    let mut size = |b: &[u8]| alone.compress(b).map_or(b.len(), |z| z.len().min(b.len()));
+    Some(samples.iter().map(|b| size(b)).collect())
 }
 
 /// A raw-content dictionary: `size` bytes of 1 KiB pieces taken at even

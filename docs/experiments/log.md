@@ -1749,3 +1749,21 @@ Newest last. Format and rules: `README.md`.
   - `cheapest_encodings` is bounded by the single largest content: on one 23.6 MB tar, zstd 19 takes 9.8 s (3,150,723 B) and brotli q11 39 s (3,056,772 B, 3% smaller). Brotli cannot split one content across cores.
 - Next candidates, none tried yet: plan each content once and share the result across the re-plans; on contents over a few MB, run brotli only when zstd's result is within reach of the cheapest plan, or in parallel with zstd; stream large contents instead of holding every copy in memory (the 842 MiB peak).
 - Verdict: **reference** (measurement; no storage change).
+
+### E109 repack-deflate-memo (each large deflate once per repack; brotli cap as an option)
+- Branch / parent: exp/109-repack-deflate-memo / E108
+- Question (from E108): the pandas repack took 7 minutes. Where does it go, and how much of it is repeated work?
+- Profile (temporary timers, four pandas releases, 4 cores): the four 23.6 MB tars were deflated 164 times for 232 s of CPU (the level search when ingest plans a container, hint checks, read checks, fsck, plan costs, reading contents back). Brotli took 44 s on one tar and lost; Q context frames 30 s, all lost; dictionaries 21 s.
+- Change:
+  - `src/container.rs`: `DeflateMemo`, a per-repack cache of deflate output for inputs of 1 MiB or more, keyed by content id and level; concurrent callers of the same key wait on one computation. `repack` installs it for its own run and removes it after; outside a repack nothing changes.
+  - `src/ingest.rs`: a content whose verified hint is already a deflate_pack is not planned as a container again (the hint is the plan).
+  - `src/repo.rs`: a range argument is sliced in place from the rebuilt source instead of cloning the whole source for each range.
+  - `src/repack.rs`: dictionary training computes each sample's size alone once, not once per candidate dictionary.
+  - New option `slow_codec_max` (default off): contents larger than this skip brotli when repack picks their encoding (see options.md).
+  - `examples/realworld.rs` prints the store's own peak memory per corpus (`store_peak_kib`, reset per corpus) and takes `--slow-codec-max`.
+- Tried and dropped: building the context frames ahead on all cores saved about 4 s on the PDF corpus and raised its peak 551 -> 695 MiB; removed.
+- Result:
+  - Pandas (17.6 MB of archives): stored bytes identical (3,270,055 B), exact, fsck clean. Repack **430 -> 130 s**, ingest 74 -> 42 s, reading every file back 25 -> 11 s, store peak 865 -> **791 MiB**. With `slow_codec_max` at 4 MiB: repack **82 s**, same bytes, peak 849 MiB.
+  - Real-world (7 corpora): every corpus byte-identical, exact, fsck clean. Repack click 23.4 -> 8.6 s, pdf 55.0 -> 50.3 s (43.9 s capped), others within a few percent; peaks within noise of main (pdf 572 -> 568 MiB).
+  - Bench (two runs): all 14 corpora byte-identical, north 0.3035, cost score 0.2419 / 0.2507 against main's 0.2497 / 0.2554; north repack CPU 72.0 / 69.8 -> 66.5 / 65.9 s.
+- Verdict: **kept** (speed with identical bytes; both scores hold; the brotli cap is an option, off by default).

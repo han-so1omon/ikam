@@ -409,7 +409,8 @@ impl<S: Store> Repo<S> {
                 best = plain;
             }
         }
-        for (tag, encode, _) in codec::CODECS.iter().filter(|c| c.2) {
+        let slow = bytes.len() <= self.slow_codec_max;
+        for (tag, encode, _) in codec::CODECS.iter().filter(|c| c.2 && slow) {
             if floor(*tag) >= self.cost(&best, reads) {
                 continue;
             }
@@ -699,6 +700,23 @@ impl<S: Store> Repo<S> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Above `slow_codec_max`, brotli is not tried (E109).
+    #[test]
+    fn slow_codecs_skip_contents_above_the_limit() {
+        let mut repo = Repo::new(crate::MemStore::default());
+        let page: Vec<u8> = (0..40)
+            .flat_map(|i| {
+                format!(
+                    "<p class=\"note\">The {i}th paragraph of the page, with ordinary words.</p>\n"
+                )
+                .into_bytes()
+            })
+            .collect();
+        assert_eq!(repo.encode_cheapest(&page, page.len())[0], b'R');
+        repo.slow_codec_max = page.len() - 1;
+        assert_ne!(repo.encode_cheapest(&page, page.len())[0], b'R');
+    }
 
     /// Every codec in `codec::CODECS`, active or archived, still decodes
     /// through `decode_plain`: archiving stops trying a codec, never

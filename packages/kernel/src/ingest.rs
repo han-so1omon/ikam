@@ -78,12 +78,17 @@ impl<S: Store> Repo<S> {
         }
         let plain = self.encode_plain(bytes);
         let mut candidates = Vec::new();
+        let mut unpacked = false;
         for d in hints {
             if let Some(work) = self.verify(d, bytes, &HashMap::new()) {
+                unpacked |= d.func == func::deflate_pack();
                 candidates.push(Candidate::single(d.clone(), vec![], work));
             }
         }
-        if depth < MAX_UNPACK_DEPTH {
+        // A verified container fact (a re-plan's hint) is the plan unpacking
+        // would find again, at the price of re-deflating every member at
+        // each level it tries (E109: most of a re-plan of source archives).
+        if depth < MAX_UNPACK_DEPTH && !unpacked {
             candidates.extend(self.container_candidate(bytes, depth)?);
         }
         // A slice or template plan rebuilds the whole content, so its read

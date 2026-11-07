@@ -32,6 +32,7 @@ below together is the simplest interface; today callers set the fields.
 | `read_weight` | 0.001 | bytes against decode CPU, for every plan | E069, E099 |
 | `search_rate`, `search_sample` | 0 (no index) | a trigram index is stored only if it pays for that many searches per read pass | E065, E089, E094 |
 | `proposed_order` | empty | an external content order (embeddings, an LLM) for grouping; used only when it saves bytes | E019; no effect in E051 |
+| `slow_codec_max` (new, E109) | off (`usize::MAX`) | contents larger than this many bytes skip brotli when repack picks their encoding: repack time against the few percent brotli wins on large content | pandas repack 130 -> 82 s at 4 MiB, same bytes (brotli lost on its 23.6 MB tar); peak 791 -> 849 MiB; see below |
 | `short_records` (new, E104) | off | derivation records store 8-byte id prefixes and a builtin index: about a third less record bytes; reading resolves prefixes (a two-pass ledger build) | north 0.3035 -> 0.2793 (8%); cost score up about 4.5% on four runs with identical instruction counts (timing, not work); see below |
 
 Reading accepts every stored form whatever the settings, so a setting can be
@@ -65,7 +66,7 @@ changed on an existing store; the next repack re-plans under it.
 
 - **Font glyph dedup across PDFs**: fonts are 48 KB of multiformat's 332 KB one-store (E101 roles); subset fonts of the same face share most glyph programs.
 - **A profile setting** (heavy / balanced / archive) instead of separate fields.
-- **Real-world corpora**: measured in E105-E108 (`packages/kernel/realworld`); the kernel is below the best archiver on 7 of 8 after E106. Scale is the open limit: four pandas releases repack in 7 minutes at 842 MiB peak (E108).
+- **Real-world corpora**: measured in E105-E108 (`packages/kernel/realworld`); the kernel is below the best archiver on 7 of 8 after E106. Scale was the open limit: four pandas releases repacked in 7 minutes at 842 MiB peak (E108); since E109 in 2 minutes 10 s (82 s with `slow_codec_max` at 4 MiB), same bytes, peak 865 -> 791 MiB. Peak memory (about 0.9 GB for 17.6 MB of archives, 112 MB expanded) is the next limit.
 
 ## E104 as an option
 
@@ -84,3 +85,22 @@ other work beside it, a 5% spread with identical bytes); on, it is E104
 (north -8%). **When to leave it off**: hot stores, until a run shows the extra work
 costs nothing there; building the ledger resolves every short id against
 the store's ids (a second pass over the records).
+
+## `slow_codec_max` (E109)
+
+Brotli (the one slow codec still tried) cannot use more than one core, so
+on one large content it bounds the whole recompress. On four pandas source
+releases it took 44 s of the repack for one 23.6 MB tar and then lost: 3%
+smaller than zstd 19, but that tar is read four times over (each later
+release is spliced from it), and four times zstd's decode work outweighed
+the bytes. On the real-world corpora, the largest content brotli won was
+3.3 MB (8% smaller than zstd 19); it lost on the two larger ones it was
+tried on (8.0 MB, 23.6 MB). With the cap the pandas peak was 849 MiB
+against 791 without it (still below 865 before E109): zstd's work on the
+large tars overlaps instead of waiting behind brotli.
+
+**When to set it** (`Repo::slow_codec_max`, `realworld --slow-codec-max`,
+`ikam --slow-codec-max`): stores with large contents where repack time
+matters; 4 MiB keeps every brotli win measured so far. **When to leave it
+off**: archives where every byte counts and repack time does not, since
+brotli can win a few percent on a large content read rarely.

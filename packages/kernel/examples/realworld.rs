@@ -4,7 +4,7 @@
 //! repacked, verified byte for byte and fsck'd, and compared with common
 //! archivers. Not a scoring command: the bench's two scores stay the gate.
 //!
-//! `cargo run --release --example realworld -- [--json] [--short-records] [--read-weight W] DIR...`
+//! `cargo run --release --example realworld -- [--json] [--short-records] [--read-weight W] [--slow-codec-max BYTES] DIR...`
 
 use std::collections::BTreeMap;
 use std::io::Write;
@@ -87,12 +87,17 @@ struct Run {
     exact: bool,
     fsck: bool,
     kinds: BTreeMap<char, usize>,
+    /// Peak resident memory of the store's run alone (ingest, repack, reads,
+    /// fsck), before the baselines: xz 9 alone can take hundreds of MiB.
+    peak_kib: usize,
 }
 
-fn run(c: &Corpus, short: bool, weight: f64) -> Run {
+fn run(c: &Corpus, short: bool, weight: f64, slow_max: usize) -> Run {
+    reset_peak();
     let mut repo = Repo::new(MemStore::default());
     repo.short_records = short;
     repo.read_weight = weight;
+    repo.slow_codec_max = slow_max;
     let t = Instant::now();
     for v in &c.versions {
         let tree = snapshot::snapshot(&mut repo, v, Path::new("/nonexistent")).unwrap();
@@ -119,6 +124,7 @@ fn run(c: &Corpus, short: bool, weight: f64) -> Run {
     }
     let read_ms = t.elapsed().as_millis();
     let fsck = repo.fsck().unwrap().is_empty();
+    let peak = peak_kib();
     let mut kinds = BTreeMap::new();
     let mut stored = 0;
     for id in repo.store().ids().unwrap() {
@@ -140,6 +146,7 @@ fn run(c: &Corpus, short: bool, weight: f64) -> Run {
         exact,
         fsck,
         kinds,
+        peak_kib: peak,
     }
 }
 
@@ -148,6 +155,12 @@ fn stored_bytes(repo: &Repo<MemStore>) -> usize {
     ids.iter()
         .map(|id| repo.store().read(id).unwrap().len())
         .sum()
+}
+
+/// Reset the peak resident memory to the current (Linux), so each corpus
+/// reports its own peak rather than the process's so far.
+fn reset_peak() {
+    let _ = std::fs::write("/proc/self/clear_refs", "5");
 }
 
 /// Peak resident memory of this process so far (Linux), in KiB.
@@ -219,9 +232,17 @@ fn main() {
         }
         None => DEFAULT_READ_WEIGHT,
     };
+    let slow_max = match args.iter().position(|a| a == "--slow-codec-max") {
+        Some(i) => {
+            let n = args.remove(i + 1).parse().expect("--slow-codec-max BYTES");
+            args.remove(i);
+            n
+        }
+        None => usize::MAX,
+    };
     for dir in &args {
         let c = corpus(Path::new(dir));
-        let r = run(&c, short, weight);
+        let r = run(&c, short, weight, slow_max);
         let base = baselines(&c);
         let best = base.iter().map(|b| b.1).min().unwrap();
         if json {
@@ -232,7 +253,7 @@ fn main() {
                 .map(|(k, v)| format!("\"{k}\":{v}"))
                 .collect();
             println!(
-                "{{\"corpus\":\"{}\",\"versions\":{},\"files\":{},\"input\":{},\"distinct\":{},\"stored\":{},\"ingest_stored\":{},\"peak_kib\":{},\"vs_best\":{:.4},\"baselines\":{{{}}},\"ingest_ms\":{},\"repack_ms\":{},\"read_ms\":{},\"exact\":{},\"fsck\":{},\"by_kind\":{{{}}}}}",
+                "{{\"corpus\":\"{}\",\"versions\":{},\"files\":{},\"input\":{},\"distinct\":{},\"stored\":{},\"ingest_stored\":{},\"peak_kib\":{},\"store_peak_kib\":{},\"vs_best\":{:.4},\"baselines\":{{{}}},\"ingest_ms\":{},\"repack_ms\":{},\"read_ms\":{},\"exact\":{},\"fsck\":{},\"by_kind\":{{{}}}}}",
                 c.name,
                 c.versions.len(),
                 r.files,
@@ -241,6 +262,7 @@ fn main() {
                 r.stored,
                 r.ingest_stored,
                 peak_kib(),
+                r.peak_kib,
                 r.stored as f64 / best as f64,
                 b.join(","),
                 r.ingest_ms,
@@ -252,7 +274,7 @@ fn main() {
             );
         } else {
             println!(
-                "{:<16} v={:<2} files={:<4} input={:>10} distinct={:>10} kernel={:>9} zstd3+dict={:>9} zstd19={:>9} zstd19-solid={:>9} xz9-solid={:>9} vs_best={:.3} before_repack={} ingest={}ms repack={}ms read={}ms peak={}MiB exact={} fsck={}",
+                "{:<16} v={:<2} files={:<4} input={:>10} distinct={:>10} kernel={:>9} zstd3+dict={:>9} zstd19={:>9} zstd19-solid={:>9} xz9-solid={:>9} vs_best={:.3} before_repack={} ingest={}ms repack={}ms read={}ms peak={}MiB store_peak={}MiB exact={} fsck={}",
                 c.name,
                 c.versions.len(),
                 r.files,
@@ -269,6 +291,7 @@ fn main() {
                 r.repack_ms,
                 r.read_ms,
                 peak_kib() / 1024,
+                r.peak_kib / 1024,
                 r.exact,
                 r.fsck
             );

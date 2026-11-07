@@ -12,7 +12,7 @@ use ikam_kernel::{Arg, FsStore, Id, Object, Repo, snapshot};
 
 use corpus::{err, lookup};
 
-const USAGE: &str = "usage: ikam [--store DIR] [--short-records] <command>
+const USAGE: &str = "usage: ikam [--store DIR] [--short-records] [--slow-codec-max BYTES] <command>
   ingest DIR [-m MSG] [--ref REF]  commit DIR, repack, verify; print what it cost
   ls [REV[:PATH]] [-r]             list a directory of REV (default main)
   grep TEXT [REV]                  files of REV containing TEXT, with lines
@@ -57,6 +57,11 @@ fn run(store_dir: &str, args: &mut Vec<String>) -> Result<(), String> {
     if let Some(i) = args.iter().position(|a| a == "--short-records") {
         args.remove(i);
         repo.short_records = true;
+    }
+    if let Some(n) = take_flag(args, "--slow-codec-max") {
+        repo.slow_codec_max = n
+            .parse()
+            .map_err(|_| "--slow-codec-max BYTES".to_string())?;
     }
     let message = take_flag(args, "-m").unwrap_or_default();
     let refname = take_flag(args, "--ref").unwrap_or_else(|| "main".into());

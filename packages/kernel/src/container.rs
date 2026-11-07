@@ -29,12 +29,13 @@
 
 use std::collections::HashMap;
 use std::io::{Read, Write};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use flate2::Compression;
 use flate2::read::DeflateDecoder;
 use flate2::write::DeflateEncoder;
 
-use crate::{Error, pdftext};
+use crate::{Error, Id, pdftext};
 
 /// Levels to try, most common first (zlib's default is 6), at memLevel 8
 /// and then 9 (`MEM9` added; see the manifest).
@@ -48,6 +49,40 @@ const MAX_MEMBER: usize = 1 << 30;
 enum Segment<'a> {
     Literal(&'a [u8]),
     Deflate { member: u32, level: u8 },
+}
+
+/// Raw deflate outputs of large members, kept for one repack (E109). A
+/// repack rebuilds each container many times (reading the store, verifying
+/// each re-plan, fsck, pricing plans), and each rebuild re-deflates every
+/// member: on four pandas source archives that was most of the repack. Keyed
+/// by the member's content id and level, so a hit is the same pure function
+/// of the same bytes; a member is deflated once even when re-plans running
+/// side by side ask for it at once.
+#[derive(Default)]
+pub struct DeflateMemo(Mutex<HashMap<(Id, u8), Deflated>>);
+
+/// One member's deflate at one level, made once.
+type Deflated = Arc<OnceLock<Vec<u8>>>;
+
+/// Members below this are deflated each time: hashing and holding them would
+/// cost about what deflating them does.
+const MEMO_MIN: usize = 1 << 20;
+
+impl DeflateMemo {
+    fn deflate(&self, data: &[u8], level: u8) -> Vec<u8> {
+        if data.len() < MEMO_MIN {
+            return deflate(data, level);
+        }
+        let key = (Id::of_content(data), level);
+        let cell = Arc::clone(
+            self.0
+                .lock()
+                .expect("memo poisoned")
+                .entry(key)
+                .or_default(),
+        );
+        cell.get_or_init(|| deflate(data, level)).clone()
+    }
 }
 
 /// Raw deflate of `data` at a manifest level (0-19, see the manifest).
@@ -288,7 +323,7 @@ fn text_layers(
     }
     let mut args = vec![out];
     args.extend(kept);
-    if pack(&args).ok()? != bytes {
+    if pack(&args, None).ok()? != bytes {
         return None;
     }
     let members = args.split_off(1);
@@ -460,7 +495,12 @@ fn manifest(
 }
 
 /// Builtin `deflate-pack`: args are `[manifest, member0, member1, ...]`.
-pub fn pack(args: &[Vec<u8>]) -> Result<Vec<u8>, Error> {
+/// With a memo, large members' deflates are reused (see `DeflateMemo`).
+pub fn pack(args: &[Vec<u8>], memo: Option<&DeflateMemo>) -> Result<Vec<u8>, Error> {
+    let deflate = |data: &[u8], level| match memo {
+        Some(m) => m.deflate(data, level),
+        None => deflate(data, level),
+    };
     let bad = || Error::Exec("deflate-pack: malformed manifest".into());
     let (manifest, members) = args.split_first().ok_or_else(bad)?;
     let mut m = Cursor(manifest);
@@ -585,8 +625,25 @@ mod tests {
         let (manifest, members) = plan_zlib(&pdf).unwrap();
         assert_eq!(members, vec![text, font]);
         let args: Vec<Vec<u8>> = [vec![manifest], members].concat();
-        assert_eq!(pack(&args).unwrap(), pdf);
+        assert_eq!(pack(&args, None).unwrap(), pdf);
         assert!(plan_zlib(b"x\x9c not a stream, just text with a header").is_none());
+    }
+
+    /// A memoised deflate is the deflate, asked once or again, at every
+    /// level; only members at or above the threshold are kept (E109).
+    #[test]
+    fn memoised_deflates_are_the_deflates() {
+        let memo = DeflateMemo::default();
+        let big: Vec<u8> = (0..MEMO_MIN / 8)
+            .flat_map(|i| format!("{:07}\n", i * 7919 % 1_000_003).into_bytes())
+            .collect();
+        for data in [&b"a member below the memo's threshold"[..], &big] {
+            for level in [6, 9, MEM9 + 9] {
+                assert_eq!(memo.deflate(data, level), deflate(data, level));
+                assert_eq!(memo.deflate(data, level), deflate(data, level));
+            }
+        }
+        assert_eq!(memo.0.lock().unwrap().len(), 3); // only the large member
     }
 
     /// gzip members (a .tar.gz, with a file name in the header; and two
@@ -610,7 +667,7 @@ mod tests {
         let (manifest, members) = plan_zlib(&file).unwrap();
         assert_eq!(members, vec![tar.clone(), more.to_vec()]);
         let args: Vec<Vec<u8>> = [vec![manifest], members].concat();
-        assert_eq!(pack(&args).unwrap(), file);
+        assert_eq!(pack(&args, None).unwrap(), file);
         let mut bad = gz(&tar, b"x");
         let n = bad.len();
         bad[n - 8] ^= 1; // CRC-32

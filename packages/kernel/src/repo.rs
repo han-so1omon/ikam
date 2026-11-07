@@ -105,9 +105,20 @@ pub struct Repo<S: Store> {
     /// E104), at the price of a two-pass ledger build and a prefix lookup per
     /// id. Reading always accepts both forms, so it can be switched at will.
     pub short_records: bool,
+    /// Contents larger than this skip the slow codecs (brotli) when repack
+    /// picks their encoding (E109). Off (`usize::MAX`) by default. Brotli
+    /// cannot use more than one core, so on a large content it bounds the
+    /// whole recompress: on four pandas source releases it took 44 s of a
+    /// 129 s repack for one 23.6 MB tar, and lost to zstd there (3% smaller,
+    /// but four times the decode work). Set, a large content can be stored
+    /// a few percent larger where brotli would have won.
+    pub slow_codec_max: usize,
     /// zstd level new encodings use (`dict::MEASURE_LEVEL` unless
     /// `recompress` is running).
     pub(crate) level: i32,
+    /// Large members' deflates, reused while a repack runs (E109); `None`
+    /// otherwise, so every other read and fsck does the full work.
+    pub(crate) deflate_memo: Option<std::sync::Arc<crate::container::DeflateMemo>>,
 }
 
 impl<S: Store> Repo<S> {
@@ -123,7 +134,9 @@ impl<S: Store> Repo<S> {
             search_rate: 0.0,
             search_sample: Vec::new(),
             short_records: false,
+            slow_codec_max: usize::MAX,
             level: crate::dict::MEASURE_LEVEL,
+            deflate_memo: None,
         }
     }
 
@@ -339,12 +352,21 @@ impl<S: Store> Repo<S> {
     pub(crate) fn eval(&self, func: &Id, args: &[Arg], cx: &mut Cx) -> Result<Vec<u8>, Error> {
         let mut inputs = Vec::with_capacity(args.len());
         for arg in args {
-            let bytes = self.rebuild(&arg.id(), cx)?;
             inputs.push(match *arg {
-                Arg::Whole(_) => bytes,
-                Arg::Range { id, start, len } => select(&bytes, start, len)
-                    .ok_or(Error::Corrupt(id))?
-                    .to_vec(),
+                Arg::Whole(id) => self.rebuild(&id, cx)?,
+                // A range is cut from the rebuilt content in place: a slice
+                // plan names its source once per range, and copying the whole
+                // source for each was most of reading a release's archive
+                // spliced from the one before (E109).
+                Arg::Range { id, start, len } => {
+                    if !cx.known.contains_key(&id) {
+                        self.rebuild(&id, cx)?;
+                    }
+                    let bytes = cx.known.get(&id).ok_or(Error::NotFound(id))?;
+                    select(bytes, start, len)
+                        .ok_or(Error::Corrupt(id))?
+                        .to_vec()
+                }
             });
         }
         let module = if func::is_builtin(func) {
@@ -352,7 +374,12 @@ impl<S: Store> Repo<S> {
         } else {
             Some(self.rebuild(func, cx)?)
         };
-        let (out, work) = func::run(func, module.as_deref(), &inputs)?;
+        let (out, work) = func::run(
+            func,
+            module.as_deref(),
+            &inputs,
+            self.deflate_memo.as_deref(),
+        )?;
         cx.work += work;
         Ok(out)
     }
