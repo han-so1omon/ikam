@@ -8,22 +8,15 @@ The goal (`docs/plans/2026-10-06-system-architecture.md`): take in data from any
 
 ## What is here
 
-There are two layers. They are not connected yet: no Python package calls the Rust kernel.
+The Rust kernel, `packages/kernel`, is a content-addressed store whose files reconstruct byte-for-byte:
+- dedup at data-driven boundaries, templates, zip and deflate-stream unpacking, compression with a trained dictionary and related-content contexts;
+- a ledger of verified derivations (`output = func(args)`), including deterministic WASM functions;
+- git-like history, gc, fsck and store-wide repacking;
+- claims, an unverified relation layer whose weights are measured.
 
-- **Rust kernel, `packages/kernel`** (the active work). A content-addressed store whose files reconstruct byte-for-byte:
-  - dedup at data-driven boundaries, templates, zip and deflate-stream unpacking, compression with a trained dictionary and related-content contexts;
-  - a ledger of verified derivations (`output = func(args)`), including deterministic WASM functions;
-  - git-like history, gc, fsck and store-wide repacking;
-  - claims, an unverified relation layer whose weights are measured.
+Every derivation is verified by reconstructing the exact bytes before it is recorded, so planners (including AI ones) can cost space but never correctness. Usage and design: `packages/kernel/README.md`, `docs/plans/2026-10-02-rust-kernel.md`.
 
-  Every derivation is verified by reconstructing the exact bytes before it is recorded, so planners (including AI ones) can cost space but never correctness. Usage and design: `packages/kernel/README.md`, `docs/plans/2026-10-02-rust-kernel.md`.
-- **Python packages** (unchanged since April 2026):
-  - `packages/ikam`: fragment and artifact models, codecs, sheet decomposition, and the `forja` ingestion and reconstruction pipeline;
-  - `packages/modelado`: the modeling framework (graph repositories on PostgreSQL, operators, semantic evaluation, embeddings);
-  - `packages/interacciones`: graph execution and multi-agent orchestration;
-  - `packages/mcp-ikam`: an MCP server over IKAM;
-  - `packages/ikam-graph-viewer`: a Three.js graph viewer;
-  - `packages/test/ikam-perf-report`: the package-level integration stack.
+The earlier Python packages (`ikam`, `modelado`, `interacciones`, `mcp-ikam`, `ikam-graph-viewer`, `test/ikam-perf-report`) were removed in November 2026; they are in git history. The benchmark's repo-history corpora read them from past commits, so they still need a full clone.
 
 Docs:
 - `docs/ikam/`: the normative IKAM specifications (fragment algebra, graph, staging, mutation).
@@ -57,7 +50,6 @@ Every file must read back byte-exact and fsck must be clean, or a run fails.
 The measured gap: storing all file types as one graph is only about 3% smaller than storing each type separately (7% on `north/tables`, the same records as xlsx, csv, json, markdown, docx and pdf). Sharing information across file types is the open work.
 
 Known limits:
-- The Python packages do not use the kernel.
 - About 30 experiment verdicts in `docs/experiments/registry.tsv` were measured under older objectives and have not been rechecked.
 
 ## Contributing
