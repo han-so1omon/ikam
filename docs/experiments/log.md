@@ -1727,3 +1727,14 @@ Newest last. Format and rules: `README.md`.
   - Real-world (`examples/realworld.rs`): click sdists **2,149,467 -> 433,893 B**, 0.205 of the best archiver (solid zstd 19: 2,114,069); every other real-world corpus byte-identical to E105. Repack 2.0 -> 21.7 s (the eight 1.3 MB tars are now planned).
   - Bench (two runs): every corpus byte-identical to E104's option-off runs (no fixture holds gzip), north 0.3035, cost score 0.2607 / 0.2521 against 0.2484 / 0.2608 for the same bytes before.
 - Verdict: **kept** (a capability added while both scores hold).
+
+### E107 parallel-recompress (store-level encodings on all cores)
+- Branch / parent: exp/107-parallel-recompress / E106
+- Question (from E105): repacking the 15 MB real PDF corpus took 65 s. Where does it go?
+- Profile (temporary timers, pdf corpus): reading content 0.5 s, dictionary training 4 s, the three re-plans (already parallel) 14 s, and `recompress` 51 s: `encode_cheapest` (zstd 19, brotli, raw) 33 s and related-content contexts 17 s, all on one core.
+- Change (`src/repack.rs`): `cheapest_encodings` computes `encode_cheapest` for every plain content before the loop, on all cores, largest first, each worker taking the next. It is a pure function of the bytes and the read model, so results do not depend on scheduling; the loop still checks each content against its id and uses the precomputed encoding. Contexts stay sequential, because each choice depends on the ones before. `examples/realworld.rs` now also prints the store before the first repack and peak memory.
+- Result:
+  - Real-world: every corpus byte-identical; repack wall time pdf 64.4 -> **43.9 s**, pptx 17.9 -> 14.1 s, docx 7.4 -> 5.5 s, sheets 8.2 -> 6.4 s, tables 1.8 -> 0.8 s (4 cores).
+  - Bench (two runs): every corpus byte-identical, north 0.3035, cost score 0.2533 / 0.2546 against E106's 0.2607 / 0.2521. The cost score counts CPU time on all threads, so it does not reward parallelism; it holds.
+  - Also measured: ingest alone stores the PDF corpus in 5,635,667 B in 8 s (already below zstd 3 with a dictionary, 6,336,442); the repack takes it to 4,826,271. Peak memory is about 570 MiB for 15 MB of PDFs, the next real-world limit to look at.
+- Verdict: **kept** (a wall-clock speedup; bytes identical, both scores hold).

@@ -34,6 +34,9 @@ use crate::{Arg, Derivation, Error, Id, MemStore, Object, Repo, Store, func, tem
 /// Seed neighbours considered for each star centre.
 const STAR_CANDIDATES: usize = 64;
 
+/// Contents and their chosen encodings.
+type Encodings = Vec<(Id, Vec<u8>)>;
+
 #[derive(Debug, PartialEq, Eq)]
 pub struct Repacked {
     /// Bytes of content and derivation objects before and after.
@@ -402,8 +405,10 @@ impl<S: Store + Sync> Repo<S> {
         let dict = self.dictionary().map(|(id, _)| *id);
         let model = self.read_model(roots)?;
         let bases = self.related_bases(dict)?;
+        let ids = self.store.ids()?;
+        let mut cheapest = self.cheapest_encodings(&ids, dict, &model)?;
         let (mut used, mut related) = (HashSet::new(), HashSet::new());
-        for id in self.store.ids()? {
+        for id in ids {
             let stored = self.store.read(&id)?;
             let encoded = match stored.first() {
                 Some(b'B' | b'W' | b'Z' | b'Y') => {
@@ -416,7 +421,10 @@ impl<S: Store + Sync> Repo<S> {
                         // A dictionary is never encoded against a dictionary.
                         true => zstd_frame(&bytes, &[], STORE_LEVEL)
                             .map_or(stored.clone(), |z| [&b"Z"[..], &z].concat()),
-                        false => self.encode_cheapest(&bytes, reads),
+                        false => match cheapest.remove(&id) {
+                            Some(encoded) => encoded,
+                            None => self.encode_cheapest(&bytes, reads),
+                        },
                     };
                     let mut cost = self.cost(&encoded, reads);
                     // A group may instead be stored as blocks, each its own
@@ -504,6 +512,57 @@ impl<S: Store + Sync> Repo<S> {
         self.level = MEASURE_LEVEL;
         self.reset_projections();
         Ok(())
+    }
+
+    /// `encode_cheapest` of every plain content but the dictionary, computed
+    /// on all cores (E107): it is pure, so the result does not depend on
+    /// scheduling, and it was most of a repack of real PDFs. Contexts
+    /// (below) stay sequential: each choice depends on the ones before.
+    fn cheapest_encodings(
+        &self,
+        ids: &[Id],
+        dict: Option<Id>,
+        model: &ReadModel,
+    ) -> Result<HashMap<Id, Vec<u8>>, Error> {
+        let mut plain = Vec::new();
+        for id in ids.iter().filter(|&&id| Some(id) != dict) {
+            let stored = self.store.read(id)?;
+            if matches!(stored.first(), Some(b'B' | b'W' | b'Z' | b'Y')) {
+                plain.push((Reverse(stored.len()), *id));
+            }
+        }
+        // Largest first, each worker taking the next: one large content
+        // must not leave the other cores idle.
+        plain.sort();
+        let next = std::sync::atomic::AtomicUsize::new(0);
+        let threads = std::thread::available_parallelism().map_or(1, |n| n.get());
+        let parts: Vec<Result<Encodings, Error>> = std::thread::scope(|scope| {
+            let workers: Vec<_> = (0..threads.min(plain.len()))
+                .map(|_| {
+                    let (plain, next) = (&plain, &next);
+                    scope.spawn(move || {
+                        let mut out = Vec::new();
+                        while let Some((_, id)) =
+                            plain.get(next.fetch_add(1, std::sync::atomic::Ordering::Relaxed))
+                        {
+                            let bytes = self.decode_plain(id, &self.store.read(id)?)?;
+                            let reads = model.reads(id, bytes.len());
+                            out.push((*id, self.encode_cheapest(&bytes, reads)));
+                        }
+                        Ok(out)
+                    })
+                })
+                .collect();
+            workers
+                .into_iter()
+                .map(|w| w.join().expect("encoder panicked"))
+                .collect()
+        });
+        let mut out = HashMap::new();
+        for part in parts {
+            out.extend(part?);
+        }
+        Ok(out)
     }
 
     /// How often each stored content is decoded when every root is read

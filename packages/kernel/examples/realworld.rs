@@ -75,6 +75,8 @@ fn read_all(dir: &Path) -> Vec<(String, Vec<u8>)> {
 }
 
 struct Run {
+    /// Stored bytes after ingest, before the first repack.
+    ingest_stored: usize,
     input: usize,
     distinct: usize,
     files: usize,
@@ -98,6 +100,7 @@ fn run(c: &Corpus, short: bool, weight: f64) -> Run {
         repo.commit("main", tree, &msg).unwrap();
     }
     let ingest_ms = t.elapsed().as_millis();
+    let ingest_stored = stored_bytes(&repo);
     let t = Instant::now();
     repo.repack().unwrap();
     let repack_ms = t.elapsed().as_millis();
@@ -126,6 +129,7 @@ fn run(c: &Corpus, short: bool, weight: f64) -> Run {
         stored += e.len();
     }
     Run {
+        ingest_stored,
         input,
         distinct: distinct.values().sum(),
         files,
@@ -137,6 +141,26 @@ fn run(c: &Corpus, short: bool, weight: f64) -> Run {
         fsck,
         kinds,
     }
+}
+
+fn stored_bytes(repo: &Repo<MemStore>) -> usize {
+    let ids = repo.store().ids().unwrap();
+    ids.iter()
+        .map(|id| repo.store().read(id).unwrap().len())
+        .sum()
+}
+
+/// Peak resident memory of this process so far (Linux), in KiB.
+fn peak_kib() -> usize {
+    let status = std::fs::read_to_string("/proc/self/status").unwrap_or_default();
+    let line = status
+        .lines()
+        .find(|l| l.starts_with("VmHWM:"))
+        .unwrap_or("");
+    line.split_whitespace()
+        .nth(1)
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0)
 }
 
 /// Archivers on the distinct file contents (what a deduplicating store has
@@ -208,13 +232,15 @@ fn main() {
                 .map(|(k, v)| format!("\"{k}\":{v}"))
                 .collect();
             println!(
-                "{{\"corpus\":\"{}\",\"versions\":{},\"files\":{},\"input\":{},\"distinct\":{},\"stored\":{},\"vs_best\":{:.4},\"baselines\":{{{}}},\"ingest_ms\":{},\"repack_ms\":{},\"read_ms\":{},\"exact\":{},\"fsck\":{},\"by_kind\":{{{}}}}}",
+                "{{\"corpus\":\"{}\",\"versions\":{},\"files\":{},\"input\":{},\"distinct\":{},\"stored\":{},\"ingest_stored\":{},\"peak_kib\":{},\"vs_best\":{:.4},\"baselines\":{{{}}},\"ingest_ms\":{},\"repack_ms\":{},\"read_ms\":{},\"exact\":{},\"fsck\":{},\"by_kind\":{{{}}}}}",
                 c.name,
                 c.versions.len(),
                 r.files,
                 r.input,
                 r.distinct,
                 r.stored,
+                r.ingest_stored,
+                peak_kib(),
                 r.stored as f64 / best as f64,
                 b.join(","),
                 r.ingest_ms,
@@ -226,7 +252,7 @@ fn main() {
             );
         } else {
             println!(
-                "{:<16} v={:<2} files={:<4} input={:>10} distinct={:>10} kernel={:>9} zstd3+dict={:>9} zstd19={:>9} zstd19-solid={:>9} xz9-solid={:>9} vs_best={:.3} ingest={}ms repack={}ms read={}ms exact={} fsck={}",
+                "{:<16} v={:<2} files={:<4} input={:>10} distinct={:>10} kernel={:>9} zstd3+dict={:>9} zstd19={:>9} zstd19-solid={:>9} xz9-solid={:>9} vs_best={:.3} before_repack={} ingest={}ms repack={}ms read={}ms peak={}MiB exact={} fsck={}",
                 c.name,
                 c.versions.len(),
                 r.files,
@@ -238,9 +264,11 @@ fn main() {
                 base[2].1,
                 base[3].1,
                 r.stored as f64 / best as f64,
+                r.ingest_stored,
                 r.ingest_ms,
                 r.repack_ms,
                 r.read_ms,
+                peak_kib() / 1024,
                 r.exact,
                 r.fsck
             );
