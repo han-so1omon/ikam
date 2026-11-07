@@ -28,6 +28,7 @@ pub mod snapshot;
 mod store;
 mod template;
 mod wasm;
+pub mod worktree;
 
 pub use dict::decode_cost;
 pub use id::Id;
@@ -38,6 +39,7 @@ pub use repack::Repacked;
 pub use repo::{DEFAULT_READ_WEIGHT, Form, Put, Repo};
 pub use search::{SEARCH_REF, SearchIndex};
 pub use store::{FsStore, MemStore, Store};
+pub use worktree::Edit;
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {

@@ -140,13 +140,13 @@ pub fn grep<S: Store>(repo: &Repo<S>, root: &Id, pattern: &str) -> Result<Vec<Hi
 
 /// A part holding XML: a member, or several members the kernel stores as
 /// one content (their declarations anywhere in it).
-fn looks_like_xml(bytes: &[u8]) -> bool {
+pub fn looks_like_xml(bytes: &[u8]) -> bool {
     memchr::memmem::find(bytes, b"<?xml").is_some()
 }
 
 /// The character data of an XML document: tags dropped, a line break after
 /// each closed paragraph (`</p>`, `</w:p>`, `</a:p>`), entities decoded.
-fn xml_text(bytes: &[u8]) -> String {
+pub fn xml_text(bytes: &[u8]) -> String {
     let src = String::from_utf8_lossy(bytes);
     let mut out = String::new();
     let mut rest = src.as_ref();
@@ -240,7 +240,7 @@ pub fn readable_text<S: Store>(
 
 /// A PDF content stream (a part the kernel stores inflated): text objects
 /// with show-text operators.
-fn is_pdf_text(bytes: &[u8]) -> bool {
+pub fn is_pdf_text(bytes: &[u8]) -> bool {
     let has = |op: &[u8]| memchr::memmem::find(bytes, op).is_some();
     has(b"BT") && (has(b"Tj") || has(b"TJ"))
 }
@@ -248,7 +248,7 @@ fn is_pdf_text(bytes: &[u8]) -> bool {
 /// The literal strings a PDF content stream shows, a line per text line
 /// (broken at `Td`, `TD`, `T*`, `Tm`, `ET`; a large `TJ` kerning gap reads
 /// as a space). Strings in a font's own encoding (hex, CID) are skipped.
-fn pdf_text(bytes: &[u8]) -> String {
+pub fn pdf_text(bytes: &[u8]) -> String {
     let (mut out, mut line) = (String::new(), Vec::new());
     let mut i = 0;
     while i < bytes.len() {

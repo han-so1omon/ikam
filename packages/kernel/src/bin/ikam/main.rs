@@ -1,12 +1,20 @@
 //! `ikam` CLI over a filesystem store.
 
+mod ask;
 mod corpus;
+mod dav;
+mod http;
+mod json;
+mod live;
 mod serve;
+mod text;
+mod ui;
 
-use std::io::Write;
-use std::path::Path;
+use std::io::{Read, Write};
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
-use std::time::Instant;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use ikam_kernel::{Arg, FsStore, Id, Object, Repo, snapshot};
 
@@ -38,7 +46,22 @@ const USAGE: &str = "usage: ikam [--store DIR] [--short-records] [--slow-codec-m
   relate ID [K]                    the K stored contents most informative about ID
   promote CLAIM                    derive the claim's subject from its object, if smaller
   repack                           re-plan storage of all live content; applied
-                                   only if smaller and fully verified";
+                                   only if smaller and fully verified
+  live [PORT] [--watch DIR[:PREFIX]]... [--llm] [--commit-after MS]
+                                   run REF (default main) as a live filesystem:
+                                   WebDAV at http://127.0.0.1:PORT/dav/ (mount it
+                                   in Finder: Go > Connect to Server), a web page
+                                   at /, and each --watch folder mirrored into the
+                                   tree as it changes. Edits commit after MS of
+                                   quiet (default 1500). --llm lets questions be
+                                   answered by Claude (needs ANTHROPIC_API_KEY).
+  write PATH [FILE|-]              store FILE (or stdin) at PATH in REF, commit
+  rm PATH | mkdir PATH             remove a file or folder / make a folder in REF
+  mv FROM TO | cp FROM TO          rename or copy a file or folder in REF
+  search TEXT                      files of REF whose text contains TEXT (also the
+                                   text inside docx, xlsx, pdf and tar members)
+  ask QUESTION [--llm]             the passages of REF that answer QUESTION best;
+                                   with --llm, an answer from them by Claude";
 
 fn main() -> ExitCode {
     quiet_on_closed_stdout();
@@ -258,9 +281,174 @@ fn run(store_dir: &str, args: &mut Vec<String>) -> Result<(), String> {
             serve::serve(&repo, port)?;
         }
         Some("gc") => println!("deleted {} objects", repo.gc().map_err(err)?),
+        Some("live") => {
+            drop(repo);
+            live_cmd(store_dir, &refname, &args[1..])?;
+        }
+        Some(cmd @ ("write" | "rm" | "mkdir" | "mv" | "cp")) => {
+            let op = match cmd {
+                "write" => {
+                    let mut bytes = Vec::new();
+                    match args.get(2).map(String::as_str) {
+                        None | Some("-") => {
+                            std::io::stdin().read_to_end(&mut bytes).map_err(err)?;
+                        }
+                        Some(f) => bytes = std::fs::read(f).map_err(err)?,
+                    }
+                    live::Op::Put(arg(1)?, bytes)
+                }
+                "rm" => live::Op::Remove(arg(1)?),
+                "mkdir" => live::Op::Mkdir(arg(1)?),
+                "mv" => live::Op::Rename(arg(1)?, arg(2)?),
+                _ => live::Op::Copy(arg(1)?, arg(2)?),
+            };
+            drop(repo);
+            let mut l = live::Live::open(store_dir, &refname)?;
+            if cmd == "rm" && l.stat(&live::norm(&arg(1)?))?.is_none() {
+                return Err(format!("{}: no such file or folder", arg(1)?));
+            }
+            let t = Instant::now();
+            let cost = l.apply(vec![op])?;
+            let commit = l.flush(true)?;
+            match commit {
+                Some(c) => println!("{c}"),
+                None => println!("no change"),
+            }
+            eprintln!(
+                "new_bytes={} store_ms={:.1} tree_ms={:.1} total_ms={:.1}",
+                cost.new_bytes,
+                cost.store_ms,
+                cost.tree_ms,
+                t.elapsed().as_secs_f64() * 1e3
+            );
+        }
+        Some("search") => {
+            let q = arg(1)?;
+            drop(repo);
+            let mut l = live::Live::open(store_dir, &refname)?;
+            l.index_all(false)?;
+            let t = Instant::now();
+            let (hits, total) = text::search(&l.docs, &q, usize::MAX);
+            for h in hits {
+                if h.part.is_empty() {
+                    println!("{}", h.path);
+                } else {
+                    println!("{} ({})", h.path, h.part);
+                }
+                for (n, line) in h.lines {
+                    println!("  {n}: {line}");
+                }
+            }
+            eprintln!("{total} file(s), {:.1} ms", t.elapsed().as_secs_f64() * 1e3);
+        }
+        Some("ask") => {
+            let llm = args.iter().any(|a| a == "--llm");
+            let q = args[1..]
+                .iter()
+                .filter(|a| *a != "--llm")
+                .cloned()
+                .collect::<Vec<_>>()
+                .join(" ");
+            if q.is_empty() {
+                return Err(USAGE.into());
+            }
+            drop(repo);
+            let mut l = live::Live::open(store_dir, &refname)?;
+            l.index_all(false)?;
+            let passages = text::retrieve(&l.docs, &q, 8);
+            if llm {
+                println!("{}\n", ask::answer(&q, &passages)?);
+            }
+            for (i, p) in passages.iter().enumerate() {
+                println!("{}", ask::source_label(i + 1, p));
+                if !llm {
+                    for line in p.text.lines().take(6) {
+                        println!("    {line}");
+                    }
+                }
+            }
+        }
         _ => return Err(USAGE.into()),
     }
     Ok(())
+}
+
+/// `ikam live`: serve the ref as a filesystem until stopped.
+fn live_cmd(store_dir: &str, refname: &str, args: &[String]) -> Result<(), String> {
+    let mut args = args.to_vec();
+    let mut watches = Vec::new();
+    while let Some(w) = take_flag(&mut args, "--watch") {
+        let (dir, prefix) = match w.rsplit_once(':') {
+            Some((d, p)) if !d.is_empty() && Path::new(d).is_dir() => {
+                (d.to_string(), live::norm(p))
+            }
+            _ => (w.clone(), String::new()),
+        };
+        if !Path::new(&dir).is_dir() {
+            return Err(format!("--watch {dir}: not a folder"));
+        }
+        watches.push((PathBuf::from(dir), prefix));
+    }
+    let commit_after = take_flag(&mut args, "--commit-after")
+        .map(|m| {
+            m.parse::<u64>()
+                .map_err(|_| "--commit-after MS".to_string())
+        })
+        .transpose()?;
+    let llm = match args.iter().position(|a| a == "--llm") {
+        Some(i) => {
+            args.remove(i);
+            true
+        }
+        None => false,
+    };
+    let port: u16 = args.first().map_or(Ok(8737), |p| p.parse()).map_err(err)?;
+    let mut l = live::Live::open(store_dir, refname)?;
+    if let Some(ms) = commit_after {
+        l.commit_after = Duration::from_millis(ms);
+    }
+    l.llm = llm;
+    if llm && !ask::key_available() {
+        eprintln!("--llm: ANTHROPIC_API_KEY is not set; questions will show sources only");
+    }
+    l.index_all(true)?;
+    let live = Arc::new(Mutex::new(l));
+    {
+        let live = live.clone();
+        std::thread::spawn(move || {
+            loop {
+                std::thread::sleep(Duration::from_millis(250));
+                if let Err(e) = live.lock().unwrap().flush(false) {
+                    eprintln!("commit failed: {e}");
+                }
+            }
+        });
+    }
+    for (dir, prefix) in watches {
+        eprintln!("watching {} into /{prefix}", dir.display());
+        let live = live.clone();
+        std::thread::spawn(move || live::watch(live, dir, prefix, Duration::from_millis(500)));
+    }
+    let hosts = [format!("127.0.0.1:{port}"), format!("localhost:{port}")];
+    let handler = Arc::new(move |req: http::Request| {
+        // A page on another site can point a name it controls at
+        // 127.0.0.1 (DNS rebinding); its requests carry that name.
+        if !req
+            .header("host")
+            .is_some_and(|h| hosts.iter().any(|ok| ok == h))
+        {
+            return http::Response::text(403, "unknown Host");
+        }
+        if req.path == dav::PREFIX || req.path.starts_with("/dav/") {
+            dav::handle(&mut live.lock().unwrap(), &req)
+        } else {
+            ui::handle(&live, &req)
+        }
+    });
+    eprintln!(
+        "live on http://127.0.0.1:{port}/ (WebDAV: http://127.0.0.1:{port}/dav/), ref {refname}"
+    );
+    http::serve(port, handler)
 }
 
 fn take_flag(args: &mut Vec<String>, flag: &str) -> Option<String> {

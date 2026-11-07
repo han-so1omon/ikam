@@ -174,7 +174,7 @@ fn file_page<S: Store>(repo: &Repo<S>, id: Id, path: &str) -> Result<Page, Strin
 
 /// How the kernel holds a file: as stored bytes, or reconstructed by a
 /// verified derivation from other contents.
-fn storage<S: Store>(repo: &Repo<S>, id: &Id) -> Result<String, String> {
+pub fn storage<S: Store>(repo: &Repo<S>, id: &Id) -> Result<String, String> {
     let derivations = repo.derivations(id).map_err(err)?;
     if derivations.is_empty() {
         let stored = repo.store().read(id).map(|e| e.len()).unwrap_or(0);
@@ -268,7 +268,7 @@ fn page(title: &str, body: &str) -> Vec<u8> {
     .into_bytes()
 }
 
-const STYLE: &str = "body{font:15px/1.45 system-ui,sans-serif;max-width:60rem;margin:1rem auto;padding:0 1rem;color:#222;background:#fff}\
+pub const STYLE: &str = "body{font:15px/1.45 system-ui,sans-serif;max-width:60rem;margin:1rem auto;padding:0 1rem;color:#222;background:#fff}\
 pre{background:#f5f5f5;padding:.6rem;overflow-x:auto;white-space:pre-wrap}td{padding:.1rem .8rem .1rem 0}.n{text-align:right;font-variant-numeric:tabular-nums}\
 .s{color:#555}input{font:inherit;padding:.25rem}@media(prefers-color-scheme:dark){body{background:#111;color:#ddd}pre{background:#1d1d1d}a{color:#8ab4f8}.s{color:#aaa}}";
 
