@@ -96,8 +96,10 @@ pub fn grep<S: Store>(repo: &Repo<S>, root: &Id, pattern: &str) -> Result<Vec<Hi
     let all = files(repo, root)?;
     // Each searched content and the files it is (part of).
     let mut owners: HashMap<Id, Vec<usize>> = HashMap::new();
+    let mut whole = std::collections::HashSet::new();
     for (k, f) in all.iter().enumerate() {
         owners.entry(f.id).or_default().push(k);
+        whole.insert(f.id);
         for d in repo.derivations(&f.id)?.iter().take(1) {
             for a in &d.args {
                 owners.entry(a.id()).or_default().push(k);
@@ -109,7 +111,16 @@ pub fn grep<S: Store>(repo: &Repo<S>, root: &Id, pattern: &str) -> Result<Vec<Hi
     let (found, _) = repo.search(pattern.as_bytes(), &ids, index.as_ref())?;
     let mut lines: BTreeMap<usize, Vec<(usize, String)>> = BTreeMap::new();
     for id in found {
-        let text = matching_lines(&repo.read_content(&id)?, pattern);
+        let bytes = repo.read_content(&id)?;
+        // A part of a file (a docx's XML member) is searched as the text a
+        // reader sees, not its markup; a file itself is searched as it is.
+        let text = match whole.contains(&id) {
+            false if looks_like_xml(&bytes) => matching_lines(xml_text(&bytes).as_bytes(), pattern),
+            _ => matching_lines(&bytes, pattern),
+        };
+        if text.is_empty() && !whole.contains(&id) {
+            continue;
+        }
         for &k in &owners[&id] {
             let l = lines.entry(k).or_default();
             l.extend(text.iter().cloned());
@@ -124,6 +135,66 @@ pub fn grep<S: Store>(repo: &Repo<S>, root: &Id, pattern: &str) -> Result<Vec<Hi
             lines,
         })
         .collect())
+}
+
+/// A part holding XML: a member, or several members the kernel stores as
+/// one content (their declarations anywhere in it).
+fn looks_like_xml(bytes: &[u8]) -> bool {
+    memchr::memmem::find(bytes, b"<?xml").is_some()
+}
+
+/// The character data of an XML document: tags dropped, a line break after
+/// each closed paragraph (`</p>`, `</w:p>`, `</a:p>`), entities decoded.
+fn xml_text(bytes: &[u8]) -> String {
+    let src = String::from_utf8_lossy(bytes);
+    let mut out = String::new();
+    let mut rest = src.as_ref();
+    // A part may begin inside a tag: drop that tag's tail.
+    if let Some(gt) = rest.find('>')
+        && rest.find('<').is_none_or(|lt| gt < lt)
+    {
+        rest = &rest[gt + 1..];
+    }
+    while let Some(open) = rest.find('<') {
+        out.push_str(&rest[..open]);
+        let after = &rest[open + 1..];
+        // Only `<name`, `</`, `<?` and `<!` open a tag; other `<` bytes (in
+        // binary around the members) are kept as they are.
+        let opens = after
+            .chars()
+            .next()
+            .is_some_and(|c| c.is_ascii_alphabetic() || "/?!_".contains(c));
+        if !opens {
+            out.push('<');
+            rest = after;
+            continue;
+        }
+        // A tag the part ends inside of is dropped with the rest.
+        let Some(close) = after.find('>') else {
+            return decode_entities(&out);
+        };
+        let tag = &after[..close];
+        if tag == "/p" || tag.starts_with('/') && tag.ends_with(":p") {
+            out.push('\n');
+        }
+        rest = &after[close + 1..];
+    }
+    out.push_str(rest);
+    decode_entities(&out)
+}
+
+/// Entities decoded; lines holding binary (bytes around the members, or a
+/// tag the part begins inside of after them) dropped.
+fn decode_entities(s: &str) -> String {
+    let text: String = s
+        .split_inclusive('\n')
+        .filter(|l| !l.contains(['\0', '\u{fffd}']))
+        .collect();
+    text.replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&quot;", "\"")
+        .replace("&apos;", "'")
+        .replace("&amp;", "&")
 }
 
 fn matching_lines(bytes: &[u8], pattern: &str) -> Vec<(usize, String)> {
@@ -209,4 +280,23 @@ fn kind_name(tag: Option<&u8>) -> String {
 
 pub fn err(e: impl std::fmt::Display) -> String {
     e.to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn xml_parts_search_as_text() {
+        let doc = br#"<?xml version="1.0"?><w:document><w:body><w:p><w:r><w:t>Q3 rev</w:t></w:r><w:r><w:t>enue &amp; costs</w:t></w:r></w:p><w:p><w:t>next</w:t></w:p></w:body></w:document>"#;
+        assert!(looks_like_xml(doc));
+        assert_eq!(xml_text(doc), "Q3 revenue & costs\nnext\n");
+        assert!(matching_lines(xml_text(doc).as_bytes(), "document").is_empty());
+        assert_eq!(xml_text(b"ttr=\"x\">Hi<b>there</b>"), "Hithere");
+        assert_eq!(
+            xml_text(b"<?xml?><p>a < b</p><w:settings xmlns:r=\"x"),
+            "a < b\n"
+        );
+        assert_eq!(matching_lines(xml_text(doc).as_bytes(), "revenue")[0].0, 1);
+    }
 }

@@ -41,6 +41,7 @@ const USAGE: &str = "usage: ikam [--store DIR] [--short-records] [--slow-codec-m
                                    only if smaller and fully verified";
 
 fn main() -> ExitCode {
+    quiet_on_closed_stdout();
     let mut args: Vec<String> = std::env::args().skip(1).collect();
     let store_dir = take_flag(&mut args, "--store").unwrap_or_else(|| ".ikam".into());
     match run(&store_dir, &mut args) {
@@ -50,6 +51,23 @@ fn main() -> ExitCode {
             ExitCode::FAILURE
         }
     }
+}
+
+/// `ikam ls -r | head` ends with stdout closed: exit quietly, as other
+/// command-line tools do, instead of printing a panic.
+fn quiet_on_closed_stdout() {
+    let default = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let msg = info
+            .payload()
+            .downcast_ref::<String>()
+            .map(String::as_str)
+            .unwrap_or("");
+        if msg.starts_with("failed printing to stdout") && msg.contains("Broken pipe") {
+            std::process::exit(141);
+        }
+        default(info)
+    }));
 }
 
 fn run(store_dir: &str, args: &mut Vec<String>) -> Result<(), String> {
