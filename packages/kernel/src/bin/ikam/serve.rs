@@ -159,7 +159,15 @@ fn file_page<S: Store>(repo: &Repo<S>, id: Id, path: &str) -> Result<Page, Strin
     html += &storage(repo, &id)?;
     match std::str::from_utf8(&bytes[..bytes.len().min(PREVIEW)]) {
         Ok(text) => html += &format!("<pre>{}</pre>", esc(text)),
-        Err(_) => html += "<p>Binary file.</p>",
+        Err(_) => match corpus::readable_text(repo, &id, PREVIEW).map_err(err)? {
+            Some(text) => {
+                html += &format!(
+                    "<p class=s>Binary file; the text in its parts:</p><pre>{}</pre>",
+                    esc(&text)
+                )
+            }
+            None => html += "<p>Binary file.</p>",
+        },
     }
     Ok(Page::Html(format!("ikam: {path}"), html))
 }

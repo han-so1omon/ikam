@@ -116,6 +116,7 @@ pub fn grep<S: Store>(repo: &Repo<S>, root: &Id, pattern: &str) -> Result<Vec<Hi
         // reader sees, not its markup; a file itself is searched as it is.
         let text = match whole.contains(&id) {
             false if looks_like_xml(&bytes) => matching_lines(xml_text(&bytes).as_bytes(), pattern),
+            false if is_pdf_text(&bytes) => matching_lines(pdf_text(&bytes).as_bytes(), pattern),
             _ => matching_lines(&bytes, pattern),
         };
         if text.is_empty() && !whole.contains(&id) {
@@ -183,18 +184,134 @@ fn xml_text(bytes: &[u8]) -> String {
     decode_entities(&out)
 }
 
-/// Entities decoded; lines holding binary (bytes around the members, or a
-/// tag the part begins inside of after them) dropped.
+/// Entities decoded, lines trimmed; blank lines and lines holding binary
+/// (bytes around the members, or a tag the part begins inside of after
+/// them) dropped.
 fn decode_entities(s: &str) -> String {
     let text: String = s
-        .split_inclusive('\n')
-        .filter(|l| !l.contains(['\0', '\u{fffd}']))
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty() && !l.contains(['\0', '\u{fffd}']))
+        .flat_map(|l| [l, "\n"])
         .collect();
     text.replace("&lt;", "<")
         .replace("&gt;", ">")
         .replace("&quot;", "\"")
         .replace("&apos;", "'")
         .replace("&amp;", "&")
+}
+
+/// The text a reader sees in a binary file's stored parts (a docx's XML
+/// members, a PDF's content streams), for a preview; `None` if it has none.
+pub fn readable_text<S: Store>(
+    repo: &Repo<S>,
+    id: &Id,
+    max: usize,
+) -> Result<Option<String>, Error> {
+    let mut out = String::new();
+    let mut seen = std::collections::HashSet::new();
+    for d in repo.derivations(id)?.iter().take(1) {
+        for a in &d.args {
+            if out.len() >= max || !seen.insert(a.id()) {
+                continue;
+            }
+            let bytes = repo.read_content(&a.id())?;
+            let text = if looks_like_xml(&bytes) {
+                xml_text(&bytes)
+            } else if is_pdf_text(&bytes) {
+                pdf_text(&bytes)
+            } else {
+                continue;
+            };
+            let text = text.trim();
+            if !text.is_empty() {
+                out.push_str(text);
+                out.push_str("\n\n");
+            }
+        }
+    }
+    let mut end = out.len().min(max);
+    while !out.is_char_boundary(end) {
+        end -= 1;
+    }
+    out.truncate(end);
+    Ok((!out.trim().is_empty()).then_some(out))
+}
+
+/// A PDF content stream (a part the kernel stores inflated): text objects
+/// with show-text operators.
+fn is_pdf_text(bytes: &[u8]) -> bool {
+    let has = |op: &[u8]| memchr::memmem::find(bytes, op).is_some();
+    has(b"BT") && (has(b"Tj") || has(b"TJ"))
+}
+
+/// The literal strings a PDF content stream shows, a line per text line
+/// (broken at `Td`, `TD`, `T*`, `Tm`, `ET`; a large `TJ` kerning gap reads
+/// as a space). Strings in a font's own encoding (hex, CID) are skipped.
+fn pdf_text(bytes: &[u8]) -> String {
+    let (mut out, mut line) = (String::new(), Vec::new());
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'(' => {
+                let mut depth = 1;
+                i += 1;
+                while i < bytes.len() && depth > 0 {
+                    match bytes[i] {
+                        b'\\' if i + 1 < bytes.len() => {
+                            i += 1;
+                            line.push(match bytes[i] {
+                                b'n' | b'r' => b' ',
+                                b't' => b'\t',
+                                c => c,
+                            });
+                        }
+                        b'(' => {
+                            depth += 1;
+                            line.push(b'(');
+                        }
+                        b')' => {
+                            depth -= 1;
+                            if depth > 0 {
+                                line.push(b')');
+                            }
+                        }
+                        c => line.push(c),
+                    }
+                    i += 1;
+                }
+                continue;
+            }
+            b'-' | b'0'..=b'9' | b'.' => {
+                let start = i;
+                while i < bytes.len() && matches!(bytes[i], b'-' | b'0'..=b'9' | b'.') {
+                    i += 1;
+                }
+                let gap = std::str::from_utf8(&bytes[start..i])
+                    .ok()
+                    .and_then(|n| n.parse::<f32>().ok());
+                if gap.is_some_and(|g| g <= -200.0) && !line.is_empty() {
+                    line.push(b' ');
+                }
+                continue;
+            }
+            b'T' | b'E' if i + 1 < bytes.len() => {
+                let op = &bytes[i..i + 2];
+                if [&b"Td"[..], b"TD", b"T*", b"Tm", b"ET"].contains(&op) && !line.is_empty() {
+                    out.push_str(&String::from_utf8_lossy(&line));
+                    out.push('\n');
+                    line.clear();
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    if !line.is_empty() {
+        out.push_str(&String::from_utf8_lossy(&line));
+        out.push('\n');
+    }
+    out
 }
 
 fn matching_lines(bytes: &[u8], pattern: &str) -> Vec<(usize, String)> {
@@ -292,11 +409,21 @@ mod tests {
         assert!(looks_like_xml(doc));
         assert_eq!(xml_text(doc), "Q3 revenue & costs\nnext\n");
         assert!(matching_lines(xml_text(doc).as_bytes(), "document").is_empty());
-        assert_eq!(xml_text(b"ttr=\"x\">Hi<b>there</b>"), "Hithere");
+        assert_eq!(xml_text(b"ttr=\"x\">Hi<b>there</b>"), "Hithere\n");
         assert_eq!(
             xml_text(b"<?xml?><p>a < b</p><w:settings xmlns:r=\"x"),
             "a < b\n"
         );
         assert_eq!(matching_lines(xml_text(doc).as_bytes(), "revenue")[0].0, 1);
+        assert_eq!(xml_text(b"<p>a</p>\0\0xmlns:r=\"x\""), "a\n");
+    }
+
+    #[test]
+    fn pdf_streams_search_as_text() {
+        let s = b"BT\n/F1 12 Tf\n(1.\\ Strip\\ the\\ cable) Tj\n0 -14 Td\n[(Hel) -20 (lo \\(world\\))] TJ\n0 -14 Td\nET\n";
+        assert!(is_pdf_text(s));
+        assert_eq!(pdf_text(s), "1. Strip the cable\nHello (world)\n");
+        let one = b"BT /F32 20.6 Tf 89.2 690.6 Td [(1)-550(Y)92(our)-367(Chapter)]TJ 0 -36.9 Td [(Lorem)-331(ipsum)]TJ ET";
+        assert_eq!(pdf_text(one), "1 Your Chapter\nLorem ipsum\n");
     }
 }
