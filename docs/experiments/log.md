@@ -1738,3 +1738,14 @@ Newest last. Format and rules: `README.md`.
   - Bench (two runs): every corpus byte-identical, north 0.3035, cost score 0.2533 / 0.2546 against E106's 0.2607 / 0.2521. The cost score counts CPU time on all threads, so it does not reward parallelism; it holds.
   - Also measured: ingest alone stores the PDF corpus in 5,635,667 B in 8 s (already below zstd 3 with a dictionary, 6,336,442); the repack takes it to 4,826,271. Peak memory is about 570 MiB for 15 MB of PDFs, the next real-world limit to look at.
 - Verdict: **kept** (a wall-clock speedup; bytes identical, both scores hold).
+
+### E108 scale-profile (four pandas releases: where the time goes)
+- Branch / parent: exp/108-scale-profile / E107
+- Question: does the kernel hold up on a larger real corpus, and what limits it?
+- Corpus: `realworld/fetch.py --large` adds the pandas source archives 2.2.0-2.2.3 (four tar.gz of about 4.4 MB each, 23.6 MB of tar inside each).
+- Result (`examples/realworld.rs`, read_weight default, 4 cores): 17,583,071 B -> **3,270,055 B**, 0.204 of the best archiver (xz 9 solid 16,001,344; the gzip'd files barely recompress as they are); exact, fsck clean. Ingest 70 s (store 4,744,677 B before repack), repack **417 s**, reading every file back 26 s, peak memory **842 MiB**.
+- Profile (temporary timers, two releases, cumulative): reading contents 13.5 s, dictionaries 21.6 s, the three re-plans 111.9 s, recompress 180 s (of which `cheapest_encodings` 51 s), total 198 s.
+  - The re-plans (90 s) re-ingest every content in fresh stores, so each one re-inflates and re-plans every tar member again.
+  - `cheapest_encodings` is bounded by the single largest content: on one 23.6 MB tar, zstd 19 takes 9.8 s (3,150,723 B) and brotli q11 39 s (3,056,772 B, 3% smaller). Brotli cannot split one content across cores.
+- Next candidates, none tried yet: plan each content once and share the result across the re-plans; on contents over a few MB, run brotli only when zstd's result is within reach of the cheapest plan, or in parallel with zstd; stream large contents instead of holding every copy in memory (the 842 MiB peak).
+- Verdict: **reference** (measurement; no storage change).

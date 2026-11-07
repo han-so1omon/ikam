@@ -6,7 +6,9 @@ real release series of a package, and local toolchain docs and sources.
 Downloads come from PyPI's JSON API and are checked against its sha256.
 Nothing downloaded is executed: archives are only unpacked (data filter).
 
-Usage: python3 -I fetch.py [CACHE_DIR]
+Usage: python3 -I fetch.py [CACHE_DIR] [--large]
+(--large adds a scale corpus: four pandas source releases, about 90 MB once
+expanded.)
 """
 
 import hashlib
@@ -19,7 +21,8 @@ import urllib.request
 import zipfile
 from pathlib import Path
 
-CACHE = Path(sys.argv[1] if len(sys.argv) > 1 else Path.home() / "ikam-corpora")
+ARGS = [a for a in sys.argv[1:] if not a.startswith("--")]
+CACHE = Path(ARGS[0] if ARGS else Path.home() / "ikam-corpora")
 
 # (corpus, package, version, archive kind, extensions to keep)
 DOCUMENTS = [
@@ -37,6 +40,10 @@ SERIES = [
      ["2.25.1", "2.26.0", "2.27.1", "2.28.2", "2.29.0", "2.30.0", "2.31.0", "2.32.3"]),
     ("click-sdists", "click", "sdist",
      ["8.0.4", "8.1.0", "8.1.3", "8.1.5", "8.1.7", "8.1.8", "8.2.0", "8.2.1"]),
+]
+
+LARGE = [
+    ("pandas-sdists", "pandas", "sdist", ["2.2.0", "2.2.1", "2.2.2", "2.2.3"]),
 ]
 
 
@@ -86,7 +93,7 @@ def main() -> None:
                 kept += 1
         manifest.append(f"{corpus}\t{pkg}=={version}\t{name}\t{kept} files")
         print(manifest[-1])
-    for corpus, pkg, kind, versions in SERIES:
+    for corpus, pkg, kind, versions in SERIES + (LARGE if "--large" in sys.argv else []):
         for version in versions:
             name, data = release_file(pkg, version, kind)
             out = CACHE / corpus / version / name

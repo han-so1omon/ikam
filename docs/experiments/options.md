@@ -65,7 +65,7 @@ changed on an existing store; the next repack re-plans under it.
 
 - **Font glyph dedup across PDFs**: fonts are 48 KB of multiformat's 332 KB one-store (E101 roles); subset fonts of the same face share most glyph programs.
 - **A profile setting** (heavy / balanced / archive) instead of separate fields.
-- **Real-world corpora**: every number above is on the bench's fixtures and generated corpora, not on files nobody made for the kernel (E105 measures those).
+- **Real-world corpora**: measured in E105-E108 (`packages/kernel/realworld`); the kernel is below the best archiver on 7 of 8 after E106. Scale is the open limit: four pandas releases repack in 7 minutes at 842 MiB peak (E108).
 
 ## E104 as an option
 

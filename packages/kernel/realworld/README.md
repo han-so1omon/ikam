@@ -12,6 +12,7 @@ corpora. This directory measures it on real files that nobody made for it:
 | `tables` | vega_datasets' bundled data sets (CSV, JSON, TSV) |
 | `requests-wheels` | eight releases of the requests wheel (zip), one snapshot each |
 | `click-sdists` | eight releases of the click source archive (tar.gz), one snapshot each |
+| `pandas-sdists` | four releases of the pandas source archive (`fetch.py --large`, 17.6 MB) |
 
 Versions are pinned in `fetch.py` and every download is checked against the
 sha256 PyPI publishes. Nothing downloaded is run; archives are only
