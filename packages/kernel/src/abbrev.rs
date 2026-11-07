@@ -276,6 +276,7 @@ mod tests {
     fn short_derivation_records_decode_exactly() {
         use crate::{Arg, Derivation, func};
         let mut repo = Repo::new(MemStore::default());
+        repo.short_records = true;
         let parts: Vec<Id> = (0..20u32)
             .map(|i| {
                 repo.put_content(format!("part number {i} of the whole").as_bytes())

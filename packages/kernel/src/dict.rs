@@ -448,9 +448,11 @@ impl<S: Store> Repo<S> {
         };
         let short = match tag {
             b'T' => self.abbreviate(rest).ok().flatten(),
-            b'D' => crate::abbrev::abbreviate_derivation(rest, &|p| self.ids_with_prefix(p))
-                .ok()
-                .flatten(),
+            b'D' if self.short_records => {
+                crate::abbrev::abbreviate_derivation(rest, &|p| self.ids_with_prefix(p))
+                    .ok()
+                    .flatten()
+            }
             _ => None,
         };
         // A graph chunk is decoded by every read of its graph (once per read

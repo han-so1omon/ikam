@@ -98,6 +98,13 @@ pub struct Repo<S: Store> {
     /// pays for this workload; with a rate of 0 (the default) it never does.
     pub search_rate: f64,
     pub search_sample: Vec<Vec<u8>>,
+    /// Store derivation records with short ids (E104): ids in a record are
+    /// cut to 8-byte prefixes and resolved against the store and ledger on
+    /// read, exactly as trees are. Off by default. On, it saves about a
+    /// third of derivation-record bytes (north score 0.3035 to 0.2793 in
+    /// E104), at the price of a two-pass ledger build and a prefix lookup per
+    /// id. Reading always accepts both forms, so it can be switched at will.
+    pub short_records: bool,
     /// zstd level new encodings use (`dict::MEASURE_LEVEL` unless
     /// `recompress` is running).
     pub(crate) level: i32,
@@ -115,6 +122,7 @@ impl<S: Store> Repo<S> {
             proposed_order: Vec::new(),
             search_rate: 0.0,
             search_sample: Vec::new(),
+            short_records: false,
             level: crate::dict::MEASURE_LEVEL,
         }
     }

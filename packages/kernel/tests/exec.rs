@@ -132,11 +132,28 @@ fn semantic_dedup_records_a_verified_function_application() {
     assert_eq!(put.id, Id::of_content(&y));
     assert_eq!(
         repo.bytes_written - before,
-        // Short record (E104): tag, mode, output, short WASM id, count, short arg.
-        2 + 32 + (1 + 8) + 1 + (1 + 8),
+        1 + 32 + 32 + 4 + 33,
         "one derivation record"
     );
     assert_eq!(repo.read_content(&put.id).unwrap(), y);
+
+    // With short records on (E104), the same record stores ids by prefix:
+    // tag, mode, output, short WASM id, count, short arg.
+    let mut short = Repo::new(MemStore::default());
+    short.short_records = true;
+    let upper_s = store_module(&mut short, UPPER);
+    let xs = short.put_content(&x).unwrap().id;
+    let before = short.bytes_written;
+    let put_s = short
+        .put_derivation(&y, upper_s, vec![Arg::Whole(xs)])
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        short.bytes_written - before,
+        2 + 32 + (1 + 8) + 1 + (1 + 8),
+        "one short derivation record"
+    );
+    assert_eq!(short.read_content(&put_s.id).unwrap(), y);
 
     // A proposal that does not reproduce the bytes is rejected, nothing written.
     let mut wrong = y.clone();

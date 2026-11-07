@@ -24,7 +24,7 @@ use std::alloc::{GlobalAlloc, Layout, System};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering::Relaxed};
 use std::time::Instant;
 
 use ikam_kernel::{
@@ -797,6 +797,8 @@ fn grep_queries(files: &BTreeMap<Id, &Vec<u8>>, n: usize, seed: u64) -> Vec<Vec<
 /// each operation's peak memory is measured, not estimated.
 struct Counting;
 
+/// `--short-records`: measure with the E104 option on (see `Repo::short_records`).
+static SHORT_RECORDS: AtomicBool = AtomicBool::new(false);
 static HEAP: AtomicUsize = AtomicUsize::new(0);
 static PEAK: AtomicUsize = AtomicUsize::new(0);
 
@@ -1378,6 +1380,7 @@ fn family(name: &str) -> &'static str {
 /// must read back byte-exact and fsck must be clean (the hard gates).
 fn north_store(name: &str, files: &[&(String, Vec<u8>)]) -> (usize, Cost, Repo<MemStore>) {
     let mut repo = Repo::new(MemStore::default());
+    repo.short_records = SHORT_RECORDS.load(Relaxed);
     repo.read_weight = ARCHIVE_READ_WEIGHT;
     let entries: Vec<TreeEntry> = files
         .iter()
@@ -1638,6 +1641,7 @@ fn north_run(name: &str, all: &Snapshot, json: bool) -> (usize, usize, usize, us
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let json = args.iter().any(|a| a == "--json");
+    SHORT_RECORDS.store(args.iter().any(|a| a == "--short-records"), Relaxed);
     // Not a scoring option: writes the generated corpus out as input for an
     // offline program writer (functions/write_programs.py), then exits.
     if let Some(i) = args.iter().position(|a| a == "--dump-generated") {
@@ -1682,6 +1686,7 @@ fn main() {
         let fastest = |a: Cost, b: Cost| if b.cpu_ms < a.cpu_ms { b } else { a };
         for _ in 0..PIPELINE_RUNS {
             let mut repo = Repo::new(MemStore::default());
+            repo.short_records = SHORT_RECORDS.load(Relaxed);
             repo.read_weight = READ_WEIGHT;
             let ((), ingest_cost) = measure(1, || {
                 snapshots.iter().for_each(|s| commit(&mut repo, s, graph))
