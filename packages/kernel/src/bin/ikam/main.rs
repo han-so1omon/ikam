@@ -437,13 +437,9 @@ fn live_cmd(store_dir: &str, refname: &str, args: &[String]) -> Result<(), Strin
         }
         allowed.push(name);
     }
-    let log_requests = match args.iter().position(|a| a == "--log-requests") {
-        Some(i) => {
-            args.remove(i);
-            true
-        }
-        None => false,
-    };
+    let before = args.len();
+    args.retain(|a| a != "--log-requests");
+    let log_requests = args.len() != before;
     let auth = auth::Auth::from_env()?;
     let llm = match args.iter().position(|a| a == "--llm") {
         Some(i) => {
