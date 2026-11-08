@@ -1787,3 +1787,19 @@ Newest last. Format and rules: `README.md`.
   - Bench (main and two runs of the branch, same machine): all corpora byte-identical, exact, fsck clean; north 0.3035 on all three; cost score 0.2493 on main, 0.2516 / 0.2434 on the branch (within its 2% spread). Nothing in ingest or repack changed; `edit_tree` and `expand` are new entry points.
 - Not done, next: an incremental repack (re-plan only content added since the last one: the drift above is all new content), a text index kept on disk (restart time), enforced WebDAV locks, a persistent store of dead properties if a client needs them.
 - Verdict: **kept** as a capability (both scores hold), on the branch until Eric says to merge.
+
+### E111 live-host (running `ikam live` as a service another machine reaches)
+- Branch / parent: exp/111-live-host / E110
+- Question (from Eric's hosting plan): what does `ikam live` need to run on his Mac as a launchd service, reached from his other devices through Tailscale Serve, as a safe test that leaves the Mac's own files alone?
+- Change (CLI only; nothing in the kernel library):
+  - `--allow-host NAME` (repeatable): requests naming NAME, with or without a port, pass the Host check as 127.0.0.1 and localhost do. The listener stays on 127.0.0.1; reaching it from elsewhere is the proxy's job.
+  - `IKAM_AUTH=user:salt:hash` (from `ikam passwd USER`, password on stdin): every request, page, API and `/dav/` alike, needs that user and password over HTTP basic auth, else 401 with `WWW-Authenticate`. The hash is BLAKE3 (derive-key mode) over a 16-byte random salt and the password, compared in constant time.
+  - SIGTERM and SIGINT set a flag; the commit thread then takes the lock (so no edit or repack is half done), commits pending edits and exits 0. Before, both signals killed the process at once, leaving edits from the last `--commit-after` window out of the ref.
+  - Found on the way, fixed: on a store with nothing committed, a repack's gc removed the empty working tree (reachable from no ref), and the next edit failed with "object not found" (the live bench on an empty corpus folder hit it as a 500 on MKCOL). The repack now stores the empty tree again; a unit test fails without the fix.
+- Result:
+  - Unit tests: Host matching (allowed name, name:port, case, no suffix tricks, other ports refused), base64, password check (right user and password pass; wrong password, wrong user, other scheme, bad base64 and no header get 401; a fresh salt each time), the empty-store repack.
+  - By hand against the binary: no or wrong password 401, right one 200, the allowed name 200 with or without :443, another Host 403, WebDAV PUT 201 with the password and 401 without; a PUT with `--commit-after 60000` then SIGTERM: exit 0, "stopped", the file in the ref after restart, fsck clean (same with SIGINT).
+  - Live bench (7 corpora without pandas, 400 edits): 0 mismatches, restart exact, fsck clean, edit p50 17 ms; the bench's own SIGTERM now stops the server cleanly. On an empty corpus folder: 0 mismatches, fsck clean (failed before the fix).
+  - Bench: all corpora exact, fsck clean; north 0.3035 (unchanged); cost score 0.2510 (E110's runs 0.2434 to 0.2516). Nothing in ingest or repack changed.
+- Not done, next: a text index kept on disk (restart 24 s with pandas), a slow password hash if the settings file could ever be read by others.
+- Verdict: **kept** as a capability (both scores hold), on the branch until Eric says to merge.

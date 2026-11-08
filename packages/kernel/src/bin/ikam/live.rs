@@ -501,6 +501,11 @@ impl Live {
         self.flush(true)?;
         let t = Instant::now();
         let r = self.repo.repack().map_err(err)?;
+        if self.base_tree.is_none() {
+            // Nothing committed yet: the empty working tree was reachable from
+            // no ref, so the repack's gc removed it. Store it again.
+            self.work = self.repo.edit_tree(None, &[]).map_err(err)?;
+        }
         let msg = format!(
             "repack: {} -> {} bytes, applied={}, {:.1} s",
             r.before,
@@ -792,5 +797,19 @@ mod tests {
         let t = SystemTime::UNIX_EPOCH + Duration::from_secs(1_794_268_800); // 2026-11-10
         assert_eq!(http_date(t), "Tue, 10 Nov 2026 00:00:00 GMT");
         assert_eq!(iso_date(t), "2026-11-10T00:00:00Z");
+    }
+
+    #[test]
+    fn edits_after_repacking_an_empty_store() {
+        let dir = std::env::temp_dir().join(format!("ikam-live-empty-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut l = Live::open(dir.to_str().unwrap(), "main").unwrap();
+        l.repack().unwrap();
+        l.apply(vec![Op::Mkdir("made".into())]).unwrap();
+        l.apply(vec![Op::Put("made/a.txt".into(), b"hello".to_vec())])
+            .unwrap();
+        l.flush(true).unwrap().expect("a commit");
+        assert!(l.repo.fsck_deep().unwrap().is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
