@@ -41,6 +41,44 @@ ikam --store S cat main:path/file    # REV:PATH, a hex id or a unique prefix wor
 ikam --store S serve                 # browse, read and search at http://127.0.0.1:8737/
 ```
 
+A live filesystem (E110): one process owns the store and you change it while
+it runs.
+
+```sh
+ikam --store S live                          # http://127.0.0.1:8737/ (page) and /dav/ (WebDAV)
+ikam --store S live --watch ~/Drop:inbox     # also mirror a folder into inbox/ as it changes
+ikam --store S live --llm                    # let questions be answered by Claude (ANTHROPIC_API_KEY)
+ikam --store S write notes/a.md FILE         # or: rm, mv, cp, mkdir; each one commit
+ikam --store S search "text"                 # text of every file, also docx/xlsx/pptx XML, PDF, tar members
+ikam --store S ask "which file says how to add a paragraph?" [--llm]
+```
+
+- **Mount it**: in Finder, Go > Connect to Server, `http://127.0.0.1:8737/dav/`
+  (any user name and password). Copy files in, open, edit and save them,
+  rename and delete them; on Linux, `mount -t davfs` or any WebDAV client.
+- **An edit** stores the new content (`put_content`, deduplicated against
+  what is already stored) and rewrites only the trees on its path
+  (`Repo::edit_tree`); it does not repack. Edits show at once; they are
+  committed to the ref after 1.5 s of quiet (`--commit-after MS`), so a
+  Finder copy of a folder is one commit. `repack` (the page's button, or
+  `ikam repack` with the server stopped) re-plans everything when you
+  choose.
+- **Search** is an exact, case-insensitive match over every file's text,
+  held in memory and updated with each edit. **Questions** rank 12-line
+  passages (BM25) and list them as numbered sources with file and line;
+  with `--llm` and a key, Claude writes an answer from those passages only
+  and cites them by number. Only the question and the passages are sent.
+- The page shows the tree, versions of a file, what each commit changed,
+  and what the store holds. `/api/status`, `/api/search?q=`, `/api/ask?q=`
+  answer in JSON.
+- It listens on 127.0.0.1 only, refuses requests whose Host is not
+  127.0.0.1 or localhost, and serves files with a sandbox policy (an HTML
+  file in the store cannot run script in the page). WebDAV locks are
+  granted but not enforced (one user).
+
+`realworld/live_bench.py` measures it (edit cost and latency, exact
+read-back against a copy of the tree, search freshness, restart).
+
 `--short-records` stores derivation records with short ids (smaller, for
 archives; see `docs/experiments/options.md`). Real-world corpora and how the
 kernel does on them: `realworld/README.md`.

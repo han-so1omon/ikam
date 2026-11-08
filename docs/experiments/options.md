@@ -104,3 +104,19 @@ large tars overlaps instead of waiting behind brotli.
 matters; 4 MiB keeps every brotli win measured so far. **When to leave it
 off**: archives where every byte counts and repack time does not, since
 brotli can win a few percent on a large content read rarely.
+
+## `ikam live` (E110)
+
+The live filesystem stores each edit as it comes and leaves re-planning to
+`repack`. Its settings are about when work happens, not what is stored.
+
+| Setting | Default | Trade | Measured |
+|---|---|---|---|
+| `--commit-after MS` | 1500 | edits are readable at once but reach the ref only after this much quiet: fewer, larger commits (a Finder copy of a folder is one) against edits that a crash in that window leaves out of the tree (their objects stay in the store, unreachable until a later commit or `gc`) | one commit per burst in the live bench |
+| when to repack | by hand (page button, `ikam repack`) | stored bytes against minutes of CPU: between repacks, edits are stored as `put_content` plans them; repack re-plans everything | see E110: about 17% more bytes before the first repack on the real-world corpora, repack 92 s |
+| `--watch DIR[:PREFIX]` scan interval | 500 ms (fixed) | a change on disk is readable after about this long; each scan stats every file in the folder | lag p50 505 ms in the live bench |
+| `--llm` | off | questions get a written answer from Claude (the question and the retrieved passages are sent to the Claude API) against sources only, locally | not scored |
+
+**Not yet a setting**: an incremental repack that re-plans only what was
+added since the last one (the live drift is in new content; a full repack
+re-plans all of it).

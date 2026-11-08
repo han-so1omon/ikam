@@ -30,6 +30,7 @@ mod template;
 mod wasm;
 pub mod worktree;
 
+pub use container::expand;
 pub use dict::decode_cost;
 pub use id::Id;
 pub use object::{

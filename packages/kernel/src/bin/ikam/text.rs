@@ -8,11 +8,9 @@
 //! member, by its path inside the archive. Search is exact and
 //! case-insensitive over that text; questions rank passages with BM25.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::io::Read;
 use std::sync::Arc;
-
-use ikam_kernel::{Id, Repo, Store};
 
 use crate::corpus::{is_pdf_text, looks_like_xml, pdf_text, xml_text};
 
@@ -71,7 +69,7 @@ impl Doc {
 }
 
 /// The text of a file with content `id` at `path` whose bytes are `bytes`.
-pub fn extract<S: Store>(repo: &Repo<S>, id: &Id, path: &str, bytes: &[u8]) -> Doc {
+pub fn extract(path: &str, bytes: &[u8]) -> Doc {
     let lower = path.to_ascii_lowercase();
     let mut parts = Vec::new();
     if lower.ends_with(".tar.gz") || lower.ends_with(".tgz") {
@@ -89,15 +87,29 @@ pub fn extract<S: Store>(repo: &Repo<S>, id: &Id, path: &str, bytes: &[u8]) -> D
         if let Some(text) = as_text(bytes) {
             parts.push(Part::new(String::new(), text));
         } else {
-            parts = stored_parts(repo, id);
+            parts = binary_parts(bytes);
         }
     }
     Doc { parts }
 }
 
-/// Bytes as text if they look like text (UTF-8, no NUL in the first 8 KiB).
+/// Text a person could read: almost no control characters or invalid
+/// bytes. Image data inflated from a PDF can hold `BT` and `Tj` by chance,
+/// and its "strings" are noise.
+fn readable(text: &str) -> bool {
+    let (mut n, mut bad) = (0usize, 0usize);
+    for c in text.chars() {
+        n += 1;
+        if c == '\u{fffd}' || (c.is_control() && !c.is_whitespace()) {
+            bad += 1;
+        }
+    }
+    bad * 50 <= n
+}
+
+/// Bytes as text if they look like text (no NUL, at least 90% UTF-8).
 fn as_text(bytes: &[u8]) -> Option<String> {
-    if bytes[..bytes.len().min(8192)].contains(&0) {
+    if memchr::memchr(0, bytes).is_some() {
         return None;
     }
     match std::str::from_utf8(bytes) {
@@ -110,42 +122,35 @@ fn as_text(bytes: &[u8]) -> Option<String> {
     }
 }
 
-/// The text of the parts the kernel derives a binary file from.
-fn stored_parts<S: Store>(repo: &Repo<S>, id: &Id) -> Vec<Part> {
-    let mut out = Vec::new();
-    let Ok(ds) = repo.derivations(id) else {
-        return out;
-    };
-    let mut seen = HashSet::new();
+/// The text in a binary file's parts, as ingest expands them from its own
+/// bytes (a zip's members, a PDF's streams and decoded text layers). Not
+/// from the stored derivation: after a repack that is slices of other
+/// files, not members.
+fn binary_parts(bytes: &[u8]) -> Vec<Part> {
     let mut joined = String::new();
-    for d in ds.iter().take(1) {
-        for a in &d.args {
-            if !seen.insert(a.id()) {
-                continue;
-            }
-            let Ok(bytes) = repo.read_content(&a.id()) else {
-                continue;
-            };
-            let text = if looks_like_xml(&bytes) {
-                xml_text(&bytes)
-            } else if is_pdf_text(&bytes) {
-                pdf_text(&bytes)
-            } else if let Some(t) = as_text(&bytes) {
-                t
-            } else {
-                continue;
-            };
-            let text = text.trim();
-            if !text.is_empty() {
-                joined.push_str(text);
-                joined.push_str("\n\n");
-            }
+    for m in ikam_kernel::expand(bytes) {
+        let text = if looks_like_xml(&m) {
+            xml_text(&m)
+        } else if is_pdf_text(&m) {
+            pdf_text(&m)
+        } else if !m.contains(&0)
+            && let Ok(t) = std::str::from_utf8(&m)
+        {
+            t.to_string()
+        } else {
+            continue;
+        };
+        let text = text.trim();
+        if !text.is_empty() && readable(text) {
+            joined.push_str(text);
+            joined.push_str("\n\n");
         }
     }
-    if !joined.is_empty() {
-        out.push(Part::new(String::new(), joined));
+    if joined.is_empty() {
+        Vec::new()
+    } else {
+        vec![Part::new(String::new(), joined)]
     }
-    out
 }
 
 /// Text members of a tar archive (ustar, GNU long names, pax paths).

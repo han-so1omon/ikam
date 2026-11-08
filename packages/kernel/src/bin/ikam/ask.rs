@@ -12,7 +12,12 @@ use crate::json::{Json, parse};
 use crate::text::Passage;
 
 pub const MODEL: &str = "claude-opus-5-5";
-const API: &str = "https://api.anthropic.com/v1/messages";
+/// `ANTHROPIC_BASE_URL` overrides the host, as in Anthropic's SDKs.
+fn api_url() -> String {
+    let base =
+        std::env::var("ANTHROPIC_BASE_URL").unwrap_or_else(|_| "https://api.anthropic.com".into());
+    format!("{}/v1/messages", base.trim_end_matches('/'))
+}
 
 pub fn key_available() -> bool {
     std::env::var("ANTHROPIC_API_KEY").is_ok_and(|k| !k.is_empty())
@@ -79,7 +84,7 @@ question, say so plainly and say what they do contain. Be brief.";
     }
     let out = (|| {
         let mut child = Command::new("curl")
-            .args(["-sS", "--max-time", "300", API, "-H"])
+            .args(["-sS", "--max-time", "300", &api_url(), "-H"])
             .arg(format!("@{}", headers.display()))
             .args(["--data-binary", "@-"])
             .stdin(Stdio::piped())

@@ -270,7 +270,7 @@ fn search_page(l: &Live, q: &str) -> Result<Response, String> {
     let (hits, total) = text::search(&l.docs, q, 200);
     let ms = t.elapsed().as_secs_f64() * 1e3;
     let mut body = format!(
-        "<p>{total} file(s) contain “{}” ({ms:.1} ms over {} files).</p>",
+        "<p>{total} file(s) or archive member(s) contain “{}” ({ms:.1} ms over {} files).</p>",
         esc(q),
         l.docs.len()
     );
@@ -398,6 +398,18 @@ fn api(live: &Mutex<Live>, name: &str, req: &Request) -> Response {
                     ),
                 ]))
             }
+            ("GET", "docs") => {
+                // Extracted text per file, largest first.
+                let l = live.lock().unwrap();
+                let mut v: Vec<(&String, usize)> =
+                    l.docs.iter().map(|(p, d)| (p, d.bytes())).collect();
+                v.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(b.0)));
+                json(Json::Arr(
+                    v.into_iter()
+                        .map(|(p, n)| Json::Arr(vec![Json::Str(p.clone()), num(n as f64)]))
+                        .collect(),
+                ))
+            }
             ("GET", "search") => {
                 let q = req.param("q").unwrap_or_default();
                 let l = live.lock().unwrap();
@@ -408,8 +420,17 @@ fn api(live: &Mutex<Live>, name: &str, req: &Request) -> Response {
                     ("total".into(), num(total as f64)),
                     ("ms".into(), num(ms)),
                     (
-                        "paths".into(),
-                        Json::Arr(hits.into_iter().map(|h| Json::Str(h.path)).collect()),
+                        "hits".into(),
+                        Json::Arr(
+                            hits.into_iter()
+                                .map(|h| {
+                                    Json::Obj(vec![
+                                        ("path".into(), Json::Str(h.path)),
+                                        ("part".into(), Json::Str(h.part)),
+                                    ])
+                                })
+                                .collect(),
+                        ),
                     ),
                 ]))
             }

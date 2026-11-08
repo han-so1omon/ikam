@@ -301,11 +301,10 @@ impl Live {
                     let path = norm(&path);
                     let id = self.repo.put_content(&bytes).map_err(err)?.id;
                     self.note_size(&id, bytes.len() as u64);
-                    if !self.extracted.contains_key(&id) {
+                    if let std::collections::hash_map::Entry::Vacant(e) = self.extracted.entry(id) {
                         let ti = Instant::now();
-                        let doc = Arc::new(text::extract(&self.repo, &id, &path, &bytes));
+                        e.insert(Arc::new(text::extract(&path, &bytes)));
                         cost.index_ms += ti.elapsed().as_secs_f64() * 1e3;
-                        self.extracted.insert(id, doc);
                     }
                     self.hold(id, Arc::new(bytes));
                     summary.push(format!("put {path}"));
@@ -377,6 +376,36 @@ impl Live {
         for p in gone {
             self.docs.remove(&p);
         }
+        // Contents not yet extracted: many at startup, so in parallel.
+        let todo: Vec<(&String, &Id)> = {
+            let mut seen = HashSet::new();
+            files
+                .iter()
+                .filter(|(_, id)| !self.extracted.contains_key(*id) && seen.insert(**id))
+                .collect()
+        };
+        if todo.len() > 8 {
+            let threads = std::thread::available_parallelism().map_or(4, |n| n.get());
+            let repo = &self.repo;
+            let done: Vec<(Id, Arc<Doc>)> = std::thread::scope(|s| {
+                let chunks: Vec<_> = todo
+                    .chunks(todo.len().div_ceil(threads))
+                    .map(|chunk| {
+                        s.spawn(move || {
+                            chunk
+                                .iter()
+                                .filter_map(|(path, id)| {
+                                    let bytes = repo.read_content(id).ok()?;
+                                    Some((**id, Arc::new(text::extract(path, &bytes))))
+                                })
+                                .collect::<Vec<_>>()
+                        })
+                    })
+                    .collect();
+                chunks.into_iter().flat_map(|h| h.join().unwrap()).collect()
+            });
+            self.extracted.extend(done);
+        }
         for (path, id) in &files {
             if self.files.get(path) == Some(id) && self.docs.contains_key(path) {
                 continue;
@@ -385,7 +414,7 @@ impl Live {
                 Some(d) => d.clone(),
                 None => {
                     let bytes = self.read(id)?;
-                    let d = Arc::new(text::extract(&self.repo, id, path, &bytes));
+                    let d = Arc::new(text::extract(path, &bytes));
                     self.extracted.insert(*id, d.clone());
                     d
                 }

@@ -203,6 +203,16 @@ pub fn plan_zip(bytes: &[u8]) -> Option<(Vec<u8>, Vec<Vec<u8>>)> {
     manifest(bytes, streams, None)
 }
 
+/// The parts ingest would expand `bytes` into: a zip's members, or the
+/// zlib streams of a file that holds them (a PDF's content streams and their
+/// decoded text layers); empty if none. For reading a binary file's text.
+pub fn expand(bytes: &[u8]) -> Vec<Vec<u8>> {
+    plan_zip(bytes)
+        .or_else(|| plan_zlib(bytes))
+        .map(|(_, members)| members)
+        .unwrap_or_default()
+}
+
 /// Smallest inflated stream `plan_zlib` expands: shorter ones gain less
 /// than their manifest entry and are more often chance matches.
 const MIN_ZLIB: usize = 64;
