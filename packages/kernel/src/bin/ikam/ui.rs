@@ -151,18 +151,8 @@ fn dir_page(l: &mut Live, dir: &str) -> Result<Response, String> {
     let mut body = format!(
         "<p>{crumbs}</p><div class=bar><label><button onclick=\"this.nextElementSibling.click()\">Upload</button><input type=file multiple hidden onchange='upload({d},this)'></label>\
 <button onclick='newfile({d})'>New file</button><button onclick='newdir({d})'>New folder</button>\
-{}</div><table>",
-        if l.public {
-            format!(
-                "<span>{} change(s) not yet committed; commits happen on their own here.</span>",
-                l.pending()
-            )
-        } else {
-            format!(
-                "<button onclick=\"api('commit')\">Commit now ({})</button><button onclick=\"api('repack')\">Repack</button>",
-                l.pending()
-            )
-        },
+<button onclick=\"api('commit')\">Commit now ({})</button><button onclick=\"api('repack')\">Repack</button></div><table>",
+        l.pending(),
         d = js(&dir),
     );
     for e in entries.iter() {
@@ -389,9 +379,6 @@ fn num(x: f64) -> Json {
 fn api(live: &Mutex<Live>, name: &str, req: &Request) -> Response {
     if req.method == "POST" && req.header("x-ikam").is_none() {
         return Response::text(403, "missing X-Ikam header");
-    }
-    if req.method == "POST" && live.lock().unwrap().public {
-        return Response::text(403, "turned off on this public copy");
     }
     let r = (|| -> Result<Response, String> {
         Ok(match (req.method.as_str(), name) {

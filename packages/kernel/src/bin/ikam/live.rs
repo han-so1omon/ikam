@@ -65,8 +65,6 @@ pub struct Live {
     pub max_store: Option<u64>,
     /// The store's size when last measured, and `repo.bytes_written` then.
     measured: Option<(u64, usize)>,
-    /// `--public`: repack, fsck and commit-now are turned off.
-    pub public: bool,
 }
 
 /// What each desktop metadata file costs beyond its bytes, for `--max-store`.
@@ -140,7 +138,6 @@ impl Live {
             started: SystemTime::now(),
             max_store: None,
             measured: None,
-            public: false,
             events: VecDeque::new(),
             llm: false,
             junk: BTreeMap::new(),

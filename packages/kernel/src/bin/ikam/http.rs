@@ -515,9 +515,22 @@ mod tests {
         let r = send(port, &many);
         assert!(r.starts_with("HTTP/1.1 431"), "{r}");
         // Two idle connections fill the cap; a third is turned away.
-        let a = TcpStream::connect(("127.0.0.1", port)).unwrap();
-        let b = TcpStream::connect(("127.0.0.1", port)).unwrap();
-        std::thread::sleep(Duration::from_millis(100));
+        let open = || {
+            // One answered request each, so both are being served.
+            let mut s = TcpStream::connect(("127.0.0.1", port)).unwrap();
+            s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+            s.write_all(b"GET / HTTP/1.1\r\nHost: x\r\n\r\n").unwrap();
+            let mut got = Vec::new();
+            let mut buf = [0u8; 512];
+            while !got.ends_with(b"got 0") {
+                let n = s.read(&mut buf).unwrap();
+                assert!(n > 0, "closed early");
+                got.extend_from_slice(&buf[..n]);
+            }
+            s
+        };
+        let a = open();
+        let b = open();
         let r = send(
             port,
             b"GET / HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n",
