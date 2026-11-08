@@ -1858,3 +1858,11 @@ Newest last. Format and rules: `README.md`.
 - Result: unit tests (limits over a real socket, store cap, guest method table, byte sizes), clippy and fmt clean, 10 full test runs with no flake. Manual: guest writes 401, password writes 201, guest reads 200/207, unknown Host 403, 30 MB upload 413, store cap 507 after 20 x 100 KB. Self-test passes twice in a row (about 13 KB stored per run). Live bench (default flags, 8 corpora, 264 files, 400 edits): 0 mismatches, search 0 wrong, fsck clean, restart 3.5 s, watch lag p50 515 ms; ingest untouched.
 - Mac setup (dry run here with stand-ins for launchctl and plutil): `/path/to/ikam-test` with its own store, a generated test password (mode 600), `com.example.ikam-test` on 127.0.0.1:8739 using the private copy's auto-updated binary, and `com.example.ikam-test-run` that restarts the test copy when `ikam-live/deployed` changes and runs the self-test (also every 6 hours). Funnel on 8443 only; the private copy keeps 443 on the tailnet.
 - Verdict: **kept** as options (all off by default); merged to main on Eric's yes (Nov 8).
+
+### E115 robots (let web readers read the public test copy)
+- Branch / parent: exp/115-robots / main at 44b5730 (E114)
+- Question (Nov 8): with Funnel on, Claude's web reader refuses https://example-host.example.ts.net:8443/ as "robots_disallowed", including /robots.txt itself. ikam answered /robots.txt with 404 (`no such page`), which RFC 9309 reads as "allow", but some readers treat a missing or failed robots.txt as "keep out".
+- Change: `/robots.txt` (GET or HEAD, after the Host check, before the password check) answers `User-agent: *` with `Allow: /` on a `--public` copy and `Disallow: /` otherwise. Nothing else changes.
+- Result: unit test; manual: public copy 200 `Allow: /`, results still 200, PUT on /robots.txt 401; private copy 200 `Disallow: /`, everything else still 401, unknown Host 403. Tests, clippy and fmt clean.
+- Not settled here: if the reader looks for robots.txt on the default port (443, the private copy, not on Funnel), this does not help; that would need the test copy on its own name on 443.
+- Verdict: **kept**; on its branch until Eric says to merge.
