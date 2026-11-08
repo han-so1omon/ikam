@@ -105,6 +105,11 @@ pub struct Repo<S: Store> {
     /// E104), at the price of a two-pass ledger build and a prefix lookup per
     /// id. Reading always accepts both forms, so it can be switched at will.
     pub short_records: bool,
+    /// Split the words of a zip's markup members (docx, xlsx, pptx XML)
+    /// from their tags at ingest (E112): one skeleton member and one text
+    /// member per zip, so the words compress with the same text in other
+    /// formats. Off by default. Reading accepts both plans at any setting.
+    pub markup_layers: bool,
     /// Contents larger than this skip the slow codecs (brotli) when repack
     /// picks their encoding (E109). Off (`usize::MAX`) by default. Brotli
     /// cannot use more than one core, so on a large content it bounds the
@@ -134,6 +139,7 @@ impl<S: Store> Repo<S> {
             search_rate: 0.0,
             search_sample: Vec::new(),
             short_records: false,
+            markup_layers: false,
             slow_codec_max: usize::MAX,
             level: crate::dict::MEASURE_LEVEL,
             deflate_memo: None,

@@ -4,7 +4,7 @@
 //! repacked, verified byte for byte and fsck'd, and compared with common
 //! archivers. Not a scoring command: the bench's two scores stay the gate.
 //!
-//! `cargo run --release --example realworld -- [--json] [--short-records] [--read-weight W] [--slow-codec-max BYTES] DIR...`
+//! `cargo run --release --example realworld -- [--json] [--short-records] [--markup-layers] [--read-weight W] [--slow-codec-max BYTES] DIR...`
 
 use std::collections::BTreeMap;
 use std::io::Write;
@@ -92,10 +92,11 @@ struct Run {
     peak_kib: usize,
 }
 
-fn run(c: &Corpus, short: bool, weight: f64, slow_max: usize) -> Run {
+fn run(c: &Corpus, short: bool, markup: bool, weight: f64, slow_max: usize) -> Run {
     reset_peak();
     let mut repo = Repo::new(MemStore::default());
     repo.short_records = short;
+    repo.markup_layers = markup;
     repo.read_weight = weight;
     repo.slow_codec_max = slow_max;
     let t = Instant::now();
@@ -224,6 +225,7 @@ fn main() {
     let mut args: Vec<String> = std::env::args().skip(1).collect();
     let json = take(&mut args, "--json");
     let short = take(&mut args, "--short-records");
+    let markup = take(&mut args, "--markup-layers");
     let weight = match args.iter().position(|a| a == "--read-weight") {
         Some(i) => {
             let w = args.remove(i + 1).parse().expect("--read-weight W");
@@ -242,7 +244,7 @@ fn main() {
     };
     for dir in &args {
         let c = corpus(Path::new(dir));
-        let r = run(&c, short, weight, slow_max);
+        let r = run(&c, short, markup, weight, slow_max);
         let base = baselines(&c);
         let best = base.iter().map(|b| b.1).min().unwrap();
         if json {

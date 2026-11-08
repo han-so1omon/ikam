@@ -10,8 +10,10 @@
 //!
 //! Manifest: count:u32 { 0 len:u32 bytes | 1 member:u32 level:u8
 //! | 2 level:u8 skeleton:u32 start:u32 len:u32 text:u32 start:u32 len:u32
-//!   fonts:u8 cmap:u32* }
-//! where a `2` segment (E102) is a PDF content stream rebuilt from spans of
+//!   fonts:u8 cmap:u32* | 3 level:u8 skeleton:u32 start:u32 len:u32
+//!   text:u32 start:u32 len:u32 }
+//! where a `3` segment (E112) is a markup member (XML) rebuilt from spans of
+//! a skeleton member and a text member (`markup.rs`), then deflated; a `2` segment (E102) is a PDF content stream rebuilt from spans of
 //! a skeleton member and a text member and its fonts' CMap members
 //! (`pdftext.rs`), then deflated at `level`;
 //! and level 0-9 is zlib's level at memLevel 8 (zlib's default), and
@@ -35,7 +37,7 @@ use flate2::Compression;
 use flate2::read::DeflateDecoder;
 use flate2::write::DeflateEncoder;
 
-use crate::{Error, Id, pdftext};
+use crate::{Error, Id, markup, pdftext};
 
 /// Levels to try, most common first (zlib's default is 6), at memLevel 8
 /// and then 9 (`MEM9` added; see the manifest).
@@ -201,6 +203,100 @@ pub fn plan_zip(bytes: &[u8]) -> Option<(Vec<u8>, Vec<Vec<u8>>)> {
         .into_iter()
         .filter_map(|(start, end, size)| Some((start, end, inflate(&bytes[start..end], size)?)));
     manifest(bytes, streams, None)
+}
+
+/// `plan_zip`, with its markup members' words split from their tags into
+/// one skeleton member and one text member (E112; `Repo::markup_layers`)
+/// when that plan rebuilds `bytes`.
+pub fn plan_zip_layered(bytes: &[u8]) -> Option<(Vec<u8>, Vec<Vec<u8>>)> {
+    let (manifest, members) = plan_zip(bytes)?;
+    Some(markup_layers(bytes, &manifest, &members).unwrap_or((manifest, members)))
+}
+
+/// Least text a member must hold to be split, in bytes and as a share of
+/// the member (1/`MIN_TEXT_SHARE`): parts with little text (styles,
+/// relationships, settings) stay whole, so identical parts still dedup.
+const MIN_TEXT: usize = 64;
+const MIN_TEXT_SHARE: usize = 16;
+
+/// The zip plan with each member that holds enough text runs replaced by
+/// spans of one skeleton member and one text member (`markup.rs`), like a
+/// PDF's text layers: the words of every part become one content, like the
+/// same document in another format. `None` if no member splits or the plan
+/// does not rebuild `bytes`.
+fn markup_layers(
+    bytes: &[u8],
+    manifest: &[u8],
+    members: &[Vec<u8>],
+) -> Option<(Vec<u8>, Vec<Vec<u8>>)> {
+    let (mut skeleton, mut text) = (Vec::new(), Vec::new());
+    let mut layers: HashMap<usize, [[usize; 2]; 2]> = HashMap::new();
+    for (k, m) in members.iter().enumerate() {
+        let Some((s, t)) = markup::split(m) else {
+            continue;
+        };
+        if t.len() < MIN_TEXT || t.len() * MIN_TEXT_SHARE < m.len() {
+            continue;
+        }
+        layers.insert(k, [[skeleton.len(), s.len()], [text.len(), t.len()]]);
+        skeleton.extend_from_slice(&s);
+        text.extend_from_slice(&t);
+    }
+    if layers.is_empty() {
+        return None;
+    }
+    let mut renumber = vec![None; members.len()];
+    let mut kept = Vec::new();
+    for (k, m) in members.iter().enumerate() {
+        if !layers.contains_key(&k) {
+            renumber[k] = Some(kept.len() as u32);
+            kept.push(m.clone());
+        }
+    }
+    let (skel_member, text_member) = (kept.len() as u32, kept.len() as u32 + 1);
+    kept.push(skeleton);
+    kept.push(text);
+    let mut m = Cursor(manifest);
+    let count = m.u32()?;
+    let mut out = (count as u32).to_be_bytes().to_vec();
+    for _ in 0..count {
+        match m.take(1)?[0] {
+            0 => {
+                let len = m.u32()?;
+                out.push(0);
+                out.extend_from_slice(&(len as u32).to_be_bytes());
+                out.extend_from_slice(m.take(len)?);
+            }
+            1 => {
+                let member = m.u32()?;
+                let level = m.take(1)?[0];
+                match layers.get(&member) {
+                    None => {
+                        out.push(1);
+                        out.extend_from_slice(&renumber[member]?.to_be_bytes());
+                        out.push(level);
+                    }
+                    Some([s, t]) => {
+                        out.extend_from_slice(&[3, level]);
+                        for n in [skel_member, s[0] as u32, s[1] as u32] {
+                            out.extend_from_slice(&n.to_be_bytes());
+                        }
+                        for n in [text_member, t[0] as u32, t[1] as u32] {
+                            out.extend_from_slice(&n.to_be_bytes());
+                        }
+                    }
+                }
+            }
+            _ => return None,
+        }
+    }
+    let mut args = vec![out];
+    args.extend(kept);
+    if pack(&args, None).ok()? != bytes {
+        return None;
+    }
+    let members = args.split_off(1);
+    Some((args.pop()?, members))
 }
 
 /// The parts ingest would expand `bytes` into: a zip's members, or the
@@ -555,6 +651,21 @@ pub fn pack(args: &[Vec<u8>], memo: Option<&DeflateMemo>) -> Result<Vec<u8>, Err
                     return Err(bad());
                 }
                 out.extend_from_slice(&deflate(&pdftext::build(skeleton, text, &fonts)?, level));
+            }
+            3 => {
+                let level = m.take(1).ok_or_else(bad)?[0];
+                let mut span = || -> Result<&[u8], Error> {
+                    let member = members.get(m.u32().ok_or_else(bad)?).ok_or_else(bad)?;
+                    let (start, len) = (m.u32().ok_or_else(bad)?, m.u32().ok_or_else(bad)?);
+                    member
+                        .get(start..start.checked_add(len).ok_or_else(bad)?)
+                        .ok_or_else(bad)
+                };
+                let (skeleton, text) = (span()?, span()?);
+                if level > 19 {
+                    return Err(bad());
+                }
+                out.extend_from_slice(&deflate(&markup::build(skeleton, text)?, level));
             }
             _ => return Err(bad()),
         }

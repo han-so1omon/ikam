@@ -1803,3 +1803,29 @@ Newest last. Format and rules: `README.md`.
   - Bench: all corpora exact, fsck clean; north 0.3035 (unchanged); cost score 0.2510 (E110's runs 0.2434 to 0.2516). Nothing in ingest or repack changed.
 - Not done, next: a text index kept on disk (restart 24 s with pandas), a slow password hash if the settings file could ever be read by others.
 - Verdict: **kept** as a capability (both scores hold), on the branch until Eric says to merge.
+
+### E112 markup-text-layer (an office XML part as its tags and its words, apart)
+- Branch / parent: exp/112-markup-text-layer / main at 9bfb18c (E111)
+- Question (from the README's measured gap): one graph is only a few percent smaller than one store per file type. Can the words of office files share with the same words in other formats, as E102 did for PDF pages?
+- Gap today (main, `bench north`): cases one graph 391,496 vs per-type 389,058 (sharing 1.0063, one graph 0.6% larger); multiformat 332,403 vs 353,786 (0.9396); tables 135,551 vs 145,332 (0.9327); north 0.3035, sharing 0.9589 (the README's "about 3%, 7% on tables" predates E102).
+- Probe (Python zstd 19, solid): md plus docx `word/document.xml` 54,158 B on multiformat; with the XML's text runs moved out of the tags and compressed with the md, the tags apart, 35,703 (-34%). tables (csv, json, md plus office XML parts) 10,582 -> 8,217 (-22%).
+- Change (kernel; `src/markup.rs`, `src/container.rs`, option `Repo::markup_layers`, off by default):
+  - `markup::split`: the skeleton is the markup with a 0x00 byte where each text run was; the text is the runs, one per line. A run with a newline stays in the skeleton; input with a 0x00 byte is not split. `build` inverts it (unit tests and a proptest).
+  - `container::plan_zip_layered`: zip members with at least 64 B of text and text at least 1/16 of the member go into one skeleton member and one text member per zip, as manifest segment `3 level skeleton:u32 start len text:u32 start len` (like E102's segment 2). Parts with little text (styles, rels) stay whole, so identical parts still dedup. The plan is checked to rebuild the zip before it is offered. Reading accepts it at any setting.
+  - With the option on, ingest plans zips this way; repack's re-plans copy the option. `bench --markup-layers`, `realworld --markup-layers`.
+- Result (two full bench runs each, alternated with main; every corpus exact with a clean fsck; tests, clippy and fmt clean):
+
+  | corpus | main one graph | option on | change | sharing main -> on |
+  |---|---:|---:|---:|---|
+  | north/cases | 391,496 | 375,713 | **-4.0%** | 1.0063 -> 0.9513 |
+  | north/multiformat | 332,403 | 337,022 | +1.4% | 0.9396 -> 0.9489 |
+  | north/tables | 135,551 | 135,230 | -0.2% | 0.9327 -> 1.0227 |
+
+  - North score **0.3035 -> 0.3005** (-1.0%, tolerance 0.5%), identical on both runs.
+  - Cost score: main 0.2635 / 0.2502, option 0.2446 / 0.2487 (within spread). Every hot corpus stores the same bytes (under the heavy read weight office stays near raw), but the office corpus's own cost rises 0.334 / 0.349 -> 0.396 / 0.459: splitting and rebuilding parts costs repack CPU.
+  - Off: byte-identical to main on every corpus.
+  - Real-world office files (`realworld`, single-type corpora): docx 563,619 -> 563,138 (-0.1%), pptx 2,930,435 -> 2,955,381 (+0.9%), sheets 243,778 -> 245,556 (+0.7%). With no other format holding the same words, the split only adds members.
+  - Byte roles: cases docx body -14.1 KB and sheet cells -13.9 KB, text:code -11.9 KB (groups re-formed), skeleton and text members charged to office:zip (+19.0 KB, E101's sniff knows neither). multiformat docx body -15.3 KB but office:zip +18.1 KB, html +4.2 KB, md +1.3 KB: the docx text is cut into runs (one per line, words split by formatting), and 20 KB skeletons fill groups three at a time.
+- What it shows: words apart from tags help where the same facts sit in several types (cases: one graph now 4.9% smaller than per-type stores, was 0.6% larger), cost a little where a file type is alone, and lose on multiformat. A per-file choice between the layered and plain plans (priced after repack) would keep the cases gain without the multiformat and real-world losses; so would an E101 role for skeleton and text members.
+- Verdict: **kept as an option** (north improves beyond tolerance, cost score holds, office repack CPU rises; Eric's rule: trade-offs are settings). On its branch until Eric says to merge.
+- Also found: on a shallow clone the bench's `repo-history` corpus is empty and `grep_queries` divides by zero (main too). A full or deeper clone runs.

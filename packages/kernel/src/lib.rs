@@ -17,6 +17,7 @@ mod history;
 mod id;
 mod ingest;
 mod library;
+mod markup;
 pub mod matcher;
 mod object;
 mod pdftext;

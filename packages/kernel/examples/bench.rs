@@ -799,6 +799,8 @@ struct Counting;
 
 /// `--short-records`: measure with the E104 option on (see `Repo::short_records`).
 static SHORT_RECORDS: AtomicBool = AtomicBool::new(false);
+/// `--markup-layers` (E112): `Repo::markup_layers` on every store.
+static MARKUP_LAYERS: AtomicBool = AtomicBool::new(false);
 static HEAP: AtomicUsize = AtomicUsize::new(0);
 static PEAK: AtomicUsize = AtomicUsize::new(0);
 
@@ -1381,6 +1383,7 @@ fn family(name: &str) -> &'static str {
 fn north_store(name: &str, files: &[&(String, Vec<u8>)]) -> (usize, Cost, Repo<MemStore>) {
     let mut repo = Repo::new(MemStore::default());
     repo.short_records = SHORT_RECORDS.load(Relaxed);
+    repo.markup_layers = MARKUP_LAYERS.load(Relaxed);
     repo.read_weight = ARCHIVE_READ_WEIGHT;
     let entries: Vec<TreeEntry> = files
         .iter()
@@ -1642,6 +1645,7 @@ fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let json = args.iter().any(|a| a == "--json");
     SHORT_RECORDS.store(args.iter().any(|a| a == "--short-records"), Relaxed);
+    MARKUP_LAYERS.store(args.iter().any(|a| a == "--markup-layers"), Relaxed);
     // Not a scoring option: writes the generated corpus out as input for an
     // offline program writer (functions/write_programs.py), then exits.
     if let Some(i) = args.iter().position(|a| a == "--dump-generated") {
@@ -1687,6 +1691,7 @@ fn main() {
         for _ in 0..PIPELINE_RUNS {
             let mut repo = Repo::new(MemStore::default());
             repo.short_records = SHORT_RECORDS.load(Relaxed);
+            repo.markup_layers = MARKUP_LAYERS.load(Relaxed);
             repo.read_weight = READ_WEIGHT;
             let ((), ingest_cost) = measure(1, || {
                 snapshots.iter().for_each(|s| commit(&mut repo, s, graph))

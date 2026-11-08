@@ -268,6 +268,7 @@ impl<S: Store + Sync> Repo<S> {
         let mut fresh = Repo::new(MemStore::default());
         fresh.read_weight = self.read_weight;
         fresh.short_records = self.short_records;
+        fresh.markup_layers = self.markup_layers;
         fresh.slow_codec_max = self.slow_codec_max;
         fresh.deflate_memo = self.deflate_memo.clone();
         fresh.proposed_order = self.proposed_order.clone();
