@@ -60,7 +60,17 @@ pub struct Live {
     pub junk: BTreeMap<String, (Vec<u8>, SystemTime)>,
     /// WebDAV locks by path (advisory: one user, never enforced).
     pub locks: HashMap<String, String>,
+    /// `--max-store`: bytes the store, plus desktop metadata held in memory,
+    /// may reach before edits that add content are refused.
+    pub max_store: Option<u64>,
+    /// The store's size when last measured, and `repo.bytes_written` then.
+    measured: Option<(u64, usize)>,
+    /// `--public`: repack, fsck and commit-now are turned off.
+    pub public: bool,
 }
+
+/// What each desktop metadata file costs beyond its bytes, for `--max-store`.
+const JUNK_OVERHEAD: u64 = 256;
 
 /// What an edit cost.
 #[derive(Default, Debug)]
@@ -128,6 +138,9 @@ impl Live {
             extracted: HashMap::new(),
             mtimes: HashMap::new(),
             started: SystemTime::now(),
+            max_store: None,
+            measured: None,
+            public: false,
             events: VecDeque::new(),
             llm: false,
             junk: BTreeMap::new(),
@@ -467,6 +480,36 @@ impl Live {
         self.refresh()
     }
 
+    /// Bytes the store holds now, by measuring once and then counting what
+    /// the repo writes, plus desktop metadata held in memory.
+    pub fn used_bytes(&mut self) -> u64 {
+        let (base, at) = match self.measured {
+            Some(m) => m,
+            None => {
+                let m = (self.store_bytes(), self.repo.bytes_written);
+                self.measured = Some(m);
+                m
+            }
+        };
+        let junk: u64 = self
+            .junk
+            .iter()
+            .map(|(p, (b, _))| (p.len() + b.len()) as u64 + JUNK_OVERHEAD)
+            .sum();
+        base + (self.repo.bytes_written - at) as u64 + junk
+    }
+
+    /// Whether the store is under `max_store` with `incoming` more bytes.
+    pub fn has_room(&mut self, incoming: usize) -> bool {
+        match self.max_store {
+            None => true,
+            Some(max) => {
+                let used = self.used_bytes();
+                used < max && used + incoming as u64 <= max
+            }
+        }
+    }
+
     pub fn pending(&self) -> usize {
         self.pending.len()
     }
@@ -502,6 +545,7 @@ impl Live {
         self.flush(true)?;
         let t = Instant::now();
         let r = self.repo.repack().map_err(err)?;
+        self.measured = None;
         if self.base_tree.is_none() {
             // Nothing committed yet: the empty working tree was reachable from
             // no ref, so the repack's gc removed it. Store it again.

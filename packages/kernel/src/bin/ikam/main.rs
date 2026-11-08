@@ -49,7 +49,8 @@ const USAGE: &str = "usage: ikam [--store DIR] [--short-records] [--slow-codec-m
   repack                           re-plan storage of all live content; applied
                                    only if smaller and fully verified
   live [PORT] [--watch DIR[:PREFIX]]... [--llm] [--commit-after MS]
-       [--allow-host NAME]... [--log-requests]
+       [--allow-host NAME]... [--log-requests] [--public]
+       [--max-body BYTES] [--max-store BYTES] [--max-conns N]
                                    run REF (default main) as a live filesystem:
                                    WebDAV at http://127.0.0.1:PORT/dav/ (mount it
                                    in Finder: Go > Connect to Server), a web page
@@ -65,6 +66,14 @@ const USAGE: &str = "usage: ikam [--store DIR] [--short-records] [--slow-codec-m
                                    commits pending edits, then exits.
                                    --log-requests prints one line per request
                                    (time, method, path, status, ms, client).
+                                   For a copy open to anyone: --max-body refuses
+                                   larger uploads (413), --max-store refuses new
+                                   content once the store reaches BYTES (507),
+                                   --max-conns serves N connections at once (503
+                                   past that); BYTES takes K, M or G. --public
+                                   turns off repack, fsck and commit-now and
+                                   --llm, and sets those limits to 25M, 1G and 32
+                                   unless given.
   passwd USER                      read a password from stdin, print the
                                    IKAM_AUTH line for it
   write PATH [FILE|-]              store FILE (or stdin) at PATH in REF, commit
@@ -440,6 +449,22 @@ fn live_cmd(store_dir: &str, refname: &str, args: &[String]) -> Result<(), Strin
     let before = args.len();
     args.retain(|a| a != "--log-requests");
     let log_requests = args.len() != before;
+    let byte_flag = |args: &mut Vec<String>, flag: &str| {
+        take_flag(args, flag)
+            .map(|v| parse_bytes(&v).ok_or_else(|| format!("{flag} BYTES (such as 25M)")))
+            .transpose()
+    };
+    let max_body = byte_flag(&mut args, "--max-body")?;
+    let max_store = byte_flag(&mut args, "--max-store")?;
+    let max_conns = take_flag(&mut args, "--max-conns")
+        .map(|n| match n.parse::<usize>() {
+            Ok(n) if n > 0 => Ok(n),
+            _ => Err("--max-conns N (at least 1)".to_string()),
+        })
+        .transpose()?;
+    let before = args.len();
+    args.retain(|a| a != "--public");
+    let public = args.len() != before;
     let auth = auth::Auth::from_env()?;
     let llm = match args.iter().position(|a| a == "--llm") {
         Some(i) => {
@@ -448,8 +473,24 @@ fn live_cmd(store_dir: &str, refname: &str, args: &[String]) -> Result<(), Strin
         }
         None => false,
     };
+    if public && llm {
+        return Err("--public turns off --llm, so give one or the other".into());
+    }
+    let limits = http::Limits {
+        max_body: max_body
+            .or(public.then_some(PUBLIC_MAX_BODY))
+            .map(|n| n as usize),
+        max_conns: max_conns.or(public.then_some(PUBLIC_MAX_CONNS)),
+        idle: if public {
+            Duration::from_secs(30)
+        } else {
+            http::Limits::default().idle
+        },
+    };
     let port: u16 = args.first().map_or(Ok(8737), |p| p.parse()).map_err(err)?;
     let mut l = live::Live::open(store_dir, refname)?;
+    l.public = public;
+    l.max_store = max_store.or(public.then_some(PUBLIC_MAX_STORE));
     if let Some(ms) = commit_after {
         l.commit_after = Duration::from_millis(ms);
     }
@@ -538,7 +579,40 @@ fn live_cmd(store_dir: &str, refname: &str, args: &[String]) -> Result<(), Strin
     if log_requests {
         eprintln!("{t} logging each request");
     }
-    http::serve(port, handler)
+    if public {
+        eprintln!("{t} public copy: repack, fsck, commit-now and Claude answers are off");
+    }
+    let show = |n: Option<u64>| n.map_or("no limit".to_string(), |n| format!("{n} bytes"));
+    if limits.max_body.is_some() || limits.max_conns.is_some() || max_store.is_some() || public {
+        eprintln!(
+            "{t} limits: uploads {}, store {}, connections {}",
+            show(limits.max_body.map(|n| n as u64)),
+            show(max_store.or(public.then_some(PUBLIC_MAX_STORE))),
+            limits
+                .max_conns
+                .map_or("no limit".to_string(), |n| n.to_string())
+        );
+    }
+    http::serve(port, handler, limits)
+}
+
+/// `--public` limits unless given: 25 MB per upload, 1 GB stored, 32
+/// connections.
+const PUBLIC_MAX_BODY: u64 = 25 << 20;
+const PUBLIC_MAX_STORE: u64 = 1 << 30;
+const PUBLIC_MAX_CONNS: usize = 32;
+
+/// `25M`, `1G`, `512K` or plain bytes (powers of 1024).
+fn parse_bytes(s: &str) -> Option<u64> {
+    let s = s.trim();
+    let (num, shift) = match s.char_indices().last()? {
+        (i, 'K' | 'k') => (&s[..i], 10),
+        (i, 'M' | 'm') => (&s[..i], 20),
+        (i, 'G' | 'g') => (&s[..i], 30),
+        _ => (s, 0),
+    };
+    let n: u64 = num.parse().ok()?;
+    n.checked_mul(1u64 << shift)
 }
 
 /// What `--log-requests` shows of a request: method, path (no query, which
@@ -640,6 +714,17 @@ fn list(repo: &Repo<FsStore>, spec: &str, recursive: bool) -> Result<(), String>
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn byte_sizes() {
+        assert_eq!(parse_bytes("25M"), Some(25 << 20));
+        assert_eq!(parse_bytes("1G"), Some(1 << 30));
+        assert_eq!(parse_bytes("512k"), Some(512 << 10));
+        assert_eq!(parse_bytes("1000"), Some(1000));
+        assert_eq!(parse_bytes("M"), None);
+        assert_eq!(parse_bytes("-1M"), None);
+        assert_eq!(parse_bytes("99999999999G"), None);
+    }
 
     #[test]
     fn request_lines_never_show_the_password() {

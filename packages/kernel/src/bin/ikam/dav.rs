@@ -48,10 +48,21 @@ fn junk_path(path: &str) -> bool {
     is_junk(name_of(path))
 }
 
+/// What a client sees once `--max-store` is reached.
+pub const FULL: &str =
+    "this ikam store is full, so new content is refused; reading and deleting still work";
+
 pub fn handle(live: &mut Live, req: &Request) -> Response {
     let Some(path) = dav_path(&req.path) else {
         return Response::text(400, "bad path");
     };
+    if matches!(
+        req.method.as_str(),
+        "PUT" | "MKCOL" | "COPY" | "MOVE" | "LOCK" | "PROPPATCH"
+    ) && !live.has_room(req.body.len())
+    {
+        return Response::text(507, FULL);
+    }
     let r = match req.method.as_str() {
         "OPTIONS" => Ok(Response::new(200)
             .with("DAV", "1, 2")
@@ -483,5 +494,66 @@ mod tests {
         assert_eq!(dav_path("/davx"), None);
         assert_eq!(href("a b/c", true), "/dav/a%20b/c/");
         assert_eq!(href("", true), "/dav/");
+    }
+
+    fn req(method: &str, path: &str, body: &[u8]) -> Request {
+        Request {
+            method: method.into(),
+            path: path.into(),
+            query: String::new(),
+            headers: vec![("Host".into(), "127.0.0.1:1".into())],
+            body: body.to_vec(),
+        }
+    }
+
+    #[test]
+    fn a_full_store_refuses_new_content_but_reads_and_deletes() {
+        let dir = std::env::temp_dir().join(format!("ikam-dav-full-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut l = Live::open(dir.to_str().unwrap(), "main").unwrap();
+        let start = l.used_bytes();
+        l.max_store = Some(start + 4096);
+        assert_eq!(
+            handle(&mut l, &req("PUT", "/dav/a.txt", b"small")).status,
+            201
+        );
+        let big = vec![b'x'; 8192];
+        let r = handle(&mut l, &req("PUT", "/dav/big.bin", &big));
+        assert_eq!(r.status, 507);
+        assert_eq!(handle(&mut l, &req("GET", "/dav/a.txt", b"")).status, 200);
+        // Fill it with distinct small files until it refuses.
+        let mut refused = false;
+        for i in 0..200 {
+            let body = format!("{i:04} {}", "y".repeat(200));
+            if handle(
+                &mut l,
+                &req("PUT", &format!("/dav/f{i}.txt"), body.as_bytes()),
+            )
+            .status
+                == 507
+            {
+                refused = true;
+                break;
+            }
+        }
+        assert!(refused, "the store never filled");
+        assert!(
+            l.used_bytes() <= start + 4096 + 512,
+            "went well past the cap"
+        );
+        // At the cap, even an empty request that adds content is refused.
+        l.max_store = Some(l.used_bytes());
+        assert_eq!(handle(&mut l, &req("MKCOL", "/dav/d", b"")).status, 507);
+        // Desktop metadata counts too.
+        assert_eq!(
+            handle(&mut l, &req("PUT", "/dav/._a.txt", &[0; 64])).status,
+            507
+        );
+        assert_eq!(
+            handle(&mut l, &req("DELETE", "/dav/a.txt", b"")).status,
+            204
+        );
+        assert_eq!(handle(&mut l, &req("PROPFIND", "/dav/", b"")).status, 207);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
