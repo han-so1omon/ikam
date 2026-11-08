@@ -1,6 +1,7 @@
 //! `ikam` CLI over a filesystem store.
 
 mod ask;
+mod auth;
 mod corpus;
 mod dav;
 mod http;
@@ -48,6 +49,7 @@ const USAGE: &str = "usage: ikam [--store DIR] [--short-records] [--slow-codec-m
   repack                           re-plan storage of all live content; applied
                                    only if smaller and fully verified
   live [PORT] [--watch DIR[:PREFIX]]... [--llm] [--commit-after MS]
+       [--allow-host NAME]...
                                    run REF (default main) as a live filesystem:
                                    WebDAV at http://127.0.0.1:PORT/dav/ (mount it
                                    in Finder: Go > Connect to Server), a web page
@@ -55,6 +57,14 @@ const USAGE: &str = "usage: ikam [--store DIR] [--short-records] [--slow-codec-m
                                    tree as it changes. Edits commit after MS of
                                    quiet (default 1500). --llm lets questions be
                                    answered by Claude (needs ANTHROPIC_API_KEY).
+                                   --allow-host also answers to NAME (such as the
+                                   machine's Tailscale name behind Tailscale
+                                   Serve); it still listens on 127.0.0.1 only. With
+                                   IKAM_AUTH set (from passwd), every request needs
+                                   that user and password. SIGTERM or Ctrl-C
+                                   commits pending edits, then exits.
+  passwd USER                      read a password from stdin, print the
+                                   IKAM_AUTH line for it
   write PATH [FILE|-]              store FILE (or stdin) at PATH in REF, commit
   rm PATH | mkdir PATH             remove a file or folder / make a folder in REF
   mv FROM TO | cp FROM TO          rename or copy a file or folder in REF
@@ -67,6 +77,15 @@ fn main() -> ExitCode {
     quiet_on_closed_stdout();
     let mut args: Vec<String> = std::env::args().skip(1).collect();
     let store_dir = take_flag(&mut args, "--store").unwrap_or_else(|| ".ikam".into());
+    if args.first().map(String::as_str) == Some("passwd") {
+        return match passwd(args.get(1).map(String::as_str)) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(msg) => {
+                eprintln!("{msg}");
+                ExitCode::FAILURE
+            }
+        };
+    }
     match run(&store_dir, &mut args) {
         Ok(()) => ExitCode::SUCCESS,
         Err(msg) => {
@@ -74,6 +93,20 @@ fn main() -> ExitCode {
             ExitCode::FAILURE
         }
     }
+}
+
+/// Print `IKAM_AUTH=...` for USER and the password on stdin's first line.
+/// Needs no store, so it opens none.
+fn passwd(user: Option<&str>) -> Result<(), String> {
+    let user = user.ok_or("usage: ikam passwd USER (password on stdin)")?;
+    let mut line = String::new();
+    std::io::stdin().read_line(&mut line).map_err(err)?;
+    let password = line.trim_end_matches(['\n', '\r']);
+    if password.is_empty() {
+        return Err("empty password".into());
+    }
+    println!("IKAM_AUTH={}", auth::Auth::line(user, password)?);
+    Ok(())
 }
 
 /// `ikam ls -r | head` ends with stdout closed: exit quietly, as other
@@ -395,6 +428,14 @@ fn live_cmd(store_dir: &str, refname: &str, args: &[String]) -> Result<(), Strin
                 .map_err(|_| "--commit-after MS".to_string())
         })
         .transpose()?;
+    let mut allowed = Vec::new();
+    while let Some(name) = take_flag(&mut args, "--allow-host") {
+        if name.is_empty() || name.contains(['/', ' ']) {
+            return Err(format!("--allow-host {name:?}: expected a host name"));
+        }
+        allowed.push(name);
+    }
+    let auth = auth::Auth::from_env()?;
     let llm = match args.iter().position(|a| a == "--llm") {
         Some(i) => {
             args.remove(i);
@@ -411,6 +452,7 @@ fn live_cmd(store_dir: &str, refname: &str, args: &[String]) -> Result<(), Strin
     if llm && !ask::key_available() {
         eprintln!("--llm: ANTHROPIC_API_KEY is not set; questions will show sources only");
     }
+    auth::catch_stop_signals();
     l.index_all(true)?;
     let live = Arc::new(Mutex::new(l));
     {
@@ -418,6 +460,20 @@ fn live_cmd(store_dir: &str, refname: &str, args: &[String]) -> Result<(), Strin
         std::thread::spawn(move || {
             loop {
                 std::thread::sleep(Duration::from_millis(250));
+                if auth::stopping() {
+                    // Holding the lock, so no edit or repack is half done;
+                    // commit what is pending and leave.
+                    let mut l = live.lock().unwrap();
+                    let code = match l.flush(true) {
+                        Ok(_) => 0,
+                        Err(e) => {
+                            eprintln!("commit on stop failed: {e}");
+                            1
+                        }
+                    };
+                    eprintln!("stopped");
+                    std::process::exit(code);
+                }
                 if let Err(e) = live.lock().unwrap().flush(false) {
                     eprintln!("commit failed: {e}");
                 }
@@ -429,15 +485,16 @@ fn live_cmd(store_dir: &str, refname: &str, args: &[String]) -> Result<(), Strin
         let live = live.clone();
         std::thread::spawn(move || live::watch(live, dir, prefix, Duration::from_millis(500)));
     }
-    let hosts = [format!("127.0.0.1:{port}"), format!("localhost:{port}")];
+    let hosts = auth::Hosts::new(port, allowed.clone());
+    let password = auth.is_some();
     let handler = Arc::new(move |req: http::Request| {
         // A page on another site can point a name it controls at
         // 127.0.0.1 (DNS rebinding); its requests carry that name.
-        if !req
-            .header("host")
-            .is_some_and(|h| hosts.iter().any(|ok| ok == h))
-        {
+        if !req.header("host").is_some_and(|h| hosts.ok(h)) {
             return http::Response::text(403, "unknown Host");
+        }
+        if let Some(refusal) = auth.as_ref().and_then(|a| a.check(&req)) {
+            return refusal;
         }
         if req.path == dav::PREFIX || req.path.starts_with("/dav/") {
             dav::handle(&mut live.lock().unwrap(), &req)
@@ -448,6 +505,12 @@ fn live_cmd(store_dir: &str, refname: &str, args: &[String]) -> Result<(), Strin
     eprintln!(
         "live on http://127.0.0.1:{port}/ (WebDAV: http://127.0.0.1:{port}/dav/), ref {refname}"
     );
+    for name in &allowed {
+        eprintln!("also answering to {name}");
+    }
+    if password {
+        eprintln!("password required (IKAM_AUTH)");
+    }
     http::serve(port, handler)
 }
 

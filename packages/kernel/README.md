@@ -75,6 +75,24 @@ ikam --store S ask "which file says how to add a paragraph?" [--llm]
   127.0.0.1 or localhost, and serves files with a sandbox policy (an HTML
   file in the store cannot run script in the page). WebDAV locks are
   granted but not enforced (one user).
+- **It stays in its own folder**: everything it writes is under `--store`.
+  A `--watch` folder is only read, never written to, and the WebDAV mount
+  is a separate network volume, so the machine's own files are untouched.
+  Stopping it and deleting the store folder removes it.
+- **From other machines** (E111): put a proxy that only your devices reach
+  in front of it, such as Tailscale Serve, and name the proxy's host with
+  `--allow-host NAME` (repeatable; it still listens on 127.0.0.1 only).
+  With `IKAM_AUTH` set, every request, page and `/dav/` alike, needs that
+  user and password (HTTP basic auth, which Finder sends):
+
+  ```sh
+  read -rs PW; printf '%s\n' "$PW" | ikam passwd eric   # prints IKAM_AUTH=eric:salt:hash
+  IKAM_AUTH=... ikam --store S live --allow-host mac.example.ts.net
+  ```
+
+  Keep that line in a file only you can read (the hash is BLAKE3, which is
+  fast to guess against). SIGTERM or Ctrl-C commits pending edits, then
+  exits, so a service manager can restart it without losing an edit.
 
 `realworld/live_bench.py` measures it (edit cost and latency, exact
 read-back against a copy of the tree, search freshness, restart).
