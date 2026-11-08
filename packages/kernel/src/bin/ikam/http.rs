@@ -112,7 +112,7 @@ pub fn serve(port: u16, handler: Arc<Handler>) -> Result<(), String> {
                         | std::io::ErrorKind::TimedOut
                 )
             {
-                eprintln!("connection: {e}");
+                eprintln!("{} connection: {e}", crate::live::stamp());
             }
         });
     }

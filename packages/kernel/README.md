@@ -93,6 +93,10 @@ ikam --store S ask "which file says how to add a paragraph?" [--llm]
   Keep that line in a file only you can read (the hash is BLAKE3, which is
   fast to guess against). SIGTERM or Ctrl-C commits pending edits, then
   exits, so a service manager can restart it without losing an edit.
+- **Seeing what clients send** (E113): `--log-requests` prints one line per
+  request, with the time, method, path, Host, the client's first User-Agent
+  word and whether it carried a password (never the password), then the
+  status and how long it took. Every log line starts with the time (UTC).
 
 `realworld/live_bench.py` measures it (edit cost and latency, exact
 read-back against a copy of the tree, search freshness, restart).
