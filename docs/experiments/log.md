@@ -1840,5 +1840,5 @@ Newest last. Format and rules: `README.md`.
   - Every line `ikam live` writes (startup, watch, commit failures, stop, connection errors) starts with the UTC time, so a log tail over ssh shows which run a line came from.
 - Result: tests, clippy and fmt clean. Ingest, repack and the store are untouched (bench not rerun for that reason).
 - Next: run it on the Mac with `--log-requests` and retry Finder. No lines means Finder's requests never reach ikam (look on the client: `mount_webdav -i URL DIR` from Terminal, and `log show --last 5m --predicate 'process CONTAINS "webdav"'`); lines that stop at one request point at that request.
-- Verdict: **kept** as a capability (logging off by default), on the branch until Eric says to merge.
+- Verdict: **kept** as a capability (logging off by default); merged to main on Eric's yes (Nov 8).
 
