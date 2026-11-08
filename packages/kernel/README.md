@@ -97,6 +97,23 @@ ikam --store S ask "which file says how to add a paragraph?" [--llm]
   request, with the time, method, path, Host, the client's first User-Agent
   word and whether it carried a password (never the password), then the
   status and how long it took. Every log line starts with the time (UTC).
+- **A copy open to anyone** (E114): with `IKAM_AUTH` set, `--public` lets
+  a request without a password read (the page, search, ask's sources,
+  `/dav/` GET, HEAD, PROPFIND and OPTIONS, so Finder can mount it
+  read-only) and refuses everything else with 401: writes, edits, deletes,
+  locks, `/api/commit`, `/api/repack`, `/api/fsck`. Claude answers are left
+  out for guests. A wrong password is refused even for a read. Limits for a
+  copy strangers can reach (each also usable alone): `--max-body` (413 on a
+  larger upload, refused before it is read), `--max-store` (507 on new
+  content once the store reaches it; reads and deletes still work),
+  `--max-conns` (503 past that many connections). `--public` sets them to
+  25M, 1G and 32 unless given, and closes idle connections after 30 s.
+  Header lines over 16 KB or more than 100 headers get 431 everywhere.
+
+  `realworld/selftest.py` checks such a copy from the outside (guest reads
+  and refused writes, exact read-back, search, ask, edits, commit, with
+  timings) using the password, under `/selftest/`, and publishes the result
+  at `/dav/results/latest.json` and `history.jsonl` for anyone to read.
 
 `realworld/live_bench.py` measures it (edit cost and latency, exact
 read-back against a copy of the tree, search freshness, restart).

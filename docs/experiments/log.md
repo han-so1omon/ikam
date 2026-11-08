@@ -1842,3 +1842,19 @@ Newest last. Format and rules: `README.md`.
 - Next: run it on the Mac with `--log-requests` and retry Finder. No lines means Finder's requests never reach ikam (look on the client: `mount_webdav -i URL DIR` from Terminal, and `log show --last 5m --predicate 'process CONTAINS "webdav"'`); lines that stop at one request point at that request.
 - Verdict: **kept** as a capability (logging off by default); merged to main on Eric's yes (Nov 8).
 
+
+### E114 public-test (a copy anyone can read, and a self-test that publishes its result)
+- Branch / parent: exp/114-public-test / main at c3afdca (E113)
+- Question (Eric, Nov 8): put a test copy of ikam on Tailscale Funnel so Claude can watch it as it develops, without opening his own files: anyone may read, writes need a password, a test runner on the Mac uses that password and publishes what it finds.
+- Gaps found in an open `ikam live`: request bodies read whole with no limit, no cap on the store, a thread per connection with no cap, header lines of any length, and repack/fsck/commit callable by anyone who can reach it when no password is set.
+- Change (CLI only; nothing changes without the new flags except the header caps):
+  - `--public` (needs `IKAM_AUTH`): guests (no Authorization header) get GET, HEAD and OPTIONS anywhere and PROPFIND on `/dav`; every other method, and all API POSTs, get 401 with the challenge. A guest's `llm` parameter is dropped, so no Claude answer is spent for them. A wrong password is refused, reads included.
+  - `--max-body BYTES`: 413 from the headers alone (before 100 Continue or any body), and mid-stream for chunked bodies.
+  - `--max-store BYTES`: 507 for PUT, MKCOL, COPY, MOVE, LOCK and PROPPATCH once the store is at the cap or the body would pass it; reads and DELETE still work. Size is measured once from disk, then counted from what the repo writes (re-measured after repack), plus desktop metadata held in memory.
+  - `--max-conns N`: 503 (Retry-After 5) past N open connections.
+  - Always: a header line over 16 KB or more than 100 headers gets 431.
+  - `--public` defaults: 25M upload, 1G store, 32 connections, 30 s idle.
+  - `realworld/selftest.py`: stdlib-only check of a running copy, under `/selftest/`: guest reads, 8 kinds of guest write refused, wrong password refused, no Claude answer for guests, 14 files (text, CSV, a Word file) read back byte for byte, search finds each by a word only it holds, ask's first source, an edit moves a word, rename/copy/delete/folder rename, commit; timings per kind. Writes `/dav/results/latest.json` and `history.jsonl` (last 200) with the password; never writes the password.
+- Result: unit tests (limits over a real socket, store cap, guest method table, byte sizes), clippy and fmt clean, 10 full test runs with no flake. Manual: guest writes 401, password writes 201, guest reads 200/207, unknown Host 403, 30 MB upload 413, store cap 507 after 20 x 100 KB. Self-test passes twice in a row (about 13 KB stored per run). Live bench (default flags, 8 corpora, 264 files, 400 edits): 0 mismatches, search 0 wrong, fsck clean, restart 3.5 s, watch lag p50 515 ms; ingest untouched.
+- Mac setup (dry run here with stand-ins for launchctl and plutil): `/path/to/ikam-test` with its own store, a generated test password (mode 600), `com.example.ikam-test` on 127.0.0.1:8739 using the private copy's auto-updated binary, and `com.example.ikam-test-run` that restarts the test copy when `ikam-live/deployed` changes and runs the self-test (also every 6 hours). Funnel on 8443 only; the private copy keeps 443 on the tailnet.
+- Verdict: **kept** as options (all off by default). On its branch until Eric says to merge.
