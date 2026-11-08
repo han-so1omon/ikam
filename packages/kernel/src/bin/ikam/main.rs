@@ -49,7 +49,7 @@ const USAGE: &str = "usage: ikam [--store DIR] [--short-records] [--slow-codec-m
   repack                           re-plan storage of all live content; applied
                                    only if smaller and fully verified
   live [PORT] [--watch DIR[:PREFIX]]... [--llm] [--commit-after MS]
-       [--allow-host NAME]...
+       [--allow-host NAME]... [--log-requests]
                                    run REF (default main) as a live filesystem:
                                    WebDAV at http://127.0.0.1:PORT/dav/ (mount it
                                    in Finder: Go > Connect to Server), a web page
@@ -63,6 +63,8 @@ const USAGE: &str = "usage: ikam [--store DIR] [--short-records] [--slow-codec-m
                                    IKAM_AUTH set (from passwd), every request needs
                                    that user and password. SIGTERM or Ctrl-C
                                    commits pending edits, then exits.
+                                   --log-requests prints one line per request
+                                   (time, method, path, status, ms, client).
   passwd USER                      read a password from stdin, print the
                                    IKAM_AUTH line for it
   write PATH [FILE|-]              store FILE (or stdin) at PATH in REF, commit
@@ -435,6 +437,9 @@ fn live_cmd(store_dir: &str, refname: &str, args: &[String]) -> Result<(), Strin
         }
         allowed.push(name);
     }
+    let before = args.len();
+    args.retain(|a| a != "--log-requests");
+    let log_requests = args.len() != before;
     let auth = auth::Auth::from_env()?;
     let llm = match args.iter().position(|a| a == "--llm") {
         Some(i) => {
@@ -467,51 +472,90 @@ fn live_cmd(store_dir: &str, refname: &str, args: &[String]) -> Result<(), Strin
                     let code = match l.flush(true) {
                         Ok(_) => 0,
                         Err(e) => {
-                            eprintln!("commit on stop failed: {e}");
+                            eprintln!("{} commit on stop failed: {e}", live::stamp());
                             1
                         }
                     };
-                    eprintln!("stopped");
+                    eprintln!("{} stopped", live::stamp());
                     std::process::exit(code);
                 }
                 if let Err(e) = live.lock().unwrap().flush(false) {
-                    eprintln!("commit failed: {e}");
+                    eprintln!("{} commit failed: {e}", live::stamp());
                 }
             }
         });
     }
     for (dir, prefix) in watches {
-        eprintln!("watching {} into /{prefix}", dir.display());
+        eprintln!(
+            "{} watching {} into /{prefix}",
+            live::stamp(),
+            dir.display()
+        );
         let live = live.clone();
         std::thread::spawn(move || live::watch(live, dir, prefix, Duration::from_millis(500)));
     }
     let hosts = auth::Hosts::new(port, allowed.clone());
     let password = auth.is_some();
-    let handler = Arc::new(move |req: http::Request| {
+    let route = move |req: &http::Request| {
         // A page on another site can point a name it controls at
         // 127.0.0.1 (DNS rebinding); its requests carry that name.
         if !req.header("host").is_some_and(|h| hosts.ok(h)) {
             return http::Response::text(403, "unknown Host");
         }
-        if let Some(refusal) = auth.as_ref().and_then(|a| a.check(&req)) {
+        if let Some(refusal) = auth.as_ref().and_then(|a| a.check(req)) {
             return refusal;
         }
         if req.path == dav::PREFIX || req.path.starts_with("/dav/") {
-            dav::handle(&mut live.lock().unwrap(), &req)
+            dav::handle(&mut live.lock().unwrap(), req)
         } else {
-            ui::handle(&live, &req)
+            ui::handle(&live, req)
         }
+    };
+    let handler = Arc::new(move |req: http::Request| {
+        let started = Instant::now();
+        let line = log_requests.then(|| request_line(&req));
+        let resp = route(&req);
+        if let Some(line) = line {
+            eprintln!(
+                "{} {line} -> {} {:.0}ms",
+                live::stamp(),
+                resp.status,
+                started.elapsed().as_secs_f64() * 1000.0
+            );
+        }
+        resp
     });
+    let t = live::stamp();
     eprintln!(
-        "live on http://127.0.0.1:{port}/ (WebDAV: http://127.0.0.1:{port}/dav/), ref {refname}"
+        "{t} live on http://127.0.0.1:{port}/ (WebDAV: http://127.0.0.1:{port}/dav/), ref {refname}"
     );
     for name in &allowed {
-        eprintln!("also answering to {name}");
+        eprintln!("{t} also answering to {name}");
     }
     if password {
-        eprintln!("password required (IKAM_AUTH)");
+        eprintln!("{t} password required (IKAM_AUTH)");
+    }
+    if log_requests {
+        eprintln!("{t} logging each request");
     }
     http::serve(port, handler)
+}
+
+/// What `--log-requests` shows of a request: method, path (no query, which
+/// may hold a search), the Host it named, the client's first User-Agent word,
+/// and whether it carried a password (never the password).
+fn request_line(req: &http::Request) -> String {
+    let client = req
+        .header("user-agent")
+        .and_then(|u| u.split_whitespace().next())
+        .unwrap_or("-");
+    format!(
+        "{} {} host={} [{client}{}]",
+        req.method,
+        req.path,
+        req.header("host").unwrap_or("-"),
+        req.header("authorization").map_or(", no password", |_| "")
+    )
 }
 
 fn take_flag(args: &mut Vec<String>, flag: &str) -> Option<String> {
@@ -591,4 +635,38 @@ fn list(repo: &Repo<FsStore>, spec: &str, recursive: bool) -> Result<(), String>
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn request_lines_never_show_the_password() {
+        let req = |auth: Option<&str>| http::Request {
+            method: "PROPFIND".into(),
+            path: "/dav/a%20b".into(),
+            query: "q=secret+search".into(),
+            headers: [
+                Some(("Host".to_string(), "mac.ts.net".to_string())),
+                Some((
+                    "User-Agent".to_string(),
+                    "WebDAVFS/3.0.0 (03008000) Darwin/25.0.0".to_string(),
+                )),
+                auth.map(|a| ("Authorization".to_string(), a.to_string())),
+            ]
+            .into_iter()
+            .flatten()
+            .collect(),
+            body: Vec::new(),
+        };
+        assert_eq!(
+            request_line(&req(Some("Basic ZXJpYzpodW50ZXIy"))),
+            "PROPFIND /dav/a%20b host=mac.ts.net [WebDAVFS/3.0.0]"
+        );
+        assert_eq!(
+            request_line(&req(None)),
+            "PROPFIND /dav/a%20b host=mac.ts.net [WebDAVFS/3.0.0, no password]"
+        );
+    }
 }

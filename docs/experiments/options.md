@@ -119,6 +119,7 @@ The live filesystem stores each edit as it comes and leaves re-planning to
 | `--llm` | off | questions get a written answer from Claude (the question and the retrieved passages are sent to the Claude API) against sources only, locally | not scored |
 
 | `--allow-host NAME` (E111) | none | another name the server answers to (a proxy such as Tailscale Serve) against a wider set of pages that could reach it if that name ever pointed somewhere else; it still listens on 127.0.0.1 only | not scored |
+| `--log-requests` (E113) | off | a line per request (what a client such as Finder sends) against a log that grows with use | not scored |
 | `IKAM_AUTH` (E111) | unset | a password on every request against one more thing to keep secret; the hash is fast (BLAKE3), so the line belongs in a file only its owner reads | not scored |
 
 **Not yet a setting**: an incremental repack that re-plans only what was

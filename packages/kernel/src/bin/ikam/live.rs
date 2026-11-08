@@ -153,7 +153,8 @@ impl Live {
         if progress {
             let bytes: usize = self.docs.values().map(|d| d.bytes()).sum();
             eprintln!(
-                "indexed {} files ({} bytes of text) in {:.1} s",
+                "{} indexed {} files ({} bytes of text) in {:.1} s",
+                stamp(),
                 self.docs.len(),
                 bytes,
                 t.elapsed().as_secs_f64()
@@ -759,6 +760,11 @@ pub fn http_date(t: SystemTime) -> String {
 }
 
 /// ISO 8601 UTC (WebDAV creationdate).
+/// The time now, for log lines.
+pub fn stamp() -> String {
+    iso_date(SystemTime::now())
+}
+
 pub fn iso_date(t: SystemTime) -> String {
     let secs = t
         .duration_since(SystemTime::UNIX_EPOCH)
