@@ -151,10 +151,12 @@ clashes are about 3 in 10,000 there).
 | --- | --- | --- | --- |
 | `Repo::seed_scope` (E131) | `None`: every stored content | `Some(roots)`: the first write reads only those contents and what they are made of, and near-match reuse stays inside them, against missing repeats of content outside them | one-file edit's first write 238 MB / 1.7 s to 0.69 MB / 8.8 ms, same bytes stored; a 36-file folder copy with source and destination folders in scope 8.5 KB written against 21.8 KB on the whole store; an empty scope 1.09 MB against 2.9 KB |
 | `Repo::set_seed_scope` (E133) | not called | a new scope for each request (a goal's folders), the seed index rebuilt for it, against that rebuild's reads (2.7 MB for the second goal in E133) | name the trees and view chunks a write replaces too: a view update stored 237 KB with them, 404 KB without |
+| What to put in a goal's scope (E137) | (a choice of the caller) | the files the goal reads and edits, plus the trees and view chunks it replaces, against their whole folders: misses repeats of files the goal never touched | E133's first goal 94 MB / 797 ms to 7.7 MB / 318 ms, 250,379 bytes written against 250,630 |
 
 **Not yet a setting**: a ledger cache file (E130: 159 KB and 0.1 ms to load
-against a 229 MB scan on every fresh handle's first derived read); it is an
-on-disk addition and waits on a decision.
+in one read; since E135 a fresh handle's first lookup reads 192 KB of headers
+in 1,906 reads instead of 229 MB). It would save round trips, mainly on R2;
+it is an on-disk addition and waits on a decision.
 
 ## Reads within one request (E124 to E128)
 

@@ -265,6 +265,8 @@ fn main() {
         ("recommended", true, true),
         ("recommended_scope_without_the_view", true, false),
         ("recommended_whole_store_scope", true, false),
+        // E137: only the files the goal edits, not their folders.
+        ("recommended_scope_edited_files", true, true),
     ] {
         let mut repo = wrap(&objects, &refs);
         repo.needed_index = recommended;
@@ -336,11 +338,14 @@ fn main() {
                 .collect();
             if recommended && config != "recommended_whole_store_scope" {
                 let folders: HashSet<&str> = chosen.iter().map(|f| top(&f.0)).collect();
-                let mut scope: Vec<Id> = all
-                    .iter()
-                    .filter(|f| folders.contains(top(&f.0)))
-                    .map(|f| f.1)
-                    .collect();
+                let mut scope: Vec<Id> = if config == "recommended_scope_edited_files" {
+                    chosen.iter().map(|f| f.1).collect()
+                } else {
+                    all.iter()
+                        .filter(|f| folders.contains(top(&f.0)))
+                        .map(|f| f.1)
+                        .collect()
+                };
                 // Trees and view chunks are stored as content, so their
                 // previous versions are where their new versions repeat.
                 if scope_view {

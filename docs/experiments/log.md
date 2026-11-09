@@ -2098,3 +2098,15 @@ Newest last. Format and rules: `README.md`.
   - Sorting costs one sort of the id list per listing, well under a millisecond for the 1,906 ids of the cases store (estimated, not timed separately).
   - All kernel tests pass, plus `tests/order.rs`: file-store listings come in id order (fails without the change), and the same writes store the same bytes in a file store as in a memory store (a guard; it also passed before).
 - Verdict: **kept**; on its branch until Eric says to merge.
+
+### E137 file-scope (a goal's repeats looked for only in the files it touches)
+- Branch / parent: exp/137-file-scope / exp/136-seed-order (E136)
+- Question: after E135 the recommended first goal from E133 still fetches 94 MB, and 89 MB of it is the seed index for the edited files' whole top-level folders. Does a scope of only the files the goal edits (plus the trees and view chunks it replaces, as E133 found it needs) lose any repeats?
+- Change: none in the kernel. `examples/goal.rs` gains a configuration, `recommended_scope_edited_files`, that sets `seed_scope` to the five edited files, the view's chunks and the trees.
+- Result (cases store, same goals as E133):
+  - First goal on a fresh handle: 94.0 MB / 797 ms to 7.7 MB / 318 ms; the edit-and-commit stage 88.7 MB / 506 ms to 2.5 MB / 28 ms. Bytes written 250,379 against 250,630: a little less, not more.
+  - Next goal on the same handle: 6.3 MB to 5.7 MB; 78,086 bytes written against 78,298.
+  - The edits here only change existing files, whose old versions are in the scope. A goal that writes new files from others it read (E131's folder copy) needs those sources in the scope too, so the rule is: what the goal reads and edits, not where it lives.
+  - What the first goal now reads: search 0.73 MB, the model's windows 0.39 MB, edits 2.5 MB, view update 3.9 MB, the projections 0.25 MB.
+  - No kernel change, so the safety check and the fixed bench are E136's.
+- Verdict: **kept** as the recommended scope (in `options.md`); on its branch until Eric says to merge.
