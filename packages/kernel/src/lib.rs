@@ -40,6 +40,7 @@ pub use id::Id;
 pub use object::{
     Arg, Claim, Commit, Derivation, Edge, Graph, Kind, Node, Object, Target, TreeEntry, node_key,
 };
+pub use range::ReadSession;
 pub use repack::Repacked;
 pub use repo::{DEFAULT_READ_WEIGHT, Form, Put, Repo};
 pub use search::{SEARCH_REF, SearchIndex};

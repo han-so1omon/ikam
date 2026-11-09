@@ -135,11 +135,24 @@ fn load(src: &Path) -> MemStore {
 }
 
 /// Every file under `tree`: (path, id, depth), and every tree with its path.
-fn walk(repo: &R, tree: Id, prefix: &str, depth: usize, files: &mut Vec<(String, Id, usize)>, trees: &mut Vec<(String, Id)>) {
+fn walk(
+    repo: &R,
+    tree: Id,
+    prefix: &str,
+    depth: usize,
+    files: &mut Vec<(String, Id, usize)>,
+    trees: &mut Vec<(String, Id)>,
+) {
     trees.push((prefix.to_string(), tree));
-    let Object::Tree(entries) = repo.get(&tree).unwrap() else { panic!("not a tree") };
+    let Object::Tree(entries) = repo.get(&tree).unwrap() else {
+        panic!("not a tree")
+    };
     for e in entries {
-        let path = if prefix.is_empty() { e.name.clone() } else { format!("{prefix}/{}", e.name) };
+        let path = if prefix.is_empty() {
+            e.name.clone()
+        } else {
+            format!("{prefix}/{}", e.name)
+        };
         match e.kind {
             Kind::Tree => walk(repo, e.id, &path, depth + 1, files, trees),
             Kind::File => files.push((path, e.id, depth + 1)),
@@ -149,7 +162,9 @@ fn walk(repo: &R, tree: Id, prefix: &str, depth: usize, files: &mut Vec<(String,
 }
 
 fn ext(path: &str) -> String {
-    Path::new(path).extension().map_or("none".into(), |e| e.to_string_lossy().into_owned())
+    Path::new(path)
+        .extension()
+        .map_or("none".into(), |e| e.to_string_lossy().into_owned())
 }
 
 fn median(v: &mut [f64]) -> f64 {
@@ -186,11 +201,19 @@ fn main() {
     let mut repo: R = Repo::new(Counting::new(load(&src)));
     eprintln!("loaded in {:.1} s", t.elapsed().as_secs_f64());
     let store_objects = repo.store().ids().unwrap().len();
-    let store_bytes: u64 = repo.store().ids().unwrap().iter().map(|id| repo.store().inner.read(id).unwrap().len() as u64).sum();
+    let store_bytes: u64 = repo
+        .store()
+        .ids()
+        .unwrap()
+        .iter()
+        .map(|id| repo.store().inner.read(id).unwrap().len() as u64)
+        .sum();
     repo.store().take();
 
     let commit = repo.resolve(&refname).unwrap();
-    let Object::Commit(c) = repo.get(&commit).unwrap() else { panic!() };
+    let Object::Commit(c) = repo.get(&commit).unwrap() else {
+        panic!()
+    };
     let (mut files, mut trees) = (Vec::new(), Vec::new());
     walk(&repo, c.tree, "", 0, &mut files, &mut trees);
     repo.store().take();
@@ -213,11 +236,147 @@ fn main() {
     let _ = repo.read_content(&files[0].1).unwrap();
     repo.store().take();
 
-    anatomy(&repo, &files);
-    e124(&repo, &files, &dir);
-    e125(&mut repo, &files, c.tree);
-    e126(&mut repo, &files, &trees, c.tree, commit, &refname);
-    e127(&mut repo, &files);
+    // ACCESS_ONLY=e128 (for example) runs one phase.
+    let only = std::env::var("ACCESS_ONLY").unwrap_or_default();
+    let run = |p: &str| only.is_empty() || only == p;
+    if run("anatomy") {
+        anatomy(&repo, &files);
+    }
+    if run("e124") {
+        e124(&repo, &files, &dir);
+    }
+    if run("e125") {
+        e125(&mut repo, &files, c.tree);
+    }
+    if run("e126") {
+        e126(&mut repo, &files, &trees, c.tree, commit, &refname);
+    }
+    if run("e127") {
+        e127(&mut repo, &files);
+    }
+    if run("e128") {
+        e128(&mut repo, &files);
+    }
+}
+
+/// E128: the same reads as E124 and E127, inside one read session per
+/// request, so what one read decodes (a group, a container part) serves the
+/// next. Each result is compared with a plain read.
+fn e128(repo: &mut R, files: &[(String, Id, usize)]) {
+    const LIMIT: usize = 64 << 20;
+    let text: Vec<Id> = files
+        .iter()
+        .filter(|f| {
+            matches!(
+                ext(&f.0).as_str(),
+                "md" | "json" | "jsonl" | "txt" | "py" | "log"
+            )
+        })
+        .map(|f| f.1)
+        .collect();
+    // Every text file, plain and in one session.
+    repo.store().take();
+    let t = Instant::now();
+    let mut plain_out = Vec::new();
+    for id in &text {
+        plain_out.push(repo.read_content(id).unwrap());
+    }
+    let plain = repo.store().take();
+    let plain_ms = t.elapsed().as_secs_f64() * 1e3;
+    let t = Instant::now();
+    let s = repo.session(LIMIT);
+    for (id, want) in text.iter().zip(&plain_out) {
+        assert_eq!(&s.read_content(id).unwrap(), want);
+    }
+    let sess = repo.store().take();
+    let sess_ms = t.elapsed().as_secs_f64() * 1e3;
+    let held = s.held();
+    drop(s);
+    let text_bytes: usize = plain_out.iter().map(Vec::len).sum();
+    println!(
+        "{{\"exp\":\"E128\",\"what\":\"read_all_text\",\"files\":{},\"bytes\":{text_bytes},\"plain_reads\":{},\"plain_fetched\":{},\"plain_ms\":{plain_ms:.1},\"session_reads\":{},\"session_fetched\":{},\"session_ms\":{sess_ms:.1},\"session_held\":{held}}}",
+        text.len(),
+        plain.reads,
+        plain.bytes,
+        sess.reads,
+        sess.bytes
+    );
+    // Office files: whole, each in a fresh session against plain (one
+    // request, one file).
+    let office: Vec<Id> = files
+        .iter()
+        .filter(|f| matches!(ext(&f.0).as_str(), "docx" | "pptx" | "xlsx"))
+        .map(|f| f.1)
+        .collect();
+    let (mut pf, mut sf, mut all_sf) = (0u64, 0u64, 0u64);
+    let all = repo.session(LIMIT);
+    for id in &office {
+        let a = repo.read_content(id).unwrap();
+        pf += repo.store().take().bytes;
+        let s = repo.session(LIMIT);
+        assert_eq!(s.read_content(id).unwrap(), a);
+        sf += repo.store().take().bytes;
+        assert_eq!(all.read_content(id).unwrap(), a);
+        all_sf += repo.store().take().bytes;
+    }
+    drop(all);
+    println!(
+        "{{\"exp\":\"E128\",\"what\":\"office\",\"files\":{},\"plain_fetched\":{pf},\"session_per_file_fetched\":{sf},\"one_session_fetched\":{all_sf}}}",
+        office.len()
+    );
+    // Goal windows (as E127), one session per goal.
+    let contents: HashMap<Id, Vec<u8>> = text.iter().copied().zip(plain_out).collect();
+    let index = repo.search_index().unwrap();
+    for goal in [
+        "invoice",
+        "churn",
+        "triage",
+        "safety",
+        "revenue",
+        "onboarding",
+        "Q3",
+    ] {
+        let (hits, _) = repo.search(goal.as_bytes(), &text, index.as_ref()).unwrap();
+        repo.store().take();
+        let (mut plain_f, mut win_bytes, mut windows, mut spans) = (0u64, 0u64, 0u64, Vec::new());
+        for id in &hits {
+            let b = &contents[id];
+            let (mut last_end, mut n) = (0usize, 0);
+            for (pos, w) in b.windows(goal.len()).enumerate() {
+                if w == goal.as_bytes() && pos >= last_end && n < 5 {
+                    let st = pos.saturating_sub(1024);
+                    let e = (pos + 1024).min(b.len());
+                    spans.push((*id, st, e));
+                    last_end = e;
+                    n += 1;
+                }
+            }
+        }
+        for (id, st, e) in &spans {
+            let (part, _) = repo.read_range(id, *st as u64, (e - st) as u64).unwrap();
+            assert_eq!(part, contents[id][*st..*e]);
+            plain_f += repo.store().take().bytes;
+            win_bytes += (e - st) as u64;
+            windows += 1;
+        }
+        let s = repo.session(LIMIT);
+        for (id, st, e) in &spans {
+            assert_eq!(
+                s.read_range(id, *st as u64, (e - st) as u64).unwrap(),
+                contents[id][*st..*e]
+            );
+        }
+        let sess_f = repo.store().take().bytes;
+        let mut whole = 0u64;
+        for id in &hits {
+            repo.read_content(id).unwrap();
+            whole += repo.store().take().bytes;
+        }
+        println!(
+            "{{\"exp\":\"E128\",\"what\":\"goal\",\"goal\":\"{goal}\",\"files\":{},\"windows\":{windows},\"window_bytes\":{win_bytes},\"plain_window_fetched\":{plain_f},\"session_window_fetched\":{sess_f},\"whole_files_fetched\":{whole}}}",
+            hits.len()
+        );
+    }
 }
 
 /// What one read fetches: for a few files of each family, every stored
@@ -242,7 +401,9 @@ fn anatomy(repo: &R, files: &[(String, Id, usize)]) {
         for s in &seen {
             let enc = repo.store().inner.read(s).unwrap();
             let tag = enc.first().map_or('?', |b| *b as char);
-            let other: Vec<&str> = owner.get(s).map_or(vec![], |v| v.iter().filter(|o| **o != path).copied().take(1).collect());
+            let other: Vec<&str> = owner.get(s).map_or(vec![], |v| {
+                v.iter().filter(|o| **o != path).copied().take(1).collect()
+            });
             parts.push(format!(
                 "{{\"id\":\"{}\",\"bytes\":{},\"tag\":\"{}\",\"self\":{},\"is_file_of\":\"{}\"}}",
                 &s.to_string()[..12],
@@ -262,8 +423,10 @@ fn anatomy(repo: &R, files: &[(String, Id, usize)]) {
 
 fn e124(repo: &R, files: &[(String, Id, usize)], dir: &Path) {
     // Per family: whole reads, 4 KiB ranges, markdown sections.
-    let mut by: BTreeMap<String, (u64, Vec<f64>, Vec<f64>, Vec<f64>, Vec<f64>, u64, u64)> = BTreeMap::new();
-    let (mut sec_n, mut sec_bytes, mut sec_fetched, mut sec_reads, mut sec_whole_fetched) = (0u64, 0u64, 0u64, 0u64, 0u64);
+    let mut by: BTreeMap<String, (u64, Vec<f64>, Vec<f64>, Vec<f64>, Vec<f64>, u64, u64)> =
+        BTreeMap::new();
+    let (mut sec_n, mut sec_bytes, mut sec_fetched, mut sec_reads, mut sec_whole_fetched) =
+        (0u64, 0u64, 0u64, 0u64, 0u64);
     for (path, id, _) in files {
         let bytes = repo.read_content(id).unwrap();
         let whole = repo.store().take();
@@ -287,7 +450,10 @@ fn e124(repo: &R, files: &[(String, Id, usize)], dir: &Path) {
             // The section's offsets come from the source file, as a section
             // index (heading -> byte range) would give them.
             let on_disk = std::fs::read(dir.join(path)).unwrap();
-            assert_eq!(on_disk, bytes, "{path}: stored bytes differ from the source");
+            assert_eq!(
+                on_disk, bytes,
+                "{path}: stored bytes differ from the source"
+            );
             let (part, _) = repo.read_range(id, s, l).unwrap();
             assert_eq!(part, bytes[s as usize..(s + l) as usize]);
             let r = repo.store().take();
@@ -311,7 +477,8 @@ fn e124(repo: &R, files: &[(String, Id, usize)], dir: &Path) {
     // Office files: a byte range of the zip needs the whole zip re-deflated,
     // but each part (word/document.xml, a slide, a sheet) is stored as its
     // own content: reading one part by its id.
-    let (mut parts_n, mut whole_fetch, mut part_fetch, mut part_bytes, mut whole_bytes) = (0u64, 0u64, 0u64, 0u64, 0u64);
+    let (mut parts_n, mut whole_fetch, mut part_fetch, mut part_bytes, mut whole_bytes) =
+        (0u64, 0u64, 0u64, 0u64, 0u64);
     for (path, id, _) in files {
         if !matches!(ext(path).as_str(), "docx" | "pptx" | "xlsx") {
             continue;
@@ -360,7 +527,9 @@ fn e125(repo: &mut R, files: &[(String, Id, usize)], root: Id) {
         let mut tree = root;
         let parts: Vec<&str> = path.split('/').collect();
         for (i, p) in parts.iter().enumerate() {
-            let Object::Tree(entries) = repo.get(&tree).unwrap() else { panic!() };
+            let Object::Tree(entries) = repo.get(&tree).unwrap() else {
+                panic!()
+            };
             let e = entries.iter().find(|e| e.name == *p).unwrap();
             if i + 1 == parts.len() {
                 assert_eq!(e.id, *id);
@@ -374,7 +543,11 @@ fn e125(repo: &mut R, files: &[(String, Id, usize)], root: Id) {
     let t = Instant::now();
     let nodes: Vec<Node> = files
         .iter()
-        .map(|(p, id, _)| Node { label: p.clone(), target: Target::Content(Arg::Whole(*id)), edges: vec![] })
+        .map(|(p, id, _)| Node {
+            label: p.clone(),
+            target: Target::Content(Arg::Whole(*id)),
+            edges: vec![],
+        })
         .collect();
     let index = repo.put_graph_with(nodes, Keys::Any).unwrap();
     let build = repo.store().take();
@@ -404,7 +577,11 @@ fn e125(repo: &mut R, files: &[(String, Id, usize)], root: Id) {
         let ev: Vec<Event> = (0..10_000u32)
             .map(|i| {
                 let k = b * 10_000 + i;
-                Event::upsert(&format!("user/{:06}/profile", k), format!("value {k}").as_bytes(), &format!("e{k}"))
+                Event::upsert(
+                    &format!("user/{:06}/profile", k),
+                    format!("value {k}").as_bytes(),
+                    &format!("e{k}"),
+                )
             })
             .collect();
         d = repo.db_append(&d, &ev).unwrap();
@@ -412,7 +589,10 @@ fn e125(repo: &mut R, files: &[(String, Id, usize)], root: Id) {
     repo.store().take();
     let mut get_reads = Vec::new();
     for k in (0..100_000u32).step_by(997) {
-        let v = repo.db_get(&d, &format!("user/{k:06}/profile")).unwrap().unwrap();
+        let v = repo
+            .db_get(&d, &format!("user/{k:06}/profile"))
+            .unwrap()
+            .unwrap();
         assert_eq!(v, format!("value {k}").into_bytes());
         get_reads.push(repo.store().take().reads as f64);
     }
@@ -422,13 +602,18 @@ fn e125(repo: &mut R, files: &[(String, Id, usize)], root: Id) {
     let mut rng = 12345u64;
     let mut gets = 0;
     for _ in 0..1000 {
-        rng = rng.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        rng = rng
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
         let k = (rng >> 33) % 100_000;
         repo.db_get(&d, &format!("user/{k:06}/profile")).unwrap();
         gets += 1;
     }
     let distinct = repo.store().record(false).unwrap();
-    let cached_bytes: u64 = distinct.iter().map(|i| repo.store().inner.read(i).unwrap().len() as u64).sum();
+    let cached_bytes: u64 = distinct
+        .iter()
+        .map(|i| repo.store().inner.read(i).unwrap().len() as u64)
+        .sum();
     let hot = repo.store().take();
     println!(
         "{{\"exp\":\"E125\",\"what\":\"db_cache\",\"gets\":{gets},\"reads_without_cache\":{},\"distinct_objects\":{},\"distinct_bytes\":{cached_bytes}}}",
@@ -481,10 +666,13 @@ fn e125(repo: &mut R, files: &[(String, Id, usize)], root: Id) {
     let via_io = repo.store().take();
     let via_us = t.elapsed().as_secs_f64() * 1e6;
     let mut a: Vec<Id> = users.iter().map(|(s, _)| *s).collect();
-    let mut b: Vec<Id> = via.iter().map(|n| match n.target {
-        Target::Object(s) => s,
-        _ => panic!(),
-    }).collect();
+    let mut b: Vec<Id> = via
+        .iter()
+        .map(|n| match n.target {
+            Target::Object(s) => s,
+            _ => panic!(),
+        })
+        .collect();
     a.sort();
     a.dedup();
     b.sort();
@@ -508,7 +696,9 @@ fn closure(repo: &R, tree: Id, out: &mut HashSet<Id>) {
     if !out.insert(tree) {
         return;
     }
-    let Object::Tree(entries) = repo.get(&tree).unwrap() else { return };
+    let Object::Tree(entries) = repo.get(&tree).unwrap() else {
+        return;
+    };
     for e in entries {
         match e.kind {
             Kind::Tree => closure(repo, e.id, out),
@@ -527,10 +717,20 @@ fn content_closure(repo: &R, id: Id, out: &mut HashSet<Id>) {
     }
 }
 
-fn e126(repo: &mut R, files: &[(String, Id, usize)], trees: &[(String, Id)], root: Id, commit: Id, refname: &str) {
+fn e126(
+    repo: &mut R,
+    files: &[(String, Id, usize)],
+    trees: &[(String, Id)],
+    root: Id,
+    commit: Id,
+    refname: &str,
+) {
     // A capability: (root, rights, expiry) under a keyed BLAKE3 MAC.
     let key = *blake3::hash(b"bake-off key, not a secret").as_bytes();
-    let tenants: Vec<&(String, Id)> = trees.iter().filter(|(p, _)| !p.is_empty() && !p.contains('/') && !p.starts_with('_')).collect();
+    let tenants: Vec<&(String, Id)> = trees
+        .iter()
+        .filter(|(p, _)| !p.is_empty() && !p.contains('/') && !p.starts_with('_'))
+        .collect();
     let mint = |root: &Id, rights: u8, expiry: u64| {
         let mut m = root.as_bytes().to_vec();
         m.push(rights);
@@ -550,7 +750,10 @@ fn e126(repo: &mut R, files: &[(String, Id, usize)], trees: &[(String, Id)], roo
     // Scoped read checks for every file of one tenant: a Merkle path from the
     // capability's root (tree reads, cached per session) or a reachable set.
     let (tname, troot) = tenants[0];
-    let mine: Vec<&(String, Id, usize)> = files.iter().filter(|f| f.0.starts_with(&format!("{tname}/"))).collect();
+    let mine: Vec<&(String, Id, usize)> = files
+        .iter()
+        .filter(|f| f.0.starts_with(&format!("{tname}/")))
+        .collect();
     repo.store().take();
     let t = Instant::now();
     let mut cache: HashMap<Id, Vec<ikam_kernel::TreeEntry>> = HashMap::new();
@@ -558,10 +761,12 @@ fn e126(repo: &mut R, files: &[(String, Id, usize)], trees: &[(String, Id)], roo
         let mut tree = *troot;
         let rel: Vec<&str> = path[tname.len() + 1..].split('/').collect();
         for (i, p) in rel.iter().enumerate() {
-            let entries = cache.entry(tree).or_insert_with(|| match repo.get(&tree).unwrap() {
-                Object::Tree(e) => e,
-                _ => panic!(),
-            });
+            let entries = cache
+                .entry(tree)
+                .or_insert_with(|| match repo.get(&tree).unwrap() {
+                    Object::Tree(e) => e,
+                    _ => panic!(),
+                });
             let e = entries.iter().find(|e| e.name == *p).unwrap().clone();
             if i + 1 == rel.len() {
                 assert_eq!(e.id, *id);
@@ -620,7 +825,11 @@ fn e126(repo: &mut R, files: &[(String, Id, usize)], trees: &[(String, Id)], roo
                 inside += 1;
             } else if Some(*id) == dict {
                 dictionary += 1;
-            } else if closures.iter().enumerate().any(|(j, c)| j != ti && c.contains(id)) {
+            } else if closures
+                .iter()
+                .enumerate()
+                .any(|(j, c)| j != ti && c.contains(id))
+            {
                 other_tenant += 1;
             } else {
                 internal += 1;
@@ -628,7 +837,12 @@ fn e126(repo: &mut R, files: &[(String, Id, usize)], trees: &[(String, Id)], roo
         }
         let shared_files = closures[ti]
             .iter()
-            .filter(|id| closures.iter().enumerate().any(|(j, c)| j != ti && c.contains(id)))
+            .filter(|id| {
+                closures
+                    .iter()
+                    .enumerate()
+                    .any(|(j, c)| j != ti && c.contains(id))
+            })
             .count();
         println!(
             "{{\"exp\":\"E126\",\"what\":\"touch\",\"tenant\":\"{tn}\",\"objects_read\":{},\"in_own_tree\":{inside},\"dictionary\":{dictionary},\"other_tenants_content\":{other_tenant},\"storage_internal\":{internal},\"ids_shared_with_other_tenants\":{shared_files}}}",
@@ -658,12 +872,32 @@ fn e126(repo: &mut R, files: &[(String, Id, usize)], trees: &[(String, Id)], roo
     let (path, _, _) = mine.iter().find(|f| f.0.ends_with(".md")).unwrap();
     let rel = &path[tname.len() + 1..];
     repo.store().take();
-    let new = repo.put_content(b"# Edited by an agent with a capability on one folder\n").unwrap().id;
-    let sub = repo.edit_tree(Some(*troot), &[Edit::Put { path: rel.to_string(), id: new }]).unwrap();
-    let top = repo.edit_tree(Some(root), &[Edit::Remove { path: tname.clone() }]).unwrap();
+    let new = repo
+        .put_content(b"# Edited by an agent with a capability on one folder\n")
+        .unwrap()
+        .id;
+    let sub = repo
+        .edit_tree(
+            Some(*troot),
+            &[Edit::Put {
+                path: rel.to_string(),
+                id: new,
+            }],
+        )
+        .unwrap();
+    let top = repo
+        .edit_tree(
+            Some(root),
+            &[Edit::Remove {
+                path: tname.clone(),
+            }],
+        )
+        .unwrap();
     let _ = top;
     // Put the new subtree back at its name: a one-entry change of the root.
-    let Object::Tree(mut entries) = repo.get(&root).unwrap() else { panic!() };
+    let Object::Tree(mut entries) = repo.get(&root).unwrap() else {
+        panic!()
+    };
     for e in entries.iter_mut() {
         if e.name == *tname {
             e.id = sub;
@@ -673,9 +907,20 @@ fn e126(repo: &mut R, files: &[(String, Id, usize)], trees: &[(String, Id)], roo
     let new_commit = repo.commit(refname, new_root, "scoped edit").unwrap();
     let edit_io = repo.store().take();
     // The same edit by path from the root, as an unscoped writer would do it.
-    let via_root = repo.edit_tree(Some(root), &[Edit::Put { path: path.clone(), id: new }]).unwrap();
+    let via_root = repo
+        .edit_tree(
+            Some(root),
+            &[Edit::Put {
+                path: path.clone(),
+                id: new,
+            }],
+        )
+        .unwrap();
     let root_io = repo.store().take();
-    assert_eq!(via_root, new_root, "scoped splice must equal the edit from the root");
+    assert_eq!(
+        via_root, new_root,
+        "scoped splice must equal the edit from the root"
+    );
     let _ = (commit, new_commit);
     println!(
         "{{\"exp\":\"E126\",\"what\":\"scoped_edit\",\"path\":\"{path}\",\"reads\":{},\"writes\":{},\"write_bytes\":{},\"from_root_reads\":{},\"tenant_objects\":{},\"store_objects\":{}}}",
@@ -692,7 +937,12 @@ fn e127(repo: &mut R, files: &[(String, Id, usize)]) {
     // Text-like files an agent would search.
     let text: Vec<&(String, Id, usize)> = files
         .iter()
-        .filter(|f| matches!(ext(&f.0).as_str(), "md" | "json" | "jsonl" | "txt" | "py" | "log"))
+        .filter(|f| {
+            matches!(
+                ext(&f.0).as_str(),
+                "md" | "json" | "jsonl" | "txt" | "py" | "log"
+            )
+        })
         .collect();
     let ids: Vec<Id> = text.iter().map(|f| f.1).collect();
     let t = Instant::now();
@@ -717,13 +967,29 @@ fn e127(repo: &mut R, files: &[(String, Id, usize)]) {
         build.wbytes,
         load.bytes
     );
-    for goal in ["invoice", "churn", "triage", "safety", "revenue", "onboarding", "Q3"] {
+    for goal in [
+        "invoice",
+        "churn",
+        "triage",
+        "safety",
+        "revenue",
+        "onboarding",
+        "Q3",
+    ] {
         let t = Instant::now();
         let (hits, _) = repo.search(goal.as_bytes(), &ids, Some(&index)).unwrap();
         let search_io = repo.store().take();
         let search_us = t.elapsed().as_secs_f64() * 1e6;
         // Ground truth from the bytes.
-        let truth: Vec<Id> = ids.iter().filter(|id| contents[id].windows(goal.len()).any(|w| w == goal.as_bytes())).copied().collect();
+        let truth: Vec<Id> = ids
+            .iter()
+            .filter(|id| {
+                contents[id]
+                    .windows(goal.len())
+                    .any(|w| w == goal.as_bytes())
+            })
+            .copied()
+            .collect();
         let mut h = hits.clone();
         h.sort();
         let mut tr = truth.clone();

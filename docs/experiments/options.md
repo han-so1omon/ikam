@@ -144,3 +144,13 @@ read weight 1.0: 1,000 single appends 0.9 s and 7.9 MB stored against
 3.1 s and 3.3 MB). A key index for the log, so in-place edits check its
 label keys across the whole graph (needed only near 100M events: chance
 clashes are about 3 in 10,000 there).
+
+## Reads within one request (E124 to E128)
+
+| Setting | Default | Trade | Measured |
+|---|---|---|---|
+| `Repo::session(limit)` | plain reads (no session) | memory up to `limit` decoded bytes, against refetching a group, dictionary or container for each read | all text files 7.31 -> 5.30 MB fetched; a goal's windows 257 -> 166 KB ("invoice", files whole 184 KB); 238 Office files 18.9 -> 2.68 MB in one session (E128) |
+| Reverse-link view (not built) | none: incoming links by scan | 33.9 MB and a write per link change, against a scan of every object | incoming links 113k reads and 340 ms by scan, 8 reads and about 1 ms by view (E125) |
+| Path index (not kept) | tree walk | an index graph, 62 KB here | worse: 4 reads a lookup against 2 by walking trees (E125) |
+| Per-tenant stores (not built) | one shared store | isolation of every stored object, against dedup across tenants | 644 MB against 229 MB for the bench corpus's 26 folders (E126) |
+| Short-term index for terms under 3 characters (not built) | trigram index only | index bytes, against a scan of every text file for "Q3" (7.3 MB, 68 ms) | E127 |

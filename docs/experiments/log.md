@@ -1924,3 +1924,58 @@ Newest last. Format and rules: `README.md`.
 - Change (CLI only): GET and HEAD under `/dav/results/` (the self-test's `latest.json` and `history.jsonl`, and the folder listing) send `Cache-Control: no-cache`, 304s included, so readers revalidate each time; ETag and Last-Modified stay, so an unchanged copy costs a 304. Other files are unchanged.
 - Result: a dav test (results revalidated on 200, 304, HEAD and the listing; `a.txt` and `resultsx.txt` without the header). All 135 kernel tests pass; clippy and fmt clean. No storage change, so the bench was not rerun.
 - Verdict: **kept**; merged to main on Eric's yes (Nov 9).
+
+### E124 section-reads (what a read of part of a file costs, by file type)
+- Branch / parent: exp/124-section-reads / main at d14be74 (E121)
+- Question (Eric, Nov 9: the most efficient format for I/O, query and permission, "including for targeting specific sections for specific actions relevant to the goals prompted by the user"): when a caller wants one section of a file (a 4 KiB byte range, one part of an Office file, one Markdown section), how many store objects and bytes does ikam fetch, against reading the whole file?
+- Change: harness `examples/access.rs` (a counting wrapper over the store; phases `anatomy`, `e124`, then E125 to E127 below), run on the bench corpus `tests/fixtures/cases` (1,438 files, 1,906 objects, 229 MB stored). One fix found by it: `read_range` read a stored leaf to learn that it was stored, then read it again to rebuild the range, so a 4 KiB range of a 1 MB png fetched 2.2 MB. It now asks `store.has` (`src/range.rs`). Tried and dropped: storing range lengths on container plans; docx and pptx are rebuilt whole as containers, so it saved no reads.
+- Result (fetched bytes per byte the caller wanted, medians by type):
+  - png (580 files, whole files are one object): whole 1.0; a 4 KiB range 546 before the fix, 273 after (the object is fetched once; ranges inside one object are not separately addressable).
+  - docx 31 reads for the whole file and 31 for any 4 KiB range (2.9 and 26 bytes per byte); pptx 59 and 59 (7.1 and 50): any range rebuilds the container. But each Office part is its own content id: the largest part of each of 238 Office files read alone fetched 2.76 MB, against 18.9 MB to rebuild the 238 files.
+  - Small text files (md, json, py, pdf, log) are members of group objects: 2 reads, and 8 to 140 fetched bytes per byte (md median 78). A Markdown section read alone (134 sections) fetched 1.945 MB against 1.961 MB for the files whole: sections save nothing while their file sits in a group.
+  - jsonl (24 files) is chunked: 3 reads whole and for a range, 0.22 bytes per byte whole (compressed).
+- Gates: bench exact and fsck clean on every corpus; north 0.3035 (unchanged); cost score 0.2422 against 0.2391 on E123, a timing difference (the bench ran beside the per-tenant ingests and the 10M build; no ingest, repack or whole-file read path changed).
+- Verdict: **kept** (the `read_range` fix; the measurements feed the design doc); on its branch until Eric says to merge.
+
+### E125 query-paths (point, path, range and neighbourhood queries)
+- Branch / parent: exp/124-section-reads / E124
+- Question: what do the queries a linked store answers cost in reads today, and which would an index pay for: a path lookup, a database get and range, and outgoing and incoming links?
+- Change: none to the kernel; phase `e125` of `examples/access.rs`.
+- Result:
+  - Path lookup (1,438 paths, depth up to 5): walking the trees takes a median 2 reads (max 9). A separate path index (59 objects, 62 KB, 1.8 s to build) takes 4 (max 7). No path index: the tree is already the index.
+  - Database (100,000 keys): a get reads 10 objects cold; with a cache of decoded graph chunks, 1,000 gets touch 2,400 distinct objects (2.0 MB), 2.4 reads a get instead of 9.7. A 100-key range reads 13 objects (13 KB).
+  - Links: outgoing links are 1 read (2 us). Incoming links ("what points at this file") need a scan of every object: 113,210 reads, 260 MB, 340 ms. A reverse-link view (328,942 edges, 18,356 objects, 33.9 MB, 40 s to build here from scratch) answers the same query in 8 reads, 12.8 KB, about 1 ms.
+- Verdict: **measurement**. Proposes a reverse-link view kept per write (option S11 in `docs/research/store-backends.md`) and a decoded-chunk cache for graph reads; no path index.
+
+### E126 permission-checks (what a permission check costs, and what crosses tenants)
+- Branch / parent: exp/124-section-reads / E124
+- Question: with each top-level case folder treated as a tenant (24 tenants), what does a read-permission check cost, which stored objects does one tenant's read touch, and what does it cost to keep tenants in separate stores?
+- Change: none to the kernel; phase `e126` of `examples/access.rs`, and a script that ingests each tenant into its own store.
+- Result:
+  - Check cost: verifying a MAC'd capability 77 ns; a set of the tenant's reachable ids (129 ids, 107 reads and 0.7 ms to build) 20 ns a check; proving a file sits under the tenant's root by its tree path 8.1 us a file (trees cached).
+  - Touch: a whole tenant read touches 105 to 203 objects; 85 to 179 are in its own tree, 17 to 24 are storage-internal (group, dictionary and delta objects), 0 to 2 are another tenant's content (identical files). 29 internal objects serve 2 or more tenants, and one 18 KB group serves all 24. So handing out storage objects, or answering "already stored" to a client, would leak across tenants; checks must sit at the file layer, where the server decodes and returns only the tenant's members.
+  - A scoped edit inside one tenant: 16 reads, 13 writes, 3.6 KB written, against a store of 127,656 objects.
+  - Separate stores: each of the 26 top-level folders ingested and repacked into its own store takes 644.1 MB in all, against 229.2 MB for the one shared store: 2.81 times. Nearly all of it is whole files that several tenants hold identically (the 1 MB diagram pngs of the l, m and xl cases: a 74 MB tenant alone is 74 MB, ratio 0.998); groups, dictionaries and deltas are a few hundred KB of it. Every store was exact with a clean fsck.
+- Verdict: **measurement**. Enforce permissions on paths and files at the server, never on storage objects; per-tenant stores only where hard isolation is required, at 2.8 times the bytes here; keeping groups, dictionaries and deltas inside a tenant would cost little, since whole-file dedup is what tenants share. Never tell a client that content was already stored.
+
+### E127 goal-reads (what a goal-scoped working set costs)
+- Branch / parent: exp/124-section-reads / E124
+- Question: when a user's goal is a few words ("invoice", "churn", "Q3"), what does it cost to find the files and sections it needs, and to hand a model only those sections?
+- Change: none to the kernel; phase `e127` of `examples/access.rs` (the existing trigram index over 550 text files, 2.0 MB; windows of the matched lines and their neighbours).
+- Result:
+  - Index: 269 KB, 237 ms to build; reading every text file instead fetches 7.3 MB in 1,147 reads.
+  - Search fetches about the matched files: "invoice" 13 files, 195 KB fetched in 2.8 ms (the 13 files whole are 184 KB); "revenue" 66 files, 1.0 MB, 12.7 ms. "Q3" has only two characters, so the trigram index can't narrow it, and the search reads every file (7.3 MB, 68 ms).
+  - Windows hand the model about 6 times fewer bytes ("invoice" 30 KB against 184 KB) but cost more fetches than the whole files without a cache (257 KB), because each window rebuilds its group again.
+  - Capabilities for the result: one id per matched file (13 for "invoice").
+- Verdict: **measurement**. Proposes a short-term index (or exact-token postings) for terms under three characters, and a per-request decoded cache so windows cost no more than their files.
+
+### E128 read-session (reads in one request share what they decode)
+- Branch / parent: exp/124-section-reads / E127
+- Question: E124 and E127 found that each read rebuilds the group, dictionary or container it needs, so reading the 2 KiB windows of a goal fetched more than reading the matched files whole, and Office files refetched the same shared groups. Does a request-scoped cache of decoded objects fix that, and what does it hold?
+- Change (kernel, no format change, nothing written): `Repo::session(limit)` returns a `ReadSession` whose `read_content` and `read_range` share one decode context, so an object decoded for one read serves the next; past `limit` decoded bytes it forgets everything after the read that crossed it. Results are checked exactly as single reads. Test `read_session_equals_plain_reads` (whole and range reads, before and after repack, limit 0 and unbounded); phase `e128` of `examples/access.rs`.
+- Result (bench corpus `tests/fixtures/cases`, 64 MiB limit):
+  - Reading all 550 text files (2.0 MB): plain 1,147 reads, 7.31 MB fetched, 43.9 ms; one session 850 reads, 5.30 MB, 33.4 ms, holding 2.0 MB.
+  - Goal windows, fetched by plain reads / by one session / for the matched files whole: invoice 257 / 166 / 184 KB; churn 460 / 198 / 248; triage 93 / 66 / 66; safety 816 / 440 / 483; revenue 1,515 / 909 / 1,007; onboarding 207 / 146 / 158; Q3 542 / 385 / 462. In a session a goal's windows always cost no more than its files whole, and hand the model about 6 times fewer bytes.
+  - 238 Office files: 18.9 MB fetched read one by one, the same with one session per file, 2.68 MB with one session for all (they share groups and dictionary blocks).
+  - All kernel tests pass.
+- Verdict: **kept** (an option for callers that read several things in one request, such as the server's goal or search endpoints; plain reads are unchanged); on its branch until Eric says to merge.

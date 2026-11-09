@@ -177,3 +177,38 @@ fn range_reads_equal_slices_of_whole_reads() {
         );
     }
 }
+
+/// A read session returns what plain reads return, whole and in ranges,
+/// before and after repack, with a limit that forgets everything after
+/// every read as well as one that keeps it all (E128).
+#[test]
+fn read_session_equals_plain_reads() {
+    let mut docs = revisions();
+    docs.extend((0..30).map(invoice));
+    let mut repo = Repo::new(MemStore::default());
+    let ids = commit_all(&mut repo, &docs);
+    for repacked in [false, true] {
+        if repacked {
+            assert!(repo.repack().unwrap().applied);
+        }
+        for limit in [0, usize::MAX] {
+            let s = repo.session(limit);
+            for (id, d) in ids.iter().zip(&docs) {
+                let n = d.len() as u64;
+                assert_eq!(&s.read_content(id).unwrap(), d);
+                for (start, len) in [(0, 1), (n / 3, 100), (n / 2, 4096), (n, 0)] {
+                    let len = len.min(n - start);
+                    let bytes = s.read_range(id, start, len).unwrap();
+                    assert_eq!(bytes, d[start as usize..(start + len) as usize]);
+                }
+                assert!(s.read_range(id, n - 3, 4).is_err());
+                assert!(s.read_range(id, u64::MAX, 2).is_err());
+            }
+            if limit == 0 {
+                assert_eq!(s.held(), 0);
+            } else {
+                assert!(s.held() > 0);
+            }
+        }
+    }
+}
