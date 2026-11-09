@@ -47,6 +47,24 @@ impl<S: Store> ReadSession<'_, S> {
         out
     }
 
+    /// `Repo::search` in this session (E142): the contents the scan
+    /// decodes, matches included, stay for the reads that follow, so a
+    /// goal that searches and then reads what it found fetches each once.
+    /// The same hits as `Repo::search`.
+    pub fn search(
+        &self,
+        pattern: &[u8],
+        files: &[Id],
+        index: Option<&crate::SearchIndex>,
+    ) -> Result<(Vec<Id>, usize), Error> {
+        let mut cx = self.cx.borrow_mut();
+        let out = self
+            .repo
+            .search_in(pattern, files, index, &mut cx, Some(self.limit));
+        self.trim(&mut cx);
+        out
+    }
+
     /// Decoded bytes the session holds now.
     pub fn held(&self) -> usize {
         self.cx.borrow().known.values().map(Vec::len).sum()

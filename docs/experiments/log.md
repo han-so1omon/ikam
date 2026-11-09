@@ -2165,3 +2165,17 @@ Newest last. Format and rules: `README.md`.
   - All kernel tests pass.
   - The fixed bench on this branch: every byte count and the north score (0.3035) as on E140; cost score 0.2450 against 0.2441, from timings only (the bench does not set replace_hints).
 - Verdict: **kept**; on its branch until Eric says to merge. Recommended with a scope; the format is unchanged.
+
+### E142 session-search (a goal's search and its reads share one session)
+- Branch / parent: exp/142-session-search / exp/141-replace-hints (E141)
+- Question: after E141 the read stage still fetched what the search had just decoded (Q3: 59 reads, 385 KB), because `search` keeps no decodes between candidates and the read stage opens its own session. Can one session serve both?
+- Change: `ReadSession::search` runs the search inside the session (`Repo::search_in`): the scan keeps decodes in the session's known set up to its limit instead of clearing them per candidate. `Repo::search` is unchanged (it calls `search_in` with a fresh context and clears per candidate, as before). `examples/goal.rs` config `recommended_shared_session`: E141's setup with one session for the search and the read stage, and a line for the search index load. Tests in `tests/session_search.rs`: the session's hits equal plain search's, reads of the hits then cost no store reads, and a 16-byte limit still finds the same hits.
+- Result (cases store, goals as in E133, against E141's `recommended_replace_hints`, first lookup's 246 KB of heads apart):
+  - First goal: 2.50 MB in 625 reads to 2.04 MB in 554; search 731 KB to 655 KB (repeats within the scan now hit the session); read 385 KB to nothing.
+  - Next goal: 1.23 MB in 394 reads to 1.14 MB in 379; search 363 KB to 351 KB; read 82 KB to nothing.
+  - Of each search, 269 KB in one read is loading the search index; a server that keeps it loaded across goals would bring the goals to about 1.77 MB and 0.87 MB.
+  - Bytes written, edit and view update: the same.
+  - What is left: the view update (906 KB and 632 KB, mostly view chunks it reads to place new edges) and the edit (477 KB and 154 KB).
+  - All kernel tests pass (164).
+  - The fixed bench on this branch: every byte count and the north score (0.3035) as on E141; cost score 0.2280 against 0.2450, from timings only (the bench ran beside goal runs; it does not search through a session).
+- Verdict: **kept**; on its branch until Eric says to merge. A library API; nothing stored changes.

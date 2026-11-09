@@ -331,6 +331,20 @@ impl<S: Store> Repo<S> {
         files: &[Id],
         index: Option<&SearchIndex>,
     ) -> Result<(Vec<Id>, usize), Error> {
+        self.search_in(pattern, files, index, &mut Cx::default(), None)
+    }
+
+    /// `search`, decoding into `cx`. With `keep` (a read session's limit,
+    /// E142) what the scan decodes stays in `cx` for the reads after it,
+    /// up to `keep` bytes; without it each candidate's decodes are dropped.
+    pub(crate) fn search_in(
+        &self,
+        pattern: &[u8],
+        files: &[Id],
+        index: Option<&SearchIndex>,
+        cx: &mut Cx,
+        keep: Option<usize>,
+    ) -> Result<(Vec<Id>, usize), Error> {
         if let Some(index) = index
             && let Some(chunks) = &index.chunks
             && !pattern.is_empty()
@@ -394,17 +408,25 @@ impl<S: Store> Repo<S> {
         };
         // A substring search built once per query (E072).
         let finder = memchr::memmem::Finder::new(pattern);
-        let mut cx = Cx::default();
+        let work = cx.work;
         let mut out = Vec::new();
         for id in candidates {
-            let bytes = self.rebuild(&id, &mut cx)?;
+            let bytes = self.rebuild(&id, cx)?;
             crate::dict::count_decode(bytes.len(), SCAN_UNITS);
             if finder.find(&bytes).is_some() {
                 out.push(id);
             }
-            cx.known.clear();
+            match keep {
+                None => cx.known.clear(),
+                Some(limit) => {
+                    cx.stack.clear();
+                    if cx.known.values().map(Vec::len).sum::<usize>() > limit {
+                        cx.known.clear();
+                    }
+                }
+            }
         }
-        Ok((out, cx.work))
+        Ok((out, cx.work - work))
     }
 
     /// `search` through a chunk index: each distinct chunk and seam once.

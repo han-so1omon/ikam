@@ -368,11 +368,14 @@ fn main() {
         // E141: only the edited files; the old chunks and trees an edit
         // reads join the seed index as it reads them.
         ("recommended_replace_hints", true, false),
+        // E142: the same, with search and read in one read session.
+        ("recommended_shared_session", true, false),
     ] {
         let mut repo = wrap(&objects, &refs);
         repo.needed_index = recommended;
-        repo.read_memo = config == "recommended_read_memo" || config == "recommended_replace_hints";
-        repo.replace_hints = config == "recommended_replace_hints";
+        let hints = config == "recommended_replace_hints" || config == "recommended_shared_session";
+        repo.read_memo = config == "recommended_read_memo" || hints;
+        repo.replace_hints = hints;
         let mut root = c.tree;
         let mut view = view;
         let mut known: HashSet<Id> = objects.iter().map(|o| o.0).collect();
@@ -403,7 +406,21 @@ fn main() {
             } else {
                 None
             };
-            let (hits, _) = repo.search(term, &text_ids, index.as_ref()).unwrap();
+            // E142: what loading the search index fetched, apart; the
+            // counts are put back so the stage line still covers it.
+            let index_io = repo.store().take();
+            println!(
+                "{{\"exp\":\"E142\",\"config\":\"{config}\",\"goal\":\"{}\",\"part\":\"search_index_load\",\"reads\":{},\"fetched\":{}}}",
+                g.term, index_io.reads, index_io.bytes
+            );
+            repo.store().reads.fetch_add(index_io.reads, Relaxed);
+            repo.store().bytes.fetch_add(index_io.bytes, Relaxed);
+            repo.store().scans.fetch_add(index_io.scans, Relaxed);
+            let shared = (config == "recommended_shared_session").then(|| repo.session(64 << 20));
+            let (hits, _) = match &shared {
+                Some(s) => s.search(term, &text_ids, index.as_ref()).unwrap(),
+                None => repo.search(term, &text_ids, index.as_ref()).unwrap(),
+            };
             line(
                 &repo,
                 g.term,
@@ -414,7 +431,11 @@ fn main() {
             // Read: the model gets the lines around each mention.
             let t = Instant::now();
             let mut contents = Vec::new();
-            if recommended {
+            if let Some(s) = &shared {
+                for id in &hits {
+                    contents.push(s.read_content(id).unwrap());
+                }
+            } else if recommended {
                 let s = repo.session(64 << 20);
                 for id in &hits {
                     contents.push(s.read_content(id).unwrap());
@@ -444,7 +465,7 @@ fn main() {
                 let folders: HashSet<&str> = chosen.iter().map(|f| top(&f.0)).collect();
                 let mut scope: Vec<Id> = if config == "recommended_scope_edited_files"
                     || config == "recommended_read_memo"
-                    || config == "recommended_replace_hints"
+                    || hints
                 {
                     chosen.iter().map(|f| f.1).collect()
                 } else {

@@ -191,3 +191,9 @@ it is an on-disk addition and waits on a decision.
 | Setting | Default | Trade | Measured |
 | --- | --- | --- | --- |
 | `replace_hints` | off | with a scope, old trees and chunks an edit reads join the seed index, so the scope can name only the files; repeats of content outside the scope and outside what the edit reads are not found | E133's first goal 4.21 MB to 2.50 MB, next 3.26 MB to 1.23 MB (heads apart); first write 1.78 MB to 189 KB; bytes written 250,171 against 250,379 |
+
+## Search and read in one session (E142)
+
+| Setting | Default | Trade | Measured |
+| --- | --- | --- | --- |
+| `ReadSession::search` | `Repo::search` (no shared decodes) | the scan keeps decodes up to the session's limit, so memory is bounded by that limit; reads of the hits then cost nothing | E133's first goal 2.50 MB to 2.04 MB, next 1.23 MB to 1.14 MB (heads apart); read stage to zero |
