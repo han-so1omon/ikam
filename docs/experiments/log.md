@@ -1884,3 +1884,13 @@ Newest last. Format and rules: `README.md`.
 - Result: depth 1: fails at once naming all four corpora; depth 150: "commit 6cd6921 is missing; transcripts (commit 0ca74e4 has 21 of 38 commits of history)"; `md pdf` alone runs; after `git fetch --unshallow`, repo-history runs as before (exact, fsck clean). Measurement unchanged. Tests, clippy and fmt clean.
 - Verdict: **kept**; merged to main on Eric's yes (Nov 9).
 
+
+### E118 db-log-view (an event log and a last-write-wins view in the kernel)
+- Branch / parent: exp/db-log-view / main at 8d95f82 (E117)
+- Question (Eric, Nov 9): step 1 of the database roadmap: an append-only log in the kernel with idempotent appends and one last-write-wins view, built from today's objects, with no format change. Plan: `docs/plans/2026-11-09-db-log-view.md`.
+- Change (kernel only, new `src/db.rs`): events (key, upsert or remove with subtree, idempotency key) stored as content; the log is a `G` graph keyed by 20-digit sequence numbers; an `ids` view refuses a reused idempotency key with different bytes and skips an exact retry; a `kv` view folds by last write wins, each value a byte range of the event that wrote it. A commit holds them under `db/`, beside any files. New error `IdempotencyConflict`. Nothing else changes.
+- Result: `tests/db.rs`, 12 laws: the April fold tests (last write wins, remove whatever its idempotency key, independent keys, subtree remove, environment qualifiers), writes to distinct keys commute, exact read-back of values (empty, binary, 70 KB) and events, strict decoding, retries change no root, rebuilt views equal maintained ones every 50 of 300 random appends, older commits read their own version after gc, repack and fsck. All kernel tests pass; clippy and fmt clean.
+  - Bench: all 14 corpora exact, fsck clean; north 0.3035 (unchanged); cost score 0.2389 (E110's runs 0.2434 to 0.2516; an append-cost test ran alongside at the start). Nothing in ingest or repack changed.
+  - Append cost (ignored test `append_cost`): 1,000 single appends 6.2 s (8.5 ms each at the end); batches of 100, 0.21 s; 10,000 in batches of 1,000, 1.9 s (202 ms for the last batch). Every append rebuilds the three graphs, so cost grows with the database.
+- Not settled here: in-place prolly edits (so an append touches one path), whether a reused idempotency key with different bytes should be an error (April skipped it), and the ledger scan at open.
+- Verdict: on its branch until Eric says to merge.
