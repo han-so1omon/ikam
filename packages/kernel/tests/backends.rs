@@ -30,9 +30,16 @@ fn contract<S: Store>(open: &dyn Fn(&Path) -> S) {
         assert_eq!(s.ids_with_prefix(&[1, 1]).unwrap().len(), 2);
         assert_eq!(s.ids().unwrap().len(), 3);
         assert_eq!(s.ids_with_prefix(&[]).unwrap().len(), 3);
+        // E147: lengths without reads, after a replace and a delete too.
+        assert_eq!(s.stored_len(&id(1)).unwrap(), 3);
+        s.replace(id(2), b"TWO, longer").unwrap();
+        assert_eq!(s.stored_len(&id(2)).unwrap(), 11);
+        s.replace(id(2), b"TWO").unwrap();
+        assert!(s.stored_len(&id(3)).is_err());
         s.delete(&Id::from_bytes(near)).unwrap();
         assert!(!s.has(&Id::from_bytes(near)));
         assert!(s.read(&Id::from_bytes(near)).is_err());
+        assert!(s.stored_len(&Id::from_bytes(near)).is_err());
 
         assert_eq!(s.get_ref("heads/main").unwrap(), None);
         s.set_ref("heads/main", None, id(1)).unwrap();
@@ -50,6 +57,7 @@ fn contract<S: Store>(open: &dyn Fn(&Path) -> S) {
     assert_eq!(s.read(&id(1)).unwrap(), b"one");
     assert_eq!(s.read(&id(2)).unwrap(), b"TWO");
     assert_eq!(s.read(&id(4)).unwrap(), b"four");
+    assert_eq!(s.stored_len(&id(4)).unwrap(), 4);
     let mut ids = s.ids().unwrap();
     ids.sort();
     assert_eq!(ids, vec![id(1), id(2), id(4)]);

@@ -89,6 +89,10 @@ impl<S: Store> Store for Counting<S> {
         }
         Ok(out)
     }
+    // A length lookup reads no object (E147).
+    fn stored_len(&self, id: &Id) -> Result<usize, Error> {
+        self.inner.stored_len(id)
+    }
     // Partial reads pass through and count only the bytes fetched (E135).
     fn read_head(&self, id: &Id, n: usize) -> Result<Vec<u8>, Error> {
         let out = self.inner.read_head(id, n)?;
@@ -153,6 +157,9 @@ impl Store for AnyStore {
     }
     fn read_head(&self, id: &Id, n: usize) -> Result<Vec<u8>, Error> {
         each!(self, s => s.read_head(id, n))
+    }
+    fn stored_len(&self, id: &Id) -> Result<usize, Error> {
+        each!(self, s => s.stored_len(id))
     }
     fn has(&self, id: &Id) -> bool {
         each!(self, s => s.has(id))

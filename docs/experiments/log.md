@@ -2223,3 +2223,21 @@ Newest last. Format and rules: `README.md`.
   - All kernel tests pass (168).
   - The fixed bench on this branch: every byte count and the north score (0.3035) as on E144; cost score 0.2443 against 0.2356, from timings only (the bench does not run batches).
 - Verdict: **kept**; on its branch until Eric says to merge. Library API, used by a server's goal loop; nothing stored changes.
+
+### E146 plain-object-chunks (tree and view chunks stored plain)
+- Question: after E145 the view update reads about 405 KB on E133's first goal, mostly old view chunks and the sources that derived chunks would be built from. Would storing tree and view chunks plain (no slice or template plans) read less?
+- Change: a temporary switch in `put_content` for chunks written by `write()` (tag t or g), measured on `recommended_batch` and taken out again; no code is kept.
+- Result (first goal, view update): reads 405 KB to 393 KB (3% fewer); bytes written 72 KB to 391 KB; in memory 125 ms to 53 ms.
+- Verdict: **discarded** (five times the writes and the store's growth for 3% fewer reads). Nothing on a branch; the row records the measurement.
+
+### E147 stored-len (an object's stored length without reading it)
+- Question: E145 left one read per edited file in the edit stage: a template plan's cost needs the old chunk's stored length, and bytes handed to a batch carry none. Can the store say how long an object is without returning it?
+- Change: `Store::stored_len(id)`, a provided method that reads by default; MemStore answers from its map, FsStore from the file's metadata, PackStore from its index entry (a deleted entry is not found). A template plan whose old chunk's bytes are in the memo without a length asks the store; an error falls back to reading. `examples/goal.rs` forwards it through its counting store. `tests/backends.rs` checks the length on every backend, after a replace and after a delete; `tests/batch.rs` now asserts that a batch handed the files reads nothing in its writes.
+- Result (cases store, `recommended_batch`, against E145):
+  - First goal (Q3): edit stage 69.8 KB in 18 reads to 7.7 KB in 8; the goal 1.13 MB to 1.07 MB (1.31 MB with the first lookup's 246 KB of heads).
+  - Next goal (AI): edit stage 53.2 KB in 15 reads to 2.3 KB in 6; the goal 744 KB to 693 KB.
+  - Other configurations, the view update and bytes written: unchanged.
+  - Time: within run-to-run spread. Five interleaved runs on packs, first goal: E145 143 to 186 ms (median 150), E147 143 to 170 ms (median 157). On files 338 to 372 ms against 381 to 429 ms over two and three runs, all of it in the view update, whose reads and writes did not change.
+  - All kernel tests pass (168). The HTTP limits test failed once while the full suite ran beside a goal run, and passed alone three times and in the next full run.
+  - The fixed bench on this branch: every byte count and the north score (0.3035) as on E145; cost score 0.2387 against 0.2443, from timings only (the bench does not run batches).
+- Verdict: **kept**; on its branch until Eric says to merge. A store API addition with a default, so any backend works unchanged; nothing stored changes.

@@ -24,6 +24,12 @@ pub trait Store {
         out.truncate(n);
         Ok(out)
     }
+    /// Length of the encoding stored under `id` (E147). A store that keeps
+    /// lengths (a file's size, a pack's index) answers without reading the
+    /// object; the default reads it.
+    fn stored_len(&self, id: &Id) -> Result<usize, Error> {
+        self.read(id).map(|b| b.len())
+    }
     fn has(&self, id: &Id) -> bool;
     fn ids(&self) -> Result<Vec<Id>, Error>;
     /// Stored ids starting with `prefix` (an abbreviated id, as in git).
@@ -75,6 +81,13 @@ impl Store for MemStore {
 
     fn read(&self, id: &Id) -> Result<Vec<u8>, Error> {
         self.objects.get(id).cloned().ok_or(Error::NotFound(*id))
+    }
+
+    fn stored_len(&self, id: &Id) -> Result<usize, Error> {
+        self.objects
+            .get(id)
+            .map(Vec::len)
+            .ok_or(Error::NotFound(*id))
     }
 
     fn read_head(&self, id: &Id, n: usize) -> Result<Vec<u8>, Error> {
@@ -187,6 +200,10 @@ impl Store for FsStore {
 
     fn read(&self, id: &Id) -> Result<Vec<u8>, Error> {
         not_found_as(fs::read(self.path(id)), || Error::NotFound(*id))
+    }
+
+    fn stored_len(&self, id: &Id) -> Result<usize, Error> {
+        not_found_as(fs::metadata(self.path(id)), || Error::NotFound(*id)).map(|m| m.len() as usize)
     }
 
     fn read_head(&self, id: &Id, n: usize) -> Result<Vec<u8>, Error> {

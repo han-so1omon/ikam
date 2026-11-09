@@ -359,7 +359,19 @@ impl<S: Store> Repo<S> {
         // E143: `template_candidates` has just read `y` as a template, so
         // with `read_memo` on its bytes are kept; only the stored length is
         // needed besides them.
-        let (y_bytes, stored_len) = match self.memo_get_stored(&y) {
+        let kept = match self.memo_get_stored(&y) {
+            Some(kept) => Some(kept),
+            // Bytes handed to a batch come without the stored length; the
+            // store gives it without reading the object (E147).
+            None => match self.memo_get(&y) {
+                Some(b) => match self.store.stored_len(&y) {
+                    Ok(n) => Some((b, n)),
+                    Err(_) => return Ok(None),
+                },
+                None => None,
+            },
+        };
+        let (y_bytes, stored_len) = match kept {
             Some(kept) => kept,
             None => {
                 let Ok(stored) = self.store.read(&y) else {

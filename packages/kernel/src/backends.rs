@@ -1165,6 +1165,14 @@ impl Store for PackStore {
         self.read_prefix(id, n)
     }
 
+    // E147: from the index alone.
+    fn stored_len(&self, id: &Id) -> Result<usize, Error> {
+        match self.locate(id)? {
+            Some((_, _, len)) if len != TOMBSTONE => Ok(len as usize),
+            _ => Err(Error::NotFound(*id)),
+        }
+    }
+
     fn has(&self, id: &Id) -> bool {
         matches!(self.locate(id), Ok(Some((_, _, len))) if len != TOMBSTONE)
     }

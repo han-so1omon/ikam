@@ -211,3 +211,9 @@ it is an on-disk addition and waits on a decision.
 | Setting | Default | Trade | Measured |
 | --- | --- | --- | --- |
 | `begin_batch` / `end_batch`, `keep_read` | each write is its own edit | with `read_memo` on, what a goal's writes read (and the files it hands over) is kept until the batch ends, up to the memo's 64 MB | E133's first goal on the recommended setup 1.48 MB to 1.13 MB, edit stage 414 KB to 70 KB; bytes written unchanged |
+
+## Object lengths from the store (E147)
+
+| Setting | Default | Trade | Measured |
+| --- | --- | --- | --- |
+| `Store::stored_len` | provided; reads the object | a backend that answers from its index saves one read per old chunk whose bytes a batch already holds; a backend that keeps the default behaves as before | E133's first goal in a batch: edit stage 70 KB to 8 KB, the goal 1.13 MB to 1.07 MB; bytes written unchanged |

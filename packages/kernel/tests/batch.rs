@@ -22,6 +22,9 @@ impl Store for Counting {
         self.reads.fetch_add(1, Relaxed);
         self.inner.read(id)
     }
+    fn stored_len(&self, id: &Id) -> Result<usize, Error> {
+        self.inner.stored_len(id)
+    }
     fn has(&self, id: &Id) -> bool {
         self.inner.has(id)
     }
@@ -132,9 +135,9 @@ fn a_batch_reads_less_and_stores_the_same() {
         batched < plain,
         "{batched} reads in a batch, {plain} without"
     );
-    // Handed the files, each write reads only the stored copy of its old
-    // version, for the length a template plan's cost needs.
-    assert_eq!(handed, 3, "{handed} reads when handed the files");
+    // Handed the files, the writes read nothing: a template plan's cost
+    // takes the stored length from the store's lookup (E147).
+    assert_eq!(handed, 0, "{handed} reads when handed the files");
 }
 
 #[test]
