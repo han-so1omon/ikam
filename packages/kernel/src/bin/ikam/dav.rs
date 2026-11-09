@@ -213,7 +213,22 @@ fn proppatch(path: &str, exists: bool) -> Response {
     Response::new(207).body("application/xml; charset=utf-8", xml)
 }
 
+/// The self-test rewrites its results in place on every run, so a reader
+/// revalidates them each time rather than showing a cached copy; the ETag
+/// and Last-Modified keep that a cheap 304 when nothing changed.
+fn fresh(r: Response, path: &str) -> Response {
+    if path == "results" || path.starts_with("results/") {
+        r.with("Cache-Control", "no-cache")
+    } else {
+        r
+    }
+}
+
 fn get(live: &mut Live, req: &Request, path: &str) -> Result<Response, String> {
+    get_cached(live, req, path).map(|r| fresh(r, path))
+}
+
+fn get_cached(live: &mut Live, req: &Request, path: &str) -> Result<Response, String> {
     let (bytes, etag, mtime) = match node(live, path)? {
         None => return Ok(Response::new(404)),
         Some(Node::Dir) => {
@@ -554,6 +569,54 @@ mod tests {
             204
         );
         assert_eq!(handle(&mut l, &req("PROPFIND", "/dav/", b"")).status, 207);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn results_are_revalidated_and_other_files_are_not() {
+        let dir = std::env::temp_dir().join(format!("ikam-dav-fresh-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut l = Live::open(dir.to_str().unwrap(), "main").unwrap();
+        assert_eq!(
+            handle(&mut l, &req("MKCOL", "/dav/results", b"")).status,
+            201
+        );
+        for p in [
+            "/dav/results/latest.json",
+            "/dav/a.txt",
+            "/dav/resultsx.txt",
+        ] {
+            assert_eq!(handle(&mut l, &req("PUT", p, b"{}")).status, 201, "{p}");
+        }
+        let cache = |r: &Response| {
+            r.headers
+                .iter()
+                .find(|(k, _)| k == "Cache-Control")
+                .map(|(_, v)| v.clone())
+        };
+        let r = handle(&mut l, &req("GET", "/dav/results/latest.json", b""));
+        assert_eq!((r.status, cache(&r).as_deref()), (200, Some("no-cache")));
+        let etag = r
+            .headers
+            .iter()
+            .find(|(k, _)| k == "ETag")
+            .unwrap()
+            .1
+            .clone();
+        assert!(r.headers.iter().any(|(k, _)| k == "Last-Modified"));
+        // Revalidating an unchanged copy is a 304 that says the same.
+        let mut again = req("GET", "/dav/results/latest.json", b"");
+        again.headers.push(("If-None-Match".into(), etag));
+        let r = handle(&mut l, &again);
+        assert_eq!((r.status, cache(&r).as_deref()), (304, Some("no-cache")));
+        let r = handle(&mut l, &req("HEAD", "/dav/results/latest.json", b""));
+        assert_eq!(cache(&r).as_deref(), Some("no-cache"));
+        let r = handle(&mut l, &req("GET", "/dav/results/", b""));
+        assert_eq!(cache(&r).as_deref(), Some("no-cache"));
+        for p in ["/dav/a.txt", "/dav/resultsx.txt"] {
+            let r = handle(&mut l, &req("GET", p, b""));
+            assert_eq!((r.status, cache(&r)), (200, None), "{p}");
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

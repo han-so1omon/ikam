@@ -1917,3 +1917,10 @@ Newest last. Format and rules: `README.md`.
 - Not settled here: `graph_edit` with `Keys::Unique` still checks only the chunks it rewrites (a key index for the log is an option past about 100M events); fsck does not check label keys; storing new chunks plain on the fast path.
 - Verdict: **kept**; merged to main on Eric's yes (Nov 9).
 
+
+### E121 results-no-cache (an old copy of the self-test results kept showing)
+- Branch / parent: exp/121-results-no-cache / main at a86be84
+- Question (Eric, Nov 9): a fetcher kept showing the 02:07 self-test results after the 6:00 run had replaced them; the server sent ETag and Last-Modified but no Cache-Control. Add the header.
+- Change (CLI only): GET and HEAD under `/dav/results/` (the self-test's `latest.json` and `history.jsonl`, and the folder listing) send `Cache-Control: no-cache`, 304s included, so readers revalidate each time; ETag and Last-Modified stay, so an unchanged copy costs a 304. Other files are unchanged.
+- Result: a dav test (results revalidated on 200, 304, HEAD and the listing; `a.txt` and `resultsx.txt` without the header). All 135 kernel tests pass; clippy and fmt clean. No storage change, so the bench was not rerun.
+- Verdict: **kept**; merged to main on Eric's yes (Nov 9).
