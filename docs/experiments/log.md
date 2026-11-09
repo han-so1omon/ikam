@@ -2071,3 +2071,17 @@ Newest last. Format and rules: `README.md`.
   - Four-ingest safety check on frozen input, needed_index on and off: fsck_failures=0 and mismatched=0 on every ingest, fsck ok in both modes, objects identical.
   - All kernel tests pass. Fixed bench: every stored-bytes figure the same as E133's; timings within run-to-run noise (score 0.2433 to 0.2401).
 - Verdict: **kept**; on its branch until Eric says to merge.
+
+### E135 head-reads (the projection pass reads each object's header, not its bytes)
+- Branch / parent: exp/135-head-reads / exp/134-one-pass (E134)
+- Question: after E134 a fresh handle still fetches every stored byte once (229 MB on the cases store) to build the derivation ledger and the needed index. Both look only at an encoding's first bytes (its tag, mode, dictionary or group reference, or context ids), except derivation records, which are small. Can the pass fetch just those bytes?
+- Change (kernel; no format change): `Store::read_head(id, n)`, the first n bytes of a stored encoding. The default reads the whole object and cuts it, so every store keeps working; `FsStore` reads only n bytes of the file and `MemStore` copies only n. The ledger's pass reads 256-byte heads; a derivation record shorter than that is already whole, and a longer one is read again in full.
+- Result (`examples/heads.rs` on the cases store, 1,906 objects, page cache warm, two runs):
+  - First lookup on a fresh handle: 229.2 MB to 192 KB fetched, 60 to 22 ms, the same 1,921 requests (no derivation record needed a second read). The same with `needed_index` on.
+  - Every file's derivations match between whole and partial reads.
+  - End to end (`examples/goal.rs`, as in E133 and E134): the recommended first goal fetches 94 MB, down from 324 MB (554 MB before E134, 9.22 GB with defaults); the same 250,630 bytes written. What it still reads is the scoped seed index (89 MB).
+  - A store that can't read part of an object (the default) behaves exactly as before. On R2 a head is a Range GET: same request count, about 1,000 times fewer bytes.
+  - The second goal's view update wrote 75,465 bytes here, 75,501 in E134 and 75,467 in E133: that varies from run to run because the scoped seed index adds content in hash-set order (E131). E136 looks at it.
+  - Four-ingest safety check on frozen input: fsck_failures=0 and mismatched=0 on every ingest, fsck ok, objects identical with needed_index on and off and identical to E134's store.
+  - All kernel tests pass, plus `tests/heads.rs` (heads are prefixes of reads on both stores; a reopened `FsStore` finds the same derivations as the handle that wrote them).
+- Verdict: **kept**; on its branch until Eric says to merge.

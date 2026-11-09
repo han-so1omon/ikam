@@ -191,13 +191,20 @@ impl<S: Store> Repo<S> {
         let mut needed = (self.needed_index && self.needed.lock().unwrap().is_none())
             .then(crate::dict::Needed::default);
         for id in self.store.ids()? {
-            let encoded = self.store.read(&id)?;
+            // Both projections need only an encoding's header, except for
+            // derivation records, which are read whole (E135).
+            let head = self.store.read_head(&id, crate::dict::HEAD_LEN)?;
             if let Some(set) = needed.as_mut() {
-                set.add(&encoded);
+                set.add(&head);
             }
-            if object_tag(&encoded) != Some(b'D') {
+            if object_tag(&head) != Some(b'D') {
                 continue;
             }
+            let encoded = if head.len() < crate::dict::HEAD_LEN {
+                head
+            } else {
+                self.store.read(&id)?
+            };
             outputs.extend(self.derivation_output(&id, &encoded));
             records.push((id, encoded));
         }

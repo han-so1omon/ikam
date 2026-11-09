@@ -57,6 +57,13 @@ impl<S: Store> Store for Counting<S> {
         self.bytes.fetch_add(out.len() as u64, Relaxed);
         Ok(out)
     }
+    // Partial reads pass through and count only the bytes fetched (E135).
+    fn read_head(&self, id: &Id, n: usize) -> Result<Vec<u8>, Error> {
+        let out = self.inner.read_head(id, n)?;
+        self.reads.fetch_add(1, Relaxed);
+        self.bytes.fetch_add(out.len() as u64, Relaxed);
+        Ok(out)
+    }
     fn has(&self, id: &Id) -> bool {
         self.inner.has(id)
     }

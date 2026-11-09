@@ -15,6 +15,15 @@ pub trait Store {
     /// Callers must only swap encodings of the same object or content.
     fn replace(&mut self, id: Id, encoded: &[u8]) -> Result<(), Error>;
     fn read(&self, id: &Id) -> Result<Vec<u8>, Error>;
+    /// The first `n` bytes of the encoding stored under `id`, or all of it
+    /// if it is shorter. A store that can read part of an object (a file, a
+    /// range GET) fetches only those bytes; the default reads it all and
+    /// cuts it (E135).
+    fn read_head(&self, id: &Id, n: usize) -> Result<Vec<u8>, Error> {
+        let mut out = self.read(id)?;
+        out.truncate(n);
+        Ok(out)
+    }
     fn has(&self, id: &Id) -> bool;
     fn ids(&self) -> Result<Vec<Id>, Error>;
     /// Stored ids starting with `prefix` (an abbreviated id, as in git).
@@ -66,6 +75,11 @@ impl Store for MemStore {
 
     fn read(&self, id: &Id) -> Result<Vec<u8>, Error> {
         self.objects.get(id).cloned().ok_or(Error::NotFound(*id))
+    }
+
+    fn read_head(&self, id: &Id, n: usize) -> Result<Vec<u8>, Error> {
+        let bytes = self.objects.get(id).ok_or(Error::NotFound(*id))?;
+        Ok(bytes[..n.min(bytes.len())].to_vec())
     }
 
     fn has(&self, id: &Id) -> bool {
@@ -173,6 +187,14 @@ impl Store for FsStore {
 
     fn read(&self, id: &Id) -> Result<Vec<u8>, Error> {
         not_found_as(fs::read(self.path(id)), || Error::NotFound(*id))
+    }
+
+    fn read_head(&self, id: &Id, n: usize) -> Result<Vec<u8>, Error> {
+        use std::io::Read;
+        let file = not_found_as(fs::File::open(self.path(id)), || Error::NotFound(*id))?;
+        let mut out = Vec::with_capacity(n);
+        file.take(n as u64).read_to_end(&mut out)?;
+        Ok(out)
     }
 
     fn has(&self, id: &Id) -> bool {

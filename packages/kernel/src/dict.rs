@@ -56,6 +56,16 @@ const ABBREVIATED: u8 = 0x80;
 const RAW: u8 = 3;
 /// Bytes of a dictionary's id stored in each encoding that uses it.
 pub(crate) const DICT_REF_LEN: usize = 4;
+
+/// How much of a stored encoding says what it is and what it needs: its
+/// tag and mode, a dictionary or group reference, or the two context ids of
+/// an "M" encoding (`needs`, `object_tag`). A projection that needs only
+/// these reads this many bytes of each object (E135); 256 so that most
+/// derivation records arrive whole in the same read.
+pub(crate) const HEAD_LEN: usize = 256;
+const _: () = assert!(
+    HEAD_LEN > 2 * 32 && HEAD_LEN >= 2 + DICT_REF_LEN && HEAD_LEN > crate::group::GROUP_REF_LEN
+);
 type DictRef = [u8; DICT_REF_LEN];
 
 /// True for any plain encoding of content bytes.
