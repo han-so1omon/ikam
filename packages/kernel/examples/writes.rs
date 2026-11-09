@@ -82,6 +82,9 @@ impl<S: Store> Store for Counting<S> {
 
 type R = Repo<Counting<MemStore>>;
 
+/// Files written by one case: paths and their new bytes.
+type Writes = Vec<(String, Vec<u8>)>;
+
 fn load(src: &Path) -> Counting<MemStore> {
     let fs = FsStore::open(src).unwrap();
     let mut mem = MemStore::default();
@@ -179,7 +182,7 @@ fn main() {
             let ext = f.0.rsplit_once('.').map_or("", |x| x.1).to_string();
             fam.entry(ext).or_insert(f);
         }
-        let cases: Vec<(&str, Vec<(String, Vec<u8>)>)> = vec![
+        let cases: Vec<(&str, Writes)> = vec![
             (
                 "one_md_file",
                 vec![(md[3].0.clone(), b"# Edited\n\nOne line changed.\n".to_vec())],

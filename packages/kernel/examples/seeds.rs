@@ -60,6 +60,9 @@ impl<S: Store> Store for Counting<S> {
 
 type R = Repo<Counting<MemStore>>;
 
+/// Files written by one case: paths and their new bytes.
+type Writes = Vec<(String, Vec<u8>)>;
+
 fn files(repo: &R, tree: Id, prefix: &str, out: &mut Vec<(String, Id)>) {
     let Object::Tree(entries) = repo.get(&tree).unwrap() else {
         panic!("not a tree")
@@ -129,7 +132,7 @@ fn main() {
     };
     let md = all.iter().filter(|f| f.0.ends_with(".md")).nth(3).unwrap();
     let folder = "l-construction-v01";
-    let cases: Vec<(&str, Vec<(String, Vec<u8>)>, Vec<String>)> = vec![
+    let cases: Vec<(&str, Writes, Vec<String>)> = vec![
         (
             "one_md_file_edited",
             vec![edit(md)],

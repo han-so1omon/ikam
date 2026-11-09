@@ -122,6 +122,12 @@ impl<S: Store> Store for Counting<S> {
 
 type R = Repo<Counting<MemStore>>;
 
+/// Files written by one case: paths and their new bytes.
+type Writes = Vec<(String, Vec<u8>)>;
+
+/// E124 per family: files, then four lists of costs, then two byte totals.
+type FamilyCosts = (u64, Vec<f64>, Vec<f64>, Vec<f64>, Vec<f64>, u64, u64);
+
 fn load(src: &Path) -> MemStore {
     let fs = FsStore::open(src).unwrap();
     let mut mem = MemStore::default();
@@ -308,7 +314,7 @@ fn e129(repo: &mut R, files: &[(String, Id, usize)], root: Id, refname: &str) {
     for f in files {
         fam.entry(ext(&f.0)).or_insert(f);
     }
-    let cases: Vec<(&str, Vec<(String, Vec<u8>)>)> = vec![
+    let cases: Vec<(&str, Writes)> = vec![
         (
             "one_md_file",
             vec![(
@@ -581,8 +587,7 @@ fn anatomy(repo: &R, files: &[(String, Id, usize)]) {
 
 fn e124(repo: &R, files: &[(String, Id, usize)], dir: &Path) {
     // Per family: whole reads, 4 KiB ranges, markdown sections.
-    let mut by: BTreeMap<String, (u64, Vec<f64>, Vec<f64>, Vec<f64>, Vec<f64>, u64, u64)> =
-        BTreeMap::new();
+    let mut by: BTreeMap<String, FamilyCosts> = BTreeMap::new();
     let (mut sec_n, mut sec_bytes, mut sec_fetched, mut sec_reads, mut sec_whole_fetched) =
         (0u64, 0u64, 0u64, 0u64, 0u64);
     for (path, id, _) in files {

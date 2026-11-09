@@ -53,6 +53,9 @@ pub struct KvOp<'a> {
     pub value: Option<&'a [u8]>,
 }
 
+/// One key and its value.
+pub type Entry = (Vec<u8>, Vec<u8>);
+
 /// The few operations a key-value engine must offer to back a [`Store`].
 pub trait Kv {
     fn get(&self, table: Table, key: &[u8]) -> Result<Option<Vec<u8>>, Error>;
@@ -61,7 +64,7 @@ pub trait Kv {
     }
     /// Keys of `table` starting with `prefix`, in order.
     fn keys(&self, table: Table, prefix: &[u8]) -> Result<Vec<Vec<u8>>, Error>;
-    fn entries(&self, table: Table) -> Result<Vec<(Vec<u8>, Vec<u8>)>, Error>;
+    fn entries(&self, table: Table) -> Result<Vec<Entry>, Error>;
     /// Apply `ops` atomically and durably. With a `guard`, first check inside
     /// the same transaction that ref `guard.0` currently holds `guard.1`, and
     /// fail with [`Error::RefConflict`] (applying nothing) if it does not.
@@ -315,7 +318,7 @@ pub mod sqlite {
             Ok(out)
         }
 
-        fn entries(&self, t: Table) -> Result<Vec<(Vec<u8>, Vec<u8>)>, Error> {
+        fn entries(&self, t: Table) -> Result<Vec<Entry>, Error> {
             let sql = format!("SELECT k, v FROM {} ORDER BY k", table(t));
             let mut st = self.conn.prepare_cached(&sql).map_err(other)?;
             let rows = st
@@ -445,7 +448,7 @@ pub mod lmdb {
             Ok(out)
         }
 
-        fn entries(&self, t: Table) -> Result<Vec<(Vec<u8>, Vec<u8>)>, Error> {
+        fn entries(&self, t: Table) -> Result<Vec<Entry>, Error> {
             let r = self.env.read_txn().map_err(other)?;
             let mut out = Vec::new();
             for kv in self.db(t).iter(&r).map_err(other)? {
@@ -539,7 +542,7 @@ pub mod redb_store {
             Ok(out)
         }
 
-        fn entries(&self, t: Table) -> Result<Vec<(Vec<u8>, Vec<u8>)>, Error> {
+        fn entries(&self, t: Table) -> Result<Vec<Entry>, Error> {
             let r = self.db.begin_read().map_err(other)?;
             let table = r.open_table(def(t)).map_err(other)?;
             let mut out = Vec::new();
@@ -656,7 +659,7 @@ pub mod fjall_store {
             Ok(out)
         }
 
-        fn entries(&self, t: Table) -> Result<Vec<(Vec<u8>, Vec<u8>)>, Error> {
+        fn entries(&self, t: Table) -> Result<Vec<Entry>, Error> {
             let mut out = Vec::new();
             for g in self.ks(t).iter() {
                 let (k, v) = g.into_inner().map_err(other)?;
@@ -757,7 +760,7 @@ pub mod rocks {
             Ok(out)
         }
 
-        fn entries(&self, t: Table) -> Result<Vec<(Vec<u8>, Vec<u8>)>, Error> {
+        fn entries(&self, t: Table) -> Result<Vec<Entry>, Error> {
             let h = self.db.cf_handle(cf(t)).unwrap();
             let mut out = Vec::new();
             for kv in self.db.iterator_cf(h, rocksdb::IteratorMode::Start) {
@@ -1051,9 +1054,12 @@ fn open_sealed(root: &Path, n: u32) -> Result<Sealed, Error> {
     Ok(Sealed { pack, idx, fanout })
 }
 
+/// Where each object of a pack starts and how long its record is.
+type PackIndex = HashMap<Id, (u64, u32)>;
+
 /// Read a pack's records, stopping at the first torn or corrupt one.
 /// Returns the index and the length of the good prefix.
-fn scan(path: &Path) -> Result<(HashMap<Id, (u64, u32)>, u64), Error> {
+fn scan(path: &Path) -> Result<(PackIndex, u64), Error> {
     let mut f = io::BufReader::with_capacity(1 << 20, File::open(path)?);
     let total = f.get_ref().metadata()?.len();
     let mut index = HashMap::new();
