@@ -2059,3 +2059,15 @@ Newest last. Format and rules: `README.md`.
   - The scope's price: 4% more bytes written on the first goal (251 against 241 KB). Without the view's chunks in scope, view updates stored 1.7 to 4 times more (404 and 308 KB).
   - fsck clean after every configuration. All kernel tests pass. Fixed bench: the same stored bytes; kernel op times within 5% of E132's (the cost ratio moved from 0.2655 to 0.3168 because the baseline's own ingest ran faster, 35.4 against 28.1 ms).
 - Verdict: **kept** (a measurement, and two fixes to the E131 option); on its branch until Eric says to merge.
+
+### E134 one-pass (a fresh handle's projections from one read of the store)
+- Branch / parent: exp/134-one-pass / exp/133-goal-pipeline (E133)
+- Question: E133's recommended first goal still read the store twice: once to build the derivation ledger (any first lookup) and once more for the needed index (E129) on the first write that could drop a copy. Both read every stored encoding. Can one pass build both?
+- Change (kernel; no format change): when `needed_index` is on and its set isn't built yet, the ledger's pass over every stored object also feeds the needed index, and installs it if nothing built it meanwhile. Writes after that keep it current as before (`note_needs`).
+- Result (`examples/goal.rs`, same setup as E133, recommended configuration):
+  - First goal on a fresh handle: 554 MB to 324 MB fetched, 871 to 851 ms; the view update alone 234 MB in one scan to 3.9 MB in none. Bytes written the same (250,630).
+  - Next goal on the same handle: unchanged (6.3 MB).
+  - What the first goal still reads: the ledger's pass (230 MB) and the scoped seed index (89 MB).
+  - Four-ingest safety check on frozen input, needed_index on and off: fsck_failures=0 and mismatched=0 on every ingest, fsck ok in both modes, objects identical.
+  - All kernel tests pass.
+- Verdict: **kept**; on its branch until Eric says to merge.

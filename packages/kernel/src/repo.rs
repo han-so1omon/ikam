@@ -185,8 +185,16 @@ impl<S: Store> Repo<S> {
         // against stored ids and these (E104, `abbrev.rs`).
         let mut records = Vec::new();
         let mut outputs = std::collections::BTreeSet::new();
+        // The needed index (E129) is another projection of every stored
+        // encoding: build it from this same pass if it will be wanted
+        // (E134), so a fresh handle reads the store once, not twice.
+        let mut needed = (self.needed_index && self.needed.lock().unwrap().is_none())
+            .then(crate::dict::Needed::default);
         for id in self.store.ids()? {
             let encoded = self.store.read(&id)?;
+            if let Some(set) = needed.as_mut() {
+                set.add(&encoded);
+            }
             if object_tag(&encoded) != Some(b'D') {
                 continue;
             }
@@ -213,6 +221,12 @@ impl<S: Store> Repo<S> {
                 && let Object::Derivation(d) = Object::decode(&encoded)?
             {
                 ledger.insert(d);
+            }
+        }
+        if let Some(set) = needed {
+            let mut slot = self.needed.lock().unwrap();
+            if slot.is_none() {
+                *slot = Some(set);
             }
         }
         Ok(self.ledger.get_or_init(|| ledger))
