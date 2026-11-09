@@ -29,6 +29,8 @@ struct Counting<S: Store> {
     by_tag: std::sync::Mutex<BTreeMap<u8, (u64, u64)>>,
     seen: std::sync::Mutex<HashMap<Id, (u64, usize)>>,
     repeats: AtomicU64,
+    // E139: objects newly written (each one a file and an fsync on FsStore).
+    writes: AtomicU64,
 }
 
 #[derive(Clone, Copy, Default)]
@@ -50,9 +52,14 @@ impl<S: Store> Counting<S> {
 
 impl<S: Store> Store for Counting<S> {
     fn write(&mut self, id: Id, encoded: &[u8]) -> Result<bool, Error> {
-        self.inner.write(id, encoded)
+        let fresh = self.inner.write(id, encoded)?;
+        if fresh {
+            self.writes.fetch_add(1, Relaxed);
+        }
+        Ok(fresh)
     }
     fn replace(&mut self, id: Id, encoded: &[u8]) -> Result<(), Error> {
+        self.writes.fetch_add(1, Relaxed);
         self.inner.replace(id, encoded)
     }
     fn read(&self, id: &Id) -> Result<Vec<u8>, Error> {
@@ -109,10 +116,12 @@ impl<S: Store> Store for Counting<S> {
 }
 
 /// E139: the goal on a file store instead of memory, when `GOAL_FS` names a
-/// scratch directory (emptied and refilled for each configuration).
+/// scratch directory (emptied and refilled for each configuration), or on
+/// pack files there with `GOAL_STORE=pack`.
 enum AnyStore {
     Mem(MemStore),
     Fs(FsStore),
+    Pack(ikam_kernel::backends::PackStore),
 }
 
 macro_rules! each {
@@ -120,6 +129,7 @@ macro_rules! each {
         match $s {
             AnyStore::Mem($x) => $e,
             AnyStore::Fs($x) => $e,
+            AnyStore::Pack($x) => $e,
         }
     };
 }
@@ -170,7 +180,11 @@ fn wrap(objects: &[(Id, Vec<u8>)], refs: &[(String, Id)]) -> R {
     let mut mem = match std::env::var_os("GOAL_FS") {
         Some(dir) => {
             let _ = std::fs::remove_dir_all(&dir);
-            AnyStore::Fs(FsStore::open(dir).unwrap())
+            if std::env::var("GOAL_STORE").as_deref() == Ok("pack") {
+                AnyStore::Pack(ikam_kernel::backends::PackStore::open(dir).unwrap())
+            } else {
+                AnyStore::Fs(FsStore::open(dir).unwrap())
+            }
         }
         None => AnyStore::Mem(MemStore::default()),
     };
@@ -188,6 +202,7 @@ fn wrap(objects: &[(Id, Vec<u8>)], refs: &[(String, Id)]) -> R {
         by_tag: Default::default(),
         seen: Default::default(),
         repeats: 0.into(),
+        writes: 0.into(),
     })
 }
 
@@ -359,8 +374,9 @@ fn main() {
         let mut known: HashSet<Id> = objects.iter().map(|o| o.0).collect();
         let line = |repo: &R, goal: &str, stage: &str, ms: f64, extra: String| {
             let io = repo.store().take();
+            let writes = repo.store().writes.swap(0, Relaxed);
             println!(
-                "{{\"exp\":\"E133\",\"config\":\"{config}\",\"goal\":\"{goal}\",\"stage\":\"{stage}\",\"reads\":{},\"fetched\":{},\"scans\":{},\"ms\":{ms:.1}{extra}}}",
+                "{{\"exp\":\"E133\",\"config\":\"{config}\",\"goal\":\"{goal}\",\"stage\":\"{stage}\",\"reads\":{},\"fetched\":{},\"scans\":{},\"ms\":{ms:.1},\"objects_written\":{writes}{extra}}}",
                 io.reads, io.bytes, io.scans
             );
         };

@@ -2125,3 +2125,17 @@ Newest last. Format and rules: `README.md`.
   - `examples/goal.rs` also gains an `edit_reads` line (E139: what the first write of a goal reads) and `GOAL_FS=<dir>` to run on a file store.
   - All kernel tests pass, plus `tests/memo.rs`: a view and a tree edited with the memo on and off store identical objects with fewer reads on; nothing is kept once an edit returns.
 - Verdict: **kept**; on its branch until Eric says to merge.
+
+### E139 file-store (the recommended setup end to end on files and on packs)
+- Branch / parent: exp/139-file-store / exp/138-view-update (E138), with exp/122-store-bakeoff merged in, so this one branch holds every experiment branch since E122.
+- Question: E133 to E138 ran the goal on a store held in memory. What does the recommended setup cost on a real store, files or packs, and what is left?
+- Change: `PackStore::read_head` reads only the first bytes of a record (E122's packs had only the default, a whole read cut short), with a test that heads are prefixes of reads from the write buffer, from the open pack and after a reopen. `examples/goal.rs` runs on a file store with `GOAL_FS=<dir>`, on packs with `GOAL_STORE=pack` too, and counts objects written per stage. Kernel defaults unchanged.
+- Result (cases store, page cache warm, goals as in E133; recommended = E137's scope plus E138's memo):
+  - First goal on a fresh handle, recommended: 4.5 MB fetched in all three; 735 ms on files, 351 ms on packs, 291 ms in memory. Defaults: 9.0 GB, 4.1 s on files, 3.4 s on packs.
+  - Next goal: 3.3 MB; 421 ms on files, 186 ms on packs, 202 ms in memory.
+  - On files the view update is most of the time (629 of 735 ms): it writes 425 objects for 214 links, and `FsStore` syncs each one. Packs sync twice per ref move whatever the count, so the same update takes 285 ms.
+  - Same bytes written on every store (250,379 and 78,086); the fresh handle's lookup fetches 246 KB of heads on each.
+  - Here each object written costs `FsStore` about 0.9 ms (create, sync, rename: 629 against 237 ms in memory for 425 objects). On macOS, Rust's `sync_all` is a full flush to the drive (`F_FULLFSYNC`), usually milliseconds, so the gap between files and packs should be wider on Eric's Mac: to measure there.
+  - The fixed bench on this branch: every byte count and the north score (0.3035) as on E138; cost score 0.2435 against 0.2399, from timings and repack peak memory only.
+  - All kernel tests pass, plus `tests/backends.rs` (pack heads).
+- Verdict: **kept**; on its branch until Eric says to merge.

@@ -173,3 +173,9 @@ it is an on-disk addition and waits on a decision.
 | Setting | Default | Trade | Measured |
 | --- | --- | --- | --- |
 | `Repo::read_memo` (E138; `--read-memo`) | off | each tree, view or content write keeps the stored contents it reads (up to 64 MB) until it returns, so the old chunks a new chunk is matched against are read once, against holding those bytes in memory for the edit; the same bytes are stored either way | E133's first goal (E137's scope) 7.7 MB to 4.5 MB fetched, its view update 3.85 MB / 1,337 reads to 1.01 MB / 446 reads; next goal 5.7 MB to 3.3 MB; identical objects stored |
+
+## Which store, for a goal (E139)
+
+| Setting | Default | Trade | Measured |
+| --- | --- | --- | --- |
+| `PackStore` (E122) against `FsStore` | `FsStore` | two syncs per ref move against one per object written, and a writer lock, against one file per object that any tool can list | E133's first goal with the recommended options 735 ms on files, 351 ms on packs (291 ms in memory), the same 4.5 MB fetched and bytes written; the view update syncs 425 objects on files |
