@@ -245,6 +245,60 @@ impl<S: Store> Repo<S> {
         Ok(out)
     }
 
+    /// `graph_prefix` of the graph that `graph_edit(root, pending)` would
+    /// make, without making it (E148): the stored nodes, overridden or
+    /// dropped by `pending`. A server can keep a view's new edits pending
+    /// and fold them in with one `graph_edit` every few goals; reads see
+    /// the same nodes either way.
+    pub fn graph_prefix_pending(
+        &self,
+        root: &Id,
+        pending: &BTreeMap<String, Option<Node>>,
+        prefix: &str,
+    ) -> Result<Vec<Node>, Error> {
+        let mut out: BTreeMap<String, Node> = self
+            .graph_prefix(root, prefix)?
+            .into_iter()
+            .map(|n| (n.label.clone(), n))
+            .collect();
+        for (label, node) in pending
+            .range(prefix.to_string()..)
+            .take_while(|(l, _)| l.starts_with(prefix))
+        {
+            match node {
+                Some(n) => {
+                    let mut n = n.clone();
+                    n.edges.sort();
+                    n.edges.dedup();
+                    out.insert(label.clone(), n);
+                }
+                None => {
+                    out.remove(label);
+                }
+            }
+        }
+        Ok(out.into_values().collect())
+    }
+
+    /// `graph_node` of the graph that `graph_edit(root, pending)` would make.
+    pub fn graph_node_pending(
+        &self,
+        root: &Id,
+        pending: &BTreeMap<String, Option<Node>>,
+        label: &str,
+    ) -> Result<Option<Node>, Error> {
+        match pending.get(label) {
+            Some(Some(n)) => {
+                let mut n = n.clone();
+                n.edges.sort();
+                n.edges.dedup();
+                Ok(Some(n))
+            }
+            Some(None) => Ok(None),
+            None => self.graph_node(root, label),
+        }
+    }
+
     fn collect_prefix(&self, id: &Id, prefix: &str, out: &mut Vec<Node>) -> Result<(), Error> {
         match self.graph_chunk(id)? {
             Graph::Nodes(nodes) => {
@@ -415,6 +469,20 @@ impl<S: Store> Repo<S> {
     /// With `Keys::Any` the root equals `put_graph_with(nodes, Keys::Any)`
     /// in every case, clashing keys included.
     pub fn graph_edit_with(
+        &mut self,
+        root: &Id,
+        edits: BTreeMap<String, Option<Node>>,
+        keys: Keys,
+    ) -> Result<Id, Error> {
+        let began = self.begin_memo();
+        let hinting = self.begin_hints();
+        let out = self.graph_edit_inner(root, edits, keys);
+        self.end_hints(hinting);
+        self.end_memo(began);
+        out
+    }
+
+    fn graph_edit_inner(
         &mut self,
         root: &Id,
         edits: BTreeMap<String, Option<Node>>,

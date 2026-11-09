@@ -15,6 +15,21 @@ pub trait Store {
     /// Callers must only swap encodings of the same object or content.
     fn replace(&mut self, id: Id, encoded: &[u8]) -> Result<(), Error>;
     fn read(&self, id: &Id) -> Result<Vec<u8>, Error>;
+    /// The first `n` bytes of the encoding stored under `id`, or all of it
+    /// if it is shorter. A store that can read part of an object (a file, a
+    /// range GET) fetches only those bytes; the default reads it all and
+    /// cuts it (E135).
+    fn read_head(&self, id: &Id, n: usize) -> Result<Vec<u8>, Error> {
+        let mut out = self.read(id)?;
+        out.truncate(n);
+        Ok(out)
+    }
+    /// Length of the encoding stored under `id` (E147). A store that keeps
+    /// lengths (a file's size, a pack's index) answers without reading the
+    /// object; the default reads it.
+    fn stored_len(&self, id: &Id) -> Result<usize, Error> {
+        self.read(id).map(|b| b.len())
+    }
     fn has(&self, id: &Id) -> bool;
     fn ids(&self) -> Result<Vec<Id>, Error>;
     /// Stored ids starting with `prefix` (an abbreviated id, as in git).
@@ -66,6 +81,18 @@ impl Store for MemStore {
 
     fn read(&self, id: &Id) -> Result<Vec<u8>, Error> {
         self.objects.get(id).cloned().ok_or(Error::NotFound(*id))
+    }
+
+    fn stored_len(&self, id: &Id) -> Result<usize, Error> {
+        self.objects
+            .get(id)
+            .map(Vec::len)
+            .ok_or(Error::NotFound(*id))
+    }
+
+    fn read_head(&self, id: &Id, n: usize) -> Result<Vec<u8>, Error> {
+        let bytes = self.objects.get(id).ok_or(Error::NotFound(*id))?;
+        Ok(bytes[..n.min(bytes.len())].to_vec())
     }
 
     fn has(&self, id: &Id) -> bool {
@@ -175,6 +202,18 @@ impl Store for FsStore {
         not_found_as(fs::read(self.path(id)), || Error::NotFound(*id))
     }
 
+    fn stored_len(&self, id: &Id) -> Result<usize, Error> {
+        not_found_as(fs::metadata(self.path(id)), || Error::NotFound(*id)).map(|m| m.len() as usize)
+    }
+
+    fn read_head(&self, id: &Id, n: usize) -> Result<Vec<u8>, Error> {
+        use std::io::Read;
+        let file = not_found_as(fs::File::open(self.path(id)), || Error::NotFound(*id))?;
+        let mut out = Vec::with_capacity(n);
+        file.take(n as u64).read_to_end(&mut out)?;
+        Ok(out)
+    }
+
     fn has(&self, id: &Id) -> bool {
         self.path(id).exists()
     }
@@ -191,6 +230,11 @@ impl Store for FsStore {
                 }
             }
         }
+        // Directory order depends on the filesystem (ext4 hashes names with a
+        // per-filesystem seed, APFS sorts them). Callers that pick among
+        // equal choices in id order then store the same encodings everywhere,
+        // as from a `MemStore` (E136).
+        out.sort_unstable();
         Ok(out)
     }
 
@@ -213,6 +257,7 @@ impl Store for FsStore {
                 out.push(id);
             }
         }
+        out.sort_unstable(); // as `ids` (E136)
         Ok(out)
     }
 
@@ -233,16 +278,34 @@ impl Store for FsStore {
         check_ref_name(name)?;
         let path = self.root.join("refs").join(name);
         fs::create_dir_all(path.parent().unwrap())?;
-        // The lock file serializes writers; create_new fails if another holds it.
+        // The lock file serializes writers through an OS lock on it, not its
+        // existence: a writer killed mid-update leaves the file behind, and
+        // an existence lock would refuse every later update of the ref
+        // (E122). The OS drops the lock with the process.
         let lock = path.with_file_name(format!(
             "{}.lock",
             path.file_name().unwrap().to_string_lossy()
         ));
+        let conflict = || Error::RefConflict(name.into());
         let mut file = fs::OpenOptions::new()
             .write(true)
-            .create_new(true)
+            .create(true)
+            .truncate(false)
             .open(&lock)
-            .map_err(|_| Error::RefConflict(name.into()))?;
+            .map_err(|_| conflict())?;
+        file.try_lock().map_err(|_| conflict())?;
+        // The file locked must still be the one at the lock path: a writer
+        // that opened it just before another renamed it into place holds
+        // the ref file itself.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            let held = file.metadata()?.ino();
+            if fs::metadata(&lock).map(|m| m.ino()).ok() != Some(held) {
+                return Err(conflict());
+            }
+        }
+        file.set_len(0)?;
         let result = (|| {
             if self.get_ref(name)? != expected {
                 return Err(Error::RefConflict(name.into()));

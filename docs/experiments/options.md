@@ -144,3 +144,114 @@ read weight 1.0: 1,000 single appends 0.9 s and 7.9 MB stored against
 3.1 s and 3.3 MB). A key index for the log, so in-place edits check its
 label keys across the whole graph (needed only near 100M events: chance
 clashes are about 3 in 10,000 there).
+
+## Store backends (E122)
+
+Each backend sits behind the `Store` trait; `FsStore` (one file per object) stays the default until the Mac numbers are in. The others build with the cargo feature named (`stores` for all).
+
+| Backend | Feature | Trade | Measured (Linux, ext4) |
+|---|---|---|---|
+| `FsStore` | default | simplest, readable by any tool; one file and one 4 KiB block per object, 66 flushes and 25 files changed per commit | 4.1 GB allocated for 1M small objects (288 MB of data); 19.2 ms a single append |
+| `PackStore` | default | append-only packs and a checkpointed index; a pack cleaner is not built yet, so deleted objects stay until one is | 769 MB/s writes, 2 flushes and 2 files per commit, 372 MB for 1M objects, open 279 ms and cold read p50 190 us at 10M |
+| SQLite (WAL) | `sqlite` | one file, `synchronous` FULL (or NORMAL: 0.3 flushes a commit, may lose the last commits on power loss, never corrupts) | 9 ms open at 10M; cold p50 155 us, warm 92 |
+| LMDB | `lmdb` | fastest warm reads (1.6 us at 1M); a fixed map size and 1.6 to 2.8 times the bytes | 6.1 GB at 10M |
+| redb | `redb` | pure Rust, one file; the largest on disk at 1M | cold p50 85 us at 10M |
+| fjall, with or without key-value separation | `fjall` | LSM; fast writes, slow open (640 ms to 1.8 s) | 330 MB/s writes separated |
+| RocksDB, with or without blobs | `rocksdb` | LSM; needs a C++ toolchain to build; 3.7 s open at 10M | cold p50 142 us at 10M |
+
+## Where new content looks for repeats (E131)
+
+| Setting | Default | Trade | Measured |
+| --- | --- | --- | --- |
+| `Repo::seed_scope` (E131) | `None`: every stored content | `Some(roots)`: the first write reads only those contents and what they are made of, and near-match reuse stays inside them, against missing repeats of content outside them | one-file edit's first write 238 MB / 1.7 s to 0.69 MB / 8.8 ms, same bytes stored; a 36-file folder copy with source and destination folders in scope 8.5 KB written against 21.8 KB on the whole store; an empty scope 1.09 MB against 2.9 KB |
+| `Repo::set_seed_scope` (E133) | not called | a new scope for each request (a goal's folders), the seed index rebuilt for it, against that rebuild's reads (2.7 MB for the second goal in E133) | name the trees and view chunks a write replaces too: a view update stored 237 KB with them, 404 KB without |
+| What to put in a goal's scope (E137) | (a choice of the caller) | the files the goal reads and edits, plus the trees and view chunks it replaces, against their whole folders: misses repeats of files the goal never touched | E133's first goal 94 MB / 797 ms to 7.7 MB / 318 ms, 250,379 bytes written against 250,630 |
+
+**Not yet a setting**: a ledger cache file (E130: 159 KB and 0.1 ms to load
+in one read; since E135 a fresh handle's first lookup reads 192 KB of headers
+in 1,906 reads instead of 229 MB). It would save round trips, mainly on R2;
+it is an on-disk addition and waits on a decision.
+
+## Reads within one request (E124 to E128)
+
+| Setting | Default | Trade | Measured |
+|---|---|---|---|
+| `Repo::session(limit)` | plain reads (no session) | memory up to `limit` decoded bytes, against refetching a group, dictionary or container for each read | all text files 7.31 -> 5.30 MB fetched; a goal's windows 257 -> 166 KB ("invoice", files whole 184 KB); 238 Office files 18.9 -> 2.68 MB in one session (E128) |
+| Reverse-link view (not built) | none: incoming links by scan | 33.9 MB and a write per link change, against a scan of every object | incoming links 113k reads and 340 ms by scan, 8 reads and about 1 ms by view (E125) |
+| Path index (not kept) | tree walk | an index graph, 62 KB here | worse: 4 reads a lookup against 2 by walking trees (E125) |
+| Per-tenant stores (not built) | one shared store | isolation of every stored object, against dedup across tenants | 644 MB against 229 MB for the bench corpus's 26 folders (E126) |
+| Short-term index for terms under 3 characters (not built) | trigram index only | index bytes, against a scan of every text file for "Q3" (7.3 MB, 68 ms) | E127 |
+
+## What one edit reads (E138)
+
+| Setting | Default | Trade | Measured |
+| --- | --- | --- | --- |
+| `Repo::read_memo` (E138; `--read-memo`) | off | each tree, view or content write keeps the stored contents it reads (up to 64 MB) until it returns, so the old chunks a new chunk is matched against are read once, against holding those bytes in memory for the edit; the same bytes are stored either way | E133's first goal (E137's scope) 7.7 MB to 4.5 MB fetched, its view update 3.85 MB / 1,337 reads to 1.01 MB / 446 reads; next goal 5.7 MB to 3.3 MB; identical objects stored |
+
+## Which store, for a goal (E139)
+
+| Setting | Default | Trade | Measured |
+| --- | --- | --- | --- |
+| `PackStore` (E122) against `FsStore` | `FsStore` | two syncs per ref move against one per object written, and a writer lock, against one file per object that any tool can list | E133's first goal with the recommended options 735 ms on files, 351 ms on packs (291 ms in memory), the same 4.5 MB fetched and bytes written; the view update syncs 425 objects on files |
+
+## What a goal may touch (E140)
+
+| Setting | Default | Trade | Measured |
+| --- | --- | --- | --- |
+| Section grants (`Grant`, `windows_around`) against file grants (E126) | none in the kernel; the server checks paths | a grant names file versions and byte ranges, so a stale version or a change outside the goal's lines is refused; the server must place the windows (it reads the matched files) and an edit check diffs the old and new bytes | "Q3": 16.7 KB of 347 KB exposed (4.8%); read check 14 to 22 ns, edit check 14 to 33 us, seal or verify 1.5 to 3.2 us; 0 of 70 out-of-window edits allowed against 70 of 70; same bytes fetched as whole files (groups) |
+
+## What a goal's first write indexes (E141)
+
+| Setting | Default | Trade | Measured |
+| --- | --- | --- | --- |
+| `replace_hints` | off | with a scope, old trees and chunks an edit reads join the seed index, so the scope can name only the files; repeats of content outside the scope and outside what the edit reads are not found | E133's first goal 4.21 MB to 2.50 MB, next 3.26 MB to 1.23 MB (heads apart); first write 1.78 MB to 189 KB; bytes written 250,171 against 250,379 |
+
+## Search and read in one session (E142)
+
+| Setting | Default | Trade | Measured |
+| --- | --- | --- | --- |
+| `ReadSession::search` | `Repo::search` (no shared decodes) | the scan keeps decodes up to the session's limit, so memory is bounded by that limit; reads of the hits then cost nothing | E133's first goal 2.50 MB to 2.04 MB, next 1.23 MB to 1.14 MB (heads apart); read stage to zero |
+
+`read_memo` (E143) also covers template candidates: a similar chunk is read once per edit, not twice. E133's first goal on the recommended setup 2.04 MB to 1.59 MB, next 1.14 MB to 0.78 MB; bytes written unchanged.
+
+## Template plans for trees and view chunks (E144)
+
+| Setting | Default | Trade | Measured |
+| --- | --- | --- | --- |
+| `object_templates` | on | off: a tree or view chunk is stored as slices of earlier content or plain, never as a template fill that also rewrites the old chunk; edits only add objects | E133's first goal on the recommended setup writes 250 KB to 86 KB, the store grows 72 KB against 76 KB, 332 ms to 159 ms on packs; the next goal reads 2% more |
+
+## A goal's writes as one batch (E145)
+
+| Setting | Default | Trade | Measured |
+| --- | --- | --- | --- |
+| `begin_batch` / `end_batch`, `keep_read` | each write is its own edit | with `read_memo` on, what a goal's writes read (and the files it hands over) is kept until the batch ends, up to the memo's 64 MB | E133's first goal on the recommended setup 1.48 MB to 1.13 MB, edit stage 414 KB to 70 KB; bytes written unchanged |
+
+## Object lengths from the store (E147)
+
+| Setting | Default | Trade | Measured |
+| --- | --- | --- | --- |
+| `Store::stored_len` | provided; reads the object | a backend that answers from its index saves one read per old chunk whose bytes a batch already holds; a backend that keeps the default behaves as before | E133's first goal in a batch: edit stage 70 KB to 8 KB, the goal 1.13 MB to 1.07 MB; bytes written unchanged |
+
+## A view's edits kept pending (E148)
+
+| Setting | Default | Trade | Measured |
+| --- | --- | --- | --- |
+| `graph_prefix_pending` / `graph_node_pending`, fold with `graph_edit_with` | the caller edits the view in every goal | lookups merge the pending edits in memory; the view on disk lags until the next fold | E133's first goal: view update 405 KB to 22 KB, 150 ms to 37 ms on packs; one fold for two goals 445 KB against 744 KB, same root |
+
+## Short searches from the postings alone (E149)
+
+| Setting | Default | Trade | Measured |
+| --- | --- | --- | --- |
+| `exact_short_search` | off | on: patterns of one to three bytes are answered from the trigram postings without decoding the matches, so the answer rests on the index | E133's searches 655 KB to 269 KB and 351 KB to 269 KB (the index alone), same matches; a goal that then reads the files fetches the same total |
+
+## Group size (E151)
+
+| Setting | Default | Trade | Measured |
+| --- | --- | --- | --- |
+| `group_size`, `--group-size` | 64 KiB | smaller groups fetch less per member read and store more where small contents share context | 16 KiB: E133's file reads 385 KB to 208 KB and 82 KB to 53 KB; north score 0.3035 to 0.3100 (multiformat +4.6%, tables +1.8%); 8 KiB: 157 KB and 25 KB |
+
+## Held search index (E152)
+
+| Setting | Default | Trade | Measured |
+| --- | --- | --- | --- |
+| a caller holds the decoded `search_index()` between goals (no kernel switch) | each caller loads it | memory for the decoded index against reloading it per goal; contents written since are scanned, so results stay exact | E133's next goal 358 KB to 89 KB (60 KB with 16 KiB groups), same matches and writes |

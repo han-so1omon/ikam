@@ -10,7 +10,7 @@
 //!   the read fails. Corruption is an error, never data.
 //! - Derivations enter the ledger only after they reproduce their output.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::OnceLock;
 
 use crate::dict::object_tag;
@@ -118,13 +118,95 @@ pub struct Repo<S: Store> {
     /// but four times the decode work). Set, a large content can be stored
     /// a few percent larger where brotli would have won.
     pub slow_codec_max: usize,
+    /// The largest group repack packs small contents into (E151), 64 KiB
+    /// by default. Reading one member fetches its whole group, so smaller
+    /// groups fetch less per file read (E133's first goal reads its files in
+    /// 208 KB at 16 KiB against 385 KB at 64 KiB) and store more where
+    /// contents share context across files (the north corpora 2% larger
+    /// at 16 KiB). Stores packed either way read the same.
+    pub group_size: usize,
+    /// Keep the set of ids stored encodings name (groups, contexts,
+    /// dictionaries) in memory, so ingest can drop a superseded stored copy
+    /// without reading every stored object first (E129). Off by default.
+    /// On, it assumes this handle is the store's only writer while it is
+    /// open (as `ikam serve` is): an encoding another process writes later
+    /// is not seen, and the copy it needs could be dropped. Off, every drop
+    /// at ingest reads the whole store.
+    pub needed_index: bool,
+    pub(crate) needed: std::sync::Mutex<Option<crate::dict::Needed>>,
+    /// Where new content looks for repeats (E131). `None` (the default):
+    /// every stored content, so the first write on a handle reads the whole
+    /// store to build the matcher's seed index. `Some(roots)`: only those
+    /// contents and what they are derived from, for example the files of
+    /// the tree being written, or of one tenant's refs. Trees and graph
+    /// chunks are stored as content too, so name the trees and view chunks
+    /// a write will replace if their new versions should repeat them (E133:
+    /// a view update stored 404 KB without its chunks, 227 KB with). A
+    /// smaller scope
+    /// reads less and never builds new content out of bytes outside it, at
+    /// the price of missing repeats of content outside it. Content written
+    /// through the handle is added to the index either way. Set it before
+    /// the handle's first write, or with `set_seed_scope` later.
+    pub seed_scope: Option<Vec<Id>>,
     /// zstd level new encodings use (`dict::MEASURE_LEVEL` unless
     /// `recompress` is running).
     pub(crate) level: i32,
     /// Large members' deflates, reused while a repack runs (E109); `None`
     /// otherwise, so every other read and fsck does the full work.
     pub(crate) deflate_memo: Option<std::sync::Arc<crate::container::DeflateMemo>>,
+    /// Keep the stored contents one tree or view edit reads, for the rest
+    /// of that edit (E138). Off by default. Each graph chunk and tree a
+    /// view or tree edit writes is matched against the old chunks near it,
+    /// and each match is read again to verify it, so the same few hundred
+    /// old chunks are read several times each. On, `graph_edit_with` and
+    /// `edit_tree` read each at most once (up to `MEMO_LIMIT` bytes), and
+    /// drop the copies when they return. Only contents stored as bytes and
+    /// checked against their id are kept, and evaluation work is counted
+    /// as before, so the bytes written are the same either way.
+    pub read_memo: bool,
+    pub(crate) memo: std::sync::Mutex<Option<Memo>>,
+    /// With a `seed_scope`, add each old tree and graph chunk that a tree
+    /// or view edit reads to the seed index before the edit writes its new
+    /// chunks (E141). Off by default. A new chunk repeats the chunks it
+    /// replaces, and those are the ones the edit reads, so a scope can name
+    /// only the files a goal touches instead of every tree and view chunk,
+    /// and the first write no longer reads them all to index them.
+    pub replace_hints: bool,
+    /// With a trigram search index, answer patterns of one to three bytes
+    /// from the postings alone (E149). Off by default. A trigram's posting
+    /// lists exactly the contents holding it, so for these patterns the
+    /// candidates are the matches and need not be decoded; contents too
+    /// short to have trigrams, and contents the index does not cover, are
+    /// still scanned. Off, every candidate is decoded and scanned, so
+    /// results never rest on the index alone.
+    pub exact_short_search: bool,
+    pub(crate) hints: std::sync::Mutex<Option<Hints>>,
+    /// Whether a stored tree or graph chunk may be planned as a fill of a
+    /// template (E144). On by default. Off, its plans are only slices of
+    /// earlier content, and the edit does not read the similar chunks a
+    /// template plan would be tried against.
+    pub object_templates: bool,
+    pub(crate) writing_object: bool,
 }
+
+/// Old chunk contents read during one edit with `replace_hints` on.
+#[derive(Default)]
+pub(crate) struct Hints {
+    pending: Vec<Id>,
+    added: HashSet<Id>,
+}
+
+/// Contents read during one edit with `read_memo` on.
+#[derive(Default)]
+pub(crate) struct Memo {
+    map: HashMap<Id, Vec<u8>>,
+    /// Length of the stored encoding of each kept content (E143).
+    stored: HashMap<Id, usize>,
+    bytes: usize,
+}
+
+/// Most bytes one edit's memo keeps; reads past it go to the store.
+pub(crate) const MEMO_LIMIT: usize = 64 << 20;
 
 impl<S: Store> Repo<S> {
     pub fn new(store: S) -> Repo<S> {
@@ -141,9 +223,168 @@ impl<S: Store> Repo<S> {
             short_records: false,
             markup_layers: false,
             slow_codec_max: usize::MAX,
+            group_size: crate::group::GROUP_SIZE,
+            needed_index: false,
+            needed: Default::default(),
+            seed_scope: None,
             level: crate::dict::MEASURE_LEVEL,
             deflate_memo: None,
+            read_memo: false,
+            memo: Default::default(),
+            replace_hints: false,
+            exact_short_search: false,
+            object_templates: true,
+            writing_object: false,
+            hints: Default::default(),
         }
+    }
+
+    /// Start noting old chunks read, if `replace_hints` is on, a scope is
+    /// set and no outer edit already does. True if this call started it.
+    pub(crate) fn begin_hints(&self) -> bool {
+        let mut hints = self.hints.lock().unwrap();
+        if !self.replace_hints || self.seed_scope.is_none() || hints.is_some() {
+            return false;
+        }
+        *hints = Some(Hints::default());
+        true
+    }
+
+    pub(crate) fn end_hints(&self, began: bool) {
+        if began {
+            *self.hints.lock().unwrap() = None;
+        }
+    }
+
+    /// Note `content`, the content holding an old tree or chunk just read.
+    pub(crate) fn hint(&self, content: &Id) {
+        if let Some(h) = self.hints.lock().unwrap().as_mut()
+            && !h.added.contains(content)
+        {
+            h.pending.push(*content);
+        }
+    }
+
+    /// Index the contents noted since the last call, in the order read.
+    fn index_hints(&mut self) -> Result<(), Error> {
+        let pending = match self.hints.lock().unwrap().as_mut() {
+            Some(h) => std::mem::take(&mut h.pending),
+            None => return Ok(()),
+        };
+        if pending.is_empty() {
+            return Ok(());
+        }
+        self.ensure_index()?;
+        // As `ensure_index` does for a scope: a derived content is indexed
+        // through the stored contents it is made of, which a plan can read.
+        let (content, _) = self.closure(pending, |_| true)?;
+        let mut ids: Vec<Id> = content.into_iter().collect();
+        ids.sort();
+        for id in ids {
+            let fresh = self
+                .hints
+                .lock()
+                .unwrap()
+                .as_mut()
+                .is_some_and(|h| h.added.insert(id));
+            if !fresh {
+                continue;
+            }
+            let bytes = match self.memo_get(&id) {
+                Some(b) => b,
+                None => {
+                    let Ok(encoded) = self.store.read(&id) else {
+                        continue; // derived: its arguments are in `ids`
+                    };
+                    match self.decode_plain(&id, &encoded) {
+                        Ok(b) => b,
+                        Err(_) => continue,
+                    }
+                }
+            };
+            if let Some(index) = &mut self.index {
+                index.add(id, &bytes);
+            }
+        }
+        Ok(())
+    }
+
+    /// Start keeping contents read, if `read_memo` is on and no outer edit
+    /// already does. True if this call started it (pass it to `end_memo`).
+    pub(crate) fn begin_memo(&self) -> bool {
+        let mut memo = self.memo.lock().unwrap();
+        if !self.read_memo || memo.is_some() {
+            return false;
+        }
+        *memo = Some(Memo::default());
+        true
+    }
+
+    pub(crate) fn end_memo(&self, began: bool) {
+        if began {
+            *self.memo.lock().unwrap() = None;
+        }
+    }
+
+    /// The kept content of `id`, while its stored copy exists (a copy
+    /// dropped during the edit reads as it would without the memo).
+    pub(crate) fn memo_get(&self, id: &Id) -> Option<Vec<u8>> {
+        let bytes = self.memo.lock().unwrap().as_ref()?.map.get(id).cloned()?;
+        self.store.has(id).then_some(bytes)
+    }
+
+    /// Keep `bytes` as the content of `id`, stored as `stored` encoded
+    /// bytes; callers have checked it.
+    pub(crate) fn memo_put(&self, id: &Id, bytes: &[u8], stored: usize) {
+        self.memo_insert(id, bytes, Some(stored));
+    }
+
+    fn memo_insert(&self, id: &Id, bytes: &[u8], stored: Option<usize>) {
+        if let Some(m) = self.memo.lock().unwrap().as_mut()
+            && m.bytes + bytes.len() <= MEMO_LIMIT
+            && !m.map.contains_key(id)
+        {
+            m.bytes += bytes.len();
+            m.map.insert(*id, bytes.to_vec());
+            if let Some(n) = stored {
+                m.stored.insert(*id, n);
+            }
+        }
+    }
+
+    /// Start running several writes as one edit (E145): with `read_memo`
+    /// on, what any of them reads is kept until `end_batch`, so a goal's
+    /// file puts, tree edit and view update read each stored content at
+    /// most once. Returns whether this call started it; pass that to
+    /// `end_batch`. Nested batches and edits join the outer one.
+    pub fn begin_batch(&self) -> bool {
+        self.begin_memo()
+    }
+
+    /// End a batch `begin_batch` started; what it kept is dropped.
+    pub fn end_batch(&self, began: bool) {
+        self.end_memo(began)
+    }
+
+    /// Hand a batch bytes the caller already holds (E145), such as the
+    /// files a goal's read session decoded, so its writes need not fetch
+    /// them again. Kept only inside a `batch` with `read_memo` on, only if
+    /// `bytes` hash to `id` and `id` is stored; otherwise ignored.
+    pub fn keep_read(&self, id: &Id, bytes: &[u8]) {
+        if self.memo.lock().unwrap().is_some() && self.store.has(id) && Id::of_content(bytes) == *id
+        {
+            self.memo_insert(id, bytes, None);
+        }
+    }
+
+    /// The kept content of `id` and the length of its stored encoding,
+    /// while its stored copy exists (E143).
+    pub(crate) fn memo_get_stored(&self, id: &Id) -> Option<(Vec<u8>, usize)> {
+        let memo = self.memo.lock().unwrap();
+        let m = memo.as_ref()?;
+        let out = (m.map.get(id)?.clone(), *m.stored.get(id)?);
+        drop(memo);
+        self.store.has(id).then_some(out)
     }
 
     pub fn store(&self) -> &S {
@@ -159,11 +400,26 @@ impl<S: Store> Repo<S> {
         // against stored ids and these (E104, `abbrev.rs`).
         let mut records = Vec::new();
         let mut outputs = std::collections::BTreeSet::new();
+        // The needed index (E129) is another projection of every stored
+        // encoding: build it from this same pass if it will be wanted
+        // (E134), so a fresh handle reads the store once, not twice.
+        let mut needed = (self.needed_index && self.needed.lock().unwrap().is_none())
+            .then(crate::dict::Needed::default);
         for id in self.store.ids()? {
-            let encoded = self.store.read(&id)?;
-            if object_tag(&encoded) != Some(b'D') {
+            // Both projections need only an encoding's header, except for
+            // derivation records, which are read whole (E135).
+            let head = self.store.read_head(&id, crate::dict::HEAD_LEN)?;
+            if let Some(set) = needed.as_mut() {
+                set.add(&head);
+            }
+            if object_tag(&head) != Some(b'D') {
                 continue;
             }
+            let encoded = if head.len() < crate::dict::HEAD_LEN {
+                head
+            } else {
+                self.store.read(&id)?
+            };
             outputs.extend(self.derivation_output(&id, &encoded));
             records.push((id, encoded));
         }
@@ -189,13 +445,35 @@ impl<S: Store> Repo<S> {
                 ledger.insert(d);
             }
         }
+        if let Some(set) = needed {
+            let mut slot = self.needed.lock().unwrap();
+            if slot.is_none() {
+                *slot = Some(set);
+            }
+        }
         Ok(self.ledger.get_or_init(|| ledger))
+    }
+
+    /// Change `seed_scope`, dropping the seed index so the next write builds
+    /// it for the new scope (E133: one handle serving goals in different
+    /// folders).
+    pub fn set_seed_scope(&mut self, scope: Option<Vec<Id>>) {
+        self.seed_scope = scope;
+        self.index = None;
     }
 
     pub(crate) fn reset_projections(&mut self) {
         self.index = None;
         self.ledger = OnceLock::new();
         self.dict = OnceLock::new();
+        *self.needed.get_mut().unwrap() = None;
+    }
+
+    /// Keep the needed set current after storing `encoded` (E129).
+    pub(crate) fn note_needs(&mut self, encoded: &[u8]) {
+        if let Some(set) = self.needed.get_mut().unwrap().as_mut() {
+            set.add(encoded);
+        }
     }
 
     /// Every recorded derivation of `id`.
@@ -241,13 +519,18 @@ impl<S: Store> Repo<S> {
             // Trees and graph chunks are stored as content, so a new version
             // is derived from earlier ones (slices); see `dict.rs`.
             Some(tag @ (b'T' | b'G')) => {
-                let content = self.put_content(encoded)?.id;
+                self.index_hints()?;
+                let outer = std::mem::replace(&mut self.writing_object, true);
+                let put = self.put_content(encoded);
+                self.writing_object = outer;
+                let content = put?.id;
                 [&[tag.to_ascii_lowercase(), 2][..], content.as_bytes()].concat()
             }
             Some(_) => self.encode_object(encoded),
             None => encoded.to_vec(),
         };
         let fresh = self.store.write(id, &stored)?;
+        self.note_needs(&stored);
         if fresh {
             self.bytes_written += stored.len();
         }
@@ -318,12 +601,16 @@ impl<S: Store> Repo<S> {
                 "{id}: derivation cycle or nesting too deep"
             )));
         }
+        if let Some(bytes) = self.memo_get(id) {
+            return self.remember(id, bytes, cx);
+        }
         let mut err = Error::NotFound(*id);
         match self.store.read(id) {
             Ok(encoded) => match self.decode_plain(id, &encoded) {
                 Ok(bytes)
                     if crate::dict::self_verified(&encoded) || Id::of_content(&bytes) == *id =>
                 {
+                    self.memo_put(id, &bytes, encoded.len());
                     return self.remember(id, bytes, cx);
                 }
                 Ok(_) | Err(Error::Corrupt(_)) => err = Error::Corrupt(*id),

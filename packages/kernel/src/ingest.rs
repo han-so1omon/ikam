@@ -60,7 +60,10 @@ impl Candidate {
 
 impl<S: Store> Repo<S> {
     pub fn put_content(&mut self, bytes: &[u8]) -> Result<Put, Error> {
-        self.put_content_with(bytes, 0, &[])
+        let began = self.begin_memo();
+        let out = self.put_content_with(bytes, 0, &[]);
+        self.end_memo(began);
+        out
     }
 
     pub(crate) fn put_content_with(
@@ -97,7 +100,9 @@ impl<S: Store> Repo<S> {
         // (E092; the heavy read weight, every content).
         if self.read_weight * (bytes.len() as f64) < plain.len() as f64 {
             candidates.extend(self.slice_candidate(bytes)?);
-            candidates.extend(self.template_candidates(bytes)?);
+            if self.object_templates || !self.writing_object {
+                candidates.extend(self.template_candidates(bytes)?);
+            }
         }
         let best = candidates
             .into_iter()
@@ -128,11 +133,12 @@ impl<S: Store> Repo<S> {
         for d in c.derivations {
             self.record(d)?;
         }
-        // A dictionary, or the context of a "Q" encoding, is decoded from its
-        // stored bytes and must stay stored.
+        // The dictionary, and anything another stored encoding is decoded
+        // from (a dictionary, a group, a "Q" or "M" context), must stay
+        // stored (E123: dropping a group lost its members).
         if let Some(old) = c.drop
             && Some(old) != self.dictionary().map(|(id, _)| *id)
-            && !self.is_related_base(&old)?
+            && !self.is_needed(&old)?
         {
             self.store.delete(&old)?;
         }
@@ -239,10 +245,15 @@ impl<S: Store> Repo<S> {
         self.ensure_index()?;
         let store = &self.store;
         let load = |id: &Id| {
-            store
-                .read(id)
-                .ok()
-                .and_then(|e| self.decode_plain(id, &e).ok())
+            if let Some(bytes) = self.memo_get(id) {
+                return Some(bytes);
+            }
+            let e = store.read(id).ok()?;
+            let bytes = self.decode_plain(id, &e).ok()?;
+            if crate::dict::self_verified(&e) || Id::of_content(&bytes) == *id {
+                self.memo_put(id, &bytes, e.len());
+            }
+            Some(bytes)
         };
         let plan = matcher::plan(bytes, self.index.as_ref().unwrap(), load);
         self.concat_candidate(bytes, &plan)
@@ -345,11 +356,35 @@ impl<S: Store> Repo<S> {
     /// with derivations (so templates never chain through repeated pairing),
     /// or the dictionary (which must stay stored).
     fn new_template_candidate(&self, bytes: &[u8], y: Id) -> Result<Option<Candidate>, Error> {
-        let Ok(stored) = self.store.read(&y) else {
-            return Ok(None);
+        // E143: `template_candidates` has just read `y` as a template, so
+        // with `read_memo` on its bytes are kept; only the stored length is
+        // needed besides them.
+        let kept = match self.memo_get_stored(&y) {
+            Some(kept) => Some(kept),
+            // Bytes handed to a batch come without the stored length; the
+            // store gives it without reading the object (E147).
+            None => match self.memo_get(&y) {
+                Some(b) => match self.store.stored_len(&y) {
+                    Ok(n) => Some((b, n)),
+                    Err(_) => return Ok(None),
+                },
+                None => None,
+            },
         };
-        let Ok(y_bytes) = self.decode_plain(&y, &stored) else {
-            return Ok(None);
+        let (y_bytes, stored_len) = match kept {
+            Some(kept) => kept,
+            None => {
+                let Ok(stored) = self.store.read(&y) else {
+                    return Ok(None);
+                };
+                let Ok(y_bytes) = self.decode_plain(&y, &stored) else {
+                    return Ok(None);
+                };
+                if crate::dict::self_verified(&stored) || Id::of_content(&y_bytes) == y {
+                    self.memo_put(&y, &y_bytes, stored.len());
+                }
+                (y_bytes, stored.len())
+            }
         };
         let is_dict = self.dictionary().is_some_and(|(d, _)| *d == y);
         if is_dict
@@ -383,7 +418,7 @@ impl<S: Store> Repo<S> {
         let written = derivation_size(&dx)
             + derivation_size(&dy)
             + literals.iter().map(|l| l.1.len()).sum::<usize>();
-        let cost = written as isize - stored.len() as isize;
+        let cost = written as isize - stored_len as isize;
         Ok(Some(Candidate {
             cost,
             work: work_x + work_y,
@@ -396,9 +431,59 @@ impl<S: Store> Repo<S> {
     pub(crate) fn ensure_index(&mut self) -> Result<(), Error> {
         if self.index.is_none() {
             let mut index = Index::default();
-            for id in self.store.ids()? {
-                if let Ok(bytes) = self.decode_plain(&id, &self.store.read(&id)?) {
+            // In id order, so the same objects give the same index (and the
+            // same encodings) on any store and in any run (E136).
+            let ids: Vec<Id> = match &self.seed_scope {
+                None => {
+                    let mut ids = self.store.ids()?;
+                    ids.sort();
+                    ids
+                }
+                // Only what these contents are made of (E131).
+                Some(roots) => {
+                    let (content, _) = self.closure(roots.clone(), |_| true)?;
+                    let mut ids: Vec<Id> = content.into_iter().collect();
+                    ids.sort();
+                    ids
+                }
+            };
+            let mut seen = std::collections::HashSet::new();
+            let mut stack: Vec<Id> = ids.into_iter().rev().collect();
+            while let Some(id) = stack.pop() {
+                if !seen.insert(id) {
+                    continue;
+                }
+                // E145: what this edit has already read (or was handed).
+                if let Some(bytes) = self.memo_get(&id) {
                     index.add(id, &bytes);
+                    continue;
+                }
+                let Ok(encoded) = self.store.read(&id) else {
+                    continue; // derived: its arguments are in `ids`
+                };
+                match self.decode_plain(&id, &encoded) {
+                    Ok(bytes) => {
+                        if crate::dict::self_verified(&encoded) || Id::of_content(&bytes) == id {
+                            self.memo_put(&id, &bytes, encoded.len());
+                        }
+                        index.add(id, &bytes)
+                    }
+                    // A tree or graph chunk named in a scope stands for the
+                    // content holding its encoding, so its next version can
+                    // repeat it (E133). On the whole store that content is
+                    // indexed in its own right.
+                    Err(_) if self.seed_scope.is_some() => {
+                        if let Some(content) = crate::dict::tree_content(&encoded) {
+                            let mut more: Vec<Id> = self
+                                .closure(vec![content], |_| true)?
+                                .0
+                                .into_iter()
+                                .collect();
+                            more.sort_unstable_by(|a, b| b.cmp(a));
+                            stack.extend(more);
+                        }
+                    }
+                    Err(_) => {}
                 }
             }
             self.index = Some(index);

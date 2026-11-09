@@ -16,6 +16,76 @@
 use crate::repo::{Cx, STACK_GUARD, select};
 use crate::{Arg, Error, Id, Repo, Store, func, template};
 
+/// Several reads that share what they decode (E128): a group, dictionary,
+/// template or container part rebuilt for one read is kept for the next,
+/// so a request that reads many small files, or many sections of a few
+/// files, fetches each stored object once instead of once per read. Kept
+/// bytes are bounded by `limit`; past it the session forgets everything
+/// it holds after the read that crossed it. Nothing is written and the
+/// format is unchanged; every result is checked exactly as a single read.
+pub struct ReadSession<'a, S: Store> {
+    repo: &'a Repo<S>,
+    cx: std::cell::RefCell<Cx>,
+    limit: usize,
+}
+
+impl<S: Store> ReadSession<'_, S> {
+    /// The contents this session holds decoded, to hand to a write batch
+    /// (`Repo::keep_read`, E145).
+    pub fn into_contents(self) -> Vec<(Id, Vec<u8>)> {
+        let mut out: Vec<(Id, Vec<u8>)> = self.cx.into_inner().known.into_iter().collect();
+        out.sort_by_key(|a| a.0);
+        out
+    }
+
+    /// Content `id`, whole.
+    pub fn read_content(&self, id: &Id) -> Result<Vec<u8>, Error> {
+        let mut cx = self.cx.borrow_mut();
+        let out = self.repo.rebuild(id, &mut cx);
+        self.trim(&mut cx);
+        out
+    }
+
+    /// Bytes `start..start + len` of content `id` (see `Repo::read_range`).
+    pub fn read_range(&self, id: &Id, start: u64, len: u64) -> Result<Vec<u8>, Error> {
+        start.checked_add(len).ok_or(Error::Corrupt(*id))?;
+        let mut cx = self.cx.borrow_mut();
+        let out = self.repo.range(id, start, len, &mut cx);
+        self.trim(&mut cx);
+        out
+    }
+
+    /// `Repo::search` in this session (E142): the contents the scan
+    /// decodes, matches included, stay for the reads that follow, so a
+    /// goal that searches and then reads what it found fetches each once.
+    /// The same hits as `Repo::search`.
+    pub fn search(
+        &self,
+        pattern: &[u8],
+        files: &[Id],
+        index: Option<&crate::SearchIndex>,
+    ) -> Result<(Vec<Id>, usize), Error> {
+        let mut cx = self.cx.borrow_mut();
+        let out = self
+            .repo
+            .search_in(pattern, files, index, &mut cx, Some(self.limit));
+        self.trim(&mut cx);
+        out
+    }
+
+    /// Decoded bytes the session holds now.
+    pub fn held(&self) -> usize {
+        self.cx.borrow().known.values().map(Vec::len).sum()
+    }
+
+    fn trim(&self, cx: &mut Cx) {
+        cx.stack.clear();
+        if cx.known.values().map(Vec::len).sum::<usize>() > self.limit {
+            cx.known.clear();
+        }
+    }
+}
+
 impl<S: Store> Repo<S> {
     /// Bytes `start..start + len` of content `id`, and the decode work the
     /// read took (bytes produced by functions, as in `evaluate`). An error
@@ -27,8 +97,19 @@ impl<S: Store> Repo<S> {
         Ok((out, cx.work))
     }
 
+    /// A read session keeping up to `limit` decoded bytes between reads.
+    pub fn session(&self, limit: usize) -> ReadSession<'_, S> {
+        ReadSession {
+            repo: self,
+            cx: Default::default(),
+            limit,
+        }
+    }
+
     fn range(&self, id: &Id, start: u64, len: u64, cx: &mut Cx) -> Result<Vec<u8>, Error> {
-        let stored = cx.known.contains_key(id) || self.store.read(id).is_ok();
+        // Presence only: reading the entry here fetched the whole object
+        // once more than the rebuild below (E124).
+        let stored = cx.known.contains_key(id) || self.store.has(id);
         if !stored && cx.stack.len() < STACK_GUARD && !cx.stack.contains(id) {
             cx.stack.push(*id);
             let walked = self.derivations(id)?.iter().find_map(|d| {

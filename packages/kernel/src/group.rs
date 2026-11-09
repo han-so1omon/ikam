@@ -20,7 +20,8 @@ use crate::{Error, Id, Repo, Store, matcher};
 pub(crate) const GROUP_REF_LEN: usize = 8;
 /// Largest group, in uncompressed bytes. Reading a member decompresses its
 /// group, so this bounds the read cost of a member.
-const GROUP_SIZE: usize = 64 * 1024;
+/// The default largest group (`Repo::group_size`, E151).
+pub const GROUP_SIZE: usize = 64 * 1024;
 
 pub(crate) fn put_varint(out: &mut Vec<u8>, mut n: usize) {
     while n >= 0x80 {
@@ -52,12 +53,12 @@ struct Planned {
     saved: f64,
 }
 
-/// Groups of consecutive items in byte order, each up to `GROUP_SIZE`.
-fn byte_order_groups(items: &[(Vec<u8>, Id, usize)]) -> Vec<Vec<usize>> {
+/// Groups of consecutive items in byte order, each up to `limit` bytes.
+fn byte_order_groups(items: &[(Vec<u8>, Id, usize)], limit: usize) -> Vec<Vec<usize>> {
     let (mut groups, mut start) = (Vec::new(), 0);
     while start < items.len() {
         let (mut end, mut size) = (start, 0);
-        while end < items.len() && (end == start || size + items[end].0.len() <= GROUP_SIZE) {
+        while end < items.len() && (end == start || size + items[end].0.len() <= limit) {
             size += items[end].0.len();
             end += 1;
         }
@@ -68,8 +69,8 @@ fn byte_order_groups(items: &[(Vec<u8>, Id, usize)]) -> Vec<Vec<usize>> {
 }
 
 /// Groups packed in an external proposed order (unlisted items follow in
-/// byte order), each up to `GROUP_SIZE`. Empty without a proposal.
-fn proposed_groups(items: &[(Vec<u8>, Id, usize)], order: &[Id]) -> Vec<Vec<usize>> {
+/// byte order), each up to `limit` bytes. Empty without a proposal.
+fn proposed_groups(items: &[(Vec<u8>, Id, usize)], order: &[Id], limit: usize) -> Vec<Vec<usize>> {
     if order.is_empty() {
         return Vec::new();
     }
@@ -78,7 +79,7 @@ fn proposed_groups(items: &[(Vec<u8>, Id, usize)], order: &[Id]) -> Vec<Vec<usiz
     sequence.sort_by_key(|&i| (rank.get(&items[i].1).copied().unwrap_or(usize::MAX), i));
     let (mut groups, mut group, mut size) = (Vec::new(), Vec::new(), 0);
     for i in sequence {
-        if !group.is_empty() && size + items[i].0.len() > GROUP_SIZE {
+        if !group.is_empty() && size + items[i].0.len() > limit {
             groups.push(std::mem::take(&mut group));
             size = 0;
         }
@@ -89,7 +90,7 @@ fn proposed_groups(items: &[(Vec<u8>, Id, usize)], order: &[Id]) -> Vec<Vec<usiz
     groups
 }
 
-/// Groups of item indices, each up to `GROUP_SIZE` bytes. A group starts
+/// Groups of item indices, each up to `limit` bytes. A group starts
 /// from the first unplaced item (in byte order) and grows by the unplaced
 /// item sharing the most content-defined seeds with the group so far (the
 /// matcher's anchors: a MinHash-like resemblance), falling back to byte
@@ -108,6 +109,7 @@ fn similar_groups(
     items: &[(Vec<u8>, Id, usize)],
     measure: Option<&[u8]>,
     order: Option<&[usize]>,
+    limit: usize,
 ) -> Vec<Vec<usize>> {
     let mut zstd = measure.and_then(framer);
     let mut cost = |b: &[u8]| {
@@ -143,7 +145,7 @@ fn similar_groups(
                     index[k].iter().for_each(|&j| score[j] += 1);
                 }
             }
-            let fits = |j: usize| !placed[j] && size + items[j].0.len() <= GROUP_SIZE;
+            let fits = |j: usize| !placed[j] && size + items[j].0.len() <= limit;
             let mut ranked: Vec<usize> = (0..items.len()).filter(|&j| fits(j)).collect();
             match order {
                 None => ranked.sort_by_key(|&j| (std::cmp::Reverse(score[j]), j)),
@@ -242,7 +244,7 @@ impl<S: Store> Repo<S> {
     }
 
     /// Group the small contents stored on their own: sorted by bytes, so
-    /// similar ones are neighbours, then packed up to `GROUP_SIZE`. A group is
+    /// similar ones are neighbours, then packed up to `group_size`. A group is
     /// written only if it and its member entries are smaller than the
     /// members' current encodings.
     pub(crate) fn group_small(&mut self) -> Result<(), Error> {
@@ -252,7 +254,7 @@ impl<S: Store> Repo<S> {
             let stored = self.store.read(&id)?;
             if matches!(stored.first(), Some(b'B' | b'W' | b'Z' | b'Y')) && Some(id) != dict {
                 let bytes = self.decode_plain(&id, &stored)?;
-                if !bytes.is_empty() && bytes.len() < GROUP_SIZE {
+                if !bytes.is_empty() && bytes.len() < self.group_size {
                     items.push((bytes, id, stored.len()));
                 }
             }
@@ -264,17 +266,19 @@ impl<S: Store> Repo<S> {
             .dictionary()
             .map(|(_, d)| d.clone())
             .unwrap_or_default();
+        let limit = self.group_size;
         let proposals = [
-            byte_order_groups(&items),
-            similar_groups(&items, None, None),
-            similar_groups(&items, Some(&dict), None),
+            byte_order_groups(&items, limit),
+            similar_groups(&items, None, None, limit),
+            similar_groups(&items, Some(&dict), None, limit),
             // Byte order shortlists, measured cost picks.
             similar_groups(
                 &items,
                 Some(&dict),
                 Some(&(0..items.len()).collect::<Vec<_>>()),
+                limit,
             ),
-            proposed_groups(&items, &self.proposed_order),
+            proposed_groups(&items, &self.proposed_order, limit),
         ];
         for proposal in proposals {
             let plans: Vec<Planned> = proposal
@@ -288,8 +292,10 @@ impl<S: Store> Repo<S> {
         }
         for p in best.1 {
             self.store.write(p.group, &p.encoded)?;
+            self.note_needs(&p.encoded);
             for (id, entry) in p.entries {
                 self.store.replace(id, &entry)?;
+                self.note_needs(&entry);
             }
         }
         self.reset_projections();

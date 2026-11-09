@@ -331,6 +331,20 @@ impl<S: Store> Repo<S> {
         files: &[Id],
         index: Option<&SearchIndex>,
     ) -> Result<(Vec<Id>, usize), Error> {
+        self.search_in(pattern, files, index, &mut Cx::default(), None)
+    }
+
+    /// `search`, decoding into `cx`. With `keep` (a read session's limit,
+    /// E142) what the scan decodes stays in `cx` for the reads after it,
+    /// up to `keep` bytes; without it each candidate's decodes are dropped.
+    pub(crate) fn search_in(
+        &self,
+        pattern: &[u8],
+        files: &[Id],
+        index: Option<&SearchIndex>,
+        cx: &mut Cx,
+        keep: Option<usize>,
+    ) -> Result<(Vec<Id>, usize), Error> {
         if let Some(index) = index
             && let Some(chunks) = &index.chunks
             && !pattern.is_empty()
@@ -338,19 +352,49 @@ impl<S: Store> Repo<S> {
         {
             return self.search_chunks(pattern, files, &index.files, chunks);
         }
-        let candidates: Vec<Id> = match index.filter(|i| pattern.len() >= 3 && i.chunks.is_none()) {
+        // E149: indexed contents the postings alone show to match.
+        let mut exact: HashSet<Id> = HashSet::new();
+        let candidates: Vec<Id> = match index.filter(|i| !pattern.is_empty() && i.chunks.is_none())
+        {
             Some(index) => {
                 let covered: HashSet<&Id> = index.files.iter().collect();
-                let mut hits: Option<HashSet<usize>> = None;
-                for w in pattern.windows(3) {
-                    let list = index.postings.get(&[w[0], w[1], w[2]]);
-                    let set: HashSet<usize> = list.into_iter().flatten().copied().collect();
-                    hits = Some(match hits {
-                        Some(h) => h.intersection(&set).copied().collect(),
-                        None => set,
-                    });
-                }
-                let hits = hits.unwrap_or_default();
+                let hits = match pattern.len() {
+                    // A pattern shorter than a trigram (E132): a content
+                    // holds it iff one of its trigrams contains it, or the
+                    // content is shorter than three bytes and so has no
+                    // trigrams (it is in no posting list).
+                    1 | 2 => {
+                        let finder = memchr::memmem::Finder::new(pattern);
+                        let (mut hits, mut seen) = (HashSet::new(), HashSet::new());
+                        for (t, list) in &index.postings {
+                            seen.extend(list.iter().copied());
+                            if finder.find(t).is_some() {
+                                hits.extend(list.iter().copied());
+                            }
+                        }
+                        if self.exact_short_search {
+                            exact.extend(hits.iter().map(|&i| index.files[i]));
+                        }
+                        hits.extend((0..index.files.len()).filter(|i| !seen.contains(i)));
+                        hits
+                    }
+                    _ => {
+                        let mut hits: Option<HashSet<usize>> = None;
+                        for w in pattern.windows(3) {
+                            let list = index.postings.get(&[w[0], w[1], w[2]]);
+                            let set: HashSet<usize> = list.into_iter().flatten().copied().collect();
+                            hits = Some(match hits {
+                                Some(h) => h.intersection(&set).copied().collect(),
+                                None => set,
+                            });
+                        }
+                        let hits = hits.unwrap_or_default();
+                        if self.exact_short_search && pattern.len() == 3 {
+                            exact.extend(hits.iter().map(|&i| index.files[i]));
+                        }
+                        hits
+                    }
+                };
                 let indexed = files.iter().filter(|id| covered.contains(id));
                 let unindexed = files.iter().filter(|id| !covered.contains(id));
                 let positions: HashMap<&Id, usize> = index
@@ -373,17 +417,29 @@ impl<S: Store> Repo<S> {
         };
         // A substring search built once per query (E072).
         let finder = memchr::memmem::Finder::new(pattern);
-        let mut cx = Cx::default();
+        let work = cx.work;
         let mut out = Vec::new();
         for id in candidates {
-            let bytes = self.rebuild(&id, &mut cx)?;
+            if exact.contains(&id) {
+                out.push(id);
+                continue;
+            }
+            let bytes = self.rebuild(&id, cx)?;
             crate::dict::count_decode(bytes.len(), SCAN_UNITS);
             if finder.find(&bytes).is_some() {
                 out.push(id);
             }
-            cx.known.clear();
+            match keep {
+                None => cx.known.clear(),
+                Some(limit) => {
+                    cx.stack.clear();
+                    if cx.known.values().map(Vec::len).sum::<usize>() > limit {
+                        cx.known.clear();
+                    }
+                }
+            }
         }
-        Ok((out, cx.work))
+        Ok((out, cx.work - work))
     }
 
     /// `search` through a chunk index: each distinct chunk and seam once.

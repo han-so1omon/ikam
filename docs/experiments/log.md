@@ -1924,3 +1924,393 @@ Newest last. Format and rules: `README.md`.
 - Change (CLI only): GET and HEAD under `/dav/results/` (the self-test's `latest.json` and `history.jsonl`, and the folder listing) send `Cache-Control: no-cache`, 304s included, so readers revalidate each time; ETag and Last-Modified stay, so an unchanged copy costs a 304. Other files are unchanged.
 - Result: a dav test (results revalidated on 200, 304, HEAD and the listing; `a.txt` and `resultsx.txt` without the header). All 135 kernel tests pass; clippy and fmt clean. No storage change, so the bench was not rerun.
 - Verdict: **kept**; merged to main on Eric's yes (Nov 9).
+
+### E122 store-bakeoff (chunk and ref store backends, measured on ikam's own workloads)
+- Branch / parent: exp/122-store-bakeoff / main at d14be74 (E121)
+- Question (Eric, Nov 9): run a measured comparison of chunk and ref store backends, each behind the `Store` trait as an option: plain files, packs, SQLite WAL, LMDB, an LSM store (RocksDB, fjall), and any other strong fit (redb). Measure object count, open time (small, 1M, 10M keys), write and read throughput, single appends, batch commits, ref swaps, size on disk and crash safety. Research note: `docs/research/store-backends.md` (git packs and reftable, Dolt, dbt, ext4 and ALICE, Apple's fsync, LFS, LSM, WiscKey, Bitcask, BlobDB, ZFS/Btrfs/APFS, lakeFS, SQLite, LMDB, redb, fjall, R2, VFS for Git, overlayfs, File Provider). OpenResearch (`orx`) could not be installed here (proxy 403); the README's git loop was followed.
+- Change (kernel; no format change to anything existing): `src/backends.rs` with a `Kv` trait and a `KvStore` adapter (objects buffered and committed atomically with the ref move, the CAS checked inside the transaction where the engine has one) over SQLite (WAL, `synchronous` FULL or NORMAL; `fullfsync` on macOS for FULL), LMDB (heed), redb, fjall (with and without key/value separation) and RocksDB (with and without blobs), each behind a cargo feature (`stores` for all); and `PackStore`: append-only packs of `id | len | bytes | crc32` records, sealed at 512 MB with a git-style fanout index, the open pack's index checkpointed every 64 MB and on close, every record's CRC checked on read, sealed lookups by interpolation search, refs as files. `FsStore` ref updates now lock with an OS lock instead of the lock file's existence. Harness `examples/stores.rs` (phases `corpus`, `db`, `build`, `probe`, `crash`); tests `tests/backends.rs` (one contract and a repository round trip on every backend, torn tails, checkpoints, stale ref locks) and a sealed-lookup unit test.
+- Result (Linux VM, ext4, 4 cores; fsync here costs about 0.09 ms, so it is not the Mac's drive flush; other jobs ran alongside some phases):
+  - The bench corpus `tests/fixtures/cases` (1,906 objects, 229 MB): write MB/s files 273, packs 769, SQLite 202, LMDB 172, redb 287, fjall 230 (330 separated), RocksDB 211; cold read MB/s files 827, packs 3,320, SQLite 1,052, LMDB 1,257, redb 557, fjall 462 (1,097 separated), RocksDB 609; open files 0.5 ms, SQLite 1 ms, LMDB 7 ms, fjall 39 ms, RocksDB 482 ms. redb took 338 MB for 229 MB.
+  - Database appends (`db_append` + `db_commit`): one event per commit, mean (p99) ms: files 19.2 (108), packs 5.1 (12.6), SQLite 6.6, LMDB 5.9, redb 6.4, fjall 4.9, RocksDB 5.2. 10,000 events in batches of 1,000: files 21.3 s, packs 3.8, SQLite 10.5, LMDB 3.5, redb 6.0, fjall 4.8, RocksDB 5.3. Files changed per commit: files 25.5, packs 2, the engines 1. Bare ref swap p50: files 323 us, packs 361, SQLite 169 (11 with NORMAL), fjall 131. Flush calls per commit (strace; each is an F_FULLFSYNC on macOS): files 66, packs 2, SQLite 1.3 (0.3 NORMAL), LMDB 1.0, redb 1.0, fjall 1.2, RocksDB 1.1.
+  - Scale, 64 to 511 byte objects: at 1M, size on disk (apparent / allocated): files 288 MB / 4.1 GB (one 4 KiB block per file), packs 372 MB, SQLite 394 MB, LMDB 1.03 GB, redb 1.08 GB / 751 MB, fjall 743 / 676 MB, RocksDB 590 MB; build files 348 s, packs 2.4 s, the engines 5 to 12 s. Cold read p50 at 1M: files 222 us, packs 39, SQLite 94, LMDB 115, redb 65, fjall 49, RocksDB 60; warm: LMDB 1.6, fjall 5.7, RocksDB 13.7, redb 32, packs 35, SQLite 46, files 49. At 10M (files skipped: over 40 GB of blocks): open packs 279 ms, SQLite 9, LMDB 15, redb 14, fjall 640, RocksDB 3,749; cold read p50 packs 190 us (351 before interpolation search), SQLite 155, LMDB 268, redb 85, fjall 130, RocksDB 142; warm LMDB 5.3, packs 37, redb 46, RocksDB 69, SQLite 92, fjall 104; size packs 3.7 GB, SQLite 3.9, LMDB 6.1, redb 6.5 / 5.3, fjall 3.5, RocksDB 4.3.
+  - Packs first opened 1M objects in 44 s and 10M in 65 s: the open pack was rescanned with a seek per record. With the checkpoint and one sequential pass: 196 ms and 279 ms.
+  - Crash (SIGKILL after 150 to 1,650 ms of a child that writes a 50 to 250 KB file, appends 1 to 40 events and commits, 25 kills per backend, twice): no acknowledged commit lost, fsck clean and views rebuilt byte-identical after every kill, on every backend (500 kills). The first runs also found that `FsStore` wedged a ref after a kill between taking `refs/<name>.lock` and the rename: every later update was refused (22 of 25 children in the second run). With the OS lock, 25 of 25 children commit.
+  - All kernel tests pass (`cargo test --release`, and `--features stores --test backends`). The bench was not rerun: no ingest, repack or read path changed, and `FsStore`'s lock change affects only who may move a ref.
+- Not measured here (needs the Mac): APFS and F_FULLFSYNC costs (66 drive flushes per commit on `FsStore` against 2 on packs is the number to price there), Finder over WebDAV, `clonefile`. Not built: a multi-pack index, a pack cleaner, per-pack Bloom filters for misses (a miss at 10M costs 130 us), an R2 backend (conditional PUT for refs, Range GET for packs).
+- Verdict: **kept** (packs and the engines as options, `FsStore` stays the default; the `FsStore` lock is a fix); on its branch until Eric says to merge.
+
+### E123 repack-dict-corruption (a later ingest dropped a group's stored bytes)
+- Branch / parent: exp/123-repack-dict-corruption / main at d14be74 (E121)
+- Question (Eric, Nov 9): ingesting `packages/kernel/fixtures/multiformat`, `docs`, `packages/kernel/src` and then `tests/fixtures/cases` into one store, each under its own ref, failed the fourth ingest with "object ... does not match its id", and fsck then failed 149 objects; `tests/fixtures/cases` alone into a fresh store was clean. Suspected: repack's dictionary move.
+- Finding: not the dictionary. Every encoding in the failed store named the one dictionary (`7a6e7089`, still stored), and the fourth ingest failed in about 20 s, inside `snapshot`, before its repack. The 149 failures were the 49 members (`S 39f9173e8bf45ce8 ...`, docx XML parts from the multiformat ref) of one group whose stored bytes (`K`, 7,636 B) were gone, plus the 100 derivation records (59 `d`, 41 `D`) that read those members. A delete trace showed `apply_candidate` (from `container_candidate` unpacking a docx of the cases) deleting it. Cause: ingest indexes every stored content, groups included, so `new_template_candidate` anti-unified a new docx part with the group, recorded the group as a `fill` and dropped its stored bytes. Members read the group's stored encoding, never a derivation of it, so they were lost. `apply_candidate` kept the dictionary and "Q"/"M" contexts but not groups. Groups exist only after a repack, which is why one ingest into a fresh store was clean.
+- Change (kernel only; no format change): `apply_candidate` keeps a content's stored bytes while another stored encoding needs them (`Repo::is_needed`: any encoding whose `needs` names the id, as gc counts it: a dictionary, a group, or a "Q"/"M" context). It replaces the "Q"/"M"-only check (`is_related_base`, now used by tests only) and costs the same one store scan per drop.
+- Result: new test `tests/groups.rs` `ingest_never_drops_a_group_its_members_read` (40 small notes committed and repacked into a group, then a file shaped like the group under another ref; fsck must be clean, the group stored, every file exact, before and after a second repack): fails on main (the group is dropped and fsck is not clean), passes with the fix, 0.3 s. All kernel tests pass. The four-ingest repro now passes: every ingest prints fsck_failures=0 mismatched=0 (the fourth: 1,438 files, 233.7 MB in, 229.9 MB stored, repack applied) and the final `fsck` prints ok. Ingest and repack plans are otherwise unchanged. clippy and fmt clean.
+  - Bench (`cargo run --release --example bench -- --json`, other jobs running): all corpora exact, fsck clean; north 0.3035 (unchanged); cost score 0.2391 (E120 0.2434; timing noise under load).
+- Not settled here: `new_template_candidate` still credits a group's stored bytes it will not drop, so it can choose a template over plain bytes on a false saving (correct, but larger until the next repack). Refusing groups there needs a check cheaper than a store scan per file.
+- Verdict: **kept**, on its branch until Eric says to merge.
+
+### E124 section-reads (what a read of part of a file costs, by file type)
+- Branch / parent: exp/124-section-reads / main at d14be74 (E121)
+- Question (Eric, Nov 9: the most efficient format for I/O, query and permission, "including for targeting specific sections for specific actions relevant to the goals prompted by the user"): when a caller wants one section of a file (a 4 KiB byte range, one part of an Office file, one Markdown section), how many store objects and bytes does ikam fetch, against reading the whole file?
+- Change: harness `examples/access.rs` (a counting wrapper over the store; phases `anatomy`, `e124`, then E125 to E127 below), run on the bench corpus `tests/fixtures/cases` (1,438 files, 1,906 objects, 229 MB stored). One fix found by it: `read_range` read a stored leaf to learn that it was stored, then read it again to rebuild the range, so a 4 KiB range of a 1 MB png fetched 2.2 MB. It now asks `store.has` (`src/range.rs`). Tried and dropped: storing range lengths on container plans; docx and pptx are rebuilt whole as containers, so it saved no reads.
+- Result (fetched bytes per byte the caller wanted, medians by type):
+  - png (580 files, whole files are one object): whole 1.0; a 4 KiB range 546 before the fix, 273 after (the object is fetched once; ranges inside one object are not separately addressable).
+  - docx 31 reads for the whole file and 31 for any 4 KiB range (2.9 and 26 bytes per byte); pptx 59 and 59 (7.1 and 50): any range rebuilds the container. But each Office part is its own content id: the largest part of each of 238 Office files read alone fetched 2.76 MB, against 18.9 MB to rebuild the 238 files.
+  - Small text files (md, json, py, pdf, log) are members of group objects: 2 reads, and 8 to 140 fetched bytes per byte (md median 78). A Markdown section read alone (134 sections) fetched 1.945 MB against 1.961 MB for the files whole: sections save nothing while their file sits in a group.
+  - jsonl (24 files) is chunked: 3 reads whole and for a range, 0.22 bytes per byte whole (compressed).
+- Gates: bench exact and fsck clean on every corpus; north 0.3035 (unchanged); cost score 0.2422 against 0.2391 on E123, a timing difference (the bench ran beside the per-tenant ingests and the 10M build; no ingest, repack or whole-file read path changed).
+- Verdict: **kept** (the `read_range` fix; the measurements feed the design doc); on its branch until Eric says to merge.
+
+### E125 query-paths (point, path, range and neighbourhood queries)
+- Branch / parent: exp/124-section-reads / E124
+- Question: what do the queries a linked store answers cost in reads today, and which would an index pay for: a path lookup, a database get and range, and outgoing and incoming links?
+- Change: none to the kernel; phase `e125` of `examples/access.rs`.
+- Result:
+  - Path lookup (1,438 paths, depth up to 5): walking the trees takes a median 2 reads (max 9). A separate path index (59 objects, 62 KB, 1.8 s to build) takes 4 (max 7). No path index: the tree is already the index.
+  - Database (100,000 keys): a get reads 10 objects cold; with a cache of decoded graph chunks, 1,000 gets touch 2,400 distinct objects (2.0 MB), 2.4 reads a get instead of 9.7. A 100-key range reads 13 objects (13 KB).
+  - Links: outgoing links are 1 read (2 us). Incoming links ("what points at this file") need a scan of every object: 113,210 reads, 260 MB, 340 ms. A reverse-link view (328,942 edges, 18,356 objects, 33.9 MB, 40 s to build here from scratch) answers the same query in 8 reads, 12.8 KB, about 1 ms. (The view indexed every object in the store at that point, including the 100,000-key database built just before; over the bench store alone it holds 6,030 edges, E129.)
+- Verdict: **measurement**. Proposes a reverse-link view kept per write (option S11 in `docs/research/store-backends.md`) and a decoded-chunk cache for graph reads; no path index.
+
+### E126 permission-checks (what a permission check costs, and what crosses tenants)
+- Branch / parent: exp/124-section-reads / E124
+- Question: with each top-level case folder treated as a tenant (24 tenants), what does a read-permission check cost, which stored objects does one tenant's read touch, and what does it cost to keep tenants in separate stores?
+- Change: none to the kernel; phase `e126` of `examples/access.rs`, and a script that ingests each tenant into its own store.
+- Result:
+  - Check cost: verifying a MAC'd capability 77 ns; a set of the tenant's reachable ids (129 ids, 107 reads and 0.7 ms to build) 20 ns a check; proving a file sits under the tenant's root by its tree path 8.1 us a file (trees cached).
+  - Touch: a whole tenant read touches 105 to 203 objects; 85 to 179 are in its own tree, 17 to 24 are storage-internal (group, dictionary and delta objects), 0 to 2 are another tenant's content (identical files). 29 internal objects serve 2 or more tenants, and one 18 KB group serves all 24. So handing out storage objects, or answering "already stored" to a client, would leak across tenants; checks must sit at the file layer, where the server decodes and returns only the tenant's members.
+  - A scoped edit inside one tenant: 16 reads, 13 writes, 3.6 KB written, against a store of 127,656 objects.
+  - Separate stores: each of the 26 top-level folders ingested and repacked into its own store takes 644.1 MB in all, against 229.2 MB for the one shared store: 2.81 times. Nearly all of it is whole files that several tenants hold identically (the 1 MB diagram pngs of the l, m and xl cases: a 74 MB tenant alone is 74 MB, ratio 0.998); groups, dictionaries and deltas are a few hundred KB of it. Every store was exact with a clean fsck.
+- Verdict: **measurement**. Enforce permissions on paths and files at the server, never on storage objects; per-tenant stores only where hard isolation is required, at 2.8 times the bytes here; keeping groups, dictionaries and deltas inside a tenant would cost little, since whole-file dedup is what tenants share. Never tell a client that content was already stored.
+
+### E127 goal-reads (what a goal-scoped working set costs)
+- Branch / parent: exp/124-section-reads / E124
+- Question: when a user's goal is a few words ("invoice", "churn", "Q3"), what does it cost to find the files and sections it needs, and to hand a model only those sections?
+- Change: none to the kernel; phase `e127` of `examples/access.rs` (the existing trigram index over 550 text files, 2.0 MB; windows of the matched lines and their neighbours).
+- Result:
+  - Index: 269 KB, 237 ms to build; reading every text file instead fetches 7.3 MB in 1,147 reads.
+  - Search fetches about the matched files: "invoice" 13 files, 195 KB fetched in 2.8 ms (the 13 files whole are 184 KB); "revenue" 66 files, 1.0 MB, 12.7 ms. "Q3" has only two characters, so the trigram index can't narrow it, and the search reads every file (7.3 MB, 68 ms).
+  - Windows hand the model about 6 times fewer bytes ("invoice" 30 KB against 184 KB) but cost more fetches than the whole files without a cache (257 KB), because each window rebuilds its group again.
+  - Capabilities for the result: one id per matched file (13 for "invoice").
+- Verdict: **measurement**. Proposes a short-term index (or exact-token postings) for terms under three characters, and a per-request decoded cache so windows cost no more than their files.
+
+### E128 read-session (reads in one request share what they decode)
+- Branch / parent: exp/124-section-reads / E127
+- Question: E124 and E127 found that each read rebuilds the group, dictionary or container it needs, so reading the 2 KiB windows of a goal fetched more than reading the matched files whole, and Office files refetched the same shared groups. Does a request-scoped cache of decoded objects fix that, and what does it hold?
+- Change (kernel, no format change, nothing written): `Repo::session(limit)` returns a `ReadSession` whose `read_content` and `read_range` share one decode context, so an object decoded for one read serves the next; past `limit` decoded bytes it forgets everything after the read that crossed it. Results are checked exactly as single reads. Test `read_session_equals_plain_reads` (whole and range reads, before and after repack, limit 0 and unbounded); phase `e128` of `examples/access.rs`.
+- Result (bench corpus `tests/fixtures/cases`, 64 MiB limit):
+  - Reading all 550 text files (2.0 MB): plain 1,147 reads, 7.31 MB fetched, 43.9 ms; one session 850 reads, 5.30 MB, 33.4 ms, holding 2.0 MB.
+  - Goal windows, fetched by plain reads / by one session / for the matched files whole: invoice 257 / 166 / 184 KB; churn 460 / 198 / 248; triage 93 / 66 / 66; safety 816 / 440 / 483; revenue 1,515 / 909 / 1,007; onboarding 207 / 146 / 158; Q3 542 / 385 / 462. In a session a goal's windows always cost no more than its files whole, and hand the model about 6 times fewer bytes.
+  - 238 Office files: 18.9 MB fetched read one by one, the same with one session per file, 2.68 MB with one session for all (they share groups and dictionary blocks).
+  - All kernel tests pass.
+- Verdict: **kept** (an option for callers that read several things in one request, such as the server's goal or search endpoints; plain reads are unchanged); on its branch until Eric says to merge.
+
+### E129 needed-index (dropping a superseded copy without reading the whole store)
+- Branch / parent: exp/129-needed-index / exp/123-repack-dict-corruption (E123)
+- Question: keeping a reverse-link view (E125) current after small writes read the whole store many times over. Why, and can it be avoided without a format change?
+- Finding: trees and graph chunks are stored as content, so ingest may plan a new chunk against its previous version and drop the old stored copy. Before any drop, `apply_candidate` asks whether another stored encoding needs that copy (a group, a context, a dictionary; E123), and `is_needed` reads every stored object to answer. Measured with `examples/writes.rs` on the bench store (2,498 objects, 229 MB, in memory behind a counting wrapper): adding 66 edges to the view after a one-file commit read 38,993 objects (3.68 GB, 16 full scans).
+- Change (kernel; no format change): `Repo::needed_index` (off by default; `--needed-index` on the CLI, passed through to `ikam live`) keeps the prefixes that stored encodings name in memory, built from one pass on first use and kept current by `Repo::write` and by every write and replace in grouping and repack; `reset_projections` drops it. A stale entry (from a deleted encoding) only keeps bytes. It assumes the handle is the store's only writer while open: an encoding another process writes later is not seen. Tests: the E123 group test runs with the option off and on; `needed_index_stores_the_same_objects` (three ingests and two repacks give byte-identical stores off and on).
+- Result (view update after each write, off / on):
+  - one Markdown file: 38,993 / 632 reads, 3.68 GB / 1.9 MB, 546 / 164 ms;
+  - one file of each of 13 types: 96,038 / 2,057 reads, 7.82 GB / 5.2 MB, 1,247 / 353 ms (the write itself 240 MB / 9.8 MB fetched);
+  - a new folder of 36 files: 38,720 / 2,442 reads, 2.53 GB / 5.5 MB, 700 / 352 ms.
+  - Still O(store) on every fresh handle: the first content write builds the slice matcher's seed index from every stored object (2,966 reads, 238 MB, 1.5 to 1.8 s here). Persisting that index would be a format addition.
+  - The four ingests that found E123 (multiformat, docs, kernel src, then the
+    1,438-file cases set, into one store), run on a frozen copy of the input
+    with `--needed-index` on and off: fsck ok and 0 mismatched files both ways,
+    and the two stores hold byte-identical objects. Wall time 333.5 s on and
+    339.5 s off; the cases ingest stores 229,892,773 bytes either way.
+  - All kernel tests pass.
+- Verdict: **kept** (an option; recommended on for `ikam live`, which is the store's one writer); on its branch until Eric says to merge.
+
+### E130 cold-handle (what the first read, write and lookup on a fresh handle read)
+- Branch / parent: exp/131-seed-scope / exp/129-needed-index (E129)
+- Question: every CLI command, and every process that opens a hosted store, starts with a fresh handle. What does its first operation read, and what would a rebuildable cache save?
+- Method: `examples/cold.rs` on the cases store (1,906 objects, 229 MB, `FsStore` on local disk, warm page cache), each phase on a new handle behind a counting wrapper. 410 of its 1,438 files are stored only as derivations.
+- Result:
+  - Open, resolving a ref and reading the root tree, or reading a file stored as bytes: 0 to 3 objects, at most 40 KB, under 1 ms.
+  - The first read of a derived file, or any first `has_content`: 1,907 reads, 229 MB, one full scan, 55 to 59 ms. The derivation ledger is a projection built by reading every stored object. The second read on the same handle: 1 read, 14 KB, 0.4 ms.
+  - The first content write: the ledger (2,384 reads, 240 MB, 89 ms in memory), then the matcher's seed index (4,194 reads, 265 MB, 2.0 s). The second write: 4 reads, 0.5 ms.
+  - A ledger cache, estimated outside the kernel: the store's 420 derivation records, length-prefixed in one file, are 159 KB and load in 0.1 ms (one read). That is 1,400 times fewer bytes than the scan, and one request instead of 1,906 on a remote store. The seed index cannot be cached the same way: about one anchor per 64 bytes of content, so near the size of the store.
+  - Not measured: a cold disk on the Mac, and R2 latency per request (1,906 GETs per cold open; at $0.36 per million that is $0.0007, but the time is one round trip per object unless they are batched).
+- Verdict: **kept** (a measurement; no kernel change). A ledger cache file would be an on-disk addition, so it waits on Eric. Until then, long-lived handles (`ikam serve`, `ikam live`) pay the scan once per process.
+
+### E131 seed-scope (bound where new content looks for repeats)
+- Branch / parent: exp/131-seed-scope / exp/129-needed-index (E129)
+- Question: the first write on a handle reads the whole store to build the matcher's seed index (E129, E130), and new content may be built from any stored bytes, other tenants' included (E126). Can the caller bound where it looks, and what does that cost in stored bytes?
+- Change (kernel; no format change): `Repo::seed_scope` (`None` by default, the whole store, as before). `Some(roots)` builds the seed index only from those contents and what they are derived from (the derivation closure); content written through the handle joins the index either way. Tests (`tests/scope.rs`): a scoped index uses repeats only inside its scope, reads back exactly, fsck clean; an empty scope stores plain bytes.
+- Method: `examples/seeds.rs` on the cases store copied into memory, a new handle per case and scope, the ledger built first so the numbers are the seed index and the writes alone. Scopes: the whole store; the files of the tree; the top-level folders written to; those plus the folders the edits came from; empty.
+- Result (reads, bytes fetched, ms, bytes written):
+  - one Markdown file edited: whole store 2,980 reads, 238 MB, 1,697 ms, 137 B; folders written to 165 reads, 690 KB, 8.8 ms, 137 B.
+  - one file of each of 13 types edited: whole store 3,344 reads, 247 MB, 1,627 ms, 16,176 B; files of the tree 2,749, 247 MB, 1,578 ms, 2,953 B; folders written to 758 reads, 85 MB, 541 ms, 2,914 B; empty 125 reads, 0.4 MB, 67 ms, 1,088,168 B.
+  - a folder of 36 files copied to a new folder: whole store 4,143 reads, 243 MB, 1,639 ms, 21,817 B; folders written to (the new folder, so nothing) 556 reads, 0.8 MB, 104 ms, 13,096 B; folders written to and read from 1,229 reads, 4.1 MB, 120 ms, 8,478 B.
+  - A narrower scope stored fewer bytes, not more, in two of three cases: the matcher keeps 4 candidates per seed, and on the whole store those slots fill with other copies before the best source. Only the empty scope lost (1.09 MB against 2.9 KB).
+  - Isolation is partial: identical content is one object whatever the scope (content addressing), and container members and groups are found by id, not by seeds. With the empty scope 92 and 141 derivation arguments still named content from before the handle. So the scope bounds near-match reuse; permission checks still belong at the file layer (E126).
+  - All kernel tests pass.
+- Verdict: **kept** (an option; for `ikam live` and `serve`, scope a write to the folders it touches plus where its bytes came from, when the caller knows); on its branch until Eric says to merge.
+
+### E132 short-search (one- and two-byte terms through the trigram index)
+- Branch / parent: exp/132-short-search / exp/131-seed-scope (E131)
+- Question: a goal of a few words often holds a two-letter term ("Q3", "AI", "EU"). E127 found the trigram index can't narrow those, so every search for one read every file. Can the existing index answer them, with no new structure?
+- Change (kernel; no format change, no option): `Repo::search` with a trigram index and a pattern of one or two bytes takes the union of the posting lists of every trigram that contains the pattern, plus the contents in no posting list (those shorter than three bytes, which have no trigrams). Every occurrence of a short pattern in a content of three bytes or more lies inside one of its trigrams, so the candidates are exactly the contents that hold it; each is still decoded and scanned as before. Tests (`tests/search_short.rs`): results equal a scan for every one- and two-byte pattern over a small alphabet, with contents of 0 to 7 bytes, and for hand-picked cases. The chunk index (E089, E094) still scans every chunk for these patterns.
+- Method: `examples/short.rs` on the cases store copied into memory, 526 text files (832 KB decoded, 7.1 MB fetched to scan them all, since most sit in groups); trigram index 393 KB, built in 1.9 s. Indexed numbers include loading the index on each query.
+- Result (scan / indexed; fetched, ms):
+  - "Q3" (26 files): 7.1 MB / 0.70 MB, 40.1 / 12.6 ms; "AI" (7): 7.1 / 0.34 MB, 44.5 / 9.0 ms; "EU" (8): 7.1 / 0.39 MB, 41.5 / 8.8 ms.
+  - One byte: "%" (83 files) 7.1 / 1.4 MB, 38.3 / 15.7 ms; "x" (230 files) 7.1 / 3.3 MB, 40.3 / 29.5 ms.
+  - Unchanged paths for comparison: "invoice" (13) 0.44 MB, 6.2 ms; "Q3 revenue" (0) 0.26 MB, 4.6 ms.
+  - Results equal the scan's for every query. All kernel tests pass.
+- Verdict: **kept** (no trade-off, so built in rather than an option); on its branch until Eric says to merge.
+
+### E133 goal-pipeline (one goal end to end, defaults against the recommended options)
+- Branch / parent: exp/133-goal-pipeline / exp/132-short-search, with exp/124-section-reads merged in for read sessions (E128)
+- Question: E124 to E132 each measured one stage. What does a whole goal cost, from a few words to a committed edit with its view current, with today's defaults and with the options they recommend together?
+- Method: `examples/goal.rs` on the cases store (2,277 objects after setup) copied into memory. Setup, not measured: a trigram index over its 550 text files and a reverse-link view over every object (E125). The goal: search a short term ("Q3"), hand a model the lines within two of each mention, change the term in five of the matched files, commit, update the view. Each configuration runs on a fresh handle, then a second goal ("AI") on the same handle. Defaults: no index at query time, plain reads, the whole store as seed scope, `needed_index` off. Recommended: the index (E132 for the short term), one read session per goal (E128), `needed_index` on (E129), and `seed_scope` set per goal to the edited files' folders plus the view's chunks and the trees on the edited paths (E131, `set_seed_scope`).
+- Change (kernel; no format change): two fixes to `seed_scope` that this run found. A tree or graph chunk named in a scope now stands for the content holding its encoding and that content's derivation closure: without that, view chunks could not repeat their previous versions and one view update stored 404 KB instead of 237 KB (whole store: 227 KB). And `Repo::set_seed_scope` changes the scope and drops the seed index, so one handle can serve goals in different folders. Tests: `set_seed_scope_rebuilds_the_index`, `a_scoped_tree_lets_its_next_version_repeat_it`.
+- Result (whole goal: fetched, ms, bytes written; the first goal includes the fresh handle's ledger build, 230 MB and 33 ms, in both):
+  - First goal ("Q3", 27 files matched, 16.7 KB to the model from 347 KB of files): defaults 9.22 GB, 2,896 ms, 241 KB written; recommended 554 MB, 871 ms, 251 KB.
+  - Second goal on the same handle ("AI", 8 files, 11.9 KB to the model): defaults 932 MB, 344 ms, 79.5 KB; recommended 6.3 MB, 214 ms, 78.3 KB. That is 148 times fewer bytes fetched.
+  - By stage, first goal, defaults / recommended: search 7.3 / 0.73 MB; read 462 / 385 KB; edit and commit 240 / 89 MB (1,684 / 532 ms); view update 8.75 GB in 38 scans / 234 MB in one (the needed index's first pass).
+  - What the recommended first goal still reads is two one-pass projections a fresh handle builds, the ledger (230 MB) and the needed index (234 MB), plus the scoped seed index (89 MB). The ledger cache in E130 would remove the first; the other two are once per handle.
+  - The scope's price: 4% more bytes written on the first goal (251 against 241 KB). Without the view's chunks in scope, view updates stored 1.7 to 4 times more (404 and 308 KB).
+  - fsck clean after every configuration. All kernel tests pass. Fixed bench: the same stored bytes; kernel op times within 5% of E132's (the cost ratio moved from 0.2655 to 0.3168 because the baseline's own ingest ran faster, 35.4 against 28.1 ms).
+- Verdict: **kept** (a measurement, and two fixes to the E131 option); on its branch until Eric says to merge.
+
+### E134 one-pass (a fresh handle's projections from one read of the store)
+- Branch / parent: exp/134-one-pass / exp/133-goal-pipeline (E133)
+- Question: E133's recommended first goal still read the store twice: once to build the derivation ledger (any first lookup) and once more for the needed index (E129) on the first write that could drop a copy. Both read every stored encoding. Can one pass build both?
+- Change (kernel; no format change): when `needed_index` is on and its set isn't built yet, the ledger's pass over every stored object also feeds the needed index, and installs it if nothing built it meanwhile. Writes after that keep it current as before (`note_needs`).
+- Result (`examples/goal.rs`, same setup as E133, recommended configuration):
+  - First goal on a fresh handle: 554 MB to 324 MB fetched, 871 to 851 ms; the view update alone 234 MB in one scan to 3.9 MB in none. Bytes written the same (250,630).
+  - Next goal on the same handle: unchanged (6.3 MB).
+  - What the first goal still reads: the ledger's pass (230 MB) and the scoped seed index (89 MB).
+  - Four-ingest safety check on frozen input, needed_index on and off: fsck_failures=0 and mismatched=0 on every ingest, fsck ok in both modes, objects identical.
+  - All kernel tests pass. Fixed bench: every stored-bytes figure the same as E133's; timings within run-to-run noise (score 0.2433 to 0.2401).
+- Verdict: **kept**; on its branch until Eric says to merge.
+
+### E135 head-reads (the projection pass reads each object's header, not its bytes)
+- Branch / parent: exp/135-head-reads / exp/134-one-pass (E134)
+- Question: after E134 a fresh handle still fetches every stored byte once (229 MB on the cases store) to build the derivation ledger and the needed index. Both look only at an encoding's first bytes (its tag, mode, dictionary or group reference, or context ids), except derivation records, which are small. Can the pass fetch just those bytes?
+- Change (kernel; no format change): `Store::read_head(id, n)`, the first n bytes of a stored encoding. The default reads the whole object and cuts it, so every store keeps working; `FsStore` reads only n bytes of the file and `MemStore` copies only n. The ledger's pass reads 256-byte heads; a derivation record shorter than that is already whole, and a longer one is read again in full.
+- Result (`examples/heads.rs` on the cases store, 1,906 objects, page cache warm, two runs):
+  - First lookup on a fresh handle: 229.2 MB to 192 KB fetched, 60 to 22 ms, the same 1,921 requests (no derivation record needed a second read). The same with `needed_index` on.
+  - Every file's derivations match between whole and partial reads.
+  - End to end (`examples/goal.rs`, as in E133 and E134): the recommended first goal fetches 94 MB, down from 324 MB (554 MB before E134, 9.22 GB with defaults); the same 250,630 bytes written. What it still reads is the scoped seed index (89 MB).
+  - A store that can't read part of an object (the default) behaves exactly as before. On R2 a head is a Range GET: same request count, about 1,000 times fewer bytes.
+  - The second goal's view update wrote 75,465 bytes here, 75,501 in E134 and 75,467 in E133: that varies from run to run because the scoped seed index adds content in hash-set order (E131). E136 looks at it.
+  - Four-ingest safety check on frozen input: fsck_failures=0 and mismatched=0 on every ingest, fsck ok, objects identical with needed_index on and off and identical to E134's store.
+  - All kernel tests pass, plus `tests/heads.rs` (heads are prefixes of reads on both stores; a reopened `FsStore` finds the same derivations as the handle that wrote them).
+- Verdict: **kept**; on its branch until Eric says to merge.
+
+### E136 seed-order (the same objects give the same encodings in every run and on every filesystem)
+- Branch / parent: exp/136-seed-order / exp/135-head-reads (E135)
+- Question: E133 to E135 each wrote a different number of bytes for the second goal's view update (75,467, 75,501 and 75,465) from the same store and the same edits. Where does the variation come from, and can it go?
+- Cause: the matcher keeps at most four candidate sources per seed, the first ones added, so the order the seed index is built in picks among equal sources. The scoped index (E131, E133) added a tree's content closure from a hash set, whose order changes from run to run. The whole-store index and every other pass over `FsStore::ids` follow directory order, which on ext4 depends on a per-filesystem hash seed and on APFS is sorted, so the same writes could store different encodings on Eric's Mac than here. Content ids never change; only which equal encoding is stored.
+- Change (kernel; no format change): `FsStore::ids` and `ids_with_prefix` return ids sorted, as `MemStore` already does, and the seed index sorts its input and each closure it adds.
+- Result:
+  - `examples/goal.rs` run twice: every stage writes the same bytes in both runs (second goal's view update 75,433 bytes in both).
+  - Four-ingest safety check on frozen input: fsck_failures=0 and mismatched=0 on every ingest, fsck ok, objects identical with needed_index on and off and identical to E135's store (here, sorting the listings changed no encoding).
+  - Fixed bench: every stored-bytes figure the same as E134's; timings within noise (score 0.2401 to 0.2472).
+  - Sorting costs one sort of the id list per listing, well under a millisecond for the 1,906 ids of the cases store (estimated, not timed separately).
+  - All kernel tests pass, plus `tests/order.rs`: file-store listings come in id order (fails without the change), and the same writes store the same bytes in a file store as in a memory store (a guard; it also passed before).
+- Verdict: **kept**; on its branch until Eric says to merge.
+
+### E137 file-scope (a goal's repeats looked for only in the files it touches)
+- Branch / parent: exp/137-file-scope / exp/136-seed-order (E136)
+- Question: after E135 the recommended first goal from E133 still fetches 94 MB, and 89 MB of it is the seed index for the edited files' whole top-level folders. Does a scope of only the files the goal edits (plus the trees and view chunks it replaces, as E133 found it needs) lose any repeats?
+- Change: none in the kernel. `examples/goal.rs` gains a configuration, `recommended_scope_edited_files`, that sets `seed_scope` to the five edited files, the view's chunks and the trees.
+- Result (cases store, same goals as E133):
+  - First goal on a fresh handle: 94.0 MB / 797 ms to 7.7 MB / 318 ms; the edit-and-commit stage 88.7 MB / 506 ms to 2.5 MB / 28 ms. Bytes written 250,379 against 250,630: a little less, not more.
+  - Next goal on the same handle: 6.3 MB to 5.7 MB; 78,086 bytes written against 78,298.
+  - The edits here only change existing files, whose old versions are in the scope. A goal that writes new files from others it read (E131's folder copy) needs those sources in the scope too, so the rule is: what the goal reads and edits, not where it lives.
+  - What the first goal now reads: search 0.73 MB, the model's windows 0.39 MB, edits 2.5 MB, view update 3.9 MB, the projections 0.25 MB.
+  - No kernel change, so the safety check and the fixed bench are E136's.
+- Verdict: **kept** as the recommended scope (in `options.md`); on its branch until Eric says to merge.
+
+### E138 read-memo (an edit reads each old chunk once)
+- Branch / parent: exp/138-view-update / exp/137-file-scope (E137)
+- Question: after E137 the biggest part of a goal is the view update: 3.8 MB and 1,337 reads to add 214 reverse links on the first goal. Only 317 of those objects are distinct; 168 are read more than once, 993 reads are repeats. Where do they come from, and can they go without changing what is stored?
+- Cause: each graph chunk (and tree) an edit writes is stored as content, so the matcher looks for repeats of it among the old chunks near it, reads each candidate, and reads it again to verify the derivation it proposes. The next new chunk does the same with mostly the same neighbours. A first try, sharing one rebuild context across the edit's chunk reads, removed only 13 of the 993: the repeats are on the write side.
+- Change (kernel; no format change): `Repo::read_memo`, off by default (`--read-memo` on the command line). On, `graph_edit_with`, `edit_tree` and `put_content` keep the contents they read (up to 64 MB) until they return, and the matcher and every rebuild look there first. Only contents stored as bytes and checked against their id are kept, a kept copy whose stored object is dropped during the edit reads as it would without the memo, and evaluation work is counted as before, so plans are chosen exactly as without it.
+- Result (`examples/goal.rs`, cases store, same goals as E133, new config `recommended_read_memo` = E137's recommended plus the memo):
+  - First goal's view update: 3.85 MB / 1,337 reads to 1.01 MB / 446 reads; repeats 993 to 102. Edit and commit: 2.46 MB to 2.08 MB. The same 236,561 and 13,818 bytes written.
+  - Next goal's view update: 3.16 MB to 0.80 MB; the same 75,221 bytes written.
+  - Whole first goal on a fresh handle: 7.7 MB to 4.5 MB fetched; next goal 5.7 MB to 3.3 MB. Time is unchanged (within noise): this store is in memory, so the gain is in bytes and requests, which is what a file or R2 store pays for.
+  - Four-ingest safety check on frozen input with `--needed-index --read-memo`: fsck_failures=0 and mismatched=0 on every ingest, fsck ok, objects identical to E136's store (needed index on, memo off).
+  - Fixed bench (memo off, the default): every stored-bytes figure the same as E136's; score 0.2472 to 0.2399, timing noise.
+  - `examples/goal.rs` also gains an `edit_reads` line (E139: what the first write of a goal reads) and `GOAL_FS=<dir>` to run on a file store.
+  - All kernel tests pass, plus `tests/memo.rs`: a view and a tree edited with the memo on and off store identical objects with fewer reads on; nothing is kept once an edit returns.
+- Verdict: **kept**; on its branch until Eric says to merge.
+
+### E139 file-store (the recommended setup end to end on files and on packs)
+- Branch / parent: exp/139-file-store / exp/138-view-update (E138), with exp/122-store-bakeoff merged in, so this one branch holds every experiment branch since E122.
+- Question: E133 to E138 ran the goal on a store held in memory. What does the recommended setup cost on a real store, files or packs, and what is left?
+- Change: `PackStore::read_head` reads only the first bytes of a record (E122's packs had only the default, a whole read cut short), with a test that heads are prefixes of reads from the write buffer, from the open pack and after a reopen. `examples/goal.rs` runs on a file store with `GOAL_FS=<dir>`, on packs with `GOAL_STORE=pack` too, and counts objects written per stage. Kernel defaults unchanged.
+- Result (cases store, page cache warm, goals as in E133; recommended = E137's scope plus E138's memo):
+  - First goal on a fresh handle, recommended: 4.5 MB fetched in all three; 735 ms on files, 351 ms on packs, 291 ms in memory. Defaults: 9.0 GB, 4.1 s on files, 3.4 s on packs.
+  - Next goal: 3.3 MB; 421 ms on files, 186 ms on packs, 202 ms in memory.
+  - On files the view update is most of the time (629 of 735 ms): it writes 425 objects for 214 links, and `FsStore` syncs each one. Packs sync twice per ref move whatever the count, so the same update takes 285 ms.
+  - Same bytes written on every store (250,379 and 78,086); the fresh handle's lookup fetches 246 KB of heads on each.
+  - Here each object written costs `FsStore` about 0.9 ms (create, sync, rename: 629 against 237 ms in memory for 425 objects). On macOS, Rust's `sync_all` is a full flush to the drive (`F_FULLFSYNC`), usually milliseconds, so the gap between files and packs should be wider on Eric's Mac: to measure there.
+  - The fixed bench on this branch: every byte count and the north score (0.3035) as on E138; cost score 0.2435 against 0.2399, from timings and repack peak memory only.
+  - All kernel tests pass, plus `tests/backends.rs` (pack heads).
+- Verdict: **kept**; on its branch until Eric says to merge.
+
+### E140 section-grants (what one goal may read and change, by byte range)
+- Branch / parent: exp/140-section-grants / exp/139-file-store (E139)
+- Question (Eric, Nov 9: permission "including for targeting specific sections for specific actions relevant to the goals prompted by the user"): E126 put permission checks at the file layer. Can a grant name sections of files instead, the lines a goal needs, for reading and for changing, and what does checking it cost?
+- Change: `src/grant.rs`, a new API that stores nothing and changes no format. A `Grant` names, for one goal, file versions (path and content id) with read ranges and write ranges; `windows_around` builds the lines within two of each mention; `FileGrant::read` hands out only the granted ranges through range reads; `check_edit` finds what an edit changes in the old version (one region, aligned both ways for repeated bytes, else changed lines narrowed to their bytes) and allows it only when every region sits inside a write range and the old version is the granted one; `seal` and `verify` are a keyed BLAKE3 tag over a canonical encoding. Tests in `tests/grant.rs`; harness `examples/grants.rs` on the cases store, recommended setup, new handle.
+- Result (goals as in E133; a file-level grant, E126, names the same paths whole):
+  - Exposure: "Q3" matches 27 files (347 KB); its grant is 33 sections, 16.7 KB (4.8%). "AI": 8 files (79.6 KB), 13 sections, 11.9 KB (15%).
+  - I/O: reading the granted sections fetches the same as reading the files whole (59 reads, 385 KB for Q3; 13 reads, 82 KB for AI; the new handle's first lookup, 192 KB of heads, apart). These text files are members of groups, which decode whole (E124), so sections cut what the caller sees, not what the store fetches.
+  - Checks: a read check 14 to 22 ns; an edit check 14 to 20 us for the goal's edit (every mention replaced), 18 to 33 us to refuse an edit with a line outside the windows; another version or an ungranted file is refused in under 0.1 us. Sealing or verifying a grant 1.5 us (1.2 KB) to 3.2 us (3.7 KB).
+  - What each grant allowed, over both goals (35 files): the goal's edit 35 of 35 under both; a line changed outside the windows, alone or with the goal's edit, 0 of 70 under the section grant against 70 of 70 under the file grant; an edit of a version the grant does not name 0 of 35 against 35 (a file grant names paths, not versions); a file not granted 0 under both.
+  - All kernel tests pass.
+  - The fixed bench on this branch: every byte count and the north score (0.3035) as on E139; cost score 0.2441 against 0.2435, from timings only.
+- Verdict: **kept**; on its branch until Eric says to merge. A server option: grants per goal, checked at the file layer as E126 says; the format is unchanged.
+
+### E141 replace-hints (a goal's scope names only its files; old chunks join the index as an edit reads them)
+- Branch / parent: exp/141-replace-hints / exp/140-section-grants (E140)
+- Question: with E137's scope and E138's memo, the first write of a goal still built a seed index over the edited files plus every tree and view chunk (1.78 MB in 1,125 reads of the 2.08 MB edit stage, E139). A new tree or chunk repeats the ones it replaces, and the edit reads exactly those. Can the scope name only the files, and the edit add what it reads?
+- Change: `Repo::replace_hints` (off by default; a library option, since the CLI sets no scope). With a `seed_scope` set, `graph_edit_with` and `edit_tree` note each old tree or chunk content they read, and before each new tree or chunk is stored the noted contents join the seed index through the stored contents they are made of (as `ensure_index` indexes a scope). `examples/goal.rs` config `recommended_replace_hints`: scope of the edited files only, memo and hints on. Tests in `tests/hints.rs`: with hints a narrow scope stores what a whole-store index stores (4,205 bytes against 24,139 without hints), with fewer reads; without a scope hints change nothing.
+- Result (cases store, goals as in E133, against E138's `recommended_read_memo`, first lookup's 246 KB of heads apart):
+  - First goal: 4.21 MB in 1,757 reads to 2.50 MB in 625; the edit stage 2.08 MB to 0.48 MB (its first write 1.78 MB in 1,125 reads to 189 KB in 28); the view update 1.01 MB to 0.91 MB.
+  - Next goal: 3.26 MB in 1,847 reads to 1.23 MB in 394 (edit 2.01 MB to 0.15 MB, view 0.80 MB to 0.63 MB).
+  - Bytes written: 250,171 against 250,379 and 77,762 against 78,086 (the index holds fewer competing candidates); the same in two runs, so the order stays fixed (E136).
+  - Time: about the same (on files 608 against 621 ms for the first goal, on packs 308 against 309 ms): what is left is the view update's syncs on files and its matching work.
+  - All kernel tests pass.
+  - The fixed bench on this branch: every byte count and the north score (0.3035) as on E140; cost score 0.2450 against 0.2441, from timings only (the bench does not set replace_hints).
+- Verdict: **kept**; on its branch until Eric says to merge. Recommended with a scope; the format is unchanged.
+
+### E142 session-search (a goal's search and its reads share one session)
+- Branch / parent: exp/142-session-search / exp/141-replace-hints (E141)
+- Question: after E141 the read stage still fetched what the search had just decoded (Q3: 59 reads, 385 KB), because `search` keeps no decodes between candidates and the read stage opens its own session. Can one session serve both?
+- Change: `ReadSession::search` runs the search inside the session (`Repo::search_in`): the scan keeps decodes in the session's known set up to its limit instead of clearing them per candidate. `Repo::search` is unchanged (it calls `search_in` with a fresh context and clears per candidate, as before). `examples/goal.rs` config `recommended_shared_session`: E141's setup with one session for the search and the read stage, and a line for the search index load. Tests in `tests/session_search.rs`: the session's hits equal plain search's, reads of the hits then cost no store reads, and a 16-byte limit still finds the same hits.
+- Result (cases store, goals as in E133, against E141's `recommended_replace_hints`, first lookup's 246 KB of heads apart):
+  - First goal: 2.50 MB in 625 reads to 2.04 MB in 554; search 731 KB to 655 KB (repeats within the scan now hit the session); read 385 KB to nothing.
+  - Next goal: 1.23 MB in 394 reads to 1.14 MB in 379; search 363 KB to 351 KB; read 82 KB to nothing.
+  - Of each search, 269 KB in one read is loading the search index; a server that keeps it loaded across goals would bring the goals to about 1.77 MB and 0.87 MB.
+  - Bytes written, edit and view update: the same.
+  - What is left: the view update (906 KB and 632 KB, mostly view chunks it reads to place new edges) and the edit (477 KB and 154 KB).
+  - All kernel tests pass (164).
+  - The fixed bench on this branch: every byte count and the north score (0.3035) as on E141; cost score 0.2280 against 0.2450, from timings only (the bench ran beside goal runs; it does not search through a session).
+- Verdict: **kept**; on its branch until Eric says to merge. A library API; nothing stored changes.
+
+### E143 template-memo (a template candidate reuses the bytes the template search just read)
+- Branch / parent: exp/143-template-memo / exp/142-session-search (E142)
+- Question: E142's view update still read 102 objects twice in one edit (Q3), with `read_memo` on. Where from?
+- Finding: a stack trace of every repeated read during the view update (183 over both goals) put all of them in `new_template_candidate`: `template_candidates` reads each similar chunk as a possible template through `read_content` (which keeps it in the memo), then `new_template_candidate` reads the same chunk's stored copy again to try it as the content a fill would replace, without asking the memo.
+- Change: the memo also keeps the length of each kept content's stored encoding (all a template candidate needs besides the bytes, for its cost), and `new_template_candidate` takes both from the memo when they are there, and keeps what it reads otherwise. Off when `read_memo` is off; nothing stored changes. Test in `tests/template_memo.rs`: with the memo a put reads every object once, without it the template is read twice, and both store the same objects byte for byte. `examples/goal.rs` takes `IKAM_CONFIG=name` to run one configuration.
+- Result (cases store, goals as in E133, E142's `recommended_shared_session`, first lookup's 246 KB of heads apart):
+  - First goal: 2.04 MB in 554 reads to 1.59 MB in 441; the view update 906 KB to 522 KB (no object read twice), the edit 477 KB to 414 KB.
+  - Next goal: 1.14 MB in 379 reads to 0.78 MB in 288; view update 632 KB to 327 KB, edit 154 KB to 102 KB.
+  - Every configuration with the memo gains about as much (E141's 2.50 to 2.05 MB; E138's 4.21 to 3.76 MB); every configuration without it reads and writes exactly as before.
+  - Bytes written: the same in every configuration (250,171 and 77,762 for the recommended setup).
+  - What is left of the view update: first reads of the similar chunks a new chunk is compared with (154 reads, 476 KB for Q3).
+  - All kernel tests pass (165).
+  - The fixed bench on this branch: every byte count and the north score (0.3035) as on E142; cost score 0.2427 against 0.2280, from timings only (the bench does not set read_memo).
+- Verdict: **kept**; on its branch until Eric says to merge. Part of `read_memo`; the format is unchanged.
+
+### E144 object-templates (tree and view chunks planned only as slices)
+- Branch / parent: exp/144-object-templates / exp/143-template-memo (E143)
+- Question: after E143 the view update was still the largest stage, and it wrote 236 KB for a goal whose store grew by 76 KB. Where do the other bytes go?
+- Finding: a new tree or view chunk is also tried as a fill of a template, and a template plan replaces the old similar chunk too (it stores the template, both fillers and two fills, and removes the old stored copy). Its cost counts only the net change, so it wins while writing three times what it saves, rewrites stored objects an edit did not change, and needs reads of the similar chunks to try.
+- Change: `Repo::object_templates` (on by default, as before). Off, a stored tree or graph chunk is planned only as slices of earlier content (or stored plain); other content keeps template plans. `examples/goal.rs` config `recommended_no_object_templates` (E143's setup with it off) and a `net_growth` field on the view update (stored bytes added less bytes removed or replaced). Test in `tests/object_templates.rs`: four rounds of view and tree edits give the same roots with it on and off; off, no stored object is rewritten or removed, and fewer bytes are written.
+- Result (cases store, goals as in E133, against E143's `recommended_shared_session`):
+  - First goal: bytes written 250,171 to 85,734 (view update 236,353 to 71,916); the store grows by 71,916 against 75,944, so less space as well; objects written 425 to 308 in the view update; reads 1.59 MB to 1.48 MB.
+  - Next goal: written 77,762 to 57,826; growth 54,961 against 57,971; reads 781 KB to 794 KB (2% more: one slice plan fetches a little more than the template plan it replaces).
+  - Time, first goal: in memory 297 to 144 ms, on packs 332 to 159 ms, on one file per object 598 to 394 ms; next goal on packs 205 to 130 ms, on files 336 to 283 ms.
+  - With it off, an edit only adds objects: nothing stored is rewritten or removed until a repack.
+  - Configurations with it on read and write exactly as before. Not measured on the fixed bench's corpora, since the bench keeps the default.
+  - All kernel tests pass (166).
+  - The fixed bench on this branch: every byte count and the north score (0.3035) as on E143; cost score 0.2356 against 0.2427, from timings only (the bench keeps object_templates on).
+- Verdict: **kept**; on its branch until Eric says to merge. Recommended off for a service that edits trees and views; the format is unchanged.
+
+### E145 write-batch (a goal's writes share one memo, handed the files it read)
+- Branch / parent: exp/145-write-batch / exp/144-object-templates (E144)
+- Question: after E144 the edit stage still fetched 414 KB for five one-word edits (Q3): the first put builds the seed index by reading the edited files, each later put reads its old version again for its plan, and all five files had just been decoded by the goal's read session. Can a goal's writes share what was read?
+- Change: with `read_memo` on, building the seed index keeps what it reads in the memo of the write in progress. `Repo::begin_batch` / `end_batch` run several writes (puts, a tree edit, a view update) as one edit, so what any of them reads is kept until the batch ends. `Repo::keep_read(id, bytes)` hands a batch bytes the caller already holds; they are kept only inside a batch, only if they hash to `id` and `id` is stored. `ReadSession::into_contents` gives back what a session decoded. `examples/goal.rs` config `recommended_batch`: E144's setup with the edit stage and view update in one batch, handed the read session's files. Tests in `tests/batch.rs`: a batch reads less and stores the same objects, handed bytes take each write down to one read (the stored length a template plan's cost needs), and wrong bytes or bytes outside a batch are ignored.
+- Result (cases store, goals as in E133, against E144's `recommended_no_object_templates`, first lookup's 246 KB of heads apart):
+  - The index-build memo alone: every configuration with the memo reads 80 KB less on the first goal and 18 KB less on the next (E144's setup 1.48 to 1.40 MB), with the same bytes written.
+  - With the batch: first goal 1.48 MB in 391 reads to 1.13 MB in 338; the edit stage 414 KB to 70 KB. Next goal 794 KB in 288 reads to 744 KB in 277; edit 102 KB to 53 KB.
+  - Time, first goal: in memory 144 to 136 ms, on packs 159 to 143 ms, on files 394 to 311 ms.
+  - Bytes written and the store's growth: the same in every configuration.
+  - Left in the edit: one read per edited file for its stored length (a store call for an object's length would remove it, an API addition) and the tree edit's own reads.
+  - All kernel tests pass (168).
+  - The fixed bench on this branch: every byte count and the north score (0.3035) as on E144; cost score 0.2443 against 0.2356, from timings only (the bench does not run batches).
+- Verdict: **kept**; on its branch until Eric says to merge. Library API, used by a server's goal loop; nothing stored changes.
+
+### E146 plain-object-chunks (tree and view chunks stored plain)
+- Question: after E145 the view update reads about 405 KB on E133's first goal, mostly old view chunks and the sources that derived chunks would be built from. Would storing tree and view chunks plain (no slice or template plans) read less?
+- Change: a temporary switch in `put_content` for chunks written by `write()` (tag t or g), measured on `recommended_batch` and taken out again; no code is kept.
+- Result (first goal, view update): reads 405 KB to 393 KB (3% fewer); bytes written 72 KB to 391 KB; in memory 125 ms to 53 ms.
+- Verdict: **discarded** (five times the writes and the store's growth for 3% fewer reads). Nothing on a branch; the row records the measurement.
+
+### E147 stored-len (an object's stored length without reading it)
+- Question: E145 left one read per edited file in the edit stage: a template plan's cost needs the old chunk's stored length, and bytes handed to a batch carry none. Can the store say how long an object is without returning it?
+- Change: `Store::stored_len(id)`, a provided method that reads by default; MemStore answers from its map, FsStore from the file's metadata, PackStore from its index entry (a deleted entry is not found). A template plan whose old chunk's bytes are in the memo without a length asks the store; an error falls back to reading. `examples/goal.rs` forwards it through its counting store. `tests/backends.rs` checks the length on every backend, after a replace and after a delete; `tests/batch.rs` now asserts that a batch handed the files reads nothing in its writes.
+- Result (cases store, `recommended_batch`, against E145):
+  - First goal (Q3): edit stage 69.8 KB in 18 reads to 7.7 KB in 8; the goal 1.13 MB to 1.07 MB (1.31 MB with the first lookup's 246 KB of heads).
+  - Next goal (AI): edit stage 53.2 KB in 15 reads to 2.3 KB in 6; the goal 744 KB to 693 KB.
+  - Other configurations, the view update and bytes written: unchanged.
+  - Time: within run-to-run spread. Five interleaved runs on packs, first goal: E145 143 to 186 ms (median 150), E147 143 to 170 ms (median 157). On files 338 to 372 ms against 381 to 429 ms over two and three runs, all of it in the view update, whose reads and writes did not change.
+  - All kernel tests pass (168). The HTTP limits test failed once while the full suite ran beside a goal run, and passed alone three times and in the next full run.
+  - The fixed bench on this branch: every byte count and the north score (0.3035) as on E145; cost score 0.2387 against 0.2443, from timings only (the bench does not run batches).
+- Verdict: **kept**; on its branch until Eric says to merge. A store API addition with a default, so any backend works unchanged; nothing stored changes.
+
+### E148 pending-view (a view's new edges kept pending, folded every few goals)
+- Question: after E147 the view update is most of a goal: on E133's first goal it reads 405 KB (100 view chunks of about 3.6 KB and their path) to add 214 reverse edges, which land all over the view because the view is keyed by target id. Smaller view chunks first (measured with a temporary switch, not kept): 2-16 KB, 1-8 KB and 0.5-4 KB chunks read 374, 364 and 349 KB but write 81, 117 and 140 KB against 72 KB, grow the ledger's heads from 246 to 286, 351 and 456 KB, and take longer. Can the view be updated less often instead, log-structured?
+- Change: `Repo::graph_prefix_pending` and `graph_node_pending`: lookups over a stored graph plus a map of pending edits (set or drop a label), giving what `graph_edit` of those edits would give, without writing it. Folding is the existing `graph_edit_with`. `examples/goal.rs` config `recommended_deferred_view`: E147's batch setup, with each goal's new reverse edges kept pending and folded once after the last goal; after each goal it looks up who links to each edited file's old version, through the pending edges. `tests/pending.rs`: over six rounds of random sets and drops, prefix and label lookups through pending edits equal lookups on the eagerly edited graph, and one fold gives the same root.
+- Result (cases store, against `recommended_batch`):
+  - View update per goal: first goal 405 KB in 260 reads to 22 KB in 26 (finding the new edges; nothing written), next goal 339 KB to 4.6 KB. The fold after both goals: 445 KB read, 96 KB written, against 744 KB and 127 KB for the two eager updates. The final view's root is the same.
+  - The goals: first 1.07 MB to 684 KB, next 693 KB to 358 KB (search index load included, first lookup's heads apart).
+  - Reverse lookups for the five edited files: the same 33 and 17 links; 51 KB and 50 KB read against 89 KB and 95 KB.
+  - Time, medians of three runs: on packs the first goal 150 to 37 ms, the next 112 to 26 ms, the fold 159 ms; on files 368 to 48 ms, 290 to 35 ms, the fold 434 ms.
+  - All kernel tests pass (169).
+  - The fixed bench on this branch: every byte count and the north score (0.3035) as on E147; cost score 0.2407 against 0.2387, from timings only (the bench does not keep views pending).
+- Verdict: **kept**; on its branch until Eric says to merge. Library API for a server, which keeps the pending edges in memory and folds every few goals or when idle. Pending edges are rebuilt from the objects written since the view's last fold, so nothing new has to be stored; recording which commit a view was folded at, so a restarted server knows where to start, would be a ref (an addition for Eric's yes).
+
+### E149 exact-short-search (patterns of up to three bytes from the postings alone)
+- Question: with the trigram index, E133's searches for "Q3" and "AI" still decode every candidate (655 KB and 351 KB with the index's 269 KB), though for patterns of one to three bytes a trigram's posting lists exactly the contents that hold it. Can such a search answer from the index alone?
+- Change: `Repo::exact_short_search` (off by default): for patterns of one to three bytes the indexed candidates are the matches and are not decoded; contents too short to have trigrams and contents the index does not cover are still scanned. `tests/search_short.rs`: results equal a scan for every pattern of one to three bytes over a small alphabet (and a longer one), with an unindexed content in the set, and a search with the option on reads nothing but the index. `examples/goal.rs` config `recommended_exact_search`: E148's setup with the option on, and a measurement of what range reads of only the windows would fetch, positions taken from the decoded files.
+- Result (cases store, against `recommended_deferred_view`):
+  - Search: first goal 655 KB in 60 reads to 269 KB in 1 (the index), next goal 351 KB in 14 to 269 KB in 1; the same 27 and 8 files. 11.4 to 8.5 ms in memory.
+  - The goal: unchanged (684 KB and 358 KB): the read stage now fetches the files the search no longer decoded, 385 KB and 82 KB.
+  - Windows by range: the lines around each mention are 16.7 KB and 11.9 KB, but range reads of only those windows fetch the same 385 KB and 82 KB, because each file is one compressed object and a window is verified against the whole of it. A positional index alone would not help; windows need range-addressable stored files (E150).
+  - All kernel tests pass (170).
+  - The fixed bench on this branch: every byte count and the north score (0.3035) as on E148; cost score 0.2427 against 0.2407, from timings only (the bench does not set exact_short_search).
+- Verdict: **kept**; on its branch until Eric says to merge. Off by default because results then rest on the index (a corrupt index would give wrong answers that a scan would not); on, a "which files mention" query costs only the index, which a server holds in memory.
+
+### E150 framed-files (window reads if stored files were seekable)
+- Question: E149 found that range reads of only the windows a goal needs fetch whole files: each file is one compressed object, verified against its id as a whole. What would window reads cost if each file were cut into independently compressed frames, each verifiable against the file's id with a BLAKE3 outboard (as Bao keeps), and what would the store grow by?
+- Change: `examples/seekable.rs`, a measurement only; nothing is stored differently. Over the cases store's 550 text files: zstd level 3 of each whole file, of fixed frames of 1 to 64 KiB, a frame table and the hash tree's inner nodes; for the files holding "Q3" and "AI", the frames overlapping the windows (two lines around each mention) and their proofs. No dictionary anywhere, so the figures compare with each other, not with the store's encodings.
+- Result:
+  - Text storage, whole-file zstd 401 KB: 1 KiB frames 980 KB plus 122 KB outboard; 4 KiB 564 KB plus 29 KB (+48%, +55% with outboard); 8 KiB 481 KB plus 14 KB; 16 KiB 437 KB plus 7 KB (+11%); 64 KiB 403 KB.
+  - Window reads, Q3 (27 files, 16.7 KB of windows, 106 KB whole-file zstd): 1 KiB frames 34 KB, 4 KiB 51 KB, 8 KiB 72 KB, 16 KiB 102 KB. AI (8 files, 11.9 KB of windows, 15 KB whole): 12.7, 12.9, 12.2 and 15.3 KB.
+  - So frames halve window reads only at 4 KiB or less, for half again the text storage; at 16 KiB they cost 11% and save 4%. For reference, the store as it is fetched 385 KB for Q3's 27 files (347 KB raw), because each file is read out of a 64 KiB group (E151).
+- Verdict: **measured**. Not worth a format addition for goals like these: windows are a large share of small files, and a goal that edits a file needs the whole file anyway. Worth it for large files read in sections (logs, long documents); there it would be a stored-format addition, for Eric's yes.
+
+### E151 group-size (smaller groups for goal reads)
+- Question: E150 found that the store fetches 385 KB to read Q3's 27 matched files (347 KB raw, 106 KB as whole-file zstd), because each small file is read out of a 64 KiB solid group and reading a member fetches its whole group. What do smaller groups cost and save?
+- Change: `Repo::group_size` (64 KiB by default) bounds the groups repack packs small contents into; it is copied into repack's working handle and is part of the repack fingerprint, so a new size is planned again. The CLI takes `--group-size BYTES`. Measured first with a temporary switch, on copies of the cases store repacked at each size, then on the fixed bench at 16 KiB. `tests/groups.rs`: at 4 KiB no group a note reads is larger than 4 KiB (at 64 KiB one is), every note reads back, the store checks clean, an unchanged repack is skipped and a new size is planned again.
+- Result:
+  - Goal reads (E149's setup, read stage): 64 KiB groups 385 KB for Q3 and 82 KB for AI; 16 KiB 208 KB and 53 KB; 8 KiB 157 KB and 25 KB. At 4 KiB the repack found no plan smaller than the store's, so it kept the store as it was (repack applies a plan only when it saves bytes).
+  - The cases store's bytes: 229,132,008 at 64 KiB, 229,131,301 at 16 KiB, 229,138,869 at 8 KiB.
+  - The fixed bench at 16 KiB: north score 0.3035 to 0.3100, beyond its tolerance (stored bytes +0.1% on cases, +4.6% on multiformat, +1.8% on tables); cost score 0.2427 to 0.2341. As a default it fails the keep rule.
+  - All kernel tests pass (171).
+  - The fixed bench on this branch at the default size: every byte count and the north score (0.3035) as on E149; cost score 0.2406 against 0.2427, from timings only.
+- Verdict: **kept** as an option, off by default (64 KiB); on its branch until Eric says to merge. A server whose work is goals reading a few files of a large store can trade about 2% of stored bytes for half the bytes per file read. Stores packed at any size read the same; nothing in the stored format changes.
+
+### E152 held-index (the search index held across goals)
+- Question: after E148 and E149 the next goal on a handle fetches 358 KB, and 269 KB of it is loading the search index again. What does a handle that keeps the decoded index between goals, as a server would, fetch?
+- Change: none in the kernel. `examples/goal.rs` gains `recommended_held_index`: E149's setup, with the index from `search_index()` decoded once per handle and passed to every goal's search. `search` already takes the index from its caller, and contents not in the index are scanned, so the answers stay exact when files change between goals.
+- Result (cases store, E133's two goals):
+  - Next goal (AI): 358,351 to 89,224 bytes fetched (the index load drops from 269,127 to 0), 23.4 to 20.3 ms in memory; the same 8 matches, the same bytes written (2,865) and the same final view root as E149's setup.
+  - First goal and the ledger pass unchanged (684 KB and 692 KB).
+  - With 16 KiB groups (E151) on a repacked copy: next goal 329,093 to 59,966 bytes; first goal 506 KB.
+  - Timed on stores (median of three, `GOAL_FS`): on packs the first goal takes 40 ms and the next 26 ms (16 KiB groups: 43 and 24 ms); on one file per object 59 and 39 ms (16 KiB groups: 84 and 52 ms, more objects to open). Here smaller groups fetch fewer bytes without being faster; they pay where bytes cost more than requests.
+  - The fixed bench: every byte count and the north score (0.3035) as on E151; cost score 0.2311 against 0.2406, from timings only.
+- Verdict: **measured**; nothing to merge beyond the example config. A server should load the search index once per handle and reuse it; then a goal after the first costs about 90 KB (60 KB with 16 KiB groups) against 932 MB with the defaults.
+
+### Merge note: the rest of E122 (Nov 9, after E152)
+- exp/139 had merged exp/122-store-bakeoff at its first commit, so E122's four later commits were in no branch after it: the bake-off harness (`examples/stores.rs`), pack checkpoints and CRC-checked reads, the FsStore OS ref lock, sealed pack lookups by interpolation search, and E122's own log, registry and options entries. They are merged into exp/152-held-index now. PackStore keeps E139's `read_head` and E147's `stored_len`; its whole read is E122's CRC-checked one.
+- Gates: 174 kernel tests pass; clippy `-D warnings` clean with and without the store features; the fixed bench matches E152 in every byte count and the north score (0.3035); cost score 0.2451 against 0.2311, from timings (another job ran alongside). E133's goals fetch the same bytes (684 KB and 89 KB).
+- `packages/kernel/scripts/mac-bakeoff.sh` runs the measurements that need macOS (flush cost per commit, kills, APFS small files, E152's goal on files and packs, clonefile) in its own folder, as the user, with no sudo and no service or port.

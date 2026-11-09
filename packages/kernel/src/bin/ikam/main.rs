@@ -21,7 +21,7 @@ use ikam_kernel::{Arg, FsStore, Id, Object, Repo, snapshot};
 
 use corpus::{err, lookup};
 
-const USAGE: &str = "usage: ikam [--store DIR] [--short-records] [--slow-codec-max BYTES] <command>
+const USAGE: &str = "usage: ikam [--store DIR] [--short-records] [--slow-codec-max BYTES] [--group-size BYTES] [--needed-index] [--read-memo] <command>
   ingest DIR [-m MSG] [--ref REF]  commit DIR, repack, verify; print what it cost
   ls [REV[:PATH]] [-r]             list a directory of REV (default main)
   grep TEXT [REV]                  files of REV containing TEXT, with lines
@@ -150,10 +150,25 @@ fn run(store_dir: &str, args: &mut Vec<String>) -> Result<(), String> {
         args.remove(i);
         repo.short_records = true;
     }
+    if let Some(i) = args.iter().position(|a| a == "--needed-index") {
+        args.remove(i);
+        repo.needed_index = true;
+    }
+    if let Some(i) = args.iter().position(|a| a == "--read-memo") {
+        args.remove(i);
+        repo.read_memo = true;
+    }
     if let Some(n) = take_flag(args, "--slow-codec-max") {
         repo.slow_codec_max = n
             .parse()
             .map_err(|_| "--slow-codec-max BYTES".to_string())?;
+    }
+    if let Some(n) = take_flag(args, "--group-size") {
+        repo.group_size = n
+            .parse()
+            .ok()
+            .filter(|&n: &usize| n > 0)
+            .ok_or_else(|| "--group-size BYTES".to_string())?;
     }
     let message = take_flag(args, "-m").unwrap_or_default();
     let refname = take_flag(args, "--ref").unwrap_or_else(|| "main".into());
@@ -333,8 +348,9 @@ fn run(store_dir: &str, args: &mut Vec<String>) -> Result<(), String> {
         }
         Some("gc") => println!("deleted {} objects", repo.gc().map_err(err)?),
         Some("live") => {
+            let needed_index = repo.needed_index;
             drop(repo);
-            live_cmd(store_dir, &refname, &args[1..])?;
+            live_cmd(store_dir, &refname, &args[1..], needed_index)?;
         }
         Some(cmd @ ("write" | "rm" | "mkdir" | "mv" | "cp")) => {
             let op = match cmd {
@@ -425,7 +441,12 @@ fn run(store_dir: &str, args: &mut Vec<String>) -> Result<(), String> {
 }
 
 /// `ikam live`: serve the ref as a filesystem until stopped.
-fn live_cmd(store_dir: &str, refname: &str, args: &[String]) -> Result<(), String> {
+fn live_cmd(
+    store_dir: &str,
+    refname: &str,
+    args: &[String],
+    needed_index: bool,
+) -> Result<(), String> {
     let mut args = args.to_vec();
     let mut watches = Vec::new();
     while let Some(w) = take_flag(&mut args, "--watch") {
@@ -502,6 +523,7 @@ fn live_cmd(store_dir: &str, refname: &str, args: &[String]) -> Result<(), Strin
     };
     let port: u16 = args.first().map_or(Ok(8737), |p| p.parse()).map_err(err)?;
     let mut l = live::Live::open(store_dir, refname)?;
+    l.repo.needed_index = needed_index;
     l.max_store = max_store.or(public.then_some(PUBLIC_MAX_STORE));
     l.gc_every = gc_every;
     if let Some(ms) = commit_after {

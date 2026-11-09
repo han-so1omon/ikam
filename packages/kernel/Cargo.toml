@@ -19,6 +19,22 @@ wasmi = { version = "=2.0.0", features = ["auto-dispatch", "deterministic"] }
 xz2 = { version = "=0.1.7", features = ["static"] }
 zstd = { version = "0.14.0", features = ["experimental"] }
 
+# Optional store backends (E122 bake-off). Each is a swappable `Store`;
+# the default build uses none of them.
+fjall = { version = "3.1.13", optional = true }
+heed = { version = "0.22", optional = true }
+redb = { version = "4.5.0", optional = true }
+rocksdb = { version = "0.25.0", optional = true, default-features = false, features = ["lz4", "zstd"] }
+rusqlite = { version = "0.41.1", optional = true, features = ["bundled"] }
+
+[features]
+store-fjall = ["dep:fjall"]
+store-lmdb = ["dep:heed"]
+store-redb = ["dep:redb"]
+store-rocksdb = ["dep:rocksdb"]
+store-sqlite = ["dep:rusqlite"]
+stores = ["store-fjall", "store-lmdb", "store-redb", "store-rocksdb", "store-sqlite"]
+
 [dev-dependencies]
 libc = "=0.2.189"
 proptest = "1.11.0"
@@ -32,3 +48,7 @@ path = "src/bin/ikam/main.rs"
 # Dependencies (wasmi, zlib, zstd) are far slower unoptimized; tests run them heavily.
 [profile.dev.package."*"]
 opt-level = 2
+
+[[example]]
+name = "stores"
+required-features = ["stores"]

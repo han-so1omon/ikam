@@ -5,6 +5,7 @@
 //! See docs/plans/2026-10-02-rust-kernel.md for the layer laws.
 
 mod abbrev;
+pub mod backends;
 mod claims;
 mod codec;
 mod container;
@@ -12,6 +13,7 @@ mod db;
 mod dict;
 mod exec;
 pub mod func;
+mod grant;
 mod graph;
 mod group;
 mod history;
@@ -35,11 +37,13 @@ pub mod worktree;
 pub use container::expand;
 pub use db::{Db, Event, Op};
 pub use dict::decode_cost;
+pub use grant::{Denied, FileGrant, Grant, Sections, windows_around};
 pub use graph::Keys;
 pub use id::Id;
 pub use object::{
     Arg, Claim, Commit, Derivation, Edge, Graph, Kind, Node, Object, Target, TreeEntry, node_key,
 };
+pub use range::ReadSession;
 pub use repack::Repacked;
 pub use repo::{DEFAULT_READ_WEIGHT, Form, Put, Repo};
 pub use search::{SEARCH_REF, SearchIndex};
