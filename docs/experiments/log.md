@@ -2069,5 +2069,5 @@ Newest last. Format and rules: `README.md`.
   - Next goal on the same handle: unchanged (6.3 MB).
   - What the first goal still reads: the ledger's pass (230 MB) and the scoped seed index (89 MB).
   - Four-ingest safety check on frozen input, needed_index on and off: fsck_failures=0 and mismatched=0 on every ingest, fsck ok in both modes, objects identical.
-  - All kernel tests pass.
+  - All kernel tests pass. Fixed bench: every stored-bytes figure the same as E133's; timings within run-to-run noise (score 0.2433 to 0.2401).
 - Verdict: **kept**; on its branch until Eric says to merge.
