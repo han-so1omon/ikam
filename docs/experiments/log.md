@@ -2273,3 +2273,14 @@ Newest last. Format and rules: `README.md`.
   - Window reads, Q3 (27 files, 16.7 KB of windows, 106 KB whole-file zstd): 1 KiB frames 34 KB, 4 KiB 51 KB, 8 KiB 72 KB, 16 KiB 102 KB. AI (8 files, 11.9 KB of windows, 15 KB whole): 12.7, 12.9, 12.2 and 15.3 KB.
   - So frames halve window reads only at 4 KiB or less, for half again the text storage; at 16 KiB they cost 11% and save 4%. For reference, the store as it is fetched 385 KB for Q3's 27 files (347 KB raw), because each file is read out of a 64 KiB group (E151).
 - Verdict: **measured**. Not worth a format addition for goals like these: windows are a large share of small files, and a goal that edits a file needs the whole file anyway. Worth it for large files read in sections (logs, long documents); there it would be a stored-format addition, for Eric's yes.
+
+### E151 group-size (smaller groups for goal reads)
+- Question: E150 found that the store fetches 385 KB to read Q3's 27 matched files (347 KB raw, 106 KB as whole-file zstd), because each small file is read out of a 64 KiB solid group and reading a member fetches its whole group. What do smaller groups cost and save?
+- Change: `Repo::group_size` (64 KiB by default) bounds the groups repack packs small contents into; it is copied into repack's working handle and is part of the repack fingerprint, so a new size is planned again. The CLI takes `--group-size BYTES`. Measured first with a temporary switch, on copies of the cases store repacked at each size, then on the fixed bench at 16 KiB. `tests/groups.rs`: at 4 KiB no group a note reads is larger than 4 KiB (at 64 KiB one is), every note reads back, the store checks clean, an unchanged repack is skipped and a new size is planned again.
+- Result:
+  - Goal reads (E149's setup, read stage): 64 KiB groups 385 KB for Q3 and 82 KB for AI; 16 KiB 208 KB and 53 KB; 8 KiB 157 KB and 25 KB. At 4 KiB the repack found no plan smaller than the store's, so it kept the store as it was (repack applies a plan only when it saves bytes).
+  - The cases store's bytes: 229,132,008 at 64 KiB, 229,131,301 at 16 KiB, 229,138,869 at 8 KiB.
+  - The fixed bench at 16 KiB: north score 0.3035 to 0.3100, beyond its tolerance (stored bytes +0.1% on cases, +4.6% on multiformat, +1.8% on tables); cost score 0.2427 to 0.2341. As a default it fails the keep rule.
+  - All kernel tests pass (171).
+  - The fixed bench on this branch at the default size: every byte count and the north score (0.3035) as on E149; cost score 0.2406 against 0.2427, from timings only.
+- Verdict: **kept** as an option, off by default (64 KiB); on its branch until Eric says to merge. A server whose work is goals reading a few files of a large store can trade about 2% of stored bytes for half the bytes per file read. Stores packed at any size read the same; nothing in the stored format changes.

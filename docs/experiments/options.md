@@ -229,3 +229,9 @@ it is an on-disk addition and waits on a decision.
 | Setting | Default | Trade | Measured |
 | --- | --- | --- | --- |
 | `exact_short_search` | off | on: patterns of one to three bytes are answered from the trigram postings without decoding the matches, so the answer rests on the index | E133's searches 655 KB to 269 KB and 351 KB to 269 KB (the index alone), same matches; a goal that then reads the files fetches the same total |
+
+## Group size (E151)
+
+| Setting | Default | Trade | Measured |
+| --- | --- | --- | --- |
+| `group_size`, `--group-size` | 64 KiB | smaller groups fetch less per member read and store more where small contents share context | 16 KiB: E133's file reads 385 KB to 208 KB and 82 KB to 53 KB; north score 0.3035 to 0.3100 (multiformat +4.6%, tables +1.8%); 8 KiB: 157 KB and 25 KB |
