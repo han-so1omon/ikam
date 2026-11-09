@@ -144,3 +144,13 @@ read weight 1.0: 1,000 single appends 0.9 s and 7.9 MB stored against
 3.1 s and 3.3 MB). A key index for the log, so in-place edits check its
 label keys across the whole graph (needed only near 100M events: chance
 clashes are about 3 in 10,000 there).
+
+## Where new content looks for repeats (E131)
+
+| Setting | Default | Trade | Measured |
+| --- | --- | --- | --- |
+| `Repo::seed_scope` (E131) | `None`: every stored content | `Some(roots)`: the first write reads only those contents and what they are made of, and near-match reuse stays inside them, against missing repeats of content outside them | one-file edit's first write 238 MB / 1.7 s to 0.69 MB / 8.8 ms, same bytes stored; a 36-file folder copy with source and destination folders in scope 8.5 KB written against 21.8 KB on the whole store; an empty scope 1.09 MB against 2.9 KB |
+
+**Not yet a setting**: a ledger cache file (E130: 159 KB and 0.1 ms to load
+against a 229 MB scan on every fresh handle's first derived read); it is an
+on-disk addition and waits on a decision.

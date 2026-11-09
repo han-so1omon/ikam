@@ -397,8 +397,21 @@ impl<S: Store> Repo<S> {
     pub(crate) fn ensure_index(&mut self) -> Result<(), Error> {
         if self.index.is_none() {
             let mut index = Index::default();
-            for id in self.store.ids()? {
-                if let Ok(bytes) = self.decode_plain(&id, &self.store.read(&id)?) {
+            let ids: Vec<Id> = match &self.seed_scope {
+                None => self.store.ids()?,
+                // Only what these contents are made of (E131).
+                Some(roots) => {
+                    let (content, _) = self.closure(roots.clone(), |_| true)?;
+                    let mut ids: Vec<Id> = content.into_iter().collect();
+                    ids.sort();
+                    ids
+                }
+            };
+            for id in ids {
+                let Ok(encoded) = self.store.read(&id) else {
+                    continue; // derived: its arguments are in `ids`
+                };
+                if let Ok(bytes) = self.decode_plain(&id, &encoded) {
                     index.add(id, &bytes);
                 }
             }

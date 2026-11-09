@@ -1952,3 +1952,29 @@ Newest last. Format and rules: `README.md`.
     339.5 s off; the cases ingest stores 229,892,773 bytes either way.
   - All kernel tests pass.
 - Verdict: **kept** (an option; recommended on for `ikam live`, which is the store's one writer); on its branch until Eric says to merge.
+
+### E130 cold-handle (what the first read, write and lookup on a fresh handle read)
+- Branch / parent: exp/131-seed-scope / exp/129-needed-index (E129)
+- Question: every CLI command, and every process that opens a hosted store, starts with a fresh handle. What does its first operation read, and what would a rebuildable cache save?
+- Method: `examples/cold.rs` on the cases store (1,906 objects, 229 MB, `FsStore` on local disk, warm page cache), each phase on a new handle behind a counting wrapper. 410 of its 1,438 files are stored only as derivations.
+- Result:
+  - Open, resolving a ref and reading the root tree, or reading a file stored as bytes: 0 to 3 objects, at most 40 KB, under 1 ms.
+  - The first read of a derived file, or any first `has_content`: 1,907 reads, 229 MB, one full scan, 55 to 59 ms. The derivation ledger is a projection built by reading every stored object. The second read on the same handle: 1 read, 14 KB, 0.4 ms.
+  - The first content write: the ledger (2,384 reads, 240 MB, 89 ms in memory), then the matcher's seed index (4,194 reads, 265 MB, 2.0 s). The second write: 4 reads, 0.5 ms.
+  - A ledger cache, estimated outside the kernel: the store's 420 derivation records, length-prefixed in one file, are 159 KB and load in 0.1 ms (one read). That is 1,400 times fewer bytes than the scan, and one request instead of 1,906 on a remote store. The seed index cannot be cached the same way: about one anchor per 64 bytes of content, so near the size of the store.
+  - Not measured: a cold disk on the Mac, and R2 latency per request (1,906 GETs per cold open; at $0.36 per million that is $0.0007, but the time is one round trip per object unless they are batched).
+- Verdict: **kept** (a measurement; no kernel change). A ledger cache file would be an on-disk addition, so it waits on Eric. Until then, long-lived handles (`ikam serve`, `ikam live`) pay the scan once per process.
+
+### E131 seed-scope (bound where new content looks for repeats)
+- Branch / parent: exp/131-seed-scope / exp/129-needed-index (E129)
+- Question: the first write on a handle reads the whole store to build the matcher's seed index (E129, E130), and new content may be built from any stored bytes, other tenants' included (E126). Can the caller bound where it looks, and what does that cost in stored bytes?
+- Change (kernel; no format change): `Repo::seed_scope` (`None` by default, the whole store, as before). `Some(roots)` builds the seed index only from those contents and what they are derived from (the derivation closure); content written through the handle joins the index either way. Tests (`tests/scope.rs`): a scoped index uses repeats only inside its scope, reads back exactly, fsck clean; an empty scope stores plain bytes.
+- Method: `examples/seeds.rs` on the cases store copied into memory, a new handle per case and scope, the ledger built first so the numbers are the seed index and the writes alone. Scopes: the whole store; the files of the tree; the top-level folders written to; those plus the folders the edits came from; empty.
+- Result (reads, bytes fetched, ms, bytes written):
+  - one Markdown file edited: whole store 2,980 reads, 238 MB, 1,697 ms, 137 B; folders written to 165 reads, 690 KB, 8.8 ms, 137 B.
+  - one file of each of 13 types edited: whole store 3,344 reads, 247 MB, 1,627 ms, 16,176 B; files of the tree 2,749, 247 MB, 1,578 ms, 2,953 B; folders written to 758 reads, 85 MB, 541 ms, 2,914 B; empty 125 reads, 0.4 MB, 67 ms, 1,088,168 B.
+  - a folder of 36 files copied to a new folder: whole store 4,143 reads, 243 MB, 1,639 ms, 21,817 B; folders written to (the new folder, so nothing) 556 reads, 0.8 MB, 104 ms, 13,096 B; folders written to and read from 1,229 reads, 4.1 MB, 120 ms, 8,478 B.
+  - A narrower scope stored fewer bytes, not more, in two of three cases: the matcher keeps 4 candidates per seed, and on the whole store those slots fill with other copies before the best source. Only the empty scope lost (1.09 MB against 2.9 KB).
+  - Isolation is partial: identical content is one object whatever the scope (content addressing), and container members and groups are found by id, not by seeds. With the empty scope 92 and 141 derivation arguments still named content from before the handle. So the scope bounds near-match reuse; permission checks still belong at the file layer (E126).
+  - All kernel tests pass.
+- Verdict: **kept** (an option; for `ikam live` and `serve`, scope a write to the folders it touches plus where its bytes came from, when the caller knows); on its branch until Eric says to merge.

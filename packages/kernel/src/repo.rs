@@ -127,6 +127,16 @@ pub struct Repo<S: Store> {
     /// at ingest reads the whole store.
     pub needed_index: bool,
     pub(crate) needed: std::sync::Mutex<Option<crate::dict::Needed>>,
+    /// Where new content looks for repeats (E131). `None` (the default):
+    /// every stored content, so the first write on a handle reads the whole
+    /// store to build the matcher's seed index. `Some(roots)`: only those
+    /// contents and what they are derived from, for example the files of
+    /// the tree being written, or of one tenant's refs. A smaller scope
+    /// reads less and never builds new content out of bytes outside it, at
+    /// the price of missing repeats of content outside it. Content written
+    /// through the handle is added to the index either way. Set it before
+    /// the handle's first write: the index is built once per handle.
+    pub seed_scope: Option<Vec<Id>>,
     /// zstd level new encodings use (`dict::MEASURE_LEVEL` unless
     /// `recompress` is running).
     pub(crate) level: i32,
@@ -152,6 +162,7 @@ impl<S: Store> Repo<S> {
             slow_codec_max: usize::MAX,
             needed_index: false,
             needed: Default::default(),
+            seed_scope: None,
             level: crate::dict::MEASURE_LEVEL,
             deflate_memo: None,
         }
