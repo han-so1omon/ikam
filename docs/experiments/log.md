@@ -2207,5 +2207,5 @@ Newest last. Format and rules: `README.md`.
   - With it off, an edit only adds objects: nothing stored is rewritten or removed until a repack.
   - Configurations with it on read and write exactly as before. Not measured on the fixed bench's corpora, since the bench keeps the default.
   - All kernel tests pass (166).
-  - BENCH_LINE
+  - The fixed bench on this branch: every byte count and the north score (0.3035) as on E143; cost score 0.2356 against 0.2427, from timings only (the bench keeps object_templates on).
 - Verdict: **kept**; on its branch until Eric says to merge. Recommended off for a service that edits trees and views; the format is unchanged.
