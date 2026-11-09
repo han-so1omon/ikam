@@ -2292,5 +2292,6 @@ Newest last. Format and rules: `README.md`.
   - Next goal (AI): 358,351 to 89,224 bytes fetched (the index load drops from 269,127 to 0), 23.4 to 20.3 ms in memory; the same 8 matches, the same bytes written (2,865) and the same final view root as E149's setup.
   - First goal and the ledger pass unchanged (684 KB and 692 KB).
   - With 16 KiB groups (E151) on a repacked copy: next goal 329,093 to 59,966 bytes; first goal 506 KB.
+  - Timed on stores (median of three, `GOAL_FS`): on packs the first goal takes 40 ms and the next 26 ms (16 KiB groups: 43 and 24 ms); on one file per object 59 and 39 ms (16 KiB groups: 84 and 52 ms, more objects to open). Here smaller groups fetch fewer bytes without being faster; they pay where bytes cost more than requests.
   - The fixed bench: every byte count and the north score (0.3035) as on E151; cost score 0.2311 against 0.2406, from timings only.
 - Verdict: **measured**; nothing to merge beyond the example config. A server should load the search index once per handle and reuse it; then a goal after the first costs about 90 KB (60 KB with 16 KiB groups) against 932 MB with the defaults.
