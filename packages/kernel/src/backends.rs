@@ -741,12 +741,32 @@ impl Sealed {
         let b = id.as_bytes()[0] as usize;
         let (mut lo, mut hi) = (if b == 0 { 0 } else { self.fanout[b - 1] }, self.fanout[b]);
         let mut key = [0u8; 32];
+        // Ids are hashes, so uniform: guess the position from the id's next
+        // bytes (interpolation search, about log log n reads), then fall
+        // back to halving if the guesses stop closing in.
+        let pos = |k: &[u8]| u64::from_be_bytes(k[1..9].try_into().unwrap());
+        let target = pos(id.as_bytes());
+        let (mut lo_key, mut hi_key) = (0u64, u64::MAX);
+        let mut guesses = 0;
         while lo < hi {
-            let mid = lo + (hi - lo) / 2;
+            let mid = if guesses < 6 && hi - lo > 8 && lo_key < hi_key {
+                guesses += 1;
+                let span = (hi - lo) as u128;
+                let frac = (target.saturating_sub(lo_key)) as u128 * span / (hi_key - lo_key) as u128;
+                lo + (frac as u32).min(hi - lo - 1)
+            } else {
+                lo + (hi - lo) / 2
+            };
             self.idx.read_exact_at(&mut key, IDX_HEAD + mid as u64 * IDX_ENTRY)?;
             match key[..].cmp(id.as_bytes()) {
-                std::cmp::Ordering::Less => lo = mid + 1,
-                std::cmp::Ordering::Greater => hi = mid,
+                std::cmp::Ordering::Less => {
+                    lo = mid + 1;
+                    lo_key = pos(&key);
+                }
+                std::cmp::Ordering::Greater => {
+                    hi = mid;
+                    hi_key = pos(&key);
+                }
                 std::cmp::Ordering::Equal => {
                     let (_, off, len) = self.entry(mid)?;
                     return Ok(Some((off, len)));
@@ -1167,5 +1187,42 @@ impl Store for PackStore {
         }
         out.sort();
         Ok(out)
+    }
+}
+
+#[cfg(test)]
+mod pack_index_tests {
+    use super::*;
+
+    #[test]
+    fn sealed_lookup_finds_every_id_and_no_other() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::create_dir_all(dir.path().join("packs")).unwrap();
+        File::create(dir.path().join("packs/00000000.pack")).unwrap();
+        let mut index = HashMap::new();
+        for n in 0..200_000u32 {
+            index.insert(Id::of(&n.to_le_bytes()), (n as u64 * 7, n));
+        }
+        write_idx(&dir.path().join("packs/00000000.idx"), &index).unwrap();
+        let s = open_sealed(dir.path(), 0).unwrap();
+        for (id, at) in &index {
+            assert_eq!(s.find(id).unwrap(), Some(*at));
+        }
+        for n in 200_000..210_000u32 {
+            assert_eq!(s.find(&Id::of(&n.to_le_bytes())).unwrap(), None);
+        }
+        // Clustered ids (not hash-like) still work through the fallback.
+        let mut index = HashMap::new();
+        for n in 0..5_000u32 {
+            let mut b = [0u8; 32];
+            b[0] = 7;
+            b[28..].copy_from_slice(&n.to_be_bytes());
+            index.insert(Id::from_bytes(b), (n as u64, 1));
+        }
+        write_idx(&dir.path().join("packs/00000000.idx"), &index).unwrap();
+        let s = open_sealed(dir.path(), 0).unwrap();
+        for (id, at) in &index {
+            assert_eq!(s.find(id).unwrap(), Some(*at));
+        }
     }
 }
