@@ -223,3 +223,9 @@ it is an on-disk addition and waits on a decision.
 | Setting | Default | Trade | Measured |
 | --- | --- | --- | --- |
 | `graph_prefix_pending` / `graph_node_pending`, fold with `graph_edit_with` | the caller edits the view in every goal | lookups merge the pending edits in memory; the view on disk lags until the next fold | E133's first goal: view update 405 KB to 22 KB, 150 ms to 37 ms on packs; one fold for two goals 445 KB against 744 KB, same root |
+
+## Short searches from the postings alone (E149)
+
+| Setting | Default | Trade | Measured |
+| --- | --- | --- | --- |
+| `exact_short_search` | off | on: patterns of one to three bytes are answered from the trigram postings without decoding the matches, so the answer rests on the index | E133's searches 655 KB to 269 KB and 351 KB to 269 KB (the index alone), same matches; a goal that then reads the files fetches the same total |

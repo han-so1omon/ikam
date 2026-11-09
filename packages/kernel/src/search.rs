@@ -352,6 +352,8 @@ impl<S: Store> Repo<S> {
         {
             return self.search_chunks(pattern, files, &index.files, chunks);
         }
+        // E149: indexed contents the postings alone show to match.
+        let mut exact: HashSet<Id> = HashSet::new();
         let candidates: Vec<Id> = match index.filter(|i| !pattern.is_empty() && i.chunks.is_none())
         {
             Some(index) => {
@@ -370,6 +372,9 @@ impl<S: Store> Repo<S> {
                                 hits.extend(list.iter().copied());
                             }
                         }
+                        if self.exact_short_search {
+                            exact.extend(hits.iter().map(|&i| index.files[i]));
+                        }
                         hits.extend((0..index.files.len()).filter(|i| !seen.contains(i)));
                         hits
                     }
@@ -383,7 +388,11 @@ impl<S: Store> Repo<S> {
                                 None => set,
                             });
                         }
-                        hits.unwrap_or_default()
+                        let hits = hits.unwrap_or_default();
+                        if self.exact_short_search && pattern.len() == 3 {
+                            exact.extend(hits.iter().map(|&i| index.files[i]));
+                        }
+                        hits
                     }
                 };
                 let indexed = files.iter().filter(|id| covered.contains(id));
@@ -411,6 +420,10 @@ impl<S: Store> Repo<S> {
         let work = cx.work;
         let mut out = Vec::new();
         for id in candidates {
+            if exact.contains(&id) {
+                out.push(id);
+                continue;
+            }
             let bytes = self.rebuild(&id, cx)?;
             crate::dict::count_decode(bytes.len(), SCAN_UNITS);
             if finder.find(&bytes).is_some() {

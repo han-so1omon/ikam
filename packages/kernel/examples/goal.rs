@@ -393,6 +393,9 @@ fn main() {
         // E148: the same, with new reverse edges kept pending and folded
         // into the view once, after the last goal.
         ("recommended_deferred_view", true, false),
+        // E149: the same, with patterns of up to three bytes answered from
+        // the trigram postings alone.
+        ("recommended_exact_search", true, false),
     ] {
         // IKAM_CONFIG=name runs only that configuration.
         if std::env::var("IKAM_CONFIG").is_ok_and(|c| c != config) {
@@ -407,13 +410,21 @@ fn main() {
                 | "recommended_no_object_templates"
                 | "recommended_batch"
                 | "recommended_deferred_view"
+                | "recommended_exact_search"
         );
-        let deferred = config == "recommended_deferred_view";
+        let deferred = matches!(
+            config,
+            "recommended_deferred_view" | "recommended_exact_search"
+        );
+        repo.exact_short_search = config == "recommended_exact_search";
         let batch = config == "recommended_batch" || deferred;
         let mut pending: BTreeMap<String, Option<Node>> = BTreeMap::new();
         repo.object_templates = !matches!(
             config,
-            "recommended_no_object_templates" | "recommended_batch" | "recommended_deferred_view"
+            "recommended_no_object_templates"
+                | "recommended_batch"
+                | "recommended_deferred_view"
+                | "recommended_exact_search"
         );
         repo.read_memo = config == "recommended_read_memo" || hints;
         repo.replace_hints = hints;
@@ -463,6 +474,7 @@ fn main() {
                     | "recommended_no_object_templates"
                     | "recommended_batch"
                     | "recommended_deferred_view"
+                    | "recommended_exact_search"
             )
             .then(|| repo.session(64 << 20));
             let (hits, _) = match &shared {
@@ -502,6 +514,25 @@ fn main() {
                 t.elapsed().as_secs_f64() * 1e3,
                 format!(",\"to_model\":{model},\"whole_files\":{whole}"),
             );
+            // E149: what range reads of only the windows would fetch, if
+            // the index gave each match's position (it does not; positions
+            // are taken from the decoded files here).
+            if repo.exact_short_search {
+                repo.store().take();
+                let s = repo.session(64 << 20);
+                let mut got = 0usize;
+                for (id, b) in hits.iter().zip(&contents) {
+                    for w in ikam_kernel::windows_around(b, term, 2) {
+                        got += s.read_range(id, w.start, w.end - w.start).unwrap().len();
+                    }
+                }
+                drop(s);
+                let io = repo.store().take();
+                println!(
+                    "{{\"exp\":\"E149\",\"config\":\"{config}\",\"goal\":\"{}\",\"part\":\"windows_by_range\",\"window_bytes\":{got},\"reads\":{},\"fetched\":{}}}",
+                    g.term, io.reads, io.bytes
+                );
+            }
             // E145: the decoded files go to the write batch.
             let handed: Vec<(Id, Vec<u8>)> = match shared {
                 Some(s) if batch => s.into_contents(),

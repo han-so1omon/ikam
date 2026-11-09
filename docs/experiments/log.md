@@ -2253,3 +2253,14 @@ Newest last. Format and rules: `README.md`.
   - All kernel tests pass (169).
   - The fixed bench on this branch: every byte count and the north score (0.3035) as on E147; cost score 0.2407 against 0.2387, from timings only (the bench does not keep views pending).
 - Verdict: **kept**; on its branch until Eric says to merge. Library API for a server, which keeps the pending edges in memory and folds every few goals or when idle. Pending edges are rebuilt from the objects written since the view's last fold, so nothing new has to be stored; recording which commit a view was folded at, so a restarted server knows where to start, would be a ref (an addition for Eric's yes).
+
+### E149 exact-short-search (patterns of up to three bytes from the postings alone)
+- Question: with the trigram index, E133's searches for "Q3" and "AI" still decode every candidate (655 KB and 351 KB with the index's 269 KB), though for patterns of one to three bytes a trigram's posting lists exactly the contents that hold it. Can such a search answer from the index alone?
+- Change: `Repo::exact_short_search` (off by default): for patterns of one to three bytes the indexed candidates are the matches and are not decoded; contents too short to have trigrams and contents the index does not cover are still scanned. `tests/search_short.rs`: results equal a scan for every pattern of one to three bytes over a small alphabet (and a longer one), with an unindexed content in the set, and a search with the option on reads nothing but the index. `examples/goal.rs` config `recommended_exact_search`: E148's setup with the option on, and a measurement of what range reads of only the windows would fetch, positions taken from the decoded files.
+- Result (cases store, against `recommended_deferred_view`):
+  - Search: first goal 655 KB in 60 reads to 269 KB in 1 (the index), next goal 351 KB in 14 to 269 KB in 1; the same 27 and 8 files. 11.4 to 8.5 ms in memory.
+  - The goal: unchanged (684 KB and 358 KB): the read stage now fetches the files the search no longer decoded, 385 KB and 82 KB.
+  - Windows by range: the lines around each mention are 16.7 KB and 11.9 KB, but range reads of only those windows fetch the same 385 KB and 82 KB, because each file is one compressed object and a window is verified against the whole of it. A positional index alone would not help; windows need range-addressable stored files (E150).
+  - All kernel tests pass (170).
+  - The fixed bench on this branch: every byte count and the north score (0.3035) as on E148; cost score 0.2427 against 0.2407, from timings only (the bench does not set exact_short_search).
+- Verdict: **kept**; on its branch until Eric says to merge. Off by default because results then rest on the index (a corrupt index would give wrong answers that a scan would not); on, a "which files mention" query costs only the index, which a server holds in memory.

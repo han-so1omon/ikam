@@ -165,6 +165,14 @@ pub struct Repo<S: Store> {
     /// only the files a goal touches instead of every tree and view chunk,
     /// and the first write no longer reads them all to index them.
     pub replace_hints: bool,
+    /// With a trigram search index, answer patterns of one to three bytes
+    /// from the postings alone (E149). Off by default. A trigram's posting
+    /// lists exactly the contents holding it, so for these patterns the
+    /// candidates are the matches and need not be decoded; contents too
+    /// short to have trigrams, and contents the index does not cover, are
+    /// still scanned. Off, every candidate is decoded and scanned, so
+    /// results never rest on the index alone.
+    pub exact_short_search: bool,
     pub(crate) hints: std::sync::Mutex<Option<Hints>>,
     /// Whether a stored tree or graph chunk may be planned as a fill of a
     /// template (E144). On by default. Off, its plans are only slices of
@@ -216,6 +224,7 @@ impl<S: Store> Repo<S> {
             read_memo: false,
             memo: Default::default(),
             replace_hints: false,
+            exact_short_search: false,
             object_templates: true,
             writing_object: false,
             hints: Default::default(),
