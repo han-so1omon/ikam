@@ -75,7 +75,11 @@ pub struct KvStore<K: Kv> {
 
 impl<K: Kv> KvStore<K> {
     pub fn new(kv: K) -> KvStore<K> {
-        KvStore { kv, pending: BTreeMap::new(), pending_bytes: 0 }
+        KvStore {
+            kv,
+            pending: BTreeMap::new(),
+            pending_bytes: 0,
+        }
     }
 
     pub fn engine(&self) -> &K {
@@ -96,10 +100,18 @@ impl<K: Kv> KvStore<K> {
         let mut ops: Vec<KvOp> = self
             .pending
             .iter()
-            .map(|(id, v)| KvOp { table: Table::Objects, key: id.as_bytes(), value: v.as_deref() })
+            .map(|(id, v)| KvOp {
+                table: Table::Objects,
+                key: id.as_bytes(),
+                value: v.as_deref(),
+            })
             .collect();
         if let (Some((name, _, _)), Some(new)) = (guard_and_ref, new.as_ref()) {
-            ops.push(KvOp { table: Table::Refs, key: name.as_bytes(), value: Some(new) });
+            ops.push(KvOp {
+                table: Table::Refs,
+                key: name.as_bytes(),
+                value: Some(new),
+            });
         }
         let guard = guard_and_ref.map(|(name, _, _)| (name, expected.as_ref().map(|e| &e[..])));
         self.kv.apply(&ops, guard)?;
@@ -145,14 +157,20 @@ impl<K: Kv> Store for KvStore<K> {
         match self.pending.get(id) {
             Some(Some(v)) => Ok(v.clone()),
             Some(None) => Err(Error::NotFound(*id)),
-            None => self.kv.get(Table::Objects, id.as_bytes())?.ok_or(Error::NotFound(*id)),
+            None => self
+                .kv
+                .get(Table::Objects, id.as_bytes())?
+                .ok_or(Error::NotFound(*id)),
         }
     }
 
     fn has(&self, id: &Id) -> bool {
         match self.pending.get(id) {
             Some(v) => v.is_some(),
-            None => self.kv.contains(Table::Objects, id.as_bytes()).unwrap_or(false),
+            None => self
+                .kv
+                .contains(Table::Objects, id.as_bytes())
+                .unwrap_or(false),
         }
     }
 
@@ -172,7 +190,11 @@ impl<K: Kv> Store for KvStore<K> {
                 out.insert(*id, v.is_some());
             }
         }
-        Ok(out.into_iter().filter(|(_, live)| *live).map(|(id, _)| id).collect())
+        Ok(out
+            .into_iter()
+            .filter(|(_, live)| *live)
+            .map(|(id, _)| id)
+            .collect())
     }
 
     fn delete(&mut self, id: &Id) -> Result<(), Error> {
@@ -243,7 +265,11 @@ pub mod sqlite {
             // On macOS, SQLite's fsync does not flush the drive's cache unless
             // asked (fullfsync is off by default); the other backends use
             // F_FULLFSYNC, so Full asks for it too, for a like-for-like test.
-            let full = if cfg!(target_os = "macos") && sync == "FULL" { "PRAGMA fullfsync=ON; PRAGMA checkpoint_fullfsync=ON;" } else { "" };
+            let full = if cfg!(target_os = "macos") && sync == "FULL" {
+                "PRAGMA fullfsync=ON; PRAGMA checkpoint_fullfsync=ON;"
+            } else {
+                ""
+            };
             conn.execute_batch(&format!(
                 "{full} PRAGMA journal_mode=WAL; PRAGMA synchronous={sync};
                  CREATE TABLE IF NOT EXISTS objects(k BLOB PRIMARY KEY, v BLOB NOT NULL);
@@ -258,19 +284,27 @@ pub mod sqlite {
         fn get(&self, t: Table, key: &[u8]) -> Result<Option<Vec<u8>>, Error> {
             let sql = format!("SELECT v FROM {} WHERE k = ?1", table(t));
             let mut st = self.conn.prepare_cached(&sql).map_err(other)?;
-            st.query_row(params![key], |r| r.get(0)).optional().map_err(other)
+            st.query_row(params![key], |r| r.get(0))
+                .optional()
+                .map_err(other)
         }
 
         fn contains(&self, t: Table, key: &[u8]) -> Result<bool, Error> {
             let sql = format!("SELECT 1 FROM {} WHERE k = ?1", table(t));
             let mut st = self.conn.prepare_cached(&sql).map_err(other)?;
-            Ok(st.query_row(params![key], |_| Ok(())).optional().map_err(other)?.is_some())
+            Ok(st
+                .query_row(params![key], |_| Ok(()))
+                .optional()
+                .map_err(other)?
+                .is_some())
         }
 
         fn keys(&self, t: Table, prefix: &[u8]) -> Result<Vec<Vec<u8>>, Error> {
             let sql = format!("SELECT k FROM {} WHERE k >= ?1 ORDER BY k", table(t));
             let mut st = self.conn.prepare_cached(&sql).map_err(other)?;
-            let rows = st.query_map(params![prefix], |r| r.get::<_, Vec<u8>>(0)).map_err(other)?;
+            let rows = st
+                .query_map(params![prefix], |r| r.get::<_, Vec<u8>>(0))
+                .map_err(other)?;
             let mut out = Vec::new();
             for k in rows {
                 let k = k.map_err(other)?;
@@ -285,18 +319,28 @@ pub mod sqlite {
         fn entries(&self, t: Table) -> Result<Vec<(Vec<u8>, Vec<u8>)>, Error> {
             let sql = format!("SELECT k, v FROM {} ORDER BY k", table(t));
             let mut st = self.conn.prepare_cached(&sql).map_err(other)?;
-            let rows = st.query_map([], |r| Ok((r.get(0)?, r.get(1)?))).map_err(other)?;
+            let rows = st
+                .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+                .map_err(other)?;
             rows.collect::<Result<_, _>>().map_err(other)
         }
 
-        fn apply(&mut self, ops: &[KvOp], guard: Option<(&str, Option<&[u8]>)>) -> Result<(), Error> {
+        fn apply(
+            &mut self,
+            ops: &[KvOp],
+            guard: Option<(&str, Option<&[u8]>)>,
+        ) -> Result<(), Error> {
             let tx = self
                 .conn
                 .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
                 .map_err(other)?;
             if let Some((name, expected)) = guard {
                 let now: Option<Vec<u8>> = tx
-                    .query_row("SELECT v FROM refs WHERE k = ?1", params![name.as_bytes()], |r| r.get(0))
+                    .query_row(
+                        "SELECT v FROM refs WHERE k = ?1",
+                        params![name.as_bytes()],
+                        |r| r.get(0),
+                    )
                     .optional()
                     .map_err(other)?;
                 if now.as_deref() != expected {
@@ -306,12 +350,21 @@ pub mod sqlite {
             for op in ops {
                 match op.value {
                     Some(v) => {
-                        let sql = format!("INSERT OR REPLACE INTO {} (k, v) VALUES (?1, ?2)", table(op.table));
-                        tx.prepare_cached(&sql).map_err(other)?.execute(params![op.key, v]).map_err(other)?;
+                        let sql = format!(
+                            "INSERT OR REPLACE INTO {} (k, v) VALUES (?1, ?2)",
+                            table(op.table)
+                        );
+                        tx.prepare_cached(&sql)
+                            .map_err(other)?
+                            .execute(params![op.key, v])
+                            .map_err(other)?;
                     }
                     None => {
                         let sql = format!("DELETE FROM {} WHERE k = ?1", table(op.table));
-                        tx.prepare_cached(&sql).map_err(other)?.execute(params![op.key]).map_err(other)?;
+                        tx.prepare_cached(&sql)
+                            .map_err(other)?
+                            .execute(params![op.key])
+                            .map_err(other)?;
                     }
                 }
             }
@@ -347,10 +400,17 @@ pub mod lmdb {
             fs::create_dir_all(dir.as_ref())?;
             // Safety: one Env per directory per process (the bake-off opens
             // each store once), and none of LMDB's unsafe flags is set.
-            let env = unsafe { EnvOpenOptions::new().map_size(MAP_SIZE).max_dbs(2).open(dir.as_ref()) }
-                .map_err(other)?;
+            let env = unsafe {
+                EnvOpenOptions::new()
+                    .map_size(MAP_SIZE)
+                    .max_dbs(2)
+                    .open(dir.as_ref())
+            }
+            .map_err(other)?;
             let mut w = env.write_txn().map_err(other)?;
-            let objects = env.create_database(&mut w, Some("objects")).map_err(other)?;
+            let objects = env
+                .create_database(&mut w, Some("objects"))
+                .map_err(other)?;
             let refs = env.create_database(&mut w, Some("refs")).map_err(other)?;
             w.commit().map_err(other)?;
             Ok(Lmdb { env, objects, refs })
@@ -396,7 +456,11 @@ pub mod lmdb {
             Ok(out)
         }
 
-        fn apply(&mut self, ops: &[KvOp], guard: Option<(&str, Option<&[u8]>)>) -> Result<(), Error> {
+        fn apply(
+            &mut self,
+            ops: &[KvOp],
+            guard: Option<(&str, Option<&[u8]>)>,
+        ) -> Result<(), Error> {
             let mut w = self.env.write_txn().map_err(other)?;
             if let Some((name, expected)) = guard
                 && self.refs.get(&w, name.as_bytes()).map_err(other)? != expected
@@ -487,12 +551,19 @@ pub mod redb_store {
             Ok(out)
         }
 
-        fn apply(&mut self, ops: &[KvOp], guard: Option<(&str, Option<&[u8]>)>) -> Result<(), Error> {
+        fn apply(
+            &mut self,
+            ops: &[KvOp],
+            guard: Option<(&str, Option<&[u8]>)>,
+        ) -> Result<(), Error> {
             let w = self.db.begin_write().map_err(other)?;
             {
                 if let Some((name, expected)) = guard {
                     let refs = w.open_table(REFS).map_err(other)?;
-                    let now = refs.get(name.as_bytes()).map_err(other)?.map(|v| v.value().to_vec());
+                    let now = refs
+                        .get(name.as_bytes())
+                        .map_err(other)?
+                        .map(|v| v.value().to_vec());
                     if now.as_deref() != expected {
                         drop(refs);
                         w.abort().map_err(other)?;
@@ -502,7 +573,11 @@ pub mod redb_store {
                 let mut objects = w.open_table(OBJECTS).map_err(other)?;
                 let mut refs = w.open_table(REFS).map_err(other)?;
                 for op in ops {
-                    let table = if op.table == Table::Objects { &mut objects } else { &mut refs };
+                    let table = if op.table == Table::Objects {
+                        &mut objects
+                    } else {
+                        &mut refs
+                    };
                     match op.value {
                         Some(v) => {
                             table.insert(op.key, v).map_err(other)?;
@@ -544,10 +619,16 @@ pub mod fjall_store {
             let objects = db
                 .keyspace("objects", || {
                     let o = KeyspaceCreateOptions::default();
-                    if separate { o.with_kv_separation(Some(KvSeparationOptions::default())) } else { o }
+                    if separate {
+                        o.with_kv_separation(Some(KvSeparationOptions::default()))
+                    } else {
+                        o
+                    }
                 })
                 .map_err(other)?;
-            let refs = db.keyspace("refs", KeyspaceCreateOptions::default).map_err(other)?;
+            let refs = db
+                .keyspace("refs", KeyspaceCreateOptions::default)
+                .map_err(other)?;
             Ok(Fjall { db, objects, refs })
         }
 
@@ -585,7 +666,11 @@ pub mod fjall_store {
             Ok(out)
         }
 
-        fn apply(&mut self, ops: &[KvOp], guard: Option<(&str, Option<&[u8]>)>) -> Result<(), Error> {
+        fn apply(
+            &mut self,
+            ops: &[KvOp],
+            guard: Option<(&str, Option<&[u8]>)>,
+        ) -> Result<(), Error> {
             // fjall locks its directory to one process, and `&mut self` makes
             // this the only writer, so checking before the batch is a true CAS.
             if let Some((name, expected)) = guard
@@ -615,7 +700,9 @@ pub mod fjall_store {
 #[cfg(feature = "store-rocksdb")]
 pub mod rocks {
     use super::*;
-    use rocksdb::{ColumnFamilyDescriptor, DB, DBCompressionType, Options, WriteBatch, WriteOptions};
+    use rocksdb::{
+        ColumnFamilyDescriptor, DB, DBCompressionType, Options, WriteBatch, WriteOptions,
+    };
 
     pub struct Rocks {
         db: DB,
@@ -681,7 +768,11 @@ pub mod rocks {
             Ok(out)
         }
 
-        fn apply(&mut self, ops: &[KvOp], guard: Option<(&str, Option<&[u8]>)>) -> Result<(), Error> {
+        fn apply(
+            &mut self,
+            ops: &[KvOp],
+            guard: Option<(&str, Option<&[u8]>)>,
+        ) -> Result<(), Error> {
             // RocksDB locks its directory to one process; `&mut self` makes this
             // the only writer, so checking before the batch is a true CAS.
             if let Some((name, expected)) = guard
@@ -731,9 +822,14 @@ struct Sealed {
 impl Sealed {
     fn entry(&self, i: u32) -> Result<(Id, u64, u32), Error> {
         let mut e = [0u8; IDX_ENTRY as usize];
-        self.idx.read_exact_at(&mut e, IDX_HEAD + i as u64 * IDX_ENTRY)?;
+        self.idx
+            .read_exact_at(&mut e, IDX_HEAD + i as u64 * IDX_ENTRY)?;
         let id = Id::from_bytes(e[..32].try_into().unwrap());
-        Ok((id, u64::from_le_bytes(e[32..40].try_into().unwrap()), u32::from_le_bytes(e[40..44].try_into().unwrap())))
+        Ok((
+            id,
+            u64::from_le_bytes(e[32..40].try_into().unwrap()),
+            u32::from_le_bytes(e[40..44].try_into().unwrap()),
+        ))
     }
 
     /// Offset and length of `id` (length `TOMBSTONE` if deleted here).
@@ -752,12 +848,14 @@ impl Sealed {
             let mid = if guesses < 6 && hi - lo > 8 && lo_key < hi_key {
                 guesses += 1;
                 let span = (hi - lo) as u128;
-                let frac = (target.saturating_sub(lo_key)) as u128 * span / (hi_key - lo_key) as u128;
+                let frac =
+                    (target.saturating_sub(lo_key)) as u128 * span / (hi_key - lo_key) as u128;
                 lo + (frac as u32).min(hi - lo - 1)
             } else {
                 lo + (hi - lo) / 2
             };
-            self.idx.read_exact_at(&mut key, IDX_HEAD + mid as u64 * IDX_ENTRY)?;
+            self.idx
+                .read_exact_at(&mut key, IDX_HEAD + mid as u64 * IDX_ENTRY)?;
             match key[..].cmp(id.as_bytes()) {
                 std::cmp::Ordering::Less => {
                     lo = mid + 1;
@@ -779,7 +877,14 @@ impl Sealed {
     fn range(&self, prefix: &[u8]) -> (u32, u32) {
         match prefix.first() {
             None => (0, self.fanout[255]),
-            Some(&b) => (if b == 0 { 0 } else { self.fanout[b as usize - 1] }, self.fanout[b as usize]),
+            Some(&b) => (
+                if b == 0 {
+                    0
+                } else {
+                    self.fanout[b as usize - 1]
+                },
+                self.fanout[b as usize],
+            ),
         }
     }
 }
@@ -818,10 +923,22 @@ impl PackStore {
         let root = root.into();
         fs::create_dir_all(root.join("packs"))?;
         fs::create_dir_all(root.join("refs"))?;
-        let lock = OpenOptions::new().create(true).truncate(false).write(true).open(root.join("LOCK"))?;
-        lock.try_lock().map_err(|_| Error::RefConflict("LOCK".into()))?;
+        let lock = OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(root.join("LOCK"))?;
+        lock.try_lock()
+            .map_err(|_| Error::RefConflict("LOCK".into()))?;
         let mut nos: Vec<u32> = fs::read_dir(root.join("packs"))?
-            .filter_map(|e| e.ok()?.file_name().to_str()?.strip_suffix(".pack")?.parse().ok())
+            .filter_map(|e| {
+                e.ok()?
+                    .file_name()
+                    .to_str()?
+                    .strip_suffix(".pack")?
+                    .parse()
+                    .ok()
+            })
             .collect();
         nos.sort();
         let mut sealed = Vec::new();
@@ -851,12 +968,27 @@ impl PackStore {
         } else {
             (HashMap::new(), 0)
         };
-        let active = OpenOptions::new().create(true).truncate(false).read(true).write(true).open(&path)?;
+        let active = OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(&path)?;
         if active.metadata()?.len() != good {
             active.set_len(good)?; // cut a torn tail
             active.sync_all()?;
         }
-        Ok(PackStore { root, sealed, active, active_no, active_index, buf: Vec::new(), flushed: good, ckpt_at: good, _lock: lock })
+        Ok(PackStore {
+            root,
+            sealed,
+            active,
+            active_no,
+            active_index,
+            buf: Vec::new(),
+            flushed: good,
+            ckpt_at: good,
+            _lock: lock,
+        })
     }
 
     fn append(&mut self, id: Id, bytes: Option<&[u8]>) -> Result<(), Error> {
@@ -866,7 +998,8 @@ impl PackStore {
         self.buf.extend_from_slice(id.as_bytes());
         self.buf.extend_from_slice(&len.to_le_bytes());
         self.buf.extend_from_slice(body);
-        self.buf.extend_from_slice(&crc(&id, len, body).to_le_bytes());
+        self.buf
+            .extend_from_slice(&crc(&id, len, body).to_le_bytes());
         self.active_index.insert(id, (off, len));
         if self.buf.len() >= 1 << 20 {
             self.flush()?;
@@ -905,12 +1038,20 @@ impl PackStore {
 
     fn seal(&mut self) -> Result<(), Error> {
         let n = self.active_no;
-        write_idx(&self.root.join(format!("packs/{n:08}.idx")), &self.active_index)?;
+        write_idx(
+            &self.root.join(format!("packs/{n:08}.idx")),
+            &self.active_index,
+        )?;
         let _ = fs::remove_file(self.root.join(format!("packs/{n:08}.ckpt")));
         self.sealed.push(open_sealed(&self.root, n)?);
         self.active_no += 1;
         let path = self.root.join(format!("packs/{:08}.pack", self.active_no));
-        self.active = OpenOptions::new().create(true).truncate(false).read(true).write(true).open(path)?;
+        self.active = OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(path)?;
         self.active_index.clear();
         self.flushed = 0;
         self.ckpt_at = 0;
@@ -953,7 +1094,11 @@ fn open_sealed(root: &Path, n: u32) -> Result<Sealed, Error> {
 
 /// Read a pack's records from `start`, stopping at the first torn or
 /// corrupt one. Returns the index and the length of the good prefix.
-fn scan(path: &Path, start: u64, mut index: HashMap<Id, (u64, u32)>) -> Result<(HashMap<Id, (u64, u32)>, u64), Error> {
+fn scan(
+    path: &Path,
+    start: u64,
+    mut index: HashMap<Id, (u64, u32)>,
+) -> Result<(HashMap<Id, (u64, u32)>, u64), Error> {
     let mut f = File::open(path)?;
     let total = f.metadata()?.len();
     f.seek(SeekFrom::Start(start))?;
@@ -1062,7 +1207,9 @@ fn write_idx(path: &Path, index: &HashMap<Id, (u64, u32)>) -> Result<(), Error> 
 
 impl Drop for PackStore {
     fn drop(&mut self) {
-        let _ = self.flush().and_then(|_| self.active.sync_data().map_err(Error::Io));
+        let _ = self
+            .flush()
+            .and_then(|_| self.active.sync_data().map_err(Error::Io));
         if self.flushed > self.ckpt_at {
             let _ = self.checkpoint();
         }
@@ -1101,7 +1248,9 @@ impl Store for PackStore {
                 }
                 let (head, rest) = rec.split_at(RECORD_HEAD as usize);
                 let (body, c) = rest.split_at(len as usize);
-                if &head[..32] != id.as_bytes() || u32::from_le_bytes(c.try_into().unwrap()) != crc(id, len, body) {
+                if &head[..32] != id.as_bytes()
+                    || u32::from_le_bytes(c.try_into().unwrap()) != crc(id, len, body)
+                {
                     return Err(Error::Corrupt(*id));
                 }
                 Ok(body.to_vec())
@@ -1134,7 +1283,11 @@ impl Store for PackStore {
                 live.insert(*id, len != TOMBSTONE);
             }
         }
-        Ok(live.into_iter().filter(|(_, l)| *l).map(|(id, _)| id).collect())
+        Ok(live
+            .into_iter()
+            .filter(|(_, l)| *l)
+            .map(|(id, _)| id)
+            .collect())
     }
 
     fn delete(&mut self, id: &Id) -> Result<(), Error> {
@@ -1161,7 +1314,10 @@ impl Store for PackStore {
         self.sync()?; // objects first, then the ref that reaches them
         let path = self.root.join("refs").join(name);
         fs::create_dir_all(path.parent().unwrap())?;
-        let tmp = path.with_file_name(format!("{}.lock", path.file_name().unwrap().to_string_lossy()));
+        let tmp = path.with_file_name(format!(
+            "{}.lock",
+            path.file_name().unwrap().to_string_lossy()
+        ));
         let mut f = File::create(&tmp)?;
         f.write_all(format!("{new}\n").as_bytes())?;
         f.sync_all()?;
@@ -1180,7 +1336,11 @@ impl Store for PackStore {
                 if e.file_type()?.is_dir() {
                     stack.push(p);
                 } else if !p.to_string_lossy().ends_with(".lock") {
-                    let name = p.strip_prefix(&base).unwrap().to_string_lossy().into_owned();
+                    let name = p
+                        .strip_prefix(&base)
+                        .unwrap()
+                        .to_string_lossy()
+                        .into_owned();
                     out.push((name, fs::read_to_string(&p)?.trim().parse()?));
                 }
             }

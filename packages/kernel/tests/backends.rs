@@ -36,7 +36,10 @@ fn contract<S: Store>(open: &dyn Fn(&Path) -> S) {
 
         assert_eq!(s.get_ref("heads/main").unwrap(), None);
         s.set_ref("heads/main", None, id(1)).unwrap();
-        assert!(s.set_ref("heads/main", None, id(2)).is_err(), "CAS rejects a stale expectation");
+        assert!(
+            s.set_ref("heads/main", None, id(2)).is_err(),
+            "CAS rejects a stale expectation"
+        );
         s.set_ref("heads/main", Some(id(1)), id(2)).unwrap();
         assert!(s.set_ref("bad/.name", None, id(1)).is_err());
         assert_eq!(s.refs().unwrap(), vec![("heads/main".to_string(), id(2))]);
@@ -57,13 +60,21 @@ fn contract<S: Store>(open: &dyn Fn(&Path) -> S) {
 /// fsck is clean, and both survive a reopen.
 fn repo_round_trip<S: Store>(open: &dyn Fn(&Path) -> S) {
     let dir = tempfile::tempdir().unwrap();
-    let text: Vec<u8> = (0..40_000u32).flat_map(|i| format!("line {i} of a test file\n").into_bytes()).collect();
+    let text: Vec<u8> = (0..40_000u32)
+        .flat_map(|i| format!("line {i} of a test file\n").into_bytes())
+        .collect();
     let (file, log) = {
         let mut repo = Repo::new(open(dir.path()));
         let put = repo.put_content(&text).unwrap();
         let empty = repo.db_empty().unwrap();
         let events: Vec<Event> = (0..300)
-            .map(|i| Event::upsert(&format!("k/{i:03}"), format!("v{i}").as_bytes(), &format!("e{i}")))
+            .map(|i| {
+                Event::upsert(
+                    &format!("k/{i:03}"),
+                    format!("v{i}").as_bytes(),
+                    &format!("e{i}"),
+                )
+            })
             .collect();
         let db = repo.db_append(&empty, &events).unwrap();
         repo.db_commit("heads/db", &db, "test").unwrap();
@@ -74,7 +85,10 @@ fn repo_round_trip<S: Store>(open: &dyn Fn(&Path) -> S) {
     assert_eq!(repo.read_content(&file).unwrap(), text);
     assert!(repo.fsck().unwrap().is_empty());
     let db = repo.db_rebuild(&log).unwrap();
-    assert_eq!(repo.db_get(&db, "k/123").unwrap().as_deref(), Some(&b"v123"[..]));
+    assert_eq!(
+        repo.db_get(&db, "k/123").unwrap().as_deref(),
+        Some(&b"v123"[..])
+    );
     assert_eq!(repo.db_scan(&db).unwrap().len(), 300);
 }
 
@@ -110,7 +124,11 @@ fn pack_store_cuts_a_torn_tail_and_keeps_what_a_ref_reached() {
     bytes.extend_from_slice(b"partial");
     std::fs::write(&pack, &bytes).unwrap();
     let s = PackStore::open(dir.path()).unwrap();
-    assert_eq!(std::fs::metadata(&pack).unwrap().len() as usize, good, "torn tail cut");
+    assert_eq!(
+        std::fs::metadata(&pack).unwrap().len() as usize,
+        good,
+        "torn tail cut"
+    );
     assert_eq!(s.read(&id(1)).unwrap(), b"durable");
     assert!(!s.has(&id(7)));
     // A flipped byte inside a record fails its checksum and is cut, with all after it.
@@ -119,7 +137,10 @@ fn pack_store_cuts_a_torn_tail_and_keeps_what_a_ref_reached() {
     bytes[40] ^= 1;
     std::fs::write(&pack, &bytes).unwrap();
     let s = PackStore::open(dir.path()).unwrap();
-    assert!(s.read(&id(1)).is_err(), "a corrupt record is never served, even one a checkpoint names");
+    assert!(
+        s.read(&id(1)).is_err(),
+        "a corrupt record is never served, even one a checkpoint names"
+    );
     // Without the checkpoint, the scan cuts it and all after it.
     drop(s);
     std::fs::remove_file(dir.path().join("packs/00000000.ckpt")).unwrap();
@@ -152,7 +173,8 @@ fn pack_store_checkpoint_opens_the_same_index_as_a_full_scan() {
             let (i, b) = blob(n);
             s.write(i, &b).unwrap();
         }
-        s.set_ref("heads/main", Some(blob(0).0), blob(5000).0).unwrap();
+        s.set_ref("heads/main", Some(blob(0).0), blob(5000).0)
+            .unwrap();
         let saved = std::fs::read(&ckpt).unwrap();
         drop(s);
         std::fs::write(&ckpt, saved).unwrap(); // as if the close never ran
@@ -227,7 +249,10 @@ fn fs_store_ref_survives_a_writer_killed_mid_update() {
         .open(dir.path().join("refs/heads/main.lock"))
         .unwrap();
     held.lock().unwrap();
-    assert!(matches!(s.set_ref("heads/main", Some(id(2)), id(3)), Err(ikam_kernel::Error::RefConflict(_))));
+    assert!(matches!(
+        s.set_ref("heads/main", Some(id(2)), id(3)),
+        Err(ikam_kernel::Error::RefConflict(_))
+    ));
     drop(held);
     s.set_ref("heads/main", Some(id(2)), id(3)).unwrap();
 }

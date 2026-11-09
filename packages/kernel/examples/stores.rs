@@ -132,7 +132,9 @@ fn disk(dir: &Path) -> (u64, u64, u64) {
     let (mut files, mut len, mut alloc) = (0, 0, 0);
     let mut stack = vec![dir.to_path_buf()];
     while let Some(d) = stack.pop() {
-        let Ok(rd) = std::fs::read_dir(&d) else { continue };
+        let Ok(rd) = std::fs::read_dir(&d) else {
+            continue;
+        };
         for e in rd.flatten() {
             let m = e.metadata().unwrap();
             if m.is_dir() {
@@ -153,13 +155,21 @@ fn files_state(dir: &Path) -> BTreeMap<PathBuf, (u64, i128)> {
     let mut out = BTreeMap::new();
     let mut stack = vec![dir.to_path_buf()];
     while let Some(d) = stack.pop() {
-        let Ok(rd) = std::fs::read_dir(&d) else { continue };
+        let Ok(rd) = std::fs::read_dir(&d) else {
+            continue;
+        };
         for e in rd.flatten() {
             let m = e.metadata().unwrap();
             if m.is_dir() {
                 stack.push(e.path());
             } else {
-                out.insert(e.path(), (m.len(), m.mtime() as i128 * 1_000_000_000 + m.mtime_nsec() as i128));
+                out.insert(
+                    e.path(),
+                    (
+                        m.len(),
+                        m.mtime() as i128 * 1_000_000_000 + m.mtime_nsec() as i128,
+                    ),
+                );
             }
         }
     }
@@ -210,7 +220,12 @@ fn wanted(arg: Option<&String>) -> Vec<&'static str> {
 
 fn corpus(src: &Path, work: &Path, only: Option<&String>) {
     let source = FsStore::open(src).unwrap();
-    let mut objects: Vec<(Id, Vec<u8>)> = source.ids().unwrap().into_iter().map(|id| (id, source.read(&id).unwrap())).collect();
+    let mut objects: Vec<(Id, Vec<u8>)> = source
+        .ids()
+        .unwrap()
+        .into_iter()
+        .map(|id| (id, source.read(&id).unwrap()))
+        .collect();
     objects.sort_by_key(|(id, _)| *id);
     let bytes: u64 = objects.iter().map(|(_, b)| b.len() as u64).sum();
     let mut order: Vec<usize> = (0..objects.len()).collect();
@@ -264,7 +279,11 @@ fn events(rng: &mut Rng, from: u64, n: u64) -> Vec<Event> {
         .map(|i| {
             let key = format!("k/{:05}", rng.below(5_000));
             let len = 16 + rng.below(400) as usize;
-            let value: Vec<u8> = format!("{i}:").into_bytes().into_iter().chain(rng.bytes(len)).collect();
+            let value: Vec<u8> = format!("{i}:")
+                .into_bytes()
+                .into_iter()
+                .chain(rng.bytes(len))
+                .collect();
             Event::upsert(&key, &value, &format!("e{i}"))
         })
         .collect()
@@ -294,21 +313,29 @@ fn db(work: &Path, only: Option<&String>) {
         }
         let t = Instant::now();
         for b in 0..10 {
-            d = repo.db_append(&d, &events(&mut rng, 1_000 + b * 1_000, 1_000)).unwrap();
+            d = repo
+                .db_append(&d, &events(&mut rng, 1_000 + b * 1_000, 1_000))
+                .unwrap();
             repo.db_commit("heads/db", &d, "batch").unwrap();
         }
         let batch = t.elapsed();
         let rebuilt = repo.db_rebuild(&d.log).unwrap();
-        assert!(rebuilt.ids == d.ids && rebuilt.kv == d.kv, "{name}: rebuild differs");
+        assert!(
+            rebuilt.ids == d.ids && rebuilt.kv == d.kv,
+            "{name}: rebuild differs"
+        );
         drop(repo);
         // Bare ref swaps: nothing else waiting to commit.
         let mut s = open(name, &dir);
         let mut prev = s.get_ref("heads/db").unwrap();
-        let ids: Vec<Id> = (0..1_000u32).map(|i| Id::from_bytes(*blake3::hash(&i.to_le_bytes()).as_bytes())).collect();
+        let ids: Vec<Id> = (0..1_000u32)
+            .map(|i| Id::from_bytes(*blake3::hash(&i.to_le_bytes()).as_bytes()))
+            .collect();
         let mut swaps = Vec::new();
         for id in &ids {
             let t = Instant::now();
-            s.set_ref("heads/swap", prev.filter(|_| swaps.len() > 0), *id).unwrap();
+            s.set_ref("heads/swap", prev.filter(|_| swaps.len() > 0), *id)
+                .unwrap();
             swaps.push(ms(t.elapsed()) * 1e3);
             prev = Some(*id);
         }
@@ -417,7 +444,9 @@ fn crash_child(name: &str, dir: &Path) {
         let before = repo.store().get_ref("heads/db").unwrap();
         if let Err(e) = repo.db_commit("heads/db", &d, "crash") {
             let now = repo.store().get_ref("heads/db").unwrap();
-            eprintln!("{name}: child commit failed after {seq} events: {e}; ref before {before:?}, now {now:?}");
+            eprintln!(
+                "{name}: child commit failed after {seq} events: {e}; ref before {before:?}, now {now:?}"
+            );
             std::process::exit(3);
         }
         seq = repo.db_head(&d.log).unwrap();
@@ -462,7 +491,13 @@ fn crash(work: &Path, name: &str, kills: u32) {
         let mut repo = Repo::new(open(name, &dir));
         let head = repo.store().get_ref("heads/db").unwrap();
         let verdict = (|| -> Result<u64, String> {
-            let Some(c) = head else { return if acked == 0 { Ok(0) } else { Err("ref lost".into()) } };
+            let Some(c) = head else {
+                return if acked == 0 {
+                    Ok(0)
+                } else {
+                    Err("ref lost".into())
+                };
+            };
             let d = repo.db_at(&c).map_err(|e| e.to_string())?;
             let seq = repo.db_head(&d.log).map_err(|e| e.to_string())?;
             if seq < acked {
