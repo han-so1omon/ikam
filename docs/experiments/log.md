@@ -1874,5 +1874,13 @@ Newest last. Format and rules: `README.md`.
 - Change: `Live::gc` (commits pending edits, runs `Repo::gc`, re-measures the store for `--max-store`, re-stores the empty working tree when nothing is committed, as repack does); `POST /api/gc` (a write: password and `X-Ikam` header; guests get 401); option `--gc-every N` runs it after every N commits, off by default. `realworld/selftest.py` adds check 11, "gc frees space and keeps every file", and a guest refusal for `POST /api/gc`.
 - Result: unit tests (garbage freed by more than half and every committed version reads back; `--gc-every 2` shrinks the store on commits 2 and 4; gc of an empty store then edits). Eight self-test runs against a local `--public` copy: 11 of 11 checks each, gc deletes ~130 objects a run, the store grows about 2 KB a run (history) instead of ~5 KB. `ikam gc` takes 0.06 s on a 9 MB store of 1849 objects. Tests, clippy and fmt clean.
 - Not settled here: history is never dropped, so the test copy still grows about 2 KB a run (about 3 MB a year at four runs a day, well under its 1 GB cap).
-- Verdict: **kept** on its branch; merge waits on Eric's yes.
+- Verdict: **kept**; merged to main on Eric's yes (Nov 9).
+
+### E117 bench-shallow (the full bench crashes on a shallow clone)
+- Branch / parent: exp/117-bench-shallow / main at 30d2042 (E115)
+- Question (noted Nov 8): `cargo run --release --example bench` on a fresh `git clone --depth 1` panics with "attempt to calculate the remainder with a divisor of zero" in `grep_queries`, after the earlier corpora have run.
+- Cause: four corpora are built from this repository's own history at pinned commits (repo-history at 6cd6921; repo-graph, structured and transcripts at 0ca74e4). A shallow clone lacks those commits, `git rev-list` fails quietly, and repo-history comes out with no files. A partly deepened clone is worse: the commits exist with only part of their history, so a corpus comes out short and the run scores a different corpus without saying so.
+- Change: before any work, the bench counts each pinned commit's history (`git rev-list --count`, 9 and 38 commits) for the corpora selected, and if one is missing or short, prints which corpora, which commit and how much history it has, and `git fetch --unshallow`, then exits with status 2. Naming only other corpora still runs. `grep_queries` asserts it has files instead of dividing by zero.
+- Result: depth 1: fails at once naming all four corpora; depth 150: "commit 6cd6921 is missing; transcripts (commit 0ca74e4 has 21 of 38 commits of history)"; `md pdf` alone runs; after `git fetch --unshallow`, repo-history runs as before (exact, fsck clean). Measurement unchanged. Tests, clippy and fmt clean.
+- Verdict: **kept**; merged to main on Eric's yes (Nov 9).
 

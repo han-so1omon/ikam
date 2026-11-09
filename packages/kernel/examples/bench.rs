@@ -105,6 +105,66 @@ fn synthetic_history() -> Vec<Snapshot> {
         .collect()
 }
 
+/// The commits the history corpora are built from, each with the number of
+/// commits from it back to the first. A shallow clone has none of them, or
+/// only the newest part of their history, and the corpora would come out
+/// empty or short.
+const PINNED: [(&str, usize); 2] = [("6cd6921", 9), ("0ca74e4", 38)];
+
+/// The corpora read from this repository's git history, and the commit each
+/// is pinned to.
+const FROM_HISTORY: [(&str, &str); 4] = [
+    ("repo-history", "6cd6921"),
+    ("repo-graph", "0ca74e4"),
+    ("structured", "0ca74e4"),
+    ("transcripts", "0ca74e4"),
+];
+
+/// Why the selected corpora can't be built from this clone, if they can't:
+/// each pinned commit's whole history must be present.
+fn missing_history(selected: &dyn Fn(&str) -> bool) -> Option<String> {
+    let root = repo_root();
+    let mut missing = Vec::new();
+    for (pin, want) in PINNED {
+        let names: Vec<&str> = FROM_HISTORY
+            .iter()
+            .filter(|(name, p)| *p == pin && selected(name))
+            .map(|(name, _)| *name)
+            .collect();
+        if names.is_empty() {
+            continue;
+        }
+        let got = Command::new("git")
+            .args(["rev-list", "--count", pin])
+            .current_dir(&root)
+            .output()
+            .ok()
+            .filter(|o| o.status.success())
+            .and_then(|o| {
+                String::from_utf8(o.stdout)
+                    .ok()?
+                    .trim()
+                    .parse::<usize>()
+                    .ok()
+            });
+        if got != Some(want) {
+            let have = got.map_or("is missing".to_string(), |n| {
+                format!("has {n} of {want} commits of history")
+            });
+            missing.push(format!("{} (commit {pin} {have})", names.join(", ")));
+        }
+    }
+    (!missing.is_empty()).then(|| {
+        format!(
+            "this clone lacks the git history some corpora are built from: {}.\n\
+             A shallow clone has only its newest commits. Fetch the rest with\n\
+             \n    git fetch --unshallow\n\n\
+             and run again, or name only the other corpora.",
+            missing.join("; ")
+        )
+    })
+}
+
 /// This repository's history before the kernel existed (fixed commits).
 fn repo_history() -> Vec<Snapshot> {
     let root = repo_root();
@@ -773,6 +833,7 @@ fn search_cost(repo: &Repo<MemStore>, snapshots: &[Snapshot]) -> (usize, bool) {
 /// line of a random distinct file, as the agent trace of E050 searched.
 fn grep_queries(files: &BTreeMap<Id, &Vec<u8>>, n: usize, seed: u64) -> Vec<Vec<u8>> {
     let ids: Vec<&Id> = files.keys().collect();
+    assert!(!ids.is_empty(), "grep_queries: the corpus has no files");
     let mut s = seed;
     let mut lcg = move || {
         s = s
@@ -1675,6 +1736,12 @@ fn main() {
         ("transcripts", transcripts, false),
         ("multiformat", multiformat, false),
     ];
+    // Before any work: a corpus built from a missing history would come out
+    // empty or short, and the run would fail or score a different corpus.
+    if let Some(why) = missing_history(&|name| only.is_empty() || only.iter().any(|o| *o == name)) {
+        eprintln!("bench: {why}");
+        std::process::exit(2);
+    }
     let (mut log_cost, mut log_ratio, mut log_read, mut log_bytes, mut n, mut total_ms) =
         (0.0, 0.0, 0.0, 0.0, 0, 0);
     for (name, build, graph) in corpora {
