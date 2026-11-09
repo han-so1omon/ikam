@@ -245,6 +245,60 @@ impl<S: Store> Repo<S> {
         Ok(out)
     }
 
+    /// `graph_prefix` of the graph that `graph_edit(root, pending)` would
+    /// make, without making it (E148): the stored nodes, overridden or
+    /// dropped by `pending`. A server can keep a view's new edits pending
+    /// and fold them in with one `graph_edit` every few goals; reads see
+    /// the same nodes either way.
+    pub fn graph_prefix_pending(
+        &self,
+        root: &Id,
+        pending: &BTreeMap<String, Option<Node>>,
+        prefix: &str,
+    ) -> Result<Vec<Node>, Error> {
+        let mut out: BTreeMap<String, Node> = self
+            .graph_prefix(root, prefix)?
+            .into_iter()
+            .map(|n| (n.label.clone(), n))
+            .collect();
+        for (label, node) in pending
+            .range(prefix.to_string()..)
+            .take_while(|(l, _)| l.starts_with(prefix))
+        {
+            match node {
+                Some(n) => {
+                    let mut n = n.clone();
+                    n.edges.sort();
+                    n.edges.dedup();
+                    out.insert(label.clone(), n);
+                }
+                None => {
+                    out.remove(label);
+                }
+            }
+        }
+        Ok(out.into_values().collect())
+    }
+
+    /// `graph_node` of the graph that `graph_edit(root, pending)` would make.
+    pub fn graph_node_pending(
+        &self,
+        root: &Id,
+        pending: &BTreeMap<String, Option<Node>>,
+        label: &str,
+    ) -> Result<Option<Node>, Error> {
+        match pending.get(label) {
+            Some(Some(n)) => {
+                let mut n = n.clone();
+                n.edges.sort();
+                n.edges.dedup();
+                Ok(Some(n))
+            }
+            Some(None) => Ok(None),
+            None => self.graph_node(root, label),
+        }
+    }
+
     fn collect_prefix(&self, id: &Id, prefix: &str, out: &mut Vec<Node>) -> Result<(), Error> {
         match self.graph_chunk(id)? {
             Graph::Nodes(nodes) => {

@@ -217,3 +217,9 @@ it is an on-disk addition and waits on a decision.
 | Setting | Default | Trade | Measured |
 | --- | --- | --- | --- |
 | `Store::stored_len` | provided; reads the object | a backend that answers from its index saves one read per old chunk whose bytes a batch already holds; a backend that keeps the default behaves as before | E133's first goal in a batch: edit stage 70 KB to 8 KB, the goal 1.13 MB to 1.07 MB; bytes written unchanged |
+
+## A view's edits kept pending (E148)
+
+| Setting | Default | Trade | Measured |
+| --- | --- | --- | --- |
+| `graph_prefix_pending` / `graph_node_pending`, fold with `graph_edit_with` | the caller edits the view in every goal | lookups merge the pending edits in memory; the view on disk lags until the next fold | E133's first goal: view update 405 KB to 22 KB, 150 ms to 37 ms on packs; one fold for two goals 445 KB against 744 KB, same root |

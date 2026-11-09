@@ -390,6 +390,9 @@ fn main() {
         // E145: the same, with a goal's writes in one batch that is handed
         // the files the read session decoded.
         ("recommended_batch", true, false),
+        // E148: the same, with new reverse edges kept pending and folded
+        // into the view once, after the last goal.
+        ("recommended_deferred_view", true, false),
     ] {
         // IKAM_CONFIG=name runs only that configuration.
         if std::env::var("IKAM_CONFIG").is_ok_and(|c| c != config) {
@@ -403,11 +406,14 @@ fn main() {
                 | "recommended_shared_session"
                 | "recommended_no_object_templates"
                 | "recommended_batch"
+                | "recommended_deferred_view"
         );
-        let batch = config == "recommended_batch";
+        let deferred = config == "recommended_deferred_view";
+        let batch = config == "recommended_batch" || deferred;
+        let mut pending: BTreeMap<String, Option<Node>> = BTreeMap::new();
         repo.object_templates = !matches!(
             config,
-            "recommended_no_object_templates" | "recommended_batch"
+            "recommended_no_object_templates" | "recommended_batch" | "recommended_deferred_view"
         );
         repo.read_memo = config == "recommended_read_memo" || hints;
         repo.replace_hints = hints;
@@ -456,6 +462,7 @@ fn main() {
                 "recommended_shared_session"
                     | "recommended_no_object_templates"
                     | "recommended_batch"
+                    | "recommended_deferred_view"
             )
             .then(|| repo.session(64 << 20));
             let (hits, _) = match &shared {
@@ -619,7 +626,11 @@ fn main() {
             repo.store().by_tag.lock().unwrap().clear();
             repo.store().seen.lock().unwrap().clear();
             repo.store().repeats.swap(0, Relaxed);
-            view = repo.graph_edit_with(&view, ed, Keys::Any).unwrap();
+            if deferred {
+                pending.extend(ed);
+            } else {
+                view = repo.graph_edit_with(&view, ed, Keys::Any).unwrap();
+            }
             repo.end_batch(began);
             let tags: Vec<String> = repo
                 .store()
@@ -659,7 +670,49 @@ fn main() {
                 ),
             );
             known.extend(repo.store().inner.ids().unwrap());
+            // E148: who links to each edited file's old version, from the
+            // view and the pending edges.
+            if batch {
+                repo.store().take();
+                let t = Instant::now();
+                let mut found = 0;
+                for f in &chosen {
+                    let prefix = format!("{}/", f.1);
+                    found += repo
+                        .graph_prefix_pending(&view, &pending, &prefix)
+                        .unwrap()
+                        .len();
+                }
+                let io = repo.store().take();
+                println!(
+                    "{{\"exp\":\"E148\",\"config\":\"{config}\",\"goal\":\"{}\",\"part\":\"reverse_lookups\",\"files\":{},\"found\":{found},\"pending\":{},\"reads\":{},\"fetched\":{},\"ms\":{:.2}}}",
+                    g.term,
+                    chosen.len(),
+                    pending.len(),
+                    io.reads,
+                    io.bytes,
+                    t.elapsed().as_secs_f64() * 1e3
+                );
+            }
         }
+        if deferred {
+            repo.store().take();
+            let t = Instant::now();
+            let before = repo.bytes_written;
+            let edges = pending.len();
+            view = repo
+                .graph_edit_with(&view, std::mem::take(&mut pending), Keys::Any)
+                .unwrap();
+            let written = repo.bytes_written - before;
+            line(
+                &repo,
+                "-",
+                "fold_view",
+                t.elapsed().as_secs_f64() * 1e3,
+                format!(",\"new_edges\":{edges},\"written\":{written}"),
+            );
+        }
+        println!("{{\"exp\":\"E148\",\"config\":\"{config}\",\"final_view\":\"{view}\"}}");
         assert!(repo.fsck().unwrap().is_empty());
     }
 }
