@@ -1866,3 +1866,12 @@ Newest last. Format and rules: `README.md`.
 - Result: unit test; manual: public copy 200 `Allow: /`, results still 200, PUT on /robots.txt 401; private copy 200 `Disallow: /`, everything else still 401, unknown Host 403. Tests, clippy and fmt clean.
 - Not settled here: if the reader looks for robots.txt on the default port (443, the private copy, not on Funnel), this does not help; that would need the test copy on its own name on 443.
 - Verdict: **kept**; merged to main on Eric's yes (Nov 9).
+
+### E117 bench-shallow (the full bench crashes on a shallow clone)
+- Branch / parent: exp/117-bench-shallow / main at 30d2042 (E115)
+- Question (noted Nov 8): `cargo run --release --example bench` on a fresh `git clone --depth 1` panics with "attempt to calculate the remainder with a divisor of zero" in `grep_queries`, after the earlier corpora have run.
+- Cause: four corpora are built from this repository's own history at pinned commits (repo-history at 6cd6921; repo-graph, structured and transcripts at 0ca74e4). A shallow clone lacks those commits, `git rev-list` fails quietly, and repo-history comes out with no files. A partly deepened clone is worse: the commits exist with only part of their history, so a corpus comes out short and the run scores a different corpus without saying so.
+- Change: before any work, the bench counts each pinned commit's history (`git rev-list --count`, 9 and 38 commits) for the corpora selected, and if one is missing or short, prints which corpora, which commit and how much history it has, and `git fetch --unshallow`, then exits with status 2. Naming only other corpora still runs. `grep_queries` asserts it has files instead of dividing by zero.
+- Result: depth 1: fails at once naming all four corpora; depth 150: "commit 6cd6921 is missing; transcripts (commit 0ca74e4 has 21 of 38 commits of history)"; `md pdf` alone runs; after `git fetch --unshallow`, repo-history runs as before (exact, fsck clean). Measurement unchanged. Tests, clippy and fmt clean.
+- Verdict: **kept** on its branch; merge waits on Eric's yes.
+
