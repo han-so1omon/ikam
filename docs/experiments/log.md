@@ -1893,7 +1893,7 @@ Newest last. Format and rules: `README.md`.
   - Bench: all 14 corpora exact, fsck clean; north 0.3035 (unchanged); cost score 0.2389 (E110's runs 0.2434 to 0.2516; an append-cost test ran alongside at the start). Nothing in ingest or repack changed.
   - Append cost (ignored test `append_cost`): 1,000 single appends 6.2 s (8.5 ms each at the end); batches of 100, 0.21 s; 10,000 in batches of 1,000, 1.9 s (202 ms for the last batch). Every append rebuilds the three graphs, so cost grows with the database.
 - Not settled here: in-place prolly edits (so an append touches one path), whether a reused idempotency key with different bytes should be an error (April skipped it), and the ledger scan at open.
-- Verdict: on its branch until Eric says to merge.
+- Verdict: **kept**; merged to main on Eric's yes (Nov 9).
 
 ### E119 db-inplace (graph edits that touch only the chunks an edit falls in)
 - Branch / parent: exp/db-inplace / exp/db-log-view at e8ee290 (E118)
@@ -1904,7 +1904,7 @@ Newest last. Format and rules: `README.md`.
   - Append cost (`append_cost`, release, nothing else running): 1,000 single appends 6.3 s -> 3.1 s (last 9.5 -> 3.0 ms); batches of 100, 0.25 -> 0.20 s; 10,000 in batches of 1,000, 2.1 -> 1.8 s; 10,000 single appends 48 s, last 4.7 ms (not run before: about 10 minutes by extrapolation). Objects and bytes written unchanged.
   - Most of the remaining cost is the slice search when a new chunk is stored. Measured with it off (read weight 1.0, not committed): 1,000 single appends 0.9 s and 7.9 MB stored instead of 3.3 MB.
 - Not settled here: storing new chunks plain on the fast path and leaving slices to repack (an option to measure next); reading every chunk above the leaves per edit (fine below about a million keys); clash checks for label keys outside the rewritten chunks.
-- Verdict: on its branch until Eric says to merge.
+- Verdict: **kept**; merged to main on Eric's yes (Nov 9).
 
 ### E120 db-loose-ends (label clashes and path-only reads in in-place edits)
 - Branch / parent: exp/db-inplace / E119 at 05035da
@@ -1915,5 +1915,5 @@ Newest last. Format and rules: `README.md`.
   - One edit: 1M keys 10 to 11 ms and about 310 reads -> 2.1 to 2.3 ms and 45 to 55; 10M keys 94 to 105 ms and about 2,700 reads -> 2.2 to 2.4 ms and 45 to 47 (one run 8.8 ms). Upper chunks read per edit: 131 and 1,321 -> 3.
   - Append cost unchanged at its sizes: 1,000 single appends 3.3 s (last 2.9 ms); 10,000, 48 s (last 5.7 ms).
 - Not settled here: `graph_edit` with `Keys::Unique` still checks only the chunks it rewrites (a key index for the log is an option past about 100M events); fsck does not check label keys; storing new chunks plain on the fast path.
-- Verdict: on its branch until Eric says to merge.
+- Verdict: **kept**; merged to main on Eric's yes (Nov 9).
 
