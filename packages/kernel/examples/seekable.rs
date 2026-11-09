@@ -114,8 +114,9 @@ fn main() {
                 let n = b.len().div_ceil(frame).max(1);
                 let mut wanted = vec![false; n];
                 for r in windows_around(b, term.as_bytes(), 2) {
-                    for f in (r.start as usize / frame)..=((r.end as usize - 1) / frame) {
-                        wanted[f] = true;
+                    let (first, last) = (r.start as usize / frame, (r.end as usize - 1) / frame);
+                    for w in &mut wanted[first..=last] {
+                        *w = true;
                     }
                 }
                 let mut runs = 0;

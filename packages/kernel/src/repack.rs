@@ -126,6 +126,10 @@ impl<S: Store + Sync> Repo<S> {
             h.update(b"slow_codec_max")
                 .update(&self.slow_codec_max.to_le_bytes());
         }
+        if self.group_size != crate::group::GROUP_SIZE {
+            h.update(b"group_size")
+                .update(&(self.group_size as u64).to_le_bytes());
+        }
         Ok(Id::from_bytes(*h.finalize().as_bytes()))
     }
 
@@ -272,6 +276,7 @@ impl<S: Store + Sync> Repo<S> {
         fresh.short_records = self.short_records;
         fresh.markup_layers = self.markup_layers;
         fresh.slow_codec_max = self.slow_codec_max;
+        fresh.group_size = self.group_size;
         fresh.deflate_memo = self.deflate_memo.clone();
         fresh.proposed_order = self.proposed_order.clone();
         if let Some(dict) = dict {

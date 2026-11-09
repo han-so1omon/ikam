@@ -118,6 +118,13 @@ pub struct Repo<S: Store> {
     /// but four times the decode work). Set, a large content can be stored
     /// a few percent larger where brotli would have won.
     pub slow_codec_max: usize,
+    /// The largest group repack packs small contents into (E151), 64 KiB
+    /// by default. Reading one member fetches its whole group, so smaller
+    /// groups fetch less per file read (E133's first goal reads its files in
+    /// 208 KB at 16 KiB against 385 KB at 64 KiB) and store more where
+    /// contents share context across files (the north corpora 2% larger
+    /// at 16 KiB). Stores packed either way read the same.
+    pub group_size: usize,
     /// Keep the set of ids stored encodings name (groups, contexts,
     /// dictionaries) in memory, so ingest can drop a superseded stored copy
     /// without reading every stored object first (E129). Off by default.
@@ -216,6 +223,7 @@ impl<S: Store> Repo<S> {
             short_records: false,
             markup_layers: false,
             slow_codec_max: usize::MAX,
+            group_size: crate::group::GROUP_SIZE,
             needed_index: false,
             needed: Default::default(),
             seed_scope: None,
