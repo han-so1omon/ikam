@@ -240,8 +240,12 @@ pub mod sqlite {
                 Sync::Full => "FULL",
                 Sync::Normal => "NORMAL",
             };
+            // On macOS, SQLite's fsync does not flush the drive's cache unless
+            // asked (fullfsync is off by default); the other backends use
+            // F_FULLFSYNC, so Full asks for it too, for a like-for-like test.
+            let full = if cfg!(target_os = "macos") && sync == "FULL" { "PRAGMA fullfsync=ON; PRAGMA checkpoint_fullfsync=ON;" } else { "" };
             conn.execute_batch(&format!(
-                "PRAGMA journal_mode=WAL; PRAGMA synchronous={sync};
+                "{full} PRAGMA journal_mode=WAL; PRAGMA synchronous={sync};
                  CREATE TABLE IF NOT EXISTS objects(k BLOB PRIMARY KEY, v BLOB NOT NULL);
                  CREATE TABLE IF NOT EXISTS refs(k BLOB PRIMARY KEY, v BLOB NOT NULL);"
             ))
@@ -709,6 +713,8 @@ pub mod rocks {
 
 /// A pack is sealed (indexed, then never written again) once it reaches this size.
 pub const PACK_SEAL_BYTES: u64 = 512 << 20;
+/// The open pack's index is checkpointed after this many new bytes, and on close.
+pub const PACK_CKPT_BYTES: u64 = 64 << 20;
 const TOMBSTONE: u32 = u32::MAX;
 const RECORD_HEAD: u64 = 32 + 4;
 const IDX_MAGIC: &[u8; 8] = b"ikamidx1";
@@ -775,6 +781,7 @@ pub struct PackStore {
     active_index: HashMap<Id, (u64, u32)>,
     buf: Vec<u8>,
     flushed: u64,
+    ckpt_at: u64, // where the open pack's last checkpoint ends
     _lock: File,
 }
 
@@ -803,7 +810,7 @@ impl PackStore {
             let idx_path = root.join(format!("packs/{n:08}.idx"));
             if !idx_path.exists() && Some(n) != last {
                 // Sealing was cut short: rebuild the index from the pack.
-                let (index, _) = scan(&root.join(format!("packs/{n:08}.pack")))?;
+                let (index, _) = scan(&root.join(format!("packs/{n:08}.pack")), 0, HashMap::new())?;
                 write_idx(&idx_path, &index)?;
             }
             if idx_path.exists() {
@@ -816,13 +823,20 @@ impl PackStore {
             None => 0,
         };
         let path = root.join(format!("packs/{active_no:08}.pack"));
-        let (active_index, good) = if path.exists() { scan(&path)? } else { (HashMap::new(), 0) };
+        let ckpt = root.join(format!("packs/{active_no:08}.ckpt"));
+        let (active_index, good) = if path.exists() {
+            let len = fs::metadata(&path)?.len();
+            let (index, start) = read_ckpt(&ckpt, len).unwrap_or_default();
+            scan(&path, start, index)?
+        } else {
+            (HashMap::new(), 0)
+        };
         let active = OpenOptions::new().create(true).truncate(false).read(true).write(true).open(&path)?;
         if active.metadata()?.len() != good {
             active.set_len(good)?; // cut a torn tail
             active.sync_all()?;
         }
-        Ok(PackStore { root, sealed, active, active_no, active_index, buf: Vec::new(), flushed: good, _lock: lock })
+        Ok(PackStore { root, sealed, active, active_no, active_index, buf: Vec::new(), flushed: good, ckpt_at: good, _lock: lock })
     }
 
     fn append(&mut self, id: Id, bytes: Option<&[u8]>) -> Result<(), Error> {
@@ -855,19 +869,31 @@ impl PackStore {
         self.active.sync_data()?;
         if self.flushed >= PACK_SEAL_BYTES {
             self.seal()?;
+        } else if self.flushed - self.ckpt_at >= PACK_CKPT_BYTES {
+            self.checkpoint()?;
         }
+        Ok(())
+    }
+
+    /// Save the open pack's index, so the next open scans only what follows.
+    fn checkpoint(&mut self) -> Result<(), Error> {
+        let path = self.root.join(format!("packs/{:08}.ckpt", self.active_no));
+        write_ckpt(&path, &self.active_index, self.flushed)?;
+        self.ckpt_at = self.flushed;
         Ok(())
     }
 
     fn seal(&mut self) -> Result<(), Error> {
         let n = self.active_no;
         write_idx(&self.root.join(format!("packs/{n:08}.idx")), &self.active_index)?;
+        let _ = fs::remove_file(self.root.join(format!("packs/{n:08}.ckpt")));
         self.sealed.push(open_sealed(&self.root, n)?);
         self.active_no += 1;
         let path = self.root.join(format!("packs/{:08}.pack", self.active_no));
         self.active = OpenOptions::new().create(true).truncate(false).read(true).write(true).open(path)?;
         self.active_index.clear();
         self.flushed = 0;
+        self.ckpt_at = 0;
         Ok(())
     }
 
@@ -905,17 +931,18 @@ fn open_sealed(root: &Path, n: u32) -> Result<Sealed, Error> {
     Ok(Sealed { pack, idx, fanout })
 }
 
-/// Read a pack's records, stopping at the first torn or corrupt one.
-/// Returns the index and the length of the good prefix.
-fn scan(path: &Path) -> Result<(HashMap<Id, (u64, u32)>, u64), Error> {
-    let mut f = io::BufReader::with_capacity(1 << 20, File::open(path)?);
-    let total = f.get_ref().metadata()?.len();
-    let mut index = HashMap::new();
-    let mut off = 0u64;
+/// Read a pack's records from `start`, stopping at the first torn or
+/// corrupt one. Returns the index and the length of the good prefix.
+fn scan(path: &Path, start: u64, mut index: HashMap<Id, (u64, u32)>) -> Result<(HashMap<Id, (u64, u32)>, u64), Error> {
+    let mut f = File::open(path)?;
+    let total = f.metadata()?.len();
+    f.seek(SeekFrom::Start(start))?;
+    // Records are read in order, so one buffered pass with no seeks.
+    let mut f = io::BufReader::with_capacity(1 << 20, f);
+    let mut off = start;
     let mut head = [0u8; RECORD_HEAD as usize];
     let mut body = Vec::new();
     while off + RECORD_HEAD + 4 <= total {
-        f.seek(SeekFrom::Start(off))?;
         f.read_exact(&mut head)?;
         let id = Id::from_bytes(head[..32].try_into().unwrap());
         let len = u32::from_le_bytes(head[32..36].try_into().unwrap());
@@ -936,7 +963,50 @@ fn scan(path: &Path) -> Result<(HashMap<Id, (u64, u32)>, u64), Error> {
     Ok((index, off))
 }
 
-fn write_idx(path: &Path, index: &HashMap<Id, (u64, u32)>) -> Result<(), Error> {
+/// A checkpoint of the open pack's index: the index file's bytes for the
+/// records before `covers`, then `covers` (u64) and a BLAKE3 hash of all of
+/// it. Open loads it and scans only what came after; a missing, torn or
+/// stale checkpoint only means a longer scan.
+fn write_ckpt(path: &Path, index: &HashMap<Id, (u64, u32)>, covers: u64) -> Result<(), Error> {
+    let mut out = idx_bytes(index);
+    out.extend_from_slice(&covers.to_le_bytes());
+    let h = blake3::hash(&out);
+    out.extend_from_slice(h.as_bytes());
+    let tmp = path.with_extension("ckpt.tmp");
+    fs::write(&tmp, &out)?;
+    fs::rename(&tmp, path)?; // no fsync: losing it costs a scan, nothing more
+    Ok(())
+}
+
+fn read_ckpt(path: &Path, pack_len: u64) -> Option<(HashMap<Id, (u64, u32)>, u64)> {
+    let b = fs::read(path).ok()?;
+    if b.len() < (IDX_HEAD + 8 + 32) as usize || &b[..8] != IDX_MAGIC {
+        return None;
+    }
+    let (body, hash) = b.split_at(b.len() - 32);
+    if blake3::hash(body).as_bytes() != hash {
+        return None;
+    }
+    let count = u64::from_le_bytes(body[8..16].try_into().ok()?) as usize;
+    if body.len() != IDX_HEAD as usize + count * IDX_ENTRY as usize + 8 {
+        return None;
+    }
+    let covers = u64::from_le_bytes(body[body.len() - 8..].try_into().ok()?);
+    if covers > pack_len {
+        return None; // the pack lost records the checkpoint names
+    }
+    let mut index = HashMap::with_capacity(count);
+    for i in 0..count {
+        let e = &body[IDX_HEAD as usize + i * IDX_ENTRY as usize..][..IDX_ENTRY as usize];
+        let id = Id::from_bytes(e[..32].try_into().ok()?);
+        let off = u64::from_le_bytes(e[32..40].try_into().ok()?);
+        let len = u32::from_le_bytes(e[40..44].try_into().ok()?);
+        index.insert(id, (off, len));
+    }
+    Some((index, covers))
+}
+
+fn idx_bytes(index: &HashMap<Id, (u64, u32)>) -> Vec<u8> {
     let mut entries: Vec<(&Id, &(u64, u32))> = index.iter().collect();
     entries.sort_by_key(|(id, _)| **id);
     let mut fanout = [0u32; 256];
@@ -957,6 +1027,11 @@ fn write_idx(path: &Path, index: &HashMap<Id, (u64, u32)>) -> Result<(), Error> 
         out.extend_from_slice(&off.to_le_bytes());
         out.extend_from_slice(&len.to_le_bytes());
     }
+    out
+}
+
+fn write_idx(path: &Path, index: &HashMap<Id, (u64, u32)>) -> Result<(), Error> {
+    let out = idx_bytes(index);
     let tmp = path.with_extension("idx.tmp");
     let mut f = File::create(&tmp)?;
     f.write_all(&out)?;
@@ -968,6 +1043,9 @@ fn write_idx(path: &Path, index: &HashMap<Id, (u64, u32)>) -> Result<(), Error> 
 impl Drop for PackStore {
     fn drop(&mut self) {
         let _ = self.flush().and_then(|_| self.active.sync_data().map_err(Error::Io));
+        if self.flushed > self.ckpt_at {
+            let _ = self.checkpoint();
+        }
     }
 }
 
@@ -989,17 +1067,24 @@ impl Store for PackStore {
             None => Err(Error::NotFound(*id)),
             Some((_, _, TOMBSTONE)) => Err(Error::NotFound(*id)),
             Some((pack, off, len)) => {
-                let mut out = vec![0u8; len as usize];
                 let at = off + RECORD_HEAD;
-                match pack {
-                    Some(i) => self.sealed[i].pack.read_exact_at(&mut out, at)?,
-                    None if at >= self.flushed => {
-                        let s = (at - self.flushed) as usize;
-                        out.copy_from_slice(&self.buf[s..s + len as usize]);
-                    }
-                    None => self.active.read_exact_at(&mut out, at)?,
+                if pack.is_none() && at >= self.flushed {
+                    let s = (at - self.flushed) as usize;
+                    return Ok(self.buf[s..s + len as usize].to_vec());
                 }
-                Ok(out)
+                // On disk: the whole record in one read, its CRC checked, so
+                // a record a checkpoint or index names is still verified.
+                let mut rec = vec![0u8; RECORD_HEAD as usize + len as usize + 4];
+                match pack {
+                    Some(i) => self.sealed[i].pack.read_exact_at(&mut rec, off)?,
+                    None => self.active.read_exact_at(&mut rec, off)?,
+                }
+                let (head, rest) = rec.split_at(RECORD_HEAD as usize);
+                let (body, c) = rest.split_at(len as usize);
+                if &head[..32] != id.as_bytes() || u32::from_le_bytes(c.try_into().unwrap()) != crc(id, len, body) {
+                    return Err(Error::Corrupt(*id));
+                }
+                Ok(body.to_vec())
             }
         }
     }

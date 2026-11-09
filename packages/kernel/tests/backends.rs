@@ -119,7 +119,61 @@ fn pack_store_cuts_a_torn_tail_and_keeps_what_a_ref_reached() {
     bytes[40] ^= 1;
     std::fs::write(&pack, &bytes).unwrap();
     let s = PackStore::open(dir.path()).unwrap();
-    assert!(!s.has(&id(1)), "a corrupt record is never served");
+    assert!(s.read(&id(1)).is_err(), "a corrupt record is never served, even one a checkpoint names");
+    // Without the checkpoint, the scan cuts it and all after it.
+    drop(s);
+    std::fs::remove_file(dir.path().join("packs/00000000.ckpt")).unwrap();
+    std::fs::write(&pack, &bytes).unwrap();
+    let s = PackStore::open(dir.path()).unwrap();
+    assert!(!s.has(&id(1)), "a corrupt record is cut by the scan");
+}
+
+#[test]
+fn pack_store_checkpoint_opens_the_same_index_as_a_full_scan() {
+    let dir = tempfile::tempdir().unwrap();
+    let blob = |n: u32| -> (Id, Vec<u8>) {
+        let b = format!("object {n} {}", "x".repeat((n % 300) as usize)).into_bytes();
+        (Id::of(&b), b)
+    };
+    {
+        let mut s = PackStore::open(dir.path()).unwrap();
+        for n in 0..5000 {
+            let (i, b) = blob(n);
+            s.write(i, &b).unwrap();
+        }
+        s.set_ref("heads/main", None, blob(0).0).unwrap();
+    } // close writes a checkpoint
+    let ckpt = dir.path().join("packs/00000000.ckpt");
+    assert!(ckpt.exists());
+    {
+        // More records after the checkpoint, and no clean close.
+        let mut s = PackStore::open(dir.path()).unwrap();
+        for n in 5000..6000 {
+            let (i, b) = blob(n);
+            s.write(i, &b).unwrap();
+        }
+        s.set_ref("heads/main", Some(blob(0).0), blob(5000).0).unwrap();
+        let saved = std::fs::read(&ckpt).unwrap();
+        drop(s);
+        std::fs::write(&ckpt, saved).unwrap(); // as if the close never ran
+    }
+    let s = PackStore::open(dir.path()).unwrap();
+    let mut with: Vec<Id> = s.ids().unwrap();
+    with.sort();
+    assert_eq!(with.len(), 6000, "checkpoint plus a scan of what followed");
+    drop(s);
+    // A torn checkpoint falls back to a full scan with the same result.
+    let mut bytes = std::fs::read(&ckpt).unwrap();
+    bytes.truncate(bytes.len() / 2);
+    std::fs::write(&ckpt, bytes).unwrap();
+    let s = PackStore::open(dir.path()).unwrap();
+    let mut without: Vec<Id> = s.ids().unwrap();
+    without.sort();
+    assert_eq!(with, without);
+    for n in (0..6000).step_by(97) {
+        let (i, b) = blob(n);
+        assert_eq!(s.read(&i).unwrap(), b);
+    }
 }
 
 #[cfg(feature = "store-sqlite")]
