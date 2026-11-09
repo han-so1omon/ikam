@@ -28,7 +28,9 @@ impl<S: Store> Repo<S> {
     }
 
     fn range(&self, id: &Id, start: u64, len: u64, cx: &mut Cx) -> Result<Vec<u8>, Error> {
-        let stored = cx.known.contains_key(id) || self.store.read(id).is_ok();
+        // Presence only: reading the entry here fetched the whole object
+        // once more than the rebuild below (E124).
+        let stored = cx.known.contains_key(id) || self.store.has(id);
         if !stored && cx.stack.len() < STACK_GUARD && !cx.stack.contains(id) {
             cx.stack.push(*id);
             let walked = self.derivations(id)?.iter().find_map(|d| {
