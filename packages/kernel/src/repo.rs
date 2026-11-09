@@ -166,6 +166,12 @@ pub struct Repo<S: Store> {
     /// and the first write no longer reads them all to index them.
     pub replace_hints: bool,
     pub(crate) hints: std::sync::Mutex<Option<Hints>>,
+    /// Whether a stored tree or graph chunk may be planned as a fill of a
+    /// template (E144). On by default. Off, its plans are only slices of
+    /// earlier content, and the edit does not read the similar chunks a
+    /// template plan would be tried against.
+    pub object_templates: bool,
+    pub(crate) writing_object: bool,
 }
 
 /// Old chunk contents read during one edit with `replace_hints` on.
@@ -210,6 +216,8 @@ impl<S: Store> Repo<S> {
             read_memo: false,
             memo: Default::default(),
             replace_hints: false,
+            object_templates: true,
+            writing_object: false,
             hints: Default::default(),
         }
     }
@@ -464,7 +472,10 @@ impl<S: Store> Repo<S> {
             // is derived from earlier ones (slices); see `dict.rs`.
             Some(tag @ (b'T' | b'G')) => {
                 self.index_hints()?;
-                let content = self.put_content(encoded)?.id;
+                let outer = std::mem::replace(&mut self.writing_object, true);
+                let put = self.put_content(encoded);
+                self.writing_object = outer;
+                let content = put?.id;
                 [&[tag.to_ascii_lowercase(), 2][..], content.as_bytes()].concat()
             }
             Some(_) => self.encode_object(encoded),

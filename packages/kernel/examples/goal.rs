@@ -31,6 +31,8 @@ struct Counting<S: Store> {
     repeats: AtomicU64,
     // E139: objects newly written (each one a file and an fsync on FsStore).
     writes: AtomicU64,
+    // E144: stored bytes added less stored bytes removed or replaced.
+    net: std::sync::atomic::AtomicI64,
 }
 
 #[derive(Clone, Copy, Default)]
@@ -55,11 +57,14 @@ impl<S: Store> Store for Counting<S> {
         let fresh = self.inner.write(id, encoded)?;
         if fresh {
             self.writes.fetch_add(1, Relaxed);
+            self.net.fetch_add(encoded.len() as i64, Relaxed);
         }
         Ok(fresh)
     }
     fn replace(&mut self, id: Id, encoded: &[u8]) -> Result<(), Error> {
         self.writes.fetch_add(1, Relaxed);
+        let old = self.inner.read(&id).map_or(0, |b| b.len() as i64);
+        self.net.fetch_add(encoded.len() as i64 - old, Relaxed);
         self.inner.replace(id, encoded)
     }
     fn read(&self, id: &Id) -> Result<Vec<u8>, Error> {
@@ -102,6 +107,8 @@ impl<S: Store> Store for Counting<S> {
         self.inner.ids_with_prefix(prefix)
     }
     fn delete(&mut self, id: &Id) -> Result<(), Error> {
+        let old = self.inner.read(id).map_or(0, |b| b.len() as i64);
+        self.net.fetch_sub(old, Relaxed);
         self.inner.delete(id)
     }
     fn get_ref(&self, name: &str) -> Result<Option<Id>, Error> {
@@ -203,6 +210,7 @@ fn wrap(objects: &[(Id, Vec<u8>)], refs: &[(String, Id)]) -> R {
         seen: Default::default(),
         repeats: 0.into(),
         writes: 0.into(),
+        net: 0.into(),
     })
 }
 
@@ -370,6 +378,8 @@ fn main() {
         ("recommended_replace_hints", true, false),
         // E142: the same, with search and read in one read session.
         ("recommended_shared_session", true, false),
+        // E144: the same, without template plans for trees and view chunks.
+        ("recommended_no_object_templates", true, false),
     ] {
         // IKAM_CONFIG=name runs only that configuration.
         if std::env::var("IKAM_CONFIG").is_ok_and(|c| c != config) {
@@ -377,7 +387,13 @@ fn main() {
         }
         let mut repo = wrap(&objects, &refs);
         repo.needed_index = recommended;
-        let hints = config == "recommended_replace_hints" || config == "recommended_shared_session";
+        let hints = matches!(
+            config,
+            "recommended_replace_hints"
+                | "recommended_shared_session"
+                | "recommended_no_object_templates"
+        );
+        repo.object_templates = config != "recommended_no_object_templates";
         repo.read_memo = config == "recommended_read_memo" || hints;
         repo.replace_hints = hints;
         let mut root = c.tree;
@@ -420,7 +436,11 @@ fn main() {
             repo.store().reads.fetch_add(index_io.reads, Relaxed);
             repo.store().bytes.fetch_add(index_io.bytes, Relaxed);
             repo.store().scans.fetch_add(index_io.scans, Relaxed);
-            let shared = (config == "recommended_shared_session").then(|| repo.session(64 << 20));
+            let shared = matches!(
+                config,
+                "recommended_shared_session" | "recommended_no_object_templates"
+            )
+            .then(|| repo.session(64 << 20));
             let (hits, _) = match &shared {
                 Some(s) => s.search(term, &text_ids, index.as_ref()).unwrap(),
                 None => repo.search(term, &text_ids, index.as_ref()).unwrap(),
@@ -551,6 +571,7 @@ fn main() {
             repo.store().take();
             let t = Instant::now();
             let before = repo.bytes_written;
+            repo.store().net.swap(0, Relaxed);
             let ed: BTreeMap<String, Option<Node>> = reverse_edges(&repo, &new)
                 .into_iter()
                 .map(|n| (n.label.clone(), Some(n)))
@@ -605,7 +626,10 @@ fn main() {
                 g.term,
                 "view_update",
                 t.elapsed().as_secs_f64() * 1e3,
-                format!(",\"new_edges\":{edges},\"written\":{written}"),
+                format!(
+                    ",\"new_edges\":{edges},\"written\":{written},\"net_growth\":{}",
+                    repo.store().net.swap(0, Relaxed)
+                ),
             );
             known.extend(repo.store().inner.ids().unwrap());
         }

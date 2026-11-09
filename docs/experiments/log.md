@@ -2194,3 +2194,18 @@ Newest last. Format and rules: `README.md`.
   - All kernel tests pass (165).
   - The fixed bench on this branch: every byte count and the north score (0.3035) as on E142; cost score 0.2427 against 0.2280, from timings only (the bench does not set read_memo).
 - Verdict: **kept**; on its branch until Eric says to merge. Part of `read_memo`; the format is unchanged.
+
+### E144 object-templates (tree and view chunks planned only as slices)
+- Branch / parent: exp/144-object-templates / exp/143-template-memo (E143)
+- Question: after E143 the view update was still the largest stage, and it wrote 236 KB for a goal whose store grew by 76 KB. Where do the other bytes go?
+- Finding: a new tree or view chunk is also tried as a fill of a template, and a template plan replaces the old similar chunk too (it stores the template, both fillers and two fills, and removes the old stored copy). Its cost counts only the net change, so it wins while writing three times what it saves, rewrites stored objects an edit did not change, and needs reads of the similar chunks to try.
+- Change: `Repo::object_templates` (on by default, as before). Off, a stored tree or graph chunk is planned only as slices of earlier content (or stored plain); other content keeps template plans. `examples/goal.rs` config `recommended_no_object_templates` (E143's setup with it off) and a `net_growth` field on the view update (stored bytes added less bytes removed or replaced). Test in `tests/object_templates.rs`: four rounds of view and tree edits give the same roots with it on and off; off, no stored object is rewritten or removed, and fewer bytes are written.
+- Result (cases store, goals as in E133, against E143's `recommended_shared_session`):
+  - First goal: bytes written 250,171 to 85,734 (view update 236,353 to 71,916); the store grows by 71,916 against 75,944, so less space as well; objects written 425 to 308 in the view update; reads 1.59 MB to 1.48 MB.
+  - Next goal: written 77,762 to 57,826; growth 54,961 against 57,971; reads 781 KB to 794 KB (2% more: one slice plan fetches a little more than the template plan it replaces).
+  - Time, first goal: in memory 297 to 144 ms, on packs 332 to 159 ms, on one file per object 598 to 394 ms; next goal on packs 205 to 130 ms, on files 336 to 283 ms.
+  - With it off, an edit only adds objects: nothing stored is rewritten or removed until a repack.
+  - Configurations with it on read and write exactly as before. Not measured on the fixed bench's corpora, since the bench keeps the default.
+  - All kernel tests pass (166).
+  - BENCH_LINE
+- Verdict: **kept**; on its branch until Eric says to merge. Recommended off for a service that edits trees and views; the format is unchanged.

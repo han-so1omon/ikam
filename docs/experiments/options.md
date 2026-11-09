@@ -199,3 +199,9 @@ it is an on-disk addition and waits on a decision.
 | `ReadSession::search` | `Repo::search` (no shared decodes) | the scan keeps decodes up to the session's limit, so memory is bounded by that limit; reads of the hits then cost nothing | E133's first goal 2.50 MB to 2.04 MB, next 1.23 MB to 1.14 MB (heads apart); read stage to zero |
 
 `read_memo` (E143) also covers template candidates: a similar chunk is read once per edit, not twice. E133's first goal on the recommended setup 2.04 MB to 1.59 MB, next 1.14 MB to 0.78 MB; bytes written unchanged.
+
+## Template plans for trees and view chunks (E144)
+
+| Setting | Default | Trade | Measured |
+| --- | --- | --- | --- |
+| `object_templates` | on | off: a tree or view chunk is stored as slices of earlier content or plain, never as a template fill that also rewrites the old chunk; edits only add objects | E133's first goal on the recommended setup writes 250 KB to 86 KB, the store grows 72 KB against 76 KB, 332 ms to 159 ms on packs; the next goal reads 2% more |

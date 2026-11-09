@@ -100,7 +100,9 @@ impl<S: Store> Repo<S> {
         // (E092; the heavy read weight, every content).
         if self.read_weight * (bytes.len() as f64) < plain.len() as f64 {
             candidates.extend(self.slice_candidate(bytes)?);
-            candidates.extend(self.template_candidates(bytes)?);
+            if self.object_templates || !self.writing_object {
+                candidates.extend(self.template_candidates(bytes)?);
+            }
         }
         let best = candidates
             .into_iter()
