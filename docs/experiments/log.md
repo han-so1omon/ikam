@@ -2264,3 +2264,12 @@ Newest last. Format and rules: `README.md`.
   - All kernel tests pass (170).
   - The fixed bench on this branch: every byte count and the north score (0.3035) as on E148; cost score 0.2427 against 0.2407, from timings only (the bench does not set exact_short_search).
 - Verdict: **kept**; on its branch until Eric says to merge. Off by default because results then rest on the index (a corrupt index would give wrong answers that a scan would not); on, a "which files mention" query costs only the index, which a server holds in memory.
+
+### E150 framed-files (window reads if stored files were seekable)
+- Question: E149 found that range reads of only the windows a goal needs fetch whole files: each file is one compressed object, verified against its id as a whole. What would window reads cost if each file were cut into independently compressed frames, each verifiable against the file's id with a BLAKE3 outboard (as Bao keeps), and what would the store grow by?
+- Change: `examples/seekable.rs`, a measurement only; nothing is stored differently. Over the cases store's 550 text files: zstd level 3 of each whole file, of fixed frames of 1 to 64 KiB, a frame table and the hash tree's inner nodes; for the files holding "Q3" and "AI", the frames overlapping the windows (two lines around each mention) and their proofs. No dictionary anywhere, so the figures compare with each other, not with the store's encodings.
+- Result:
+  - Text storage, whole-file zstd 401 KB: 1 KiB frames 980 KB plus 122 KB outboard; 4 KiB 564 KB plus 29 KB (+48%, +55% with outboard); 8 KiB 481 KB plus 14 KB; 16 KiB 437 KB plus 7 KB (+11%); 64 KiB 403 KB.
+  - Window reads, Q3 (27 files, 16.7 KB of windows, 106 KB whole-file zstd): 1 KiB frames 34 KB, 4 KiB 51 KB, 8 KiB 72 KB, 16 KiB 102 KB. AI (8 files, 11.9 KB of windows, 15 KB whole): 12.7, 12.9, 12.2 and 15.3 KB.
+  - So frames halve window reads only at 4 KiB or less, for half again the text storage; at 16 KiB they cost 11% and save 4%. For reference, the store as it is fetched 385 KB for Q3's 27 files (347 KB raw), because each file is read out of a 64 KiB group (E151).
+- Verdict: **measured**. Not worth a format addition for goals like these: windows are a large share of small files, and a goal that edits a file needs the whole file anyway. Worth it for large files read in sections (logs, long documents); there it would be a stored-format addition, for Eric's yes.
