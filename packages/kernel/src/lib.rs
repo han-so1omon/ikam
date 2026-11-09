@@ -8,6 +8,7 @@ mod abbrev;
 mod claims;
 mod codec;
 mod container;
+mod db;
 mod dict;
 mod exec;
 pub mod func;
@@ -32,7 +33,9 @@ mod wasm;
 pub mod worktree;
 
 pub use container::expand;
+pub use db::{Db, Event, Op};
 pub use dict::decode_cost;
+pub use graph::Keys;
 pub use id::Id;
 pub use object::{
     Arg, Claim, Commit, Derivation, Edge, Graph, Kind, Node, Object, Target, TreeEntry, node_key,
@@ -57,6 +60,8 @@ pub enum Error {
     InvalidName(String),
     #[error("execution failed: {0}")]
     Exec(String),
+    #[error("idempotency key {0:?} is already logged with a different event")]
+    IdempotencyConflict(String),
     #[error("ref {0} moved or is locked; retry")]
     RefConflict(String),
     #[error(transparent)]

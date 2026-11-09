@@ -1884,3 +1884,36 @@ Newest last. Format and rules: `README.md`.
 - Result: depth 1: fails at once naming all four corpora; depth 150: "commit 6cd6921 is missing; transcripts (commit 0ca74e4 has 21 of 38 commits of history)"; `md pdf` alone runs; after `git fetch --unshallow`, repo-history runs as before (exact, fsck clean). Measurement unchanged. Tests, clippy and fmt clean.
 - Verdict: **kept**; merged to main on Eric's yes (Nov 9).
 
+
+### E118 db-log-view (an event log and a last-write-wins view in the kernel)
+- Branch / parent: exp/db-log-view / main at 8d95f82 (E117)
+- Question (Eric, Nov 9): step 1 of the database roadmap: an append-only log in the kernel with idempotent appends and one last-write-wins view, built from today's objects, with no format change. Plan: `docs/plans/2026-11-09-db-log-view.md`.
+- Change (kernel only, new `src/db.rs`): events (key, upsert or remove with subtree, idempotency key) stored as content; the log is a `G` graph keyed by 20-digit sequence numbers; an `ids` view refuses a reused idempotency key with different bytes and skips an exact retry; a `kv` view folds by last write wins, each value a byte range of the event that wrote it. A commit holds them under `db/`, beside any files. New error `IdempotencyConflict`. Nothing else changes.
+- Result: `tests/db.rs`, 12 laws: the April fold tests (last write wins, remove whatever its idempotency key, independent keys, subtree remove, environment qualifiers), writes to distinct keys commute, exact read-back of values (empty, binary, 70 KB) and events, strict decoding, retries change no root, rebuilt views equal maintained ones every 50 of 300 random appends, older commits read their own version after gc, repack and fsck. All kernel tests pass; clippy and fmt clean.
+  - Bench: all 14 corpora exact, fsck clean; north 0.3035 (unchanged); cost score 0.2389 (E110's runs 0.2434 to 0.2516; an append-cost test ran alongside at the start). Nothing in ingest or repack changed.
+  - Append cost (ignored test `append_cost`): 1,000 single appends 6.2 s (8.5 ms each at the end); batches of 100, 0.21 s; 10,000 in batches of 1,000, 1.9 s (202 ms for the last batch). Every append rebuilds the three graphs, so cost grows with the database.
+- Not settled here: in-place prolly edits (so an append touches one path), whether a reused idempotency key with different bytes should be an error (April skipped it), and the ledger scan at open.
+- Verdict: on its branch until Eric says to merge.
+
+### E119 db-inplace (graph edits that touch only the chunks an edit falls in)
+- Branch / parent: exp/db-inplace / exp/db-log-view at e8ee290 (E118)
+- Question (Eric, Nov 9): every append rebuilt the whole view; build in-place edits, with each view's log position recorded.
+- Change (kernel only; no format change): `graph_edit` re-cuts only the chunks edits fall in, until the content-defined cut falls back into step, level by level; `graph_nodes_in` (batch lookup), `graph_prefix`, `graph_last`; `db_append` uses them; `db_rebuild` is a separate full fold with `put_graph`; views record their log position (`ids.at`, `kv.at` files under `db/views`), and appends to views behind the log are refused. `put_graph` is refactored to share sizing and parent building, unchanged in output.
+- Result: 4 new graph laws (in-place root equals `put_graph` on graphs of height 0 to 2, chained random batches, appends at both ends from empty, emptying; one edit in 150,000 nodes writes only its path; label checks) and 2 new db laws (in-place views equal a full rebuild on a multi-chunk view with subtree removes across chunks; positions committed, defaulted and enforced). All kernel tests pass; clippy and fmt clean.
+  - Bench: all 14 corpora exact, fsck clean; north 0.3035 (unchanged); cost score 0.2426 (E118 0.2389).
+  - Append cost (`append_cost`, release, nothing else running): 1,000 single appends 6.3 s -> 3.1 s (last 9.5 -> 3.0 ms); batches of 100, 0.25 -> 0.20 s; 10,000 in batches of 1,000, 2.1 -> 1.8 s; 10,000 single appends 48 s, last 4.7 ms (not run before: about 10 minutes by extrapolation). Objects and bytes written unchanged.
+  - Most of the remaining cost is the slice search when a new chunk is stored. Measured with it off (read weight 1.0, not committed): 1,000 single appends 0.9 s and 7.9 MB stored instead of 3.3 MB.
+- Not settled here: storing new chunks plain on the fast path and leaving slices to repack (an option to measure next); reading every chunk above the leaves per edit (fine below about a million keys); clash checks for label keys outside the rewritten chunks.
+- Verdict: on its branch until Eric says to merge.
+
+### E120 db-loose-ends (label clashes and path-only reads in in-place edits)
+- Branch / parent: exp/db-inplace / E119 at 05035da
+- Question (Eric, Nov 9): fix both loose ends from E119: label-key clashes outside the rewritten chunks, and every upper chunk read per edit.
+- Change (kernel only; no format change): `Keys::{Unique, Any}` with `put_graph_with` and `graph_edit_with`; the db's `ids` and `kv` views use `Keys::Any` (no edge points into them), the log keeps `Keys::Unique`. `graph_edit` walks from the root to the chunks edits fall in and right only until the cut falls back into step, instead of loading every upper level; output unchanged.
+- Result: a real 64-bit key collision (`ke32051949435c933`, `kb4a1e63c25ad68d4`, found in about 10 minutes on 4 cores) used in a graph test and a db test (the db test fails with the views on `Keys::Unique`); a read-count test (fails on E119's code). All 134 kernel tests pass; clippy and fmt clean.
+  - Bench: all 14 corpora exact, fsck clean; north 0.3035 (unchanged); cost score 0.2434 (E119 0.2426, timing noise: no bench path calls graph_edit).
+  - One edit: 1M keys 10 to 11 ms and about 310 reads -> 2.1 to 2.3 ms and 45 to 55; 10M keys 94 to 105 ms and about 2,700 reads -> 2.2 to 2.4 ms and 45 to 47 (one run 8.8 ms). Upper chunks read per edit: 131 and 1,321 -> 3.
+  - Append cost unchanged at its sizes: 1,000 single appends 3.3 s (last 2.9 ms); 10,000, 48 s (last 5.7 ms).
+- Not settled here: `graph_edit` with `Keys::Unique` still checks only the chunks it rewrites (a key index for the log is an option past about 100M events); fsck does not check label keys; storing new chunks plain on the fast path.
+- Verdict: on its branch until Eric says to merge.
+
