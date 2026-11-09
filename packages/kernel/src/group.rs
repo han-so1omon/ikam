@@ -288,8 +288,10 @@ impl<S: Store> Repo<S> {
         }
         for p in best.1 {
             self.store.write(p.group, &p.encoded)?;
+            self.note_needs(&p.encoded);
             for (id, entry) in p.entries {
                 self.store.replace(id, &entry)?;
+                self.note_needs(&entry);
             }
         }
         self.reset_projections();

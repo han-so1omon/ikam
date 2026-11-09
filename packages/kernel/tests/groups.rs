@@ -35,7 +35,14 @@ fn group_of<S: Store>(repo: &Repo<S>, member: &Id) -> Option<Id> {
 /// stored, and the store must stay fully readable.
 #[test]
 fn ingest_never_drops_a_group_its_members_read() {
+    for needed_index in [false, true] {
+        group_survives(needed_index);
+    }
+}
+
+fn group_survives(needed_index: bool) {
     let mut repo = Repo::new(MemStore::default());
+    repo.needed_index = needed_index;
     // Similar small notes, each with a token of its own: they group, and
     // the group's stored bytes stay large (the tokens do not compress). The
     // tokens are long enough for the matcher's seeds to find the group as a
@@ -81,4 +88,44 @@ fn ingest_never_drops_a_group_its_members_read() {
     for n in notes.iter().chain([&similar]) {
         assert_eq!(&repo.read_content(&Id::of_content(n)).unwrap(), n);
     }
+}
+
+/// With `needed_index` on (E129), ingest and repack store exactly what they
+/// store with it off: the same ids with the same encodings.
+#[test]
+fn needed_index_stores_the_same_objects() {
+    let docs: Vec<Vec<u8>> = (0..60)
+        .map(|i| {
+            format!(
+                "Invoice {i}\nCustomer: Customer {}\nAmount: {}.00\nTerms: net 30\nNotes: {}\n",
+                i % 7,
+                100 + i * 13,
+                "the same paragraph of terms repeated in every invoice ".repeat(4)
+            )
+            .into_bytes()
+        })
+        .collect();
+    let run = |on: bool| {
+        let mut repo = Repo::new(MemStore::default());
+        repo.needed_index = on;
+        commit_files(&mut repo, "c/a", &docs[..30]);
+        repo.repack().unwrap();
+        commit_files(&mut repo, "c/b", &docs[20..]);
+        repo.repack().unwrap();
+        commit_files(&mut repo, "c/c", &docs[10..50]);
+        assert!(repo.fsck().unwrap().is_empty());
+        for d in &docs {
+            assert_eq!(&repo.read_content(&Id::of_content(d)).unwrap(), d);
+        }
+        let mut out: Vec<(Id, Vec<u8>)> = repo
+            .store()
+            .ids()
+            .unwrap()
+            .into_iter()
+            .map(|id| (id, repo.store().read(&id).unwrap()))
+            .collect();
+        out.sort();
+        out
+    };
+    assert!(run(false) == run(true));
 }

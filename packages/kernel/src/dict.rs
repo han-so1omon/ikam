@@ -161,6 +161,32 @@ pub(crate) fn tree_content(encoded: &[u8]) -> Option<Id> {
 }
 
 /// True if `id` is one of the ids an id prefix may name.
+/// What stored encodings name as a group, context or dictionary, by
+/// prefix (E129): `Repo::is_needed` without reading every stored object.
+/// Built from one pass over the store on first use, kept current by every
+/// write and replace through `Repo`, dropped with the other projections.
+/// A superset at worst: entries of deleted encodings stay until the next
+/// reset, so a stale entry keeps bytes and never loses them.
+#[derive(Default)]
+pub(crate) struct Needed {
+    by_len: std::collections::HashMap<usize, std::collections::HashSet<Vec<u8>>>,
+}
+
+impl Needed {
+    pub(crate) fn add(&mut self, encoded: &[u8]) {
+        for p in needs(encoded) {
+            self.by_len.entry(p.len()).or_default().insert(p.to_vec());
+        }
+    }
+
+    fn names(&self, id: &Id) -> bool {
+        let id = id.as_bytes();
+        self.by_len
+            .iter()
+            .any(|(n, set)| id.get(..*n).is_some_and(|p| set.contains(p)))
+    }
+}
+
 pub(crate) fn names(prefix: &[u8], id: &Id) -> bool {
     id.as_bytes().starts_with(prefix)
 }
@@ -644,6 +670,17 @@ impl<S: Store> Repo<S> {
     /// stored bytes themselves, never a derivation of them (E123: a group
     /// dropped for a `fill` that rebuilds it lost every member).
     pub(crate) fn is_needed(&self, id: &Id) -> Result<bool, Error> {
+        if self.needed_index {
+            let mut slot = self.needed.lock().unwrap();
+            if slot.is_none() {
+                let mut set = Needed::default();
+                for other in self.store.ids()? {
+                    set.add(&self.store.read(&other)?);
+                }
+                *slot = Some(set);
+            }
+            return Ok(slot.as_ref().unwrap().names(id));
+        }
         for other in self.store.ids()? {
             if other != *id
                 && needs(&self.store.read(&other)?)

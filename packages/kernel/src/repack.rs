@@ -229,6 +229,7 @@ impl<S: Store + Sync> Repo<S> {
             if !self.store.write(*id, &encoded)? && self.store.read(id)? != encoded {
                 self.store.replace(*id, &encoded)?;
             }
+            self.note_needs(&encoded);
         }
         let refs: HashSet<Id> = self.store.refs()?.into_iter().map(|(_, id)| id).collect();
         for id in self.store.ids()? {
@@ -247,6 +248,7 @@ impl<S: Store + Sync> Repo<S> {
             let encoded = self.encode_object(&canonical);
             if self.store.read(&id)? != encoded {
                 self.store.replace(id, &encoded)?;
+                self.note_needs(&encoded);
             }
         }
         self.level = MEASURE_LEVEL;
@@ -377,6 +379,7 @@ impl<S: Store + Sync> Repo<S> {
             {
                 let encoded = self.encode_object(&self.read_object(&id)?);
                 self.store.replace(id, &encoded)?;
+                self.note_needs(&encoded);
             }
         }
         Ok(())
@@ -510,6 +513,7 @@ impl<S: Store + Sync> Repo<S> {
                     }
                     if cost < self.cost(&stored, reads) {
                         self.store.replace(id, &encoded)?;
+                        self.note_needs(&encoded);
                     } else {
                         related.remove(&id);
                     }
@@ -522,6 +526,7 @@ impl<S: Store + Sync> Repo<S> {
             };
             if encoded.len() < stored.len() {
                 self.store.replace(id, &encoded)?;
+                self.note_needs(&encoded);
             }
         }
         self.level = MEASURE_LEVEL;

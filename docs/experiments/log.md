@@ -1934,3 +1934,21 @@ Newest last. Format and rules: `README.md`.
   - Bench (`cargo run --release --example bench -- --json`, other jobs running): all corpora exact, fsck clean; north 0.3035 (unchanged); cost score 0.2391 (E120 0.2434; timing noise under load).
 - Not settled here: `new_template_candidate` still credits a group's stored bytes it will not drop, so it can choose a template over plain bytes on a false saving (correct, but larger until the next repack). Refusing groups there needs a check cheaper than a store scan per file.
 - Verdict: **kept**, on its branch until Eric says to merge.
+
+### E129 needed-index (dropping a superseded copy without reading the whole store)
+- Branch / parent: exp/129-needed-index / exp/123-repack-dict-corruption (E123)
+- Question: keeping a reverse-link view (E125) current after small writes read the whole store many times over. Why, and can it be avoided without a format change?
+- Finding: trees and graph chunks are stored as content, so ingest may plan a new chunk against its previous version and drop the old stored copy. Before any drop, `apply_candidate` asks whether another stored encoding needs that copy (a group, a context, a dictionary; E123), and `is_needed` reads every stored object to answer. Measured with `examples/writes.rs` on the bench store (2,498 objects, 229 MB, in memory behind a counting wrapper): adding 66 edges to the view after a one-file commit read 38,993 objects (3.68 GB, 16 full scans).
+- Change (kernel; no format change): `Repo::needed_index` (off by default; `--needed-index` on the CLI, passed through to `ikam live`) keeps the prefixes that stored encodings name in memory, built from one pass on first use and kept current by `Repo::write` and by every write and replace in grouping and repack; `reset_projections` drops it. A stale entry (from a deleted encoding) only keeps bytes. It assumes the handle is the store's only writer while open: an encoding another process writes later is not seen. Tests: the E123 group test runs with the option off and on; `needed_index_stores_the_same_objects` (three ingests and two repacks give byte-identical stores off and on).
+- Result (view update after each write, off / on):
+  - one Markdown file: 38,993 / 632 reads, 3.68 GB / 1.9 MB, 546 / 164 ms;
+  - one file of each of 13 types: 96,038 / 2,057 reads, 7.82 GB / 5.2 MB, 1,247 / 353 ms (the write itself 240 MB / 9.8 MB fetched);
+  - a new folder of 36 files: 38,720 / 2,442 reads, 2.53 GB / 5.5 MB, 700 / 352 ms.
+  - Still O(store) on every fresh handle: the first content write builds the slice matcher's seed index from every stored object (2,966 reads, 238 MB, 1.5 to 1.8 s here). Persisting that index would be a format addition.
+  - The four ingests that found E123 (multiformat, docs, kernel src, then the
+    1,438-file cases set, into one store), run on a frozen copy of the input
+    with `--needed-index` on and off: fsck ok and 0 mismatched files both ways,
+    and the two stores hold byte-identical objects. Wall time 333.5 s on and
+    339.5 s off; the cases ingest stores 229,892,773 bytes either way.
+  - All kernel tests pass.
+- Verdict: **kept** (an option; recommended on for `ikam live`, which is the store's one writer); on its branch until Eric says to merge.

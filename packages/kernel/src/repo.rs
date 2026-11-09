@@ -118,6 +118,15 @@ pub struct Repo<S: Store> {
     /// but four times the decode work). Set, a large content can be stored
     /// a few percent larger where brotli would have won.
     pub slow_codec_max: usize,
+    /// Keep the set of ids stored encodings name (groups, contexts,
+    /// dictionaries) in memory, so ingest can drop a superseded stored copy
+    /// without reading every stored object first (E129). Off by default.
+    /// On, it assumes this handle is the store's only writer while it is
+    /// open (as `ikam serve` is): an encoding another process writes later
+    /// is not seen, and the copy it needs could be dropped. Off, every drop
+    /// at ingest reads the whole store.
+    pub needed_index: bool,
+    pub(crate) needed: std::sync::Mutex<Option<crate::dict::Needed>>,
     /// zstd level new encodings use (`dict::MEASURE_LEVEL` unless
     /// `recompress` is running).
     pub(crate) level: i32,
@@ -141,6 +150,8 @@ impl<S: Store> Repo<S> {
             short_records: false,
             markup_layers: false,
             slow_codec_max: usize::MAX,
+            needed_index: false,
+            needed: Default::default(),
             level: crate::dict::MEASURE_LEVEL,
             deflate_memo: None,
         }
@@ -196,6 +207,14 @@ impl<S: Store> Repo<S> {
         self.index = None;
         self.ledger = OnceLock::new();
         self.dict = OnceLock::new();
+        *self.needed.get_mut().unwrap() = None;
+    }
+
+    /// Keep the needed set current after storing `encoded` (E129).
+    pub(crate) fn note_needs(&mut self, encoded: &[u8]) {
+        if let Some(set) = self.needed.get_mut().unwrap().as_mut() {
+            set.add(encoded);
+        }
     }
 
     /// Every recorded derivation of `id`.
@@ -248,6 +267,7 @@ impl<S: Store> Repo<S> {
             None => encoded.to_vec(),
         };
         let fresh = self.store.write(id, &stored)?;
+        self.note_needs(&stored);
         if fresh {
             self.bytes_written += stored.len();
         }
