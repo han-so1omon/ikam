@@ -334,7 +334,7 @@ fn db(work: &Path, only: Option<&String>) {
         let mut swaps = Vec::new();
         for id in &ids {
             let t = Instant::now();
-            s.set_ref("heads/swap", prev.filter(|_| swaps.len() > 0), *id)
+            s.set_ref("heads/swap", prev.filter(|_| !swaps.is_empty()), *id)
                 .unwrap();
             swaps.push(ms(t.elapsed()) * 1e3);
             prev = Some(*id);
