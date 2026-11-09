@@ -16,6 +16,8 @@ that holds only test data. Checks, each timed:
   word; ask's sources name the right file.
 - edits: rename, copy, delete and a folder rename, then the listing checked.
 - commit: the server's own commit, then the head moves.
+- gc: what no commit needs is deleted (E116), the store does not grow, and
+  every file left reads back byte for byte.
 
 Then it writes /results/latest.json (and appends a line to
 /results/history.jsonl, keeping the last --history lines) with the password,
@@ -228,6 +230,7 @@ def main():
             ("POST", "/api/commit", None),
             ("POST", "/api/repack", None),
             ("POST", "/api/fsck", None),
+            ("POST", "/api/gc", None),
         ]
         for m, p, body in tries:
             h = {"Destination": "/dav/selftest/moved.csv"} if m == "MOVE" else None
@@ -313,6 +316,31 @@ def main():
         return b.decode()
 
     check("commit", commit)
+
+    def gc():
+        before = me.api("status")["store_bytes"]
+        t = time.perf_counter()
+        s, b = me.req("POST", "/api/gc")
+        timed("gc", (time.perf_counter() - t) * 1e3)
+        expect(s, 200, "POST /api/gc")
+        after = me.api("status")["store_bytes"]
+        if after > before:
+            raise Check(f"the store grew from {before} to {after} bytes")
+        moved = {
+            "selftest/text/renamed.txt": "selftest/text/note1.txt",
+            "selftest/data/table-copy.csv": "selftest/data/table.csv",
+            "selftest/letters/letter.docx": "selftest/docs/letter.docx",
+        }
+        edited = f"Rewritten. Now the marker is zq{run}edited.\n".encode()
+        for path in sorted(p for p in listing(guest, "selftest") if "." in p.rsplit("/", 1)[-1]):
+            want = edited if path == "selftest/text/note0.txt" else tests[moved.get(path, path)][1]
+            s, got = guest.dav("GET", path)
+            expect(s, 200, f"GET {path} after gc")
+            if got != want:
+                raise Check(f"{path} read back different bytes after gc")
+        return b.decode()
+
+    check("gc frees space and keeps every file", gc)
     return finish(me, a, result, timings)
 
 

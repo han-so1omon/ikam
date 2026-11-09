@@ -124,6 +124,7 @@ The live filesystem stores each edit as it comes and leaves re-planning to
 | `--max-body BYTES` (E114) | none (25M with `--public`) | one upload can't fill memory (the body is held whole) against larger single files refused with 413 | not scored |
 | `--max-store BYTES` (E114) | none (1G with `--public`) | the disk can't fill against new content refused with 507 once reached; history is kept, so deletes don't free it | not scored |
 | `--max-conns N` (E114) | none (32 with `--public`) | threads stay bounded against a busy client (Finder opens several) waiting on 503 | not scored |
+| `--gc-every N` (E116) | off | the store keeps only what commits need (edits leave a working tree per edit and files replaced before a commit) against a pause after every N commits while gc walks the whole store; `POST /api/gc` does it once | test copy: about 70% of each self-test run's bytes freed |
 | `IKAM_AUTH` (E111) | unset | a password on every request against one more thing to keep secret; the hash is fast (BLAKE3), so the line belongs in a file only its owner reads | not scored |
 
 **Not yet a setting**: an incremental repack that re-plans only what was

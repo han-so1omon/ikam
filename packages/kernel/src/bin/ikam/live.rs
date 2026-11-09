@@ -63,6 +63,10 @@ pub struct Live {
     /// `--max-store`: bytes the store, plus desktop metadata held in memory,
     /// may reach before edits that add content are refused.
     pub max_store: Option<u64>,
+    /// Run `gc` after this many commits (off by default: each gc walks the
+    /// whole store while edits wait) (E116).
+    pub gc_every: Option<usize>,
+    commits_since_gc: usize,
     /// The store's size when last measured, and `repo.bytes_written` then.
     measured: Option<(u64, usize)>,
 }
@@ -137,6 +141,8 @@ impl Live {
             mtimes: HashMap::new(),
             started: SystemTime::now(),
             max_store: None,
+            gc_every: None,
+            commits_since_gc: 0,
             measured: None,
             events: VecDeque::new(),
             llm: false,
@@ -534,6 +540,10 @@ impl Live {
             "committed {n} change(s) as {}",
             &commit.to_hex()[..12]
         ));
+        self.commits_since_gc += 1;
+        if self.gc_every.is_some_and(|n| self.commits_since_gc >= n) {
+            self.gc()?;
+        }
         Ok(Some(commit))
     }
 
@@ -543,6 +553,7 @@ impl Live {
         let t = Instant::now();
         let r = self.repo.repack().map_err(err)?;
         self.measured = None;
+        self.commits_since_gc = 0;
         if self.base_tree.is_none() {
             // Nothing committed yet: the empty working tree was reachable from
             // no ref, so the repack's gc removed it. Store it again.
@@ -553,6 +564,30 @@ impl Live {
             r.before,
             r.after,
             r.applied,
+            t.elapsed().as_secs_f64()
+        );
+        self.log(msg.clone());
+        Ok(msg)
+    }
+
+    /// Delete what no ref needs (commits first): the trees and file
+    /// versions that edits wrote between commits, and files only the
+    /// working tree held. Cheaper than a repack, which also re-plans
+    /// storage; it walks the whole store while holding the lock (E116).
+    pub fn gc(&mut self) -> Result<String, String> {
+        self.flush(true)?;
+        let t = Instant::now();
+        let before = self.store_bytes();
+        let deleted = self.repo.gc().map_err(err)?;
+        self.measured = None;
+        self.commits_since_gc = 0;
+        if self.base_tree.is_none() {
+            // As in repack: the empty working tree was reachable from no ref.
+            self.work = self.repo.edit_tree(None, &[]).map_err(err)?;
+        }
+        let msg = format!(
+            "gc: deleted {deleted} objects, {before} -> {} bytes, {:.2} s",
+            self.store_bytes(),
             t.elapsed().as_secs_f64()
         );
         self.log(msg.clone());
@@ -854,6 +889,100 @@ mod tests {
         l.repack().unwrap();
         l.apply(vec![Op::Mkdir("made".into())]).unwrap();
         l.apply(vec![Op::Put("made/a.txt".into(), b"hello".to_vec())])
+            .unwrap();
+        l.flush(true).unwrap().expect("a commit");
+        assert!(l.repo.fsck_deep().unwrap().is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Text no other test text shares, so each version stores its own bytes.
+    fn noise(seed: u64, n: usize) -> Vec<u8> {
+        let mut x = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;
+        (0..n)
+            .map(|_| {
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                b"abcdefghijklmnopqrstuvwxyz \n"[(x % 28) as usize]
+            })
+            .collect()
+    }
+
+    fn store(name: &str) -> (std::path::PathBuf, Live) {
+        let dir = std::env::temp_dir().join(format!("ikam-live-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let l = Live::open(dir.to_str().unwrap(), "main").unwrap();
+        (dir, l)
+    }
+
+    /// Edits between commits each store a working tree, and a file written
+    /// then replaced or removed before a commit is in no commit: gc frees
+    /// both, and every committed version still reads back (E116).
+    #[test]
+    fn gc_frees_what_edits_wrote_between_commits_and_keeps_history() {
+        let (dir, mut l) = store("gc");
+        let mut committed = Vec::new();
+        for round in 0..3u64 {
+            for v in 0..4 {
+                let body = noise(round * 10 + v, 4000);
+                l.apply(vec![Op::Put("notes/a.txt".into(), body.clone())])
+                    .unwrap();
+                l.apply(vec![Op::Put(
+                    format!("tmp/{round}-{v}.txt"),
+                    noise(100 + v, 3000),
+                )])
+                .unwrap();
+                l.apply(vec![Op::Remove(format!("tmp/{round}-{v}.txt"))])
+                    .unwrap();
+                if v == 3 {
+                    committed.push(body);
+                }
+            }
+            l.flush(true).unwrap().expect("a commit");
+        }
+        let before = l.store_bytes();
+        let msg = l.gc().unwrap();
+        let after = l.store_bytes();
+        assert!(after * 2 < before, "{msg}");
+        assert!(l.repo.fsck_deep().unwrap().is_empty());
+        let versions = l.versions("notes/a.txt").unwrap();
+        assert_eq!(versions.len(), 3);
+        for ((_, _, at), want) in versions.iter().rev().zip(&committed) {
+            assert_eq!(**l.read(&at.unwrap()).unwrap(), *want);
+        }
+        // Edits go on as before, and a second gc finds nothing more.
+        l.apply(vec![Op::Put("notes/b.txt".into(), b"after".to_vec())])
+            .unwrap();
+        l.flush(true).unwrap().expect("a commit");
+        assert!(l.gc().unwrap().starts_with("gc: deleted 0 objects"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn gc_every_runs_after_that_many_commits() {
+        let (dir, mut l) = store("gc-every");
+        l.gc_every = Some(2);
+        let mut sizes = Vec::new();
+        for round in 0..4u64 {
+            for v in 0..3 {
+                l.apply(vec![Op::Put("a.txt".into(), noise(round * 10 + v, 4000))])
+                    .unwrap();
+            }
+            l.flush(true).unwrap().expect("a commit");
+            sizes.push(l.store_bytes());
+        }
+        // Commits 2 and 4 collect: the store after each is smaller than after
+        // the commit before it, though a commit only ever adds.
+        assert!(sizes[1] < sizes[0] && sizes[3] < sizes[2], "{sizes:?}");
+        assert!(l.repo.fsck_deep().unwrap().is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn edits_after_a_gc_of_an_empty_store() {
+        let (dir, mut l) = store("gc-empty");
+        l.gc().unwrap();
+        l.apply(vec![Op::Put("a.txt".into(), b"hello".to_vec())])
             .unwrap();
         l.flush(true).unwrap().expect("a commit");
         assert!(l.repo.fsck_deep().unwrap().is_empty());

@@ -481,6 +481,7 @@ fn api(live: &Mutex<Live>, name: &str, req: &Request) -> Response {
                 }
             }
             ("POST", "repack") => Response::text(200, live.lock().unwrap().repack()?),
+            ("POST", "gc") => Response::text(200, live.lock().unwrap().gc()?),
             ("POST", "fsck") => {
                 let mut l = live.lock().unwrap();
                 l.flush(true)?;

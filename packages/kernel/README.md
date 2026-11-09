@@ -101,7 +101,7 @@ ikam --store S ask "which file says how to add a paragraph?" [--llm]
   a request without a password read (the page, search, ask's sources,
   `/dav/` GET, HEAD, PROPFIND and OPTIONS, so Finder can mount it
   read-only) and refuses everything else with 401: writes, edits, deletes,
-  locks, `/api/commit`, `/api/repack`, `/api/fsck`. Claude answers are left
+  locks, `/api/commit`, `/api/repack`, `/api/fsck`, `/api/gc`. Claude answers are left
   out for guests. A wrong password is refused even for a read. Limits for a
   copy strangers can reach (each also usable alone): `--max-body` (413 on a
   larger upload, refused before it is read), `--max-store` (507 on new
@@ -109,6 +109,13 @@ ikam --store S ask "which file says how to add a paragraph?" [--llm]
   `--max-conns` (503 past that many connections). `--public` sets them to
   25M, 1G and 32 unless given, and closes idle connections after 30 s.
   Header lines over 16 KB or more than 100 headers get 431 everywhere.
+- **Collecting garbage** (E116): every live edit stores a new working tree,
+  and a file written then replaced or removed before a commit is in no
+  commit, so a store that is edited often keeps bytes nothing needs.
+  `POST /api/gc` (password, `X-Ikam` header) commits pending edits, then
+  deletes what no ref needs; every committed version stays. `--gc-every N`
+  does it after every N commits. Off by default, since each walks the whole
+  store while edits wait (0.06 s for a 9 MB store of 1849 objects here).
 
   `realworld/selftest.py` checks such a copy from the outside (guest reads
   and refused writes, exact read-back, search, ask, edits, commit, with

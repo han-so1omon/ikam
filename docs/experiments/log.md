@@ -1866,3 +1866,13 @@ Newest last. Format and rules: `README.md`.
 - Result: unit test; manual: public copy 200 `Allow: /`, results still 200, PUT on /robots.txt 401; private copy 200 `Disallow: /`, everything else still 401, unknown Host 403. Tests, clippy and fmt clean.
 - Not settled here: if the reader looks for robots.txt on the default port (443, the private copy, not on Funnel), this does not help; that would need the test copy on its own name on 443.
 - Verdict: **kept**; merged to main on Eric's yes (Nov 9).
+
+### E116 live-gc (the test copy's store grows each run)
+- Branch / parent: exp/116-gc / main at 30d2042 (E115)
+- Question (Nov 9): the public test copy's store grew 12,353 -> 26,020 -> 39,785 -> 53,847 bytes over four self-test runs, though each run clears its test area first.
+- Cause: every live edit stores a new working tree (`edit_tree` per change), and a file written and then replaced, renamed away or removed before the next commit is in no commit. Nothing deleted either: `gc` ran only inside `repack`. Reproduced locally: six runs grew the store 12.2 KB -> 44.6 KB; `ikam gc` on a copy then deleted 455 objects and left 17.9 KB. The rest is history: each run's test files stay in its commits (about 1.5 to 4 KB a run, including the rolling results/history.jsonl, which shares all but ~700 bytes between versions).
+- Change: `Live::gc` (commits pending edits, runs `Repo::gc`, re-measures the store for `--max-store`, re-stores the empty working tree when nothing is committed, as repack does); `POST /api/gc` (a write: password and `X-Ikam` header; guests get 401); option `--gc-every N` runs it after every N commits, off by default. `realworld/selftest.py` adds check 11, "gc frees space and keeps every file", and a guest refusal for `POST /api/gc`.
+- Result: unit tests (garbage freed by more than half and every committed version reads back; `--gc-every 2` shrinks the store on commits 2 and 4; gc of an empty store then edits). Eight self-test runs against a local `--public` copy: 11 of 11 checks each, gc deletes ~130 objects a run, the store grows about 2 KB a run (history) instead of ~5 KB. `ikam gc` takes 0.06 s on a 9 MB store of 1849 objects. Tests, clippy and fmt clean.
+- Not settled here: history is never dropped, so the test copy still grows about 2 KB a run (about 3 MB a year at four runs a day, well under its 1 GB cap).
+- Verdict: **kept** on its branch; merge waits on Eric's yes.
+
