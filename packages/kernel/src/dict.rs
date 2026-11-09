@@ -560,7 +560,10 @@ impl<S: Store> Repo<S> {
             }
             RAW if t.is_ascii_lowercase() => finish(z.to_vec()),
             _ => match tree_content(&encoded) {
-                Some(content) => self.read_content(&content),
+                Some(content) => {
+                    self.hint(&content);
+                    self.read_content(&content)
+                }
                 None => Ok(encoded),
             },
         }

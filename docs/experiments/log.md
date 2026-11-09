@@ -2152,3 +2152,16 @@ Newest last. Format and rules: `README.md`.
   - All kernel tests pass.
   - The fixed bench on this branch: every byte count and the north score (0.3035) as on E139; cost score 0.2441 against 0.2435, from timings only.
 - Verdict: **kept**; on its branch until Eric says to merge. A server option: grants per goal, checked at the file layer as E126 says; the format is unchanged.
+
+### E141 replace-hints (a goal's scope names only its files; old chunks join the index as an edit reads them)
+- Branch / parent: exp/141-replace-hints / exp/140-section-grants (E140)
+- Question: with E137's scope and E138's memo, the first write of a goal still built a seed index over the edited files plus every tree and view chunk (1.78 MB in 1,125 reads of the 2.08 MB edit stage, E139). A new tree or chunk repeats the ones it replaces, and the edit reads exactly those. Can the scope name only the files, and the edit add what it reads?
+- Change: `Repo::replace_hints` (off by default; a library option, since the CLI sets no scope). With a `seed_scope` set, `graph_edit_with` and `edit_tree` note each old tree or chunk content they read, and before each new tree or chunk is stored the noted contents join the seed index through the stored contents they are made of (as `ensure_index` indexes a scope). `examples/goal.rs` config `recommended_replace_hints`: scope of the edited files only, memo and hints on. Tests in `tests/hints.rs`: with hints a narrow scope stores what a whole-store index stores (4,205 bytes against 24,139 without hints), with fewer reads; without a scope hints change nothing.
+- Result (cases store, goals as in E133, against E138's `recommended_read_memo`, first lookup's 246 KB of heads apart):
+  - First goal: 4.21 MB in 1,757 reads to 2.50 MB in 625; the edit stage 2.08 MB to 0.48 MB (its first write 1.78 MB in 1,125 reads to 189 KB in 28); the view update 1.01 MB to 0.91 MB.
+  - Next goal: 3.26 MB in 1,847 reads to 1.23 MB in 394 (edit 2.01 MB to 0.15 MB, view 0.80 MB to 0.63 MB).
+  - Bytes written: 250,171 against 250,379 and 77,762 against 78,086 (the index holds fewer competing candidates); the same in two runs, so the order stays fixed (E136).
+  - Time: about the same (on files 608 against 621 ms for the first goal, on packs 308 against 309 ms): what is left is the view update's syncs on files and its matching work.
+  - All kernel tests pass.
+  - The fixed bench on this branch: every byte count and the north score (0.3035) as on E140; cost score 0.2450 against 0.2441, from timings only (the bench does not set replace_hints).
+- Verdict: **kept**; on its branch until Eric says to merge. Recommended with a scope; the format is unchanged.

@@ -185,3 +185,9 @@ it is an on-disk addition and waits on a decision.
 | Setting | Default | Trade | Measured |
 | --- | --- | --- | --- |
 | Section grants (`Grant`, `windows_around`) against file grants (E126) | none in the kernel; the server checks paths | a grant names file versions and byte ranges, so a stale version or a change outside the goal's lines is refused; the server must place the windows (it reads the matched files) and an edit check diffs the old and new bytes | "Q3": 16.7 KB of 347 KB exposed (4.8%); read check 14 to 22 ns, edit check 14 to 33 us, seal or verify 1.5 to 3.2 us; 0 of 70 out-of-window edits allowed against 70 of 70; same bytes fetched as whole files (groups) |
+
+## What a goal's first write indexes (E141)
+
+| Setting | Default | Trade | Measured |
+| --- | --- | --- | --- |
+| `replace_hints` | off | with a scope, old trees and chunks an edit reads join the seed index, so the scope can name only the files; repeats of content outside the scope and outside what the edit reads are not found | E133's first goal 4.21 MB to 2.50 MB, next 3.26 MB to 1.23 MB (heads apart); first write 1.78 MB to 189 KB; bytes written 250,171 against 250,379 |

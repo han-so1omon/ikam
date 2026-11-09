@@ -421,7 +421,9 @@ impl<S: Store> Repo<S> {
         keys: Keys,
     ) -> Result<Id, Error> {
         let began = self.begin_memo();
+        let hinting = self.begin_hints();
         let out = self.graph_edit_inner(root, edits, keys);
+        self.end_hints(hinting);
         self.end_memo(began);
         out
     }

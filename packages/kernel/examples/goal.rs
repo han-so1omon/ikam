@@ -365,10 +365,14 @@ fn main() {
         ("recommended_scope_edited_files", true, true),
         // E138: the same, keeping what each tree and view edit reads.
         ("recommended_read_memo", true, true),
+        // E141: only the edited files; the old chunks and trees an edit
+        // reads join the seed index as it reads them.
+        ("recommended_replace_hints", true, false),
     ] {
         let mut repo = wrap(&objects, &refs);
         repo.needed_index = recommended;
-        repo.read_memo = config == "recommended_read_memo";
+        repo.read_memo = config == "recommended_read_memo" || config == "recommended_replace_hints";
+        repo.replace_hints = config == "recommended_replace_hints";
         let mut root = c.tree;
         let mut view = view;
         let mut known: HashSet<Id> = objects.iter().map(|o| o.0).collect();
@@ -440,6 +444,7 @@ fn main() {
                 let folders: HashSet<&str> = chosen.iter().map(|f| top(&f.0)).collect();
                 let mut scope: Vec<Id> = if config == "recommended_scope_edited_files"
                     || config == "recommended_read_memo"
+                    || config == "recommended_replace_hints"
                 {
                     chosen.iter().map(|f| f.1).collect()
                 } else {

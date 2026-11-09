@@ -10,7 +10,7 @@
 //!   the read fails. Corruption is an error, never data.
 //! - Derivations enter the ledger only after they reproduce their output.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::OnceLock;
 
 use crate::dict::object_tag;
@@ -158,6 +158,21 @@ pub struct Repo<S: Store> {
     /// as before, so the bytes written are the same either way.
     pub read_memo: bool,
     pub(crate) memo: std::sync::Mutex<Option<Memo>>,
+    /// With a `seed_scope`, add each old tree and graph chunk that a tree
+    /// or view edit reads to the seed index before the edit writes its new
+    /// chunks (E141). Off by default. A new chunk repeats the chunks it
+    /// replaces, and those are the ones the edit reads, so a scope can name
+    /// only the files a goal touches instead of every tree and view chunk,
+    /// and the first write no longer reads them all to index them.
+    pub replace_hints: bool,
+    pub(crate) hints: std::sync::Mutex<Option<Hints>>,
+}
+
+/// Old chunk contents read during one edit with `replace_hints` on.
+#[derive(Default)]
+pub(crate) struct Hints {
+    pending: Vec<Id>,
+    added: HashSet<Id>,
 }
 
 /// Contents read during one edit with `read_memo` on.
@@ -192,7 +207,79 @@ impl<S: Store> Repo<S> {
             deflate_memo: None,
             read_memo: false,
             memo: Default::default(),
+            replace_hints: false,
+            hints: Default::default(),
         }
+    }
+
+    /// Start noting old chunks read, if `replace_hints` is on, a scope is
+    /// set and no outer edit already does. True if this call started it.
+    pub(crate) fn begin_hints(&self) -> bool {
+        let mut hints = self.hints.lock().unwrap();
+        if !self.replace_hints || self.seed_scope.is_none() || hints.is_some() {
+            return false;
+        }
+        *hints = Some(Hints::default());
+        true
+    }
+
+    pub(crate) fn end_hints(&self, began: bool) {
+        if began {
+            *self.hints.lock().unwrap() = None;
+        }
+    }
+
+    /// Note `content`, the content holding an old tree or chunk just read.
+    pub(crate) fn hint(&self, content: &Id) {
+        if let Some(h) = self.hints.lock().unwrap().as_mut()
+            && !h.added.contains(content)
+        {
+            h.pending.push(*content);
+        }
+    }
+
+    /// Index the contents noted since the last call, in the order read.
+    fn index_hints(&mut self) -> Result<(), Error> {
+        let pending = match self.hints.lock().unwrap().as_mut() {
+            Some(h) => std::mem::take(&mut h.pending),
+            None => return Ok(()),
+        };
+        if pending.is_empty() {
+            return Ok(());
+        }
+        self.ensure_index()?;
+        // As `ensure_index` does for a scope: a derived content is indexed
+        // through the stored contents it is made of, which a plan can read.
+        let (content, _) = self.closure(pending, |_| true)?;
+        let mut ids: Vec<Id> = content.into_iter().collect();
+        ids.sort();
+        for id in ids {
+            let fresh = self
+                .hints
+                .lock()
+                .unwrap()
+                .as_mut()
+                .is_some_and(|h| h.added.insert(id));
+            if !fresh {
+                continue;
+            }
+            let bytes = match self.memo_get(&id) {
+                Some(b) => b,
+                None => {
+                    let Ok(encoded) = self.store.read(&id) else {
+                        continue; // derived: its arguments are in `ids`
+                    };
+                    match self.decode_plain(&id, &encoded) {
+                        Ok(b) => b,
+                        Err(_) => continue,
+                    }
+                }
+            };
+            if let Some(index) = &mut self.index {
+                index.add(id, &bytes);
+            }
+        }
+        Ok(())
     }
 
     /// Start keeping contents read, if `read_memo` is on and no outer edit
@@ -362,6 +449,7 @@ impl<S: Store> Repo<S> {
             // Trees and graph chunks are stored as content, so a new version
             // is derived from earlier ones (slices); see `dict.rs`.
             Some(tag @ (b'T' | b'G')) => {
+                self.index_hints()?;
                 let content = self.put_content(encoded)?.id;
                 [&[tag.to_ascii_lowercase(), 2][..], content.as_bytes()].concat()
             }

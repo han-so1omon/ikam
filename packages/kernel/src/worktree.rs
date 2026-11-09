@@ -51,7 +51,9 @@ impl<S: Store> Repo<S> {
     /// and rewritten.
     pub fn edit_tree(&mut self, root: Option<Id>, edits: &[Edit]) -> Result<Id, Error> {
         let began = self.begin_memo();
+        let hinting = self.begin_hints();
         let out = self.edit_tree_inner(root, edits);
+        self.end_hints(hinting);
         self.end_memo(began);
         out
     }
