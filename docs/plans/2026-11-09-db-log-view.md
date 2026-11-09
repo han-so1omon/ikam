@@ -97,3 +97,43 @@ search off (read weight 1.0, measured, not committed), 1,000 single appends
 take 0.9 s but store 7.9 MB instead of 3.3 MB, and 10,000 take 23 s and
 130 MB instead of 47 MB. That trade is the background integration idea:
 store new chunks plain on the fast path and let repack find the slices.
+
+## Loose ends fixed (E120, branch exp/db-inplace)
+
+Eric, Nov 9: do both fixes from the loose ends in the design doc.
+
+- **Label clashes.** `Keys::Any` lets a graph's label keys repeat;
+  `put_graph_with` and `graph_edit_with` take it, and agree on every graph,
+  clashing keys included. The `ids` and `kv` views use it, since their
+  labels are chosen by clients and no edge points into either; nodes are
+  found by label, so a repeated key changes nothing there. The log keeps
+  `Keys::Unique`: its labels are sequence numbers, so a clash can only be
+  chance, and `db_rebuild` (`put_graph`) checks its whole key set.
+  `graph_edit` with `Keys::Unique` still checks only the chunks it
+  rewrites. No format change, and no existing root changes.
+- **A real clashing pair.** `ke32051949435c933` and `kb4a1e63c25ad68d4`
+  share their 8-byte key (`2402028764400e0e`), found by a distinguished-point
+  collision search in about 10 minutes on 4 cores. Tests use it in a graph
+  (refused by `put_graph`; kept by both functions with `Keys::Any`, in one
+  chunk or two) and in a database (as keys and idempotency keys: read back
+  exactly, retries are no-ops, views equal a rebuild). With the views on
+  `Keys::Unique`, the database test fails.
+- **Path-only reads.** `graph_edit` no longer loads every chunk above the
+  leaves: it walks down from the root to each chunk an edit falls in and
+  moves right through the tree only while the re-cut hasn't fallen back
+  into step, reading each upper chunk at most once per edit. Its output is
+  unchanged (every in-place equality test passes as before). A new test
+  reads at most twice the height in upper chunks for one edit in 150,000
+  nodes; the old code read all 11, some twice, and fails it.
+
+One edit to a kv-shaped graph (`edit_cost`, ignored test; numbers from the
+same code run as a scratch program, release, in memory):
+
+| Keys | Upper chunks | Before: time, reads | After: time, reads | Upper chunks read |
+| --- | --- | --- | --- | --- |
+| 1M | 131 | 10 to 11 ms, about 310 | 2.1 to 2.3 ms, 45 to 55 | 3 |
+| 10M | 1,321 | 94 to 105 ms, about 2,700 | 2.2 to 2.4 ms, 45 to 47 (one of three: 8.8 ms, 183) | 3 |
+
+The reads left are the leaf and the slice search when new chunks are
+stored, as before. Append timings are unchanged at these sizes (1,000 single
+appends 3.3 s; 10,000, 48 s), since their views have few upper chunks.

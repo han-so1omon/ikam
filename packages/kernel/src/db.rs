@@ -17,6 +17,10 @@
 //!   `put_graph` and must give the same roots as the views `db_append`
 //!   edits in place (E119), which touch only the chunks an event's keys
 //!   fall in. Each view records the log position it reflects.
+//! - Labels of `ids` and `kv` are chosen by clients and no edge points
+//!   into either view, so their label keys may repeat (`Keys::Any`): two
+//!   keys whose `node_key`s collide are stored, read and rebuilt like any
+//!   others. The log's labels are sequence numbers and keep the check.
 //!
 //! In a commit the database is the tree entry `db`: `db/log`, and
 //! `db/views/ids` and `db/views/kv` with their positions in `ids.at` and
@@ -24,7 +28,9 @@
 
 use std::collections::BTreeMap;
 
-use crate::{Arg, Edge, Error, Id, Kind, Node, Object, Repo, Store, Target, TreeEntry, node_key};
+use crate::{
+    Arg, Edge, Error, Id, Keys, Kind, Node, Object, Repo, Store, Target, TreeEntry, node_key,
+};
 
 /// Leading bytes of an event's encoding.
 const MAGIC: &[u8] = b"ikam-db-event/1\0";
@@ -342,8 +348,8 @@ impl<S: Store> Repo<S> {
             .collect();
         Ok(Db {
             log: self.graph_edit(&db.log, log)?,
-            ids: self.graph_edit(&db.ids, ids)?,
-            kv: self.graph_edit(&db.kv, kv)?,
+            ids: self.graph_edit_with(&db.ids, ids, Keys::Any)?,
+            kv: self.graph_edit_with(&db.kv, kv, Keys::Any)?,
             ids_at: seq,
             kv_at: seq,
         })
@@ -428,8 +434,8 @@ impl<S: Store> Repo<S> {
             .collect();
         let rebuilt = Db {
             log: self.put_graph(log_nodes)?,
-            ids: self.put_graph(ids)?,
-            kv: self.put_graph(kv)?,
+            ids: self.put_graph_with(ids, Keys::Any)?,
+            kv: self.put_graph_with(kv, Keys::Any)?,
             ids_at: seq,
             kv_at: seq,
         };

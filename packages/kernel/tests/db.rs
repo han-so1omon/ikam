@@ -429,3 +429,47 @@ fn append_cost() {
         );
     }
 }
+
+/// Two strings whose 8-byte label keys are the same (tests/graphs.rs).
+const CLASH: [&str; 2] = ["ke32051949435c933", "kb4a1e63c25ad68d4"];
+
+/// Keys and idempotency keys are chosen by clients, so two of them may
+/// share a label key (a client can find such a pair in minutes). Both are
+/// stored and read back exactly, and the views still equal a full rebuild.
+#[test]
+fn clashing_label_keys_are_stored_and_rebuilt() {
+    let mut repo = Repo::new(MemStore::default());
+    let mut db = repo.db_empty().unwrap();
+    for i in 0..400 {
+        let key = format!("k{:016x}", (i as u64) * (u64::MAX / 400) + 1);
+        db = repo.db_append(&db, &[up(&key, "filler", &key)]).unwrap();
+    }
+    // As keys, and as idempotency keys, in separate appends and together.
+    db = repo
+        .db_append(&db, &[up(CLASH[0], "first", CLASH[0])])
+        .unwrap();
+    db = repo
+        .db_append(&db, &[up(CLASH[1], "second", CLASH[1])])
+        .unwrap();
+    assert_eq!(repo.db_get(&db, CLASH[0]).unwrap(), Some(b"first".to_vec()));
+    assert_eq!(
+        repo.db_get(&db, CLASH[1]).unwrap(),
+        Some(b"second".to_vec())
+    );
+    assert_eq!(repo.db_rebuild(&db.log).unwrap(), db);
+    // A retry under either idempotency key is still a no-op.
+    assert_eq!(
+        repo.db_append(&db, &[up(CLASH[1], "second", CLASH[1])])
+            .unwrap(),
+        db
+    );
+    db = repo
+        .db_append(
+            &db,
+            &[rm(CLASH[0], false, "r0"), up(CLASH[1], "third", "u1")],
+        )
+        .unwrap();
+    assert_eq!(repo.db_get(&db, CLASH[0]).unwrap(), None);
+    assert_eq!(repo.db_get(&db, CLASH[1]).unwrap(), Some(b"third".to_vec()));
+    assert_eq!(repo.db_rebuild(&db.log).unwrap(), db);
+}

@@ -3,7 +3,8 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use ikam_kernel::{
-    Arg, Edge, Graph, Id, Kind, MemStore, Node, Object, Repo, Store, Target, TreeEntry, node_key,
+    Arg, Edge, Graph, Id, Keys, Kind, MemStore, Node, Object, Repo, Store, Target, TreeEntry,
+    node_key,
 };
 
 fn rng(s: &mut u64) -> u64 {
@@ -426,4 +427,211 @@ fn in_place_edit_writes_only_its_path() {
         written <= 4 * levels,
         "{written} objects for {levels} levels"
     );
+}
+
+/// A store that records which objects are read.
+#[derive(Default)]
+struct Reads {
+    inner: MemStore,
+    read: std::cell::RefCell<Vec<Id>>,
+}
+
+impl Store for Reads {
+    fn write(&mut self, id: Id, encoded: &[u8]) -> Result<bool, ikam_kernel::Error> {
+        self.inner.write(id, encoded)
+    }
+    fn replace(&mut self, id: Id, encoded: &[u8]) -> Result<(), ikam_kernel::Error> {
+        self.inner.replace(id, encoded)
+    }
+    fn read(&self, id: &Id) -> Result<Vec<u8>, ikam_kernel::Error> {
+        self.read.borrow_mut().push(*id);
+        self.inner.read(id)
+    }
+    fn has(&self, id: &Id) -> bool {
+        self.inner.has(id)
+    }
+    fn ids(&self) -> Result<Vec<Id>, ikam_kernel::Error> {
+        self.inner.ids()
+    }
+    fn ids_with_prefix(&self, prefix: &[u8]) -> Result<Vec<Id>, ikam_kernel::Error> {
+        self.inner.ids_with_prefix(prefix)
+    }
+    fn delete(&mut self, id: &Id) -> Result<(), ikam_kernel::Error> {
+        self.inner.delete(id)
+    }
+    fn get_ref(&self, name: &str) -> Result<Option<Id>, ikam_kernel::Error> {
+        self.inner.get_ref(name)
+    }
+    fn set_ref(
+        &mut self,
+        name: &str,
+        expected: Option<Id>,
+        new: Id,
+    ) -> Result<(), ikam_kernel::Error> {
+        self.inner.set_ref(name, expected, new)
+    }
+    fn refs(&self) -> Result<Vec<(String, Id)>, ikam_kernel::Error> {
+        self.inner.refs()
+    }
+}
+
+/// An edit reads the path from the root to the chunks it changes, not
+/// every chunk above the leaves (which grows with the graph: about 130 at
+/// a million nodes, 1,300 at ten million).
+#[test]
+fn in_place_edit_reads_only_its_path() {
+    let mut s = 0x9e3779b97f4a7c15u64;
+    let mut repo = Repo::new(Reads::default());
+    let nodes: Vec<Node> = (0..150_000)
+        .map(|i| simple(format!("entity:{i:08}"), &mut s))
+        .collect();
+    let root = repo.put_graph(nodes.clone()).unwrap();
+    // Every chunk above the leaves.
+    let (mut upper, mut level) = (BTreeSet::new(), vec![root]);
+    let mut top = 0;
+    while !level.is_empty() {
+        let mut next = Vec::new();
+        for id in &level {
+            if let Object::Graph(Graph::Children(h, children)) = repo.get(id).unwrap() {
+                top = top.max(h as usize);
+                upper.insert(*id);
+                next.extend(children.into_iter().map(|c| c.1));
+            }
+        }
+        level = next;
+    }
+    assert!(top >= 2 && upper.len() > 10, "{} upper chunks", upper.len());
+    for at in [0, 75_000, 149_999] {
+        let label = nodes[at].label.clone();
+        let edit = simple(label.clone(), &mut s);
+        repo.store().read.borrow_mut().clear();
+        let edited = repo
+            .graph_edit(&root, BTreeMap::from([(label.clone(), Some(edit.clone()))]))
+            .unwrap();
+        let reads = repo.store().read.borrow().clone();
+        let upper_reads = reads.iter().filter(|id| upper.contains(id)).count();
+        assert!(
+            upper_reads <= 2 * top,
+            "{upper_reads} of {} upper chunks read for one edit at height {top}",
+            upper.len()
+        );
+        let mut want = nodes.clone();
+        want[at] = edit;
+        assert_eq!(edited, repo.put_graph(want).unwrap());
+    }
+}
+
+/// Two labels whose 8-byte keys are the same, found once by a collision
+/// search over labels of this shape (about 2^32 hashes).
+const CLASH: [&str; 2] = ["ke32051949435c933", "kb4a1e63c25ad68d4"];
+
+/// A graph of `n` labels spread over the range the clashing labels fall
+/// in, so the two land in different chunks.
+fn spread(n: u64, s: &mut u64) -> Vec<Node> {
+    (0..n)
+        .map(|i| simple(format!("k{:016x}", i * (u64::MAX / n) + 1), s))
+        .collect()
+}
+
+/// Labels whose keys clash: `put_graph` refuses them; with `Keys::Any`
+/// both are kept, found by label, and in-place edits give the root a full
+/// build gives, whether the two land in one chunk or in different ones.
+#[test]
+fn clashing_keys_are_kept_alike_with_any_keys() {
+    assert_ne!(CLASH[0], CLASH[1]);
+    assert_eq!(node_key(CLASH[0]), node_key(CLASH[1]));
+    let mut s = 0x2545f4914f6cdd1du64;
+    for n in [0, 20, 60_000] {
+        let mut repo = Repo::new(MemStore::default());
+        let nodes = spread(n, &mut s);
+        let clash: Vec<Node> = CLASH
+            .iter()
+            .map(|l| simple(l.to_string(), &mut s))
+            .collect();
+        let all: Vec<Node> = nodes.iter().chain(&clash).cloned().collect();
+        assert!(repo.put_graph(all.clone()).is_err(), "{n} nodes");
+        let full = repo.put_graph_with(all.clone(), Keys::Any).unwrap();
+
+        // Without a clash, either kind of check gives the same root.
+        let base = repo.put_graph(nodes.clone()).unwrap();
+        assert_eq!(base, repo.put_graph_with(nodes.clone(), Keys::Any).unwrap());
+
+        // One at a time, then both at once.
+        let one = repo
+            .graph_edit_with(
+                &base,
+                BTreeMap::from([(CLASH[0].to_string(), Some(clash[0].clone()))]),
+                Keys::Any,
+            )
+            .unwrap();
+        let two = repo
+            .graph_edit_with(
+                &one,
+                BTreeMap::from([(CLASH[1].to_string(), Some(clash[1].clone()))]),
+                Keys::Any,
+            )
+            .unwrap();
+        assert_eq!(two, full, "{n} nodes");
+        let both = clash
+            .iter()
+            .map(|c| (c.label.clone(), Some(c.clone())))
+            .collect();
+        assert_eq!(repo.graph_edit_with(&base, both, Keys::Any).unwrap(), full);
+        for c in &clash {
+            assert_eq!(repo.graph_node(&full, &c.label).unwrap().as_ref(), Some(c));
+        }
+
+        // Dropping one leaves the other, as a full build of the rest does.
+        let dropped = repo
+            .graph_edit_with(
+                &full,
+                BTreeMap::from([(CLASH[0].to_string(), None)]),
+                Keys::Any,
+            )
+            .unwrap();
+        let rest: Vec<Node> = nodes.iter().chain(&clash[1..]).cloned().collect();
+        assert_eq!(dropped, repo.put_graph(rest).unwrap());
+    }
+}
+
+/// Time and reads of one edit to a kv-shaped graph of `IKAM_EDIT_KEYS`
+/// nodes (default 1,000,000): `cargo test --release --test graphs
+/// edit_cost -- --ignored --nocapture`.
+#[test]
+#[ignore]
+fn edit_cost() {
+    let n: u64 = std::env::var("IKAM_EDIT_KEYS").map_or(1_000_000, |v| v.parse().unwrap());
+    let event = Id::of_content(b"event");
+    let node = |i: u64| Node {
+        label: format!("user/{:08}/profile", i * 7919 % 100_000_000),
+        target: Target::Content(Arg::Range {
+            id: event,
+            start: 60,
+            len: 140,
+        }),
+        edges: vec![],
+    };
+    let mut repo = Repo::new(Reads::default());
+    let t = std::time::Instant::now();
+    let root = repo.put_graph((0..n).map(node).collect()).unwrap();
+    println!(
+        "{n} keys built in {:?}, height {}",
+        t.elapsed(),
+        match repo.get(&root).unwrap() {
+            Object::Graph(Graph::Children(h, _)) => h,
+            _ => 0,
+        }
+    );
+    for k in 0..3 {
+        let edit = node(n + 1 + k);
+        repo.store().read.borrow_mut().clear();
+        let t = std::time::Instant::now();
+        repo.graph_edit(&root, BTreeMap::from([(edit.label.clone(), Some(edit))]))
+            .unwrap();
+        println!(
+            "one edit: {:?}, {} store reads",
+            t.elapsed(),
+            repo.store().read.borrow().len()
+        );
+    }
 }

@@ -35,6 +35,7 @@ pub mod worktree;
 pub use container::expand;
 pub use db::{Db, Event, Op};
 pub use dict::decode_cost;
+pub use graph::Keys;
 pub use id::Id;
 pub use object::{
     Arg, Claim, Commit, Derivation, Edge, Graph, Kind, Node, Object, Target, TreeEntry, node_key,

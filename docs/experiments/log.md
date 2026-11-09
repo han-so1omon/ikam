@@ -1905,3 +1905,15 @@ Newest last. Format and rules: `README.md`.
   - Most of the remaining cost is the slice search when a new chunk is stored. Measured with it off (read weight 1.0, not committed): 1,000 single appends 0.9 s and 7.9 MB stored instead of 3.3 MB.
 - Not settled here: storing new chunks plain on the fast path and leaving slices to repack (an option to measure next); reading every chunk above the leaves per edit (fine below about a million keys); clash checks for label keys outside the rewritten chunks.
 - Verdict: on its branch until Eric says to merge.
+
+### E120 db-loose-ends (label clashes and path-only reads in in-place edits)
+- Branch / parent: exp/db-inplace / E119 at 05035da
+- Question (Eric, Nov 9): fix both loose ends from E119: label-key clashes outside the rewritten chunks, and every upper chunk read per edit.
+- Change (kernel only; no format change): `Keys::{Unique, Any}` with `put_graph_with` and `graph_edit_with`; the db's `ids` and `kv` views use `Keys::Any` (no edge points into them), the log keeps `Keys::Unique`. `graph_edit` walks from the root to the chunks edits fall in and right only until the cut falls back into step, instead of loading every upper level; output unchanged.
+- Result: a real 64-bit key collision (`ke32051949435c933`, `kb4a1e63c25ad68d4`, found in about 10 minutes on 4 cores) used in a graph test and a db test (the db test fails with the views on `Keys::Unique`); a read-count test (fails on E119's code). All 134 kernel tests pass; clippy and fmt clean.
+  - Bench: all 14 corpora exact, fsck clean; north 0.3035 (unchanged); cost score 0.2434 (E119 0.2426, timing noise: no bench path calls graph_edit).
+  - One edit: 1M keys 10 to 11 ms and about 310 reads -> 2.1 to 2.3 ms and 45 to 55; 10M keys 94 to 105 ms and about 2,700 reads -> 2.2 to 2.4 ms and 45 to 47 (one run 8.8 ms). Upper chunks read per edit: 131 and 1,321 -> 3.
+  - Append cost unchanged at its sizes: 1,000 single appends 3.3 s (last 2.9 ms); 10,000, 48 s (last 5.7 ms).
+- Not settled here: `graph_edit` with `Keys::Unique` still checks only the chunks it rewrites (a key index for the log is an option past about 100M events); fsck does not check label keys; storing new chunks plain on the fast path.
+- Verdict: on its branch until Eric says to merge.
+

@@ -13,7 +13,7 @@
 //! may form cycles; they are not on the rebuild path, and gc never follows
 //! them.
 
-use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use crate::{Error, Graph, Id, Node, Object, Repo, Store, node_key};
 
@@ -24,6 +24,18 @@ pub type NodeChange = (String, Option<Node>, Option<Node>);
 const MIN_CHUNK: usize = 4096;
 /// Every chunk ends by this many encoded bytes.
 const MAX_CHUNK: usize = 32768;
+
+/// Whether two labels of a graph may share a key (see `node_key`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Keys {
+    /// Every label has its own key, so an edge names one node. What
+    /// `put_graph` requires.
+    Unique,
+    /// Keys may repeat. For graphs no edge points into, such as the
+    /// database's `ids` and `kv` views, whose labels clients choose: a
+    /// repeated key there changes nothing, since nodes are found by label.
+    Any,
+}
 
 /// True if a chunk of `size` bytes ends after the entry labelled `label`:
 /// the boundary probability rises linearly from 0 at `MIN_CHUNK` to 1 at
@@ -63,11 +75,21 @@ fn cut<T>(items: &[T], label: impl Fn(&T) -> &str, size: impl Fn(&T) -> usize) -
 impl<S: Store> Repo<S> {
     /// Store a graph and return its root id. Labels must be unique, and so
     /// must their keys within the graph; edges are sorted and deduplicated.
-    pub fn put_graph(&mut self, mut nodes: Vec<Node>) -> Result<Id, Error> {
+    pub fn put_graph(&mut self, nodes: Vec<Node>) -> Result<Id, Error> {
+        self.put_graph_with(nodes, Keys::Unique)
+    }
+
+    /// `put_graph`, with `keys` saying whether label keys must be unique.
+    /// Labels must be unique either way. The root of a graph whose keys
+    /// are unique is the same with either.
+    pub fn put_graph_with(&mut self, mut nodes: Vec<Node>, keys: Keys) -> Result<Id, Error> {
         nodes.sort_by(|a, b| a.label.cmp(&b.label));
-        let mut keys = HashSet::new();
+        if let Some(w) = nodes.windows(2).find(|w| w[0].label == w[1].label) {
+            return Err(Error::InvalidName(w[1].label.clone()));
+        }
+        let mut seen = HashSet::new();
         for n in nodes.iter_mut() {
-            if !keys.insert(node_key(&n.label)) {
+            if keys == Keys::Unique && !seen.insert(node_key(&n.label)) {
                 return Err(Error::InvalidName(n.label.clone()));
             }
             n.edges.sort();
@@ -328,35 +350,75 @@ fn merge<T: Item>(items: Vec<T>, edits: &[(&String, &Option<T>)]) -> Vec<T> {
     map.into_values().collect()
 }
 
-/// Entries that differ between two sorted levels, as edits.
-fn level_edits(
-    old: &[(String, Id)],
-    new: &[(String, Id)],
-) -> BTreeMap<String, Option<(String, Id)>> {
-    let a: HashSet<&(String, Id)> = old.iter().collect();
-    let b: HashSet<&(String, Id)> = new.iter().collect();
+/// Child entries that changed in each run (the old entries a run replaced
+/// and the new ones it wrote), as edits one level up. Runs cover disjoint
+/// label ranges.
+fn run_edits(runs: Vec<Run>) -> BTreeMap<String, Option<(String, Id)>> {
     let mut edits = BTreeMap::new();
-    for c in old.iter().filter(|c| !b.contains(c)) {
-        edits.insert(c.0.clone(), None);
-    }
-    for c in new.iter().filter(|c| !a.contains(c)) {
-        edits.insert(c.0.clone(), Some(c.clone()));
+    for (old, new) in runs {
+        let a: HashSet<&(String, Id)> = old.iter().collect();
+        let b: HashSet<&(String, Id)> = new.iter().collect();
+        for c in old.iter().filter(|c| !b.contains(c)) {
+            edits.insert(c.0.clone(), None);
+        }
+        for c in new.iter().filter(|c| !a.contains(c)) {
+            edits.insert(c.0.clone(), Some(c.clone()));
+        }
     }
     edits
 }
 
+/// One re-cut stretch of a level: the chunks it replaced and the chunks it
+/// wrote, as `(first label, id)`.
+type Run = (Vec<(String, Id)>, Vec<(String, Id)>);
+
+/// Child lists read during one edit, by chunk id, so each upper chunk is
+/// read at most once.
+type Upper = HashMap<Id, Vec<(String, Id)>>;
+
+/// A position among the chunks at one height: the child lists from the
+/// root down to that height, each with the index taken. An empty path is
+/// the root itself.
+struct Cursor {
+    root: Id,
+    path: Vec<(Vec<(String, Id)>, usize)>,
+}
+
+impl Cursor {
+    fn entry(&self) -> (String, Id) {
+        match self.path.last() {
+            Some((list, i)) => list[*i].clone(),
+            None => (String::new(), self.root),
+        }
+    }
+}
+
 impl<S: Store> Repo<S> {
     /// Apply `edits` to the graph at `root` (`Some` sets a node, `None`
-    /// drops a label, present or not) and return the new root. Only the
-    /// chunks the edits fall in are read and rewritten, plus neighbours
-    /// until the content-defined cut falls back into step, and the levels
-    /// above them; the root equals `put_graph` of the edited node set
-    /// (tests/graphs.rs). Label keys are checked for clashes only within
-    /// the chunks rewritten; `put_graph` checks the whole graph.
+    /// drops a label, present or not) and return the new root, which
+    /// equals `put_graph` of the edited node set (tests/graphs.rs). Reads
+    /// only the chunks the edits fall in, their neighbours until the
+    /// content-defined cut falls back into step, and the path from the
+    /// root to each. Label keys are checked only within the chunks
+    /// rewritten, so a clash elsewhere is found by `put_graph`
+    /// (`db_rebuild`), not here; graphs no edge points into skip the check
+    /// with `graph_edit_with` and `Keys::Any`.
     pub fn graph_edit(
         &mut self,
         root: &Id,
         edits: BTreeMap<String, Option<Node>>,
+    ) -> Result<Id, Error> {
+        self.graph_edit_with(root, edits, Keys::Unique)
+    }
+
+    /// `graph_edit`, with `keys` saying whether label keys are checked.
+    /// With `Keys::Any` the root equals `put_graph_with(nodes, Keys::Any)`
+    /// in every case, clashing keys included.
+    pub fn graph_edit_with(
+        &mut self,
+        root: &Id,
+        edits: BTreeMap<String, Option<Node>>,
+        keys: Keys,
     ) -> Result<Id, Error> {
         if edits.is_empty() {
             return Ok(*root);
@@ -371,128 +433,203 @@ impl<S: Store> Repo<S> {
                 n.edges.dedup();
             }
         }
-        let levels = self.graph_levels(root)?;
-        let mut items = self.splice(
-            &levels[0],
+        let mut upper = Upper::new();
+        let top = match self.graph_chunk(root)? {
+            Graph::Nodes(_) => 0,
+            Graph::Children(height, children) => {
+                upper.insert(*root, children);
+                height
+            }
+        };
+        let mut runs = self.splice(
+            &mut upper,
+            root,
+            top,
+            0,
             &edits,
-            |r, id| match r.graph_chunk(id)? {
+            |r, _, id| match r.graph_chunk(id)? {
                 Graph::Nodes(nodes) => Ok(nodes),
                 _ => Err(Error::WrongKind(*id)),
             },
             |nodes| {
-                let mut keys = HashSet::new();
-                match nodes.iter().find(|n| !keys.insert(node_key(&n.label))) {
-                    Some(n) => Err(Error::InvalidName(n.label.clone())),
-                    None => Ok(Graph::Nodes(nodes)),
+                if keys == Keys::Unique {
+                    let mut seen = HashSet::new();
+                    if let Some(n) = nodes.iter().find(|n| !seen.insert(node_key(&n.label))) {
+                        return Err(Error::InvalidName(n.label.clone()));
+                    }
                 }
+                Ok(Graph::Nodes(nodes))
             },
         )?;
-        if items.is_empty() {
-            return self.put_graph(Vec::new());
-        }
-        let mut h = 1;
-        loop {
-            if items.len() == 1 {
-                return Ok(items[0].1);
+        for height in 1..=top {
+            let up = run_edits(runs);
+            if up.is_empty() {
+                return Ok(*root);
             }
-            let height = u8::try_from(h).map_err(|_| Error::Decode("graph too tall"))?;
-            let Some(chunks) = levels.get(h) else {
-                return self.put_parents(items, height);
-            };
-            let edits = level_edits(&levels[h - 1], &items);
-            items = self.splice(
-                chunks,
-                &edits,
-                |r, id| match r.graph_chunk(id)? {
-                    Graph::Children(_, children) => Ok(children),
-                    _ => Err(Error::WrongKind(*id)),
-                },
+            runs = self.splice(
+                &mut upper,
+                root,
+                top,
+                height,
+                &up,
+                |r, upper, id| r.children(upper, id),
                 |children| Ok(Graph::Children(height, children)),
             )?;
-            h += 1;
         }
-    }
-
-    /// The chunk lists of a graph, bottom up: `[0]` lists its leaves as
-    /// `(first label, id)`, and the last holds only the root. Reads every
-    /// chunk above the leaves, and no leaf.
-    fn graph_levels(&self, root: &Id) -> Result<Vec<Vec<(String, Id)>>, Error> {
-        let mut levels = vec![vec![(String::new(), *root)]];
-        loop {
-            let (mut next, mut leaves) = (Vec::new(), false);
-            for (_, id) in levels.last().unwrap() {
-                match self.graph_chunk(id)? {
-                    Graph::Children(height, children) => {
-                        leaves = height == 1;
-                        next.extend(children)
+        // At the root's height the one run is the whole level.
+        let Some((_, level)) = runs.into_iter().next() else {
+            return Ok(*root);
+        };
+        match level.len() {
+            0 => self.put_graph(Vec::new()),
+            1 => {
+                // The levels below may have shrunk to one chunk too.
+                let mut id = level[0].1;
+                while let Graph::Children(_, children) = self.graph_chunk(&id)? {
+                    if children.len() != 1 {
+                        break;
                     }
-                    Graph::Nodes(_) => break,
+                    id = children[0].1;
                 }
+                Ok(id)
             }
-            if next.is_empty() {
-                break;
-            }
-            levels.push(next);
-            if leaves {
-                break;
+            _ => {
+                let height = top.checked_add(1).ok_or(Error::Decode("graph too tall"))?;
+                self.put_parents(level, height)
             }
         }
-        levels.reverse();
-        Ok(levels)
     }
 
-    /// Re-cut one level where `edits` fall: each run of chunks from the one
-    /// an edit falls in until a new boundary lands on an old one. Returns
-    /// the level's new chunk list; untouched chunks keep their ids.
+    /// The child list of an upper chunk, read once per edit.
+    fn children(&self, upper: &mut Upper, id: &Id) -> Result<Vec<(String, Id)>, Error> {
+        if let Some(children) = upper.get(id) {
+            return Ok(children.clone());
+        }
+        match self.graph_chunk(id)? {
+            Graph::Children(_, children) => {
+                upper.insert(*id, children.clone());
+                Ok(children)
+            }
+            _ => Err(Error::WrongKind(*id)),
+        }
+    }
+
+    /// A cursor at the chunk of `height` that `label` falls in, under a
+    /// root of height `top`: the last whose first label is at most
+    /// `label`, or the first. Reads one child list per level above.
+    fn cursor_at(
+        &self,
+        upper: &mut Upper,
+        root: &Id,
+        top: u8,
+        height: u8,
+        label: &str,
+    ) -> Result<Cursor, Error> {
+        let mut path = Vec::new();
+        let mut id = *root;
+        for _ in height..top {
+            let list = self.children(upper, &id)?;
+            let i = list
+                .partition_point(|c| c.0.as_str() <= label)
+                .saturating_sub(1);
+            id = list[i].1;
+            path.push((list, i));
+        }
+        Ok(Cursor { root: *root, path })
+    }
+
+    /// Move a cursor to the next chunk at its height; false at the end of
+    /// the level, after which the cursor is not used.
+    fn cursor_next(&self, upper: &mut Upper, cursor: &mut Cursor) -> Result<bool, Error> {
+        let depth = cursor.path.len();
+        let mut d = depth;
+        loop {
+            if d == 0 {
+                return Ok(false);
+            }
+            let (list, i) = &mut cursor.path[d - 1];
+            if *i + 1 < list.len() {
+                *i += 1;
+                break;
+            }
+            d -= 1;
+        }
+        cursor.path.truncate(d);
+        while cursor.path.len() < depth {
+            let (list, i) = cursor.path.last().unwrap();
+            let id = list[*i].1;
+            let child = self.children(upper, &id)?;
+            cursor.path.push((child, 0));
+        }
+        Ok(true)
+    }
+
+    /// Re-cut the chunks at `height` that `edits` fall in: each run goes
+    /// from the chunk an edit falls in until a new boundary lands on an
+    /// old one, or the level ends. Returns the runs; chunks outside them
+    /// are neither read nor rewritten. At the root's height the one run
+    /// is the whole new level.
+    #[allow(clippy::too_many_arguments)]
     fn splice<T: Item>(
         &mut self,
-        chunks: &[(String, Id)],
+        upper: &mut Upper,
+        root: &Id,
+        top: u8,
+        height: u8,
         edits: &BTreeMap<String, Option<T>>,
-        load: impl Fn(&Self, &Id) -> Result<Vec<T>, Error>,
+        load: impl Fn(&Self, &mut Upper, &Id) -> Result<Vec<T>, Error>,
         make: impl Fn(Vec<T>) -> Result<Graph, Error>,
-    ) -> Result<Vec<(String, Id)>, Error> {
-        let mut by_chunk: BTreeMap<usize, Vec<(&String, &Option<T>)>> = BTreeMap::new();
-        for (label, edit) in edits {
-            let at = chunks.partition_point(|c| c.0.as_str() <= label.as_str());
-            by_chunk
-                .entry(at.saturating_sub(1))
-                .or_default()
-                .push((label, edit));
-        }
-        let mut out = Vec::new();
+    ) -> Result<Vec<Run>, Error> {
         let put = |r: &mut Self, items: Vec<T>| -> Result<(String, Id), Error> {
             let first = items[0].label().to_string();
             Ok((first, r.put(&Object::Graph(make(items)?))?))
         };
-        let mut k = 0;
-        while k < chunks.len() {
-            if !by_chunk.contains_key(&k) {
-                out.push(chunks[k].clone());
-                k += 1;
-                continue;
-            }
-            let (mut buf, mut acc) = (Vec::new(), 0);
+        // An edit falls in the chunk before the next one's first label.
+        let falls_in = |label: &str, next: &Option<(String, Id)>| {
+            next.as_ref().is_none_or(|n| label < n.0.as_str())
+        };
+        let mut pending = edits.iter().peekable();
+        let mut runs = Vec::new();
+        while let Some((label, _)) = pending.peek() {
+            let mut cursor = self.cursor_at(upper, root, top, height, label)?;
+            let mut cur = cursor.entry();
+            let mut next = match self.cursor_next(upper, &mut cursor)? {
+                true => Some(cursor.entry()),
+                false => None,
+            };
+            let (mut old, mut new, mut buf, mut acc) = (Vec::new(), Vec::new(), Vec::new(), 0);
             loop {
-                let edits = by_chunk.get(&k).map_or(&[][..], |e| &e[..]);
-                let items = merge(load(self, &chunks[k].1)?, edits);
-                k += 1;
+                let mut mine = Vec::new();
+                while let Some(e) = pending.next_if(|(l, _)| falls_in(l, &next)) {
+                    mine.push(e);
+                }
+                let items = merge(load(self, upper, &cur.1)?, &mine);
+                old.push(cur);
                 for item in items {
                     acc += item.size();
                     let ends = ends_chunk(item.label(), acc);
                     buf.push(item);
                     if ends {
-                        out.push(put(self, std::mem::take(&mut buf))?);
+                        new.push(put(self, std::mem::take(&mut buf))?);
                         acc = 0;
                     }
                 }
-                if buf.is_empty() || k == chunks.len() {
+                let Some(n) = next.take() else { break };
+                cur = n;
+                next = match self.cursor_next(upper, &mut cursor)? {
+                    true => Some(cursor.entry()),
+                    false => None,
+                };
+                let more = pending.peek().is_some_and(|(l, _)| falls_in(l, &next));
+                if buf.is_empty() && !more {
                     break;
                 }
             }
             if !buf.is_empty() {
-                out.push(put(self, buf)?);
+                new.push(put(self, buf)?);
             }
+            runs.push((old, new));
         }
-        Ok(out)
+        Ok(runs)
     }
 }
