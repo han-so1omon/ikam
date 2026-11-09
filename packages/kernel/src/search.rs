@@ -338,19 +338,40 @@ impl<S: Store> Repo<S> {
         {
             return self.search_chunks(pattern, files, &index.files, chunks);
         }
-        let candidates: Vec<Id> = match index.filter(|i| pattern.len() >= 3 && i.chunks.is_none()) {
+        let candidates: Vec<Id> = match index.filter(|i| !pattern.is_empty() && i.chunks.is_none())
+        {
             Some(index) => {
                 let covered: HashSet<&Id> = index.files.iter().collect();
-                let mut hits: Option<HashSet<usize>> = None;
-                for w in pattern.windows(3) {
-                    let list = index.postings.get(&[w[0], w[1], w[2]]);
-                    let set: HashSet<usize> = list.into_iter().flatten().copied().collect();
-                    hits = Some(match hits {
-                        Some(h) => h.intersection(&set).copied().collect(),
-                        None => set,
-                    });
-                }
-                let hits = hits.unwrap_or_default();
+                let hits = match pattern.len() {
+                    // A pattern shorter than a trigram (E132): a content
+                    // holds it iff one of its trigrams contains it, or the
+                    // content is shorter than three bytes and so has no
+                    // trigrams (it is in no posting list).
+                    1 | 2 => {
+                        let finder = memchr::memmem::Finder::new(pattern);
+                        let (mut hits, mut seen) = (HashSet::new(), HashSet::new());
+                        for (t, list) in &index.postings {
+                            seen.extend(list.iter().copied());
+                            if finder.find(t).is_some() {
+                                hits.extend(list.iter().copied());
+                            }
+                        }
+                        hits.extend((0..index.files.len()).filter(|i| !seen.contains(i)));
+                        hits
+                    }
+                    _ => {
+                        let mut hits: Option<HashSet<usize>> = None;
+                        for w in pattern.windows(3) {
+                            let list = index.postings.get(&[w[0], w[1], w[2]]);
+                            let set: HashSet<usize> = list.into_iter().flatten().copied().collect();
+                            hits = Some(match hits {
+                                Some(h) => h.intersection(&set).copied().collect(),
+                                None => set,
+                            });
+                        }
+                        hits.unwrap_or_default()
+                    }
+                };
                 let indexed = files.iter().filter(|id| covered.contains(id));
                 let unindexed = files.iter().filter(|id| !covered.contains(id));
                 let positions: HashMap<&Id, usize> = index

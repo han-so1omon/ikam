@@ -1978,3 +1978,15 @@ Newest last. Format and rules: `README.md`.
   - Isolation is partial: identical content is one object whatever the scope (content addressing), and container members and groups are found by id, not by seeds. With the empty scope 92 and 141 derivation arguments still named content from before the handle. So the scope bounds near-match reuse; permission checks still belong at the file layer (E126).
   - All kernel tests pass.
 - Verdict: **kept** (an option; for `ikam live` and `serve`, scope a write to the folders it touches plus where its bytes came from, when the caller knows); on its branch until Eric says to merge.
+
+### E132 short-search (one- and two-byte terms through the trigram index)
+- Branch / parent: exp/132-short-search / exp/131-seed-scope (E131)
+- Question: a goal of a few words often holds a two-letter term ("Q3", "AI", "EU"). E127 found the trigram index can't narrow those, so every search for one read every file. Can the existing index answer them, with no new structure?
+- Change (kernel; no format change, no option): `Repo::search` with a trigram index and a pattern of one or two bytes takes the union of the posting lists of every trigram that contains the pattern, plus the contents in no posting list (those shorter than three bytes, which have no trigrams). Every occurrence of a short pattern in a content of three bytes or more lies inside one of its trigrams, so the candidates are exactly the contents that hold it; each is still decoded and scanned as before. Tests (`tests/search_short.rs`): results equal a scan for every one- and two-byte pattern over a small alphabet, with contents of 0 to 7 bytes, and for hand-picked cases. The chunk index (E089, E094) still scans every chunk for these patterns.
+- Method: `examples/short.rs` on the cases store copied into memory, 526 text files (832 KB decoded, 7.1 MB fetched to scan them all, since most sit in groups); trigram index 393 KB, built in 1.9 s. Indexed numbers include loading the index on each query.
+- Result (scan / indexed; fetched, ms):
+  - "Q3" (26 files): 7.1 MB / 0.70 MB, 40.1 / 12.6 ms; "AI" (7): 7.1 / 0.34 MB, 44.5 / 9.0 ms; "EU" (8): 7.1 / 0.39 MB, 41.5 / 8.8 ms.
+  - One byte: "%" (83 files) 7.1 / 1.4 MB, 38.3 / 15.7 ms; "x" (230 files) 7.1 / 3.3 MB, 40.3 / 29.5 ms.
+  - Unchanged paths for comparison: "invoice" (13) 0.44 MB, 6.2 ms; "Q3 revenue" (0) 0.26 MB, 4.6 ms.
+  - Results equal the scan's for every query. All kernel tests pass.
+- Verdict: **kept** (no trade-off, so built in rather than an option); on its branch until Eric says to merge.
