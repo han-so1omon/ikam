@@ -2139,3 +2139,16 @@ Newest last. Format and rules: `README.md`.
   - The fixed bench on this branch: every byte count and the north score (0.3035) as on E138; cost score 0.2435 against 0.2399, from timings and repack peak memory only.
   - All kernel tests pass, plus `tests/backends.rs` (pack heads).
 - Verdict: **kept**; on its branch until Eric says to merge.
+
+### E140 section-grants (what one goal may read and change, by byte range)
+- Branch / parent: exp/140-section-grants / exp/139-file-store (E139)
+- Question (Eric, Nov 9: permission "including for targeting specific sections for specific actions relevant to the goals prompted by the user"): E126 put permission checks at the file layer. Can a grant name sections of files instead, the lines a goal needs, for reading and for changing, and what does checking it cost?
+- Change: `src/grant.rs`, a new API that stores nothing and changes no format. A `Grant` names, for one goal, file versions (path and content id) with read ranges and write ranges; `windows_around` builds the lines within two of each mention; `FileGrant::read` hands out only the granted ranges through range reads; `check_edit` finds what an edit changes in the old version (one region, aligned both ways for repeated bytes, else changed lines narrowed to their bytes) and allows it only when every region sits inside a write range and the old version is the granted one; `seal` and `verify` are a keyed BLAKE3 tag over a canonical encoding. Tests in `tests/grant.rs`; harness `examples/grants.rs` on the cases store, recommended setup, new handle.
+- Result (goals as in E133; a file-level grant, E126, names the same paths whole):
+  - Exposure: "Q3" matches 27 files (347 KB); its grant is 33 sections, 16.7 KB (4.8%). "AI": 8 files (79.6 KB), 13 sections, 11.9 KB (15%).
+  - I/O: reading the granted sections fetches the same as reading the files whole (59 reads, 385 KB for Q3; 13 reads, 82 KB for AI; the new handle's first lookup, 192 KB of heads, apart). These text files are members of groups, which decode whole (E124), so sections cut what the caller sees, not what the store fetches.
+  - Checks: a read check 14 to 22 ns; an edit check 14 to 20 us for the goal's edit (every mention replaced), 18 to 33 us to refuse an edit with a line outside the windows; another version or an ungranted file is refused in under 0.1 us. Sealing or verifying a grant 1.5 us (1.2 KB) to 3.2 us (3.7 KB).
+  - What each grant allowed, over both goals (35 files): the goal's edit 35 of 35 under both; a line changed outside the windows, alone or with the goal's edit, 0 of 70 under the section grant against 70 of 70 under the file grant; an edit of a version the grant does not name 0 of 35 against 35 (a file grant names paths, not versions); a file not granted 0 under both.
+  - All kernel tests pass.
+  - The fixed bench on this branch: every byte count and the north score (0.3035) as on E139; cost score 0.2441 against 0.2435, from timings only.
+- Verdict: **kept**; on its branch until Eric says to merge. A server option: grants per goal, checked at the file layer as E126 says; the format is unchanged.

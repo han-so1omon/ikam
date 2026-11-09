@@ -179,3 +179,9 @@ it is an on-disk addition and waits on a decision.
 | Setting | Default | Trade | Measured |
 | --- | --- | --- | --- |
 | `PackStore` (E122) against `FsStore` | `FsStore` | two syncs per ref move against one per object written, and a writer lock, against one file per object that any tool can list | E133's first goal with the recommended options 735 ms on files, 351 ms on packs (291 ms in memory), the same 4.5 MB fetched and bytes written; the view update syncs 425 objects on files |
+
+## What a goal may touch (E140)
+
+| Setting | Default | Trade | Measured |
+| --- | --- | --- | --- |
+| Section grants (`Grant`, `windows_around`) against file grants (E126) | none in the kernel; the server checks paths | a grant names file versions and byte ranges, so a stale version or a change outside the goal's lines is refused; the server must place the windows (it reads the matched files) and an edit check diffs the old and new bytes | "Q3": 16.7 KB of 347 KB exposed (4.8%); read check 14 to 22 ns, edit check 14 to 33 us, seal or verify 1.5 to 3.2 us; 0 of 70 out-of-window edits allowed against 70 of 70; same bytes fetched as whole files (groups) |
