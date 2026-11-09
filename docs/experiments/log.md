@@ -1944,7 +1944,7 @@ Newest last. Format and rules: `README.md`.
 - Result:
   - Path lookup (1,438 paths, depth up to 5): walking the trees takes a median 2 reads (max 9). A separate path index (59 objects, 62 KB, 1.8 s to build) takes 4 (max 7). No path index: the tree is already the index.
   - Database (100,000 keys): a get reads 10 objects cold; with a cache of decoded graph chunks, 1,000 gets touch 2,400 distinct objects (2.0 MB), 2.4 reads a get instead of 9.7. A 100-key range reads 13 objects (13 KB).
-  - Links: outgoing links are 1 read (2 us). Incoming links ("what points at this file") need a scan of every object: 113,210 reads, 260 MB, 340 ms. A reverse-link view (328,942 edges, 18,356 objects, 33.9 MB, 40 s to build here from scratch) answers the same query in 8 reads, 12.8 KB, about 1 ms.
+  - Links: outgoing links are 1 read (2 us). Incoming links ("what points at this file") need a scan of every object: 113,210 reads, 260 MB, 340 ms. A reverse-link view (328,942 edges, 18,356 objects, 33.9 MB, 40 s to build here from scratch) answers the same query in 8 reads, 12.8 KB, about 1 ms. (The view indexed every object in the store at that point, including the 100,000-key database built just before; over the bench store alone it holds 6,030 edges, E129.)
 - Verdict: **measurement**. Proposes a reverse-link view kept per write (option S11 in `docs/research/store-backends.md`) and a decoded-chunk cache for graph reads; no path index.
 
 ### E126 permission-checks (what a permission check costs, and what crosses tenants)

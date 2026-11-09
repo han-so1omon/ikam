@@ -257,6 +257,164 @@ fn main() {
     if run("e128") {
         e128(&mut repo, &files);
     }
+    if run("e129") {
+        e129(&mut repo, &files, c.tree, &refname);
+    }
+}
+
+/// Reverse-link edges ("target/source/label") of every object in `ids`.
+fn reverse_edges(repo: &R, ids: &[Id]) -> Vec<Node> {
+    let mut rev = Vec::new();
+    for src in ids {
+        if let Ok(obj) = repo.get(src) {
+            for (label, to) in obj.links() {
+                rev.push(Node {
+                    label: format!("{to}/{src}/{label}"),
+                    target: Target::Object(*src),
+                    edges: vec![],
+                });
+            }
+        }
+    }
+    rev
+}
+
+/// E129: what keeping the reverse-link view of E125 current costs per
+/// write. Objects are never rewritten in place, so a write only adds
+/// edges: those of the objects it created. (A gc pass would drop the
+/// edges of what it deletes, in one batch.)
+fn e129(repo: &mut R, files: &[(String, Id, usize)], root: Id, refname: &str) {
+    let all = repo.store().ids().unwrap();
+    let t = Instant::now();
+    let mut rev = reverse_edges(repo, &all);
+    rev.sort_by(|a, b| a.label.cmp(&b.label));
+    rev.dedup_by(|a, b| a.label == b.label);
+    let edges = rev.len();
+    let mut view = repo.put_graph_with(rev, Keys::Any).unwrap();
+    let build_ms = t.elapsed().as_secs_f64() * 1e3;
+    let build = repo.store().take();
+    eprintln!("view: {edges} edges in {build_ms:.0} ms");
+    let mut known: HashSet<Id> = repo.store().ids().unwrap().into_iter().collect();
+    let mut root = root;
+    // Writes of growing size: one small file; one file of each family;
+    // a new folder holding a copy of a whole small tenant with every file
+    // changed by one line.
+    let md: Vec<&(String, Id, usize)> = files.iter().filter(|f| f.0.ends_with(".md")).collect();
+    let tenant = files
+        .iter()
+        .filter(|f| f.0.starts_with("l-construction-v01/"))
+        .collect::<Vec<_>>();
+    let mut fam: HashMap<String, &(String, Id, usize)> = HashMap::new();
+    for f in files {
+        fam.entry(ext(&f.0)).or_insert(f);
+    }
+    let cases: Vec<(&str, Vec<(String, Vec<u8>)>)> = vec![
+        (
+            "one_md_file",
+            vec![(
+                md[3].0.clone(),
+                b"# Edited\n\nOne line changed by an agent.\n".to_vec(),
+            )],
+        ),
+        (
+            "one_file_per_family",
+            fam.values()
+                .map(|f| {
+                    let mut b = repo.read_content(&f.1).unwrap();
+                    b.extend_from_slice(b"\n");
+                    (f.0.clone(), b)
+                })
+                .collect(),
+        ),
+        (
+            "new_folder_36_files",
+            tenant
+                .iter()
+                .map(|f| {
+                    let mut b = repo.read_content(&f.1).unwrap();
+                    b.extend_from_slice(b"\n");
+                    (format!("e129-copy/{}", f.0), b)
+                })
+                .collect(),
+        ),
+    ];
+    repo.store().take();
+    for (name, writes) in cases {
+        let t = Instant::now();
+        let mut edits = Vec::new();
+        for (path, bytes) in &writes {
+            let id = repo.put_content(bytes).unwrap().id;
+            edits.push(Edit::Put {
+                path: path.clone(),
+                id,
+            });
+        }
+        root = repo.edit_tree(Some(root), &edits).unwrap();
+        repo.commit(refname, root, name).unwrap();
+        let write_io = repo.store().take();
+        let write_ms = t.elapsed().as_secs_f64() * 1e3;
+        let now = repo.store().ids().unwrap();
+        let new: Vec<Id> = now.iter().filter(|i| !known.contains(i)).copied().collect();
+        known.extend(new.iter().copied());
+        repo.store().take();
+        let t = Instant::now();
+        let added = reverse_edges(repo, &new);
+        let n_edges = added.len();
+        let ed: BTreeMap<String, Option<Node>> = added
+            .into_iter()
+            .map(|n| (n.label.clone(), Some(n)))
+            .collect();
+        repo.store().record(true);
+        view = repo.graph_edit_with(&view, ed, Keys::Any).unwrap();
+        let distinct = repo.store().record(false).unwrap();
+        let view_io = repo.store().take();
+        let dbytes: u64 = distinct
+            .iter()
+            .map(|i| repo.store().inner.read(i).map_or(0, |b| b.len() as u64))
+            .sum();
+        eprintln!(
+            "{name}: view edit read {} distinct objects, {dbytes} bytes, {} scans, {} reads",
+            distinct.len(),
+            view_io.scans,
+            view_io.reads
+        );
+        let view_ms = t.elapsed().as_secs_f64() * 1e3;
+        // The view's own chunks are not content and get no edges.
+        known.extend(repo.store().ids().unwrap());
+        // The view now answers for the first written file's new object.
+        let first = match &edits[0] {
+            Edit::Put { id, .. } => *id,
+            _ => unreachable!(),
+        };
+        let users = repo.used_by(&first).unwrap();
+        let via = repo.graph_prefix(&view, &format!("{first}/")).unwrap();
+        let mut a: Vec<Id> = users.iter().map(|(s, _)| *s).collect();
+        let mut b: Vec<Id> = via
+            .iter()
+            .map(|n| match n.target {
+                Target::Object(s) => s,
+                _ => panic!(),
+            })
+            .collect();
+        a.sort();
+        a.dedup();
+        b.sort();
+        b.dedup();
+        assert_eq!(a, b, "{name}: view must answer what a scan answers");
+        repo.store().take();
+        println!(
+            "{{\"exp\":\"E129\",\"what\":\"{name}\",\"files\":{},\"view_edges\":{edges},\"write_objects\":{},\"write_bytes\":{},\"write_ms\":{write_ms:.1},\"new_objects\":{},\"new_edges\":{n_edges},\"view_reads\":{},\"view_fetched\":{},\"view_writes\":{},\"view_write_bytes\":{},\"view_ms\":{view_ms:.1}}}",
+            writes.len(),
+            write_io.writes,
+            write_io.wbytes,
+            new.len(),
+            view_io.reads,
+            view_io.bytes,
+            view_io.writes,
+            view_io.wbytes
+        );
+    }
+    let _ = build;
 }
 
 /// E128: the same reads as E124 and E127, inside one read session per
