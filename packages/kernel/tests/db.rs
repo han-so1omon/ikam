@@ -220,6 +220,100 @@ fn rebuilt_views_equal_maintained_views() {
     assert_eq!(repo.db_rebuild(&db.log).unwrap(), db);
 }
 
+/// The same law on a database spread over many chunks: random batches of
+/// upserts, removes and subtree removes (some spanning chunk boundaries)
+/// edited in place give, byte for byte, the roots a full rebuild gives.
+#[test]
+fn in_place_views_equal_a_full_rebuild_at_scale() {
+    let mut repo = Repo::new(MemStore::default());
+    let mut db = repo.db_empty().unwrap();
+    let mut s = 0x853c49e6748fea9bu64;
+    let mut next = || {
+        s ^= s << 13;
+        s ^= s >> 7;
+        s ^= s << 17;
+        s
+    };
+    let mut i = 0;
+    for round in 0..40 {
+        let batch: Vec<Event> = (0..1 + next() % 300)
+            .map(|_| {
+                i += 1;
+                let r = next();
+                let key = format!("chain:{}/run:{}/{}", r % 20, (r >> 8) % 50, (r >> 16) % 5);
+                let idem = format!("e{i}");
+                match r % 20 {
+                    0 => rm(&format!("chain:{}", r % 20), true, &idem),
+                    1 | 2 => rm(
+                        &format!("chain:{}/run:{}", r % 20, (r >> 8) % 50),
+                        true,
+                        &idem,
+                    ),
+                    3..=5 => rm(&key, false, &idem),
+                    _ => up(&key, &"x".repeat((r >> 24) as usize % 400), &idem),
+                }
+            })
+            .collect();
+        db = repo.db_append(&db, &batch).unwrap();
+        assert_eq!(db.kv_at, i as u64);
+        if round % 5 == 4 {
+            assert_eq!(repo.db_rebuild(&db.log).unwrap(), db, "round {round}");
+        }
+    }
+    assert_eq!(repo.db_rebuild(&db.log).unwrap(), db);
+    assert!(
+        repo.db_scan(&db).unwrap().len() > 100,
+        "the view spans many chunks"
+    );
+}
+
+/// Each view records its log position; a commit keeps it, a commit from
+/// before positions were recorded reads as the log's end, and views behind
+/// the log are refused rather than appended to.
+#[test]
+fn views_record_their_log_position() {
+    let mut repo = Repo::new(MemStore::default());
+    let empty = repo.db_empty().unwrap();
+    assert_eq!((empty.ids_at, empty.kv_at), (0, 0));
+    let db = repo
+        .db_append(&empty, &[up("a", "1", "e1"), up("b", "2", "e2")])
+        .unwrap();
+    assert_eq!(
+        (db.ids_at, db.kv_at, repo.db_head(&db.log).unwrap()),
+        (2, 2, 2)
+    );
+    let c = repo.db_commit("main", &db, "two").unwrap();
+    assert_eq!(repo.db_at(&c).unwrap(), db);
+
+    let graph = |name: &str, id| TreeEntry {
+        name: name.into(),
+        kind: Kind::Graph,
+        id,
+    };
+    let views = repo
+        .put(&Object::tree(vec![graph("ids", db.ids), graph("kv", db.kv)]).unwrap())
+        .unwrap();
+    let views = TreeEntry {
+        name: "views".into(),
+        kind: Kind::Tree,
+        id: views,
+    };
+    let dir = repo
+        .put(&Object::tree(vec![graph("log", db.log), views]).unwrap())
+        .unwrap();
+    let dir = TreeEntry {
+        name: "db".into(),
+        kind: Kind::Tree,
+        id: dir,
+    };
+    let tree = repo.put(&Object::tree(vec![dir]).unwrap()).unwrap();
+    let old = repo.commit("old", tree, "no positions").unwrap();
+    assert_eq!(repo.db_at(&old).unwrap(), db);
+
+    let behind = Db { kv_at: 1, ..db };
+    assert!(repo.db_append(&behind, &[up("c", "3", "e3")]).is_err());
+}
+
 /// Commits keep every version: reads at an older commit see that version,
 /// files beside `db` are kept, and gc, repack and fsck leave both intact.
 #[test]
@@ -296,7 +390,12 @@ fn commits_without_a_database_read_as_empty() {
 #[ignore]
 fn append_cost() {
     use std::time::Instant;
-    for &(n, batch) in &[(1000usize, 1usize), (1000, 100), (10_000, 1000)] {
+    for &(n, batch) in &[
+        (1000usize, 1usize),
+        (1000, 100),
+        (10_000, 1000),
+        (10_000, 1),
+    ] {
         let mut repo = Repo::new(MemStore::default());
         let mut db = repo.db_empty().unwrap();
         let start = Instant::now();

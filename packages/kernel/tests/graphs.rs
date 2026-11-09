@@ -1,6 +1,6 @@
 //! Graph laws (docs/plans/2026-10-04-graph-objects.md).
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use ikam_kernel::{
     Arg, Edge, Graph, Id, Kind, MemStore, Node, Object, Repo, Store, Target, TreeEntry, node_key,
@@ -251,4 +251,179 @@ fn graph_versions_share_storage() {
         assert_eq!(&repo.graph_nodes(root).unwrap(), v);
     }
     assert!(total < 4 * one_zstd, "{total} >= 4 x {one_zstd}");
+}
+
+fn simple(label: String, s: &mut u64) -> Node {
+    let to = format!("entity:{:x}", rng(s) % 1_000_000_007);
+    Node {
+        label,
+        target: Target::None,
+        edges: vec![Edge {
+            to: node_key(&to),
+            label: "cites".into(),
+        }],
+    }
+}
+
+/// Random edits: inserts (some before the first label or after the last),
+/// updates, removes of present and absent labels.
+fn random_edits(nodes: &[Node], n: usize, s: &mut u64) -> BTreeMap<String, Option<Node>> {
+    let mut edits = BTreeMap::new();
+    for _ in 0..n {
+        let r = rng(s);
+        let existing = (!nodes.is_empty())
+            .then(|| nodes[(rng(s) % nodes.len() as u64) as usize].label.clone());
+        match (r % 10, existing) {
+            (0, _) => edits.insert(
+                format!("!{:x}", rng(s) % 1000),
+                Some(simple(String::new(), s)),
+            ),
+            (1, _) => edits.insert(
+                format!("~{:x}", rng(s) % 1000),
+                Some(simple(String::new(), s)),
+            ),
+            (2..=4, _) => edits.insert(
+                format!("entity:{:x}", rng(s) % 1_000_000_007),
+                Some(simple(String::new(), s)),
+            ),
+            (5..=6, Some(l)) => edits.insert(l, Some(simple(String::new(), s))),
+            (7..=8, Some(l)) => edits.insert(l, None),
+            _ => edits.insert(format!("absent:{:x}", rng(s)), None),
+        };
+    }
+    for (label, node) in edits.iter_mut() {
+        if let Some(n) = node {
+            n.label = label.clone();
+        }
+    }
+    edits
+}
+
+fn apply(nodes: &[Node], edits: &BTreeMap<String, Option<Node>>) -> Vec<Node> {
+    let mut map: BTreeMap<String, Node> =
+        nodes.iter().map(|n| (n.label.clone(), n.clone())).collect();
+    for (label, edit) in edits {
+        match edit {
+            Some(n) => map.insert(label.clone(), n.clone()),
+            None => map.remove(label),
+        };
+    }
+    map.into_values().collect()
+}
+
+fn height(repo: &Repo<MemStore>, root: &Id) -> u8 {
+    match repo.get(root).unwrap() {
+        Object::Graph(Graph::Children(h, _)) => h,
+        _ => 0,
+    }
+}
+
+/// In-place edits give the root `put_graph` gives for the edited node set,
+/// byte for byte, on graphs of every height (including growing and
+/// shrinking ones), chained edit after edit.
+#[test]
+fn in_place_edits_equal_a_full_rebuild() {
+    let mut s = 0x853c49e6748fea9bu64;
+    let mut repo = Repo::new(MemStore::default());
+    let mut heights = BTreeSet::new();
+    for &(size, rounds, batch) in &[
+        (0usize, 20, 5usize),
+        (40, 30, 10),
+        (3000, 40, 30),
+        (150_000, 6, 200),
+    ] {
+        let mut nodes: Vec<Node> = (0..size)
+            .map(|_| simple(format!("entity:{:x}", rng(&mut s) % 1_000_000_007), &mut s))
+            .map(|n| (n.label.clone(), n))
+            .collect::<BTreeMap<_, _>>()
+            .into_values()
+            .collect();
+        let mut root = repo.put_graph(nodes.clone()).unwrap();
+        heights.insert(height(&repo, &root));
+        for _ in 0..rounds {
+            let n = 1 + (rng(&mut s) % batch as u64) as usize;
+            let edits = random_edits(&nodes, n, &mut s);
+            nodes = apply(&nodes, &edits);
+            root = repo.graph_edit(&root, edits).unwrap();
+            assert_eq!(root, repo.put_graph(nodes.clone()).unwrap(), "size {size}");
+            heights.insert(height(&repo, &root));
+        }
+        assert_eq!(repo.graph_nodes(&root).unwrap(), nodes);
+        let all: BTreeMap<String, Option<Node>> =
+            nodes.iter().map(|n| (n.label.clone(), None)).collect();
+        let emptied = repo.graph_edit(&root, all).unwrap();
+        assert_eq!(
+            emptied,
+            repo.put_graph(Vec::new()).unwrap(),
+            "removing everything gives the empty graph"
+        );
+    }
+    assert!(
+        heights.contains(&0) && heights.contains(&1) && heights.iter().any(|h| *h >= 2),
+        "{heights:?}"
+    );
+}
+
+/// Growing a graph one node at a time from empty, at the end and at the
+/// start, matches `put_graph` at every step and grows its height.
+#[test]
+fn in_place_appends_equal_a_full_rebuild() {
+    let mut s = 0x9e3779b97f4a7c15u64;
+    let mut repo = Repo::new(MemStore::default());
+    let (mut root, mut nodes) = (repo.put_graph(Vec::new()).unwrap(), Vec::new());
+    for i in 0..3000u32 {
+        let label = if i % 2 == 0 {
+            format!("{:08}", i)
+        } else {
+            format!("!{:08}", 10_000 - i)
+        };
+        let node = simple(label.clone(), &mut s);
+        nodes.push(node.clone());
+        root = repo
+            .graph_edit(&root, BTreeMap::from([(label, Some(node))]))
+            .unwrap();
+        if i % 97 == 0 || i == 2999 {
+            assert_eq!(root, repo.put_graph(nodes.clone()).unwrap(), "after {i}");
+        }
+    }
+    assert!(height(&repo, &root) >= 1);
+}
+
+/// A label whose key clashes with a node in a chunk being rewritten is
+/// refused; a label must match its node.
+#[test]
+fn in_place_edits_check_labels() {
+    let mut repo = Repo::new(MemStore::default());
+    let root = repo.put_graph(vec![node("a", &[])]).unwrap();
+    assert!(
+        repo.graph_edit(
+            &root,
+            BTreeMap::from([("b".to_string(), Some(node("c", &[])))])
+        )
+        .is_err()
+    );
+}
+
+/// One edit in a large graph writes only the path to it: a few chunks per
+/// level, not the graph.
+#[test]
+fn in_place_edit_writes_only_its_path() {
+    let mut s = 0x2545f4914f6cdd1du64;
+    let mut repo = Repo::new(MemStore::default());
+    let nodes: Vec<Node> = (0..150_000)
+        .map(|i| simple(format!("entity:{i:08}"), &mut s))
+        .collect();
+    let root = repo.put_graph(nodes.clone()).unwrap();
+    let before = repo.store().ids().unwrap().len();
+    let label = nodes[75_000].label.clone();
+    let edit = simple(label.clone(), &mut s);
+    let edited = repo
+        .graph_edit(&root, BTreeMap::from([(label, Some(edit))]))
+        .unwrap();
+    let written = repo.store().ids().unwrap().len() - before;
+    let levels = height(&repo, &edited) as usize + 1;
+    assert!(
+        written <= 4 * levels,
+        "{written} objects for {levels} levels"
+    );
 }

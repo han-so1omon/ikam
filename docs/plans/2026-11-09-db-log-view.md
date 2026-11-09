@@ -62,3 +62,38 @@ with subtree deletes (`graph_edge_event_folding.py`). Its tests are ported in
 
 Events are about 220 bytes over 500 keys; nothing was committed or gc'd, so
 "stored" includes every intermediate graph version.
+
+## In-place edits and view positions (E119, branch exp/db-inplace)
+
+Eric, Nov 9: build in-place graph edits, with each view's log position
+recorded, on a branch from exp/db-log-view.
+
+- `Repo::graph_edit(root, edits)` re-cuts only the chunks the edits fall in,
+  continuing until a new boundary lands on an old one, then does the same one
+  level up. It reads every chunk above the leaves (small) and only the leaves
+  it edits. Its root equals `put_graph` of the edited node set: tested on
+  graphs of height 0, 1 and 2, growing, shrinking and emptied.
+- `db_append` edits the three views in place, looks up a batch's idempotency
+  keys in one pass (`graph_nodes_in`) and finds a subtree remove's keys with
+  `graph_prefix`. `db_rebuild` is now an independent full fold with
+  `put_graph`, so the rebuild law compares two implementations.
+- Each view records its log position (`Db::ids_at`, `Db::kv_at`), committed
+  as the files `db/views/ids.at` and `db/views/kv.at`; a commit without them
+  reads as the log's end. Appending to views behind the log is refused.
+- Label-key clashes are checked only within the chunks rewritten.
+
+| Case | Before (E118, rerun) | After |
+| --- | --- | --- |
+| 1,000 single appends | 6.3 s, last 9.5 ms | 3.1 s, last 3.0 ms |
+| 1,000 in batches of 100 | 0.25 s | 0.20 s |
+| 10,000 in batches of 1,000 | 2.1 s, last 214 ms | 1.8 s, last 189 ms |
+| 10,000 single appends | not run (about 10 min by extrapolation) | 48 s, last 4.7 ms |
+
+Objects and bytes written are the same before and after: unchanged chunks
+were never rewritten. Most of what is left is the write path, not the
+graph: each new chunk is stored as a slice of its earlier version when that
+is smaller, and searching for that slice is most of an append. With that
+search off (read weight 1.0, measured, not committed), 1,000 single appends
+take 0.9 s but store 7.9 MB instead of 3.3 MB, and 10,000 take 23 s and
+130 MB instead of 47 MB. That trade is the background integration idea:
+store new chunks plain on the fast path and let repack find the slices.

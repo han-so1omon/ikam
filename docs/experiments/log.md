@@ -1894,3 +1894,14 @@ Newest last. Format and rules: `README.md`.
   - Append cost (ignored test `append_cost`): 1,000 single appends 6.2 s (8.5 ms each at the end); batches of 100, 0.21 s; 10,000 in batches of 1,000, 1.9 s (202 ms for the last batch). Every append rebuilds the three graphs, so cost grows with the database.
 - Not settled here: in-place prolly edits (so an append touches one path), whether a reused idempotency key with different bytes should be an error (April skipped it), and the ledger scan at open.
 - Verdict: on its branch until Eric says to merge.
+
+### E119 db-inplace (graph edits that touch only the chunks an edit falls in)
+- Branch / parent: exp/db-inplace / exp/db-log-view at e8ee290 (E118)
+- Question (Eric, Nov 9): every append rebuilt the whole view; build in-place edits, with each view's log position recorded.
+- Change (kernel only; no format change): `graph_edit` re-cuts only the chunks edits fall in, until the content-defined cut falls back into step, level by level; `graph_nodes_in` (batch lookup), `graph_prefix`, `graph_last`; `db_append` uses them; `db_rebuild` is a separate full fold with `put_graph`; views record their log position (`ids.at`, `kv.at` files under `db/views`), and appends to views behind the log are refused. `put_graph` is refactored to share sizing and parent building, unchanged in output.
+- Result: 4 new graph laws (in-place root equals `put_graph` on graphs of height 0 to 2, chained random batches, appends at both ends from empty, emptying; one edit in 150,000 nodes writes only its path; label checks) and 2 new db laws (in-place views equal a full rebuild on a multi-chunk view with subtree removes across chunks; positions committed, defaulted and enforced). All kernel tests pass; clippy and fmt clean.
+  - Bench: all 14 corpora exact, fsck clean; north 0.3035 (unchanged); cost score 0.2426 (E118 0.2389).
+  - Append cost (`append_cost`, release, nothing else running): 1,000 single appends 6.3 s -> 3.1 s (last 9.5 -> 3.0 ms); batches of 100, 0.25 -> 0.20 s; 10,000 in batches of 1,000, 2.1 -> 1.8 s; 10,000 single appends 48 s, last 4.7 ms (not run before: about 10 minutes by extrapolation). Objects and bytes written unchanged.
+  - Most of the remaining cost is the slice search when a new chunk is stored. Measured with it off (read weight 1.0, not committed): 1,000 single appends 0.9 s and 7.9 MB stored instead of 3.3 MB.
+- Not settled here: storing new chunks plain on the fast path and leaving slices to repack (an option to measure next); reading every chunk above the leaves per edit (fine below about a million keys); clash checks for label keys outside the rewritten chunks.
+- Verdict: on its branch until Eric says to merge.
