@@ -1865,4 +1865,4 @@ Newest last. Format and rules: `README.md`.
 - Change: `/robots.txt` (GET or HEAD, after the Host check, before the password check) answers `User-agent: *` with `Allow: /` on a `--public` copy and `Disallow: /` otherwise. Nothing else changes.
 - Result: unit test; manual: public copy 200 `Allow: /`, results still 200, PUT on /robots.txt 401; private copy 200 `Disallow: /`, everything else still 401, unknown Host 403. Tests, clippy and fmt clean.
 - Not settled here: if the reader looks for robots.txt on the default port (443, the private copy, not on Funnel), this does not help; that would need the test copy on its own name on 443.
-- Verdict: **kept**; on its branch until Eric says to merge.
+- Verdict: **kept**; merged to main on Eric's yes (Nov 9).
