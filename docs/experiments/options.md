@@ -150,6 +150,7 @@ clashes are about 3 in 10,000 there).
 | Setting | Default | Trade | Measured |
 | --- | --- | --- | --- |
 | `Repo::seed_scope` (E131) | `None`: every stored content | `Some(roots)`: the first write reads only those contents and what they are made of, and near-match reuse stays inside them, against missing repeats of content outside them | one-file edit's first write 238 MB / 1.7 s to 0.69 MB / 8.8 ms, same bytes stored; a 36-file folder copy with source and destination folders in scope 8.5 KB written against 21.8 KB on the whole store; an empty scope 1.09 MB against 2.9 KB |
+| `Repo::set_seed_scope` (E133) | not called | a new scope for each request (a goal's folders), the seed index rebuilt for it, against that rebuild's reads (2.7 MB for the second goal in E133) | name the trees and view chunks a write replaces too: a view update stored 237 KB with them, 404 KB without |
 
 **Not yet a setting**: a ledger cache file (E130: 159 KB and 0.1 ms to load
 against a 229 MB scan on every fresh handle's first derived read); it is an

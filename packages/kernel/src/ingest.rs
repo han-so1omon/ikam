@@ -407,12 +407,27 @@ impl<S: Store> Repo<S> {
                     ids
                 }
             };
-            for id in ids {
+            let mut seen = std::collections::HashSet::new();
+            let mut stack: Vec<Id> = ids.into_iter().rev().collect();
+            while let Some(id) = stack.pop() {
+                if !seen.insert(id) {
+                    continue;
+                }
                 let Ok(encoded) = self.store.read(&id) else {
                     continue; // derived: its arguments are in `ids`
                 };
-                if let Ok(bytes) = self.decode_plain(&id, &encoded) {
-                    index.add(id, &bytes);
+                match self.decode_plain(&id, &encoded) {
+                    Ok(bytes) => index.add(id, &bytes),
+                    // A tree or graph chunk named in a scope stands for the
+                    // content holding its encoding, so its next version can
+                    // repeat it (E133). On the whole store that content is
+                    // indexed in its own right.
+                    Err(_) if self.seed_scope.is_some() => {
+                        if let Some(content) = crate::dict::tree_content(&encoded) {
+                            stack.extend(self.closure(vec![content], |_| true)?.0);
+                        }
+                    }
+                    Err(_) => {}
                 }
             }
             self.index = Some(index);

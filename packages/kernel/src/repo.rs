@@ -131,11 +131,15 @@ pub struct Repo<S: Store> {
     /// every stored content, so the first write on a handle reads the whole
     /// store to build the matcher's seed index. `Some(roots)`: only those
     /// contents and what they are derived from, for example the files of
-    /// the tree being written, or of one tenant's refs. A smaller scope
+    /// the tree being written, or of one tenant's refs. Trees and graph
+    /// chunks are stored as content too, so name the trees and view chunks
+    /// a write will replace if their new versions should repeat them (E133:
+    /// a view update stored 404 KB without its chunks, 227 KB with). A
+    /// smaller scope
     /// reads less and never builds new content out of bytes outside it, at
     /// the price of missing repeats of content outside it. Content written
     /// through the handle is added to the index either way. Set it before
-    /// the handle's first write: the index is built once per handle.
+    /// the handle's first write, or with `set_seed_scope` later.
     pub seed_scope: Option<Vec<Id>>,
     /// zstd level new encodings use (`dict::MEASURE_LEVEL` unless
     /// `recompress` is running).
@@ -212,6 +216,14 @@ impl<S: Store> Repo<S> {
             }
         }
         Ok(self.ledger.get_or_init(|| ledger))
+    }
+
+    /// Change `seed_scope`, dropping the seed index so the next write builds
+    /// it for the new scope (E133: one handle serving goals in different
+    /// folders).
+    pub fn set_seed_scope(&mut self, scope: Option<Vec<Id>>) {
+        self.seed_scope = scope;
+        self.index = None;
     }
 
     pub(crate) fn reset_projections(&mut self) {
