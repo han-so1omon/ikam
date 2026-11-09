@@ -50,7 +50,7 @@ const USAGE: &str = "usage: ikam [--store DIR] [--short-records] [--slow-codec-m
                                    only if smaller and fully verified
   live [PORT] [--watch DIR[:PREFIX]]... [--llm] [--commit-after MS]
        [--allow-host NAME]... [--log-requests] [--public]
-       [--max-body BYTES] [--max-store BYTES] [--max-conns N]
+       [--max-body BYTES] [--max-store BYTES] [--max-conns N] [--gc-every N]
                                    run REF (default main) as a live filesystem:
                                    WebDAV at http://127.0.0.1:PORT/dav/ (mount it
                                    in Finder: Go > Connect to Server), a web page
@@ -76,6 +76,11 @@ const USAGE: &str = "usage: ikam [--store DIR] [--short-records] [--slow-codec-m
                                    read-only) but not write, edit, delete, run
                                    repack, fsck or commit, or ask Claude; it sets
                                    those limits to 25M, 1G and 32 unless given.
+                                   --gc-every deletes what no commit needs (file
+                                   versions and trees written between commits)
+                                   after every N commits; POST /api/gc does it
+                                   once. Each walks the whole store while edits
+                                   wait, so it is off by default.
   passwd USER                      read a password from stdin, print the
                                    IKAM_AUTH line for it
   write PATH [FILE|-]              store FILE (or stdin) at PATH in REF, commit
@@ -464,6 +469,12 @@ fn live_cmd(store_dir: &str, refname: &str, args: &[String]) -> Result<(), Strin
             _ => Err("--max-conns N (at least 1)".to_string()),
         })
         .transpose()?;
+    let gc_every = take_flag(&mut args, "--gc-every")
+        .map(|n| match n.parse::<usize>() {
+            Ok(n) if n > 0 => Ok(n),
+            _ => Err("--gc-every N (at least 1)".to_string()),
+        })
+        .transpose()?;
     let before = args.len();
     args.retain(|a| a != "--public");
     let public = args.len() != before;
@@ -492,6 +503,7 @@ fn live_cmd(store_dir: &str, refname: &str, args: &[String]) -> Result<(), Strin
     let port: u16 = args.first().map_or(Ok(8737), |p| p.parse()).map_err(err)?;
     let mut l = live::Live::open(store_dir, refname)?;
     l.max_store = max_store.or(public.then_some(PUBLIC_MAX_STORE));
+    l.gc_every = gc_every;
     if let Some(ms) = commit_after {
         l.commit_after = Duration::from_millis(ms);
     }
