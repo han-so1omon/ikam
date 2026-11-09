@@ -128,11 +128,12 @@ impl<S: Store> Repo<S> {
         for d in c.derivations {
             self.record(d)?;
         }
-        // A dictionary, or the context of a "Q" encoding, is decoded from its
-        // stored bytes and must stay stored.
+        // The dictionary, and anything another stored encoding is decoded
+        // from (a dictionary, a group, a "Q" or "M" context), must stay
+        // stored (E123: dropping a group lost its members).
         if let Some(old) = c.drop
             && Some(old) != self.dictionary().map(|(id, _)| *id)
-            && !self.is_related_base(&old)?
+            && !self.is_needed(&old)?
         {
             self.store.delete(&old)?;
         }

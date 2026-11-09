@@ -627,10 +627,29 @@ impl<S: Store> Repo<S> {
     }
 
     /// True if some stored "Q" or "M" encoding uses `id` as a context.
+    #[cfg(test)]
     pub(crate) fn is_related_base(&self, id: &Id) -> Result<bool, Error> {
         for other in self.store.ids()? {
             let stored = self.store.read(&other)?;
             if contexts(&stored).contains(&&id.as_bytes()[..]) {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    /// True if another stored encoding cannot be decoded without `id`'s
+    /// stored bytes: `needs` names it (a dictionary, a group, or the context
+    /// of a "Q" or "M" encoding), as gc counts it. These encodings read the
+    /// stored bytes themselves, never a derivation of them (E123: a group
+    /// dropped for a `fill` that rebuilds it lost every member).
+    pub(crate) fn is_needed(&self, id: &Id) -> Result<bool, Error> {
+        for other in self.store.ids()? {
+            if other != *id
+                && needs(&self.store.read(&other)?)
+                    .iter()
+                    .any(|p| names(p, id))
+            {
                 return Ok(true);
             }
         }
