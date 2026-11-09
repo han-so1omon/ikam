@@ -213,6 +213,11 @@ impl Store for FsStore {
                 }
             }
         }
+        // Directory order depends on the filesystem (ext4 hashes names with a
+        // per-filesystem seed, APFS sorts them). Callers that pick among
+        // equal choices in id order then store the same encodings everywhere,
+        // as from a `MemStore` (E136).
+        out.sort_unstable();
         Ok(out)
     }
 
@@ -235,6 +240,7 @@ impl Store for FsStore {
                 out.push(id);
             }
         }
+        out.sort_unstable(); // as `ids` (E136)
         Ok(out)
     }
 

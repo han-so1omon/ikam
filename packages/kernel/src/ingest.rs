@@ -397,8 +397,14 @@ impl<S: Store> Repo<S> {
     pub(crate) fn ensure_index(&mut self) -> Result<(), Error> {
         if self.index.is_none() {
             let mut index = Index::default();
+            // In id order, so the same objects give the same index (and the
+            // same encodings) on any store and in any run (E136).
             let ids: Vec<Id> = match &self.seed_scope {
-                None => self.store.ids()?,
+                None => {
+                    let mut ids = self.store.ids()?;
+                    ids.sort();
+                    ids
+                }
                 // Only what these contents are made of (E131).
                 Some(roots) => {
                     let (content, _) = self.closure(roots.clone(), |_| true)?;
@@ -424,7 +430,13 @@ impl<S: Store> Repo<S> {
                     // indexed in its own right.
                     Err(_) if self.seed_scope.is_some() => {
                         if let Some(content) = crate::dict::tree_content(&encoded) {
-                            stack.extend(self.closure(vec![content], |_| true)?.0);
+                            let mut more: Vec<Id> = self
+                                .closure(vec![content], |_| true)?
+                                .0
+                                .into_iter()
+                                .collect();
+                            more.sort_unstable_by(|a, b| b.cmp(a));
+                            stack.extend(more);
                         }
                     }
                     Err(_) => {}

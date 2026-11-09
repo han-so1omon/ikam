@@ -2085,3 +2085,16 @@ Newest last. Format and rules: `README.md`.
   - Four-ingest safety check on frozen input: fsck_failures=0 and mismatched=0 on every ingest, fsck ok, objects identical with needed_index on and off and identical to E134's store.
   - All kernel tests pass, plus `tests/heads.rs` (heads are prefixes of reads on both stores; a reopened `FsStore` finds the same derivations as the handle that wrote them).
 - Verdict: **kept**; on its branch until Eric says to merge.
+
+### E136 seed-order (the same objects give the same encodings in every run and on every filesystem)
+- Branch / parent: exp/136-seed-order / exp/135-head-reads (E135)
+- Question: E133 to E135 each wrote a different number of bytes for the second goal's view update (75,467, 75,501 and 75,465) from the same store and the same edits. Where does the variation come from, and can it go?
+- Cause: the matcher keeps at most four candidate sources per seed, the first ones added, so the order the seed index is built in picks among equal sources. The scoped index (E131, E133) added a tree's content closure from a hash set, whose order changes from run to run. The whole-store index and every other pass over `FsStore::ids` follow directory order, which on ext4 depends on a per-filesystem hash seed and on APFS is sorted, so the same writes could store different encodings on Eric's Mac than here. Content ids never change; only which equal encoding is stored.
+- Change (kernel; no format change): `FsStore::ids` and `ids_with_prefix` return ids sorted, as `MemStore` already does, and the seed index sorts its input and each closure it adds.
+- Result:
+  - `examples/goal.rs` run twice: every stage writes the same bytes in both runs (second goal's view update 75,433 bytes in both).
+  - Four-ingest safety check on frozen input: fsck_failures=0 and mismatched=0 on every ingest, fsck ok, objects identical with needed_index on and off and identical to E135's store (here, sorting the listings changed no encoding).
+  - Fixed bench: every stored-bytes figure the same as E134's; timings within noise (score 0.2401 to 0.2472).
+  - Sorting costs one sort of the id list per listing, well under a millisecond for the 1,906 ids of the cases store (estimated, not timed separately).
+  - All kernel tests pass, plus `tests/order.rs`: file-store listings come in id order (fails without the change), and the same writes store the same bytes in a file store as in a memory store (a guard; it also passed before).
+- Verdict: **kept**; on its branch until Eric says to merge.
