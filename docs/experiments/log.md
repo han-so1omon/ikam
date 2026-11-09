@@ -2179,3 +2179,18 @@ Newest last. Format and rules: `README.md`.
   - All kernel tests pass (164).
   - The fixed bench on this branch: every byte count and the north score (0.3035) as on E141; cost score 0.2280 against 0.2450, from timings only (the bench ran beside goal runs; it does not search through a session).
 - Verdict: **kept**; on its branch until Eric says to merge. A library API; nothing stored changes.
+
+### E143 template-memo (a template candidate reuses the bytes the template search just read)
+- Branch / parent: exp/143-template-memo / exp/142-session-search (E142)
+- Question: E142's view update still read 102 objects twice in one edit (Q3), with `read_memo` on. Where from?
+- Finding: a stack trace of every repeated read during the view update (183 over both goals) put all of them in `new_template_candidate`: `template_candidates` reads each similar chunk as a possible template through `read_content` (which keeps it in the memo), then `new_template_candidate` reads the same chunk's stored copy again to try it as the content a fill would replace, without asking the memo.
+- Change: the memo also keeps the length of each kept content's stored encoding (all a template candidate needs besides the bytes, for its cost), and `new_template_candidate` takes both from the memo when they are there, and keeps what it reads otherwise. Off when `read_memo` is off; nothing stored changes. Test in `tests/template_memo.rs`: with the memo a put reads every object once, without it the template is read twice, and both store the same objects byte for byte. `examples/goal.rs` takes `IKAM_CONFIG=name` to run one configuration.
+- Result (cases store, goals as in E133, E142's `recommended_shared_session`, first lookup's 246 KB of heads apart):
+  - First goal: 2.04 MB in 554 reads to 1.59 MB in 441; the view update 906 KB to 522 KB (no object read twice), the edit 477 KB to 414 KB.
+  - Next goal: 1.14 MB in 379 reads to 0.78 MB in 288; view update 632 KB to 327 KB, edit 154 KB to 102 KB.
+  - Every configuration with the memo gains about as much (E141's 2.50 to 2.05 MB; E138's 4.21 to 3.76 MB); every configuration without it reads and writes exactly as before.
+  - Bytes written: the same in every configuration (250,171 and 77,762 for the recommended setup).
+  - What is left of the view update: first reads of the similar chunks a new chunk is compared with (154 reads, 476 KB for Q3).
+  - All kernel tests pass (165).
+  - The fixed bench on this branch: every byte count and the north score (0.3035) as on E142; cost score 0.2427 against 0.2280, from timings only (the bench does not set read_memo).
+- Verdict: **kept**; on its branch until Eric says to merge. Part of `read_memo`; the format is unchanged.

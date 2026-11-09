@@ -179,6 +179,8 @@ pub(crate) struct Hints {
 #[derive(Default)]
 pub(crate) struct Memo {
     map: HashMap<Id, Vec<u8>>,
+    /// Length of the stored encoding of each kept content (E143).
+    stored: HashMap<Id, usize>,
     bytes: usize,
 }
 
@@ -306,15 +308,27 @@ impl<S: Store> Repo<S> {
         self.store.has(id).then_some(bytes)
     }
 
-    /// Keep `bytes` as the content of `id`; callers have checked it.
-    pub(crate) fn memo_put(&self, id: &Id, bytes: &[u8]) {
+    /// Keep `bytes` as the content of `id`, stored as `stored` encoded
+    /// bytes; callers have checked it.
+    pub(crate) fn memo_put(&self, id: &Id, bytes: &[u8], stored: usize) {
         if let Some(m) = self.memo.lock().unwrap().as_mut()
             && m.bytes + bytes.len() <= MEMO_LIMIT
             && !m.map.contains_key(id)
         {
             m.bytes += bytes.len();
             m.map.insert(*id, bytes.to_vec());
+            m.stored.insert(*id, stored);
         }
+    }
+
+    /// The kept content of `id` and the length of its stored encoding,
+    /// while its stored copy exists (E143).
+    pub(crate) fn memo_get_stored(&self, id: &Id) -> Option<(Vec<u8>, usize)> {
+        let memo = self.memo.lock().unwrap();
+        let m = memo.as_ref()?;
+        let out = (m.map.get(id)?.clone(), *m.stored.get(id)?);
+        drop(memo);
+        self.store.has(id).then_some(out)
     }
 
     pub fn store(&self) -> &S {
@@ -537,7 +551,7 @@ impl<S: Store> Repo<S> {
                 Ok(bytes)
                     if crate::dict::self_verified(&encoded) || Id::of_content(&bytes) == *id =>
                 {
-                    self.memo_put(id, &bytes);
+                    self.memo_put(id, &bytes, encoded.len());
                     return self.remember(id, bytes, cx);
                 }
                 Ok(_) | Err(Error::Corrupt(_)) => err = Error::Corrupt(*id),

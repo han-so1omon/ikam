@@ -249,7 +249,7 @@ impl<S: Store> Repo<S> {
             let e = store.read(id).ok()?;
             let bytes = self.decode_plain(id, &e).ok()?;
             if crate::dict::self_verified(&e) || Id::of_content(&bytes) == *id {
-                self.memo_put(id, &bytes);
+                self.memo_put(id, &bytes, e.len());
             }
             Some(bytes)
         };
@@ -354,11 +354,23 @@ impl<S: Store> Repo<S> {
     /// with derivations (so templates never chain through repeated pairing),
     /// or the dictionary (which must stay stored).
     fn new_template_candidate(&self, bytes: &[u8], y: Id) -> Result<Option<Candidate>, Error> {
-        let Ok(stored) = self.store.read(&y) else {
-            return Ok(None);
-        };
-        let Ok(y_bytes) = self.decode_plain(&y, &stored) else {
-            return Ok(None);
+        // E143: `template_candidates` has just read `y` as a template, so
+        // with `read_memo` on its bytes are kept; only the stored length is
+        // needed besides them.
+        let (y_bytes, stored_len) = match self.memo_get_stored(&y) {
+            Some(kept) => kept,
+            None => {
+                let Ok(stored) = self.store.read(&y) else {
+                    return Ok(None);
+                };
+                let Ok(y_bytes) = self.decode_plain(&y, &stored) else {
+                    return Ok(None);
+                };
+                if crate::dict::self_verified(&stored) || Id::of_content(&y_bytes) == y {
+                    self.memo_put(&y, &y_bytes, stored.len());
+                }
+                (y_bytes, stored.len())
+            }
         };
         let is_dict = self.dictionary().is_some_and(|(d, _)| *d == y);
         if is_dict
@@ -392,7 +404,7 @@ impl<S: Store> Repo<S> {
         let written = derivation_size(&dx)
             + derivation_size(&dy)
             + literals.iter().map(|l| l.1.len()).sum::<usize>();
-        let cost = written as isize - stored.len() as isize;
+        let cost = written as isize - stored_len as isize;
         Ok(Some(Candidate {
             cost,
             work: work_x + work_y,

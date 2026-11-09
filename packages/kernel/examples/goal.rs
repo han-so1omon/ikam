@@ -371,6 +371,10 @@ fn main() {
         // E142: the same, with search and read in one read session.
         ("recommended_shared_session", true, false),
     ] {
+        // IKAM_CONFIG=name runs only that configuration.
+        if std::env::var("IKAM_CONFIG").is_ok_and(|c| c != config) {
+            continue;
+        }
         let mut repo = wrap(&objects, &refs);
         repo.needed_index = recommended;
         let hints = config == "recommended_replace_hints" || config == "recommended_shared_session";

@@ -197,3 +197,5 @@ it is an on-disk addition and waits on a decision.
 | Setting | Default | Trade | Measured |
 | --- | --- | --- | --- |
 | `ReadSession::search` | `Repo::search` (no shared decodes) | the scan keeps decodes up to the session's limit, so memory is bounded by that limit; reads of the hits then cost nothing | E133's first goal 2.50 MB to 2.04 MB, next 1.23 MB to 1.14 MB (heads apart); read stage to zero |
+
+`read_memo` (E143) also covers template candidates: a similar chunk is read once per edit, not twice. E133's first goal on the recommended setup 2.04 MB to 1.59 MB, next 1.14 MB to 0.78 MB; bytes written unchanged.
