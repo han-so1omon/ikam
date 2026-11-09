@@ -544,6 +544,9 @@ fn live_cmd(store_dir: &str, refname: &str, args: &[String]) -> Result<(), Strin
         if !req.header("host").is_some_and(|h| hosts.ok(h)) {
             return http::Response::text(403, "unknown Host");
         }
+        if req.path == "/robots.txt" && matches!(req.method.as_str(), "GET" | "HEAD") {
+            return robots(public);
+        }
         if let Some(refusal) = auth.as_ref().and_then(|a| a.check(req)) {
             // With --public, a guest (no password sent) may read; Claude
             // answers are dropped from what it asks.
@@ -604,6 +607,15 @@ fn live_cmd(store_dir: &str, refname: &str, args: &[String]) -> Result<(), Strin
         );
     }
     http::serve(port, handler, limits)
+}
+
+/// `/robots.txt`, answered before the password check: crawlers and web
+/// readers that honour it may read a `--public` copy, and are asked to keep
+/// out of any other (which needs the password anyway). Many treat a missing
+/// or refused robots.txt as "keep out".
+fn robots(public: bool) -> http::Response {
+    let rules = if public { "Allow: /" } else { "Disallow: /" };
+    http::Response::text(200, format!("User-agent: *\n{rules}\n"))
 }
 
 /// Whether a request can change anything: every WebDAV method but the
@@ -740,6 +752,13 @@ fn list(repo: &Repo<FsStore>, spec: &str, recursive: bool) -> Result<(), String>
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn robots_rules() {
+        assert_eq!(robots(true).body, b"User-agent: *\nAllow: /\n");
+        assert_eq!(robots(false).body, b"User-agent: *\nDisallow: /\n");
+        assert_eq!(robots(true).status, 200);
+    }
 
     #[test]
     fn guest_requests() {
