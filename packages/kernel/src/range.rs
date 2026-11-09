@@ -30,6 +30,14 @@ pub struct ReadSession<'a, S: Store> {
 }
 
 impl<S: Store> ReadSession<'_, S> {
+    /// The contents this session holds decoded, to hand to a write batch
+    /// (`Repo::keep_read`, E145).
+    pub fn into_contents(self) -> Vec<(Id, Vec<u8>)> {
+        let mut out: Vec<(Id, Vec<u8>)> = self.cx.into_inner().known.into_iter().collect();
+        out.sort_by_key(|a| a.0);
+        out
+    }
+
     /// Content `id`, whole.
     pub fn read_content(&self, id: &Id) -> Result<Vec<u8>, Error> {
         let mut cx = self.cx.borrow_mut();

@@ -2209,3 +2209,17 @@ Newest last. Format and rules: `README.md`.
   - All kernel tests pass (166).
   - The fixed bench on this branch: every byte count and the north score (0.3035) as on E143; cost score 0.2356 against 0.2427, from timings only (the bench keeps object_templates on).
 - Verdict: **kept**; on its branch until Eric says to merge. Recommended off for a service that edits trees and views; the format is unchanged.
+
+### E145 write-batch (a goal's writes share one memo, handed the files it read)
+- Branch / parent: exp/145-write-batch / exp/144-object-templates (E144)
+- Question: after E144 the edit stage still fetched 414 KB for five one-word edits (Q3): the first put builds the seed index by reading the edited files, each later put reads its old version again for its plan, and all five files had just been decoded by the goal's read session. Can a goal's writes share what was read?
+- Change: with `read_memo` on, building the seed index keeps what it reads in the memo of the write in progress. `Repo::begin_batch` / `end_batch` run several writes (puts, a tree edit, a view update) as one edit, so what any of them reads is kept until the batch ends. `Repo::keep_read(id, bytes)` hands a batch bytes the caller already holds; they are kept only inside a batch, only if they hash to `id` and `id` is stored. `ReadSession::into_contents` gives back what a session decoded. `examples/goal.rs` config `recommended_batch`: E144's setup with the edit stage and view update in one batch, handed the read session's files. Tests in `tests/batch.rs`: a batch reads less and stores the same objects, handed bytes take each write down to one read (the stored length a template plan's cost needs), and wrong bytes or bytes outside a batch are ignored.
+- Result (cases store, goals as in E133, against E144's `recommended_no_object_templates`, first lookup's 246 KB of heads apart):
+  - The index-build memo alone: every configuration with the memo reads 80 KB less on the first goal and 18 KB less on the next (E144's setup 1.48 to 1.40 MB), with the same bytes written.
+  - With the batch: first goal 1.48 MB in 391 reads to 1.13 MB in 338; the edit stage 414 KB to 70 KB. Next goal 794 KB in 288 reads to 744 KB in 277; edit 102 KB to 53 KB.
+  - Time, first goal: in memory 144 to 136 ms, on packs 159 to 143 ms, on files 394 to 311 ms.
+  - Bytes written and the store's growth: the same in every configuration.
+  - Left in the edit: one read per edited file for its stored length (a store call for an object's length would remove it, an API addition) and the tree edit's own reads.
+  - All kernel tests pass (168).
+  - The fixed bench on this branch: every byte count and the north score (0.3035) as on E144; cost score 0.2443 against 0.2356, from timings only (the bench does not run batches).
+- Verdict: **kept**; on its branch until Eric says to merge. Library API, used by a server's goal loop; nothing stored changes.

@@ -380,6 +380,9 @@ fn main() {
         ("recommended_shared_session", true, false),
         // E144: the same, without template plans for trees and view chunks.
         ("recommended_no_object_templates", true, false),
+        // E145: the same, with a goal's writes in one batch that is handed
+        // the files the read session decoded.
+        ("recommended_batch", true, false),
     ] {
         // IKAM_CONFIG=name runs only that configuration.
         if std::env::var("IKAM_CONFIG").is_ok_and(|c| c != config) {
@@ -392,8 +395,13 @@ fn main() {
             "recommended_replace_hints"
                 | "recommended_shared_session"
                 | "recommended_no_object_templates"
+                | "recommended_batch"
         );
-        repo.object_templates = config != "recommended_no_object_templates";
+        let batch = config == "recommended_batch";
+        repo.object_templates = !matches!(
+            config,
+            "recommended_no_object_templates" | "recommended_batch"
+        );
         repo.read_memo = config == "recommended_read_memo" || hints;
         repo.replace_hints = hints;
         let mut root = c.tree;
@@ -438,7 +446,9 @@ fn main() {
             repo.store().scans.fetch_add(index_io.scans, Relaxed);
             let shared = matches!(
                 config,
-                "recommended_shared_session" | "recommended_no_object_templates"
+                "recommended_shared_session"
+                    | "recommended_no_object_templates"
+                    | "recommended_batch"
             )
             .then(|| repo.session(64 << 20));
             let (hits, _) = match &shared {
@@ -478,6 +488,11 @@ fn main() {
                 t.elapsed().as_secs_f64() * 1e3,
                 format!(",\"to_model\":{model},\"whole_files\":{whole}"),
             );
+            // E145: the decoded files go to the write batch.
+            let handed: Vec<(Id, Vec<u8>)> = match shared {
+                Some(s) if batch => s.into_contents(),
+                _ => vec![],
+            };
             // Edit five of them and commit.
             let hit_set: HashSet<&Id> = hits.iter().collect();
             let chosen: Vec<&(String, Id)> = text
@@ -511,6 +526,10 @@ fn main() {
             }
             repo.store().by_tag.lock().unwrap().clear();
             let t = Instant::now();
+            let began = batch && repo.begin_batch();
+            for (id, b) in &handed {
+                repo.keep_read(id, b);
+            }
             let before = repo.bytes_written;
             let mut edits = Vec::new();
             let mut first_put = None;
@@ -594,6 +613,7 @@ fn main() {
             repo.store().seen.lock().unwrap().clear();
             repo.store().repeats.swap(0, Relaxed);
             view = repo.graph_edit_with(&view, ed, Keys::Any).unwrap();
+            repo.end_batch(began);
             let tags: Vec<String> = repo
                 .store()
                 .by_tag

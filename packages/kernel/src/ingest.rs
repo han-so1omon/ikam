@@ -441,11 +441,21 @@ impl<S: Store> Repo<S> {
                 if !seen.insert(id) {
                     continue;
                 }
+                // E145: what this edit has already read (or was handed).
+                if let Some(bytes) = self.memo_get(&id) {
+                    index.add(id, &bytes);
+                    continue;
+                }
                 let Ok(encoded) = self.store.read(&id) else {
                     continue; // derived: its arguments are in `ids`
                 };
                 match self.decode_plain(&id, &encoded) {
-                    Ok(bytes) => index.add(id, &bytes),
+                    Ok(bytes) => {
+                        if crate::dict::self_verified(&encoded) || Id::of_content(&bytes) == id {
+                            self.memo_put(&id, &bytes, encoded.len());
+                        }
+                        index.add(id, &bytes)
+                    }
                     // A tree or graph chunk named in a scope stands for the
                     // content holding its encoding, so its next version can
                     // repeat it (E133). On the whole store that content is

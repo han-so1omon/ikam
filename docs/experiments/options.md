@@ -205,3 +205,9 @@ it is an on-disk addition and waits on a decision.
 | Setting | Default | Trade | Measured |
 | --- | --- | --- | --- |
 | `object_templates` | on | off: a tree or view chunk is stored as slices of earlier content or plain, never as a template fill that also rewrites the old chunk; edits only add objects | E133's first goal on the recommended setup writes 250 KB to 86 KB, the store grows 72 KB against 76 KB, 332 ms to 159 ms on packs; the next goal reads 2% more |
+
+## A goal's writes as one batch (E145)
+
+| Setting | Default | Trade | Measured |
+| --- | --- | --- | --- |
+| `begin_batch` / `end_batch`, `keep_read` | each write is its own edit | with `read_memo` on, what a goal's writes read (and the files it hands over) is kept until the batch ends, up to the memo's 64 MB | E133's first goal on the recommended setup 1.48 MB to 1.13 MB, edit stage 414 KB to 70 KB; bytes written unchanged |

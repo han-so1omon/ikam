@@ -319,13 +319,44 @@ impl<S: Store> Repo<S> {
     /// Keep `bytes` as the content of `id`, stored as `stored` encoded
     /// bytes; callers have checked it.
     pub(crate) fn memo_put(&self, id: &Id, bytes: &[u8], stored: usize) {
+        self.memo_insert(id, bytes, Some(stored));
+    }
+
+    fn memo_insert(&self, id: &Id, bytes: &[u8], stored: Option<usize>) {
         if let Some(m) = self.memo.lock().unwrap().as_mut()
             && m.bytes + bytes.len() <= MEMO_LIMIT
             && !m.map.contains_key(id)
         {
             m.bytes += bytes.len();
             m.map.insert(*id, bytes.to_vec());
-            m.stored.insert(*id, stored);
+            if let Some(n) = stored {
+                m.stored.insert(*id, n);
+            }
+        }
+    }
+
+    /// Start running several writes as one edit (E145): with `read_memo`
+    /// on, what any of them reads is kept until `end_batch`, so a goal's
+    /// file puts, tree edit and view update read each stored content at
+    /// most once. Returns whether this call started it; pass that to
+    /// `end_batch`. Nested batches and edits join the outer one.
+    pub fn begin_batch(&self) -> bool {
+        self.begin_memo()
+    }
+
+    /// End a batch `begin_batch` started; what it kept is dropped.
+    pub fn end_batch(&self, began: bool) {
+        self.end_memo(began)
+    }
+
+    /// Hand a batch bytes the caller already holds (E145), such as the
+    /// files a goal's read session decoded, so its writes need not fetch
+    /// them again. Kept only inside a `batch` with `read_memo` on, only if
+    /// `bytes` hash to `id` and `id` is stored; otherwise ignored.
+    pub fn keep_read(&self, id: &Id, bytes: &[u8]) {
+        if self.memo.lock().unwrap().is_some() && self.store.has(id) && Id::of_content(bytes) == *id
+        {
+            self.memo_insert(id, bytes, None);
         }
     }
 
