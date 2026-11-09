@@ -208,3 +208,26 @@ fn rocksdb_store() {
     all(&|p| ikam_kernel::backends::rocks::open(p, false).unwrap());
     all(&|p| ikam_kernel::backends::rocks::open(p, true).unwrap());
 }
+
+#[test]
+fn fs_store_ref_survives_a_writer_killed_mid_update() {
+    // A writer killed between taking the lock and the rename leaves
+    // refs/<name>.lock behind; the next update must still go through.
+    let dir = tempfile::tempdir().unwrap();
+    let mut s = FsStore::open(dir.path()).unwrap();
+    s.set_ref("heads/main", None, id(1)).unwrap();
+    std::fs::write(dir.path().join("refs/heads/main.lock"), b"half-written").unwrap();
+    s.set_ref("heads/main", Some(id(1)), id(2)).unwrap();
+    assert_eq!(s.get_ref("heads/main").unwrap(), Some(id(2)));
+    // A lock held by a live writer still refuses.
+    let held = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(dir.path().join("refs/heads/main.lock"))
+        .unwrap();
+    held.lock().unwrap();
+    assert!(matches!(s.set_ref("heads/main", Some(id(2)), id(3)), Err(ikam_kernel::Error::RefConflict(_))));
+    drop(held);
+    s.set_ref("heads/main", Some(id(2)), id(3)).unwrap();
+}
