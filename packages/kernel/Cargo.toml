@@ -48,3 +48,7 @@ path = "src/bin/ikam/main.rs"
 # Dependencies (wasmi, zlib, zstd) are far slower unoptimized; tests run them heavily.
 [profile.dev.package."*"]
 opt-level = 2
+
+[[example]]
+name = "stores"
+required-features = ["stores"]

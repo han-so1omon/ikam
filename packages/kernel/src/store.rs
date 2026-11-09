@@ -278,16 +278,34 @@ impl Store for FsStore {
         check_ref_name(name)?;
         let path = self.root.join("refs").join(name);
         fs::create_dir_all(path.parent().unwrap())?;
-        // The lock file serializes writers; create_new fails if another holds it.
+        // The lock file serializes writers through an OS lock on it, not its
+        // existence: a writer killed mid-update leaves the file behind, and
+        // an existence lock would refuse every later update of the ref
+        // (E122). The OS drops the lock with the process.
         let lock = path.with_file_name(format!(
             "{}.lock",
             path.file_name().unwrap().to_string_lossy()
         ));
+        let conflict = || Error::RefConflict(name.into());
         let mut file = fs::OpenOptions::new()
             .write(true)
-            .create_new(true)
+            .create(true)
+            .truncate(false)
             .open(&lock)
-            .map_err(|_| Error::RefConflict(name.into()))?;
+            .map_err(|_| conflict())?;
+        file.try_lock().map_err(|_| conflict())?;
+        // The file locked must still be the one at the lock path: a writer
+        // that opened it just before another renamed it into place holds
+        // the ref file itself.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            let held = file.metadata()?.ino();
+            if fs::metadata(&lock).map(|m| m.ino()).ok() != Some(held) {
+                return Err(conflict());
+            }
+        }
+        file.set_len(0)?;
         let result = (|| {
             if self.get_ref(name)? != expected {
                 return Err(Error::RefConflict(name.into()));

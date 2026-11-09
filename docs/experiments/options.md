@@ -145,6 +145,20 @@ read weight 1.0: 1,000 single appends 0.9 s and 7.9 MB stored against
 label keys across the whole graph (needed only near 100M events: chance
 clashes are about 3 in 10,000 there).
 
+## Store backends (E122)
+
+Each backend sits behind the `Store` trait; `FsStore` (one file per object) stays the default until the Mac numbers are in. The others build with the cargo feature named (`stores` for all).
+
+| Backend | Feature | Trade | Measured (Linux, ext4) |
+|---|---|---|---|
+| `FsStore` | default | simplest, readable by any tool; one file and one 4 KiB block per object, 66 flushes and 25 files changed per commit | 4.1 GB allocated for 1M small objects (288 MB of data); 19.2 ms a single append |
+| `PackStore` | default | append-only packs and a checkpointed index; a pack cleaner is not built yet, so deleted objects stay until one is | 769 MB/s writes, 2 flushes and 2 files per commit, 372 MB for 1M objects, open 279 ms and cold read p50 190 us at 10M |
+| SQLite (WAL) | `sqlite` | one file, `synchronous` FULL (or NORMAL: 0.3 flushes a commit, may lose the last commits on power loss, never corrupts) | 9 ms open at 10M; cold p50 155 us, warm 92 |
+| LMDB | `lmdb` | fastest warm reads (1.6 us at 1M); a fixed map size and 1.6 to 2.8 times the bytes | 6.1 GB at 10M |
+| redb | `redb` | pure Rust, one file; the largest on disk at 1M | cold p50 85 us at 10M |
+| fjall, with or without key-value separation | `fjall` | LSM; fast writes, slow open (640 ms to 1.8 s) | 330 MB/s writes separated |
+| RocksDB, with or without blobs | `rocksdb` | LSM; needs a C++ toolchain to build; 3.7 s open at 10M | cold p50 142 us at 10M |
+
 ## Where new content looks for repeats (E131)
 
 | Setting | Default | Trade | Measured |
