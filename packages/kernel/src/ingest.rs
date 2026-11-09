@@ -60,7 +60,10 @@ impl Candidate {
 
 impl<S: Store> Repo<S> {
     pub fn put_content(&mut self, bytes: &[u8]) -> Result<Put, Error> {
-        self.put_content_with(bytes, 0, &[])
+        let began = self.begin_memo();
+        let out = self.put_content_with(bytes, 0, &[]);
+        self.end_memo(began);
+        out
     }
 
     pub(crate) fn put_content_with(
@@ -240,10 +243,15 @@ impl<S: Store> Repo<S> {
         self.ensure_index()?;
         let store = &self.store;
         let load = |id: &Id| {
-            store
-                .read(id)
-                .ok()
-                .and_then(|e| self.decode_plain(id, &e).ok())
+            if let Some(bytes) = self.memo_get(id) {
+                return Some(bytes);
+            }
+            let e = store.read(id).ok()?;
+            let bytes = self.decode_plain(id, &e).ok()?;
+            if crate::dict::self_verified(&e) || Id::of_content(&bytes) == *id {
+                self.memo_put(id, &bytes);
+            }
+            Some(bytes)
         };
         let plan = matcher::plan(bytes, self.index.as_ref().unwrap(), load);
         self.concat_candidate(bytes, &plan)

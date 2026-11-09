@@ -50,6 +50,13 @@ impl<S: Store> Repo<S> {
     /// store the resulting tree. Only directories on edited paths are read
     /// and rewritten.
     pub fn edit_tree(&mut self, root: Option<Id>, edits: &[Edit]) -> Result<Id, Error> {
+        let began = self.begin_memo();
+        let out = self.edit_tree_inner(root, edits);
+        self.end_memo(began);
+        out
+    }
+
+    fn edit_tree_inner(&mut self, root: Option<Id>, edits: &[Edit]) -> Result<Id, Error> {
         let mut top = match root {
             Some(id) => self.load_dir(&id)?,
             None => BTreeMap::new(),

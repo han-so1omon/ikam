@@ -11,7 +11,7 @@
 //! one JSON line per stage: objects read, bytes fetched, scans, ms, bytes
 //! handed to the model and bytes written.
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 use std::time::Instant;
@@ -25,6 +25,10 @@ struct Counting<S: Store> {
     reads: AtomicU64,
     bytes: AtomicU64,
     scans: AtomicU64,
+    // E138: reads by the stored encoding's first byte, and repeat reads.
+    by_tag: std::sync::Mutex<BTreeMap<u8, (u64, u64)>>,
+    seen: std::sync::Mutex<HashMap<Id, (u64, usize)>>,
+    repeats: AtomicU64,
 }
 
 #[derive(Clone, Copy, Default)]
@@ -55,6 +59,22 @@ impl<S: Store> Store for Counting<S> {
         let out = self.inner.read(id)?;
         self.reads.fetch_add(1, Relaxed);
         self.bytes.fetch_add(out.len() as u64, Relaxed);
+        let e = *self
+            .by_tag
+            .lock()
+            .unwrap()
+            .entry(out.first().copied().unwrap_or(0))
+            .or_default();
+        self.by_tag.lock().unwrap().insert(
+            out.first().copied().unwrap_or(0),
+            (e.0 + 1, e.1 + out.len() as u64),
+        );
+        let mut seen = self.seen.lock().unwrap();
+        let e = seen.entry(*id).or_insert((0, out.len()));
+        e.0 += 1;
+        if e.0 > 1 {
+            self.repeats.fetch_add(1, Relaxed);
+        }
         Ok(out)
     }
     // Partial reads pass through and count only the bytes fetched (E135).
@@ -88,14 +108,72 @@ impl<S: Store> Store for Counting<S> {
     }
 }
 
-type R = Repo<Counting<MemStore>>;
+/// E139: the goal on a file store instead of memory, when `GOAL_FS` names a
+/// scratch directory (emptied and refilled for each configuration).
+enum AnyStore {
+    Mem(MemStore),
+    Fs(FsStore),
+}
+
+macro_rules! each {
+    ($s:expr, $x:ident => $e:expr) => {
+        match $s {
+            AnyStore::Mem($x) => $e,
+            AnyStore::Fs($x) => $e,
+        }
+    };
+}
+
+impl Store for AnyStore {
+    fn write(&mut self, id: Id, encoded: &[u8]) -> Result<bool, Error> {
+        each!(self, s => s.write(id, encoded))
+    }
+    fn replace(&mut self, id: Id, encoded: &[u8]) -> Result<(), Error> {
+        each!(self, s => s.replace(id, encoded))
+    }
+    fn read(&self, id: &Id) -> Result<Vec<u8>, Error> {
+        each!(self, s => s.read(id))
+    }
+    fn read_head(&self, id: &Id, n: usize) -> Result<Vec<u8>, Error> {
+        each!(self, s => s.read_head(id, n))
+    }
+    fn has(&self, id: &Id) -> bool {
+        each!(self, s => s.has(id))
+    }
+    fn ids(&self) -> Result<Vec<Id>, Error> {
+        each!(self, s => s.ids())
+    }
+    fn ids_with_prefix(&self, prefix: &[u8]) -> Result<Vec<Id>, Error> {
+        each!(self, s => s.ids_with_prefix(prefix))
+    }
+    fn delete(&mut self, id: &Id) -> Result<(), Error> {
+        each!(self, s => s.delete(id))
+    }
+    fn get_ref(&self, name: &str) -> Result<Option<Id>, Error> {
+        each!(self, s => s.get_ref(name))
+    }
+    fn set_ref(&mut self, name: &str, expected: Option<Id>, new: Id) -> Result<(), Error> {
+        each!(self, s => s.set_ref(name, expected, new))
+    }
+    fn refs(&self) -> Result<Vec<(String, Id)>, Error> {
+        each!(self, s => s.refs())
+    }
+}
+
+type R = Repo<Counting<AnyStore>>;
 
 const TEXT: &[&str] = &[
     "md", "txt", "csv", "json", "jsonl", "html", "xml", "py", "log", "eml",
 ];
 
 fn wrap(objects: &[(Id, Vec<u8>)], refs: &[(String, Id)]) -> R {
-    let mut mem = MemStore::default();
+    let mut mem = match std::env::var_os("GOAL_FS") {
+        Some(dir) => {
+            let _ = std::fs::remove_dir_all(&dir);
+            AnyStore::Fs(FsStore::open(dir).unwrap())
+        }
+        None => AnyStore::Mem(MemStore::default()),
+    };
     for (id, b) in objects {
         mem.write(*id, b).unwrap();
     }
@@ -107,6 +185,9 @@ fn wrap(objects: &[(Id, Vec<u8>)], refs: &[(String, Id)]) -> R {
         reads: 0.into(),
         bytes: 0.into(),
         scans: 0.into(),
+        by_tag: Default::default(),
+        seen: Default::default(),
+        repeats: 0.into(),
     })
 }
 
@@ -267,9 +348,12 @@ fn main() {
         ("recommended_whole_store_scope", true, false),
         // E137: only the files the goal edits, not their folders.
         ("recommended_scope_edited_files", true, true),
+        // E138: the same, keeping what each tree and view edit reads.
+        ("recommended_read_memo", true, true),
     ] {
         let mut repo = wrap(&objects, &refs);
         repo.needed_index = recommended;
+        repo.read_memo = config == "recommended_read_memo";
         let mut root = c.tree;
         let mut view = view;
         let mut known: HashSet<Id> = objects.iter().map(|o| o.0).collect();
@@ -338,7 +422,9 @@ fn main() {
                 .collect();
             if recommended && config != "recommended_whole_store_scope" {
                 let folders: HashSet<&str> = chosen.iter().map(|f| top(&f.0)).collect();
-                let mut scope: Vec<Id> = if config == "recommended_scope_edited_files" {
+                let mut scope: Vec<Id> = if config == "recommended_scope_edited_files"
+                    || config == "recommended_read_memo"
+                {
                     chosen.iter().map(|f| f.1).collect()
                 } else {
                     all.iter()
@@ -357,9 +443,11 @@ fn main() {
                 // A new scope per goal; the seed index is rebuilt for it.
                 repo.set_seed_scope(Some(scope));
             }
+            repo.store().by_tag.lock().unwrap().clear();
             let t = Instant::now();
             let before = repo.bytes_written;
             let mut edits = Vec::new();
+            let mut first_put = None;
             for f in &chosen {
                 let i = hits.iter().position(|h| *h == f.1).unwrap();
                 let b = &contents[i];
@@ -368,6 +456,13 @@ fn main() {
                 nb.extend_from_slice(g.to.as_bytes());
                 nb.extend_from_slice(&b[at + term.len()..]);
                 let id = repo.put_content(&nb).unwrap().id;
+                // E139: the first write builds the seed index for the scope.
+                if first_put.is_none() {
+                    first_put = Some((
+                        repo.store().reads.load(Relaxed),
+                        repo.store().bytes.load(Relaxed),
+                    ));
+                }
                 edits.push(Edit::Put {
                     path: f.0.clone(),
                     id,
@@ -376,6 +471,20 @@ fn main() {
             root = repo.edit_tree(Some(root), &edits).unwrap();
             repo.commit(refname, root, g.term).unwrap();
             let written = repo.bytes_written - before;
+            let tags: Vec<String> = repo
+                .store()
+                .by_tag
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|(t, (n, b))| format!("\"{}\":[{n},{b}]", *t as char))
+                .collect();
+            let (fr, fb) = first_put.unwrap_or_default();
+            println!(
+                "{{\"exp\":\"E139\",\"config\":\"{config}\",\"goal\":\"{}\",\"part\":\"edit_reads\",\"first_put_reads\":{fr},\"first_put_fetched\":{fb},\"tags\":{{{}}}}}",
+                g.term,
+                tags.join(",")
+            );
             line(
                 &repo,
                 g.term,
@@ -401,7 +510,49 @@ fn main() {
                 .map(|n| (n.label.clone(), Some(n)))
                 .collect();
             let edges = ed.len();
+            // E138: split the stage into finding the new edges and the edit.
+            let found = repo.store().take();
+            let found_ms = t.elapsed().as_secs_f64() * 1e3;
+            println!(
+                "{{\"exp\":\"E138\",\"config\":\"{config}\",\"goal\":\"{}\",\"part\":\"find_new_edges\",\"new_objects\":{},\"reads\":{},\"fetched\":{},\"ms\":{found_ms:.1}}}",
+                g.term,
+                new.len(),
+                found.reads,
+                found.bytes
+            );
+            // Put the counts back so the stage line still covers both parts.
+            repo.store().reads.fetch_add(found.reads, Relaxed);
+            repo.store().bytes.fetch_add(found.bytes, Relaxed);
+            repo.store().by_tag.lock().unwrap().clear();
+            repo.store().seen.lock().unwrap().clear();
+            repo.store().repeats.swap(0, Relaxed);
             view = repo.graph_edit_with(&view, ed, Keys::Any).unwrap();
+            let tags: Vec<String> = repo
+                .store()
+                .by_tag
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|(t, (n, b))| format!("\"{}\":[{n},{b}]", *t as char))
+                .collect();
+            println!(
+                "{{\"exp\":\"E138\",\"config\":\"{config}\",\"goal\":\"{}\",\"part\":\"graph_edit_reads_by_tag\",\"repeat_reads\":{},\"tags\":{{{}}}}}",
+                g.term,
+                repo.store().repeats.load(Relaxed),
+                tags.join(",")
+            );
+            let seen = repo.store().seen.lock().unwrap();
+            let mut top: Vec<(u64, usize)> = seen.values().copied().filter(|v| v.0 > 1).collect();
+            top.sort_by_key(|v| std::cmp::Reverse(v.0));
+            let distinct_repeated = top.len();
+            top.truncate(8);
+            println!(
+                "{{\"exp\":\"E138\",\"config\":\"{config}\",\"goal\":\"{}\",\"part\":\"most_read\",\"distinct\":{},\"distinct_repeated\":{distinct_repeated},\"top_reads_and_sizes\":{:?}}}",
+                g.term,
+                seen.len(),
+                top
+            );
+            drop(seen);
             let written = repo.bytes_written - before;
             line(
                 &repo,

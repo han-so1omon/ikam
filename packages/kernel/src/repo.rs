@@ -147,7 +147,28 @@ pub struct Repo<S: Store> {
     /// Large members' deflates, reused while a repack runs (E109); `None`
     /// otherwise, so every other read and fsck does the full work.
     pub(crate) deflate_memo: Option<std::sync::Arc<crate::container::DeflateMemo>>,
+    /// Keep the stored contents one tree or view edit reads, for the rest
+    /// of that edit (E138). Off by default. Each graph chunk and tree a
+    /// view or tree edit writes is matched against the old chunks near it,
+    /// and each match is read again to verify it, so the same few hundred
+    /// old chunks are read several times each. On, `graph_edit_with` and
+    /// `edit_tree` read each at most once (up to `MEMO_LIMIT` bytes), and
+    /// drop the copies when they return. Only contents stored as bytes and
+    /// checked against their id are kept, and evaluation work is counted
+    /// as before, so the bytes written are the same either way.
+    pub read_memo: bool,
+    pub(crate) memo: std::sync::Mutex<Option<Memo>>,
 }
+
+/// Contents read during one edit with `read_memo` on.
+#[derive(Default)]
+pub(crate) struct Memo {
+    map: HashMap<Id, Vec<u8>>,
+    bytes: usize,
+}
+
+/// Most bytes one edit's memo keeps; reads past it go to the store.
+pub(crate) const MEMO_LIMIT: usize = 64 << 20;
 
 impl<S: Store> Repo<S> {
     pub fn new(store: S) -> Repo<S> {
@@ -169,6 +190,43 @@ impl<S: Store> Repo<S> {
             seed_scope: None,
             level: crate::dict::MEASURE_LEVEL,
             deflate_memo: None,
+            read_memo: false,
+            memo: Default::default(),
+        }
+    }
+
+    /// Start keeping contents read, if `read_memo` is on and no outer edit
+    /// already does. True if this call started it (pass it to `end_memo`).
+    pub(crate) fn begin_memo(&self) -> bool {
+        let mut memo = self.memo.lock().unwrap();
+        if !self.read_memo || memo.is_some() {
+            return false;
+        }
+        *memo = Some(Memo::default());
+        true
+    }
+
+    pub(crate) fn end_memo(&self, began: bool) {
+        if began {
+            *self.memo.lock().unwrap() = None;
+        }
+    }
+
+    /// The kept content of `id`, while its stored copy exists (a copy
+    /// dropped during the edit reads as it would without the memo).
+    pub(crate) fn memo_get(&self, id: &Id) -> Option<Vec<u8>> {
+        let bytes = self.memo.lock().unwrap().as_ref()?.map.get(id).cloned()?;
+        self.store.has(id).then_some(bytes)
+    }
+
+    /// Keep `bytes` as the content of `id`; callers have checked it.
+    pub(crate) fn memo_put(&self, id: &Id, bytes: &[u8]) {
+        if let Some(m) = self.memo.lock().unwrap().as_mut()
+            && m.bytes + bytes.len() <= MEMO_LIMIT
+            && !m.map.contains_key(id)
+        {
+            m.bytes += bytes.len();
+            m.map.insert(*id, bytes.to_vec());
         }
     }
 
@@ -382,12 +440,16 @@ impl<S: Store> Repo<S> {
                 "{id}: derivation cycle or nesting too deep"
             )));
         }
+        if let Some(bytes) = self.memo_get(id) {
+            return self.remember(id, bytes, cx);
+        }
         let mut err = Error::NotFound(*id);
         match self.store.read(id) {
             Ok(encoded) => match self.decode_plain(id, &encoded) {
                 Ok(bytes)
                     if crate::dict::self_verified(&encoded) || Id::of_content(&bytes) == *id =>
                 {
+                    self.memo_put(id, &bytes);
                     return self.remember(id, bytes, cx);
                 }
                 Ok(_) | Err(Error::Corrupt(_)) => err = Error::Corrupt(*id),

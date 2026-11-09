@@ -2110,3 +2110,18 @@ Newest last. Format and rules: `README.md`.
   - What the first goal now reads: search 0.73 MB, the model's windows 0.39 MB, edits 2.5 MB, view update 3.9 MB, the projections 0.25 MB.
   - No kernel change, so the safety check and the fixed bench are E136's.
 - Verdict: **kept** as the recommended scope (in `options.md`); on its branch until Eric says to merge.
+
+### E138 read-memo (an edit reads each old chunk once)
+- Branch / parent: exp/138-view-update / exp/137-file-scope (E137)
+- Question: after E137 the biggest part of a goal is the view update: 3.8 MB and 1,337 reads to add 214 reverse links on the first goal. Only 317 of those objects are distinct; 168 are read more than once, 993 reads are repeats. Where do they come from, and can they go without changing what is stored?
+- Cause: each graph chunk (and tree) an edit writes is stored as content, so the matcher looks for repeats of it among the old chunks near it, reads each candidate, and reads it again to verify the derivation it proposes. The next new chunk does the same with mostly the same neighbours. A first try, sharing one rebuild context across the edit's chunk reads, removed only 13 of the 993: the repeats are on the write side.
+- Change (kernel; no format change): `Repo::read_memo`, off by default (`--read-memo` on the command line). On, `graph_edit_with`, `edit_tree` and `put_content` keep the contents they read (up to 64 MB) until they return, and the matcher and every rebuild look there first. Only contents stored as bytes and checked against their id are kept, a kept copy whose stored object is dropped during the edit reads as it would without the memo, and evaluation work is counted as before, so plans are chosen exactly as without it.
+- Result (`examples/goal.rs`, cases store, same goals as E133, new config `recommended_read_memo` = E137's recommended plus the memo):
+  - First goal's view update: 3.85 MB / 1,337 reads to 1.01 MB / 446 reads; repeats 993 to 102. Edit and commit: 2.46 MB to 2.08 MB. The same 236,561 and 13,818 bytes written.
+  - Next goal's view update: 3.16 MB to 0.80 MB; the same 75,221 bytes written.
+  - Whole first goal on a fresh handle: 7.7 MB to 4.5 MB fetched; next goal 5.7 MB to 3.3 MB. Time is unchanged (within noise): this store is in memory, so the gain is in bytes and requests, which is what a file or R2 store pays for.
+  - Four-ingest safety check on frozen input with `--needed-index --read-memo`: fsck_failures=0 and mismatched=0 on every ingest, fsck ok, objects identical to E136's store (needed index on, memo off).
+  - Fixed bench (memo off, the default): every stored-bytes figure the same as E136's; score 0.2472 to 0.2399, timing noise.
+  - `examples/goal.rs` also gains an `edit_reads` line (E139: what the first write of a goal reads) and `GOAL_FS=<dir>` to run on a file store.
+  - All kernel tests pass, plus `tests/memo.rs`: a view and a tree edited with the memo on and off store identical objects with fewer reads on; nothing is kept once an edit returns.
+- Verdict: **kept**; on its branch until Eric says to merge.

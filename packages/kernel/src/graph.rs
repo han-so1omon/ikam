@@ -420,6 +420,18 @@ impl<S: Store> Repo<S> {
         edits: BTreeMap<String, Option<Node>>,
         keys: Keys,
     ) -> Result<Id, Error> {
+        let began = self.begin_memo();
+        let out = self.graph_edit_inner(root, edits, keys);
+        self.end_memo(began);
+        out
+    }
+
+    fn graph_edit_inner(
+        &mut self,
+        root: &Id,
+        edits: BTreeMap<String, Option<Node>>,
+        keys: Keys,
+    ) -> Result<Id, Error> {
         if edits.is_empty() {
             return Ok(*root);
         }

@@ -167,3 +167,9 @@ it is an on-disk addition and waits on a decision.
 | Path index (not kept) | tree walk | an index graph, 62 KB here | worse: 4 reads a lookup against 2 by walking trees (E125) |
 | Per-tenant stores (not built) | one shared store | isolation of every stored object, against dedup across tenants | 644 MB against 229 MB for the bench corpus's 26 folders (E126) |
 | Short-term index for terms under 3 characters (not built) | trigram index only | index bytes, against a scan of every text file for "Q3" (7.3 MB, 68 ms) | E127 |
+
+## What one edit reads (E138)
+
+| Setting | Default | Trade | Measured |
+| --- | --- | --- | --- |
+| `Repo::read_memo` (E138; `--read-memo`) | off | each tree, view or content write keeps the stored contents it reads (up to 64 MB) until it returns, so the old chunks a new chunk is matched against are read once, against holding those bytes in memory for the edit; the same bytes are stored either way | E133's first goal (E137's scope) 7.7 MB to 4.5 MB fetched, its view update 3.85 MB / 1,337 reads to 1.01 MB / 446 reads; next goal 5.7 MB to 3.3 MB; identical objects stored |
