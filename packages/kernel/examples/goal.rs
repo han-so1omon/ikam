@@ -396,6 +396,9 @@ fn main() {
         // E149: the same, with patterns of up to three bytes answered from
         // the trigram postings alone.
         ("recommended_exact_search", true, false),
+        // E152: the same, with the search index loaded once per handle and
+        // held across goals, as a server would.
+        ("recommended_held_index", true, false),
     ] {
         // IKAM_CONFIG=name runs only that configuration.
         if std::env::var("IKAM_CONFIG").is_ok_and(|c| c != config) {
@@ -411,12 +414,16 @@ fn main() {
                 | "recommended_batch"
                 | "recommended_deferred_view"
                 | "recommended_exact_search"
+                | "recommended_held_index"
         );
         let deferred = matches!(
             config,
-            "recommended_deferred_view" | "recommended_exact_search"
+            "recommended_deferred_view" | "recommended_exact_search" | "recommended_held_index"
         );
-        repo.exact_short_search = config == "recommended_exact_search";
+        repo.exact_short_search = matches!(
+            config,
+            "recommended_exact_search" | "recommended_held_index"
+        );
         let batch = config == "recommended_batch" || deferred;
         let mut pending: BTreeMap<String, Option<Node>> = BTreeMap::new();
         repo.object_templates = !matches!(
@@ -425,6 +432,7 @@ fn main() {
                 | "recommended_batch"
                 | "recommended_deferred_view"
                 | "recommended_exact_search"
+                | "recommended_held_index"
         );
         repo.read_memo = config == "recommended_read_memo" || hints;
         repo.replace_hints = hints;
@@ -449,14 +457,26 @@ fn main() {
             t.elapsed().as_secs_f64() * 1e3,
             String::new(),
         );
+        let held = config == "recommended_held_index";
+        let mut held_index = None;
         for g in &goals {
             let term = g.term.as_bytes();
             // Search.
             let t = Instant::now();
-            let index = if recommended {
+            // E152: decoded once, then reused; contents written since are
+            // not in it and are scanned, so results stay exact.
+            if held && held_index.is_none() {
+                held_index = repo.search_index().unwrap();
+            }
+            let loaded = if recommended && !held {
                 repo.search_index().unwrap()
             } else {
                 None
+            };
+            let index = if held {
+                held_index.as_ref()
+            } else {
+                loaded.as_ref()
             };
             // E142: what loading the search index fetched, apart; the
             // counts are put back so the stage line still covers it.
@@ -475,11 +495,12 @@ fn main() {
                     | "recommended_batch"
                     | "recommended_deferred_view"
                     | "recommended_exact_search"
+                    | "recommended_held_index"
             )
             .then(|| repo.session(64 << 20));
             let (hits, _) = match &shared {
-                Some(s) => s.search(term, &text_ids, index.as_ref()).unwrap(),
-                None => repo.search(term, &text_ids, index.as_ref()).unwrap(),
+                Some(s) => s.search(term, &text_ids, index).unwrap(),
+                None => repo.search(term, &text_ids, index).unwrap(),
             };
             line(
                 &repo,

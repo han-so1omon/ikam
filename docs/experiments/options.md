@@ -235,3 +235,9 @@ it is an on-disk addition and waits on a decision.
 | Setting | Default | Trade | Measured |
 | --- | --- | --- | --- |
 | `group_size`, `--group-size` | 64 KiB | smaller groups fetch less per member read and store more where small contents share context | 16 KiB: E133's file reads 385 KB to 208 KB and 82 KB to 53 KB; north score 0.3035 to 0.3100 (multiformat +4.6%, tables +1.8%); 8 KiB: 157 KB and 25 KB |
+
+## Held search index (E152)
+
+| Setting | Default | Trade | Measured |
+| --- | --- | --- | --- |
+| a caller holds the decoded `search_index()` between goals (no kernel switch) | each caller loads it | memory for the decoded index against reloading it per goal; contents written since are scanned, so results stay exact | E133's next goal 358 KB to 89 KB (60 KB with 16 KiB groups), same matches and writes |

@@ -2284,3 +2284,13 @@ Newest last. Format and rules: `README.md`.
   - All kernel tests pass (171).
   - The fixed bench on this branch at the default size: every byte count and the north score (0.3035) as on E149; cost score 0.2406 against 0.2427, from timings only.
 - Verdict: **kept** as an option, off by default (64 KiB); on its branch until Eric says to merge. A server whose work is goals reading a few files of a large store can trade about 2% of stored bytes for half the bytes per file read. Stores packed at any size read the same; nothing in the stored format changes.
+
+### E152 held-index (the search index held across goals)
+- Question: after E148 and E149 the next goal on a handle fetches 358 KB, and 269 KB of it is loading the search index again. What does a handle that keeps the decoded index between goals, as a server would, fetch?
+- Change: none in the kernel. `examples/goal.rs` gains `recommended_held_index`: E149's setup, with the index from `search_index()` decoded once per handle and passed to every goal's search. `search` already takes the index from its caller, and contents not in the index are scanned, so the answers stay exact when files change between goals.
+- Result (cases store, E133's two goals):
+  - Next goal (AI): 358,351 to 89,224 bytes fetched (the index load drops from 269,127 to 0), 23.4 to 20.3 ms in memory; the same 8 matches, the same bytes written (2,865) and the same final view root as E149's setup.
+  - First goal and the ledger pass unchanged (684 KB and 692 KB).
+  - With 16 KiB groups (E151) on a repacked copy: next goal 329,093 to 59,966 bytes; first goal 506 KB.
+  - The fixed bench: every byte count and the north score (0.3035) as on E151; cost score 0.2311 against 0.2406, from timings only.
+- Verdict: **measured**; nothing to merge beyond the example config. A server should load the search index once per handle and reuse it; then a goal after the first costs about 90 KB (60 KB with 16 KiB groups) against 932 MB with the defaults.
