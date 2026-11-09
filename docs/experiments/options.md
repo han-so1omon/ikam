@@ -130,3 +130,17 @@ The live filesystem stores each edit as it comes and leaves re-planning to
 **Not yet a setting**: an incremental repack that re-plans only what was
 added since the last one (the live drift is in new content; a full repack
 re-plans all of it).
+
+## The database layer (E118 to E120)
+
+| Setting | Default | Trade | Measured |
+| --- | --- | --- | --- |
+| Batch size of `db_append` (E118) | the caller's | fewer graph edits and objects per event against waiting to fill a batch | 10,000 events: one at a time 48 s, in batches of 1,000 1.9 s (E120) |
+| `Keys::Any` in `put_graph_with` / `graph_edit_with` (E120) | `Keys::Unique` (`put_graph`, `graph_edit`); the db's `ids` and `kv` views use `Any` | labels chosen by clients may share an 8-byte key without refusing the graph or blocking a rebuild, against edges that could name two nodes: only for graphs no edge points into | a real clashing pair is kept, read back and rebuilt (tests) |
+
+**Not yet a setting**: storing new view chunks plain on the append path and
+leaving slices to repack or a background integrator (E119, measured with
+read weight 1.0: 1,000 single appends 0.9 s and 7.9 MB stored against
+3.1 s and 3.3 MB). A key index for the log, so in-place edits check its
+label keys across the whole graph (needed only near 100M events: chance
+clashes are about 3 in 10,000 there).
