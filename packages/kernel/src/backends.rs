@@ -999,7 +999,7 @@ pub struct PackStore {
     opts: PackOptions,
     /// E171: the open pack's checkpoint, searched on disk; `active_index`
     /// then holds only the records after it.
-    base: Option<Sealed>,
+    base: Option<Box<Sealed>>, // boxed: a fanout is 1 KiB
     /// E172: refs, when they live in the packs.
     log_refs: BTreeMap<String, Id>,
     sealed: Vec<Sealed>, // oldest first; lookups go newest first
@@ -1118,11 +1118,11 @@ impl PackStore {
             }
         }
         let base = match base_ckpt {
-            Some((idx, fanout)) => Some(Sealed {
+            Some((idx, fanout)) => Some(Box::new(Sealed {
                 pack: active.try_clone()?,
                 idx,
                 fanout,
-            }),
+            })),
             None => None,
         };
         if active.metadata()?.len() != good {
@@ -1204,11 +1204,11 @@ impl PackStore {
         if self.opts.lazy_checkpoint
             && let Some((idx, fanout, _)) = open_ckpt_lazy(&path, self.flushed)
         {
-            self.base = Some(Sealed {
+            self.base = Some(Box::new(Sealed {
                 pack: self.active.try_clone()?,
                 idx,
                 fanout,
-            });
+            }));
             self.active_index.clear();
         }
         Ok(())
