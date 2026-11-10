@@ -2314,3 +2314,93 @@ Newest last. Format and rules: `README.md`.
 - exp/139 had merged exp/122-store-bakeoff at its first commit, so E122's four later commits were in no branch after it: the bake-off harness (`examples/stores.rs`), pack checkpoints and CRC-checked reads, the FsStore OS ref lock, sealed pack lookups by interpolation search, and E122's own log, registry and options entries. They are merged into exp/152-held-index now. PackStore keeps E139's `read_head` and E147's `stored_len`; its whole read is E122's CRC-checked one.
 - Gates: 174 kernel tests pass; clippy `-D warnings` clean with and without the store features; the fixed bench matches E152 in every byte count and the north score (0.3035); cost score 0.2451 against 0.2311, from timings (another job ran alongside). E133's goals fetch the same bytes (684 KB and 89 KB).
 - `packages/kernel/scripts/mac-bakeoff.sh` runs the measurements that need macOS (flush cost per commit, kills, APFS small files, E152's goal on files and packs, clonefile) in its own folder, as the user, with no sudo and no service or port.
+
+### E153 fragment-cuts (how to cut content into fragments)
+- Branch / parent: exp/153-fragment-edits / E152 (main badc682)
+- Question: Eric (Nov 9) asked for experiments on fragments as the Python version had them (research note `docs/research/fragments-and-ir.md`). Which cut makes a good fragment: one that is shared across files and survives edits?
+- Change: none in the kernel. `examples/fragments.rs` cuts the 534 md and text files of the cases (1,035,302 bytes) whole, by line, by paragraph block (ending after a run of blank lines, cut at a line past 16 KiB), by CDC at 256, 1,024, 4,096 and 16,384 bytes, and by line-aligned CDC. Per cutter: distinct fragments and their bytes, zstd 3 over the distinct fragments end to end, a stored-size proxy (that zstd plus 32 bytes per distinct fragment and 4 per reference), size distribution and fan-out.
+- Result:
+  - Proxy bytes: whole 175,489 (dedup 1.11); lines 626K (dedup 1.95, but reference overhead); blocks 265,571 (dedup 1.24, median block 122 bytes); CDC 256 262K; CDC 1,024 197K; CDC 4,096 and 16,384 about as whole; line-aligned CDC like CDC.
+  - zstd over each cutter's distinct fragments: about 157 KB for every cutter. Finer cuts do not help storage; the matcher and zstd already find what is shared.
+  - Blocks: 805 shared blocks (125.7 KB), the largest fan-out 52. Natural fan-out is mostly the case generator's boilerplate (23 files).
+- Verdict: **measured**. Paragraph blocks are the cut for edits (E154), not for storage.
+
+### E154 edit-survival (new bytes per edit, by cutter)
+- Branch / parent: exp/153-fragment-edits / E153
+- Question: how many new bytes and references does a small edit cost under each cutter?
+- Change: none in the kernel; part of `examples/fragments.rs`: four edits per md file (a word replaced in a middle line, a paragraph inserted, a line deleted, a note appended), measured as new fragment bytes and changed references per cutter, and as the bytes the kernel's `put_content` of the edited file writes.
+- Result: whole files 740 to 860 new bytes per edit; lines 0 to 101 bytes but about 27 to 30 references; blocks 115 to 176 bytes, 1 to 2.3 new fragments and 5.6 to 7.6 references; CDC 256 201 to 367 bytes; CDC 1,024 345 to 549 bytes. The kernel's `put_content` of an edited file writes 139 to 194 bytes today.
+- Verdict: **measured**. Blocks give the fewest new bytes with few references, so a block is the edit unit for E155.
+
+### E155 fragment-renders (a file stored as a render over its blocks)
+- Branch / parent: exp/153-fragment-edits / E154
+- Question: can one edit to a shared fragment reach every file that renders it without re-planning those files?
+- Change: `func.rs` adds the builtin `render/1`, which concatenates like `concat/1` but is a fact (not in `is_plan`), so repack keeps it; `range.rs` reads ranges of a render through its fragments. New `src/fragment.rs`: `blocks`, `put_fragmented` (fragments plus one render fact; a content of one fragment is stored as itself), `fragments_of`, `FragmentIndex` (which files render each fragment), `propagate`. `tests/fragment.rs`: blocks cover their input; after `propagate` every file that rendered the old fragment reads as before with it replaced, nothing else changes, the index follows the edit and fsck is clean; a render survives repack. `examples/propagate.rs` compares `scan-rewrite` (today: read every file, splice, `put_content`), `index-rewrite` (a side index finds the files) and `render`, on the 343 md files of the cases with natural fan-out and with a notice inserted into 1 to 256 copies.
+- Result: stored at rest after repack 69,332 bytes as plain files, 169,623 as renders (+145%). Read pass 17.2 ms plain, 24 to 25 ms as renders. Edits: every check and fsck pass; render writes fewer bytes than index-rewrite at fan-out 64 and above (E157 has the numbers).
+- Verdict: **kept** as an option on its branch, not a default: renders cost too much at rest (see E156, E157). `render/1` is a new builtin, a stored-format addition, so it waits on Eric's yes.
+
+### E156 render-short (renders with short records)
+- Branch / parent: exp/153-fragment-edits / E155
+- Question: how much of E155's cost at rest is the records, and does E104's `short_records` take it back?
+- Change: none beyond E155; `examples/propagate.rs` runs `render` with `short_records` on.
+- Result: stored at rest 120,903 bytes (+74% over plain). Edit time at fan-out 256: 69.7 ms against index-rewrite's 117 ms.
+- Verdict: **measured**; E157 goes further.
+
+### E157 render-runs (only shared blocks stand alone)
+- Branch / parent: exp/153-fragment-edits / E156
+- Question: if only blocks that appear in two or more files stand alone and each run of other blocks is one fragment, is the cost at rest small enough?
+- Change: `put_fragmented(bytes, Some(&shared))` merges runs of unshared blocks; `FragmentIndex.inner` records the blocks inside run fragments, so a block that later becomes shared is still found and its run is rewritten (`Part::Splice`). The law test covers runs.
+- Result (343 md files; bytes written per edit, render-runs against index-rewrite):
+  - At rest after repack: 85,851 bytes (+24% over plain); read pass 14.5 ms (plain 17.2 ms). The index holds 824 fragments and is built in 6.25 ms.
+  - Natural fan-out 23: about 10.7 KB against 18.0 KB, and 8.2 KB against 13.6 KB.
+  - Fan-out 64: 22.0 KB against 30.0 KB; about 23 ms against 28 to 37 ms.
+  - Fan-out 256: 85.6 KB against 115.3 KB; 85 ms against 117 ms.
+  - Small fan-out: the same (about 0.9 to 1.7 ms). scan-rewrite takes 7 to 117 ms (7 ms even at fan-out 1, against 0.9 ms with an index).
+  - Trees and records dominate the bytes written; the synthetic `fan/i/` layout inflates the tree bytes.
+- Verdict: **kept** as an option, off by default: a store whose work is edits that reach many files pays 24% at rest for 26 to 40% fewer bytes per edit and a faster edit at large fan-out. On its branch until Eric says to merge.
+
+### E158 render-locality (does one paragraph change only its piece of each format?)
+- Branch / parent: exp/153-fragment-edits / E157
+- Question: an md file has html, docx and pdf renders (`fixtures/multiformat`). Is a block's render a piece of the whole render, so a fragment edit can be spliced into each format instead of re-rendering it?
+- Change: `scripts/render_locality.py` (pandoc 3.1.3, LibreOffice). pandoc with `SOURCE_DATE_EPOCH=1767225600` and `--metadata pagetitle=<name>` reproduces the committed html byte for byte. Per text: whether each block's render alone appears in the whole render (html; docx `word/document.xml` body), and three edits per text (blocks at 1/4, 1/2, 3/4) spliced against a full re-render; one pdf re-render per text; bytes the kernel writes for each new render (`ikam put`).
+- Result:
+  - html: 571 of 576 blocks local; 72 of 72 edits splice byte-identical to the full re-render. Rendering the block alone takes a median 13.9 ms against 58 ms for the document.
+  - docx: 26 of 576 blocks local and 0 of 72 edits exact. pandoc numbers bookmarks (`w:id`), lists (`numId`, in document order) and places `bookmarkEnd` across the whole document. With those ids normalised, 206 of 236 blocks (the first 10 texts) are local.
+  - Median times: full docx 77 ms, block docx 44 ms, pdf through LibreOffice 1,049 ms.
+  - Median bytes the kernel writes for a regenerated render: html 488, docx 1,504, pdf 2,517.
+- Verdict: **measured**. html renders can be spliced per fragment; docx needs a renderer that renumbers document-wide ids (an option, not built); pdf is regenerated.
+
+### E159 fragment-grants (goal-scoped edits under sealed grants)
+- Branch / parent: exp/153-fragment-edits / E158
+- Question: can a goal's sealed grant (E140) scope a propagated edit, so it touches only the ranges the goal may write, without diffing every file?
+- Change: `fragment.rs` adds `propagate_granted`: it plans every file's parts first, takes each changed range from fragment lengths, checks the grant per file (no file: `NoFile`; another version: `Stale`; a range outside the write ranges: `Outside`) and writes nothing unless every file passes. `grant::inside` is `pub(crate)`. `tests/fragment.rs` adds `refused_grant_writes_nothing`. `examples/fragment_grants.rs` (the cases' md files plus a notice in n copies, render-runs): no grant, a full grant, the E140 diff check of the same edit, half the files granted, another block granted, and a stale version.
+- Result (median of 5; n = 16, 64, 256):
+  - No grant against a full grant: 5.5 / 5.5 ms, 20.3 / 22.9 ms, 88.7 / 81.9 ms (within noise), the same bytes written (5,766, 22,038, 85,616).
+  - The diff check alone would add 1.0, 4.1 and 17.5 ms (it reads and diffs every file).
+  - Refusals write nothing and leave the index as it was: half granted 0.6, 2.2, 9.2 ms; another block or a stale version 0.03 to 0.08 ms.
+  - The sealed grant lists every file: 2,251, 9,087 and 35,772 bytes (about 140 bytes per file). A grant naming the fragment instead would be about 57 bytes whatever n is.
+  - All kernel law tests on the branch pass.
+- Verdict: **kept** with E155 (the check is free once edits go through fragments). A fragment-scoped grant is an option to build if grants that reach hundreds of files are common.
+
+### E160 fragment-queries (search and insights over fragments, kept fresh)
+- Branch / parent: exp/153-fragment-edits / E159
+- Question: do indexes over fragments answer queries as exactly as file indexes, and can a propagated edit keep them fresh without a rebuild?
+- Change: none in the kernel. `examples/fragment_query.rs`: the cases' md files plus a notice in 64 copies (407 files, 214,129 bytes), render-runs. 41 patterns (40 from the corpus by a fixed LCG, one notice phrase), each answer checked against a scan. A fragment search scans each distinct fragment and each distinct seam (63 bytes on each side of a boundary) once; a fragment trigram index narrows them. Per-fragment word counts, summed through each file's fragment list, checked against counting each file. Then the notice is revised by one `propagate` over 64 files.
+- Result:
+  - Search per query: scan 12.5 ms (178 KB decoded); stored index (E058/E094, 186 KB) 1.84 ms (36 KB decoded), built in 35 ms; fragment scan 0.45 ms (230 KB scanned, fragments held decoded: 159 KB plus 71 KB of seams); fragment trigram index (281 KB encoded) 0.11 ms, 10.8 KB scanned. All answers exact.
+  - Word counts: per fragment 3.8 ms against 20.2 ms per file; summing all 407 files from fragments 4.2 ms, exact.
+  - Goal reads: the paragraphs that hold a pattern are 8.0 KB per query against 29.2 KB for the files that hold it.
+  - After the edit: the stored index left stale answers exactly but slower (5.2 ms, 66 KB decoded, since the 64 new files are scanned); rebuilding it takes 42 ms. The fragment indexes and counts update in 1.5 ms by reading one new fragment (101 bytes), and every answer and count stays exact.
+- Verdict: **measured**. With files stored as renders, queries and insights per fragment stay fresh for the cost of the new fragment; the fragment trigram index is larger than the stored one (its seams and 33-byte keys), which a seam bound and a packed key list would cut. Nothing to merge beyond the example.
+
+### E161 table-ir (one table, many formats)
+- Branch / parent: exp/153-fragment-edits / E160
+- Question: the Python version's `TableIR` (StructuredDataIR) with a deterministic renderer and a byte-identity drift spec: can a cell edit be made once and reach csv, json, md, docx and pdf (`fixtures/tables`, 24 workbooks)?
+- Change: none in the kernel. `scripts/table_ir.py` lifts each csv into a TableIR: header, rows, per cell whether the spreadsheet typed it as a number (LibreOffice quotes only text cells), and two residuals (the md's title and source line; the csv's empty rows). Renderers follow `fixtures/tables/render.py`. A one-cell edit (the middle row's last numeric cell) is rendered to every format; the kernel's bytes written are the store files a put creates or rewrites. A scaled run (synthetic: one workbook's rows repeated to 10,000) shows the cost with size.
+- Result:
+  - Byte-exact renders: csv 24 of 24, json 24 of 24, md 24 of 24. Without cell types, 13 of 24 csv files reproduce; without the empty-row residual, 23 of 24.
+  - Stored: the IR alone 6,515 bytes against 12,725 bytes for csv, json and md put as files (51%), with json and md rendered on read.
+  - The edit: each rendered csv, json and md differs from the old in one contiguous range, 24 of 24. Bytes the kernel writes for all 24 tables: csv 3,105, json 3,566, md 4,124; docx 49,005 and pdf 92,905 (regenerated: docx median 45 ms, pdf 895 ms; not byte-identical to the committed files, which carry tool timestamps).
+  - Scaled: rendering 10,000 rows takes 23 ms (csv), 99 ms (json), 11 ms (md); the kernel writes 12.7 to 16.1 KB per one-cell edit there, against 164 to 363 bytes at 100 and 1,000 rows.
+- Verdict: **measured**. A typed table IR reproduces every committed text format and halves their storage; cell types are what the IR must keep. At 10,000 rows a one-cell edit costs the kernel 13 to 16 KB, so large tables want rows as fragments (an option, not built).
+- Gates on the branch (E153 to E161): 178 kernel tests pass; clippy `-D warnings` clean on all targets; the fixed bench matches main (badc682) in every byte count, read cost and the north score (0.3035); cost score 0.2564 against 0.2392, from timings only (the bench never stores a render).

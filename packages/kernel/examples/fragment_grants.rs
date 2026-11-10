@@ -128,6 +128,7 @@ fn ranges_of(b: &[u8], target: &[u8]) -> Vec<std::ops::Range<u64>> {
 
 /// A grant for `paths` (all reached files when None): each file's notice
 /// range, or with `other`, the block after it.
+#[allow(clippy::single_range_in_vec_init)]
 fn grant(s: &Setup, paths: &[String], other: bool, stale: bool) -> Grant {
     let mut files = Vec::new();
     for p in paths {

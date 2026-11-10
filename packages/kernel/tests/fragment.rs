@@ -110,6 +110,7 @@ fn render_survives_repack() {
 }
 
 #[test]
+#[allow(clippy::single_range_in_vec_init)]
 fn refused_grant_writes_nothing() {
     use ikam_kernel::{FileGrant, Grant, Store};
     let mut repo = Repo::new(MemStore::default());

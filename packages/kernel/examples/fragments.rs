@@ -18,6 +18,8 @@
 //! A last line, `kernel`, puts each md file and then each edit into a
 //! kernel store and reports the bytes each edit writes, for reference.
 
+#![allow(clippy::single_range_in_vec_init)]
+
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::ops::Range;
 use std::path::{Path, PathBuf};

@@ -28,6 +28,8 @@
 //! Goal-scoped reads: for a word, the bytes read to return the paragraphs
 //! that hold it (fragments) vs the files that hold it (whole files).
 
+#![allow(clippy::single_range_in_vec_init)]
+
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::time::Instant;

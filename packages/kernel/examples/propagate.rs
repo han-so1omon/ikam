@@ -23,6 +23,8 @@
 //! clean. One `setup` line per storage form: stored bytes, ingest ms, and a
 //! read pass over every file.
 
+#![allow(clippy::single_range_in_vec_init)]
+
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::time::Instant;

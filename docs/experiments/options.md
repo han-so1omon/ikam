@@ -255,3 +255,20 @@ it is an on-disk addition and waits on a decision.
 | Setting | Default | Trade | Measured |
 | --- | --- | --- | --- |
 | a caller holds the decoded `search_index()` between goals (no kernel switch) | each caller loads it | memory for the decoded index against reloading it per goal; contents written since are scanned, so results stay exact | E133's next goal 358 KB to 89 KB (60 KB with 16 KiB groups), same matches and writes |
+
+## Files as renders over fragments (E155 to E159)
+
+| Setting | Default | Trade | Measured |
+| --- | --- | --- | --- |
+| `put_fragmented(bytes, None)`, files as `render/1` over every paragraph block | files stored by `put_content` | one edit to a shared block reaches every file that renders it without re-planning them; +145% stored at rest (+74% with `short_records`) | 343 md files: 169,623 against 69,332 bytes after repack |
+| `put_fragmented(bytes, Some(&shared))`, only shared blocks stand alone (render-runs) | off | +24% stored at rest for 26 to 40% fewer bytes per propagated edit, and faster edits at large fan-out | fan-out 256: 85.6 KB and 85 ms against 115.3 KB and 117 ms (index-rewrite); fan-out 64: 22.0 against 30.0 KB |
+| `propagate_granted` with a goal's grant | `propagate` (no grant) | the grant is checked from fragment lengths, so a scoped edit costs no more than an unscoped one; the grant lists every file it reaches (about 140 bytes each) | n = 256: 81.9 ms granted against 88.7 ms ungranted; the diff check it replaces would add 17.5 ms |
+
+## Not built, measured as worth building
+
+| Option | Trade | Measured |
+| --- | --- | --- |
+| a fragment-scoped grant (the goal may change one fragment wherever it is rendered) | constant size against a per-file grant; needs a grant form that names a fragment | about 57 bytes against 35,772 for 256 files (E159) |
+| a docx renderer that renumbers document-wide ids, so docx renders splice per fragment like html | a renderer to maintain against re-running pandoc | 206 of 236 blocks local once bookmark and list ids are normalised; 0 of 72 splices exact without it (E158) |
+| rows as fragments for large tables | per-row references against one plain file | a one-cell edit of a 10,000-row table writes 12.7 to 16.1 KB today, against 164 to 363 bytes at 100 to 1,000 rows (E161) |
+| a typed table IR (TableIR) stored instead of its csv, json and md renders | json and md rendered on read (json 99 ms at 10,000 rows) against storing them | 6,515 against 12,725 bytes for the 24 workbooks, all renders byte-exact (E161) |
