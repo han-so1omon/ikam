@@ -390,6 +390,7 @@ fn pack_store_ref_log() {
     let both = PackOptions {
         ref_log: true,
         lazy_checkpoint: true,
+        ..PackOptions::default()
     };
     all(&|p| PackStore::open_with(p, log).unwrap());
     all(&|p| PackStore::open_with(p, both).unwrap());
@@ -445,4 +446,56 @@ fn pack_store_ref_log() {
     }
     let s = PackStore::open_with(dir.path(), log).unwrap();
     assert_eq!(s.refs().unwrap(), vec![("heads/old".to_string(), id(3))]);
+}
+
+/// E175: with filters, every stored id is found and no other, through a
+/// lazy checkpoint's filter; a damaged filter is rebuilt, never trusted.
+/// (Sealed packs' filters are tested in the crate, at a smaller scale.)
+#[test]
+fn pack_store_filters() {
+    use ikam_kernel::backends::PackOptions;
+    let f = PackOptions {
+        filters: true,
+        ..PackOptions::default()
+    };
+    let all_on = PackOptions {
+        filters: true,
+        lazy_checkpoint: true,
+        ref_log: true,
+    };
+    all(&|p| PackStore::open_with(p, f).unwrap());
+    all(&|p| PackStore::open_with(p, all_on).unwrap());
+
+    let obj = |i: u64| {
+        let b = format!("object {i}").into_bytes();
+        (Id::of_content(&b), b)
+    };
+    let dir = tempfile::tempdir().unwrap();
+    {
+        let mut s = PackStore::open_with(dir.path(), all_on).unwrap();
+        for i in 0..20_000 {
+            let (id, b) = obj(i);
+            s.write(id, &b).unwrap();
+        }
+        s.set_ref("heads/main", None, obj(0).0).unwrap();
+    }
+    let check = |s: &PackStore| {
+        for i in 0..20_000 {
+            let (id, b) = obj(i);
+            assert_eq!(s.read(&id).unwrap(), b, "lost {i}");
+        }
+        for i in 20_000..30_000 {
+            assert!(!s.has(&obj(i).0));
+        }
+    };
+    check(&PackStore::open_with(dir.path(), all_on).unwrap());
+    let cflt = dir.path().join("packs/00000000.cflt");
+    assert!(cflt.exists(), "the lazy checkpoint has a filter");
+    let mut b = std::fs::read(&cflt).unwrap();
+    for x in b[20..].iter_mut().take(4096) {
+        *x = 0;
+    }
+    std::fs::write(&cflt, b).unwrap();
+    check(&PackStore::open_with(dir.path(), all_on).unwrap());
+    check(&PackStore::open(dir.path()).unwrap());
 }

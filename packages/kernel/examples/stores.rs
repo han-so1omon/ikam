@@ -42,6 +42,8 @@ const BACKENDS: &[&str] = &[
     "packs-lazy",
     "packs-log",
     "packs-fast",
+    "packs-filter",
+    "packs-fast-filter",
     "sqlite",
     "sqlite-normal",
     "lmdb",
@@ -121,6 +123,28 @@ fn open(name: &str, dir: &Path) -> Dyn {
                 PackOptions {
                     lazy_checkpoint: true,
                     ref_log: true,
+                    ..PackOptions::default()
+                },
+            )
+            .unwrap(),
+        ),
+        "packs-filter" => Box::new(
+            PackStore::open_with(
+                dir,
+                PackOptions {
+                    filters: true,
+                    ..PackOptions::default()
+                },
+            )
+            .unwrap(),
+        ),
+        "packs-fast-filter" => Box::new(
+            PackStore::open_with(
+                dir,
+                PackOptions {
+                    lazy_checkpoint: true,
+                    ref_log: true,
+                    filters: true,
                 },
             )
             .unwrap(),

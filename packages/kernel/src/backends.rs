@@ -827,6 +827,7 @@ struct Sealed {
     pack: File,
     idx: File,
     fanout: [u32; 256],
+    filter: Option<Box<Filter>>, // E175
 }
 
 impl Sealed {
@@ -844,6 +845,11 @@ impl Sealed {
 
     /// Offset and length of `id` (length `TOMBSTONE` if deleted here).
     fn find(&self, id: &Id) -> Result<Option<(u64, u32)>, Error> {
+        if let Some(f) = &self.filter
+            && !f.may_have(id)
+        {
+            return Ok(None);
+        }
         let b = id.as_bytes()[0] as usize;
         let (mut lo, mut hi) = (if b == 0 { 0 } else { self.fanout[b - 1] }, self.fanout[b]);
         let mut key = [0u8; 32];
@@ -922,6 +928,107 @@ pub struct PackOptions {
     /// store written this way keeps its refs only in its packs, and code
     /// without this option does not see them.
     pub ref_log: bool,
+    /// E175: a Bloom filter beside each sealed index (`.flt`) and lazy
+    /// checkpoint (`.cflt`), held in memory, so a lookup searches on disk
+    /// only the packs that may hold the id. Filters are derived files: one
+    /// that is missing or fails its hash is rebuilt from its index at open.
+    pub filters: bool,
+}
+
+/// E175: a Bloom filter over one index's ids (10 bits an id, 7 probes: about
+/// 1% false positives). Ids are BLAKE3 hashes, so their bytes are the hashes.
+struct Filter {
+    m: u64,
+    bits: Vec<u64>,
+}
+
+const FLT_MAGIC: &[u8; 8] = b"ikamflt1";
+const FLT_K: u64 = 7;
+
+impl Filter {
+    fn build<'a>(ids: impl ExactSizeIterator<Item = &'a Id>) -> Filter {
+        let m = (ids.len() as u64 * 10).max(64);
+        let mut f = Filter {
+            m,
+            bits: vec![0; m.div_ceil(64) as usize],
+        };
+        for id in ids {
+            for b in f.probes(id) {
+                f.bits[(b / 64) as usize] |= 1 << (b % 64);
+            }
+        }
+        f
+    }
+
+    fn probes(&self, id: &Id) -> impl Iterator<Item = u64> + use<> {
+        let b = id.as_bytes();
+        let h1 = u64::from_le_bytes(b[8..16].try_into().unwrap());
+        let h2 = u64::from_le_bytes(b[16..24].try_into().unwrap()) | 1;
+        let m = self.m;
+        (0..FLT_K).map(move |i| h1.wrapping_add(i.wrapping_mul(h2)) % m)
+    }
+
+    fn may_have(&self, id: &Id) -> bool {
+        self.probes(id)
+            .all(|b| self.bits[(b / 64) as usize] & (1 << (b % 64)) != 0)
+    }
+
+    /// magic, the index's entry count, m, the words, then BLAKE3 of all that.
+    /// Not synced: a lost or torn filter is rebuilt.
+    fn write(&self, path: &Path, count: u32) -> Result<(), Error> {
+        let mut out = Vec::with_capacity(20 + self.bits.len() * 8 + 32);
+        out.extend_from_slice(FLT_MAGIC);
+        out.extend_from_slice(&count.to_le_bytes());
+        out.extend_from_slice(&self.m.to_le_bytes());
+        for w in &self.bits {
+            out.extend_from_slice(&w.to_le_bytes());
+        }
+        let h = blake3::hash(&out);
+        out.extend_from_slice(h.as_bytes());
+        let tmp = path.with_extension("flt-tmp");
+        fs::write(&tmp, &out)?;
+        fs::rename(&tmp, path)?;
+        Ok(())
+    }
+
+    fn load(path: &Path, count: u32) -> Option<Filter> {
+        let b = fs::read(path).ok()?;
+        if b.len() < 20 + 32 || &b[..8] != FLT_MAGIC {
+            return None;
+        }
+        let (body, h) = b.split_at(b.len() - 32);
+        if blake3::hash(body).as_bytes() != h
+            || u32::from_le_bytes(body[8..12].try_into().unwrap()) != count
+        {
+            return None;
+        }
+        let m = u64::from_le_bytes(body[12..20].try_into().unwrap());
+        let words = &body[20..];
+        if m == 0 || words.len() as u64 != m.div_ceil(64) * 8 {
+            return None;
+        }
+        let bits = words
+            .chunks_exact(8)
+            .map(|w| u64::from_le_bytes(w.try_into().unwrap()))
+            .collect();
+        Some(Filter { m, bits })
+    }
+
+    /// The filter at `path` if it matches the index, or one built from it.
+    fn load_or_build(path: &Path, idx: &File, count: u32) -> Result<Filter, Error> {
+        if let Some(f) = Filter::load(path, count) {
+            return Ok(f);
+        }
+        let mut body = vec![0u8; count as usize * IDX_ENTRY as usize];
+        idx.read_exact_at(&mut body, IDX_HEAD)?;
+        let ids: Vec<Id> = body
+            .chunks_exact(IDX_ENTRY as usize)
+            .map(|e| Id::from_bytes(e[..32].try_into().unwrap()))
+            .collect();
+        let f = Filter::build(ids.iter());
+        f.write(path, count)?;
+        Ok(f)
+    }
 }
 
 /// E172: the id field of a ref record. No object has it (ids are BLAKE3).
@@ -1057,7 +1164,12 @@ impl PackStore {
                 write_idx(&idx_path, &index)?;
             }
             if idx_path.exists() {
-                sealed.push(open_sealed(&root, n)?);
+                let mut s = open_sealed(&root, n)?;
+                if opts.filters {
+                    let f = root.join(format!("packs/{n:08}.flt"));
+                    s.filter = Some(Box::new(Filter::load_or_build(&f, &s.idx, s.fanout[255])?));
+                }
+                sealed.push(s);
             }
         }
         let active_no = match last {
@@ -1118,11 +1230,20 @@ impl PackStore {
             }
         }
         let base = match base_ckpt {
-            Some((idx, fanout)) => Some(Box::new(Sealed {
-                pack: active.try_clone()?,
-                idx,
-                fanout,
-            })),
+            Some((idx, fanout)) => {
+                let filter = if opts.filters {
+                    let f = root.join(format!("packs/{active_no:08}.cflt"));
+                    Some(Box::new(Filter::load_or_build(&f, &idx, fanout[255])?))
+                } else {
+                    None
+                };
+                Some(Box::new(Sealed {
+                    pack: active.try_clone()?,
+                    idx,
+                    fanout,
+                    filter,
+                }))
+            }
             None => None,
         };
         if active.metadata()?.len() != good {
@@ -1204,10 +1325,18 @@ impl PackStore {
         if self.opts.lazy_checkpoint
             && let Some((idx, fanout, _)) = open_ckpt_lazy(&path, self.flushed)
         {
+            let filter = if self.opts.filters {
+                let f = Filter::build(full.keys());
+                f.write(&path.with_extension("cflt"), fanout[255])?;
+                Some(Box::new(f))
+            } else {
+                None
+            };
             self.base = Some(Box::new(Sealed {
                 pack: self.active.try_clone()?,
                 idx,
                 fanout,
+                filter,
             }));
             self.active_index.clear();
         }
@@ -1244,7 +1373,14 @@ impl PackStore {
         write_idx(&self.root.join(format!("packs/{n:08}.idx")), &full)?;
         self.base = None;
         let _ = fs::remove_file(self.root.join(format!("packs/{n:08}.ckpt")));
-        self.sealed.push(open_sealed(&self.root, n)?);
+        let _ = fs::remove_file(self.root.join(format!("packs/{n:08}.cflt")));
+        let mut sealed = open_sealed(&self.root, n)?;
+        if self.opts.filters {
+            let f = Filter::build(full.keys());
+            f.write(&self.root.join(format!("packs/{n:08}.flt")), sealed.fanout[255])?;
+            sealed.filter = Some(Box::new(f));
+        }
+        self.sealed.push(sealed);
         self.active_no += 1;
         let path = self.root.join(format!("packs/{:08}.pack", self.active_no));
         self.active = OpenOptions::new()
@@ -1297,7 +1433,12 @@ fn open_sealed(root: &Path, n: u32) -> Result<Sealed, Error> {
         let at = 16 + i * 4;
         *f = u32::from_le_bytes(head[at..at + 4].try_into().unwrap());
     }
-    Ok(Sealed { pack, idx, fanout })
+    Ok(Sealed {
+        pack,
+        idx,
+        fanout,
+        filter: None,
+    })
 }
 
 /// Where each object of a pack starts and how long its record is.
@@ -2100,5 +2241,43 @@ mod pack_index_tests {
         for (id, at) in &index {
             assert_eq!(s.find(id).unwrap(), Some(*at));
         }
+    }
+
+    /// E175: through a filter every id is still found, few others are
+    /// searched for, and a damaged or stale filter file is rebuilt.
+    #[test]
+    fn sealed_filter_has_no_false_negatives() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::create_dir_all(dir.path().join("packs")).unwrap();
+        File::create(dir.path().join("packs/00000000.pack")).unwrap();
+        let mut index = HashMap::new();
+        for n in 0..100_000u32 {
+            index.insert(Id::of(&n.to_le_bytes()), (n as u64 * 7, n));
+        }
+        write_idx(&dir.path().join("packs/00000000.idx"), &index).unwrap();
+        let flt = dir.path().join("packs/00000000.flt");
+        let mut s = open_sealed(dir.path(), 0).unwrap();
+        let f = Filter::load_or_build(&flt, &s.idx, s.fanout[255]).unwrap();
+        s.filter = Some(Box::new(f));
+        for (id, at) in &index {
+            assert_eq!(s.find(id).unwrap(), Some(*at));
+        }
+        let f = s.filter.as_ref().unwrap();
+        let passed = (100_000..200_000u32)
+            .filter(|n| f.may_have(&Id::of(&n.to_le_bytes())))
+            .count();
+        assert!(passed < 2_000, "false positives {passed} of 100,000");
+        // A filter written for another index (wrong count) or damaged is not used.
+        assert!(Filter::load(&flt, 99_999).is_none());
+        let mut b = fs::read(&flt).unwrap();
+        b[100] ^= 1;
+        fs::write(&flt, &b).unwrap();
+        assert!(Filter::load(&flt, 100_000).is_none());
+        let f = Filter::load_or_build(&flt, &s.idx, 100_000).unwrap();
+        s.filter = Some(Box::new(f));
+        for (id, at) in &index {
+            assert_eq!(s.find(id).unwrap(), Some(*at));
+        }
+        assert!(Filter::load(&flt, 100_000).is_some(), "rebuilt and rewritten");
     }
 }
