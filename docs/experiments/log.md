@@ -2499,3 +2499,28 @@ Newest last. Format and rules: `README.md`.
   - Kernel (median of 3): all files as plain puts add 47,388 bytes in 158 ms; md as render-runs add 25,249 bytes in 222 ms (md 6,235, html 7,046, docx 11,968). At rest 228,047 and 230,669 bytes. Every file reads back exact; fsck clean.
 - Verdict: **measured**. For an edit that reaches many files and their renders, rendering the changed block once and splicing it is about 44 times faster than re-rendering and exact; render-runs for the md halve the bytes the kernel writes. Duplicate copies in this corpus flatter the bytes; the render times are per file.
 - Gates (E180, E181): scripts and examples only; clippy `-D warnings` and fmt clean; the kernel is as at E169's gates.
+
+### E182 fragment-insights (summaries per fragment kept fresh through edits)
+- Branch / parent: exp/162-fragment-options / E181
+- Question: insights over a corpus (word counts and document frequency, dollar amounts, dates, headings, list items) are sums over files. If each fragment keeps its own summary, can an edit, including one propagated to many files, update the corpus totals by reading only the changed fragments, and how wrong do they get if left alone?
+- Change: none in the kernel. `examples/fragment_insights.rs`: the multiformat md texts plus 64 `fan/` copies holding one shared notice (407 files, 214,129 bytes) stored as render-runs. A summary per fragment; a file's summary is the sum of its fragments'; corpus aggregates (word totals and document frequency, dollar total and count) take a file's summary out and the new one in. Stream of 22 edits: the notice revised by `propagate` (64 files), the most-shared block of the real texts revised by `propagate`, and 20 single-file edits. Policies: full recompute from every file; eager (fragments read only where the summary cache misses, aggregates updated per edit, checked equal to full after every edit); lazy (nothing updated until a refresh at the end).
+- Result:
+  - Build: 21.6 ms reading 158,915 bytes over 675 fragments, against 24.5 ms reading 214,129 bytes.
+  - Stream: eager 7.5 ms reading 5,671 bytes in all, exact after all 22 edits; full 481 ms reading 4,780,872 bytes. The 64-file edit costs 1.55 ms and 117 bytes eager, against about 21 ms and 216 KB full.
+  - Lazy staleness: after the 64-file edit, 64 file summaries wrong, top 20 words by count still 20/20, by document frequency 19/20, 3 document-frequency errors, dollar total off by $160,000. After all 22 edits: 105 files wrong, top 20 19/20, 47 errors, dollar total off by $222,240. Refresh: 5.9 ms reading 5,475 bytes, exact.
+- Verdict: **measured**. Keeping summaries per fragment is cheaper than keeping them stale: eager upkeep costs about 0.3 ms per edit here and is always exact; a shared-fragment edit costs one fragment read whatever its fan-out. Lazy upkeep looks right on top-word lists and is wrong on totals.
+
+### E183 goal-queries (insight queries that read only the fragments a goal needs)
+- Branch / parent: exp/162-fragment-options / E182
+- Question: a goal-scoped question ("for each file that mentions W, the dollar amounts and dates in the blocks that mention it") needs only some fragments. With E182's per-fragment word sets, how much less is read than scanning files?
+- Change: none in the kernel. In `examples/fragment_insights.rs`: 12 words chosen by a fixed seed among words in 5 to 120 files. Each query answered by reading every file, or by reading only the fragments whose word set holds W; answers compared. A second query answered from summaries alone: files that mention W and cite over $100,000 in all.
+- Result: 14 files per query on average. Fragments: 0.33 ms reading 8,406 bytes per query, against 15.0 ms reading 217,693 bytes; answers equal for all 12. Summary-only query: 0.025 ms reading nothing, against 18.3 ms reading 214,129 bytes; 3 matches, equal.
+- Verdict: **measured**. A goal-scoped query over fragments reads about 4% of the bytes and is about 45 times faster here; a query whose answer is a function of summaries reads no content at all.
+
+### E184 table-aggregates (aggregates kept fresh from the computed-table IR)
+- Branch / parent: exp/162-fragment-options / E183
+- Question: E180's IR carries an input edit to every computed cell. Can corpus aggregates over the 24 workbooks (dollar totals per workbook and per column header, percent cells counted) be kept fresh by re-evaluating only the edited workbook's IR?
+- Change: none in the kernel. `scripts/table_aggregates.py`: aggregates from each workbook's committed csv, checked equal to the IR's. For each of E180's 22 input edits, the truth is LibreOffice's recalculated csv for that workbook with the other 23 unchanged. Policies: full (parse all 24 csv renders); ir (re-evaluate the edited workbook's IR and apply the difference of its aggregates); lazy (left as they were).
+- Result: ir and full both exact 22/22. ir 0.14 ms against 0.32 ms (one workbook evaluated against 24 renders parsed, 4,412 bytes; the corpus is small). Lazy: 18 of 22 edits leave an aggregate wrong; median error in the corpus dollar total $1,950,000 of $93,589,350.
+- Verdict: **measured**. The IR keeps table aggregates exact from one workbook's evaluation with no renderer run. At 24 small workbooks the time saved is small; the point is that it scales with the edited workbook, not the corpus.
+- Gates (E182 to E184): examples and scripts only; clippy `-D warnings` and fmt clean; the kernel is as at E169's gates.
