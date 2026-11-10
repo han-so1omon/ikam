@@ -2314,3 +2314,33 @@ Newest last. Format and rules: `README.md`.
 - exp/139 had merged exp/122-store-bakeoff at its first commit, so E122's four later commits were in no branch after it: the bake-off harness (`examples/stores.rs`), pack checkpoints and CRC-checked reads, the FsStore OS ref lock, sealed pack lookups by interpolation search, and E122's own log, registry and options entries. They are merged into exp/152-held-index now. PackStore keeps E139's `read_head` and E147's `stored_len`; its whole read is E122's CRC-checked one.
 - Gates: 174 kernel tests pass; clippy `-D warnings` clean with and without the store features; the fixed bench matches E152 in every byte count and the north score (0.3035); cost score 0.2451 against 0.2311, from timings (another job ran alongside). E133's goals fetch the same bytes (684 KB and 89 KB).
 - `packages/kernel/scripts/mac-bakeoff.sh` runs the measurements that need macOS (flush cost per commit, kills, APFS small files, E152's goal on files and packs, clonefile) in its own folder, as the user, with no sudo and no service or port.
+
+### E170 hybrid-store (content in packs, refs and index in RocksDB)
+- Question: on the Mac (E122's run of Nov 9) packs flushed a commit in 10.8 ms and RocksDB in 1.4 ms, and packs opened 1M objects in 69 ms. Does keeping content in packs but refs, or refs and the object index, in RocksDB get RocksDB's commit with packs' storage?
+- Change: `backends::hybrid` (feature `store-rocksdb`, off unless built with it): `RefsHybrid` is a PackStore for objects and a RocksDB for refs; a ref update syncs the pack, then writes the ref in one synced batch. `IndexHybrid` appends objects to its own packs and keeps each object's place (pack, offset, length) in RocksDB; a commit syncs the pack data, then writes the places and the ref in one synced batch, so a swap that adds no object is one flush. Reads check the id and CRC. `examples/stores.rs` gains `hybrid-refs` and `hybrid-index`; `tests/backends.rs` runs the store contract on both.
+- Result (Linux, ext4, the harness's db, crash and 1M phases):
+  - Single commit mean: packs 5.72 ms, RocksDB 4.90, hybrid-refs 5.30, hybrid-index 5.99. Ref swap p50: 464, 160, 189 and 162 us. A batch of 10k: 4.2, 4.7, 3.8 and 7.5 s.
+  - Flushes per commit (strace over 2,010 commits): packs 2 and a rename, RocksDB 1, hybrid-refs 2, hybrid-index 1.5 (swaps skip the pack sync). The hybrids do not cut a commit's flushes: content and ref still live in two files.
+  - Kills: 50 of 50 clean on both (7,411 and 5,914 events), nothing acknowledged lost.
+  - 1M objects: build 2.3 s packs, 11.7 RocksDB, 2.4 hybrid-refs, 4.2 hybrid-index; on disk 372, 590, 372 and 380 MB; open 205, 966, 252 and 663 ms; cold read p50 38, 50, 37 and 49 us; a missing id 0.2, 45, 0.2 and 5.8 us.
+- Verdict: **kept** as options, built only with `store-rocksdb`; not a winner. hybrid-refs costs RocksDB's build and open for faster ref swaps; hybrid-index gets one flush only on swaps and opens three times slower than packs. E172 gets one flush a commit without RocksDB.
+
+### E171 lazy-pack-open (open the active pack's checkpoint in place)
+- Question: a PackStore open reads every sealed index's fanout, but loads the open pack's whole checkpoint into a map: at 1M objects 205 ms on Linux and 69 ms on the Mac. Can open use the checkpoint where it lies, as a sealed index is used?
+- Change: `PackOptions::lazy_checkpoint` (off by default) with `PackStore::open_with`. The checkpoint is already a sorted index with a fanout; open checks its size, magic, fanout and coverage (not its hash) and searches it in place, scanning only the records after it. A checkpoint is then synced when written, and folded with the newer entries on the next checkpoint or seal. A torn or short checkpoint falls back to a full scan. Nothing stored changes: the files are the ones the default writes. `tests/backends.rs`: the contract with the option on; a lazy view equals a full load after deletes and replaces; a torn checkpoint falls back.
+- Result (Linux, 1M objects, three probes each):
+  - Open: 186 to 237 ms to 0.9 to 1.2 ms.
+  - Cold read p50 36 to 42 us becomes 78 to 80 us (one more read, into the checkpoint, until the page cache holds it); warm read p50 the same (30 to 38 us). A missing id 0.2 to about 2.5 us.
+  - Build of 1M: 2.5 to 4.4 s (each checkpoint is synced and rewritten whole).
+  - Kills (with E172's ref log, `packs-fast`): 50 of 50 clean.
+- Verdict: **kept** as an option, off by default; on its branch until Eric says to merge. Worth turning on for a server that restarts often or opens many stores; a long-running server pays the slower cold reads instead.
+
+### E172 pack-ref-log (refs as records in the open pack: one flush a commit)
+- Question: a PackStore commit is two flushes and a rename: the pack's data, then the ref file (written, synced, renamed). On the Mac each flush is an F_FULLFSYNC, which is most of the 10.8 ms. Can the ref ride in the same flush as the objects it names?
+- Change: `PackOptions::ref_log` (off by default). A ref update appends a ref record (a marker id, then the name and new id) after the objects, and syncs the pack once; no ref file is written. `refs.snap` keeps all refs at each checkpoint and seal (not synced: losing it only means a longer replay); open loads it and replays ref records after it. A store that kept refs as files carries them over on first open. A record torn ahead of a ref cuts the ref with it, so after a crash a ref only ever falls back to an earlier acknowledged value. Separately, in every mode, sealing a pack now syncs the packs directory after creating the next pack file (it did not before). `tests/backends.rs`: the contract with the option, alone and with E171; refs replay with no checkpoint or snapshot; a flipped byte in an object cuts it and the ref after it; refs carried over from files.
+- Result (Linux):
+  - Flushes per commit (strace over 2,010 commits): 2 and a rename to 1 and none. Files opened 10,068 to 3,028.
+  - Single commit mean 5.26 to 4.74 ms (on this disk a flush is about 40 us, so the time is mostly the harness's writes); ref swap p50 495 to 143 us, p99 1,356 to 310 us. RocksDB's is 160 us.
+  - Kills: 50 of 50 clean, alone and with E171 (7,672 and 7,682 events), nothing acknowledged lost.
+  - 1M objects: the same bytes on disk (+886 bytes), open as before (190 to 246 ms; 1.5 ms with E171), first ref 0.12 to 0.19 ms.
+- Verdict: **kept** as an option, off by default; on its branch until Eric says to merge. A stored-format addition (ref records and `refs.snap`), so turning it on for his stores needs his yes; a store written with it needs a kernel that knows the records. Expect it to halve a commit's flush time on the Mac; that is a Mac measurement.

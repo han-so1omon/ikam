@@ -158,6 +158,10 @@ Each backend sits behind the `Store` trait; `FsStore` (one file per object) stay
 | redb | `redb` | pure Rust, one file; the largest on disk at 1M | cold p50 85 us at 10M |
 | fjall, with or without key-value separation | `fjall` | LSM; fast writes, slow open (640 ms to 1.8 s) | 330 MB/s writes separated |
 | RocksDB, with or without blobs | `rocksdb` | LSM; needs a C++ toolchain to build; 3.7 s open at 10M | cold p50 142 us at 10M |
+| PackStore, `lazy_checkpoint` (E171) | default, off | open searches the open pack's checkpoint in place; cold reads one read slower until cached | 1M open 205 ms to 1.1 ms; cold read p50 38 to 79 us |
+| PackStore, `ref_log` (E172) | default, off | refs as records in the pack: one flush and no rename a commit; a format addition (ref records, `refs.snap`) | swap p50 495 to 143 us; 100 kills clean |
+| `hybrid::RefsHybrid` (E170) | `store-rocksdb` | objects in packs, refs in RocksDB; still two flushes a commit | 1M open 252 ms; swap p50 189 us |
+| `hybrid::IndexHybrid` (E170) | `store-rocksdb` | own packs, object places and refs in RocksDB; one flush for a swap, two for new objects | 1M open 663 ms; 10k batch 7.5 s |
 
 ## Where new content looks for repeats (E131)
 
