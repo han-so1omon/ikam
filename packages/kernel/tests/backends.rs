@@ -665,3 +665,48 @@ fn pack_store_group_commit() {
         }
     }
 }
+
+/// E179: a tail the open had to scan (the process died before its next
+/// checkpoint) is saved by that open, so a store killed again and again
+/// does not rescan an ever longer tail. Checked with and without the
+/// lazy checkpoint and the ref log.
+#[test]
+fn pack_store_saves_a_scanned_tail() {
+    use ikam_kernel::backends::PackOptions;
+    for opts in [
+        PackOptions::default(),
+        PackOptions {
+            lazy_checkpoint: true,
+            ref_log: true,
+            ..PackOptions::default()
+        },
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let big = vec![7u8; 1 << 20];
+        let mut last = None;
+        {
+            let mut s = PackStore::open_with(root, opts).unwrap();
+            for i in 0..70u32 {
+                let mut b = big.clone();
+                b[..4].copy_from_slice(&i.to_le_bytes());
+                let id = Id::from_bytes(*blake3::hash(&b).as_bytes());
+                s.write(id, &b).unwrap();
+                last = Some(id);
+            }
+            s.set_ref("heads/t", None, last.unwrap()).unwrap();
+        }
+        // As if the process had died before saving anything: no checkpoint.
+        let ckpt = root.join("packs/00000000.ckpt");
+        std::fs::remove_file(&ckpt).unwrap();
+        let _ = std::fs::remove_file(root.join("packs/00000000.cflt"));
+        let _ = std::fs::remove_file(root.join("refs.snap"));
+        let s = PackStore::open_with(root, opts).unwrap();
+        assert!(ckpt.exists(), "the open saved the tail it scanned");
+        assert_eq!(s.get_ref("heads/t").unwrap(), last);
+        assert_eq!(s.read(&last.unwrap()).unwrap()[4..], big[4..]);
+        drop(s);
+        let s = PackStore::open_with(root, opts).unwrap();
+        assert_eq!(s.ids().unwrap().len(), 70);
+    }
+}

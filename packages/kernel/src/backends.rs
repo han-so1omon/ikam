@@ -1180,6 +1180,8 @@ impl PackStore {
         let path = root.join(format!("packs/{active_no:08}.pack"));
         let ckpt = root.join(format!("packs/{active_no:08}.ckpt"));
         let mut base_ckpt = None;
+        // E179: where the saved checkpoint ends; what follows was scanned.
+        let mut ckpt_end = 0;
         let (active_index, good) = if path.exists() {
             let len = fs::metadata(&path)?.len();
             let lazy = if opts.lazy_checkpoint {
@@ -1190,10 +1192,12 @@ impl PackStore {
             match lazy {
                 Some((idx, fanout, covers)) => {
                     base_ckpt = Some((idx, fanout));
+                    ckpt_end = covers;
                     scan(&path, covers, HashMap::new())?
                 }
                 None => {
                     let (index, start) = read_ckpt(&ckpt, len).unwrap_or_default();
+                    ckpt_end = start;
                     scan(&path, start, index)?
                 }
             }
@@ -1250,7 +1254,7 @@ impl PackStore {
             active.set_len(good)?; // cut a torn tail
             active.sync_all()?;
         }
-        Ok(PackStore {
+        let mut store = PackStore {
             root,
             opts,
             base,
@@ -1261,9 +1265,18 @@ impl PackStore {
             active_index,
             buf: Vec::new(),
             flushed: good,
-            ckpt_at: good,
+            // E179: not `good`: a tail scanned after a crash is not saved,
+            // so the next checkpoint (or a drop) must still save it.
+            ckpt_at: ckpt_end.min(good),
             _lock: lock,
-        })
+        };
+        // E179: a store killed before each 64 MiB checkpoint would otherwise
+        // rescan an ever longer tail on every open. Save it now.
+        if store.flushed - store.ckpt_at >= PACK_CKPT_BYTES {
+            store.active.sync_data()?; // a checkpoint names only durable records
+            store.checkpoint()?;
+        }
+        Ok(store)
     }
 
     fn append(&mut self, id: Id, bytes: Option<&[u8]>) -> Result<(), Error> {
