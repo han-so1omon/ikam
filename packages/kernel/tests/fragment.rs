@@ -181,3 +181,53 @@ fn refused_grant_writes_nothing() {
         assert_eq!(&got[at..at + new.len()], new);
     }
 }
+
+#[test]
+fn fragment_grant_scopes_one_fragment() {
+    use ikam_kernel::{Denied, FragmentGrant, Store};
+    let mut repo = Repo::new(MemStore::default());
+    let mut edits = Vec::new();
+    for p in ["a/1.md", "a/2.md", "b/1.md"] {
+        let d: Vec<u8> = [b"head\n\n".as_slice(), SHARED, b"tail\n"].concat();
+        let d = [p.as_bytes(), b"\n\n", &d].concat();
+        let id = repo.put_fragmented(&d, None).unwrap();
+        edits.push(Edit::Put { path: p.into(), id });
+    }
+    let tree = repo.edit_tree(None, &edits).unwrap();
+    let mut ix = repo.fragment_index(&tree).unwrap();
+    let old = Id::of_content(SHARED);
+    let key = [1u8; 32];
+    let g = |fragment: Id, within: &str| FragmentGrant {
+        goal: "g".into(),
+        fragment,
+        within: within.into(),
+    };
+    let count = |r: &Repo<MemStore>| r.store().ids().unwrap().len();
+    let before = count(&repo);
+    // b/1.md renders the fragment too, so a grant within a/ is refused.
+    let r = repo
+        .propagate_fragment_granted(&mut ix, &old, b"New.\n\n", &g(old, "a/"))
+        .unwrap();
+    assert_eq!(r.unwrap_err(), ("b/1.md".to_string(), Denied::NoFile));
+    let other = Id::of_content(b"other");
+    let r = repo
+        .propagate_fragment_granted(&mut ix, &old, b"New.\n\n", &g(other, ""))
+        .unwrap();
+    assert_eq!(r.unwrap_err().1, Denied::Stale);
+    assert_eq!(count(&repo), before, "refusals write nothing");
+    // A sealed grant does not verify once changed.
+    let full = g(old, "");
+    let tag = full.seal(&key);
+    assert!(full.verify(&key, &tag) && !g(old, "a/").verify(&key, &tag));
+    let changes = repo
+        .propagate_fragment_granted(&mut ix, &old, b"New.\n\n", &full)
+        .unwrap()
+        .unwrap();
+    assert_eq!(changes.len(), 3);
+    // The fragment is the version: the same grant no longer applies.
+    let new = Id::of_content(b"New.\n\n");
+    let r = repo
+        .propagate_fragment_granted(&mut ix, &new, b"Again.\n\n", &full)
+        .unwrap();
+    assert_eq!(r.unwrap_err().1, Denied::Stale);
+}

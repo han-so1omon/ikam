@@ -20,7 +20,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::ops::Range;
 
 use crate::grant::inside;
-use crate::{Arg, Denied, Edit, Error, Grant, Id, Kind, Object, Repo, Store, func};
+use crate::{Arg, Denied, Edit, Error, FragmentGrant, Grant, Id, Kind, Object, Repo, Store, func};
 
 /// Longest block before it is cut at the next line boundary.
 const MAX_BLOCK: usize = 16 * 1024;
@@ -245,6 +245,27 @@ impl<S: Store> Repo<S> {
             edits.push(Edit::Put { path, id: out });
         }
         Ok(Ok(edits))
+    }
+
+    /// `propagate` under a fragment grant (E162): every file that renders
+    /// `old` must be one the grant covers, and the grant must name `old`.
+    /// Checked from the index alone, before anything is written.
+    pub fn propagate_fragment_granted(
+        &mut self,
+        ix: &mut FragmentIndex,
+        old: &Id,
+        new_bytes: &[u8],
+        grant: &FragmentGrant,
+    ) -> Result<Result<Vec<Edit>, (String, Denied)>, Error> {
+        if grant.fragment != *old {
+            return Ok(Err((String::new(), Denied::Stale)));
+        }
+        for path in ix.by_fragment.get(old).into_iter().flatten() {
+            if let Err(d) = grant.allows(old, path) {
+                return Ok(Err((path.clone(), d)));
+            }
+        }
+        self.propagate_granted(ix, old, new_bytes, None)
     }
 
     /// Bytes of a content, from its stored form or by rebuilding it.

@@ -17,16 +17,20 @@
 //! - `other-range`: each file granted a different block: refused;
 //! - `stale`: the grant names the version before an earlier edit: refused.
 //!
+//! - `fragment-grant` (E162): a `FragmentGrant` naming the notice within
+//!   `fan/`, checked from the index; `fragment-outside`: within `fan/1/`,
+//!   refused; `fragment-stale`: naming another fragment, refused.
+//!
 //! Each line: ms (median of 5), whether it was allowed, stored bytes
-//! written, files, and the sealed grant's encoded size. A fragment-scoped
-//! grant (the goal may change this fragment wherever it is rendered) would
-//! be 32 bytes plus the goal, whatever n is; its size is printed beside.
+//! written, files, and the sealed grant's encoded size.
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
-use ikam_kernel::{Edit, FileGrant, FragmentIndex, Grant, Id, MemStore, Repo, Store, blocks};
+use ikam_kernel::{
+    Edit, FileGrant, FragmentGrant, FragmentIndex, Grant, Id, MemStore, Repo, Store, blocks,
+};
 
 fn md_files() -> Vec<(String, Vec<u8>)> {
     let root: PathBuf = Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -172,6 +176,9 @@ fn main() {
             "half",
             "other-range",
             "stale",
+            "fragment-grant",
+            "fragment-outside",
+            "fragment-stale",
         ] {
             let mut runs = Vec::new();
             for _ in 0..5 {
@@ -182,12 +189,45 @@ fn main() {
                     reached.clone()
                 };
                 let g = grant(&s, &paths, case == "other-range", case == "stale");
-                let tag = g.seal(&key);
-                let size = g.encode().len();
+                let fg = FragmentGrant {
+                    goal: "revise the notice".into(),
+                    fragment: if case == "fragment-stale" {
+                        Id::of_content(b"another fragment")
+                    } else {
+                        old
+                    },
+                    within: if case == "fragment-outside" {
+                        "fan/1/"
+                    } else {
+                        "fan/"
+                    }
+                    .into(),
+                };
+                let fragment_case = case.starts_with("fragment");
+                let (tag, ftag) = (g.seal(&key), fg.seal(&key));
+                let size = if fragment_case {
+                    fg.encode().len()
+                } else {
+                    g.encode().len()
+                };
                 let before = stored(&s.repo);
                 let t = Instant::now();
-                assert!(g.verify(&key, &tag));
-                let allowed = if case == "diff-check" {
+                let allowed = if fragment_case {
+                    assert!(fg.verify(&key, &ftag));
+                    match s
+                        .repo
+                        .propagate_fragment_granted(&mut s.ix, &old, &new, &fg)
+                        .unwrap()
+                    {
+                        Ok(edits) => {
+                            let tree = s.repo.edit_tree(Some(s.tree), &edits).unwrap();
+                            s.repo.commit("main", tree, "notice").unwrap();
+                            true
+                        }
+                        Err(_) => false,
+                    }
+                } else if case == "diff-check" {
+                    assert!(g.verify(&key, &tag));
                     // The E140 check: diff each file's old and new bytes.
                     let mut ok = true;
                     for p in &reached {
@@ -207,6 +247,7 @@ fn main() {
                     }
                     ok
                 } else {
+                    assert!(g.verify(&key, &tag));
                     let gr = (case != "ungranted").then_some(&g);
                     match s.repo.propagate_granted(&mut s.ix, &old, &new, gr).unwrap() {
                         Ok(edits) => {
@@ -219,14 +260,17 @@ fn main() {
                 };
                 let ms = t.elapsed().as_secs_f64() * 1e3;
                 let written = stored(&s.repo) - before;
-                if !matches!(case, "granted" | "diff-check" | "ungranted") {
+                if !matches!(
+                    case,
+                    "granted" | "diff-check" | "ungranted" | "fragment-grant"
+                ) {
                     assert!(
                         !allowed && written == 0,
                         "{case}: refused edits write nothing"
                     );
                     assert_eq!(s.ix.by_fragment[&old].len(), reached.len());
                 }
-                if case == "granted" {
+                if case == "granted" || case == "fragment-grant" {
                     assert!(allowed);
                     assert!(s.repo.fsck().unwrap().is_empty());
                 }
@@ -235,9 +279,8 @@ fn main() {
             runs.sort_by(|a, b| a.0.total_cmp(&b.0));
             let (ms, allowed, written, size) = runs[2];
             println!(
-                "{{\"n\":{n},\"case\":\"{case}\",\"files\":{},\"ms\":{ms:.3},\"allowed\":{allowed},\"written\":{written},\"grant_bytes\":{size},\"fragment_grant_bytes\":{}}}",
-                reached.len(),
-                32 + 8 + "revise the notice".len()
+                "{{\"n\":{n},\"case\":\"{case}\",\"files\":{},\"ms\":{ms:.3},\"allowed\":{allowed},\"written\":{written},\"grant_bytes\":{size}}}",
+                reached.len()
             );
         }
     }
