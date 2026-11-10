@@ -2404,3 +2404,78 @@ Newest last. Format and rules: `README.md`.
   - Scaled: rendering 10,000 rows takes 23 ms (csv), 99 ms (json), 11 ms (md); the kernel writes 12.7 to 16.1 KB per one-cell edit there, against 164 to 363 bytes at 100 and 1,000 rows.
 - Verdict: **measured**. A typed table IR reproduces every committed text format and halves their storage; cell types are what the IR must keep. At 10,000 rows a one-cell edit costs the kernel 13 to 16 KB, so large tables want rows as fragments (an option, not built).
 - Gates on the branch (E153 to E161): 178 kernel tests pass; clippy `-D warnings` clean on all targets; the fixed bench matches main (badc682) in every byte count, read cost and the north score (0.3035); cost score 0.2564 against 0.2392, from timings only (the bench never stores a render).
+
+### E162 fragment-grant (a grant that names one fragment)
+- Branch / parent: exp/162-fragment-options / E161
+- Question: E159's sealed grant lists every file it reaches (about 140 bytes each). Can a grant name the fragment instead, at a constant size, with the same checks?
+- Change: `grant.rs` adds `FragmentGrant { goal, fragment, within }` (its own seal tag, `seal`, `verify`, `allows`). `fragment.rs` adds `propagate_fragment_granted`: refused as `Stale` when the grant names another version of the fragment, as `NoFile` when a file that renders it lies outside `within`, otherwise `propagate_granted` with no per-file grant. `tests/fragment.rs` adds `fragment_grant_scopes_one_fragment`. `examples/fragment_grants.rs` adds three cases.
+- Result (median of 5; n = 16, 64, 256):
+  - Grant size: 85 bytes at every n, against 2,251, 9,087 and 35,772 bytes for the per-file grant.
+  - Edit time: 5.7, 19.9 and 91.0 ms, the same as the per-file grant within noise.
+  - Refusals (a file outside `within`, a stale fragment) take 0.002 ms and write nothing.
+- Verdict: **kept** as an option beside the per-file grant. It is a sealed format addition (a new tag), so it waits on a merge decision.
+
+### E163 docx-splice (a docx renderer that splices one block)
+- Branch / parent: exp/162-fragment-options / E162
+- Question: E158 found 0 of 72 docx splices exact, because pandoc numbers bookmarks and lists across the document. Can a renderer that maps those ids splice one edited block exactly?
+- Change: none in the kernel. `scripts/docx_splice.py`: the old document.xml split into top-level items; the edited block's items (rendered alone) replace the old block's, list ids mapped to the document's, the context style (FirstParagraph or BodyText) taken from the position, and a heading's section bookmark renamed. The package is rewritten with the old entries' order, flags and deflate settings (Python's zipfile would change the flags).
+- Result: 72 word edits and 24 heading edits. document.xml identical 96 of 96, every other part identical 96 of 96, the whole .docx identical 96 of 96. Median 35 ms per splice (mostly pandoc rendering the block) against 65 ms for the full render.
+- Verdict: **kept** as a script. Edits that add or remove headings or lists were left to E169.
+
+### E164 table-rows (rows as fragments for large tables)
+- Branch / parent: exp/162-fragment-options / E163
+- Question: E161 measured 13 to 16 KB written per one-cell edit at 10,000 rows. Do rows (or groups of rows) stored as fragments cut that?
+- Change: `fragment.rs` adds `put_cut(bytes, cuts, fanout)`: a render over given pieces, optionally a tree of renders with at most `fanout` children. `examples/table_rows.rs`: synthetic tables (one workbook's rows with every digit redrawn, so rows do not repeat) as csv and md at 1,000, 10,000 and 100,000 rows; forms plain, rows, groups-64, tree-64, tree-groups-64; one appended digit in the middle row; everything checked byte-exact with fsck clean, before and after a repack.
+- Result (csv; md is alike):
+  - plain: 14 KB, 139 KB, 1.41 MB at rest; an edit adds 166 to 169 bytes at every size, in 2.7, 24 and 353 ms.
+  - rows: about 10 times larger at rest; an edit adds 33 KB, 330 KB and 3.3 MB (the render names every row).
+  - groups-64: +45% at rest; an edit adds 763 B, 5.4 KB and 51.8 KB, in 1.2, 7.9 and 60 ms.
+  - tree-groups-64: an edit adds 763 B, 2.5 KB and 3.2 KB, in 1.1, 11 and 115 ms. tree-64 is slow (2.8 s per edit at 100,000 rows).
+  - After a repack plain is smallest (100,000-row csv: 938 KB, against 1.18 MB for groups and 1.14 MB for tree-groups). Repack takes 36 s at 100,000 rows plain and 70 s for groups (the 100,000-row repack run was cut by the 30-minute limit; the rest is in the raw output).
+  - Correction to E161: its 13 to 16 KB per edit at 10,000 rows was FsStore rewriting store files. In memory the kernel adds about 168 bytes for a plain put, at any size.
+- Verdict: **discarded** as a default; plain puts already write about one row. Groups of rows are an option only for faster edits on very large tables (6x faster at 100,000 rows), at +45% stored.
+
+### E165 table-ir-store (TableIR stored, json and md rendered on read)
+- Branch / parent: exp/162-fragment-options / E164
+- Question: store E161's typed TableIR (the csv itself, which carries the cell types, plus a residual sidecar) instead of csv, json and md, and render the other two on read?
+- Change: none in the kernel. `scripts/table_ir_store.py`: four layouts ingested with `ikam ingest` (commit, repack, verify): the three text formats as files, the IR (csv plus `<name>.table.json`), and each with xlsx, docx and pdf added. json and md rendered from what `ikam cat` returns.
+- Result:
+  - Stored: 3,736 bytes against 6,519 for the three text formats (-43%); with the office formats 133,135 against 135,572 (-1.8%).
+  - csv, json and md byte-exact 24 of 24; rendering json and md on read takes 0.14 ms for these tables.
+  - Scaled (synthetic): rendering on read takes 241 ms at 10,000 rows and 2,656 ms at 100,000, against 6 to 11 ms and 35 to 94 ms to read the stored files.
+- Verdict: **measured**. An archive option (cold tables, text formats only); for tables read often, storing the renders is faster and the kernel already stores them compactly.
+
+### E166 render-range-lengths (bug: range reads rebuilt whole arguments)
+- Branch / parent: exp/162-fragment-options / E165
+- Question: E164's range reads of render trees cost far more decode work than the range. Why?
+- Change: `range.rs` (`concat_range`) learned each whole argument's length by rebuilding it. It now asks `content_length`, which takes the length from the derivation for concat and render (summed recursively, memoized in the reconstruction context, with the existing stack guard), and rebuilds only otherwise. `tests/fragment.rs` adds `range_read_of_a_render_tree_skips_what_it_does_not_read`.
+- Result: a 100-byte range of a 4,096-line render tree: decode work 99,064 to 400. The fixed bench is unchanged in every byte count, read cost and the north score (0.3035); the cost score moves with timings only.
+- Verdict: **kept** (a fix to a default read path; no format change).
+
+### E167 endpoints (one md edit carried to its html and docx)
+- Branch / parent: exp/162-fragment-options / E166
+- Question: one md paragraph edit, carried to the text's html and docx by splices (E158, E163) and stored in the kernel: what does it cost against re-rendering both, and should the html be stored as fragments?
+- Change: none in the kernel. `scripts/endpoints_prep.py` makes 72 edits (24 texts, E158's three each), each html and docx splice checked byte-identical to a full pandoc re-render. `examples/endpoints.rs` stores the old md, html and docx, then the new ones, in two forms: every file with `put_content`, or the html as a render over its block pieces (`put_cut`).
+- Result:
+  - Rendering: the splices take a median 58 ms against 134 ms for re-rendering html and docx in full; 72 of 72 html and docx exact.
+  - Bytes the kernel adds per edit (median): md 172, html 196, docx 1,951 (all files 2,340) as files; html 1,071 as fragments (all 3,210), because the new render names every piece.
+  - Every file reads back exact and fsck is clean.
+- Verdict: **measured**. For one file and its renders, splice the renders and store them as plain files: the matcher already writes about one paragraph for the html. Storing renders as fragments pays only when blocks are shared by many files (E157).
+
+### E168 fragment-index-compact (a smaller fragment search index)
+- Branch / parent: exp/162-fragment-options / E167
+- Question: E160's fragment trigram index was 281 KB against the stored index's 186 KB, from its 33-byte keys and 63-byte seams. Can a packed form match it and keep answers exact?
+- Change: none in the kernel. `examples/fragment_query.rs` adds a compact index: postings name fragments by position (the fragment list stored once, 32 bytes an id), seams are not stored (each file's fragment list gives them), and a seam is indexed only by the two trigrams that cross its boundary (any pattern of three bytes or more that crosses it holds one). A candidate seam is checked on the bytes around that boundary in each file that has it, walking into neighbouring fragments as far as the pattern reaches, so patterns of any length are exact (E160 was limited to 64 bytes).
+- Result:
+  - Size: 185,690 bytes (ids 21,600; fragment postings 162,408; seam postings 1,682) against 280,615 (-34%), about the stored index's 186,420. Bitmaps for dense lists save 98 bytes.
+  - Query: 0.093 ms per query, 9.9 KB scanned, against 0.103 ms and 10.8 KB; all 41 answers exact, and 10 patterns of 200 bytes exact.
+  - Build 7.8 ms against 20.8 ms; after the 64-file edit the index updates in 0.24 ms, every answer exact.
+- Verdict: **kept** as the encoding for a fragment index (the example only; no kernel change).
+
+### E169 docx-restructure (docx splices that add or remove blocks)
+- Branch / parent: exp/162-fragment-options / E168
+- Question: E163 spliced one block of the same shape. Can the docx renderer splice inserts and deletes, new headings and new lists, by renumbering what pandoc numbers across the document?
+- Change: none in the kernel. `scripts/docx_restructure.py`: at ingest each md block's items are recorded (blocks markdown joins in the document, such as a list continued past a blank line, are kept as one group). An edit replaces a range of blocks with any md: bookmarks dropped, new items spliced in with fresh list ids, context styles set at both seams from what follows what in the old document, section bookmarks rebuilt from the headings (ids from 20 in the order their ends appear, names kept or made unique as pandoc does), lists renumbered from 1001 in order of first use, numbering.xml rebuilt to match. Where the new text touches a list, the neighbouring block is rendered with it, since markdown may join the lists. `docx_splice.rezip` takes several parts.
+- Result (24 texts each): paragraph inserted 24/24, paragraph deleted 24/24, heading and paragraph inserted 24/24, two-item list inserted 24/24, heading deleted 24/24, one-word edit 24/24, and (synthetic, as no text has the case) a paragraph between two lists deleted so the lists join 24/24. The whole .docx byte-identical to a full re-render in all 168. Median ms, splice against full render: deletes 2.8 against 77; inserts 45 to 49 against 69 to 77; a list insert 95 against 78 (it renders its neighbour too).
+- Verdict: **kept** as a script. Not covered: tables, footnotes, images, and edits to the title block.
+- Gates on exp/162-fragment-options (E162 to E169): 180 kernel tests pass; clippy `-D warnings` and `cargo fmt --check` clean on all targets; the fixed bench matches exp/153 and main (badc682) in every byte count, read cost and the north score (0.3035).

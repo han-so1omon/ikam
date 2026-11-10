@@ -28,3 +28,13 @@ Eric asked (Nov 9) for experiments on efficient edits that propagate to many ren
 - Non-deterministic lifting (a model in the loop): every lift here is deterministic and checked by a byte-identity drift spec.
 - Delta chains: the kernel's matcher and repack already store a new version as references into the old one [inf].
 - `ExpressionIR`, `PropositionIR`, `ClaimIR`, `StyleIR`: no corpus here exercises them; they are left for a corpus that does (formulas in workbooks would be the first).
+
+## Second round (E162 to E169)
+
+- **A grant that names a fragment** (E162) is 85 bytes whatever the fan-out (against 35,772 for a per-file grant over 256 files), with the same edit time, and refuses a stale fragment or a file outside its path prefix without writing.
+- **docx becomes a splice target** (E163, E169). A renderer that maps pandoc's document-wide numbering reproduces a full re-render byte for byte: one-block edits 96 of 96, and inserts and deletes of paragraphs, headings and lists 168 of 168, with bookmarks, list ids and numbering.xml rebuilt. Deletes take 2.8 ms against 77 ms. This is the Python `Renderer` executing a reconstruction program with a byte-identity `DriftSpec`, for a renderer that numbers across the document [inf].
+- **For one file and its renders, splice the renders and store them as plain files** (E167). The kernel's matcher already writes about one paragraph for a changed html (196 bytes); storing the html as a render over its pieces costs more (1,071 bytes, since the render names every piece). Fragments as storage pay where blocks are shared across files (E157).
+- **Large tables do not need rows as fragments** (E164). A plain put of a one-cell edit adds about 168 bytes at 1,000 to 100,000 rows; E161's 13 to 16 KB was the file store rewriting its files, not the kernel. Groups of rows only make edits faster on very large tables.
+- **A stored TableIR is an archive form** (E165): 43% fewer bytes than the three text formats, but rendering on read is slow for large tables (241 ms at 10,000 rows).
+- **A compact fragment index** (E168) is the stored index's size (186 KB) with fragment-index speed (0.09 ms per query) and exact answers for patterns of any length.
+- **A bug in range reads** (E166): a range read of a render rebuilt each whole argument to learn its length. Lengths now come from the derivation (decode work for a 100-byte range of a 4,096-line render: 99,064 to 400).

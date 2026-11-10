@@ -272,3 +272,21 @@ it is an on-disk addition and waits on a decision.
 | a docx renderer that renumbers document-wide ids, so docx renders splice per fragment like html | a renderer to maintain against re-running pandoc | 206 of 236 blocks local once bookmark and list ids are normalised; 0 of 72 splices exact without it (E158) |
 | rows as fragments for large tables | per-row references against one plain file | a one-cell edit of a 10,000-row table writes 12.7 to 16.1 KB today, against 164 to 363 bytes at 100 to 1,000 rows (E161) |
 | a typed table IR (TableIR) stored instead of its csv, json and md renders | json and md rendered on read (json 99 ms at 10,000 rows) against storing them | 6,515 against 12,725 bytes for the 24 workbooks, all renders byte-exact (E161) |
+
+## Fragment options built (E162 to E169)
+
+These are the options E158 to E161 listed above as not built; each is now built and measured.
+
+| Setting | Default | Trade | Measured |
+| --- | --- | --- | --- |
+| `propagate_fragment_granted` with a `FragmentGrant` (the goal may change one fragment wherever it is rendered, under a path prefix) | `propagate_granted` with a per-file grant | constant grant size against one entry per file; a new sealed grant form | 85 bytes at any fan-out against 35,772 for 256 files, same edit time (E162) |
+| `put_cut` over groups of 64 rows (optionally as a tree) for very large tables | `put_content` | +45% stored and larger after repack, for faster one-cell edits; plain puts already write about one row | 100,000 rows: edit 60 ms (tree 115 ms) against 353 ms; plain adds about 168 bytes (E164) |
+| a typed table IR (csv plus a residual sidecar) stored instead of csv, json and md | store each format | 43% fewer bytes for the text formats, for rendering json and md on every read | 241 ms to render at 10,000 rows against 6 to 11 ms to read (E165) |
+
+Renderers and indexes outside the kernel (scripts and examples; no switch):
+
+| Option | Trade | Measured |
+| --- | --- | --- |
+| docx renders spliced per edit (`scripts/docx_splice.py`, `scripts/docx_restructure.py`) instead of re-running pandoc | a renderer to keep in step with pandoc's numbering, against a full render per edit | 96/96 same-shape edits and 168/168 inserts and deletes byte-identical; deletes 2.8 ms, inserts 45 to 49 ms, against 65 to 77 ms (E163, E169) |
+| an md edit carried to its html and docx by splices, stored as plain files | storing the html as fragments costs more for one file (the render names every piece) | 58 against 134 ms; 2,340 bytes per edit as files, 3,210 with html fragments (E167) |
+| a compact fragment trigram index (positions, implied seams, crossing trigrams) | the fragment list must be held to map positions | 185,690 against 280,615 bytes, about the stored index's size, exact for any pattern length (E168) |
