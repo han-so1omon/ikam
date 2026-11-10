@@ -1418,6 +1418,115 @@ impl PackStore {
     pub fn packs(&self) -> usize {
         self.sealed.len() + 1
     }
+
+    /// E176: the pack cleaner. Seals the open pack, copies every object whose
+    /// newest record is in a sealed pack into new packs (dropping deleted and
+    /// replaced records and tombstones), then removes the old packs, oldest
+    /// first. A kill at any point leaves a store that reads the same: until
+    /// an old pack is removed the copies only duplicate its newest records,
+    /// and removing oldest first never uncovers a record a newer tombstone
+    /// hid. With `ref_log` the refs are logged again after the copies.
+    pub fn compact(&mut self) -> Result<Compacted, Error> {
+        self.flush()?;
+        if self.flushed > 0 {
+            self.active.sync_data()?;
+            self.seal()?;
+        }
+        let old = self.sealed.len();
+        let old_nos: Vec<u32> = (0..self.active_no)
+            .filter(|n| self.root.join(format!("packs/{n:08}.pack")).exists())
+            .collect();
+        let mut out = Compacted {
+            packs_before: old,
+            bytes_before: self.pack_bytes()?,
+            ..Compacted::default()
+        };
+        const CHUNK: u32 = 1 << 16;
+        let mut body = Vec::new();
+        for i in 0..old {
+            let count = self.sealed[i].fanout[255];
+            let mut at = 0;
+            while at < count {
+                let n = CHUNK.min(count - at);
+                body.resize(n as usize * IDX_ENTRY as usize, 0);
+                self.sealed[i]
+                    .idx
+                    .read_exact_at(&mut body, IDX_HEAD + at as u64 * IDX_ENTRY)?;
+                for e in body.chunks_exact(IDX_ENTRY as usize) {
+                    let id = Id::from_bytes(e[..32].try_into().unwrap());
+                    let off = u64::from_le_bytes(e[32..40].try_into().unwrap());
+                    let len = u32::from_le_bytes(e[40..44].try_into().unwrap());
+                    let newest = matches!(self.locate(&id)?, Some((Some(j), o, _)) if j == i && o == off);
+                    if len == TOMBSTONE || !newest {
+                        out.dropped += 1;
+                        continue;
+                    }
+                    let bytes = self.read(&id)?; // CRC-checked
+                    self.append(id, Some(&bytes))?;
+                    out.kept += 1;
+                    if self.flushed >= PACK_SEAL_BYTES {
+                        self.sync()?; // seals
+                    }
+                }
+                at += n;
+            }
+        }
+        if self.opts.ref_log {
+            let marker = ref_marker();
+            for (name, new) in &self.log_refs {
+                let body = ref_body(name, new);
+                let len = body.len() as u32;
+                self.buf.extend_from_slice(marker.as_bytes());
+                self.buf.extend_from_slice(&len.to_le_bytes());
+                self.buf.extend_from_slice(&body);
+                self.buf.extend_from_slice(&crc(&marker, len, &body).to_le_bytes());
+            }
+        }
+        self.flush()?;
+        if self.flushed > 0 {
+            self.active.sync_data()?;
+            self.seal()?;
+        }
+        if self.opts.ref_log {
+            write_snap(&self.root.join("refs.snap"), self.active_no, 0, &self.log_refs)?;
+        }
+        let packs = self.root.join("packs");
+        sync_dir(&packs)?;
+        for n in old_nos {
+            // The pack first: an index or filter without its pack is ignored.
+            fs::remove_file(packs.join(format!("{n:08}.pack")))?;
+            for ext in ["idx", "flt", "ckpt", "cflt"] {
+                let _ = fs::remove_file(packs.join(format!("{n:08}.{ext}")));
+            }
+        }
+        sync_dir(&packs)?;
+        self.sealed.drain(..old);
+        out.packs_after = self.sealed.len();
+        out.bytes_after = self.pack_bytes()?;
+        Ok(out)
+    }
+
+    /// Bytes in the packs folder.
+    pub fn pack_bytes(&self) -> Result<u64, Error> {
+        let mut n = 0;
+        for e in fs::read_dir(self.root.join("packs"))? {
+            n += e?.metadata()?.len();
+        }
+        Ok(n)
+    }
+}
+
+/// What [`PackStore::compact`] did.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Compacted {
+    /// Sealed packs before and after (the open pack is sealed first).
+    pub packs_before: usize,
+    pub packs_after: usize,
+    pub bytes_before: u64,
+    pub bytes_after: u64,
+    /// Objects copied, and records dropped (old versions, deleted, tombstones).
+    pub kept: u64,
+    pub dropped: u64,
 }
 
 fn open_sealed(root: &Path, n: u32) -> Result<Sealed, Error> {

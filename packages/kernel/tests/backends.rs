@@ -499,3 +499,109 @@ fn pack_store_filters() {
     check(&PackStore::open_with(dir.path(), all_on).unwrap());
     check(&PackStore::open(dir.path()).unwrap());
 }
+
+/// E176: the pack cleaner keeps exactly the newest version of every live
+/// object and every ref, drops the rest, and a kill partway (old packs still
+/// there, or some removed oldest first) reads the same.
+#[test]
+fn pack_store_compact() {
+    use ikam_kernel::backends::PackOptions;
+    use std::collections::BTreeMap;
+    let obj = |i: u64, v: u64| format!("object {i} version {v} {}", "x".repeat((i % 50) as usize)).into_bytes();
+    let key = |i: u64| Id::of_content(format!("key {i}").as_bytes());
+    for opts in [
+        PackOptions::default(),
+        PackOptions {
+            ref_log: true,
+            ..PackOptions::default()
+        },
+        PackOptions {
+            ref_log: true,
+            lazy_checkpoint: true,
+            filters: true,
+        },
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let mut want: BTreeMap<Id, Vec<u8>> = BTreeMap::new();
+        let mut gone = Vec::new();
+        let mut s = PackStore::open_with(dir.path(), opts).unwrap();
+        let mut head = None;
+        for round in 0..4u64 {
+            for i in 0..3_000u64 {
+                let k = key(i);
+                match (i + round) % 7 {
+                    0 if want.contains_key(&k) => {
+                        s.delete(&k).unwrap();
+                        want.remove(&k);
+                        gone.push(k);
+                    }
+                    1 | 2 => {
+                        let b = obj(i, round);
+                        s.replace(k, &b).unwrap();
+                        want.insert(k, b);
+                    }
+                    _ if !want.contains_key(&k) => {
+                        let b = obj(i, round);
+                        s.write(k, &b).unwrap();
+                        want.insert(k, b);
+                    }
+                    _ => {}
+                }
+            }
+            let r = key(10_000 + round);
+            s.set_ref("heads/main", head, r).unwrap();
+            head = Some(r);
+            if round % 2 == 1 {
+                let c = s.compact().unwrap();
+                assert!(c.dropped > 0 && c.bytes_after < c.bytes_before, "{c:?}");
+            }
+        }
+        // Old packs kept, as after a kill before the cleaner removed any.
+        let before = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(before.path().join("packs")).unwrap();
+        for e in std::fs::read_dir(dir.path().join("packs")).unwrap() {
+            let p = e.unwrap().path();
+            std::fs::copy(&p, before.path().join("packs").join(p.file_name().unwrap())).unwrap();
+        }
+        let c = s.compact().unwrap();
+        assert_eq!(c.kept, want.len() as u64);
+        drop(s);
+        let check = |p: &Path| {
+            let s = PackStore::open_with(p, opts).unwrap();
+            for (k, b) in &want {
+                assert_eq!(&s.read(k).unwrap(), b);
+            }
+            for k in &gone {
+                if !want.contains_key(k) {
+                    assert!(!s.has(k));
+                }
+            }
+            assert_eq!(s.get_ref("heads/main").unwrap(), head);
+            let mut ids = s.ids().unwrap();
+            ids.sort();
+            assert_eq!(ids, want.keys().copied().collect::<Vec<_>>());
+        };
+        check(dir.path());
+        if opts.ref_log {
+            // Kill before any old pack was removed: the old packs come back
+            // (only those the cleaner removed; it never rewrites a file).
+            for e in std::fs::read_dir(before.path().join("packs")).unwrap() {
+                let p = e.unwrap().path();
+                let to = dir.path().join("packs").join(p.file_name().unwrap());
+                if !to.exists() {
+                    std::fs::copy(&p, to).unwrap();
+                }
+            }
+            check(dir.path());
+            // Kill after the oldest were removed: remove the lowest numbers.
+            let mut nos: Vec<_> = std::fs::read_dir(before.path().join("packs"))
+                .unwrap()
+                .filter_map(|e| e.unwrap().file_name().to_str()?.strip_suffix(".pack").map(String::from))
+                .collect();
+            nos.sort();
+            let first = &nos[0];
+            std::fs::remove_file(dir.path().join(format!("packs/{first}.pack"))).unwrap();
+            check(dir.path());
+        }
+    }
+}

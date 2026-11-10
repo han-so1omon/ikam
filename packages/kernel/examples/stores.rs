@@ -26,6 +26,11 @@
 //!   least N objects, and 100,000 of the contents read back byte for byte.
 //!   After the last kill, a full fsck.
 //!
+//! - `churn BACKEND DIR N` (E176): on a store `build` made, delete 3 in 10
+//!   of the objects and replace 1 in 10 with new bytes, then (PackStore
+//!   backends) time the pack cleaner, and check every object reads as it
+//!   should after a reopen.
+//!
 //! Every line printed is one JSON object.
 
 use std::collections::BTreeMap;
@@ -495,6 +500,11 @@ fn probe(name: &str, dir: &Path, n: u64) {
 /// The child of `crash`: append and commit forever, acknowledging each commit.
 fn crash_child(name: &str, dir: &Path) {
     let mut repo = Repo::new(open(name, dir));
+    if std::env::var_os("CRASH_EMPTY_SEEDS").is_some() {
+        // E174: on a big store a fresh handle's first write reads every
+        // stored content for the seed index (E130); scope it to nothing.
+        repo.set_seed_scope(Some(Vec::new()));
+    }
     let mut d = match repo.store().get_ref("heads/db").unwrap() {
         Some(c) => repo.db_at(&c).unwrap(),
         None => repo.db_empty().unwrap(),
@@ -621,6 +631,8 @@ fn crash_big(work: &Path, name: &str, kills: u32, n: u64) {
         );
     }
     let exe = std::env::current_exe().unwrap();
+    // SAFETY: set before any thread is started.
+    unsafe { std::env::set_var("CRASH_EMPTY_SEEDS", "1") };
     let mut rng = Rng(7);
     let (mut ok, mut lost, mut bad, mut failed) = (0, 0, 0, 0);
     let mut max_seq = 0u64;
@@ -711,6 +723,62 @@ fn crash_big(work: &Path, name: &str, kills: u32, n: u64) {
     );
 }
 
+fn churned(i: u64) -> Option<Vec<u8>> {
+    match i % 10 {
+        0..=2 => None,
+        3 => {
+            let mut b = synthetic(i).1;
+            b.reverse();
+            Some(b)
+        }
+        _ => Some(synthetic(i).1),
+    }
+}
+
+fn churn(name: &str, dir: &Path, n: u64) {
+    use ikam_kernel::backends::{PackOptions, PackStore};
+    let opts = match name {
+        "packs" => PackOptions::default(),
+        "packs-fast" => PackOptions { lazy_checkpoint: true, ref_log: true, ..PackOptions::default() },
+        "packs-fast-filter" => PackOptions { lazy_checkpoint: true, ref_log: true, filters: true },
+        _ => panic!("churn is for PackStore backends"),
+    };
+    let t = Instant::now();
+    let mut s = PackStore::open_with(dir, opts).unwrap();
+    for i in 0..n {
+        let id = synthetic(i).0;
+        match churned(i) {
+            None => s.delete(&id).unwrap(),
+            Some(b) if i % 10 == 3 => s.replace(id, &b).unwrap(),
+            Some(_) => {}
+        }
+    }
+    let head = s.get_ref("heads/scale").unwrap();
+    s.set_ref("heads/scale", head, synthetic(n - 1).0).unwrap();
+    let churn_s = t.elapsed().as_secs_f64();
+    let (_, before, _) = disk(dir);
+    let t = Instant::now();
+    let c = s.compact().unwrap();
+    let compact_s = t.elapsed().as_secs_f64();
+    drop(s);
+    let (_, after, _) = disk(dir);
+    let t = Instant::now();
+    let s = PackStore::open_with(dir, opts).unwrap();
+    let open_ms = ms(t.elapsed());
+    let mut wrong = 0u64;
+    for i in (0..n).step_by(97) {
+        let id = synthetic(i).0;
+        match churned(i) {
+            None => wrong += s.has(&id) as u64,
+            Some(b) => wrong += (s.read(&id).ok() != Some(b)) as u64,
+        }
+    }
+    println!(
+        "{{\"phase\":\"churn\",\"backend\":\"{name}\",\"n\":{n},\"churn_s\":{churn_s:.1},\"compact_s\":{compact_s:.1},\"kept\":{},\"dropped\":{},\"packs_before\":{},\"packs_after\":{},\"bytes_before\":{before},\"bytes_after\":{after},\"open_ms\":{open_ms:.1},\"sampled_wrong\":{wrong}}}",
+        c.kept, c.dropped, c.packs_before, c.packs_after
+    );
+}
+
 fn main() {
     let a: Vec<String> = std::env::args().skip(1).collect();
     let p = |i: usize| PathBuf::from(&a[i]);
@@ -720,6 +788,7 @@ fn main() {
         Some("build") => build(&a[1], &p(2), a[3].parse().unwrap()),
         Some("probe") => probe(&a[1], &p(2), a[3].parse().unwrap()),
         Some("crash") => crash(&p(1), &a[2], a[3].parse().unwrap()),
+        Some("churn") => churn(&a[1], &p(2), a[3].parse().unwrap()),
         Some("crash-big") => crash_big(&p(1), &a[2], a[3].parse().unwrap(), a[4].parse().unwrap()),
         Some("crash-child") => crash_child(&a[1], &p(2)),
         _ => eprintln!("see the module docs for phases"),
