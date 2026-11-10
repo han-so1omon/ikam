@@ -12,6 +12,8 @@
 # Steps: preflight build flush crash apfs goal clone summary
 # Named only (not in the default run): fullfsync night (E170 to E173),
 #   bash mac-bakeoff.sh preflight build fullfsync night summary
+# and night2 (E174 to E178; needs BRANCH=exp/178-repo-cost or later),
+#   BRANCH=exp/178-repo-cost bash mac-bakeoff.sh preflight build night2 summary
 # Results: $ROOT/results/*.jsonl and $ROOT/results/summary.txt.
 set -euo pipefail
 
@@ -178,6 +180,44 @@ if named night; then
   done
 fi
 
+# night2 (E174 to E178): store-level kills over a big store, filters and
+#    the pack cleaner, writers sharing one flush (where F_FULLFSYNC makes
+#    each flush cost most), and a Repo commit against store size.
+NIGHT2_OBJECTS=${NIGHT2_OBJECTS:-1000000}
+NIGHT2_KILLS=${NIGHT2_KILLS:-20}
+if named night2; then
+  : > "$OUT/night2.jsonl"
+  for b in packs-fast packs; do
+    log "night2: crash-store, $b, $NIGHT2_OBJECTS objects, $NIGHT2_KILLS kills"
+    "$X/examples/stores" crash-store "$W/crash2" "$b" "$NIGHT2_KILLS" "$NIGHT2_OBJECTS" >> "$OUT/night2.jsonl"
+    rm -rf "$W/crash2"
+  done
+  for b in packs-filter packs-fast-filter; do
+    d=$W/night2-$b
+    log "night2: $b, $NIGHT2_OBJECTS objects"
+    "$X/examples/stores" build "$b" "$d" "$NIGHT2_OBJECTS" >> "$OUT/night2.jsonl"
+    for r in 1 2 3; do "$X/examples/stores" probe "$b" "$d" "$NIGHT2_OBJECTS" >> "$OUT/night2.jsonl"; done
+    log "night2: churn and clean, $b"
+    "$X/examples/stores" churn "$b" "$d" "$NIGHT2_OBJECTS" >> "$OUT/night2.jsonl"
+    rm -rf "$d"
+  done
+  for t in 1 4 16; do
+    for m in alone group; do
+      log "night2: writers, $t threads, $m"
+      "$X/examples/stores" writers "$W/writers" "$t" 1000 "$m" >> "$OUT/night2.jsonl"
+    done
+  done
+  rm -rf "$W/writers"
+  log "night2: crash-group, 8 writers, $NIGHT2_KILLS kills"
+  "$X/examples/stores" crash-group "$W/cg" "$NIGHT2_KILLS" 8 >> "$OUT/night2.jsonl"
+  rm -rf "$W/cg"
+  for n in 10000 100000; do
+    log "night2: repo-cost, $n contents"
+    "$X/examples/stores" repo-cost "$W/rc" packs-fast "$n" >> "$OUT/night2.jsonl"
+  done
+  rm -rf "$W/rc"
+fi
+
 if want summary; then
   python3 - "$OUT" <<'EOF' | tee "$OUT/summary.txt"
 import json, sys, statistics, collections, os
@@ -212,6 +252,8 @@ print("\nclone:")
 for r in rows("clone.jsonl"): print(" ", r)
 print("\nnight (E170 to E173):")
 for r in rows("night.jsonl"): print(" ", r)
+print("\nnight2 (E174 to E178):")
+for r in rows("night2.jsonl"): print(" ", r)
 EOF
   log "done; results in $OUT"
 fi
