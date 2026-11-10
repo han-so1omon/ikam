@@ -2479,3 +2479,23 @@ Newest last. Format and rules: `README.md`.
 - Result (24 texts each): paragraph inserted 24/24, paragraph deleted 24/24, heading and paragraph inserted 24/24, two-item list inserted 24/24, heading deleted 24/24, one-word edit 24/24, and (synthetic, as no text has the case) a paragraph between two lists deleted so the lists join 24/24. The whole .docx byte-identical to a full re-render in all 168. Median ms, splice against full render: deletes 2.8 against 77; inserts 45 to 49 against 69 to 77; a list insert 95 against 78 (it renders its neighbour too).
 - Verdict: **kept** as a script. Not covered: tables, footnotes, images, and edits to the title block.
 - Gates on exp/162-fragment-options (E162 to E169): 180 kernel tests pass; clippy `-D warnings` and `cargo fmt --check` clean on all targets; the fixed bench matches exp/153 and main (badc682) in every byte count, read cost and the north score (0.3035).
+
+### E180 formula-ir (a table IR with values, number formats and formulas)
+- Branch / parent: exp/162-fragment-options / E169 (numbered from 180 because the storage thread holds E170 to E179)
+- Question: E161's TableIR is lifted from the csv, so a formula's result is only text. Can an IR lifted from the workbook (the Python version's StructuredDataIR with ExpressionIR) render every committed format exactly and carry an input edit to every cell computed from it?
+- Change: none in the kernel. `scripts/formula_ir.py`: the first sheet of each of the 24 workbooks as cells (value or formula, and number format). A formula is an OpShape (its AST with references relative to its cell) and an OpInstance (its cell). The renderer evaluates formulas (+ - * /, comparisons, IF, AND, SUM; a cycle shows as LibreOffice's Err:522), shows each value by its format (General, `$#,##0`, `0%`, `0.0%`; a General formula cell takes the format of the first cell it reads, as LibreOffice does), and writes csv with LibreOffice's quoting, then json and md (E161's renderers). Per formula, the first numeric input it reads is doubled (or set to 7 when 0); the truth is the workbook edited with openpyxl and recalculated and exported by LibreOffice, as `fixtures/tables/render.py` does.
+- Result:
+  - The unedited IR renders csv, json and md byte-exact for 24 of 24 workbooks.
+  - 25 formulas in 9 workbooks are 12 shapes (`B2*12` in C2 and `B3*12` in C3 are one).
+  - Input edits: 22 (3 formulas read no plain number: a SUM over formulas and two cyclic totals). csv, json and md exact 22 of 22; each edit changes 2.5 cells on average (the input and what is computed from it). The IR recomputes and renders in 0.12 ms against 872 ms for LibreOffice.
+- Verdict: **measured**. Values, formats and formula shapes are enough to carry an input edit to every format exactly for this corpus; a formula evaluator and format renderer is the price, and the corpus exercises few functions.
+
+### E181 fanout-endpoints (one paragraph edit to 64 files and their renders)
+- Branch / parent: exp/162-fragment-options / E180
+- Question: one paragraph shared by 64 md files is edited once. What does it cost to carry it to the 64 md files and their 64 html and 64 docx renders (192 endpoints), against re-rendering?
+- Change: none in the kernel. `scripts/fanout_prep.py`: the 24 multiformat texts cycled to 64 copies, each with the same notice paragraph before its middle block (as E160), so 24 of the 64 are distinct. The notice is revised. Renders made by full pandoc runs, or by rendering the notice once and splicing it into each file (html as in E158, docx with E169's renderer). `examples/fanout_endpoints.rs` stores the 192 old files in one commit and the 192 new ones: every file with `put_content`, or the md files as render-runs (E157) with the edit as one `propagate`.
+- Result:
+  - Renders: 64 of 64 html and 64 of 64 docx spliced files byte-identical to full re-renders. Splicing all 128 takes 194 ms with 3 pandoc runs, against 8,477 ms and 128 runs to re-render (about 3.2 s if only the 24 distinct files were re-rendered).
+  - Kernel (median of 3): all files as plain puts add 47,388 bytes in 158 ms; md as render-runs add 25,249 bytes in 222 ms (md 6,235, html 7,046, docx 11,968). At rest 228,047 and 230,669 bytes. Every file reads back exact; fsck clean.
+- Verdict: **measured**. For an edit that reaches many files and their renders, rendering the changed block once and splicing it is about 44 times faster than re-rendering and exact; render-runs for the md halve the bytes the kernel writes. Duplicate copies in this corpus flatter the bytes; the render times are per file.
+- Gates (E180, E181): scripts and examples only; clippy `-D warnings` and fmt clean; the kernel is as at E169's gates.
