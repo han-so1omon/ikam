@@ -253,6 +253,197 @@ impl FragSearch {
     }
 }
 
+/// E168: a smaller fragment index. Postings name fragments by position (the
+/// fragment list is stored once, 32 bytes an id), seams are not stored at
+/// all (each file's fragment list gives them), and a seam is indexed only
+/// by the two trigrams that cross its boundary: a pattern of 3 bytes or
+/// more that crosses the boundary holds one of them. A candidate seam is
+/// checked on the last and first `len - 1` bytes of its two fragments.
+struct Compact {
+    ids: Vec<Id>,
+    pos: HashMap<Id, u32>,
+    seams: Vec<(u32, u32)>,
+    seam_pos: HashSet<(u32, u32)>,
+    tri: HashMap<[u8; 3], Vec<u32>>,
+    cross: HashMap<[u8; 3], Vec<u32>>,
+}
+
+impl Compact {
+    fn new() -> Self {
+        Compact {
+            ids: vec![],
+            pos: HashMap::new(),
+            seams: vec![],
+            seam_pos: HashSet::new(),
+            tri: HashMap::new(),
+            cross: HashMap::new(),
+        }
+    }
+
+    /// Add whatever of `units` is new, reading fragments from `frag`.
+    fn add(&mut self, frag: &HashMap<Id, Vec<u8>>, units: &BTreeMap<String, Vec<Id>>) {
+        for fs in units.values() {
+            for f in fs {
+                if !self.pos.contains_key(f) {
+                    let n = self.ids.len() as u32;
+                    self.ids.push(*f);
+                    self.pos.insert(*f, n);
+                    for t in trigrams(&frag[f]) {
+                        self.tri.entry(t).or_default().push(n);
+                    }
+                }
+            }
+            for w in fs.windows(2) {
+                let k = (self.pos[&w[0]], self.pos[&w[1]]);
+                if self.seam_pos.insert(k) {
+                    let n = self.seams.len() as u32;
+                    self.seams.push(k);
+                    let (a, b) = (&frag[&w[0]], &frag[&w[1]]);
+                    let mut s = a[a.len().saturating_sub(2)..].to_vec();
+                    s.extend_from_slice(&b[..b.len().min(2)]);
+                    let cut = a.len().min(2);
+                    let mut mine = HashSet::new();
+                    for (i, t) in s.windows(3).enumerate() {
+                        // Only trigrams with bytes on both sides.
+                        if i < cut && i + 3 > cut {
+                            mine.insert([t[0], t[1], t[2]]);
+                        }
+                    }
+                    for t in mine {
+                        self.cross.entry(t).or_default().push(n);
+                    }
+                }
+            }
+        }
+    }
+
+    fn search(
+        &self,
+        frag: &HashMap<Id, Vec<u8>>,
+        pat: &[u8],
+        units: &BTreeMap<String, Vec<Id>>,
+    ) -> (Vec<String>, usize) {
+        assert!(pat.len() >= 3);
+        let has = |b: &[u8]| b.windows(pat.len()).any(|w| w == pat);
+        let mut scanned = 0;
+        let pt = trigrams(pat);
+        let mut cand: Option<HashSet<u32>> = None;
+        for t in &pt {
+            let s: HashSet<u32> = self
+                .tri
+                .get(t)
+                .map(|v| v.iter().copied().collect())
+                .unwrap_or_default();
+            cand = Some(match cand {
+                None => s,
+                Some(c) => c.intersection(&s).copied().collect(),
+            });
+        }
+        let mut hit_f: HashSet<u32> = HashSet::new();
+        for n in cand.unwrap_or_default() {
+            let b = &frag[&self.ids[n as usize]];
+            scanned += b.len();
+            if has(b) {
+                hit_f.insert(n);
+            }
+        }
+        // Seams: candidates by their crossing trigrams, then each file
+        // that holds a candidate seam is checked around that boundary,
+        // walking into neighbouring fragments as far as the pattern
+        // reaches (a pattern may span a short fragment whole).
+        let mut cand_s: HashSet<(u32, u32)> = HashSet::new();
+        for t in &pt {
+            for &n in self.cross.get(t).into_iter().flatten() {
+                cand_s.insert(self.seams[n as usize]);
+            }
+        }
+        let k = pat.len() - 1;
+        let mut checked: HashMap<(Vec<u32>, usize), bool> = HashMap::new();
+        let out = units
+            .iter()
+            .filter(|(_, fs)| {
+                let ps: Vec<u32> = fs.iter().map(|f| self.pos[f]).collect();
+                if ps.iter().any(|n| hit_f.contains(n)) {
+                    return true;
+                }
+                (1..ps.len()).any(|j| {
+                    if !cand_s.contains(&(ps[j - 1], ps[j])) {
+                        return false;
+                    }
+                    // Fragments before the boundary until k bytes, and after.
+                    let (mut a, mut need) = (j, k);
+                    while a > 0 && need > 0 {
+                        a -= 1;
+                        need = need.saturating_sub(frag[&self.ids[ps[a] as usize]].len());
+                    }
+                    let (mut z, mut need) = (j, k);
+                    while z < ps.len() && need > 0 {
+                        need = need.saturating_sub(frag[&self.ids[ps[z] as usize]].len());
+                        z += 1;
+                    }
+                    let key = (ps[a..z].to_vec(), j - a);
+                    *checked.entry(key).or_insert_with(|| {
+                        let mut w: Vec<u8> = Vec::new();
+                        for n in &ps[a..z] {
+                            w.extend_from_slice(&frag[&self.ids[*n as usize]]);
+                        }
+                        let before: usize = ps[a..j]
+                            .iter()
+                            .map(|n| frag[&self.ids[*n as usize]].len())
+                            .sum();
+                        let lo = before.saturating_sub(k);
+                        let hi = (before + k).min(w.len());
+                        scanned += hi - lo;
+                        has(&w[lo..hi])
+                    })
+                })
+            })
+            .map(|e| e.0.clone())
+            .collect();
+        (out, scanned)
+    }
+
+    /// Encoded size: the fragment ids, then per trigram 3 bytes, a count
+    /// and delta varints (or, with `bitmap`, a bitmap when that is
+    /// smaller, plus one byte to say which), for both posting maps.
+    fn bytes(&self, bitmap: bool) -> (usize, usize, usize) {
+        let varint = |mut v: u32| {
+            let mut n = 1;
+            while v >= 128 {
+                v >>= 7;
+                n += 1;
+            }
+            n
+        };
+        let enc = |m: &HashMap<[u8; 3], Vec<u32>>, universe: usize| -> usize {
+            m.values()
+                .map(|v| {
+                    let mut prev = 0;
+                    let deltas: usize = v
+                        .iter()
+                        .map(|&x| {
+                            let d = x - prev;
+                            prev = x;
+                            varint(d)
+                        })
+                        .sum();
+                    let list = varint(v.len() as u32) + deltas;
+                    3 + if bitmap {
+                        1 + list.min(universe.div_ceil(8))
+                    } else {
+                        list
+                    }
+                })
+                .sum()
+        };
+        (
+            self.ids.len() * 32,
+            enc(&self.tri, self.ids.len()),
+            enc(&self.cross, self.seams.len()),
+        )
+    }
+}
+
 struct Store {
     repo: Repo<MemStore>,
     tree: Id,
@@ -432,6 +623,56 @@ fn main() {
         );
     }
 
+    let mut cx = Compact::new();
+    let t = Instant::now();
+    cx.add(&fsr.frag, &u);
+    let cbuild = ms(t);
+    let t = Instant::now();
+    let mut scanned = 0;
+    for (p, tr) in pats.iter().zip(&truths) {
+        let (hit, n) = cx.search(&fsr.frag, p, &u);
+        scanned += n;
+        assert_eq!(&hit, tr, "{}", String::from_utf8_lossy(p));
+    }
+    let (idb, fl, sl) = cx.bytes(false);
+    let (_, flb, slb) = cx.bytes(true);
+    line(
+        "search frag-tri-compact",
+        format!(
+            "\"build_ms\":{cbuild:.2},\"id_bytes\":{idb},\"fragment_postings\":{fl},\"seam_postings\":{sl},\"index_bytes\":{},\"index_bytes_bitmaps\":{},\"ms_per_query\":{:.3},\"scanned_per_query\":{}",
+            idb + fl + sl,
+            idb + flb + slb,
+            ms(t) / pats.len() as f64,
+            scanned / pats.len()
+        ),
+    );
+    // Longer patterns than the seam context E160 allowed (up to 200 bytes,
+    // drawn from the corpus), checked against a scan.
+    let long: Vec<Vec<u8>> = files
+        .iter()
+        .filter(|f| f.1.len() > 400)
+        .step_by(7)
+        .take(20)
+        .map(|f| {
+            let m = f.1.len() / 2;
+            f.1[m - 100..m + 100].to_vec()
+        })
+        .collect();
+    let t = Instant::now();
+    for p in &long {
+        let tr = truth(&s.repo, &s.ix, p);
+        let got = cx.search(&fsr.frag, p, &u).0;
+        assert_eq!(got, tr);
+    }
+    line(
+        "search frag-tri-compact long",
+        format!(
+            "\"patterns\":{},\"pattern_bytes\":200,\"ms_per_query_with_truth\":{:.3}",
+            long.len(),
+            ms(t) / long.len() as f64
+        ),
+    );
+
     // Insights: per-fragment word counts.
     let t = Instant::now();
     let mut per_frag: HashMap<Id, HashMap<Vec<u8>, u32>> = HashMap::new();
@@ -573,6 +814,16 @@ fn main() {
             word_counts(&s.repo.read_content(&id).unwrap())
         );
     }
+    let t = Instant::now();
+    cx.add(&fsr.frag, &u2);
+    let cupd = ms(t);
+    for (p, tr) in pats2.iter().zip(&truths2) {
+        assert_eq!(&cx.search(&fsr.frag, p, &u2).0, tr);
+    }
+    line(
+        "after edit compact updated",
+        format!("\"update_ms\":{cupd:.3}"),
+    );
     line(
         "after edit fragments updated",
         format!(
