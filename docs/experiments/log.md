@@ -2415,3 +2415,6 @@ Newest last. Format and rules: `README.md`.
 - Verdict: **kept** as a fix, on its branch until Eric says to merge. It changes no stored format; an open after a crash may now write one checkpoint.
 
 ### Gates for E174 to E179 (Nov 10)
+- On exp/179-ckpt-after-crash (E174 to E179 stacked on exp/173): 181 kernel tests pass, 187 with the store features; clippy `-D warnings` clean with and without them; the fixed bench matches main (badc682) in every byte count and the north score (0.3035), with only timing fields different. `cargo fmt` was run on the changed files (backends.rs was already off-format on exp/173).
+- Branches: exp/174-kill-10m (crash-big phase), exp/175-pack-filters, exp/176-pack-compact (also the crash-store phase), exp/177-group-commit, exp/178-repo-cost (and the Mac `night2` step), exp/179-ckpt-after-crash (the fix, these docs). Each builds on the one before; nothing merged.
+- `packages/kernel/scripts/mac-bakeoff.sh` gains `night2`, outside the default run, with `BRANCH=exp/178-repo-cost` or later: store-level kills at 1M, filters and the cleaner at 1M, writers alone and grouped at 1, 4 and 16 threads, group kills, and Repo commit cost at 10k and 100k.
