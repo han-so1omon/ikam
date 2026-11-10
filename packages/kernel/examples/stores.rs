@@ -40,6 +40,8 @@ const BACKENDS: &[&str] = &[
     "fjall-kvsep",
     "rocksdb",
     "rocksdb-blob",
+    "hybrid-refs",
+    "hybrid-index",
 ];
 
 /// Any backend behind one type, so a `Repo` can run over each.
@@ -91,6 +93,8 @@ fn open(name: &str, dir: &Path) -> Dyn {
         "fjall-kvsep" => Box::new(fjall_store::open(dir, true).unwrap()),
         "rocksdb" => Box::new(rocks::open(dir, false).unwrap()),
         "rocksdb-blob" => Box::new(rocks::open(dir, true).unwrap()),
+        "hybrid-refs" => Box::new(hybrid::RefsHybrid::open(dir).unwrap()),
+        "hybrid-index" => Box::new(hybrid::IndexHybrid::open(dir).unwrap()),
         _ => panic!("unknown backend {name}"),
     };
     Dyn(s)

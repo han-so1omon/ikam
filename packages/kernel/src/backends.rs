@@ -1396,6 +1396,377 @@ impl Store for PackStore {
     }
 }
 
+// ---------------------------------------------------------------------------
+// E170: packs for content, RocksDB for refs (and optionally the index).
+
+#[cfg(feature = "store-rocksdb")]
+pub mod hybrid {
+    //! Two hybrids of [`PackStore`](super::PackStore) and RocksDB (E170).
+    //!
+    //! - [`RefsHybrid`]: objects in packs with their own index, as in
+    //!   `PackStore`; refs in RocksDB. A commit is the pack's `sync_data`, then
+    //!   one synced RocksDB write of the ref, in place of a ref file written,
+    //!   synced and renamed.
+    //! - [`IndexHybrid`]: objects in append-only pack files with no index of
+    //!   their own; where each object lives, and the refs, in RocksDB. A
+    //!   commit is the pack's `sync_data`, then one synced RocksDB batch that
+    //!   holds the new objects' locations and the ref. Open reads no pack
+    //!   index or checkpoint: RocksDB's open is the whole cost.
+    //!
+    //! Both keep the store contract: bytes reach disk before the ref (or
+    //! location) that names them, and every read checks the record's CRC.
+    use super::rocks::Rocks;
+    use super::*;
+
+    /// Packs for objects, RocksDB for refs.
+    pub struct RefsHybrid {
+        packs: PackStore,
+        refs: Rocks,
+    }
+
+    impl RefsHybrid {
+        pub fn open(root: impl AsRef<Path>) -> Result<RefsHybrid, Error> {
+            let root = root.as_ref();
+            Ok(RefsHybrid {
+                packs: PackStore::open(root.join("packs-store"))?,
+                refs: Rocks::open(root.join("refs-db"), false)?,
+            })
+        }
+    }
+
+    impl Store for RefsHybrid {
+        fn write(&mut self, id: Id, encoded: &[u8]) -> Result<bool, Error> {
+            self.packs.write(id, encoded)
+        }
+        fn replace(&mut self, id: Id, encoded: &[u8]) -> Result<(), Error> {
+            self.packs.replace(id, encoded)
+        }
+        fn read(&self, id: &Id) -> Result<Vec<u8>, Error> {
+            self.packs.read(id)
+        }
+        fn read_head(&self, id: &Id, n: usize) -> Result<Vec<u8>, Error> {
+            self.packs.read_head(id, n)
+        }
+        fn stored_len(&self, id: &Id) -> Result<usize, Error> {
+            self.packs.stored_len(id)
+        }
+        fn has(&self, id: &Id) -> bool {
+            self.packs.has(id)
+        }
+        fn ids(&self) -> Result<Vec<Id>, Error> {
+            self.packs.ids()
+        }
+        fn ids_with_prefix(&self, prefix: &[u8]) -> Result<Vec<Id>, Error> {
+            self.packs.ids_with_prefix(prefix)
+        }
+        fn delete(&mut self, id: &Id) -> Result<(), Error> {
+            self.packs.delete(id)
+        }
+        fn get_ref(&self, name: &str) -> Result<Option<Id>, Error> {
+            check_ref_name(name)?;
+            Ok(self
+                .refs
+                .get(Table::Refs, name.as_bytes())?
+                .and_then(|v| parse_id(&v)))
+        }
+        fn set_ref(&mut self, name: &str, expected: Option<Id>, new: Id) -> Result<(), Error> {
+            check_ref_name(name)?;
+            if self.get_ref(name)? != expected {
+                return Err(Error::RefConflict(name.into()));
+            }
+            self.packs.sync()?; // objects first, then the ref that reaches them
+            let e = expected.map(|e| *e.as_bytes());
+            self.refs.apply(
+                &[KvOp {
+                    table: Table::Refs,
+                    key: name.as_bytes(),
+                    value: Some(new.as_bytes()),
+                }],
+                Some((name, e.as_ref().map(|e| &e[..]))),
+            )
+        }
+        fn refs(&self) -> Result<Vec<(String, Id)>, Error> {
+            let mut out = Vec::new();
+            for (k, v) in self.refs.entries(Table::Refs)? {
+                if let (Ok(name), Some(id)) = (String::from_utf8(k), parse_id(&v)) {
+                    out.push((name, id));
+                }
+            }
+            Ok(out)
+        }
+    }
+
+    /// Where an object's record starts: pack number, offset, body length.
+    #[derive(Clone, Copy)]
+    struct Loc {
+        pack: u32,
+        off: u64,
+        len: u32,
+    }
+
+    impl Loc {
+        fn bytes(&self) -> [u8; 16] {
+            let mut b = [0u8; 16];
+            b[..4].copy_from_slice(&self.pack.to_le_bytes());
+            b[4..12].copy_from_slice(&self.off.to_le_bytes());
+            b[12..].copy_from_slice(&self.len.to_le_bytes());
+            b
+        }
+        fn parse(b: &[u8]) -> Option<Loc> {
+            (b.len() == 16).then(|| Loc {
+                pack: u32::from_le_bytes(b[..4].try_into().unwrap()),
+                off: u64::from_le_bytes(b[4..12].try_into().unwrap()),
+                len: u32::from_le_bytes(b[12..].try_into().unwrap()),
+            })
+        }
+    }
+
+    /// Append-only pack files for objects; every location and every ref in
+    /// RocksDB. Records are `PackStore`'s (`id | len | bytes | crc32`).
+    pub struct IndexHybrid {
+        root: PathBuf,
+        db: Rocks,
+        packs: Vec<File>, // by number; the last is open for appends
+        buf: Vec<u8>,
+        flushed: u64,
+        /// Written since the last commit: readable now, durable with the next.
+        pending: BTreeMap<Id, Option<Loc>>,
+    }
+
+    impl IndexHybrid {
+        pub fn open(root: impl Into<PathBuf>) -> Result<IndexHybrid, Error> {
+            let root = root.into();
+            fs::create_dir_all(root.join("packs"))?;
+            let db = Rocks::open(root.join("index-db"), false)?;
+            let mut nos: Vec<u32> = fs::read_dir(root.join("packs"))?
+                .filter_map(|e| {
+                    e.ok()?
+                        .file_name()
+                        .to_str()?
+                        .strip_suffix(".pack")?
+                        .parse()
+                        .ok()
+                })
+                .collect();
+            nos.sort();
+            if nos.is_empty() {
+                nos.push(0);
+            }
+            let mut packs = Vec::new();
+            for n in 0..=*nos.last().unwrap() {
+                packs.push(
+                    OpenOptions::new()
+                        .create(true)
+                        .truncate(false)
+                        .read(true)
+                        .write(true)
+                        .open(root.join(format!("packs/{n:08}.pack")))?,
+                );
+            }
+            // A torn tail is past every location RocksDB holds, so it is
+            // unreachable; new records simply follow it.
+            let flushed = packs.last().unwrap().metadata()?.len();
+            Ok(IndexHybrid {
+                root,
+                db,
+                packs,
+                buf: Vec::new(),
+                flushed,
+                pending: BTreeMap::new(),
+            })
+        }
+
+        fn active(&self) -> u32 {
+            self.packs.len() as u32 - 1
+        }
+
+        fn append(&mut self, id: Id, bytes: &[u8]) -> Result<(), Error> {
+            let len = bytes.len() as u32;
+            let off = self.flushed + self.buf.len() as u64;
+            self.buf.extend_from_slice(id.as_bytes());
+            self.buf.extend_from_slice(&len.to_le_bytes());
+            self.buf.extend_from_slice(bytes);
+            self.buf.extend_from_slice(&crc(&id, len, bytes).to_le_bytes());
+            let pack = self.active();
+            self.pending.insert(id, Some(Loc { pack, off, len }));
+            if self.buf.len() >= 1 << 20 {
+                self.flush()?;
+            }
+            Ok(())
+        }
+
+        fn flush(&mut self) -> Result<(), Error> {
+            if !self.buf.is_empty() {
+                let f = self.packs.last().unwrap();
+                f.write_all_at(&self.buf, self.flushed)?;
+                self.flushed += self.buf.len() as u64;
+                self.buf.clear();
+            }
+            Ok(())
+        }
+
+        /// Pack bytes durable, then one synced batch: locations and the ref.
+        fn commit(&mut self, guard: Option<(&str, Option<Id>, Id)>) -> Result<(), Error> {
+            if self.pending.is_empty() && guard.is_none() {
+                return Ok(());
+            }
+            self.flush()?;
+            if !self.pending.is_empty() {
+                self.packs.last().unwrap().sync_data()?;
+            }
+            let locs: Vec<(Id, Option<[u8; 16]>)> = self
+                .pending
+                .iter()
+                .map(|(id, l)| (*id, l.map(|l| l.bytes())))
+                .collect();
+            let mut ops: Vec<KvOp> = locs
+                .iter()
+                .map(|(id, l)| KvOp {
+                    table: Table::Objects,
+                    key: id.as_bytes(),
+                    value: l.as_ref().map(|b| &b[..]),
+                })
+                .collect();
+            let expected = guard.and_then(|(_, e, _)| e).map(|e| *e.as_bytes());
+            let new = guard.map(|(_, _, n)| *n.as_bytes());
+            if let (Some((name, _, _)), Some(new)) = (guard, new.as_ref()) {
+                ops.push(KvOp {
+                    table: Table::Refs,
+                    key: name.as_bytes(),
+                    value: Some(new),
+                });
+            }
+            let g = guard.map(|(name, _, _)| (name, expected.as_ref().map(|e| &e[..])));
+            self.db.apply(&ops, g)?;
+            self.pending.clear();
+            if self.flushed >= PACK_SEAL_BYTES {
+                let n = self.active() + 1;
+                self.packs.push(
+                    OpenOptions::new()
+                        .create(true)
+                        .truncate(false)
+                        .read(true)
+                        .write(true)
+                        .open(self.root.join(format!("packs/{n:08}.pack")))?,
+                );
+                self.flushed = 0;
+            }
+            Ok(())
+        }
+
+        fn locate(&self, id: &Id) -> Result<Option<Loc>, Error> {
+            if let Some(l) = self.pending.get(id) {
+                return Ok(*l);
+            }
+            Ok(self
+                .db
+                .get(Table::Objects, id.as_bytes())?
+                .and_then(|b| Loc::parse(&b)))
+        }
+
+        pub fn sync(&mut self) -> Result<(), Error> {
+            self.commit(None)
+        }
+    }
+
+    impl Drop for IndexHybrid {
+        fn drop(&mut self) {
+            let _ = self.commit(None);
+        }
+    }
+
+    impl Store for IndexHybrid {
+        fn write(&mut self, id: Id, encoded: &[u8]) -> Result<bool, Error> {
+            if self.has(&id) {
+                return Ok(false);
+            }
+            self.append(id, encoded)?;
+            Ok(true)
+        }
+        fn replace(&mut self, id: Id, encoded: &[u8]) -> Result<(), Error> {
+            self.append(id, encoded)
+        }
+        fn read(&self, id: &Id) -> Result<Vec<u8>, Error> {
+            let Some(l) = self.locate(id)? else {
+                return Err(Error::NotFound(*id));
+            };
+            let at = l.off + RECORD_HEAD;
+            if l.pack == self.active() && at >= self.flushed {
+                let s = (at - self.flushed) as usize;
+                return Ok(self.buf[s..s + l.len as usize].to_vec());
+            }
+            let mut rec = vec![0u8; RECORD_HEAD as usize + l.len as usize + 4];
+            self.packs[l.pack as usize].read_exact_at(&mut rec, l.off)?;
+            let (head, rest) = rec.split_at(RECORD_HEAD as usize);
+            let (body, c) = rest.split_at(l.len as usize);
+            if &head[..32] != id.as_bytes()
+                || u32::from_le_bytes(c.try_into().unwrap()) != crc(id, l.len, body)
+            {
+                return Err(Error::Corrupt(*id));
+            }
+            Ok(body.to_vec())
+        }
+        fn stored_len(&self, id: &Id) -> Result<usize, Error> {
+            match self.locate(id)? {
+                Some(l) => Ok(l.len as usize),
+                None => Err(Error::NotFound(*id)),
+            }
+        }
+        fn has(&self, id: &Id) -> bool {
+            matches!(self.locate(id), Ok(Some(_)))
+        }
+        fn ids(&self) -> Result<Vec<Id>, Error> {
+            self.ids_with_prefix(&[])
+        }
+        fn ids_with_prefix(&self, prefix: &[u8]) -> Result<Vec<Id>, Error> {
+            let mut live: BTreeMap<Id, bool> = BTreeMap::new();
+            for k in self.db.keys(Table::Objects, prefix)? {
+                if let Some(id) = parse_id(&k) {
+                    live.insert(id, true);
+                }
+            }
+            for (id, l) in &self.pending {
+                if id.as_bytes().starts_with(prefix) {
+                    live.insert(*id, l.is_some());
+                }
+            }
+            Ok(live.into_iter().filter(|(_, l)| *l).map(|(id, _)| id).collect())
+        }
+        fn delete(&mut self, id: &Id) -> Result<(), Error> {
+            if !self.has(id) {
+                return Err(Error::NotFound(*id));
+            }
+            // The record stays in its pack until a cleaner runs; the
+            // location goes with the next commit.
+            self.pending.insert(*id, None);
+            Ok(())
+        }
+        fn get_ref(&self, name: &str) -> Result<Option<Id>, Error> {
+            check_ref_name(name)?;
+            Ok(self
+                .db
+                .get(Table::Refs, name.as_bytes())?
+                .and_then(|v| parse_id(&v)))
+        }
+        fn set_ref(&mut self, name: &str, expected: Option<Id>, new: Id) -> Result<(), Error> {
+            check_ref_name(name)?;
+            if self.get_ref(name)? != expected {
+                return Err(Error::RefConflict(name.into()));
+            }
+            self.commit(Some((name, expected, new)))
+        }
+        fn refs(&self) -> Result<Vec<(String, Id)>, Error> {
+            let mut out = Vec::new();
+            for (k, v) in self.db.entries(Table::Refs)? {
+                if let (Ok(name), Some(id)) = (String::from_utf8(k), parse_id(&v)) {
+                    out.push((name, id));
+                }
+            }
+            Ok(out)
+        }
+    }
+}
+
 #[cfg(test)]
 mod pack_index_tests {
     use super::*;
