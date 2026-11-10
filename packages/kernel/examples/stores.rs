@@ -32,6 +32,7 @@ use ikam_kernel::{Error, Event, FsStore, Id, Repo, Store};
 const BACKENDS: &[&str] = &[
     "files",
     "packs",
+    "packs-lazy",
     "sqlite",
     "sqlite-normal",
     "lmdb",
@@ -85,6 +86,16 @@ fn open(name: &str, dir: &Path) -> Dyn {
     let s: Box<dyn Store> = match name {
         "files" => Box::new(FsStore::open(dir).unwrap()),
         "packs" => Box::new(ikam_kernel::backends::PackStore::open(dir).unwrap()),
+        "packs-lazy" => Box::new(
+            PackStore::open_with(
+                dir,
+                PackOptions {
+                    lazy_checkpoint: true,
+                    ..PackOptions::default()
+                },
+            )
+            .unwrap(),
+        ),
         "sqlite" => Box::new(sqlite::open(dir, sqlite::Sync::Full).unwrap()),
         "sqlite-normal" => Box::new(sqlite::open(dir, sqlite::Sync::Normal).unwrap()),
         "lmdb" => Box::new(lmdb::open(dir).unwrap()),

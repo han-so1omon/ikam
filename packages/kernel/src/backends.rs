@@ -908,8 +908,22 @@ impl Sealed {
 /// cut off. New records reach disk with one `sync_data` when a ref moves, before
 /// the ref file is renamed into place, so a ref never points past durable data.
 /// One process writes at a time (a lock file is held while open).
+/// Settings for [`PackStore`]; every one is off by default.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct PackOptions {
+    /// E171: open the open pack's checkpoint as a sorted on-disk index, read
+    /// on lookup, instead of loading every entry into memory (and hashing the
+    /// file) at open. Checkpoints are then fsynced, like a sealed pack's index.
+    /// No format change: the same checkpoint file, read differently.
+    pub lazy_checkpoint: bool,
+}
+
 pub struct PackStore {
     root: PathBuf,
+    opts: PackOptions,
+    /// E171: the open pack's checkpoint, searched on disk; `active_index`
+    /// then holds only the records after it.
+    base: Option<Sealed>,
     sealed: Vec<Sealed>, // oldest first; lookups go newest first
     active: File,
     active_no: u32,
@@ -930,6 +944,10 @@ fn crc(id: &Id, len: u32, bytes: &[u8]) -> u32 {
 
 impl PackStore {
     pub fn open(root: impl Into<PathBuf>) -> Result<PackStore, Error> {
+        PackStore::open_with(root, PackOptions::default())
+    }
+
+    pub fn open_with(root: impl Into<PathBuf>, opts: PackOptions) -> Result<PackStore, Error> {
         let root = root.into();
         fs::create_dir_all(root.join("packs"))?;
         fs::create_dir_all(root.join("refs"))?;
@@ -971,10 +989,24 @@ impl PackStore {
         };
         let path = root.join(format!("packs/{active_no:08}.pack"));
         let ckpt = root.join(format!("packs/{active_no:08}.ckpt"));
+        let mut base_ckpt = None;
         let (active_index, good) = if path.exists() {
             let len = fs::metadata(&path)?.len();
-            let (index, start) = read_ckpt(&ckpt, len).unwrap_or_default();
-            scan(&path, start, index)?
+            let lazy = if opts.lazy_checkpoint {
+                open_ckpt_lazy(&ckpt, len)
+            } else {
+                None
+            };
+            match lazy {
+                Some((idx, fanout, covers)) => {
+                    base_ckpt = Some((idx, fanout));
+                    scan(&path, covers, HashMap::new())?
+                }
+                None => {
+                    let (index, start) = read_ckpt(&ckpt, len).unwrap_or_default();
+                    scan(&path, start, index)?
+                }
+            }
         } else {
             (HashMap::new(), 0)
         };
@@ -984,12 +1016,22 @@ impl PackStore {
             .read(true)
             .write(true)
             .open(&path)?;
+        let base = match base_ckpt {
+            Some((idx, fanout)) => Some(Sealed {
+                pack: active.try_clone()?,
+                idx,
+                fanout,
+            }),
+            None => None,
+        };
         if active.metadata()?.len() != good {
             active.set_len(good)?; // cut a torn tail
             active.sync_all()?;
         }
         Ok(PackStore {
             root,
+            opts,
+            base,
             sealed,
             active,
             active_no,
@@ -1041,17 +1083,47 @@ impl PackStore {
     /// Save the open pack's index, so the next open scans only what follows.
     fn checkpoint(&mut self) -> Result<(), Error> {
         let path = self.root.join(format!("packs/{:08}.ckpt", self.active_no));
-        write_ckpt(&path, &self.active_index, self.flushed)?;
+        let full = self.full_active_index()?;
+        write_ckpt(&path, &full, self.flushed, self.opts.lazy_checkpoint)?;
         self.ckpt_at = self.flushed;
+        if self.opts.lazy_checkpoint
+            && let Some((idx, fanout, _)) = open_ckpt_lazy(&path, self.flushed)
+        {
+            self.base = Some(Sealed {
+                pack: self.active.try_clone()?,
+                idx,
+                fanout,
+            });
+            self.active_index.clear();
+        }
         Ok(())
+    }
+
+    /// The open pack's whole index: the lazily read checkpoint (E171), if
+    /// any, under the records that followed it.
+    fn full_active_index(&self) -> Result<PackIndex, Error> {
+        let Some(b) = &self.base else {
+            return Ok(self.active_index.clone());
+        };
+        let n = b.fanout[255] as usize;
+        let mut body = vec![0u8; n * IDX_ENTRY as usize];
+        b.idx.read_exact_at(&mut body, IDX_HEAD)?;
+        let mut full = HashMap::with_capacity(n + self.active_index.len());
+        for e in body.chunks_exact(IDX_ENTRY as usize) {
+            let id = Id::from_bytes(e[..32].try_into().unwrap());
+            let off = u64::from_le_bytes(e[32..40].try_into().unwrap());
+            let len = u32::from_le_bytes(e[40..44].try_into().unwrap());
+            full.insert(id, (off, len));
+        }
+        full.extend(self.active_index.iter().map(|(k, v)| (*k, *v)));
+        Ok(full)
     }
 
     fn seal(&mut self) -> Result<(), Error> {
         let n = self.active_no;
-        write_idx(
-            &self.root.join(format!("packs/{n:08}.idx")),
-            &self.active_index,
-        )?;
+        let full = self.full_active_index()?;
+        write_idx(&self.root.join(format!("packs/{n:08}.idx")), &full)?;
+        self.base = None;
         let _ = fs::remove_file(self.root.join(format!("packs/{n:08}.ckpt")));
         self.sealed.push(open_sealed(&self.root, n)?);
         self.active_no += 1;
@@ -1071,6 +1143,11 @@ impl PackStore {
     /// Where `id` lives: `(sealed pack or None for the open one, offset, len)`.
     fn locate(&self, id: &Id) -> Result<Option<(Option<usize>, u64, u32)>, Error> {
         if let Some(&(off, len)) = self.active_index.get(id) {
+            return Ok(Some((None, off, len)));
+        }
+        if let Some(b) = &self.base
+            && let Some((off, len)) = b.find(id)?
+        {
             return Ok(Some((None, off, len)));
         }
         for (i, s) in self.sealed.iter().enumerate().rev() {
@@ -1141,15 +1218,59 @@ fn scan(path: &Path, start: u64, mut index: PackIndex) -> Result<(PackIndex, u64
 /// records before `covers`, then `covers` (u64) and a BLAKE3 hash of all of
 /// it. Open loads it and scans only what came after; a missing, torn or
 /// stale checkpoint only means a longer scan.
-fn write_ckpt(path: &Path, index: &HashMap<Id, (u64, u32)>, covers: u64) -> Result<(), Error> {
+fn write_ckpt(
+    path: &Path,
+    index: &HashMap<Id, (u64, u32)>,
+    covers: u64,
+    durable: bool,
+) -> Result<(), Error> {
     let mut out = idx_bytes(index);
     out.extend_from_slice(&covers.to_le_bytes());
     let h = blake3::hash(&out);
     out.extend_from_slice(h.as_bytes());
     let tmp = path.with_extension("ckpt.tmp");
-    fs::write(&tmp, &out)?;
-    fs::rename(&tmp, path)?; // no fsync: losing it costs a scan, nothing more
+    if durable {
+        // E171: read lazily, unhashed, so written like a sealed index.
+        let mut f = File::create(&tmp)?;
+        f.write_all(&out)?;
+        f.sync_all()?;
+    } else {
+        fs::write(&tmp, &out)?; // no fsync: losing it costs a scan, nothing more
+    }
+    fs::rename(&tmp, path)?;
     Ok(())
+}
+
+/// E171: a checkpoint to search on disk: its file, fanout and the pack
+/// length it covers. Checked for size, magic, sorted fanout and coverage;
+/// its hash is not read (that would read the whole file). Each record read
+/// through it still checks the record's id and CRC.
+fn open_ckpt_lazy(path: &Path, pack_len: u64) -> Option<(File, [u32; 256], u64)> {
+    let f = File::open(path).ok()?;
+    let size = f.metadata().ok()?.len();
+    let mut head = vec![0u8; IDX_HEAD as usize];
+    f.read_exact_at(&mut head, 0).ok()?;
+    if &head[..8] != IDX_MAGIC {
+        return None;
+    }
+    let count = u64::from_le_bytes(head[8..16].try_into().ok()?);
+    if size != IDX_HEAD + count * IDX_ENTRY + 8 + 32 {
+        return None;
+    }
+    let mut fanout = [0u32; 256];
+    for (i, x) in fanout.iter_mut().enumerate() {
+        *x = u32::from_le_bytes(head[16 + i * 4..20 + i * 4].try_into().ok()?);
+    }
+    if fanout.windows(2).any(|w| w[0] > w[1]) || fanout[255] as u64 != count {
+        return None;
+    }
+    let mut c = [0u8; 8];
+    f.read_exact_at(&mut c, size - 40).ok()?;
+    let covers = u64::from_le_bytes(c);
+    if covers > pack_len {
+        return None;
+    }
+    Some((f, fanout, covers))
 }
 
 fn read_ckpt(path: &Path, pack_len: u64) -> Option<(PackIndex, u64)> {
@@ -1319,6 +1440,15 @@ impl Store for PackStore {
             let (lo, hi) = s.range(prefix);
             for i in lo..hi {
                 let (id, _, len) = s.entry(i)?;
+                if id.as_bytes().starts_with(prefix) {
+                    live.insert(id, len != TOMBSTONE);
+                }
+            }
+        }
+        if let Some(b) = &self.base {
+            let (lo, hi) = b.range(prefix);
+            for i in lo..hi {
+                let (id, _, len) = b.entry(i)?;
                 if id.as_bytes().starts_with(prefix) {
                     live.insert(id, len != TOMBSTONE);
                 }

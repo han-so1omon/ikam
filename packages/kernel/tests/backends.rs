@@ -293,3 +293,88 @@ fn fs_store_ref_survives_a_writer_killed_mid_update() {
     drop(held);
     s.set_ref("heads/main", Some(id(2)), id(3)).unwrap();
 }
+
+/// E171: the lazy checkpoint keeps the contract, and a store opened lazily
+/// sees exactly what a full load sees, before and after more writes.
+#[test]
+fn pack_store_lazy_checkpoint() {
+    use ikam_kernel::backends::PackOptions;
+    let lazy = PackOptions {
+        lazy_checkpoint: true,
+        ..PackOptions::default()
+    };
+    all(&|p| PackStore::open_with(p, lazy).unwrap());
+    let dir = tempfile::tempdir().unwrap();
+    let blob = |n: u32| -> (Id, Vec<u8>) {
+        let b = format!("object {n} {}", "y".repeat((n % 200) as usize)).into_bytes();
+        (Id::of(&b), b)
+    };
+    {
+        let mut s = PackStore::open_with(dir.path(), lazy).unwrap();
+        for n in 0..4000 {
+            let (i, b) = blob(n);
+            s.write(i, &b).unwrap();
+        }
+        s.set_ref("heads/main", None, blob(0).0).unwrap();
+        s.delete(&blob(7).0).unwrap();
+        s.replace(blob(8).0, b"replaced").unwrap();
+    } // close writes the checkpoint
+    {
+        // Lazily opened, then more writes and a replace of a checkpointed id.
+        let mut s = PackStore::open_with(dir.path(), lazy).unwrap();
+        assert!(!s.has(&blob(7).0));
+        assert_eq!(s.read(&blob(8).0).unwrap(), b"replaced");
+        for n in 4000..5000 {
+            let (i, b) = blob(n);
+            s.write(i, &b).unwrap();
+        }
+        s.replace(blob(9).0, b"again").unwrap();
+        s.set_ref("heads/main", Some(blob(0).0), blob(4000).0)
+            .unwrap();
+    }
+    // One open at a time (the lock): take a full view of each.
+    type View = (Vec<Id>, Vec<(Id, bool, Option<(Vec<u8>, usize)>)>, Vec<Vec<Id>>);
+    let view = |s: &PackStore| -> View {
+        let mut ids = s.ids().unwrap();
+        ids.sort();
+        let probes = (0..5000)
+            .step_by(13)
+            .map(|n| {
+                let i = blob(n).0;
+                let got = s
+                    .has(&i)
+                    .then(|| (s.read(&i).unwrap(), s.stored_len(&i).unwrap()));
+                (i, s.has(&i), got)
+            })
+            .collect();
+        let prefixes = [&[0x00u8][..], &[0x7f], &[0xff, 0x01]]
+            .iter()
+            .map(|p| s.ids_with_prefix(p).unwrap())
+            .collect();
+        (ids, probes, prefixes)
+    };
+    let full = view(&PackStore::open(dir.path()).unwrap());
+    let lz = view(&PackStore::open_with(dir.path(), lazy).unwrap());
+    assert_eq!(full.0.len(), 4999);
+    assert!(full == lz, "lazy open sees what a full load sees");
+    {
+        let s = PackStore::open_with(dir.path(), lazy).unwrap();
+        assert_eq!(s.read(&blob(9).0).unwrap(), b"again");
+    }
+    // A torn checkpoint is refused and the open falls back to a full scan.
+    let ckpt = dir.path().join("packs/00000000.ckpt");
+    let mut bytes = std::fs::read(&ckpt).unwrap();
+    bytes.truncate(bytes.len() - 5);
+    std::fs::write(&ckpt, bytes).unwrap();
+    let s = PackStore::open_with(dir.path(), lazy).unwrap();
+    assert_eq!(s.ids().unwrap().len(), 4999);
+}
+
+/// E170: both hybrids keep the contract.
+#[cfg(feature = "store-rocksdb")]
+#[test]
+fn hybrid_stores() {
+    use ikam_kernel::backends::hybrid::{IndexHybrid, RefsHybrid};
+    all(&|p| RefsHybrid::open(p).unwrap());
+    all(&|p| IndexHybrid::open(p).unwrap());
+}
