@@ -100,14 +100,16 @@ def docx_xml(docx):
 
 
 def rezip(old_docx, new_xml):
-    """The old package with document.xml replaced, written entry by entry
+    """The old package with document.xml replaced (or, given a dict, the
+    parts it names), written entry by entry
     with the old package's order, flags, versions, times and deflate
     settings (pandoc's zip matches zlib's raw deflate at its default
     level; Python's zipfile would rewrite the flags)."""
     zin = zipfile.ZipFile(io.BytesIO(old_docx))
+    new = new_xml if isinstance(new_xml, dict) else {"word/document.xml": new_xml}
     out, central = bytearray(), bytearray()
     for info in zin.infolist():
-        data = new_xml if info.filename == "word/document.xml" else zin.read(info)
+        data = new[info.filename] if info.filename in new else zin.read(info)
         if info.compress_type == zipfile.ZIP_DEFLATED:
             c = zlib.compressobj(zlib.Z_DEFAULT_COMPRESSION, zlib.DEFLATED, -15)
             packed = c.compress(data) + c.flush()
