@@ -24,9 +24,16 @@ pub fn fill() -> Id {
     builtin("fill/1")
 }
 
+/// A file rendered from its fragments (E155, `fragment.rs`): the arguments
+/// concatenated, like `concat`, but a fact rather than a storage plan, so
+/// repack keeps it and the file stays addressable by its fragments.
+pub fn render() -> Id {
+    builtin("render/1")
+}
+
 /// Builtins by index, for short derivation records (`abbrev.rs`). Stored
 /// records depend on this order: only append.
-const BUILTINS: [&str; 3] = ["concat/1", "deflate-pack/1", "fill/1"];
+const BUILTINS: [&str; 4] = ["concat/1", "deflate-pack/1", "fill/1", "render/1"];
 
 pub(crate) fn builtin_index(func: &Id) -> Option<u8> {
     BUILTINS
@@ -46,7 +53,7 @@ pub fn is_plan(func: &Id) -> bool {
 }
 
 pub fn is_builtin(func: &Id) -> bool {
-    *func == concat() || *func == deflate_pack() || *func == fill()
+    *func == concat() || *func == deflate_pack() || *func == fill() || *func == render()
 }
 
 /// Run `func` on `args`: its output and the decode work it took (bytes
@@ -57,7 +64,7 @@ pub fn run(
     args: &[Vec<u8>],
     memo: Option<&container::DeflateMemo>,
 ) -> Result<(Vec<u8>, usize), Error> {
-    let out = if *func == concat() {
+    let out = if *func == concat() || *func == render() {
         args.concat()
     } else if *func == deflate_pack() {
         container::pack(args, memo)?

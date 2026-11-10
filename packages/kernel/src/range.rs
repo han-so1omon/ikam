@@ -113,7 +113,7 @@ impl<S: Store> Repo<S> {
         if !stored && cx.stack.len() < STACK_GUARD && !cx.stack.contains(id) {
             cx.stack.push(*id);
             let walked = self.derivations(id)?.iter().find_map(|d| {
-                let out = if d.func == func::concat() {
+                let out = if d.func == func::concat() || d.func == func::render() {
                     self.concat_range(&d.args, start, len, cx)
                 } else if d.func == func::fill() {
                     self.fill_range(&d.args, start, len, cx)
