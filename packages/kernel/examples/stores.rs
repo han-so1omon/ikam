@@ -47,6 +47,10 @@
 //! - `crash-group WORK KILLS THREADS` (E177): writers sharing flushes in a
 //!   child killed at random; after each kill every writer's ref is at or past
 //!   its last acknowledged commit and its chain reads back.
+//! - `repo-cost WORK BACKEND N` (E178): on a store of N small contents, one
+//!   database commit through the Repo on a fresh handle (first, then the
+//!   median of nine more), with the defaults, `needed_index`, and that plus
+//!   an empty seed scope.
 //!
 //! Every line printed is one JSON object.
 
@@ -971,6 +975,7 @@ fn main() {
         Some("writers") => writers(&p(1), a[2].parse().unwrap(), a[3].parse().unwrap(), &a[4]),
         Some("crash-group") => crash_group(&p(1), a[2].parse().unwrap(), a[3].parse().unwrap()),
         Some("crash-group-child") => crash_group_child(&p(1), a[2].parse().unwrap()),
+        Some("repo-cost") => repo_cost(&p(1), &a[2], a[3].parse().unwrap()),
         Some("crash-big") => crash_big(&p(1), &a[2], a[3].parse().unwrap(), a[4].parse().unwrap()),
         Some("crash-child") => crash_child(&a[1], &p(2)),
         _ => eprintln!("see the module docs for phases"),
@@ -1242,4 +1247,65 @@ fn crash_group_child(dir: &Path, threads: u64) {
 /// The sequence number of commit `h`, read through the group's store.
 fn fast_view(g: &ikam_kernel::backends::GroupCommit, h: Id) -> u64 {
     parse_commit(&g.read(&h).unwrap()).unwrap().0
+}
+
+/// E178 `repo-cost WORK BACKEND N`: on a store holding N small contents
+/// (built as `crash-big` builds it), what one database commit costs through
+/// the Repo, on a fresh handle: the first commit and the median of the next
+/// nine, with the defaults, with `needed_index` on (E129), and with that and
+/// the seed scope set to nothing (E131). A commit is one 50 to 250 KB
+/// content, 1 to 40 events appended and the `heads/db` ref moved.
+fn repo_cost(work: &Path, name: &str, n: u64) {
+    let dir = work.join(format!("crash-big-{name}-{n}"));
+    if !dir.join("BUILT").exists() {
+        let _ = std::fs::remove_dir_all(&dir);
+        let t = Instant::now();
+        let mut repo = Repo::new(open(name, &dir));
+        let mut last = None;
+        for i in 0..n {
+            last = Some(repo.put_content(&synthetic(i).1).unwrap().id);
+        }
+        drop(repo);
+        open(name, &dir).set_ref("heads/scale", None, last.unwrap()).unwrap();
+        std::fs::write(dir.join("BUILT"), b"").unwrap();
+        println!(
+            "{{\"phase\":\"repo-cost-build\",\"backend\":\"{name}\",\"n\":{n},\"build_s\":{:.1}}}",
+            t.elapsed().as_secs_f64()
+        );
+    }
+    for config in ["default", "needed", "needed+seeds"] {
+        let t = Instant::now();
+        let mut repo = Repo::new(open(name, &dir));
+        let open_ms = ms(t.elapsed());
+        if config != "default" {
+            repo.needed_index = true;
+        }
+        if config == "needed+seeds" {
+            repo.set_seed_scope(Some(Vec::new()));
+        }
+        let mut d = match repo.store().get_ref("heads/db").unwrap() {
+            Some(c) => repo.db_at(&c).unwrap(),
+            None => repo.db_empty().unwrap(),
+        };
+        let mut seq = repo.db_head(&d.log).unwrap();
+        let mut rng = Rng(seq ^ 0x178);
+        let mut times = Vec::new();
+        for _ in 0..10 {
+            let t = Instant::now();
+            let len = 50_000 + rng.below(200_000) as usize;
+            repo.put_content(&rng.bytes(len)).unwrap();
+            let k = 1 + rng.below(40);
+            d = repo.db_append(&d, &events(&mut rng, seq, k)).unwrap();
+            repo.db_commit("heads/db", &d, "cost").unwrap();
+            seq = repo.db_head(&d.log).unwrap();
+            times.push(ms(t.elapsed()));
+        }
+        let first = times[0];
+        let mut rest = times[1..].to_vec();
+        println!(
+            "{{\"phase\":\"repo-cost\",\"backend\":\"{name}\",\"n\":{n},\"config\":\"{config}\",\"open_ms\":{open_ms:.1},\"first_commit_ms\":{first:.1},\"commit_ms_p50\":{:.1},\"commit_ms_max\":{:.1}}}",
+            pct(&mut rest, 0.5),
+            rest.iter().cloned().fold(0.0, f64::max),
+        );
+    }
 }
