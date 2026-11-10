@@ -1057,7 +1057,12 @@ const SNAP_MAGIC: &[u8; 8] = b"ikamref1";
 /// E172: every ref as of a point in the packs (pack number, offset); open
 /// loads it and replays the ref records after that point. Losing it only
 /// means a longer replay: the records stay in the packs.
-fn write_snap(path: &Path, pack: u32, covers: u64, refs: &BTreeMap<String, Id>) -> Result<(), Error> {
+fn write_snap(
+    path: &Path,
+    pack: u32,
+    covers: u64,
+    refs: &BTreeMap<String, Id>,
+) -> Result<(), Error> {
     let mut out = SNAP_MAGIC.to_vec();
     out.extend_from_slice(&pack.to_le_bytes());
     out.extend_from_slice(&covers.to_le_bytes());
@@ -1390,7 +1395,10 @@ impl PackStore {
         let mut sealed = open_sealed(&self.root, n)?;
         if self.opts.filters {
             let f = Filter::build(full.keys());
-            f.write(&self.root.join(format!("packs/{n:08}.flt")), sealed.fanout[255])?;
+            f.write(
+                &self.root.join(format!("packs/{n:08}.flt")),
+                sealed.fanout[255],
+            )?;
             sealed.filter = Some(Box::new(f));
         }
         self.sealed.push(sealed);
@@ -1469,7 +1477,8 @@ impl PackStore {
                     let id = Id::from_bytes(e[..32].try_into().unwrap());
                     let off = u64::from_le_bytes(e[32..40].try_into().unwrap());
                     let len = u32::from_le_bytes(e[40..44].try_into().unwrap());
-                    let newest = matches!(self.locate(&id)?, Some((Some(j), o, _)) if j == i && o == off);
+                    let newest =
+                        matches!(self.locate(&id)?, Some((Some(j), o, _)) if j == i && o == off);
                     if len == TOMBSTONE || !newest {
                         out.dropped += 1;
                         continue;
@@ -1492,7 +1501,8 @@ impl PackStore {
                 self.buf.extend_from_slice(marker.as_bytes());
                 self.buf.extend_from_slice(&len.to_le_bytes());
                 self.buf.extend_from_slice(&body);
-                self.buf.extend_from_slice(&crc(&marker, len, &body).to_le_bytes());
+                self.buf
+                    .extend_from_slice(&crc(&marker, len, &body).to_le_bytes());
             }
         }
         self.flush()?;
@@ -1501,7 +1511,12 @@ impl PackStore {
             self.seal()?;
         }
         if self.opts.ref_log {
-            write_snap(&self.root.join("refs.snap"), self.active_no, 0, &self.log_refs)?;
+            write_snap(
+                &self.root.join("refs.snap"),
+                self.active_no,
+                0,
+                &self.log_refs,
+            )?;
         }
         let packs = self.root.join("packs");
         sync_dir(&packs)?;
@@ -1545,7 +1560,8 @@ impl PackStore {
         self.buf.extend_from_slice(marker.as_bytes());
         self.buf.extend_from_slice(&len.to_le_bytes());
         self.buf.extend_from_slice(&body);
-        self.buf.extend_from_slice(&crc(&marker, len, &body).to_le_bytes());
+        self.buf
+            .extend_from_slice(&crc(&marker, len, &body).to_le_bytes());
         self.log_refs.insert(name.to_string(), new);
         Ok(())
     }
@@ -1594,7 +1610,9 @@ impl GroupCommit {
     /// Needs a store opened with the ref log on.
     pub fn new(store: PackStore) -> Result<GroupCommit, Error> {
         if !store.opts.ref_log {
-            return Err(Error::Io(io::Error::other("group commit needs the ref log")));
+            return Err(Error::Io(io::Error::other(
+                "group commit needs the ref log",
+            )));
         }
         Ok(GroupCommit {
             state: std::sync::Mutex::new(GroupState {
@@ -1656,7 +1674,9 @@ impl GroupCommit {
             let r = file.sync_data();
             st = self.state.lock().unwrap();
             st.flushing = false;
-            let r = r.map_err(Error::from).and_then(|_| st.store.maintain_after_group());
+            let r = r
+                .map_err(Error::from)
+                .and_then(|_| st.store.maintain_after_group());
             match r {
                 Ok(()) => {
                     st.durable = st.durable.max(target);
@@ -2061,7 +2081,8 @@ impl Store for PackStore {
             self.buf.extend_from_slice(marker.as_bytes());
             self.buf.extend_from_slice(&len.to_le_bytes());
             self.buf.extend_from_slice(&body);
-            self.buf.extend_from_slice(&crc(&marker, len, &body).to_le_bytes());
+            self.buf
+                .extend_from_slice(&crc(&marker, len, &body).to_le_bytes());
             self.flush()?;
             self.active.sync_data()?;
             self.log_refs.insert(name.to_string(), new);
@@ -2309,7 +2330,8 @@ pub mod hybrid {
             self.buf.extend_from_slice(id.as_bytes());
             self.buf.extend_from_slice(&len.to_le_bytes());
             self.buf.extend_from_slice(bytes);
-            self.buf.extend_from_slice(&crc(&id, len, bytes).to_le_bytes());
+            self.buf
+                .extend_from_slice(&crc(&id, len, bytes).to_le_bytes());
             let pack = self.active();
             self.pending.insert(id, Some(Loc { pack, off, len }));
             if self.buf.len() >= 1 << 20 {
@@ -2453,7 +2475,11 @@ pub mod hybrid {
                     live.insert(*id, l.is_some());
                 }
             }
-            Ok(live.into_iter().filter(|(_, l)| *l).map(|(id, _)| id).collect())
+            Ok(live
+                .into_iter()
+                .filter(|(_, l)| *l)
+                .map(|(id, _)| id)
+                .collect())
         }
         fn delete(&mut self, id: &Id) -> Result<(), Error> {
             if !self.has(id) {
@@ -2561,6 +2587,9 @@ mod pack_index_tests {
         for (id, at) in &index {
             assert_eq!(s.find(id).unwrap(), Some(*at));
         }
-        assert!(Filter::load(&flt, 100_000).is_some(), "rebuilt and rewritten");
+        assert!(
+            Filter::load(&flt, 100_000).is_some(),
+            "rebuilt and rewritten"
+        );
     }
 }

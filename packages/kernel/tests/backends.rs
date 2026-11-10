@@ -333,7 +333,11 @@ fn pack_store_lazy_checkpoint() {
             .unwrap();
     }
     // One open at a time (the lock): take a full view of each.
-    type View = (Vec<Id>, Vec<(Id, bool, Option<(Vec<u8>, usize)>)>, Vec<Vec<Id>>);
+    type View = (
+        Vec<Id>,
+        Vec<(Id, bool, Option<(Vec<u8>, usize)>)>,
+        Vec<Vec<Id>>,
+    );
     let view = |s: &PackStore| -> View {
         let mut ids = s.ids().unwrap();
         ids.sort();
@@ -507,7 +511,9 @@ fn pack_store_filters() {
 fn pack_store_compact() {
     use ikam_kernel::backends::PackOptions;
     use std::collections::BTreeMap;
-    let obj = |i: u64, v: u64| format!("object {i} version {v} {}", "x".repeat((i % 50) as usize)).into_bytes();
+    let obj = |i: u64, v: u64| {
+        format!("object {i} version {v} {}", "x".repeat((i % 50) as usize)).into_bytes()
+    };
     let key = |i: u64| Id::of_content(format!("key {i}").as_bytes());
     for opts in [
         PackOptions::default(),
@@ -596,7 +602,13 @@ fn pack_store_compact() {
             // Kill after the oldest were removed: remove the lowest numbers.
             let mut nos: Vec<_> = std::fs::read_dir(before.path().join("packs"))
                 .unwrap()
-                .filter_map(|e| e.unwrap().file_name().to_str()?.strip_suffix(".pack").map(String::from))
+                .filter_map(|e| {
+                    e.unwrap()
+                        .file_name()
+                        .to_str()?
+                        .strip_suffix(".pack")
+                        .map(String::from)
+                })
                 .collect();
             nos.sort();
             let first = &nos[0];

@@ -644,7 +644,9 @@ fn crash_big(work: &Path, name: &str, kills: u32, n: u64) {
             last = Some(repo.put_content(&synthetic(i).1).unwrap().id);
         }
         drop(repo);
-        open(name, &dir).set_ref("heads/scale", None, last.unwrap()).unwrap();
+        open(name, &dir)
+            .set_ref("heads/scale", None, last.unwrap())
+            .unwrap();
         std::fs::write(&marker, b"").unwrap();
         println!(
             "{{\"phase\":\"crash-big-build\",\"backend\":\"{name}\",\"n\":{n},\"build_s\":{:.1}}}",
@@ -690,11 +692,20 @@ fn crash_big(work: &Path, name: &str, kills: u32, n: u64) {
         open_ms.push(ms(t.elapsed()));
         let head = repo.store().get_ref("heads/db").unwrap();
         let verdict = (|| -> Result<u64, String> {
-            if repo.store().get_ref("heads/scale").map_err(|e| e.to_string())?.is_none() {
+            if repo
+                .store()
+                .get_ref("heads/scale")
+                .map_err(|e| e.to_string())?
+                .is_none()
+            {
                 return Err("scale ref lost".into());
             }
             let Some(c) = head else {
-                return if acked == 0 { Ok(0) } else { Err("ref lost".into()) };
+                return if acked == 0 {
+                    Ok(0)
+                } else {
+                    Err("ref lost".into())
+                };
             };
             let d = repo.db_at(&c).map_err(|e| e.to_string())?;
             let seq = repo.db_head(&d.log).map_err(|e| e.to_string())?;
@@ -712,7 +723,11 @@ fn crash_big(work: &Path, name: &str, kills: u32, n: u64) {
             let mut r = Rng(1000 + k as u64);
             for _ in 0..100_000 {
                 let b = synthetic(r.below(n)).1;
-                if repo.read_content(&Id::of_content(&b)).map_err(|e| e.to_string())? != b {
+                if repo
+                    .read_content(&Id::of_content(&b))
+                    .map_err(|e| e.to_string())?
+                    != b
+                {
                     return Err("content differs".into());
                 }
             }
@@ -734,7 +749,10 @@ fn crash_big(work: &Path, name: &str, kills: u32, n: u64) {
         }
     }
     let t = Instant::now();
-    let fsck = Repo::new(open(name, &dir)).fsck().map(|p| p.len()).unwrap_or(usize::MAX);
+    let fsck = Repo::new(open(name, &dir))
+        .fsck()
+        .map(|p| p.len())
+        .unwrap_or(usize::MAX);
     let fsck_s = t.elapsed().as_secs_f64();
     let (files, len, _) = disk(&dir);
     println!(
@@ -760,8 +778,16 @@ fn churn(name: &str, dir: &Path, n: u64) {
     use ikam_kernel::backends::{PackOptions, PackStore};
     let opts = match name {
         "packs" => PackOptions::default(),
-        "packs-fast" => PackOptions { lazy_checkpoint: true, ref_log: true, ..PackOptions::default() },
-        "packs-fast-filter" => PackOptions { lazy_checkpoint: true, ref_log: true, filters: true },
+        "packs-fast" => PackOptions {
+            lazy_checkpoint: true,
+            ref_log: true,
+            ..PackOptions::default()
+        },
+        "packs-fast-filter" => PackOptions {
+            lazy_checkpoint: true,
+            ref_log: true,
+            filters: true,
+        },
         _ => panic!("churn is for PackStore backends"),
     };
     let t = Instant::now();
@@ -894,11 +920,18 @@ fn crash_store(work: &Path, name: &str, kills: u32, n: u64) {
         let s = open(name, &dir);
         open_ms.push(ms(t.elapsed()));
         let verdict = (|| -> Result<u64, String> {
-            if s.get_ref("heads/scale").map_err(|e| e.to_string())?.is_none() {
+            if s.get_ref("heads/scale")
+                .map_err(|e| e.to_string())?
+                .is_none()
+            {
                 return Err("scale ref lost".into());
             }
             let Some(h) = s.get_ref("heads/log").map_err(|e| e.to_string())? else {
-                return if acked == 0 { Ok(0) } else { Err("ref lost".into()) };
+                return if acked == 0 {
+                    Ok(0)
+                } else {
+                    Err("ref lost".into())
+                };
             };
             let mut at = Some(h);
             let mut top = None;
@@ -970,7 +1003,9 @@ fn main() {
         Some("probe") => probe(&a[1], &p(2), a[3].parse().unwrap()),
         Some("crash") => crash(&p(1), &a[2], a[3].parse().unwrap()),
         Some("churn") => churn(&a[1], &p(2), a[3].parse().unwrap()),
-        Some("crash-store") => crash_store(&p(1), &a[2], a[3].parse().unwrap(), a[4].parse().unwrap()),
+        Some("crash-store") => {
+            crash_store(&p(1), &a[2], a[3].parse().unwrap(), a[4].parse().unwrap())
+        }
         Some("crash-store-child") => crash_store_child(&a[1], &p(2)),
         Some("writers") => writers(&p(1), a[2].parse().unwrap(), a[3].parse().unwrap(), &a[4]),
         Some("crash-group") => crash_group(&p(1), a[2].parse().unwrap(), a[3].parse().unwrap()),
@@ -1089,7 +1124,10 @@ fn writers(dir: &Path, threads: u64, commits: u64, mode: &str) {
             })
         })
         .collect();
-    let mut lat: Vec<f64> = handles.into_iter().flat_map(|h| h.join().unwrap()).collect();
+    let mut lat: Vec<f64> = handles
+        .into_iter()
+        .flat_map(|h| h.join().unwrap())
+        .collect();
     let secs = t0.elapsed().as_secs_f64();
     let shared = Arc::try_unwrap(shared).ok().unwrap();
     let flushes = match &shared {
@@ -1142,7 +1180,11 @@ fn crash_group(work: &Path, kills: u32, threads: u64) {
     let mut acked_total = 0u64;
     for k in 0..kills {
         let mut child = Command::new(&exe)
-            .args(["crash-group-child", dir.to_str().unwrap(), &threads.to_string()])
+            .args([
+                "crash-group-child",
+                dir.to_str().unwrap(),
+                &threads.to_string(),
+            ])
             .stdout(Stdio::piped())
             .spawn()
             .unwrap();
@@ -1182,7 +1224,9 @@ fn crash_group(work: &Path, kills: u32, threads: u64) {
             };
             match r {
                 Ok((top, _)) if top >= a => {}
-                Ok((top, _)) => verdict = Err(format!("kill {k} w{w}: acked {a} but ref is at {top}")),
+                Ok((top, _)) => {
+                    verdict = Err(format!("kill {k} w{w}: acked {a} but ref is at {top}"))
+                }
                 Err(e) => verdict = Err(format!("kill {k} w{w}: {e}")),
             }
         }
@@ -1266,7 +1310,9 @@ fn repo_cost(work: &Path, name: &str, n: u64) {
             last = Some(repo.put_content(&synthetic(i).1).unwrap().id);
         }
         drop(repo);
-        open(name, &dir).set_ref("heads/scale", None, last.unwrap()).unwrap();
+        open(name, &dir)
+            .set_ref("heads/scale", None, last.unwrap())
+            .unwrap();
         std::fs::write(dir.join("BUILT"), b"").unwrap();
         println!(
             "{{\"phase\":\"repo-cost-build\",\"backend\":\"{name}\",\"n\":{n},\"build_s\":{:.1}}}",
