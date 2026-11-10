@@ -108,3 +108,75 @@ fn render_survives_repack() {
     assert_eq!(repo.read_content(&id).unwrap(), d);
     assert_eq!(repo.fragments_of(&id).unwrap().map(|f| f.len()), Some(3));
 }
+
+#[test]
+fn refused_grant_writes_nothing() {
+    use ikam_kernel::{FileGrant, Grant, Store};
+    let mut repo = Repo::new(MemStore::default());
+    let docs: Vec<Vec<u8>> = (0..4)
+        .map(|i| {
+            format!("head {i}\n\n")
+                .into_bytes()
+                .into_iter()
+                .chain(SHARED.iter().copied())
+                .chain(b"tail\n".iter().copied())
+                .collect()
+        })
+        .collect();
+    let mut edits = Vec::new();
+    for (i, d) in docs.iter().enumerate() {
+        let id = repo.put_fragmented(d, None).unwrap();
+        edits.push(Edit::Put {
+            path: format!("d/{i}.md"),
+            id,
+        });
+    }
+    let tree = repo.edit_tree(None, &edits).unwrap();
+    let mut ix = repo.fragment_index(&tree).unwrap();
+    let range = |d: &[u8]| {
+        let at = d.windows(SHARED.len()).position(|w| w == SHARED).unwrap() as u64;
+        vec![at..at + SHARED.len() as u64]
+    };
+    let ids: Vec<Id> = (0..4).map(|i| ix.files[&format!("d/{i}.md")].0).collect();
+    let file = |i: usize| {
+        FileGrant::new(
+            &format!("d/{i}.md"),
+            ids[i],
+            range(&docs[i]),
+            range(&docs[i]),
+        )
+    };
+    let old = Id::of_content(SHARED);
+    let new = b"Revised.\n\n";
+    let count = |r: &Repo<MemStore>| r.store().ids().unwrap().len();
+    // Three of four files granted: refused, nothing stored.
+    let partial = Grant {
+        goal: "g".into(),
+        files: (0..3).map(file).collect(),
+    };
+    let before = count(&repo);
+    assert!(
+        repo.propagate_granted(&mut ix, &old, new, Some(&partial))
+            .unwrap()
+            .is_err()
+    );
+    assert_eq!(count(&repo), before);
+    assert_eq!(ix.by_fragment[&old].len(), 4);
+    // All four: allowed, and every file now renders the new paragraph.
+    let full = Grant {
+        goal: "g".into(),
+        files: (0..4).map(file).collect(),
+    };
+    let changes = repo
+        .propagate_granted(&mut ix, &old, new, Some(&full))
+        .unwrap()
+        .unwrap();
+    assert_eq!(changes.len(), 4);
+    for (i, d) in docs.iter().enumerate() {
+        let got = repo
+            .read_content(&ix.files[&format!("d/{i}.md")].0)
+            .unwrap();
+        let at = range(d)[0].start as usize;
+        assert_eq!(&got[at..at + new.len()], new);
+    }
+}
