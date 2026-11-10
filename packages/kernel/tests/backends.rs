@@ -605,3 +605,63 @@ fn pack_store_compact() {
         }
     }
 }
+
+/// E177: writers sharing flushes. Eight threads each build a chain on their
+/// own ref; every commit returns only once durable, a stale expected value
+/// is refused, and after a reopen every chain is whole. The store must have
+/// the ref log; staging a ref without it is refused.
+#[test]
+fn pack_store_group_commit() {
+    use ikam_kernel::backends::{GroupCommit, PackOptions};
+    use std::sync::Arc;
+    let opts = PackOptions {
+        lazy_checkpoint: true,
+        ref_log: true,
+        ..PackOptions::default()
+    };
+    let dir = tempfile::tempdir().unwrap();
+    assert!(GroupCommit::new(PackStore::open(dir.path().join("plain")).unwrap()).is_err());
+    let mut plain = PackStore::open(dir.path().join("plain2")).unwrap();
+    assert!(plain.stage_ref("heads/x", None, id(1)).is_err());
+    drop(plain);
+
+    let root = dir.path().join("g");
+    let g = Arc::new(GroupCommit::new(PackStore::open_with(&root, opts).unwrap()).unwrap());
+    let chain = |t: u64, i: u64| {
+        let b = format!("w{t} commit {i} {}", "x".repeat((i % 50) as usize)).into_bytes();
+        (Id::from_bytes(*blake3::hash(&b).as_bytes()), b)
+    };
+    let hs: Vec<_> = (0..8u64)
+        .map(|t| {
+            let g = g.clone();
+            std::thread::spawn(move || {
+                let name = format!("heads/w{t}");
+                let mut head = None;
+                for i in 0..300 {
+                    let (cid, b) = chain(t, i);
+                    g.commit(&[(cid, b)], &name, head, cid).unwrap();
+                    head = Some(cid);
+                }
+                // A stale expected value is refused, and moves nothing.
+                let (cid, b) = chain(t, 1_000);
+                assert!(g.commit(&[(cid, b)], &name, None, cid).is_err());
+                assert_eq!(g.get_ref(&name).unwrap(), head);
+            })
+        })
+        .collect();
+    for h in hs {
+        h.join().unwrap();
+    }
+    let g = Arc::try_unwrap(g).ok().unwrap();
+    assert!(g.flushes() <= 8 * 300 + 8);
+    drop(g.into_inner());
+    let s = PackStore::open_with(&root, opts).unwrap();
+    for t in 0..8 {
+        let (last, _) = chain(t, 299);
+        assert_eq!(s.get_ref(&format!("heads/w{t}")).unwrap(), Some(last));
+        for i in 0..300 {
+            let (cid, b) = chain(t, i);
+            assert_eq!(s.read(&cid).unwrap(), b);
+        }
+    }
+}

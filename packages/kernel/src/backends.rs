@@ -1514,6 +1514,167 @@ impl PackStore {
         }
         Ok(n)
     }
+
+    /// E177: move a ref in memory and append its record, without making
+    /// it durable. Needs the ref log. The caller must not report the ref
+    /// as moved until a later [`PackStore::sync`] or group flush covers it.
+    pub fn stage_ref(&mut self, name: &str, expected: Option<Id>, new: Id) -> Result<(), Error> {
+        if !self.opts.ref_log {
+            return Err(Error::Io(io::Error::other("stage_ref needs the ref log")));
+        }
+        check_ref_name(name)?;
+        if self.get_ref(name)? != expected {
+            return Err(Error::RefConflict(name.into()));
+        }
+        let body = ref_body(name, &new);
+        let marker = ref_marker();
+        let len = body.len() as u32;
+        self.buf.extend_from_slice(marker.as_bytes());
+        self.buf.extend_from_slice(&len.to_le_bytes());
+        self.buf.extend_from_slice(&body);
+        self.buf.extend_from_slice(&crc(&marker, len, &body).to_le_bytes());
+        self.log_refs.insert(name.to_string(), new);
+        Ok(())
+    }
+
+    /// E177: write out what is buffered and hand back a handle to the open
+    /// pack, so the flush to disk can run without holding the store.
+    fn flush_for_group(&mut self) -> Result<File, Error> {
+        self.flush()?;
+        Ok(self.active.try_clone()?)
+    }
+
+    /// E177: after a group flush, seal or checkpoint if due. Records may have
+    /// been appended while the flush ran, so a due seal syncs again first:
+    /// an index or snapshot must never name records that are not durable.
+    fn maintain_after_group(&mut self) -> Result<(), Error> {
+        if self.flushed + self.buf.len() as u64 >= PACK_SEAL_BYTES
+            || self.flushed - self.ckpt_at >= PACK_CKPT_BYTES
+        {
+            self.sync()?;
+        }
+        Ok(())
+    }
+}
+
+/// E177: many writers sharing one pack store, with one flush to disk
+/// covering every commit that is waiting (group commit). Each commit's
+/// objects and ref record are appended under the lock; the first waiter
+/// to find no flush running becomes the flusher, flushes outside the lock,
+/// and wakes everyone its flush covered. A commit returns only once a flush
+/// that started after its records were appended has finished.
+pub struct GroupCommit {
+    state: std::sync::Mutex<GroupState>,
+    done: std::sync::Condvar,
+}
+
+struct GroupState {
+    store: PackStore,
+    staged: u64,
+    durable: u64,
+    flushing: bool,
+    failed: bool,
+    flushes: u64,
+}
+
+impl GroupCommit {
+    /// Needs a store opened with the ref log on.
+    pub fn new(store: PackStore) -> Result<GroupCommit, Error> {
+        if !store.opts.ref_log {
+            return Err(Error::Io(io::Error::other("group commit needs the ref log")));
+        }
+        Ok(GroupCommit {
+            state: std::sync::Mutex::new(GroupState {
+                store,
+                staged: 0,
+                durable: 0,
+                flushing: false,
+                failed: false,
+                flushes: 0,
+            }),
+            done: std::sync::Condvar::new(),
+        })
+    }
+
+    /// Write `objects`, then move `name` from `expected` to `new`, and
+    /// return once both are durable.
+    pub fn commit(
+        &self,
+        objects: &[(Id, Vec<u8>)],
+        name: &str,
+        expected: Option<Id>,
+        new: Id,
+    ) -> Result<(), Error> {
+        let failed = || Error::Io(io::Error::other("an earlier group flush failed"));
+        let mut st = self.state.lock().unwrap();
+        if st.failed {
+            return Err(failed());
+        }
+        for (id, bytes) in objects {
+            st.store.write(*id, bytes)?;
+        }
+        st.store.stage_ref(name, expected, new)?;
+        st.staged += 1;
+        let mine = st.staged;
+        loop {
+            if st.failed {
+                return Err(failed());
+            }
+            if st.durable >= mine {
+                return Ok(());
+            }
+            if st.flushing {
+                st = self.done.wait(st).unwrap();
+                continue;
+            }
+            // Become the flusher for everything staged so far.
+            st.flushing = true;
+            let target = st.staged;
+            let file = match st.store.flush_for_group() {
+                Ok(f) => f,
+                Err(e) => {
+                    st.failed = true;
+                    st.flushing = false;
+                    self.done.notify_all();
+                    return Err(e);
+                }
+            };
+            drop(st);
+            let r = file.sync_data();
+            st = self.state.lock().unwrap();
+            st.flushing = false;
+            let r = r.map_err(Error::from).and_then(|_| st.store.maintain_after_group());
+            match r {
+                Ok(()) => {
+                    st.durable = st.durable.max(target);
+                    st.flushes += 1;
+                }
+                Err(e) => {
+                    st.failed = true;
+                    self.done.notify_all();
+                    return Err(e);
+                }
+            }
+            self.done.notify_all();
+        }
+    }
+
+    pub fn get_ref(&self, name: &str) -> Result<Option<Id>, Error> {
+        self.state.lock().unwrap().store.get_ref(name)
+    }
+
+    pub fn read(&self, id: &Id) -> Result<Vec<u8>, Error> {
+        self.state.lock().unwrap().store.read(id)
+    }
+
+    /// Flushes to disk so far (commits per flush shows the grouping).
+    pub fn flushes(&self) -> u64 {
+        self.state.lock().unwrap().flushes
+    }
+
+    pub fn into_inner(self) -> PackStore {
+        self.state.into_inner().unwrap().store
+    }
 }
 
 /// What [`PackStore::compact`] did.

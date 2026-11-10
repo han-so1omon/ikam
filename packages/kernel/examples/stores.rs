@@ -40,6 +40,14 @@
 //!   every object they name read back and hash to their ids, and 100,000 of
 //!   the N objects read back.
 //!
+//! - `writers DIR THREADS COMMITS MODE` (E177): THREADS writers, each making
+//!   COMMITS commits on its own ref in one packs-fast store, flushing alone
+//!   under a shared lock (`alone`) or sharing flushes (`group`); then a
+//!   reopen checks every chain.
+//! - `crash-group WORK KILLS THREADS` (E177): writers sharing flushes in a
+//!   child killed at random; after each kill every writer's ref is at or past
+//!   its last acknowledged commit and its chain reads back.
+//!
 //! Every line printed is one JSON object.
 
 use std::collections::BTreeMap;
@@ -960,8 +968,276 @@ fn main() {
         Some("churn") => churn(&a[1], &p(2), a[3].parse().unwrap()),
         Some("crash-store") => crash_store(&p(1), &a[2], a[3].parse().unwrap(), a[4].parse().unwrap()),
         Some("crash-store-child") => crash_store_child(&a[1], &p(2)),
+        Some("writers") => writers(&p(1), a[2].parse().unwrap(), a[3].parse().unwrap(), &a[4]),
+        Some("crash-group") => crash_group(&p(1), a[2].parse().unwrap(), a[3].parse().unwrap()),
+        Some("crash-group-child") => crash_group_child(&p(1), a[2].parse().unwrap()),
         Some("crash-big") => crash_big(&p(1), &a[2], a[3].parse().unwrap(), a[4].parse().unwrap()),
         Some("crash-child") => crash_child(&a[1], &p(2)),
         _ => eprintln!("see the module docs for phases"),
     }
+}
+
+fn fast_pack(dir: &Path) -> ikam_kernel::backends::PackStore {
+    use ikam_kernel::backends::*;
+    PackStore::open_with(
+        dir,
+        PackOptions {
+            lazy_checkpoint: true,
+            ref_log: true,
+            ..PackOptions::default()
+        },
+    )
+    .unwrap()
+}
+
+/// One writer's next commit: 1 to 4 objects of 100 to 2,000 bytes, then a
+/// commit object naming them and the writer's previous commit.
+fn writer_batch(t: u64, seq: u64, head: Option<Id>, rng: &mut Rng) -> (Vec<(Id, Vec<u8>)>, Id) {
+    let mut objs = Vec::new();
+    let mut ids = Vec::new();
+    for _ in 0..1 + rng.below(4) {
+        let mut b = t.to_le_bytes().to_vec();
+        b.extend(seq.to_le_bytes());
+        let len = 100 + rng.below(1_900) as usize;
+        b.extend(rng.bytes(len));
+        let id = Id::from_bytes(*blake3::hash(&b).as_bytes());
+        ids.push(id);
+        objs.push((id, b));
+    }
+    let (cid, cb) = commit_obj(seq, head, &ids);
+    objs.push((cid, cb));
+    (objs, cid)
+}
+
+/// Walk up to `limit` commits back from `head`, checking every hash.
+/// Returns the top sequence number and how many commits were walked.
+fn walk_chain(s: &dyn Store, head: Id, limit: usize) -> Result<(u64, usize), String> {
+    let mut at = Some(head);
+    let mut top = None;
+    let mut walked = 0;
+    while let Some(c) = at {
+        if walked == limit {
+            break;
+        }
+        let b = s.read(&c).map_err(|e| format!("commit unreadable: {e}"))?;
+        if *blake3::hash(&b).as_bytes() != *c.as_bytes() {
+            return Err("commit hash differs".into());
+        }
+        let (seq, prev, ids) = parse_commit(&b).ok_or("not a commit")?;
+        top.get_or_insert(seq);
+        for id in ids {
+            let o = s.read(&id).map_err(|e| format!("object unreadable: {e}"))?;
+            if *blake3::hash(&o).as_bytes() != *id.as_bytes() {
+                return Err("object hash differs".into());
+            }
+        }
+        at = prev;
+        walked += 1;
+    }
+    Ok((top.unwrap_or(0), walked))
+}
+
+/// E177 `writers DIR THREADS COMMITS MODE`: THREADS writers each make
+/// COMMITS commits on their own ref (`heads/wN`) in one fresh packs-fast
+/// store, either each flushing alone under a shared lock (`alone`) or
+/// sharing flushes (`group`). Then a reopen checks every chain.
+fn writers(dir: &Path, threads: u64, commits: u64, mode: &str) {
+    use ikam_kernel::backends::GroupCommit;
+    use std::sync::{Arc, Mutex};
+    let _ = std::fs::remove_dir_all(dir);
+    let store = fast_pack(dir);
+    enum Shared {
+        Alone(Mutex<ikam_kernel::backends::PackStore>),
+        Group(GroupCommit),
+    }
+    let shared = Arc::new(match mode {
+        "alone" => Shared::Alone(Mutex::new(store)),
+        "group" => Shared::Group(GroupCommit::new(store).unwrap()),
+        _ => panic!("mode is alone or group"),
+    });
+    let t0 = Instant::now();
+    let handles: Vec<_> = (0..threads)
+        .map(|t| {
+            let shared = shared.clone();
+            std::thread::spawn(move || {
+                let mut rng = Rng(77 + t);
+                let name = format!("heads/w{t}");
+                let mut head = None;
+                let mut lat = Vec::with_capacity(commits as usize);
+                for seq in 1..=commits {
+                    let (objs, cid) = writer_batch(t, seq, head, &mut rng);
+                    let s = Instant::now();
+                    match &*shared {
+                        Shared::Alone(m) => {
+                            let mut st = m.lock().unwrap();
+                            for (id, b) in &objs {
+                                st.write(*id, b).unwrap();
+                            }
+                            st.set_ref(&name, head, cid).unwrap();
+                        }
+                        Shared::Group(g) => g.commit(&objs, &name, head, cid).unwrap(),
+                    }
+                    lat.push(ms(s.elapsed()));
+                    head = Some(cid);
+                }
+                lat
+            })
+        })
+        .collect();
+    let mut lat: Vec<f64> = handles.into_iter().flat_map(|h| h.join().unwrap()).collect();
+    let secs = t0.elapsed().as_secs_f64();
+    let shared = Arc::try_unwrap(shared).ok().unwrap();
+    let flushes = match &shared {
+        Shared::Group(g) => g.flushes(),
+        Shared::Alone(_) => threads * commits,
+    };
+    drop(shared);
+    let s = fast_pack(dir);
+    let mut bad = 0;
+    for t in 0..threads {
+        let r = s
+            .get_ref(&format!("heads/w{t}"))
+            .map_err(|e| e.to_string())
+            .and_then(|h| h.ok_or("ref lost".to_string()))
+            .and_then(|h| walk_chain(&s, h, usize::MAX));
+        match r {
+            Ok((top, walked)) if top == commits && walked as u64 == commits => {}
+            Ok((top, walked)) => {
+                bad += 1;
+                eprintln!("w{t}: top {top}, walked {walked}");
+            }
+            Err(e) => {
+                bad += 1;
+                eprintln!("w{t}: {e}");
+            }
+        }
+    }
+    let total = threads * commits;
+    println!(
+        "{{\"phase\":\"writers\",\"mode\":\"{mode}\",\"threads\":{threads},\"commits\":{total},\"secs\":{secs:.2},\"commits_per_s\":{:.0},\"flushes\":{flushes},\"commits_per_flush\":{:.2},\"lat_ms_p50\":{:.2},\"lat_ms_p99\":{:.2},\"bad_chains\":{bad}}}",
+        total as f64 / secs,
+        total as f64 / flushes.max(1) as f64,
+        pct(&mut lat, 0.5),
+        pct(&mut lat, 0.99),
+    );
+}
+
+/// E177 `crash-group WORK KILLS THREADS`: THREADS writers sharing flushes
+/// in a child that is killed at random, KILLS times; after each kill every
+/// writer's ref must be at or past its last acknowledged commit, and the
+/// last 2,000 commits of each chain must read back and hash to their ids.
+fn crash_group(work: &Path, kills: u32, threads: u64) {
+    let dir = work.join(format!("crash-group-{threads}"));
+    let _ = std::fs::remove_dir_all(&dir);
+    drop(fast_pack(&dir));
+    let exe = std::env::current_exe().unwrap();
+    let mut rng = Rng(13);
+    let (mut ok, mut lost, mut bad, mut failed) = (0, 0, 0, 0);
+    let mut open_ms = Vec::new();
+    let mut acked_total = 0u64;
+    for k in 0..kills {
+        let mut child = Command::new(&exe)
+            .args(["crash-group-child", dir.to_str().unwrap(), &threads.to_string()])
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let stdout = child.stdout.take().unwrap();
+        let n = threads as usize;
+        let acks = std::thread::spawn(move || {
+            let mut last = vec![0u64; n];
+            for line in BufReader::new(stdout).lines().map_while(Result::ok) {
+                if let Some(v) = line.strip_prefix("ack ") {
+                    let mut it = v.split(' ');
+                    let t: usize = it.next().unwrap().parse().unwrap();
+                    let seq: u64 = it.next().unwrap().parse().unwrap();
+                    last[t] = last[t].max(seq);
+                }
+            }
+            last
+        });
+        std::thread::sleep(Duration::from_millis(300 + rng.below(1_200)));
+        let early = child.try_wait().unwrap();
+        child.kill().unwrap();
+        child.wait().unwrap();
+        if let Some(status) = early {
+            failed += 1;
+            eprintln!("child exited before the kill: {status}");
+        }
+        let acked = acks.join().unwrap();
+        let t = Instant::now();
+        let s = fast_pack(&dir);
+        open_ms.push(ms(t.elapsed()));
+        let mut verdict = Ok(());
+        for (w, &a) in acked.iter().enumerate() {
+            let r = match s.get_ref(&format!("heads/w{w}")) {
+                Err(e) => Err(e.to_string()),
+                Ok(None) if a == 0 => Ok((0, 0)),
+                Ok(None) => Err("ref lost".to_string()),
+                Ok(Some(h)) => walk_chain(&s, h, 2_000),
+            };
+            match r {
+                Ok((top, _)) if top >= a => {}
+                Ok((top, _)) => verdict = Err(format!("kill {k} w{w}: acked {a} but ref is at {top}")),
+                Err(e) => verdict = Err(format!("kill {k} w{w}: {e}")),
+            }
+        }
+        acked_total = acked.iter().sum::<u64>().max(acked_total);
+        drop(s);
+        match verdict {
+            Ok(()) => ok += 1,
+            Err(e) if e.contains("acked") || e.contains("lost") => {
+                lost += 1;
+                eprintln!("{e}");
+            }
+            Err(e) => {
+                bad += 1;
+                eprintln!("{e}");
+            }
+        }
+    }
+    let (files, len, _) = disk(&dir);
+    println!(
+        "{{\"phase\":\"crash-group\",\"threads\":{threads},\"kills\":{kills},\"clean\":{ok},\"lost_acked\":{lost},\"corrupt\":{bad},\"child_failed\":{failed},\"commits_acked\":{acked_total},\"reopen_ms_p50\":{:.1},\"reopen_ms_max\":{:.1},\"files\":{files},\"apparent\":{len}}}",
+        pct(&mut open_ms.clone(), 0.5),
+        open_ms.iter().cloned().fold(0.0, f64::max),
+    );
+}
+
+fn crash_group_child(dir: &Path, threads: u64) {
+    use ikam_kernel::backends::GroupCommit;
+    use std::sync::Arc;
+    let g = Arc::new(GroupCommit::new(fast_pack(dir)).unwrap());
+    let handles: Vec<_> = (0..threads)
+        .map(|t| {
+            let g = g.clone();
+            std::thread::spawn(move || {
+                let name = format!("heads/w{t}");
+                let mut head = g.get_ref(&name).unwrap();
+                let mut seq = 0;
+                if let Some(h) = head {
+                    let st = fast_view(&g, h);
+                    seq = st;
+                }
+                let mut rng = Rng(seq ^ (t << 32) ^ std::process::id() as u64);
+                let out = std::io::stdout();
+                loop {
+                    seq += 1;
+                    let (objs, cid) = writer_batch(t, seq, head, &mut rng);
+                    g.commit(&objs, &name, head, cid).unwrap();
+                    head = Some(cid);
+                    let mut o = out.lock();
+                    writeln!(o, "ack {t} {seq}").unwrap();
+                    o.flush().unwrap();
+                }
+            })
+        })
+        .collect();
+    for h in handles {
+        h.join().unwrap();
+    }
+}
+
+/// The sequence number of commit `h`, read through the group's store.
+fn fast_view(g: &ikam_kernel::backends::GroupCommit, h: Id) -> u64 {
+    parse_commit(&g.read(&h).unwrap()).unwrap().0
 }
