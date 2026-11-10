@@ -1232,8 +1232,10 @@ fn crash_group_child(dir: &Path, threads: u64) {
             })
         })
         .collect();
-    for h in handles {
-        h.join().unwrap();
+    // The writers never return; the parent kills this process.
+    drop(handles);
+    loop {
+        std::thread::park();
     }
 }
 
