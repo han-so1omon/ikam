@@ -2314,3 +2314,213 @@ Newest last. Format and rules: `README.md`.
 - exp/139 had merged exp/122-store-bakeoff at its first commit, so E122's four later commits were in no branch after it: the bake-off harness (`examples/stores.rs`), pack checkpoints and CRC-checked reads, the FsStore OS ref lock, sealed pack lookups by interpolation search, and E122's own log, registry and options entries. They are merged into exp/152-held-index now. PackStore keeps E139's `read_head` and E147's `stored_len`; its whole read is E122's CRC-checked one.
 - Gates: 174 kernel tests pass; clippy `-D warnings` clean with and without the store features; the fixed bench matches E152 in every byte count and the north score (0.3035); cost score 0.2451 against 0.2311, from timings (another job ran alongside). E133's goals fetch the same bytes (684 KB and 89 KB).
 - `packages/kernel/scripts/mac-bakeoff.sh` runs the measurements that need macOS (flush cost per commit, kills, APFS small files, E152's goal on files and packs, clonefile) in its own folder, as the user, with no sudo and no service or port.
+
+### E153 fragment-cuts (how to cut content into fragments)
+- Branch / parent: exp/153-fragment-edits / E152 (main badc682)
+- Question: Eric (Nov 9) asked for experiments on fragments as the Python version had them (research note `docs/research/fragments-and-ir.md`). Which cut makes a good fragment: one that is shared across files and survives edits?
+- Change: none in the kernel. `examples/fragments.rs` cuts the 534 md and text files of the cases (1,035,302 bytes) whole, by line, by paragraph block (ending after a run of blank lines, cut at a line past 16 KiB), by CDC at 256, 1,024, 4,096 and 16,384 bytes, and by line-aligned CDC. Per cutter: distinct fragments and their bytes, zstd 3 over the distinct fragments end to end, a stored-size proxy (that zstd plus 32 bytes per distinct fragment and 4 per reference), size distribution and fan-out.
+- Result:
+  - Proxy bytes: whole 175,489 (dedup 1.11); lines 626K (dedup 1.95, but reference overhead); blocks 265,571 (dedup 1.24, median block 122 bytes); CDC 256 262K; CDC 1,024 197K; CDC 4,096 and 16,384 about as whole; line-aligned CDC like CDC.
+  - zstd over each cutter's distinct fragments: about 157 KB for every cutter. Finer cuts do not help storage; the matcher and zstd already find what is shared.
+  - Blocks: 805 shared blocks (125.7 KB), the largest fan-out 52. Natural fan-out is mostly the case generator's boilerplate (23 files).
+- Verdict: **measured**. Paragraph blocks are the cut for edits (E154), not for storage.
+
+### E154 edit-survival (new bytes per edit, by cutter)
+- Branch / parent: exp/153-fragment-edits / E153
+- Question: how many new bytes and references does a small edit cost under each cutter?
+- Change: none in the kernel; part of `examples/fragments.rs`: four edits per md file (a word replaced in a middle line, a paragraph inserted, a line deleted, a note appended), measured as new fragment bytes and changed references per cutter, and as the bytes the kernel's `put_content` of the edited file writes.
+- Result: whole files 740 to 860 new bytes per edit; lines 0 to 101 bytes but about 27 to 30 references; blocks 115 to 176 bytes, 1 to 2.3 new fragments and 5.6 to 7.6 references; CDC 256 201 to 367 bytes; CDC 1,024 345 to 549 bytes. The kernel's `put_content` of an edited file writes 139 to 194 bytes today.
+- Verdict: **measured**. Blocks give the fewest new bytes with few references, so a block is the edit unit for E155.
+
+### E155 fragment-renders (a file stored as a render over its blocks)
+- Branch / parent: exp/153-fragment-edits / E154
+- Question: can one edit to a shared fragment reach every file that renders it without re-planning those files?
+- Change: `func.rs` adds the builtin `render/1`, which concatenates like `concat/1` but is a fact (not in `is_plan`), so repack keeps it; `range.rs` reads ranges of a render through its fragments. New `src/fragment.rs`: `blocks`, `put_fragmented` (fragments plus one render fact; a content of one fragment is stored as itself), `fragments_of`, `FragmentIndex` (which files render each fragment), `propagate`. `tests/fragment.rs`: blocks cover their input; after `propagate` every file that rendered the old fragment reads as before with it replaced, nothing else changes, the index follows the edit and fsck is clean; a render survives repack. `examples/propagate.rs` compares `scan-rewrite` (today: read every file, splice, `put_content`), `index-rewrite` (a side index finds the files) and `render`, on the 343 md files of the cases with natural fan-out and with a notice inserted into 1 to 256 copies.
+- Result: stored at rest after repack 69,332 bytes as plain files, 169,623 as renders (+145%). Read pass 17.2 ms plain, 24 to 25 ms as renders. Edits: every check and fsck pass; render writes fewer bytes than index-rewrite at fan-out 64 and above (E157 has the numbers).
+- Verdict: **kept** as an option on its branch, not a default: renders cost too much at rest (see E156, E157). `render/1` is a new builtin, a stored-format addition, so it waits on Eric's yes.
+
+### E156 render-short (renders with short records)
+- Branch / parent: exp/153-fragment-edits / E155
+- Question: how much of E155's cost at rest is the records, and does E104's `short_records` take it back?
+- Change: none beyond E155; `examples/propagate.rs` runs `render` with `short_records` on.
+- Result: stored at rest 120,903 bytes (+74% over plain). Edit time at fan-out 256: 69.7 ms against index-rewrite's 117 ms.
+- Verdict: **measured**; E157 goes further.
+
+### E157 render-runs (only shared blocks stand alone)
+- Branch / parent: exp/153-fragment-edits / E156
+- Question: if only blocks that appear in two or more files stand alone and each run of other blocks is one fragment, is the cost at rest small enough?
+- Change: `put_fragmented(bytes, Some(&shared))` merges runs of unshared blocks; `FragmentIndex.inner` records the blocks inside run fragments, so a block that later becomes shared is still found and its run is rewritten (`Part::Splice`). The law test covers runs.
+- Result (343 md files; bytes written per edit, render-runs against index-rewrite):
+  - At rest after repack: 85,851 bytes (+24% over plain); read pass 14.5 ms (plain 17.2 ms). The index holds 824 fragments and is built in 6.25 ms.
+  - Natural fan-out 23: about 10.7 KB against 18.0 KB, and 8.2 KB against 13.6 KB.
+  - Fan-out 64: 22.0 KB against 30.0 KB; about 23 ms against 28 to 37 ms.
+  - Fan-out 256: 85.6 KB against 115.3 KB; 85 ms against 117 ms.
+  - Small fan-out: the same (about 0.9 to 1.7 ms). scan-rewrite takes 7 to 117 ms (7 ms even at fan-out 1, against 0.9 ms with an index).
+  - Trees and records dominate the bytes written; the synthetic `fan/i/` layout inflates the tree bytes.
+- Verdict: **kept** as an option, off by default: a store whose work is edits that reach many files pays 24% at rest for 26 to 40% fewer bytes per edit and a faster edit at large fan-out. On its branch until Eric says to merge.
+
+### E158 render-locality (does one paragraph change only its piece of each format?)
+- Branch / parent: exp/153-fragment-edits / E157
+- Question: an md file has html, docx and pdf renders (`fixtures/multiformat`). Is a block's render a piece of the whole render, so a fragment edit can be spliced into each format instead of re-rendering it?
+- Change: `scripts/render_locality.py` (pandoc 3.1.3, LibreOffice). pandoc with `SOURCE_DATE_EPOCH=1767225600` and `--metadata pagetitle=<name>` reproduces the committed html byte for byte. Per text: whether each block's render alone appears in the whole render (html; docx `word/document.xml` body), and three edits per text (blocks at 1/4, 1/2, 3/4) spliced against a full re-render; one pdf re-render per text; bytes the kernel writes for each new render (`ikam put`).
+- Result:
+  - html: 571 of 576 blocks local; 72 of 72 edits splice byte-identical to the full re-render. Rendering the block alone takes a median 13.9 ms against 58 ms for the document.
+  - docx: 26 of 576 blocks local and 0 of 72 edits exact. pandoc numbers bookmarks (`w:id`), lists (`numId`, in document order) and places `bookmarkEnd` across the whole document. With those ids normalised, 206 of 236 blocks (the first 10 texts) are local.
+  - Median times: full docx 77 ms, block docx 44 ms, pdf through LibreOffice 1,049 ms.
+  - Median bytes the kernel writes for a regenerated render: html 488, docx 1,504, pdf 2,517.
+- Verdict: **measured**. html renders can be spliced per fragment; docx needs a renderer that renumbers document-wide ids (an option, not built); pdf is regenerated.
+
+### E159 fragment-grants (goal-scoped edits under sealed grants)
+- Branch / parent: exp/153-fragment-edits / E158
+- Question: can a goal's sealed grant (E140) scope a propagated edit, so it touches only the ranges the goal may write, without diffing every file?
+- Change: `fragment.rs` adds `propagate_granted`: it plans every file's parts first, takes each changed range from fragment lengths, checks the grant per file (no file: `NoFile`; another version: `Stale`; a range outside the write ranges: `Outside`) and writes nothing unless every file passes. `grant::inside` is `pub(crate)`. `tests/fragment.rs` adds `refused_grant_writes_nothing`. `examples/fragment_grants.rs` (the cases' md files plus a notice in n copies, render-runs): no grant, a full grant, the E140 diff check of the same edit, half the files granted, another block granted, and a stale version.
+- Result (median of 5; n = 16, 64, 256):
+  - No grant against a full grant: 5.5 / 5.5 ms, 20.3 / 22.9 ms, 88.7 / 81.9 ms (within noise), the same bytes written (5,766, 22,038, 85,616).
+  - The diff check alone would add 1.0, 4.1 and 17.5 ms (it reads and diffs every file).
+  - Refusals write nothing and leave the index as it was: half granted 0.6, 2.2, 9.2 ms; another block or a stale version 0.03 to 0.08 ms.
+  - The sealed grant lists every file: 2,251, 9,087 and 35,772 bytes (about 140 bytes per file). A grant naming the fragment instead would be about 57 bytes whatever n is.
+  - All kernel law tests on the branch pass.
+- Verdict: **kept** with E155 (the check is free once edits go through fragments). A fragment-scoped grant is an option to build if grants that reach hundreds of files are common.
+
+### E160 fragment-queries (search and insights over fragments, kept fresh)
+- Branch / parent: exp/153-fragment-edits / E159
+- Question: do indexes over fragments answer queries as exactly as file indexes, and can a propagated edit keep them fresh without a rebuild?
+- Change: none in the kernel. `examples/fragment_query.rs`: the cases' md files plus a notice in 64 copies (407 files, 214,129 bytes), render-runs. 41 patterns (40 from the corpus by a fixed LCG, one notice phrase), each answer checked against a scan. A fragment search scans each distinct fragment and each distinct seam (63 bytes on each side of a boundary) once; a fragment trigram index narrows them. Per-fragment word counts, summed through each file's fragment list, checked against counting each file. Then the notice is revised by one `propagate` over 64 files.
+- Result:
+  - Search per query: scan 12.5 ms (178 KB decoded); stored index (E058/E094, 186 KB) 1.84 ms (36 KB decoded), built in 35 ms; fragment scan 0.45 ms (230 KB scanned, fragments held decoded: 159 KB plus 71 KB of seams); fragment trigram index (281 KB encoded) 0.11 ms, 10.8 KB scanned. All answers exact.
+  - Word counts: per fragment 3.8 ms against 20.2 ms per file; summing all 407 files from fragments 4.2 ms, exact.
+  - Goal reads: the paragraphs that hold a pattern are 8.0 KB per query against 29.2 KB for the files that hold it.
+  - After the edit: the stored index left stale answers exactly but slower (5.2 ms, 66 KB decoded, since the 64 new files are scanned); rebuilding it takes 42 ms. The fragment indexes and counts update in 1.5 ms by reading one new fragment (101 bytes), and every answer and count stays exact.
+- Verdict: **measured**. With files stored as renders, queries and insights per fragment stay fresh for the cost of the new fragment; the fragment trigram index is larger than the stored one (its seams and 33-byte keys), which a seam bound and a packed key list would cut. Nothing to merge beyond the example.
+
+### E161 table-ir (one table, many formats)
+- Branch / parent: exp/153-fragment-edits / E160
+- Question: the Python version's `TableIR` (StructuredDataIR) with a deterministic renderer and a byte-identity drift spec: can a cell edit be made once and reach csv, json, md, docx and pdf (`fixtures/tables`, 24 workbooks)?
+- Change: none in the kernel. `scripts/table_ir.py` lifts each csv into a TableIR: header, rows, per cell whether the spreadsheet typed it as a number (LibreOffice quotes only text cells), and two residuals (the md's title and source line; the csv's empty rows). Renderers follow `fixtures/tables/render.py`. A one-cell edit (the middle row's last numeric cell) is rendered to every format; the kernel's bytes written are the store files a put creates or rewrites. A scaled run (synthetic: one workbook's rows repeated to 10,000) shows the cost with size.
+- Result:
+  - Byte-exact renders: csv 24 of 24, json 24 of 24, md 24 of 24. Without cell types, 13 of 24 csv files reproduce; without the empty-row residual, 23 of 24.
+  - Stored: the IR alone 6,515 bytes against 12,725 bytes for csv, json and md put as files (51%), with json and md rendered on read.
+  - The edit: each rendered csv, json and md differs from the old in one contiguous range, 24 of 24. Bytes the kernel writes for all 24 tables: csv 3,105, json 3,566, md 4,124; docx 49,005 and pdf 92,905 (regenerated: docx median 45 ms, pdf 895 ms; not byte-identical to the committed files, which carry tool timestamps).
+  - Scaled: rendering 10,000 rows takes 23 ms (csv), 99 ms (json), 11 ms (md); the kernel writes 12.7 to 16.1 KB per one-cell edit there, against 164 to 363 bytes at 100 and 1,000 rows.
+- Verdict: **measured**. A typed table IR reproduces every committed text format and halves their storage; cell types are what the IR must keep. At 10,000 rows a one-cell edit costs the kernel 13 to 16 KB, so large tables want rows as fragments (an option, not built).
+- Gates on the branch (E153 to E161): 178 kernel tests pass; clippy `-D warnings` clean on all targets; the fixed bench matches main (badc682) in every byte count, read cost and the north score (0.3035); cost score 0.2564 against 0.2392, from timings only (the bench never stores a render).
+
+### E162 fragment-grant (a grant that names one fragment)
+- Branch / parent: exp/162-fragment-options / E161
+- Question: E159's sealed grant lists every file it reaches (about 140 bytes each). Can a grant name the fragment instead, at a constant size, with the same checks?
+- Change: `grant.rs` adds `FragmentGrant { goal, fragment, within }` (its own seal tag, `seal`, `verify`, `allows`). `fragment.rs` adds `propagate_fragment_granted`: refused as `Stale` when the grant names another version of the fragment, as `NoFile` when a file that renders it lies outside `within`, otherwise `propagate_granted` with no per-file grant. `tests/fragment.rs` adds `fragment_grant_scopes_one_fragment`. `examples/fragment_grants.rs` adds three cases.
+- Result (median of 5; n = 16, 64, 256):
+  - Grant size: 85 bytes at every n, against 2,251, 9,087 and 35,772 bytes for the per-file grant.
+  - Edit time: 5.7, 19.9 and 91.0 ms, the same as the per-file grant within noise.
+  - Refusals (a file outside `within`, a stale fragment) take 0.002 ms and write nothing.
+- Verdict: **kept** as an option beside the per-file grant. It is a sealed format addition (a new tag), so it waits on a merge decision.
+
+### E163 docx-splice (a docx renderer that splices one block)
+- Branch / parent: exp/162-fragment-options / E162
+- Question: E158 found 0 of 72 docx splices exact, because pandoc numbers bookmarks and lists across the document. Can a renderer that maps those ids splice one edited block exactly?
+- Change: none in the kernel. `scripts/docx_splice.py`: the old document.xml split into top-level items; the edited block's items (rendered alone) replace the old block's, list ids mapped to the document's, the context style (FirstParagraph or BodyText) taken from the position, and a heading's section bookmark renamed. The package is rewritten with the old entries' order, flags and deflate settings (Python's zipfile would change the flags).
+- Result: 72 word edits and 24 heading edits. document.xml identical 96 of 96, every other part identical 96 of 96, the whole .docx identical 96 of 96. Median 35 ms per splice (mostly pandoc rendering the block) against 65 ms for the full render.
+- Verdict: **kept** as a script. Edits that add or remove headings or lists were left to E169.
+
+### E164 table-rows (rows as fragments for large tables)
+- Branch / parent: exp/162-fragment-options / E163
+- Question: E161 measured 13 to 16 KB written per one-cell edit at 10,000 rows. Do rows (or groups of rows) stored as fragments cut that?
+- Change: `fragment.rs` adds `put_cut(bytes, cuts, fanout)`: a render over given pieces, optionally a tree of renders with at most `fanout` children. `examples/table_rows.rs`: synthetic tables (one workbook's rows with every digit redrawn, so rows do not repeat) as csv and md at 1,000, 10,000 and 100,000 rows; forms plain, rows, groups-64, tree-64, tree-groups-64; one appended digit in the middle row; everything checked byte-exact with fsck clean, before and after a repack.
+- Result (csv; md is alike):
+  - plain: 14 KB, 139 KB, 1.41 MB at rest; an edit adds 166 to 169 bytes at every size, in 2.7, 24 and 353 ms.
+  - rows: about 10 times larger at rest; an edit adds 33 KB, 330 KB and 3.3 MB (the render names every row).
+  - groups-64: +45% at rest; an edit adds 763 B, 5.4 KB and 51.8 KB, in 1.2, 7.9 and 60 ms.
+  - tree-groups-64: an edit adds 763 B, 2.5 KB and 3.2 KB, in 1.1, 11 and 115 ms. tree-64 is slow (2.8 s per edit at 100,000 rows).
+  - After a repack plain is smallest (100,000-row csv: 938 KB, against 1.18 MB for groups and 1.14 MB for tree-groups). Repack takes 36 s at 100,000 rows plain and 70 s for groups (the 100,000-row repack run was cut by the 30-minute limit; the rest is in the raw output).
+  - Correction to E161: its 13 to 16 KB per edit at 10,000 rows was FsStore rewriting store files. In memory the kernel adds about 168 bytes for a plain put, at any size.
+- Verdict: **discarded** as a default; plain puts already write about one row. Groups of rows are an option only for faster edits on very large tables (6x faster at 100,000 rows), at +45% stored.
+
+### E165 table-ir-store (TableIR stored, json and md rendered on read)
+- Branch / parent: exp/162-fragment-options / E164
+- Question: store E161's typed TableIR (the csv itself, which carries the cell types, plus a residual sidecar) instead of csv, json and md, and render the other two on read?
+- Change: none in the kernel. `scripts/table_ir_store.py`: four layouts ingested with `ikam ingest` (commit, repack, verify): the three text formats as files, the IR (csv plus `<name>.table.json`), and each with xlsx, docx and pdf added. json and md rendered from what `ikam cat` returns.
+- Result:
+  - Stored: 3,736 bytes against 6,519 for the three text formats (-43%); with the office formats 133,135 against 135,572 (-1.8%).
+  - csv, json and md byte-exact 24 of 24; rendering json and md on read takes 0.14 ms for these tables.
+  - Scaled (synthetic): rendering on read takes 241 ms at 10,000 rows and 2,656 ms at 100,000, against 6 to 11 ms and 35 to 94 ms to read the stored files.
+- Verdict: **measured**. An archive option (cold tables, text formats only); for tables read often, storing the renders is faster and the kernel already stores them compactly.
+
+### E166 render-range-lengths (bug: range reads rebuilt whole arguments)
+- Branch / parent: exp/162-fragment-options / E165
+- Question: E164's range reads of render trees cost far more decode work than the range. Why?
+- Change: `range.rs` (`concat_range`) learned each whole argument's length by rebuilding it. It now asks `content_length`, which takes the length from the derivation for concat and render (summed recursively, memoized in the reconstruction context, with the existing stack guard), and rebuilds only otherwise. `tests/fragment.rs` adds `range_read_of_a_render_tree_skips_what_it_does_not_read`.
+- Result: a 100-byte range of a 4,096-line render tree: decode work 99,064 to 400. The fixed bench is unchanged in every byte count, read cost and the north score (0.3035); the cost score moves with timings only.
+- Verdict: **kept** (a fix to a default read path; no format change).
+
+### E167 endpoints (one md edit carried to its html and docx)
+- Branch / parent: exp/162-fragment-options / E166
+- Question: one md paragraph edit, carried to the text's html and docx by splices (E158, E163) and stored in the kernel: what does it cost against re-rendering both, and should the html be stored as fragments?
+- Change: none in the kernel. `scripts/endpoints_prep.py` makes 72 edits (24 texts, E158's three each), each html and docx splice checked byte-identical to a full pandoc re-render. `examples/endpoints.rs` stores the old md, html and docx, then the new ones, in two forms: every file with `put_content`, or the html as a render over its block pieces (`put_cut`).
+- Result:
+  - Rendering: the splices take a median 58 ms against 134 ms for re-rendering html and docx in full; 72 of 72 html and docx exact.
+  - Bytes the kernel adds per edit (median): md 172, html 196, docx 1,951 (all files 2,340) as files; html 1,071 as fragments (all 3,210), because the new render names every piece.
+  - Every file reads back exact and fsck is clean.
+- Verdict: **measured**. For one file and its renders, splice the renders and store them as plain files: the matcher already writes about one paragraph for the html. Storing renders as fragments pays only when blocks are shared by many files (E157).
+
+### E168 fragment-index-compact (a smaller fragment search index)
+- Branch / parent: exp/162-fragment-options / E167
+- Question: E160's fragment trigram index was 281 KB against the stored index's 186 KB, from its 33-byte keys and 63-byte seams. Can a packed form match it and keep answers exact?
+- Change: none in the kernel. `examples/fragment_query.rs` adds a compact index: postings name fragments by position (the fragment list stored once, 32 bytes an id), seams are not stored (each file's fragment list gives them), and a seam is indexed only by the two trigrams that cross its boundary (any pattern of three bytes or more that crosses it holds one). A candidate seam is checked on the bytes around that boundary in each file that has it, walking into neighbouring fragments as far as the pattern reaches, so patterns of any length are exact (E160 was limited to 64 bytes).
+- Result:
+  - Size: 185,690 bytes (ids 21,600; fragment postings 162,408; seam postings 1,682) against 280,615 (-34%), about the stored index's 186,420. Bitmaps for dense lists save 98 bytes.
+  - Query: 0.093 ms per query, 9.9 KB scanned, against 0.103 ms and 10.8 KB; all 41 answers exact, and 10 patterns of 200 bytes exact.
+  - Build 7.8 ms against 20.8 ms; after the 64-file edit the index updates in 0.24 ms, every answer exact.
+- Verdict: **kept** as the encoding for a fragment index (the example only; no kernel change).
+
+### E169 docx-restructure (docx splices that add or remove blocks)
+- Branch / parent: exp/162-fragment-options / E168
+- Question: E163 spliced one block of the same shape. Can the docx renderer splice inserts and deletes, new headings and new lists, by renumbering what pandoc numbers across the document?
+- Change: none in the kernel. `scripts/docx_restructure.py`: at ingest each md block's items are recorded (blocks markdown joins in the document, such as a list continued past a blank line, are kept as one group). An edit replaces a range of blocks with any md: bookmarks dropped, new items spliced in with fresh list ids, context styles set at both seams from what follows what in the old document, section bookmarks rebuilt from the headings (ids from 20 in the order their ends appear, names kept or made unique as pandoc does), lists renumbered from 1001 in order of first use, numbering.xml rebuilt to match. Where the new text touches a list, the neighbouring block is rendered with it, since markdown may join the lists. `docx_splice.rezip` takes several parts.
+- Result (24 texts each): paragraph inserted 24/24, paragraph deleted 24/24, heading and paragraph inserted 24/24, two-item list inserted 24/24, heading deleted 24/24, one-word edit 24/24, and (synthetic, as no text has the case) a paragraph between two lists deleted so the lists join 24/24. The whole .docx byte-identical to a full re-render in all 168. Median ms, splice against full render: deletes 2.8 against 77; inserts 45 to 49 against 69 to 77; a list insert 95 against 78 (it renders its neighbour too).
+- Verdict: **kept** as a script. Not covered: tables, footnotes, images, and edits to the title block.
+- Gates on exp/162-fragment-options (E162 to E169): 180 kernel tests pass; clippy `-D warnings` and `cargo fmt --check` clean on all targets; the fixed bench matches exp/153 and main (badc682) in every byte count, read cost and the north score (0.3035).
+
+### E180 formula-ir (a table IR with values, number formats and formulas)
+- Branch / parent: exp/162-fragment-options / E169 (numbered from 180 because the storage thread holds E170 to E179)
+- Question: E161's TableIR is lifted from the csv, so a formula's result is only text. Can an IR lifted from the workbook (the Python version's StructuredDataIR with ExpressionIR) render every committed format exactly and carry an input edit to every cell computed from it?
+- Change: none in the kernel. `scripts/formula_ir.py`: the first sheet of each of the 24 workbooks as cells (value or formula, and number format). A formula is an OpShape (its AST with references relative to its cell) and an OpInstance (its cell). The renderer evaluates formulas (+ - * /, comparisons, IF, AND, SUM; a cycle shows as LibreOffice's Err:522), shows each value by its format (General, `$#,##0`, `0%`, `0.0%`; a General formula cell takes the format of the first cell it reads, as LibreOffice does), and writes csv with LibreOffice's quoting, then json and md (E161's renderers). Per formula, the first numeric input it reads is doubled (or set to 7 when 0); the truth is the workbook edited with openpyxl and recalculated and exported by LibreOffice, as `fixtures/tables/render.py` does.
+- Result:
+  - The unedited IR renders csv, json and md byte-exact for 24 of 24 workbooks.
+  - 25 formulas in 9 workbooks are 12 shapes (`B2*12` in C2 and `B3*12` in C3 are one).
+  - Input edits: 22 (3 formulas read no plain number: a SUM over formulas and two cyclic totals). csv, json and md exact 22 of 22; each edit changes 2.5 cells on average (the input and what is computed from it). The IR recomputes and renders in 0.12 ms against 872 ms for LibreOffice.
+- Verdict: **measured**. Values, formats and formula shapes are enough to carry an input edit to every format exactly for this corpus; a formula evaluator and format renderer is the price, and the corpus exercises few functions.
+
+### E181 fanout-endpoints (one paragraph edit to 64 files and their renders)
+- Branch / parent: exp/162-fragment-options / E180
+- Question: one paragraph shared by 64 md files is edited once. What does it cost to carry it to the 64 md files and their 64 html and 64 docx renders (192 endpoints), against re-rendering?
+- Change: none in the kernel. `scripts/fanout_prep.py`: the 24 multiformat texts cycled to 64 copies, each with the same notice paragraph before its middle block (as E160), so 24 of the 64 are distinct. The notice is revised. Renders made by full pandoc runs, or by rendering the notice once and splicing it into each file (html as in E158, docx with E169's renderer). `examples/fanout_endpoints.rs` stores the 192 old files in one commit and the 192 new ones: every file with `put_content`, or the md files as render-runs (E157) with the edit as one `propagate`.
+- Result:
+  - Renders: 64 of 64 html and 64 of 64 docx spliced files byte-identical to full re-renders. Splicing all 128 takes 194 ms with 3 pandoc runs, against 8,477 ms and 128 runs to re-render (about 3.2 s if only the 24 distinct files were re-rendered).
+  - Kernel (median of 3): all files as plain puts add 47,388 bytes in 158 ms; md as render-runs add 25,249 bytes in 222 ms (md 6,235, html 7,046, docx 11,968). At rest 228,047 and 230,669 bytes. Every file reads back exact; fsck clean.
+- Verdict: **measured**. For an edit that reaches many files and their renders, rendering the changed block once and splicing it is about 44 times faster than re-rendering and exact; render-runs for the md halve the bytes the kernel writes. Duplicate copies in this corpus flatter the bytes; the render times are per file.
+- Gates (E180, E181): scripts and examples only; clippy `-D warnings` and fmt clean; the kernel is as at E169's gates.
+
+### E182 fragment-insights (summaries per fragment kept fresh through edits)
+- Branch / parent: exp/162-fragment-options / E181
+- Question: insights over a corpus (word counts and document frequency, dollar amounts, dates, headings, list items) are sums over files. If each fragment keeps its own summary, can an edit, including one propagated to many files, update the corpus totals by reading only the changed fragments, and how wrong do they get if left alone?
+- Change: none in the kernel. `examples/fragment_insights.rs`: the multiformat md texts plus 64 `fan/` copies holding one shared notice (407 files, 214,129 bytes) stored as render-runs. A summary per fragment; a file's summary is the sum of its fragments'; corpus aggregates (word totals and document frequency, dollar total and count) take a file's summary out and the new one in. Stream of 22 edits: the notice revised by `propagate` (64 files), the most-shared block of the real texts revised by `propagate`, and 20 single-file edits. Policies: full recompute from every file; eager (fragments read only where the summary cache misses, aggregates updated per edit, checked equal to full after every edit); lazy (nothing updated until a refresh at the end).
+- Result:
+  - Build: 21.6 ms reading 158,915 bytes over 675 fragments, against 24.5 ms reading 214,129 bytes.
+  - Stream: eager 7.5 ms reading 5,671 bytes in all, exact after all 22 edits; full 481 ms reading 4,780,872 bytes. The 64-file edit costs 1.55 ms and 117 bytes eager, against about 21 ms and 216 KB full.
+  - Lazy staleness: after the 64-file edit, 64 file summaries wrong, top 20 words by count still 20/20, by document frequency 19/20, 3 document-frequency errors, dollar total off by $160,000. After all 22 edits: 105 files wrong, top 20 19/20, 47 errors, dollar total off by $222,240. Refresh: 5.9 ms reading 5,475 bytes, exact.
+- Verdict: **measured**. Keeping summaries per fragment is cheaper than keeping them stale: eager upkeep costs about 0.3 ms per edit here and is always exact; a shared-fragment edit costs one fragment read whatever its fan-out. Lazy upkeep looks right on top-word lists and is wrong on totals.
+
+### E183 goal-queries (insight queries that read only the fragments a goal needs)
+- Branch / parent: exp/162-fragment-options / E182
+- Question: a goal-scoped question ("for each file that mentions W, the dollar amounts and dates in the blocks that mention it") needs only some fragments. With E182's per-fragment word sets, how much less is read than scanning files?
+- Change: none in the kernel. In `examples/fragment_insights.rs`: 12 words chosen by a fixed seed among words in 5 to 120 files. Each query answered by reading every file, or by reading only the fragments whose word set holds W; answers compared. A second query answered from summaries alone: files that mention W and cite over $100,000 in all.
+- Result: 14 files per query on average. Fragments: 0.33 ms reading 8,406 bytes per query, against 15.0 ms reading 217,693 bytes; answers equal for all 12. Summary-only query: 0.025 ms reading nothing, against 18.3 ms reading 214,129 bytes; 3 matches, equal.
+- Verdict: **measured**. A goal-scoped query over fragments reads about 4% of the bytes and is about 45 times faster here; a query whose answer is a function of summaries reads no content at all.
+
+### E184 table-aggregates (aggregates kept fresh from the computed-table IR)
+- Branch / parent: exp/162-fragment-options / E183
+- Question: E180's IR carries an input edit to every computed cell. Can corpus aggregates over the 24 workbooks (dollar totals per workbook and per column header, percent cells counted) be kept fresh by re-evaluating only the edited workbook's IR?
+- Change: none in the kernel. `scripts/table_aggregates.py`: aggregates from each workbook's committed csv, checked equal to the IR's. For each of E180's 22 input edits, the truth is LibreOffice's recalculated csv for that workbook with the other 23 unchanged. Policies: full (parse all 24 csv renders); ir (re-evaluate the edited workbook's IR and apply the difference of its aggregates); lazy (left as they were).
+- Result: ir and full both exact 22/22. ir 0.14 ms against 0.32 ms (one workbook evaluated against 24 renders parsed, 4,412 bytes; the corpus is small). Lazy: 18 of 22 edits leave an aggregate wrong; median error in the corpus dollar total $1,950,000 of $93,589,350.
+- Verdict: **measured**. The IR keeps table aggregates exact from one workbook's evaluation with no renderer run. At 24 small workbooks the time saved is small; the point is that it scales with the edited workbook, not the corpus.
+- Gates (E182 to E184): examples and scripts only; clippy `-D warnings` and fmt clean; the kernel is as at E169's gates.

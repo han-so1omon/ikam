@@ -66,7 +66,7 @@ fn normalise(mut v: Vec<Range<u64>>) -> Vec<Range<u64>> {
 
 /// Whether `at` (a region of the old version; empty for an insertion) lies
 /// inside one of the sorted, merged `ranges`.
-fn inside(ranges: &[Range<u64>], at: &Range<u64>) -> bool {
+pub(crate) fn inside(ranges: &[Range<u64>], at: &Range<u64>) -> bool {
     let i = ranges.partition_point(|r| r.end < at.end);
     ranges
         .get(i)
@@ -253,6 +253,54 @@ impl Grant {
     /// (compared in constant time).
     pub fn verify(&self, key: &[u8; 32], tag: &[u8; 32]) -> bool {
         blake3::keyed_hash(key, &self.encode()) == blake3::Hash::from(*tag)
+    }
+}
+
+/// A grant to change one fragment wherever it is rendered (E162), in the
+/// files whose paths start with `within` (empty: every file). Its size does
+/// not depend on how many files render the fragment. The fragment's id is
+/// the version: once it is replaced, the grant no longer applies. Unlike a
+/// [`Grant`], it also covers files that start rendering the fragment after
+/// it is issued, and it grants no reads.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FragmentGrant {
+    pub goal: String,
+    pub fragment: Id,
+    pub within: String,
+}
+
+/// First bytes of a fragment grant's encoding, so it never reads as a
+/// [`Grant`]'s (whose first 8 bytes are a goal length).
+const FRAGMENT_GRANT_TAG: &[u8; 16] = b"ikam:frag-grant\0";
+
+impl FragmentGrant {
+    pub fn encode(&self) -> Vec<u8> {
+        let mut out = FRAGMENT_GRANT_TAG.to_vec();
+        for b in [self.goal.as_bytes(), self.within.as_bytes()] {
+            out.extend_from_slice(&(b.len() as u64).to_le_bytes());
+            out.extend_from_slice(b);
+        }
+        out.extend_from_slice(self.fragment.as_bytes());
+        out
+    }
+
+    pub fn seal(&self, key: &[u8; 32]) -> [u8; 32] {
+        *blake3::keyed_hash(key, &self.encode()).as_bytes()
+    }
+
+    pub fn verify(&self, key: &[u8; 32], tag: &[u8; 32]) -> bool {
+        blake3::keyed_hash(key, &self.encode()) == blake3::Hash::from(*tag)
+    }
+
+    /// Whether replacing fragment `old` in the file at `path` is allowed.
+    pub fn allows(&self, old: &Id, path: &str) -> Result<(), Denied> {
+        if self.fragment != *old {
+            return Err(Denied::Stale);
+        }
+        if !path.starts_with(&self.within) {
+            return Err(Denied::NoFile);
+        }
+        Ok(())
     }
 }
 

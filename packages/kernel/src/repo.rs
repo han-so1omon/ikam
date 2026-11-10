@@ -68,6 +68,8 @@ pub(crate) struct Cx {
     pub(crate) known: HashMap<Id, Vec<u8>>,
     /// Bytes produced by function evaluations so far: the decode work.
     pub(crate) work: usize,
+    /// Content lengths learned without rebuilding (E166).
+    pub(crate) lens: HashMap<Id, u64>,
 }
 
 impl Cx {

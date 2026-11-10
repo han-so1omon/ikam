@@ -12,6 +12,7 @@ mod container;
 mod db;
 mod dict;
 mod exec;
+mod fragment;
 pub mod func;
 mod grant;
 mod graph;
@@ -37,7 +38,8 @@ pub mod worktree;
 pub use container::expand;
 pub use db::{Db, Event, Op};
 pub use dict::decode_cost;
-pub use grant::{Denied, FileGrant, Grant, Sections, windows_around};
+pub use fragment::{FragmentIndex, blocks};
+pub use grant::{Denied, FileGrant, FragmentGrant, Grant, Sections, windows_around};
 pub use graph::Keys;
 pub use id::Id;
 pub use object::{

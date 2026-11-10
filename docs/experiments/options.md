@@ -255,3 +255,42 @@ it is an on-disk addition and waits on a decision.
 | Setting | Default | Trade | Measured |
 | --- | --- | --- | --- |
 | a caller holds the decoded `search_index()` between goals (no kernel switch) | each caller loads it | memory for the decoded index against reloading it per goal; contents written since are scanned, so results stay exact | E133's next goal 358 KB to 89 KB (60 KB with 16 KiB groups), same matches and writes |
+
+## Files as renders over fragments (E155 to E159)
+
+| Setting | Default | Trade | Measured |
+| --- | --- | --- | --- |
+| `put_fragmented(bytes, None)`, files as `render/1` over every paragraph block | files stored by `put_content` | one edit to a shared block reaches every file that renders it without re-planning them; +145% stored at rest (+74% with `short_records`) | 343 md files: 169,623 against 69,332 bytes after repack |
+| `put_fragmented(bytes, Some(&shared))`, only shared blocks stand alone (render-runs) | off | +24% stored at rest for 26 to 40% fewer bytes per propagated edit, and faster edits at large fan-out | fan-out 256: 85.6 KB and 85 ms against 115.3 KB and 117 ms (index-rewrite); fan-out 64: 22.0 against 30.0 KB |
+| `propagate_granted` with a goal's grant | `propagate` (no grant) | the grant is checked from fragment lengths, so a scoped edit costs no more than an unscoped one; the grant lists every file it reaches (about 140 bytes each) | n = 256: 81.9 ms granted against 88.7 ms ungranted; the diff check it replaces would add 17.5 ms |
+
+## Not built, measured as worth building
+
+| Option | Trade | Measured |
+| --- | --- | --- |
+| a fragment-scoped grant (the goal may change one fragment wherever it is rendered) | constant size against a per-file grant; needs a grant form that names a fragment | about 57 bytes against 35,772 for 256 files (E159) |
+| a docx renderer that renumbers document-wide ids, so docx renders splice per fragment like html | a renderer to maintain against re-running pandoc | 206 of 236 blocks local once bookmark and list ids are normalised; 0 of 72 splices exact without it (E158) |
+| rows as fragments for large tables | per-row references against one plain file | a one-cell edit of a 10,000-row table writes 12.7 to 16.1 KB today, against 164 to 363 bytes at 100 to 1,000 rows (E161) |
+| a typed table IR (TableIR) stored instead of its csv, json and md renders | json and md rendered on read (json 99 ms at 10,000 rows) against storing them | 6,515 against 12,725 bytes for the 24 workbooks, all renders byte-exact (E161) |
+
+## Fragment options built (E162 to E169)
+
+These are the options E158 to E161 listed above as not built; each is now built and measured.
+
+| Setting | Default | Trade | Measured |
+| --- | --- | --- | --- |
+| `propagate_fragment_granted` with a `FragmentGrant` (the goal may change one fragment wherever it is rendered, under a path prefix) | `propagate_granted` with a per-file grant | constant grant size against one entry per file; a new sealed grant form | 85 bytes at any fan-out against 35,772 for 256 files, same edit time (E162) |
+| `put_cut` over groups of 64 rows (optionally as a tree) for very large tables | `put_content` | +45% stored and larger after repack, for faster one-cell edits; plain puts already write about one row | 100,000 rows: edit 60 ms (tree 115 ms) against 353 ms; plain adds about 168 bytes (E164) |
+| a typed table IR (csv plus a residual sidecar) stored instead of csv, json and md | store each format | 43% fewer bytes for the text formats, for rendering json and md on every read | 241 ms to render at 10,000 rows against 6 to 11 ms to read (E165) |
+
+Renderers and indexes outside the kernel (scripts and examples; no switch):
+
+| Option | Trade | Measured |
+| --- | --- | --- |
+| docx renders spliced per edit (`scripts/docx_splice.py`, `scripts/docx_restructure.py`) instead of re-running pandoc | a renderer to keep in step with pandoc's numbering, against a full render per edit | 96/96 same-shape edits and 168/168 inserts and deletes byte-identical; deletes 2.8 ms, inserts 45 to 49 ms, against 65 to 77 ms (E163, E169) |
+| an md edit carried to its html and docx by splices, stored as plain files | storing the html as fragments costs more for one file (the render names every piece) | 58 against 134 ms; 2,340 bytes per edit as files, 3,210 with html fragments (E167) |
+| a compact fragment trigram index (positions, implied seams, crossing trigrams) | the fragment list must be held to map positions | 185,690 against 280,615 bytes, about the stored index's size, exact for any pattern length (E168) |
+| a computed-table IR (cell values, number formats, formulas as shapes) lifted from the workbook (`scripts/formula_ir.py`) | a formula evaluator and format renderer to maintain, against re-running LibreOffice | 24/24 renders and 22/22 input edits exact; 0.12 ms against 872 ms (E180) |
+| a shared paragraph's renders made once and spliced into every file that holds it (`scripts/fanout_prep.py`) | the per-file block layout kept from ingest | 64 files' html and docx: 194 ms against 8,477 ms, 128/128 exact (E181) |
+| summaries per fragment, with corpus aggregates updated as edits propagate (`examples/fragment_insights.rs`) | a summary cache keyed by fragment id, and a word-to-fragment index | 22 edits 7.5 ms reading 5.7 KB against 481 ms reading 4.8 MB, always exact; goal queries read 4% of the bytes (E182, E183) |
+| table aggregates kept fresh from the computed-table IR (`scripts/table_aggregates.py`) | per-workbook aggregates kept, and the IR's evaluator | exact 22/22 from one workbook's evaluation (E184) |
