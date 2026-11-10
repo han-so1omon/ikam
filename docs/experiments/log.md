@@ -2344,3 +2344,17 @@ Newest last. Format and rules: `README.md`.
   - Kills: 50 of 50 clean, alone and with E171 (7,672 and 7,682 events), nothing acknowledged lost.
   - 1M objects: the same bytes on disk (+886 bytes), open as before (190 to 246 ms; 1.5 ms with E171), first ref 0.12 to 0.19 ms.
 - Verdict: **kept** as an option, off by default; on its branch until Eric says to merge. A stored-format addition (ref records and `refs.snap`), so turning it on for his stores needs his yes; a store written with it needs a kernel that knows the records. Expect it to halve a commit's flush time on the Mac; that is a Mac measurement.
+
+### E173 scale-10m (10M objects: packs, packs with E171 and E172, RocksDB, both hybrids)
+- Question: E122 measured 10M objects before E170 to E172. Do the new options and the hybrids hold up at 10M, and does lazy open still pay there?
+- Change: none in the kernel; the harness's build and probe phases at 10M (about 3.7 GB of small objects), each store built, probed three times and deleted before the next. `packs-fast` is PackStore with `lazy_checkpoint` and `ref_log`. The machine has 15 GB of memory and the probes do not drop the page cache, so "cold" reads here are partly cached; the Mac run should drop it.
+- Result (Linux, ext4):
+  - Build: packs 75 s, packs-fast 93, RocksDB 236, hybrid-refs 77, hybrid-index 157.
+  - On disk: packs and packs-fast 3.72 GB, hybrid-refs 3.72, RocksDB 4.32, hybrid-index 4.31.
+  - Open: packs 329 to 444 ms; packs-fast 2.0 to 2.5 ms; hybrid-refs 276 to 360 ms; RocksDB 3.6 s on the first open after the build, then 22 to 31 ms; hybrid-index 3.0 s, then 18 ms.
+  - Cold read p50: packs 146 to 162 us, packs-fast 191 to 208, RocksDB 122 to 209, hybrid-refs 156 to 165, hybrid-index 107 to 174. Warm read p50: packs 40 to 45 us, packs-fast 42 to 49, RocksDB 83 to 99, hybrid-refs 44 to 49, hybrid-index 80 to 88.
+  - A missing id p50: packs 142 to 148 us (a sealed index has no filter), RocksDB 161 to 182, hybrid-index 69 to 101.
+- Verdict: **measured**. PackStore with E171 and E172 is the best all-round store at 10M: the smallest, three times faster to build than RocksDB, open in 2 ms, warm reads twice as fast as RocksDB's; it gives up about 40 us on cold reads. RocksDB's open is fast only after it has compacted. A filter on sealed indexes would cut missing-id lookups (a next experiment). Repeat on APFS on the Mac with the page cache dropped.
+
+### Gates for E170 to E173 (Nov 10)
+- On exp/173-scale-10m (E172 plus docs): 176 kernel tests pass, 182 with the store features; clippy `-D warnings` clean with and without them (E171's lazy index is boxed so `examples/goal.rs`'s store enum stays small; exp/171 alone predates that fix); the fixed bench matches main (badc682) in every byte count and the north score (0.3035); cost score 0.2430 against 0.2486, from timings only.
