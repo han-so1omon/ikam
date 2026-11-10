@@ -231,3 +231,34 @@ fn fragment_grant_scopes_one_fragment() {
         .unwrap();
     assert_eq!(r.unwrap_err().1, Denied::Stale);
 }
+
+#[test]
+fn range_read_of_a_render_tree_skips_what_it_does_not_read() {
+    // 4,096 lines in a tree of renders, 8 children each (E164, E166).
+    let mut b = Vec::new();
+    for i in 0..4096u32 {
+        b.extend_from_slice(
+            format!("{i:05},{}\n", i.wrapping_mul(2654435761) % 1_000_003).as_bytes(),
+        );
+    }
+    let mut lines = Vec::new();
+    let mut s = 0;
+    for (i, &c) in b.iter().enumerate() {
+        if c == b'\n' {
+            lines.push(s..i + 1);
+            s = i + 1;
+        }
+    }
+    let mut repo = Repo::new(MemStore::default());
+    let id = repo.put_cut(&b, &lines, Some(8)).unwrap();
+    assert_eq!(repo.read_content(&id).unwrap(), b);
+    let mid = b.len() as u64 / 2;
+    let (got, work) = repo.read_range(&id, mid, 100).unwrap();
+    assert_eq!(&got[..], &b[mid as usize..mid as usize + 100]);
+    eprintln!("range work {work} of {}", b.len());
+    assert!(
+        work < b.len() / 8,
+        "a range read decoded {work} of {} bytes",
+        b.len()
+    );
+}

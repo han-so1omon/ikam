@@ -28,7 +28,7 @@ use std::ops::Range;
 use std::path::Path;
 use std::time::Instant;
 
-use ikam_kernel::{MemStore, Repo, Store};
+use ikam_kernel::{Edit, MemStore, Repo, Store};
 
 /// Bytes of the objects not in `before`.
 fn added(repo: &Repo<MemStore>, before: &std::collections::HashSet<ikam_kernel::Id>) -> usize {
@@ -173,15 +173,41 @@ fn main() {
                     assert_eq!(&got[..], &new[mid as usize..mid as usize + 4096]);
                     assert_eq!(&repo.read_content(&id0).unwrap(), old);
                     assert!(repo.fsck().unwrap().is_empty());
+                    // After a repack: what is kept, and range reads then.
+                    let edits = [
+                        Edit::Put {
+                            path: "old".into(),
+                            id: id0,
+                        },
+                        Edit::Put {
+                            path: "new".into(),
+                            id: id1,
+                        },
+                    ];
+                    let tree = repo.edit_tree(None, &edits).unwrap();
+                    repo.commit("main", tree, "both versions").unwrap();
+                    let t = Instant::now();
+                    repo.repack().unwrap();
+                    let repack_ms = ms(t);
+                    let repacked = stored(&repo);
+                    let (got, packed_work) = repo.read_range(&id1, mid, 4096).unwrap();
+                    assert_eq!(&got[..], &new[mid as usize..mid as usize + 4096]);
+                    assert_eq!(&repo.read_content(&id0).unwrap(), old);
+                    assert!(repo.fsck().unwrap().is_empty());
+                    let packed = (repack_ms, repacked, packed_work);
                     runs.push((
-                        edit_ms, put_ms, at_rest, written, read_ms, range_ms, range_work,
+                        edit_ms, put_ms, at_rest, written, read_ms, range_ms, range_work, packed,
                     ));
                 }
                 runs.sort_by(|a, b| a.0.total_cmp(&b.0));
-                let (edit_ms, put_ms, at_rest, written, read_ms, range_ms, range_work) = runs[1];
+                let (edit_ms, put_ms, at_rest, written, read_ms, range_ms, range_work, packed) =
+                    runs[1];
                 println!(
-                    "{{\"rows\":{n},\"format\":\"{fmt}\",\"form\":\"{form}\",\"bytes\":{},\"at_rest\":{at_rest},\"put_ms\":{put_ms:.2},\"edit_written\":{written},\"edit_ms\":{edit_ms:.2},\"read_ms\":{read_ms:.2},\"range_4k_ms\":{range_ms:.3},\"range_4k_work\":{range_work}}}",
-                    old.len()
+                    "{{\"rows\":{n},\"format\":\"{fmt}\",\"form\":\"{form}\",\"bytes\":{},\"at_rest\":{at_rest},\"put_ms\":{put_ms:.2},\"edit_written\":{written},\"edit_ms\":{edit_ms:.2},\"read_ms\":{read_ms:.2},\"range_4k_ms\":{range_ms:.3},\"range_4k_work\":{range_work},\"repack_ms\":{:.1},\"repacked\":{},\"repacked_range_4k_work\":{}}}",
+                    old.len(),
+                    packed.0,
+                    packed.1,
+                    packed.2
                 );
             }
         }

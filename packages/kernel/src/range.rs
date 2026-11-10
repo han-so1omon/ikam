@@ -148,7 +148,7 @@ impl<S: Store> Repo<S> {
             }
             let (from, n) = match *arg {
                 Arg::Range { start, len, .. } => (start, len),
-                Arg::Whole(id) => (0, self.rebuild(&id, cx)?.len() as u64),
+                Arg::Whole(id) => (0, self.content_length(&id, cx)?),
             };
             let (lo, hi) = (start.max(pos), end.min(pos + n));
             if lo < hi {
@@ -157,6 +157,47 @@ impl<S: Store> Repo<S> {
             pos += n;
         }
         Ok(out)
+    }
+
+    /// The length of content `id`. A content that a `concat` or `render`
+    /// derivation gives is the sum of its arguments, so a range read that
+    /// skips over it learns its length without rebuilding it (E166); other
+    /// contents are rebuilt.
+    fn content_length(&self, id: &Id, cx: &mut Cx) -> Result<u64, Error> {
+        if let Some(b) = cx.known.get(id) {
+            return Ok(b.len() as u64);
+        }
+        if let Some(&n) = cx.lens.get(id) {
+            return Ok(n);
+        }
+        if cx.stack.len() < STACK_GUARD && !cx.stack.contains(id) {
+            for d in self.derivations(id)? {
+                if d.func != func::concat() && d.func != func::render() {
+                    continue;
+                }
+                cx.stack.push(*id);
+                let mut n = Some(0u64);
+                for a in &d.args {
+                    let l = match *a {
+                        Arg::Range { len, .. } => Ok(len),
+                        Arg::Whole(c) => self.content_length(&c, cx),
+                    };
+                    n = match (n, l) {
+                        (Some(n), Ok(l)) => Some(n + l),
+                        _ => None,
+                    };
+                    if n.is_none() {
+                        break;
+                    }
+                }
+                cx.stack.pop();
+                if let Some(n) = n {
+                    cx.lens.insert(*id, n);
+                    return Ok(n);
+                }
+            }
+        }
+        Ok(self.rebuild(id, cx)?.len() as u64)
     }
 
     fn fill_range(
