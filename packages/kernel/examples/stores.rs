@@ -31,6 +31,15 @@
 //!   backends) time the pack cleaner, and check every object reads as it
 //!   should after a reopen.
 //!
+//! - `crash-store WORK BACKEND KILLS N` (E174): the store alone, without the
+//!   Repo above it, on a store that already holds N synthetic objects: a
+//!   child writes batches of objects (100 bytes to 200 KB) and a commit object
+//!   naming them and the previous commit, moves `heads/log` to it, and
+//!   acknowledges; it is killed at random. After each kill: reopen time, the
+//!   acknowledged commit reachable from the ref, the last 2,000 commits and
+//!   every object they name read back and hash to their ids, and 100,000 of
+//!   the N objects read back.
+//!
 //! Every line printed is one JSON object.
 
 use std::collections::BTreeMap;
@@ -779,6 +788,166 @@ fn churn(name: &str, dir: &Path, n: u64) {
     );
 }
 
+fn commit_obj(seq: u64, prev: Option<Id>, ids: &[Id]) -> (Id, Vec<u8>) {
+    let mut b = b"commit".to_vec();
+    b.extend(seq.to_le_bytes());
+    b.extend(prev.map_or([0u8; 32], |p| *p.as_bytes()));
+    for id in ids {
+        b.extend(id.as_bytes());
+    }
+    (Id::from_bytes(*blake3::hash(&b).as_bytes()), b)
+}
+
+fn parse_commit(b: &[u8]) -> Option<(u64, Option<Id>, Vec<Id>)> {
+    let rest = b.strip_prefix(b"commit")?;
+    let seq = u64::from_le_bytes(rest.get(..8)?.try_into().ok()?);
+    let prev: [u8; 32] = rest.get(8..40)?.try_into().ok()?;
+    let prev = (prev != [0u8; 32]).then(|| Id::from_bytes(prev));
+    let ids = rest[40..]
+        .chunks_exact(32)
+        .map(|c| Id::from_bytes(c.try_into().unwrap()))
+        .collect();
+    Some((seq, prev, ids))
+}
+
+fn crash_store_child(name: &str, dir: &Path) {
+    let mut s = open(name, dir);
+    let mut head = s.get_ref("heads/log").unwrap();
+    let mut seq = match head {
+        Some(h) => parse_commit(&s.read(&h).unwrap()).unwrap().0,
+        None => 0,
+    };
+    let mut rng = Rng(seq ^ 0xfeed ^ std::process::id() as u64);
+    let out = std::io::stdout();
+    loop {
+        seq += 1;
+        let mut ids = Vec::new();
+        for _ in 0..1 + rng.below(8) {
+            let cap = if rng.below(4) == 0 { 200_000 } else { 2_000 };
+            let len = 100 + rng.below(cap) as usize;
+            let mut b = seq.to_le_bytes().to_vec();
+            b.extend(rng.bytes(len));
+            let id = Id::from_bytes(*blake3::hash(&b).as_bytes());
+            s.write(id, &b).unwrap();
+            ids.push(id);
+        }
+        let (cid, cb) = commit_obj(seq, head, &ids);
+        s.write(cid, &cb).unwrap();
+        s.set_ref("heads/log", head, cid).unwrap();
+        head = Some(cid);
+        let mut o = out.lock();
+        writeln!(o, "ack {seq}").unwrap();
+        o.flush().unwrap();
+    }
+}
+
+fn crash_store(work: &Path, name: &str, kills: u32, n: u64) {
+    let dir = work.join(format!("crash-store-{name}-{n}"));
+    let marker = dir.join("BUILT");
+    if !marker.exists() {
+        build(name, &dir, n);
+        std::fs::write(&marker, b"").unwrap();
+    }
+    let exe = std::env::current_exe().unwrap();
+    let mut rng = Rng(11);
+    let (mut ok, mut lost, mut bad, mut failed) = (0, 0, 0, 0);
+    let (mut max_seq, mut checked) = (0u64, 0u64);
+    let mut open_ms = Vec::new();
+    for k in 0..kills {
+        let mut child = Command::new(&exe)
+            .args(["crash-store-child", name, dir.to_str().unwrap()])
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let stdout = child.stdout.take().unwrap();
+        let acks = std::thread::spawn(move || {
+            let mut last = 0u64;
+            for line in BufReader::new(stdout).lines().map_while(Result::ok) {
+                if let Some(v) = line.strip_prefix("ack ") {
+                    last = v.parse().unwrap();
+                }
+            }
+            last
+        });
+        std::thread::sleep(Duration::from_millis(500 + rng.below(1_500)));
+        let early = child.try_wait().unwrap();
+        child.kill().unwrap();
+        child.wait().unwrap();
+        if let Some(status) = early {
+            failed += 1;
+            eprintln!("{name}: child exited before the kill: {status}");
+        }
+        let acked = acks.join().unwrap();
+        let t = Instant::now();
+        let s = open(name, &dir);
+        open_ms.push(ms(t.elapsed()));
+        let verdict = (|| -> Result<u64, String> {
+            if s.get_ref("heads/scale").map_err(|e| e.to_string())?.is_none() {
+                return Err("scale ref lost".into());
+            }
+            let Some(h) = s.get_ref("heads/log").map_err(|e| e.to_string())? else {
+                return if acked == 0 { Ok(0) } else { Err("ref lost".into()) };
+            };
+            let mut at = Some(h);
+            let mut top = None;
+            let mut walked = 0;
+            while let Some(c) = at {
+                if walked == 2_000 {
+                    break;
+                }
+                let b = s.read(&c).map_err(|e| format!("commit unreadable: {e}"))?;
+                if *blake3::hash(&b).as_bytes() != *c.as_bytes() {
+                    return Err("commit hash differs".into());
+                }
+                let (seq, prev, ids) = parse_commit(&b).ok_or("not a commit")?;
+                top.get_or_insert(seq);
+                for id in ids {
+                    let o = s.read(&id).map_err(|e| format!("object unreadable: {e}"))?;
+                    if *blake3::hash(&o).as_bytes() != *id.as_bytes() {
+                        return Err("object hash differs".into());
+                    }
+                    checked += 1;
+                }
+                at = prev;
+                walked += 1;
+            }
+            let top = top.unwrap_or(0);
+            if top < acked {
+                return Err(format!("acked {acked} but ref is at {top}"));
+            }
+            let mut r = Rng(2000 + k as u64);
+            for _ in 0..100_000 {
+                let (id, b) = synthetic(r.below(n));
+                if s.read(&id).map_err(|e| e.to_string())? != b {
+                    return Err("seed object differs".into());
+                }
+            }
+            Ok(top)
+        })();
+        drop(s);
+        match verdict {
+            Ok(seq) => {
+                ok += 1;
+                max_seq = max_seq.max(seq);
+            }
+            Err(e) if e.contains("acked") || e.contains("lost") => {
+                lost += 1;
+                eprintln!("{name}: {e}");
+            }
+            Err(e) => {
+                bad += 1;
+                eprintln!("{name}: {e}");
+            }
+        }
+    }
+    let (files, len, _) = disk(&dir);
+    println!(
+        "{{\"phase\":\"crash-store\",\"backend\":\"{name}\",\"n\":{n},\"kills\":{kills},\"clean\":{ok},\"lost_acked\":{lost},\"corrupt\":{bad},\"child_failed\":{failed},\"commits\":{max_seq},\"objects_checked\":{checked},\"reopen_ms_p50\":{:.1},\"reopen_ms_max\":{:.1},\"files\":{files},\"apparent\":{len}}}",
+        pct(&mut open_ms.clone(), 0.5),
+        open_ms.iter().cloned().fold(0.0, f64::max),
+    );
+}
+
 fn main() {
     let a: Vec<String> = std::env::args().skip(1).collect();
     let p = |i: usize| PathBuf::from(&a[i]);
@@ -789,6 +958,8 @@ fn main() {
         Some("probe") => probe(&a[1], &p(2), a[3].parse().unwrap()),
         Some("crash") => crash(&p(1), &a[2], a[3].parse().unwrap()),
         Some("churn") => churn(&a[1], &p(2), a[3].parse().unwrap()),
+        Some("crash-store") => crash_store(&p(1), &a[2], a[3].parse().unwrap(), a[4].parse().unwrap()),
+        Some("crash-store-child") => crash_store_child(&a[1], &p(2)),
         Some("crash-big") => crash_big(&p(1), &a[2], a[3].parse().unwrap(), a[4].parse().unwrap()),
         Some("crash-child") => crash_child(&a[1], &p(2)),
         _ => eprintln!("see the module docs for phases"),
