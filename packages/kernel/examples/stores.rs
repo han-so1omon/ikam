@@ -19,6 +19,13 @@
 //!   commit must be there, and the views rebuilt from the log must equal the
 //!   committed ones byte for byte.
 //!
+//! - `crash-big WORK BACKEND KILLS N` (E174): `crash` on a store that already
+//!   holds N small contents (the synthetic bytes, put as ikam contents; built
+//!   once and kept in WORK). After each kill: the time to reopen, every
+//!   acknowledged commit there, the views rebuilt equal, the store lists at
+//!   least N objects, and 100,000 of the contents read back byte for byte.
+//!   After the last kill, a full fsck.
+//!
 //! Every line printed is one JSON object.
 
 use std::collections::BTreeMap;
@@ -570,6 +577,116 @@ fn crash(work: &Path, name: &str, kills: u32) {
     );
 }
 
+fn crash_big(work: &Path, name: &str, kills: u32, n: u64) {
+    let dir = work.join(format!("crash-big-{name}-{n}"));
+    let marker = dir.join("BUILT");
+    if !marker.exists() {
+        let _ = std::fs::remove_dir_all(&dir);
+        let t = Instant::now();
+        let mut repo = Repo::new(open(name, &dir));
+        let mut last = None;
+        for i in 0..n {
+            last = Some(repo.put_content(&synthetic(i).1).unwrap().id);
+        }
+        drop(repo);
+        open(name, &dir).set_ref("heads/scale", None, last.unwrap()).unwrap();
+        std::fs::write(&marker, b"").unwrap();
+        println!(
+            "{{\"phase\":\"crash-big-build\",\"backend\":\"{name}\",\"n\":{n},\"build_s\":{:.1}}}",
+            t.elapsed().as_secs_f64()
+        );
+    }
+    let exe = std::env::current_exe().unwrap();
+    let mut rng = Rng(7);
+    let (mut ok, mut lost, mut bad, mut failed) = (0, 0, 0, 0);
+    let mut max_seq = 0u64;
+    let mut open_ms = Vec::new();
+    for k in 0..kills {
+        let mut child = Command::new(&exe)
+            .args(["crash-child", name, dir.to_str().unwrap()])
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let stdout = child.stdout.take().unwrap();
+        let acks = std::thread::spawn(move || {
+            let mut last = 0u64;
+            for line in BufReader::new(stdout).lines().map_while(Result::ok) {
+                if let Some(v) = line.strip_prefix("ack ") {
+                    last = v.parse().unwrap();
+                }
+            }
+            last
+        });
+        // A default PackStore takes about 0.4 s to open at 10M: give the
+        // child time to open and commit before the kill.
+        std::thread::sleep(Duration::from_millis(700 + rng.below(2_000)));
+        let early = child.try_wait().unwrap();
+        child.kill().unwrap();
+        child.wait().unwrap();
+        if let Some(status) = early {
+            failed += 1;
+            eprintln!("{name}: child exited before the kill: {status}");
+        }
+        let acked = acks.join().unwrap();
+        let t = Instant::now();
+        let mut repo = Repo::new(open(name, &dir));
+        open_ms.push(ms(t.elapsed()));
+        let head = repo.store().get_ref("heads/db").unwrap();
+        let verdict = (|| -> Result<u64, String> {
+            if repo.store().get_ref("heads/scale").map_err(|e| e.to_string())?.is_none() {
+                return Err("scale ref lost".into());
+            }
+            let Some(c) = head else {
+                return if acked == 0 { Ok(0) } else { Err("ref lost".into()) };
+            };
+            let d = repo.db_at(&c).map_err(|e| e.to_string())?;
+            let seq = repo.db_head(&d.log).map_err(|e| e.to_string())?;
+            if seq < acked {
+                return Err(format!("acked {acked} but store has {seq}"));
+            }
+            let rebuilt = repo.db_rebuild(&d.log).map_err(|e| e.to_string())?;
+            if rebuilt.ids != d.ids || rebuilt.kv != d.kv {
+                return Err("rebuilt views differ".into());
+            }
+            let count = repo.store().ids().map_err(|e| e.to_string())?.len() as u64;
+            if count < n {
+                return Err(format!("{count} objects listed, built {n}"));
+            }
+            let mut r = Rng(1000 + k as u64);
+            for _ in 0..100_000 {
+                let b = synthetic(r.below(n)).1;
+                if repo.read_content(&Id::of_content(&b)).map_err(|e| e.to_string())? != b {
+                    return Err("content differs".into());
+                }
+            }
+            Ok(seq)
+        })();
+        match verdict {
+            Ok(seq) => {
+                ok += 1;
+                max_seq = max_seq.max(seq);
+            }
+            Err(e) if e.contains("acked") || e.contains("lost") => {
+                lost += 1;
+                eprintln!("{name}: {e}");
+            }
+            Err(e) => {
+                bad += 1;
+                eprintln!("{name}: {e}");
+            }
+        }
+    }
+    let t = Instant::now();
+    let fsck = Repo::new(open(name, &dir)).fsck().map(|p| p.len()).unwrap_or(usize::MAX);
+    let fsck_s = t.elapsed().as_secs_f64();
+    let (files, len, _) = disk(&dir);
+    println!(
+        "{{\"phase\":\"crash-big\",\"fsck_problems\":{fsck},\"fsck_s\":{fsck_s:.1},\"backend\":\"{name}\",\"n\":{n},\"kills\":{kills},\"clean\":{ok},\"lost_acked\":{lost},\"corrupt\":{bad},\"child_failed\":{failed},\"events\":{max_seq},\"reopen_ms_p50\":{:.1},\"reopen_ms_max\":{:.1},\"files\":{files},\"apparent\":{len}}}",
+        pct(&mut open_ms.clone(), 0.5),
+        open_ms.iter().cloned().fold(0.0, f64::max),
+    );
+}
+
 fn main() {
     let a: Vec<String> = std::env::args().skip(1).collect();
     let p = |i: usize| PathBuf::from(&a[i]);
@@ -579,6 +696,7 @@ fn main() {
         Some("build") => build(&a[1], &p(2), a[3].parse().unwrap()),
         Some("probe") => probe(&a[1], &p(2), a[3].parse().unwrap()),
         Some("crash") => crash(&p(1), &a[2], a[3].parse().unwrap()),
+        Some("crash-big") => crash_big(&p(1), &a[2], a[3].parse().unwrap(), a[4].parse().unwrap()),
         Some("crash-child") => crash_child(&a[1], &p(2)),
         _ => eprintln!("see the module docs for phases"),
     }
