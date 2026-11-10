@@ -19,7 +19,8 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::ops::Range;
 
-use crate::{Arg, Edit, Error, Id, Kind, Object, Repo, Store, func};
+use crate::grant::inside;
+use crate::{Arg, Denied, Edit, Error, Grant, Id, Kind, Object, Repo, Store, func};
 
 /// Longest block before it is cut at the next line boundary.
 const MAX_BLOCK: usize = 16 * 1024;
@@ -157,54 +158,106 @@ impl<S: Store> Repo<S> {
         old: &Id,
         new_bytes: &[u8],
     ) -> Result<Vec<Edit>, Error> {
-        let new = self.put_content(new_bytes)?.id;
-        let paths = ix.by_fragment.get(old).cloned().unwrap_or_default();
-        let mut edits = Vec::with_capacity(paths.len());
-        let mut done: HashMap<Id, Id> = HashMap::new();
+        self.propagate_granted(ix, old, new_bytes, None)?
+            .map_err(|(path, d)| Error::Exec(format!("{path}: {d:?}")))
+    }
+
+    /// `propagate` under a goal's grant (E159). Every file the edit reaches
+    /// must be granted at the version indexed, and each range the edit
+    /// changes (the old fragment's bytes in that file) must lie inside its
+    /// write ranges. The ranges come from the fragments' lengths, so no
+    /// file is diffed. Every file is checked before anything is written: a
+    /// refused edit writes nothing and names the first file refused.
+    pub fn propagate_granted(
+        &mut self,
+        ix: &mut FragmentIndex,
+        old: &Id,
+        new_bytes: &[u8],
+        grant: Option<&Grant>,
+    ) -> Result<Result<Vec<Edit>, (String, Denied)>, Error> {
+        let mut paths = ix.by_fragment.get(old).cloned().unwrap_or_default();
+        paths.dedup();
+        // Plan: each file's new fragments, and the ranges the edit changes.
+        let mut plans: Vec<(String, Id, Vec<Part>)> = Vec::with_capacity(paths.len());
         for path in paths {
             let file = ix.files[&path].0;
-            let out = match done.get(&file) {
-                Some(out) => *out,
-                None => {
-                    let frags = self.fragments_of(&file)?.ok_or(Error::WrongKind(file))?;
-                    let mut args = Vec::with_capacity(frags.len());
-                    for f in &frags {
-                        let holds = ix.inner.get(f).is_some_and(|bs| bs.contains(old));
-                        args.push(Arg::Whole(if f == old {
-                            new
-                        } else if holds {
-                            // A block inside a run: the run is rewritten.
-                            let b = self.read_content(f)?;
-                            let spliced: Vec<u8> = blocks(&b)
-                                .into_iter()
-                                .flat_map(|r| {
-                                    if Id::of_content(&b[r.clone()]) == *old {
-                                        new_bytes.to_vec()
-                                    } else {
-                                        b[r].to_vec()
-                                    }
-                                })
-                                .collect();
-                            self.put_content(&spliced)?.id
-                        } else {
-                            *f
-                        }));
+            let frags = self.fragments_of(&file)?.ok_or(Error::WrongKind(file))?;
+            let (mut at, mut changed, mut parts) = (0u64, Vec::new(), Vec::new());
+            for f in &frags {
+                let holds = ix.inner.get(f).is_some_and(|bs| bs.contains(old));
+                let len = if f == old || holds {
+                    let b = self.read_content(f)?;
+                    if f == old {
+                        changed.push(at..at + b.len() as u64);
+                        parts.push(Part::New);
+                    } else {
+                        // A block inside a run: the run is rewritten.
+                        let mut spliced = Vec::with_capacity(b.len());
+                        for r in blocks(&b) {
+                            if Id::of_content(&b[r.clone()]) == *old {
+                                changed.push(at + r.start as u64..at + r.end as u64);
+                                spliced.extend_from_slice(new_bytes);
+                            } else {
+                                spliced.extend_from_slice(&b[r]);
+                            }
+                        }
+                        parts.push(Part::Splice(spliced));
                     }
-                    let (bytes, _) = self.evaluate(&func::render(), &args)?;
-                    let put = self.put_derivation(&bytes, func::render(), args)?;
-                    let out = put.ok_or(Error::Corrupt(file))?.id;
-                    done.insert(file, out);
-                    out
+                    b.len() as u64
+                } else {
+                    parts.push(Part::Keep(*f));
+                    self.content_len(f)?
+                };
+                at += len;
+            }
+            if let Some(g) = grant {
+                let Some(fg) = g.file(&path) else {
+                    return Ok(Err((path, Denied::NoFile)));
+                };
+                if fg.id != file {
+                    return Ok(Err((path, Denied::Stale)));
                 }
-            };
+                if let Some(r) = changed.iter().find(|r| !inside(&fg.write, r)) {
+                    return Ok(Err((path, Denied::Outside(r.clone()))));
+                }
+            }
+            plans.push((path, file, parts));
+        }
+        // Write.
+        let new = self.put_content(new_bytes)?.id;
+        let mut edits = Vec::with_capacity(plans.len());
+        for (path, file, parts) in plans {
+            let mut args = Vec::with_capacity(parts.len());
+            for p in parts {
+                args.push(Arg::Whole(match p {
+                    Part::Keep(f) => f,
+                    Part::New => new,
+                    Part::Splice(b) => self.put_content(&b)?.id,
+                }));
+            }
+            let (bytes, _) = self.evaluate(&func::render(), &args)?;
+            let put = self.put_derivation(&bytes, func::render(), args)?;
+            let out = put.ok_or(Error::Corrupt(file))?.id;
             ix.remove(&path);
             let frags = self.fragments_of(&out)?;
             self.index_inner(ix, frags.as_deref().unwrap_or(&[]))?;
             ix.add(&path, out, frags);
             edits.push(Edit::Put { path, id: out });
         }
-        Ok(edits)
+        Ok(Ok(edits))
     }
+
+    /// Bytes of a content, from its stored form or by rebuilding it.
+    fn content_len(&self, id: &Id) -> Result<u64, Error> {
+        Ok(self.read_content(id)?.len() as u64)
+    }
+}
+
+/// One fragment of a planned render.
+enum Part {
+    Keep(Id),
+    New,
+    Splice(Vec<u8>),
 }
 
 impl FragmentIndex {

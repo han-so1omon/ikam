@@ -66,7 +66,7 @@ fn normalise(mut v: Vec<Range<u64>>) -> Vec<Range<u64>> {
 
 /// Whether `at` (a region of the old version; empty for an insertion) lies
 /// inside one of the sorted, merged `ranges`.
-fn inside(ranges: &[Range<u64>], at: &Range<u64>) -> bool {
+pub(crate) fn inside(ranges: &[Range<u64>], at: &Range<u64>) -> bool {
     let i = ranges.partition_point(|r| r.end < at.end);
     ranges
         .get(i)
