@@ -378,3 +378,71 @@ fn hybrid_stores() {
     all(&|p| RefsHybrid::open(p).unwrap());
     all(&|p| IndexHybrid::open(p).unwrap());
 }
+
+/// E172: refs logged in the pack keep the contract, alone and with E171.
+#[test]
+fn pack_store_ref_log() {
+    use ikam_kernel::backends::PackOptions;
+    let log = PackOptions {
+        ref_log: true,
+        ..PackOptions::default()
+    };
+    let both = PackOptions {
+        ref_log: true,
+        lazy_checkpoint: true,
+    };
+    all(&|p| PackStore::open_with(p, log).unwrap());
+    all(&|p| PackStore::open_with(p, both).unwrap());
+
+    // A ref record is durable with the objects before it, and a torn record
+    // ahead of it takes the ref with it: the ref falls back, never forward.
+    let dir = tempfile::tempdir().unwrap();
+    let pack = dir.path().join("packs/00000000.pack");
+    {
+        let mut s = PackStore::open_with(dir.path(), log).unwrap();
+        s.write(id(1), b"first").unwrap();
+        s.set_ref("heads/main", None, id(1)).unwrap();
+        s.write(id(2), b"second").unwrap();
+        s.set_ref("heads/main", Some(id(1)), id(2)).unwrap();
+    }
+    // As after a kill: no checkpoint and no snapshot, so refs come from replay.
+    std::fs::remove_file(dir.path().join("refs.snap")).unwrap();
+    std::fs::remove_file(dir.path().join("packs/00000000.ckpt")).ok();
+    let len = std::fs::metadata(&pack).unwrap().len() as usize;
+    {
+        let s = PackStore::open_with(dir.path(), log).unwrap();
+        assert_eq!(s.get_ref("heads/main").unwrap(), Some(id(2)));
+        assert_eq!(s.read(&id(2)).unwrap(), b"second");
+        assert!(s.ids().unwrap().len() == 2, "ref records are not objects");
+    }
+    std::fs::remove_file(dir.path().join("refs.snap")).ok();
+    std::fs::remove_file(dir.path().join("packs/00000000.ckpt")).ok();
+    // Flip a byte inside object 2's record: it and the ref after it are cut.
+    let mut bytes = std::fs::read(&pack).unwrap();
+    assert_eq!(bytes.len(), len);
+    let at = bytes.windows(6).position(|w| w == b"second").unwrap();
+    bytes[at] ^= 1;
+    std::fs::write(&pack, &bytes).unwrap();
+    std::fs::remove_file(dir.path().join("packs/00000000.ckpt")).ok();
+    std::fs::remove_file(dir.path().join("refs.snap")).ok();
+    let s = PackStore::open_with(dir.path(), log).unwrap();
+    assert_eq!(s.get_ref("heads/main").unwrap(), Some(id(1)));
+    assert!(!s.has(&id(2)));
+    assert_eq!(s.read(&id(1)).unwrap(), b"first");
+    drop(s);
+
+    // A store that kept refs as files carries them over on first open.
+    let dir = tempfile::tempdir().unwrap();
+    {
+        let mut s = PackStore::open(dir.path()).unwrap();
+        s.write(id(3), b"three").unwrap();
+        s.set_ref("heads/old", None, id(3)).unwrap();
+    }
+    {
+        let mut s = PackStore::open_with(dir.path(), log).unwrap();
+        assert_eq!(s.get_ref("heads/old").unwrap(), Some(id(3)));
+        s.set_ref("heads/old", Some(id(3)), id(3)).unwrap();
+    }
+    let s = PackStore::open_with(dir.path(), log).unwrap();
+    assert_eq!(s.refs().unwrap(), vec![("heads/old".to_string(), id(3))]);
+}

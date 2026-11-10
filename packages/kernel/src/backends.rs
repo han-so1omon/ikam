@@ -916,6 +916,82 @@ pub struct PackOptions {
     /// file) at open. Checkpoints are then fsynced, like a sealed pack's index.
     /// No format change: the same checkpoint file, read differently.
     pub lazy_checkpoint: bool,
+    /// E172: refs are records in the pack, after the objects they reach, so
+    /// one `sync_data` makes a commit durable (in place of the pack's sync,
+    /// then a ref file written, synced and renamed). A format addition: a
+    /// store written this way keeps its refs only in its packs, and code
+    /// without this option does not see them.
+    pub ref_log: bool,
+}
+
+/// E172: the id field of a ref record. No object has it (ids are BLAKE3).
+fn ref_marker() -> Id {
+    Id::from_bytes([0xff; 32])
+}
+
+/// E172: a ref record's body: name length (u16), name, new id.
+fn ref_body(name: &str, new: &Id) -> Vec<u8> {
+    let mut b = Vec::with_capacity(2 + name.len() + 32);
+    b.extend_from_slice(&(name.len() as u16).to_le_bytes());
+    b.extend_from_slice(name.as_bytes());
+    b.extend_from_slice(new.as_bytes());
+    b
+}
+
+fn parse_ref_body(b: &[u8]) -> Option<(String, Id)> {
+    let n = u16::from_le_bytes(b.get(..2)?.try_into().ok()?) as usize;
+    let name = std::str::from_utf8(b.get(2..2 + n)?).ok()?.to_string();
+    let id: [u8; 32] = b.get(2 + n..2 + n + 32)?.try_into().ok()?;
+    (b.len() == 2 + n + 32).then(|| (name, Id::from_bytes(id)))
+}
+
+const SNAP_MAGIC: &[u8; 8] = b"ikamref1";
+
+/// E172: every ref as of a point in the packs (pack number, offset); open
+/// loads it and replays the ref records after that point. Losing it only
+/// means a longer replay: the records stay in the packs.
+fn write_snap(path: &Path, pack: u32, covers: u64, refs: &BTreeMap<String, Id>) -> Result<(), Error> {
+    let mut out = SNAP_MAGIC.to_vec();
+    out.extend_from_slice(&pack.to_le_bytes());
+    out.extend_from_slice(&covers.to_le_bytes());
+    out.extend_from_slice(&(refs.len() as u32).to_le_bytes());
+    for (name, id) in refs {
+        out.extend_from_slice(&ref_body(name, id));
+    }
+    let h = blake3::hash(&out);
+    out.extend_from_slice(h.as_bytes());
+    let tmp = path.with_extension("snap.tmp");
+    fs::write(&tmp, &out)?;
+    fs::rename(&tmp, path)?;
+    Ok(())
+}
+
+fn read_snap(path: &Path) -> Option<(u32, u64, BTreeMap<String, Id>)> {
+    let b = fs::read(path).ok()?;
+    if b.len() < 8 + 4 + 8 + 4 + 32 || &b[..8] != SNAP_MAGIC {
+        return None;
+    }
+    let (body, hash) = b.split_at(b.len() - 32);
+    if blake3::hash(body).as_bytes() != hash {
+        return None;
+    }
+    let pack = u32::from_le_bytes(body[8..12].try_into().ok()?);
+    let covers = u64::from_le_bytes(body[12..20].try_into().ok()?);
+    let count = u32::from_le_bytes(body[20..24].try_into().ok()?);
+    let mut refs = BTreeMap::new();
+    let mut at = 24;
+    for _ in 0..count {
+        let n = u16::from_le_bytes(body.get(at..at + 2)?.try_into().ok()?) as usize;
+        let (name, id) = parse_ref_body(body.get(at..at + 2 + n + 32)?)?;
+        refs.insert(name, id);
+        at += 2 + n + 32;
+    }
+    (at == body.len()).then_some((pack, covers, refs))
+}
+
+fn sync_dir(dir: &Path) -> Result<(), Error> {
+    File::open(dir)?.sync_all()?;
+    Ok(())
 }
 
 pub struct PackStore {
@@ -924,6 +1000,8 @@ pub struct PackStore {
     /// E171: the open pack's checkpoint, searched on disk; `active_index`
     /// then holds only the records after it.
     base: Option<Sealed>,
+    /// E172: refs, when they live in the packs.
+    log_refs: BTreeMap<String, Id>,
     sealed: Vec<Sealed>, // oldest first; lookups go newest first
     active: File,
     active_no: u32,
@@ -1016,6 +1094,29 @@ impl PackStore {
             .read(true)
             .write(true)
             .open(&path)?;
+        let mut log_refs = BTreeMap::new();
+        if opts.ref_log {
+            let snap = read_snap(&root.join("refs.snap"));
+            let (from_pack, from_off) = match snap {
+                Some((p, c, r)) => {
+                    log_refs = r;
+                    (p, c)
+                }
+                None => (0, 0),
+            };
+            // Replay ref records after the snapshot, in pack order.
+            for &n in nos.iter().filter(|&&n| n >= from_pack) {
+                let start = if n == from_pack { from_off } else { 0 };
+                let p = root.join(format!("packs/{n:08}.pack"));
+                scan_with(&p, start, HashMap::new(), Some(&mut log_refs))?;
+            }
+            if log_refs.is_empty() && snap_missing_and_ref_files(&root) {
+                // A store that kept refs as files: carry them over.
+                for (name, id) in file_refs(&root)? {
+                    log_refs.insert(name, id);
+                }
+            }
+        }
         let base = match base_ckpt {
             Some((idx, fanout)) => Some(Sealed {
                 pack: active.try_clone()?,
@@ -1032,6 +1133,7 @@ impl PackStore {
             root,
             opts,
             base,
+            log_refs,
             sealed,
             active,
             active_no,
@@ -1072,6 +1174,11 @@ impl PackStore {
     pub fn sync(&mut self) -> Result<(), Error> {
         self.flush()?;
         self.active.sync_data()?;
+        self.maintain()
+    }
+
+    /// Seal a full pack, or checkpoint a grown one.
+    fn maintain(&mut self) -> Result<(), Error> {
         if self.flushed >= PACK_SEAL_BYTES {
             self.seal()?;
         } else if self.flushed - self.ckpt_at >= PACK_CKPT_BYTES {
@@ -1086,6 +1193,14 @@ impl PackStore {
         let full = self.full_active_index()?;
         write_ckpt(&path, &full, self.flushed, self.opts.lazy_checkpoint)?;
         self.ckpt_at = self.flushed;
+        if self.opts.ref_log {
+            write_snap(
+                &self.root.join("refs.snap"),
+                self.active_no,
+                self.flushed,
+                &self.log_refs,
+            )?;
+        }
         if self.opts.lazy_checkpoint
             && let Some((idx, fanout, _)) = open_ckpt_lazy(&path, self.flushed)
         {
@@ -1122,6 +1237,10 @@ impl PackStore {
     fn seal(&mut self) -> Result<(), Error> {
         let n = self.active_no;
         let full = self.full_active_index()?;
+        if self.opts.ref_log {
+            // Every ref so far, as of the start of the next pack.
+            write_snap(&self.root.join("refs.snap"), n + 1, 0, &self.log_refs)?;
+        }
         write_idx(&self.root.join(format!("packs/{n:08}.idx")), &full)?;
         self.base = None;
         let _ = fs::remove_file(self.root.join(format!("packs/{n:08}.ckpt")));
@@ -1134,6 +1253,8 @@ impl PackStore {
             .read(true)
             .write(true)
             .open(path)?;
+        // E172: the new pack's name must be durable before records in it are.
+        sync_dir(&self.root.join("packs"))?;
         self.active_index.clear();
         self.flushed = 0;
         self.ckpt_at = 0;
@@ -1184,7 +1305,18 @@ type PackIndex = HashMap<Id, (u64, u32)>;
 
 /// Read a pack's records from `start`, stopping at the first torn or
 /// corrupt one. Returns the index and the length of the good prefix.
-fn scan(path: &Path, start: u64, mut index: PackIndex) -> Result<(PackIndex, u64), Error> {
+fn scan(path: &Path, start: u64, index: PackIndex) -> Result<(PackIndex, u64), Error> {
+    scan_with(path, start, index, None)
+}
+
+/// [`scan`], collecting ref records (E172) into `refs` in pack order
+/// rather than indexing them.
+fn scan_with(
+    path: &Path,
+    start: u64,
+    mut index: PackIndex,
+    mut refs: Option<&mut BTreeMap<String, Id>>,
+) -> Result<(PackIndex, u64), Error> {
     let mut f = File::open(path)?;
     let total = f.metadata()?.len();
     f.seek(SeekFrom::Start(start))?;
@@ -1208,7 +1340,13 @@ fn scan(path: &Path, start: u64, mut index: PackIndex) -> Result<(PackIndex, u64
         if u32::from_le_bytes(c) != crc(&id, len, &body) {
             break;
         }
-        index.insert(id, (off, len));
+        if id == ref_marker() {
+            if let (Some(r), Some((name, to))) = (refs.as_deref_mut(), parse_ref_body(&body)) {
+                r.insert(name, to);
+            }
+        } else {
+            index.insert(id, (off, len));
+        }
         off += RECORD_HEAD + n + 4;
     }
     Ok((index, off))
@@ -1475,6 +1613,9 @@ impl Store for PackStore {
 
     fn get_ref(&self, name: &str) -> Result<Option<Id>, Error> {
         check_ref_name(name)?;
+        if self.opts.ref_log {
+            return Ok(self.log_refs.get(name).copied());
+        }
         match fs::read_to_string(self.root.join("refs").join(name)) {
             Ok(s) => Ok(Some(s.trim().parse()?)),
             Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
@@ -1486,6 +1627,21 @@ impl Store for PackStore {
         check_ref_name(name)?;
         if self.get_ref(name)? != expected {
             return Err(Error::RefConflict(name.into()));
+        }
+        if self.opts.ref_log {
+            // E172: the ref record follows the objects in the same file, and
+            // a scan stops at the first bad record, so one sync covers both.
+            let body = ref_body(name, &new);
+            let marker = ref_marker();
+            let len = body.len() as u32;
+            self.buf.extend_from_slice(marker.as_bytes());
+            self.buf.extend_from_slice(&len.to_le_bytes());
+            self.buf.extend_from_slice(&body);
+            self.buf.extend_from_slice(&crc(&marker, len, &body).to_le_bytes());
+            self.flush()?;
+            self.active.sync_data()?;
+            self.log_refs.insert(name.to_string(), new);
+            return self.maintain();
         }
         self.sync()?; // objects first, then the ref that reaches them
         let path = self.root.join("refs").join(name);
@@ -1502,28 +1658,41 @@ impl Store for PackStore {
     }
 
     fn refs(&self) -> Result<Vec<(String, Id)>, Error> {
-        let mut out = Vec::new();
-        let base = self.root.join("refs");
-        let mut stack = vec![base.clone()];
-        while let Some(dir) = stack.pop() {
-            for e in fs::read_dir(&dir)? {
-                let e = e?;
-                let p = e.path();
-                if e.file_type()?.is_dir() {
-                    stack.push(p);
-                } else if !p.to_string_lossy().ends_with(".lock") {
-                    let name = p
-                        .strip_prefix(&base)
-                        .unwrap()
-                        .to_string_lossy()
-                        .into_owned();
-                    out.push((name, fs::read_to_string(&p)?.trim().parse()?));
-                }
+        if self.opts.ref_log {
+            return Ok(self.log_refs.iter().map(|(k, v)| (k.clone(), *v)).collect());
+        }
+        file_refs(&self.root)
+    }
+}
+
+fn snap_missing_and_ref_files(root: &Path) -> bool {
+    !root.join("refs.snap").exists()
+        && fs::read_dir(root.join("refs")).is_ok_and(|mut d| d.next().is_some())
+}
+
+/// Refs kept as files under `root/refs`, sorted by name.
+fn file_refs(root: &Path) -> Result<Vec<(String, Id)>, Error> {
+    let mut out = Vec::new();
+    let base = root.join("refs");
+    let mut stack = vec![base.clone()];
+    while let Some(dir) = stack.pop() {
+        for e in fs::read_dir(&dir)? {
+            let e = e?;
+            let p = e.path();
+            if e.file_type()?.is_dir() {
+                stack.push(p);
+            } else if !p.to_string_lossy().ends_with(".lock") {
+                let name = p
+                    .strip_prefix(&base)
+                    .unwrap()
+                    .to_string_lossy()
+                    .into_owned();
+                out.push((name, fs::read_to_string(&p)?.trim().parse()?));
             }
         }
-        out.sort();
-        Ok(out)
     }
+    out.sort();
+    Ok(out)
 }
 
 // ---------------------------------------------------------------------------
