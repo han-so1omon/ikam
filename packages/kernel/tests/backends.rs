@@ -293,3 +293,432 @@ fn fs_store_ref_survives_a_writer_killed_mid_update() {
     drop(held);
     s.set_ref("heads/main", Some(id(2)), id(3)).unwrap();
 }
+
+/// E171: the lazy checkpoint keeps the contract, and a store opened lazily
+/// sees exactly what a full load sees, before and after more writes.
+#[test]
+fn pack_store_lazy_checkpoint() {
+    use ikam_kernel::backends::PackOptions;
+    let lazy = PackOptions {
+        lazy_checkpoint: true,
+        ..PackOptions::default()
+    };
+    all(&|p| PackStore::open_with(p, lazy).unwrap());
+    let dir = tempfile::tempdir().unwrap();
+    let blob = |n: u32| -> (Id, Vec<u8>) {
+        let b = format!("object {n} {}", "y".repeat((n % 200) as usize)).into_bytes();
+        (Id::of(&b), b)
+    };
+    {
+        let mut s = PackStore::open_with(dir.path(), lazy).unwrap();
+        for n in 0..4000 {
+            let (i, b) = blob(n);
+            s.write(i, &b).unwrap();
+        }
+        s.set_ref("heads/main", None, blob(0).0).unwrap();
+        s.delete(&blob(7).0).unwrap();
+        s.replace(blob(8).0, b"replaced").unwrap();
+    } // close writes the checkpoint
+    {
+        // Lazily opened, then more writes and a replace of a checkpointed id.
+        let mut s = PackStore::open_with(dir.path(), lazy).unwrap();
+        assert!(!s.has(&blob(7).0));
+        assert_eq!(s.read(&blob(8).0).unwrap(), b"replaced");
+        for n in 4000..5000 {
+            let (i, b) = blob(n);
+            s.write(i, &b).unwrap();
+        }
+        s.replace(blob(9).0, b"again").unwrap();
+        s.set_ref("heads/main", Some(blob(0).0), blob(4000).0)
+            .unwrap();
+    }
+    // One open at a time (the lock): take a full view of each.
+    type View = (
+        Vec<Id>,
+        Vec<(Id, bool, Option<(Vec<u8>, usize)>)>,
+        Vec<Vec<Id>>,
+    );
+    let view = |s: &PackStore| -> View {
+        let mut ids = s.ids().unwrap();
+        ids.sort();
+        let probes = (0..5000)
+            .step_by(13)
+            .map(|n| {
+                let i = blob(n).0;
+                let got = s
+                    .has(&i)
+                    .then(|| (s.read(&i).unwrap(), s.stored_len(&i).unwrap()));
+                (i, s.has(&i), got)
+            })
+            .collect();
+        let prefixes = [&[0x00u8][..], &[0x7f], &[0xff, 0x01]]
+            .iter()
+            .map(|p| s.ids_with_prefix(p).unwrap())
+            .collect();
+        (ids, probes, prefixes)
+    };
+    let full = view(&PackStore::open(dir.path()).unwrap());
+    let lz = view(&PackStore::open_with(dir.path(), lazy).unwrap());
+    assert_eq!(full.0.len(), 4999);
+    assert!(full == lz, "lazy open sees what a full load sees");
+    {
+        let s = PackStore::open_with(dir.path(), lazy).unwrap();
+        assert_eq!(s.read(&blob(9).0).unwrap(), b"again");
+    }
+    // A torn checkpoint is refused and the open falls back to a full scan.
+    let ckpt = dir.path().join("packs/00000000.ckpt");
+    let mut bytes = std::fs::read(&ckpt).unwrap();
+    bytes.truncate(bytes.len() - 5);
+    std::fs::write(&ckpt, bytes).unwrap();
+    let s = PackStore::open_with(dir.path(), lazy).unwrap();
+    assert_eq!(s.ids().unwrap().len(), 4999);
+}
+
+/// E170: both hybrids keep the contract.
+#[cfg(feature = "store-rocksdb")]
+#[test]
+fn hybrid_stores() {
+    use ikam_kernel::backends::hybrid::{IndexHybrid, RefsHybrid};
+    all(&|p| RefsHybrid::open(p).unwrap());
+    all(&|p| IndexHybrid::open(p).unwrap());
+}
+
+/// E172: refs logged in the pack keep the contract, alone and with E171.
+#[test]
+fn pack_store_ref_log() {
+    use ikam_kernel::backends::PackOptions;
+    let log = PackOptions {
+        ref_log: true,
+        ..PackOptions::default()
+    };
+    let both = PackOptions {
+        ref_log: true,
+        lazy_checkpoint: true,
+        ..PackOptions::default()
+    };
+    all(&|p| PackStore::open_with(p, log).unwrap());
+    all(&|p| PackStore::open_with(p, both).unwrap());
+
+    // A ref record is durable with the objects before it, and a torn record
+    // ahead of it takes the ref with it: the ref falls back, never forward.
+    let dir = tempfile::tempdir().unwrap();
+    let pack = dir.path().join("packs/00000000.pack");
+    {
+        let mut s = PackStore::open_with(dir.path(), log).unwrap();
+        s.write(id(1), b"first").unwrap();
+        s.set_ref("heads/main", None, id(1)).unwrap();
+        s.write(id(2), b"second").unwrap();
+        s.set_ref("heads/main", Some(id(1)), id(2)).unwrap();
+    }
+    // As after a kill: no checkpoint and no snapshot, so refs come from replay.
+    std::fs::remove_file(dir.path().join("refs.snap")).unwrap();
+    std::fs::remove_file(dir.path().join("packs/00000000.ckpt")).ok();
+    let len = std::fs::metadata(&pack).unwrap().len() as usize;
+    {
+        let s = PackStore::open_with(dir.path(), log).unwrap();
+        assert_eq!(s.get_ref("heads/main").unwrap(), Some(id(2)));
+        assert_eq!(s.read(&id(2)).unwrap(), b"second");
+        assert!(s.ids().unwrap().len() == 2, "ref records are not objects");
+    }
+    std::fs::remove_file(dir.path().join("refs.snap")).ok();
+    std::fs::remove_file(dir.path().join("packs/00000000.ckpt")).ok();
+    // Flip a byte inside object 2's record: it and the ref after it are cut.
+    let mut bytes = std::fs::read(&pack).unwrap();
+    assert_eq!(bytes.len(), len);
+    let at = bytes.windows(6).position(|w| w == b"second").unwrap();
+    bytes[at] ^= 1;
+    std::fs::write(&pack, &bytes).unwrap();
+    std::fs::remove_file(dir.path().join("packs/00000000.ckpt")).ok();
+    std::fs::remove_file(dir.path().join("refs.snap")).ok();
+    let s = PackStore::open_with(dir.path(), log).unwrap();
+    assert_eq!(s.get_ref("heads/main").unwrap(), Some(id(1)));
+    assert!(!s.has(&id(2)));
+    assert_eq!(s.read(&id(1)).unwrap(), b"first");
+    drop(s);
+
+    // A store that kept refs as files carries them over on first open.
+    let dir = tempfile::tempdir().unwrap();
+    {
+        let mut s = PackStore::open(dir.path()).unwrap();
+        s.write(id(3), b"three").unwrap();
+        s.set_ref("heads/old", None, id(3)).unwrap();
+    }
+    {
+        let mut s = PackStore::open_with(dir.path(), log).unwrap();
+        assert_eq!(s.get_ref("heads/old").unwrap(), Some(id(3)));
+        s.set_ref("heads/old", Some(id(3)), id(3)).unwrap();
+    }
+    let s = PackStore::open_with(dir.path(), log).unwrap();
+    assert_eq!(s.refs().unwrap(), vec![("heads/old".to_string(), id(3))]);
+}
+
+/// E175: with filters, every stored id is found and no other, through a
+/// lazy checkpoint's filter; a damaged filter is rebuilt, never trusted.
+/// (Sealed packs' filters are tested in the crate, at a smaller scale.)
+#[test]
+fn pack_store_filters() {
+    use ikam_kernel::backends::PackOptions;
+    let f = PackOptions {
+        filters: true,
+        ..PackOptions::default()
+    };
+    let all_on = PackOptions {
+        filters: true,
+        lazy_checkpoint: true,
+        ref_log: true,
+    };
+    all(&|p| PackStore::open_with(p, f).unwrap());
+    all(&|p| PackStore::open_with(p, all_on).unwrap());
+
+    let obj = |i: u64| {
+        let b = format!("object {i}").into_bytes();
+        (Id::of_content(&b), b)
+    };
+    let dir = tempfile::tempdir().unwrap();
+    {
+        let mut s = PackStore::open_with(dir.path(), all_on).unwrap();
+        for i in 0..20_000 {
+            let (id, b) = obj(i);
+            s.write(id, &b).unwrap();
+        }
+        s.set_ref("heads/main", None, obj(0).0).unwrap();
+    }
+    let check = |s: &PackStore| {
+        for i in 0..20_000 {
+            let (id, b) = obj(i);
+            assert_eq!(s.read(&id).unwrap(), b, "lost {i}");
+        }
+        for i in 20_000..30_000 {
+            assert!(!s.has(&obj(i).0));
+        }
+    };
+    check(&PackStore::open_with(dir.path(), all_on).unwrap());
+    let cflt = dir.path().join("packs/00000000.cflt");
+    assert!(cflt.exists(), "the lazy checkpoint has a filter");
+    let mut b = std::fs::read(&cflt).unwrap();
+    for x in b[20..].iter_mut().take(4096) {
+        *x = 0;
+    }
+    std::fs::write(&cflt, b).unwrap();
+    check(&PackStore::open_with(dir.path(), all_on).unwrap());
+    check(&PackStore::open(dir.path()).unwrap());
+}
+
+/// E176: the pack cleaner keeps exactly the newest version of every live
+/// object and every ref, drops the rest, and a kill partway (old packs still
+/// there, or some removed oldest first) reads the same.
+#[test]
+fn pack_store_compact() {
+    use ikam_kernel::backends::PackOptions;
+    use std::collections::BTreeMap;
+    let obj = |i: u64, v: u64| {
+        format!("object {i} version {v} {}", "x".repeat((i % 50) as usize)).into_bytes()
+    };
+    let key = |i: u64| Id::of_content(format!("key {i}").as_bytes());
+    for opts in [
+        PackOptions::default(),
+        PackOptions {
+            ref_log: true,
+            ..PackOptions::default()
+        },
+        PackOptions {
+            ref_log: true,
+            lazy_checkpoint: true,
+            filters: true,
+        },
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let mut want: BTreeMap<Id, Vec<u8>> = BTreeMap::new();
+        let mut gone = Vec::new();
+        let mut s = PackStore::open_with(dir.path(), opts).unwrap();
+        let mut head = None;
+        for round in 0..4u64 {
+            for i in 0..3_000u64 {
+                let k = key(i);
+                match (i + round) % 7 {
+                    0 if want.contains_key(&k) => {
+                        s.delete(&k).unwrap();
+                        want.remove(&k);
+                        gone.push(k);
+                    }
+                    1 | 2 => {
+                        let b = obj(i, round);
+                        s.replace(k, &b).unwrap();
+                        want.insert(k, b);
+                    }
+                    _ if !want.contains_key(&k) => {
+                        let b = obj(i, round);
+                        s.write(k, &b).unwrap();
+                        want.insert(k, b);
+                    }
+                    _ => {}
+                }
+            }
+            let r = key(10_000 + round);
+            s.set_ref("heads/main", head, r).unwrap();
+            head = Some(r);
+            if round % 2 == 1 {
+                let c = s.compact().unwrap();
+                assert!(c.dropped > 0 && c.bytes_after < c.bytes_before, "{c:?}");
+            }
+        }
+        // Old packs kept, as after a kill before the cleaner removed any.
+        let before = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(before.path().join("packs")).unwrap();
+        for e in std::fs::read_dir(dir.path().join("packs")).unwrap() {
+            let p = e.unwrap().path();
+            std::fs::copy(&p, before.path().join("packs").join(p.file_name().unwrap())).unwrap();
+        }
+        let c = s.compact().unwrap();
+        assert_eq!(c.kept, want.len() as u64);
+        drop(s);
+        let check = |p: &Path| {
+            let s = PackStore::open_with(p, opts).unwrap();
+            for (k, b) in &want {
+                assert_eq!(&s.read(k).unwrap(), b);
+            }
+            for k in &gone {
+                if !want.contains_key(k) {
+                    assert!(!s.has(k));
+                }
+            }
+            assert_eq!(s.get_ref("heads/main").unwrap(), head);
+            let mut ids = s.ids().unwrap();
+            ids.sort();
+            assert_eq!(ids, want.keys().copied().collect::<Vec<_>>());
+        };
+        check(dir.path());
+        if opts.ref_log {
+            // Kill before any old pack was removed: the old packs come back
+            // (only those the cleaner removed; it never rewrites a file).
+            for e in std::fs::read_dir(before.path().join("packs")).unwrap() {
+                let p = e.unwrap().path();
+                let to = dir.path().join("packs").join(p.file_name().unwrap());
+                if !to.exists() {
+                    std::fs::copy(&p, to).unwrap();
+                }
+            }
+            check(dir.path());
+            // Kill after the oldest were removed: remove the lowest numbers.
+            let mut nos: Vec<_> = std::fs::read_dir(before.path().join("packs"))
+                .unwrap()
+                .filter_map(|e| {
+                    e.unwrap()
+                        .file_name()
+                        .to_str()?
+                        .strip_suffix(".pack")
+                        .map(String::from)
+                })
+                .collect();
+            nos.sort();
+            let first = &nos[0];
+            std::fs::remove_file(dir.path().join(format!("packs/{first}.pack"))).unwrap();
+            check(dir.path());
+        }
+    }
+}
+
+/// E177: writers sharing flushes. Eight threads each build a chain on their
+/// own ref; every commit returns only once durable, a stale expected value
+/// is refused, and after a reopen every chain is whole. The store must have
+/// the ref log; staging a ref without it is refused.
+#[test]
+fn pack_store_group_commit() {
+    use ikam_kernel::backends::{GroupCommit, PackOptions};
+    use std::sync::Arc;
+    let opts = PackOptions {
+        lazy_checkpoint: true,
+        ref_log: true,
+        ..PackOptions::default()
+    };
+    let dir = tempfile::tempdir().unwrap();
+    assert!(GroupCommit::new(PackStore::open(dir.path().join("plain")).unwrap()).is_err());
+    let mut plain = PackStore::open(dir.path().join("plain2")).unwrap();
+    assert!(plain.stage_ref("heads/x", None, id(1)).is_err());
+    drop(plain);
+
+    let root = dir.path().join("g");
+    let g = Arc::new(GroupCommit::new(PackStore::open_with(&root, opts).unwrap()).unwrap());
+    let chain = |t: u64, i: u64| {
+        let b = format!("w{t} commit {i} {}", "x".repeat((i % 50) as usize)).into_bytes();
+        (Id::from_bytes(*blake3::hash(&b).as_bytes()), b)
+    };
+    let hs: Vec<_> = (0..8u64)
+        .map(|t| {
+            let g = g.clone();
+            std::thread::spawn(move || {
+                let name = format!("heads/w{t}");
+                let mut head = None;
+                for i in 0..300 {
+                    let (cid, b) = chain(t, i);
+                    g.commit(&[(cid, b)], &name, head, cid).unwrap();
+                    head = Some(cid);
+                }
+                // A stale expected value is refused, and moves nothing.
+                let (cid, b) = chain(t, 1_000);
+                assert!(g.commit(&[(cid, b)], &name, None, cid).is_err());
+                assert_eq!(g.get_ref(&name).unwrap(), head);
+            })
+        })
+        .collect();
+    for h in hs {
+        h.join().unwrap();
+    }
+    let g = Arc::try_unwrap(g).ok().unwrap();
+    assert!(g.flushes() <= 8 * 300 + 8);
+    drop(g.into_inner());
+    let s = PackStore::open_with(&root, opts).unwrap();
+    for t in 0..8 {
+        let (last, _) = chain(t, 299);
+        assert_eq!(s.get_ref(&format!("heads/w{t}")).unwrap(), Some(last));
+        for i in 0..300 {
+            let (cid, b) = chain(t, i);
+            assert_eq!(s.read(&cid).unwrap(), b);
+        }
+    }
+}
+
+/// E179: a tail the open had to scan (the process died before its next
+/// checkpoint) is saved by that open, so a store killed again and again
+/// does not rescan an ever longer tail. Checked with and without the
+/// lazy checkpoint and the ref log.
+#[test]
+fn pack_store_saves_a_scanned_tail() {
+    use ikam_kernel::backends::PackOptions;
+    for opts in [
+        PackOptions::default(),
+        PackOptions {
+            lazy_checkpoint: true,
+            ref_log: true,
+            ..PackOptions::default()
+        },
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let big = vec![7u8; 1 << 20];
+        let mut last = None;
+        {
+            let mut s = PackStore::open_with(root, opts).unwrap();
+            for i in 0..70u32 {
+                let mut b = big.clone();
+                b[..4].copy_from_slice(&i.to_le_bytes());
+                let id = Id::from_bytes(*blake3::hash(&b).as_bytes());
+                s.write(id, &b).unwrap();
+                last = Some(id);
+            }
+            s.set_ref("heads/t", None, last.unwrap()).unwrap();
+        }
+        // As if the process had died before saving anything: no checkpoint.
+        let ckpt = root.join("packs/00000000.ckpt");
+        std::fs::remove_file(&ckpt).unwrap();
+        let _ = std::fs::remove_file(root.join("packs/00000000.cflt"));
+        let _ = std::fs::remove_file(root.join("refs.snap"));
+        let s = PackStore::open_with(root, opts).unwrap();
+        assert!(ckpt.exists(), "the open saved the tail it scanned");
+        assert_eq!(s.get_ref("heads/t").unwrap(), last);
+        assert_eq!(s.read(&last.unwrap()).unwrap()[4..], big[4..]);
+        drop(s);
+        let s = PackStore::open_with(root, opts).unwrap();
+        assert_eq!(s.ids().unwrap().len(), 70);
+    }
+}

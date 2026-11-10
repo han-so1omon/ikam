@@ -827,6 +827,7 @@ struct Sealed {
     pack: File,
     idx: File,
     fanout: [u32; 256],
+    filter: Option<Box<Filter>>, // E175
 }
 
 impl Sealed {
@@ -844,6 +845,11 @@ impl Sealed {
 
     /// Offset and length of `id` (length `TOMBSTONE` if deleted here).
     fn find(&self, id: &Id) -> Result<Option<(u64, u32)>, Error> {
+        if let Some(f) = &self.filter
+            && !f.may_have(id)
+        {
+            return Ok(None);
+        }
         let b = id.as_bytes()[0] as usize;
         let (mut lo, mut hi) = (if b == 0 { 0 } else { self.fanout[b - 1] }, self.fanout[b]);
         let mut key = [0u8; 32];
@@ -908,8 +914,206 @@ impl Sealed {
 /// cut off. New records reach disk with one `sync_data` when a ref moves, before
 /// the ref file is renamed into place, so a ref never points past durable data.
 /// One process writes at a time (a lock file is held while open).
+/// Settings for [`PackStore`]; every one is off by default.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct PackOptions {
+    /// E171: open the open pack's checkpoint as a sorted on-disk index, read
+    /// on lookup, instead of loading every entry into memory (and hashing the
+    /// file) at open. Checkpoints are then fsynced, like a sealed pack's index.
+    /// No format change: the same checkpoint file, read differently.
+    pub lazy_checkpoint: bool,
+    /// E172: refs are records in the pack, after the objects they reach, so
+    /// one `sync_data` makes a commit durable (in place of the pack's sync,
+    /// then a ref file written, synced and renamed). A format addition: a
+    /// store written this way keeps its refs only in its packs, and code
+    /// without this option does not see them.
+    pub ref_log: bool,
+    /// E175: a Bloom filter beside each sealed index (`.flt`) and lazy
+    /// checkpoint (`.cflt`), held in memory, so a lookup searches on disk
+    /// only the packs that may hold the id. Filters are derived files: one
+    /// that is missing or fails its hash is rebuilt from its index at open.
+    pub filters: bool,
+}
+
+/// E175: a Bloom filter over one index's ids (10 bits an id, 7 probes: about
+/// 1% false positives). Ids are BLAKE3 hashes, so their bytes are the hashes.
+struct Filter {
+    m: u64,
+    bits: Vec<u64>,
+}
+
+const FLT_MAGIC: &[u8; 8] = b"ikamflt1";
+const FLT_K: u64 = 7;
+
+impl Filter {
+    fn build<'a>(ids: impl ExactSizeIterator<Item = &'a Id>) -> Filter {
+        let m = (ids.len() as u64 * 10).max(64);
+        let mut f = Filter {
+            m,
+            bits: vec![0; m.div_ceil(64) as usize],
+        };
+        for id in ids {
+            for b in f.probes(id) {
+                f.bits[(b / 64) as usize] |= 1 << (b % 64);
+            }
+        }
+        f
+    }
+
+    fn probes(&self, id: &Id) -> impl Iterator<Item = u64> + use<> {
+        let b = id.as_bytes();
+        let h1 = u64::from_le_bytes(b[8..16].try_into().unwrap());
+        let h2 = u64::from_le_bytes(b[16..24].try_into().unwrap()) | 1;
+        let m = self.m;
+        (0..FLT_K).map(move |i| h1.wrapping_add(i.wrapping_mul(h2)) % m)
+    }
+
+    fn may_have(&self, id: &Id) -> bool {
+        self.probes(id)
+            .all(|b| self.bits[(b / 64) as usize] & (1 << (b % 64)) != 0)
+    }
+
+    /// magic, the index's entry count, m, the words, then BLAKE3 of all that.
+    /// Not synced: a lost or torn filter is rebuilt.
+    fn write(&self, path: &Path, count: u32) -> Result<(), Error> {
+        let mut out = Vec::with_capacity(20 + self.bits.len() * 8 + 32);
+        out.extend_from_slice(FLT_MAGIC);
+        out.extend_from_slice(&count.to_le_bytes());
+        out.extend_from_slice(&self.m.to_le_bytes());
+        for w in &self.bits {
+            out.extend_from_slice(&w.to_le_bytes());
+        }
+        let h = blake3::hash(&out);
+        out.extend_from_slice(h.as_bytes());
+        let tmp = path.with_extension("flt-tmp");
+        fs::write(&tmp, &out)?;
+        fs::rename(&tmp, path)?;
+        Ok(())
+    }
+
+    fn load(path: &Path, count: u32) -> Option<Filter> {
+        let b = fs::read(path).ok()?;
+        if b.len() < 20 + 32 || &b[..8] != FLT_MAGIC {
+            return None;
+        }
+        let (body, h) = b.split_at(b.len() - 32);
+        if blake3::hash(body).as_bytes() != h
+            || u32::from_le_bytes(body[8..12].try_into().unwrap()) != count
+        {
+            return None;
+        }
+        let m = u64::from_le_bytes(body[12..20].try_into().unwrap());
+        let words = &body[20..];
+        if m == 0 || words.len() as u64 != m.div_ceil(64) * 8 {
+            return None;
+        }
+        let bits = words
+            .chunks_exact(8)
+            .map(|w| u64::from_le_bytes(w.try_into().unwrap()))
+            .collect();
+        Some(Filter { m, bits })
+    }
+
+    /// The filter at `path` if it matches the index, or one built from it.
+    fn load_or_build(path: &Path, idx: &File, count: u32) -> Result<Filter, Error> {
+        if let Some(f) = Filter::load(path, count) {
+            return Ok(f);
+        }
+        let mut body = vec![0u8; count as usize * IDX_ENTRY as usize];
+        idx.read_exact_at(&mut body, IDX_HEAD)?;
+        let ids: Vec<Id> = body
+            .chunks_exact(IDX_ENTRY as usize)
+            .map(|e| Id::from_bytes(e[..32].try_into().unwrap()))
+            .collect();
+        let f = Filter::build(ids.iter());
+        f.write(path, count)?;
+        Ok(f)
+    }
+}
+
+/// E172: the id field of a ref record. No object has it (ids are BLAKE3).
+fn ref_marker() -> Id {
+    Id::from_bytes([0xff; 32])
+}
+
+/// E172: a ref record's body: name length (u16), name, new id.
+fn ref_body(name: &str, new: &Id) -> Vec<u8> {
+    let mut b = Vec::with_capacity(2 + name.len() + 32);
+    b.extend_from_slice(&(name.len() as u16).to_le_bytes());
+    b.extend_from_slice(name.as_bytes());
+    b.extend_from_slice(new.as_bytes());
+    b
+}
+
+fn parse_ref_body(b: &[u8]) -> Option<(String, Id)> {
+    let n = u16::from_le_bytes(b.get(..2)?.try_into().ok()?) as usize;
+    let name = std::str::from_utf8(b.get(2..2 + n)?).ok()?.to_string();
+    let id: [u8; 32] = b.get(2 + n..2 + n + 32)?.try_into().ok()?;
+    (b.len() == 2 + n + 32).then(|| (name, Id::from_bytes(id)))
+}
+
+const SNAP_MAGIC: &[u8; 8] = b"ikamref1";
+
+/// E172: every ref as of a point in the packs (pack number, offset); open
+/// loads it and replays the ref records after that point. Losing it only
+/// means a longer replay: the records stay in the packs.
+fn write_snap(
+    path: &Path,
+    pack: u32,
+    covers: u64,
+    refs: &BTreeMap<String, Id>,
+) -> Result<(), Error> {
+    let mut out = SNAP_MAGIC.to_vec();
+    out.extend_from_slice(&pack.to_le_bytes());
+    out.extend_from_slice(&covers.to_le_bytes());
+    out.extend_from_slice(&(refs.len() as u32).to_le_bytes());
+    for (name, id) in refs {
+        out.extend_from_slice(&ref_body(name, id));
+    }
+    let h = blake3::hash(&out);
+    out.extend_from_slice(h.as_bytes());
+    let tmp = path.with_extension("snap.tmp");
+    fs::write(&tmp, &out)?;
+    fs::rename(&tmp, path)?;
+    Ok(())
+}
+
+fn read_snap(path: &Path) -> Option<(u32, u64, BTreeMap<String, Id>)> {
+    let b = fs::read(path).ok()?;
+    if b.len() < 8 + 4 + 8 + 4 + 32 || &b[..8] != SNAP_MAGIC {
+        return None;
+    }
+    let (body, hash) = b.split_at(b.len() - 32);
+    if blake3::hash(body).as_bytes() != hash {
+        return None;
+    }
+    let pack = u32::from_le_bytes(body[8..12].try_into().ok()?);
+    let covers = u64::from_le_bytes(body[12..20].try_into().ok()?);
+    let count = u32::from_le_bytes(body[20..24].try_into().ok()?);
+    let mut refs = BTreeMap::new();
+    let mut at = 24;
+    for _ in 0..count {
+        let n = u16::from_le_bytes(body.get(at..at + 2)?.try_into().ok()?) as usize;
+        let (name, id) = parse_ref_body(body.get(at..at + 2 + n + 32)?)?;
+        refs.insert(name, id);
+        at += 2 + n + 32;
+    }
+    (at == body.len()).then_some((pack, covers, refs))
+}
+
+fn sync_dir(dir: &Path) -> Result<(), Error> {
+    File::open(dir)?.sync_all()?;
+    Ok(())
+}
+
 pub struct PackStore {
     root: PathBuf,
+    opts: PackOptions,
+    /// E171: the open pack's checkpoint, searched on disk; `active_index`
+    /// then holds only the records after it.
+    base: Option<Box<Sealed>>, // boxed: a fanout is 1 KiB
+    /// E172: refs, when they live in the packs.
+    log_refs: BTreeMap<String, Id>,
     sealed: Vec<Sealed>, // oldest first; lookups go newest first
     active: File,
     active_no: u32,
@@ -930,6 +1134,10 @@ fn crc(id: &Id, len: u32, bytes: &[u8]) -> u32 {
 
 impl PackStore {
     pub fn open(root: impl Into<PathBuf>) -> Result<PackStore, Error> {
+        PackStore::open_with(root, PackOptions::default())
+    }
+
+    pub fn open_with(root: impl Into<PathBuf>, opts: PackOptions) -> Result<PackStore, Error> {
         let root = root.into();
         fs::create_dir_all(root.join("packs"))?;
         fs::create_dir_all(root.join("refs"))?;
@@ -961,7 +1169,12 @@ impl PackStore {
                 write_idx(&idx_path, &index)?;
             }
             if idx_path.exists() {
-                sealed.push(open_sealed(&root, n)?);
+                let mut s = open_sealed(&root, n)?;
+                if opts.filters {
+                    let f = root.join(format!("packs/{n:08}.flt"));
+                    s.filter = Some(Box::new(Filter::load_or_build(&f, &s.idx, s.fanout[255])?));
+                }
+                sealed.push(s);
             }
         }
         let active_no = match last {
@@ -971,10 +1184,28 @@ impl PackStore {
         };
         let path = root.join(format!("packs/{active_no:08}.pack"));
         let ckpt = root.join(format!("packs/{active_no:08}.ckpt"));
+        let mut base_ckpt = None;
+        // E179: where the saved checkpoint ends; what follows was scanned.
+        let mut ckpt_end = 0;
         let (active_index, good) = if path.exists() {
             let len = fs::metadata(&path)?.len();
-            let (index, start) = read_ckpt(&ckpt, len).unwrap_or_default();
-            scan(&path, start, index)?
+            let lazy = if opts.lazy_checkpoint {
+                open_ckpt_lazy(&ckpt, len)
+            } else {
+                None
+            };
+            match lazy {
+                Some((idx, fanout, covers)) => {
+                    base_ckpt = Some((idx, fanout));
+                    ckpt_end = covers;
+                    scan(&path, covers, HashMap::new())?
+                }
+                None => {
+                    let (index, start) = read_ckpt(&ckpt, len).unwrap_or_default();
+                    ckpt_end = start;
+                    scan(&path, start, index)?
+                }
+            }
         } else {
             (HashMap::new(), 0)
         };
@@ -984,21 +1215,73 @@ impl PackStore {
             .read(true)
             .write(true)
             .open(&path)?;
+        let mut log_refs = BTreeMap::new();
+        if opts.ref_log {
+            let snap = read_snap(&root.join("refs.snap"));
+            let (from_pack, from_off) = match snap {
+                Some((p, c, r)) => {
+                    log_refs = r;
+                    (p, c)
+                }
+                None => (0, 0),
+            };
+            // Replay ref records after the snapshot, in pack order.
+            for &n in nos.iter().filter(|&&n| n >= from_pack) {
+                let start = if n == from_pack { from_off } else { 0 };
+                let p = root.join(format!("packs/{n:08}.pack"));
+                scan_with(&p, start, HashMap::new(), Some(&mut log_refs))?;
+            }
+            if log_refs.is_empty() && snap_missing_and_ref_files(&root) {
+                // A store that kept refs as files: carry them over.
+                for (name, id) in file_refs(&root)? {
+                    log_refs.insert(name, id);
+                }
+            }
+        }
+        let base = match base_ckpt {
+            Some((idx, fanout)) => {
+                let filter = if opts.filters {
+                    let f = root.join(format!("packs/{active_no:08}.cflt"));
+                    Some(Box::new(Filter::load_or_build(&f, &idx, fanout[255])?))
+                } else {
+                    None
+                };
+                Some(Box::new(Sealed {
+                    pack: active.try_clone()?,
+                    idx,
+                    fanout,
+                    filter,
+                }))
+            }
+            None => None,
+        };
         if active.metadata()?.len() != good {
             active.set_len(good)?; // cut a torn tail
             active.sync_all()?;
         }
-        Ok(PackStore {
+        let mut store = PackStore {
             root,
+            opts,
+            base,
+            log_refs,
             sealed,
             active,
             active_no,
             active_index,
             buf: Vec::new(),
             flushed: good,
-            ckpt_at: good,
+            // E179: not `good`: a tail scanned after a crash is not saved,
+            // so the next checkpoint (or a drop) must still save it.
+            ckpt_at: ckpt_end.min(good),
             _lock: lock,
-        })
+        };
+        // E179: a store killed before each 64 MiB checkpoint would otherwise
+        // rescan an ever longer tail on every open. Save it now.
+        if store.flushed - store.ckpt_at >= PACK_CKPT_BYTES {
+            store.active.sync_data()?; // a checkpoint names only durable records
+            store.checkpoint()?;
+        }
+        Ok(store)
     }
 
     fn append(&mut self, id: Id, bytes: Option<&[u8]>) -> Result<(), Error> {
@@ -1030,6 +1313,11 @@ impl PackStore {
     pub fn sync(&mut self) -> Result<(), Error> {
         self.flush()?;
         self.active.sync_data()?;
+        self.maintain()
+    }
+
+    /// Seal a full pack, or checkpoint a grown one.
+    fn maintain(&mut self) -> Result<(), Error> {
         if self.flushed >= PACK_SEAL_BYTES {
             self.seal()?;
         } else if self.flushed - self.ckpt_at >= PACK_CKPT_BYTES {
@@ -1041,19 +1329,79 @@ impl PackStore {
     /// Save the open pack's index, so the next open scans only what follows.
     fn checkpoint(&mut self) -> Result<(), Error> {
         let path = self.root.join(format!("packs/{:08}.ckpt", self.active_no));
-        write_ckpt(&path, &self.active_index, self.flushed)?;
+        let full = self.full_active_index()?;
+        write_ckpt(&path, &full, self.flushed, self.opts.lazy_checkpoint)?;
         self.ckpt_at = self.flushed;
+        if self.opts.ref_log {
+            write_snap(
+                &self.root.join("refs.snap"),
+                self.active_no,
+                self.flushed,
+                &self.log_refs,
+            )?;
+        }
+        if self.opts.lazy_checkpoint
+            && let Some((idx, fanout, _)) = open_ckpt_lazy(&path, self.flushed)
+        {
+            let filter = if self.opts.filters {
+                let f = Filter::build(full.keys());
+                f.write(&path.with_extension("cflt"), fanout[255])?;
+                Some(Box::new(f))
+            } else {
+                None
+            };
+            self.base = Some(Box::new(Sealed {
+                pack: self.active.try_clone()?,
+                idx,
+                fanout,
+                filter,
+            }));
+            self.active_index.clear();
+        }
         Ok(())
+    }
+
+    /// The open pack's whole index: the lazily read checkpoint (E171), if
+    /// any, under the records that followed it.
+    fn full_active_index(&self) -> Result<PackIndex, Error> {
+        let Some(b) = &self.base else {
+            return Ok(self.active_index.clone());
+        };
+        let n = b.fanout[255] as usize;
+        let mut body = vec![0u8; n * IDX_ENTRY as usize];
+        b.idx.read_exact_at(&mut body, IDX_HEAD)?;
+        let mut full = HashMap::with_capacity(n + self.active_index.len());
+        for e in body.chunks_exact(IDX_ENTRY as usize) {
+            let id = Id::from_bytes(e[..32].try_into().unwrap());
+            let off = u64::from_le_bytes(e[32..40].try_into().unwrap());
+            let len = u32::from_le_bytes(e[40..44].try_into().unwrap());
+            full.insert(id, (off, len));
+        }
+        full.extend(self.active_index.iter().map(|(k, v)| (*k, *v)));
+        Ok(full)
     }
 
     fn seal(&mut self) -> Result<(), Error> {
         let n = self.active_no;
-        write_idx(
-            &self.root.join(format!("packs/{n:08}.idx")),
-            &self.active_index,
-        )?;
+        let full = self.full_active_index()?;
+        if self.opts.ref_log {
+            // Every ref so far, as of the start of the next pack.
+            write_snap(&self.root.join("refs.snap"), n + 1, 0, &self.log_refs)?;
+        }
+        write_idx(&self.root.join(format!("packs/{n:08}.idx")), &full)?;
+        self.base = None;
         let _ = fs::remove_file(self.root.join(format!("packs/{n:08}.ckpt")));
-        self.sealed.push(open_sealed(&self.root, n)?);
+        let _ = fs::remove_file(self.root.join(format!("packs/{n:08}.cflt")));
+        let mut sealed = open_sealed(&self.root, n)?;
+        if self.opts.filters {
+            let f = Filter::build(full.keys());
+            f.write(
+                &self.root.join(format!("packs/{n:08}.flt")),
+                sealed.fanout[255],
+            )?;
+            sealed.filter = Some(Box::new(f));
+        }
+        self.sealed.push(sealed);
         self.active_no += 1;
         let path = self.root.join(format!("packs/{:08}.pack", self.active_no));
         self.active = OpenOptions::new()
@@ -1062,6 +1410,8 @@ impl PackStore {
             .read(true)
             .write(true)
             .open(path)?;
+        // E172: the new pack's name must be durable before records in it are.
+        sync_dir(&self.root.join("packs"))?;
         self.active_index.clear();
         self.flushed = 0;
         self.ckpt_at = 0;
@@ -1071,6 +1421,11 @@ impl PackStore {
     /// Where `id` lives: `(sealed pack or None for the open one, offset, len)`.
     fn locate(&self, id: &Id) -> Result<Option<(Option<usize>, u64, u32)>, Error> {
         if let Some(&(off, len)) = self.active_index.get(id) {
+            return Ok(Some((None, off, len)));
+        }
+        if let Some(b) = &self.base
+            && let Some((off, len)) = b.find(id)?
+        {
             return Ok(Some((None, off, len)));
         }
         for (i, s) in self.sealed.iter().enumerate().rev() {
@@ -1084,6 +1439,288 @@ impl PackStore {
     pub fn packs(&self) -> usize {
         self.sealed.len() + 1
     }
+
+    /// E176: the pack cleaner. Seals the open pack, copies every object whose
+    /// newest record is in a sealed pack into new packs (dropping deleted and
+    /// replaced records and tombstones), then removes the old packs, oldest
+    /// first. A kill at any point leaves a store that reads the same: until
+    /// an old pack is removed the copies only duplicate its newest records,
+    /// and removing oldest first never uncovers a record a newer tombstone
+    /// hid. With `ref_log` the refs are logged again after the copies.
+    pub fn compact(&mut self) -> Result<Compacted, Error> {
+        self.flush()?;
+        if self.flushed > 0 {
+            self.active.sync_data()?;
+            self.seal()?;
+        }
+        let old = self.sealed.len();
+        let old_nos: Vec<u32> = (0..self.active_no)
+            .filter(|n| self.root.join(format!("packs/{n:08}.pack")).exists())
+            .collect();
+        let mut out = Compacted {
+            packs_before: old,
+            bytes_before: self.pack_bytes()?,
+            ..Compacted::default()
+        };
+        const CHUNK: u32 = 1 << 16;
+        let mut body = Vec::new();
+        for i in 0..old {
+            let count = self.sealed[i].fanout[255];
+            let mut at = 0;
+            while at < count {
+                let n = CHUNK.min(count - at);
+                body.resize(n as usize * IDX_ENTRY as usize, 0);
+                self.sealed[i]
+                    .idx
+                    .read_exact_at(&mut body, IDX_HEAD + at as u64 * IDX_ENTRY)?;
+                for e in body.chunks_exact(IDX_ENTRY as usize) {
+                    let id = Id::from_bytes(e[..32].try_into().unwrap());
+                    let off = u64::from_le_bytes(e[32..40].try_into().unwrap());
+                    let len = u32::from_le_bytes(e[40..44].try_into().unwrap());
+                    let newest =
+                        matches!(self.locate(&id)?, Some((Some(j), o, _)) if j == i && o == off);
+                    if len == TOMBSTONE || !newest {
+                        out.dropped += 1;
+                        continue;
+                    }
+                    let bytes = self.read(&id)?; // CRC-checked
+                    self.append(id, Some(&bytes))?;
+                    out.kept += 1;
+                    if self.flushed >= PACK_SEAL_BYTES {
+                        self.sync()?; // seals
+                    }
+                }
+                at += n;
+            }
+        }
+        if self.opts.ref_log {
+            let marker = ref_marker();
+            for (name, new) in &self.log_refs {
+                let body = ref_body(name, new);
+                let len = body.len() as u32;
+                self.buf.extend_from_slice(marker.as_bytes());
+                self.buf.extend_from_slice(&len.to_le_bytes());
+                self.buf.extend_from_slice(&body);
+                self.buf
+                    .extend_from_slice(&crc(&marker, len, &body).to_le_bytes());
+            }
+        }
+        self.flush()?;
+        if self.flushed > 0 {
+            self.active.sync_data()?;
+            self.seal()?;
+        }
+        if self.opts.ref_log {
+            write_snap(
+                &self.root.join("refs.snap"),
+                self.active_no,
+                0,
+                &self.log_refs,
+            )?;
+        }
+        let packs = self.root.join("packs");
+        sync_dir(&packs)?;
+        for n in old_nos {
+            // The pack first: an index or filter without its pack is ignored.
+            fs::remove_file(packs.join(format!("{n:08}.pack")))?;
+            for ext in ["idx", "flt", "ckpt", "cflt"] {
+                let _ = fs::remove_file(packs.join(format!("{n:08}.{ext}")));
+            }
+        }
+        sync_dir(&packs)?;
+        self.sealed.drain(..old);
+        out.packs_after = self.sealed.len();
+        out.bytes_after = self.pack_bytes()?;
+        Ok(out)
+    }
+
+    /// Bytes in the packs folder.
+    pub fn pack_bytes(&self) -> Result<u64, Error> {
+        let mut n = 0;
+        for e in fs::read_dir(self.root.join("packs"))? {
+            n += e?.metadata()?.len();
+        }
+        Ok(n)
+    }
+
+    /// E177: move a ref in memory and append its record, without making
+    /// it durable. Needs the ref log. The caller must not report the ref
+    /// as moved until a later [`PackStore::sync`] or group flush covers it.
+    pub fn stage_ref(&mut self, name: &str, expected: Option<Id>, new: Id) -> Result<(), Error> {
+        if !self.opts.ref_log {
+            return Err(Error::Io(io::Error::other("stage_ref needs the ref log")));
+        }
+        check_ref_name(name)?;
+        if self.get_ref(name)? != expected {
+            return Err(Error::RefConflict(name.into()));
+        }
+        let body = ref_body(name, &new);
+        let marker = ref_marker();
+        let len = body.len() as u32;
+        self.buf.extend_from_slice(marker.as_bytes());
+        self.buf.extend_from_slice(&len.to_le_bytes());
+        self.buf.extend_from_slice(&body);
+        self.buf
+            .extend_from_slice(&crc(&marker, len, &body).to_le_bytes());
+        self.log_refs.insert(name.to_string(), new);
+        Ok(())
+    }
+
+    /// E177: write out what is buffered and hand back a handle to the open
+    /// pack, so the flush to disk can run without holding the store.
+    fn flush_for_group(&mut self) -> Result<File, Error> {
+        self.flush()?;
+        Ok(self.active.try_clone()?)
+    }
+
+    /// E177: after a group flush, seal or checkpoint if due. Records may have
+    /// been appended while the flush ran, so a due seal syncs again first:
+    /// an index or snapshot must never name records that are not durable.
+    fn maintain_after_group(&mut self) -> Result<(), Error> {
+        if self.flushed + self.buf.len() as u64 >= PACK_SEAL_BYTES
+            || self.flushed - self.ckpt_at >= PACK_CKPT_BYTES
+        {
+            self.sync()?;
+        }
+        Ok(())
+    }
+}
+
+/// E177: many writers sharing one pack store, with one flush to disk
+/// covering every commit that is waiting (group commit). Each commit's
+/// objects and ref record are appended under the lock; the first waiter
+/// to find no flush running becomes the flusher, flushes outside the lock,
+/// and wakes everyone its flush covered. A commit returns only once a flush
+/// that started after its records were appended has finished.
+pub struct GroupCommit {
+    state: std::sync::Mutex<GroupState>,
+    done: std::sync::Condvar,
+}
+
+struct GroupState {
+    store: PackStore,
+    staged: u64,
+    durable: u64,
+    flushing: bool,
+    failed: bool,
+    flushes: u64,
+}
+
+impl GroupCommit {
+    /// Needs a store opened with the ref log on.
+    pub fn new(store: PackStore) -> Result<GroupCommit, Error> {
+        if !store.opts.ref_log {
+            return Err(Error::Io(io::Error::other(
+                "group commit needs the ref log",
+            )));
+        }
+        Ok(GroupCommit {
+            state: std::sync::Mutex::new(GroupState {
+                store,
+                staged: 0,
+                durable: 0,
+                flushing: false,
+                failed: false,
+                flushes: 0,
+            }),
+            done: std::sync::Condvar::new(),
+        })
+    }
+
+    /// Write `objects`, then move `name` from `expected` to `new`, and
+    /// return once both are durable.
+    pub fn commit(
+        &self,
+        objects: &[(Id, Vec<u8>)],
+        name: &str,
+        expected: Option<Id>,
+        new: Id,
+    ) -> Result<(), Error> {
+        let failed = || Error::Io(io::Error::other("an earlier group flush failed"));
+        let mut st = self.state.lock().unwrap();
+        if st.failed {
+            return Err(failed());
+        }
+        for (id, bytes) in objects {
+            st.store.write(*id, bytes)?;
+        }
+        st.store.stage_ref(name, expected, new)?;
+        st.staged += 1;
+        let mine = st.staged;
+        loop {
+            if st.failed {
+                return Err(failed());
+            }
+            if st.durable >= mine {
+                return Ok(());
+            }
+            if st.flushing {
+                st = self.done.wait(st).unwrap();
+                continue;
+            }
+            // Become the flusher for everything staged so far.
+            st.flushing = true;
+            let target = st.staged;
+            let file = match st.store.flush_for_group() {
+                Ok(f) => f,
+                Err(e) => {
+                    st.failed = true;
+                    st.flushing = false;
+                    self.done.notify_all();
+                    return Err(e);
+                }
+            };
+            drop(st);
+            let r = file.sync_data();
+            st = self.state.lock().unwrap();
+            st.flushing = false;
+            let r = r
+                .map_err(Error::from)
+                .and_then(|_| st.store.maintain_after_group());
+            match r {
+                Ok(()) => {
+                    st.durable = st.durable.max(target);
+                    st.flushes += 1;
+                }
+                Err(e) => {
+                    st.failed = true;
+                    self.done.notify_all();
+                    return Err(e);
+                }
+            }
+            self.done.notify_all();
+        }
+    }
+
+    pub fn get_ref(&self, name: &str) -> Result<Option<Id>, Error> {
+        self.state.lock().unwrap().store.get_ref(name)
+    }
+
+    pub fn read(&self, id: &Id) -> Result<Vec<u8>, Error> {
+        self.state.lock().unwrap().store.read(id)
+    }
+
+    /// Flushes to disk so far (commits per flush shows the grouping).
+    pub fn flushes(&self) -> u64 {
+        self.state.lock().unwrap().flushes
+    }
+
+    pub fn into_inner(self) -> PackStore {
+        self.state.into_inner().unwrap().store
+    }
+}
+
+/// What [`PackStore::compact`] did.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Compacted {
+    /// Sealed packs before and after (the open pack is sealed first).
+    pub packs_before: usize,
+    pub packs_after: usize,
+    pub bytes_before: u64,
+    pub bytes_after: u64,
+    /// Objects copied, and records dropped (old versions, deleted, tombstones).
+    pub kept: u64,
+    pub dropped: u64,
 }
 
 fn open_sealed(root: &Path, n: u32) -> Result<Sealed, Error> {
@@ -1099,7 +1736,12 @@ fn open_sealed(root: &Path, n: u32) -> Result<Sealed, Error> {
         let at = 16 + i * 4;
         *f = u32::from_le_bytes(head[at..at + 4].try_into().unwrap());
     }
-    Ok(Sealed { pack, idx, fanout })
+    Ok(Sealed {
+        pack,
+        idx,
+        fanout,
+        filter: None,
+    })
 }
 
 /// Where each object of a pack starts and how long its record is.
@@ -1107,7 +1749,18 @@ type PackIndex = HashMap<Id, (u64, u32)>;
 
 /// Read a pack's records from `start`, stopping at the first torn or
 /// corrupt one. Returns the index and the length of the good prefix.
-fn scan(path: &Path, start: u64, mut index: PackIndex) -> Result<(PackIndex, u64), Error> {
+fn scan(path: &Path, start: u64, index: PackIndex) -> Result<(PackIndex, u64), Error> {
+    scan_with(path, start, index, None)
+}
+
+/// [`scan`], collecting ref records (E172) into `refs` in pack order
+/// rather than indexing them.
+fn scan_with(
+    path: &Path,
+    start: u64,
+    mut index: PackIndex,
+    mut refs: Option<&mut BTreeMap<String, Id>>,
+) -> Result<(PackIndex, u64), Error> {
     let mut f = File::open(path)?;
     let total = f.metadata()?.len();
     f.seek(SeekFrom::Start(start))?;
@@ -1131,7 +1784,13 @@ fn scan(path: &Path, start: u64, mut index: PackIndex) -> Result<(PackIndex, u64
         if u32::from_le_bytes(c) != crc(&id, len, &body) {
             break;
         }
-        index.insert(id, (off, len));
+        if id == ref_marker() {
+            if let (Some(r), Some((name, to))) = (refs.as_deref_mut(), parse_ref_body(&body)) {
+                r.insert(name, to);
+            }
+        } else {
+            index.insert(id, (off, len));
+        }
         off += RECORD_HEAD + n + 4;
     }
     Ok((index, off))
@@ -1141,15 +1800,59 @@ fn scan(path: &Path, start: u64, mut index: PackIndex) -> Result<(PackIndex, u64
 /// records before `covers`, then `covers` (u64) and a BLAKE3 hash of all of
 /// it. Open loads it and scans only what came after; a missing, torn or
 /// stale checkpoint only means a longer scan.
-fn write_ckpt(path: &Path, index: &HashMap<Id, (u64, u32)>, covers: u64) -> Result<(), Error> {
+fn write_ckpt(
+    path: &Path,
+    index: &HashMap<Id, (u64, u32)>,
+    covers: u64,
+    durable: bool,
+) -> Result<(), Error> {
     let mut out = idx_bytes(index);
     out.extend_from_slice(&covers.to_le_bytes());
     let h = blake3::hash(&out);
     out.extend_from_slice(h.as_bytes());
     let tmp = path.with_extension("ckpt.tmp");
-    fs::write(&tmp, &out)?;
-    fs::rename(&tmp, path)?; // no fsync: losing it costs a scan, nothing more
+    if durable {
+        // E171: read lazily, unhashed, so written like a sealed index.
+        let mut f = File::create(&tmp)?;
+        f.write_all(&out)?;
+        f.sync_all()?;
+    } else {
+        fs::write(&tmp, &out)?; // no fsync: losing it costs a scan, nothing more
+    }
+    fs::rename(&tmp, path)?;
     Ok(())
+}
+
+/// E171: a checkpoint to search on disk: its file, fanout and the pack
+/// length it covers. Checked for size, magic, sorted fanout and coverage;
+/// its hash is not read (that would read the whole file). Each record read
+/// through it still checks the record's id and CRC.
+fn open_ckpt_lazy(path: &Path, pack_len: u64) -> Option<(File, [u32; 256], u64)> {
+    let f = File::open(path).ok()?;
+    let size = f.metadata().ok()?.len();
+    let mut head = vec![0u8; IDX_HEAD as usize];
+    f.read_exact_at(&mut head, 0).ok()?;
+    if &head[..8] != IDX_MAGIC {
+        return None;
+    }
+    let count = u64::from_le_bytes(head[8..16].try_into().ok()?);
+    if size != IDX_HEAD + count * IDX_ENTRY + 8 + 32 {
+        return None;
+    }
+    let mut fanout = [0u32; 256];
+    for (i, x) in fanout.iter_mut().enumerate() {
+        *x = u32::from_le_bytes(head[16 + i * 4..20 + i * 4].try_into().ok()?);
+    }
+    if fanout.windows(2).any(|w| w[0] > w[1]) || fanout[255] as u64 != count {
+        return None;
+    }
+    let mut c = [0u8; 8];
+    f.read_exact_at(&mut c, size - 40).ok()?;
+    let covers = u64::from_le_bytes(c);
+    if covers > pack_len {
+        return None;
+    }
+    Some((f, fanout, covers))
 }
 
 fn read_ckpt(path: &Path, pack_len: u64) -> Option<(PackIndex, u64)> {
@@ -1324,6 +2027,15 @@ impl Store for PackStore {
                 }
             }
         }
+        if let Some(b) = &self.base {
+            let (lo, hi) = b.range(prefix);
+            for i in lo..hi {
+                let (id, _, len) = b.entry(i)?;
+                if id.as_bytes().starts_with(prefix) {
+                    live.insert(id, len != TOMBSTONE);
+                }
+            }
+        }
         for (id, &(_, len)) in &self.active_index {
             if id.as_bytes().starts_with(prefix) {
                 live.insert(*id, len != TOMBSTONE);
@@ -1345,6 +2057,9 @@ impl Store for PackStore {
 
     fn get_ref(&self, name: &str) -> Result<Option<Id>, Error> {
         check_ref_name(name)?;
+        if self.opts.ref_log {
+            return Ok(self.log_refs.get(name).copied());
+        }
         match fs::read_to_string(self.root.join("refs").join(name)) {
             Ok(s) => Ok(Some(s.trim().parse()?)),
             Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
@@ -1356,6 +2071,22 @@ impl Store for PackStore {
         check_ref_name(name)?;
         if self.get_ref(name)? != expected {
             return Err(Error::RefConflict(name.into()));
+        }
+        if self.opts.ref_log {
+            // E172: the ref record follows the objects in the same file, and
+            // a scan stops at the first bad record, so one sync covers both.
+            let body = ref_body(name, &new);
+            let marker = ref_marker();
+            let len = body.len() as u32;
+            self.buf.extend_from_slice(marker.as_bytes());
+            self.buf.extend_from_slice(&len.to_le_bytes());
+            self.buf.extend_from_slice(&body);
+            self.buf
+                .extend_from_slice(&crc(&marker, len, &body).to_le_bytes());
+            self.flush()?;
+            self.active.sync_data()?;
+            self.log_refs.insert(name.to_string(), new);
+            return self.maintain();
         }
         self.sync()?; // objects first, then the ref that reaches them
         let path = self.root.join("refs").join(name);
@@ -1372,27 +2103,416 @@ impl Store for PackStore {
     }
 
     fn refs(&self) -> Result<Vec<(String, Id)>, Error> {
-        let mut out = Vec::new();
-        let base = self.root.join("refs");
-        let mut stack = vec![base.clone()];
-        while let Some(dir) = stack.pop() {
-            for e in fs::read_dir(&dir)? {
-                let e = e?;
-                let p = e.path();
-                if e.file_type()?.is_dir() {
-                    stack.push(p);
-                } else if !p.to_string_lossy().ends_with(".lock") {
-                    let name = p
-                        .strip_prefix(&base)
-                        .unwrap()
-                        .to_string_lossy()
-                        .into_owned();
-                    out.push((name, fs::read_to_string(&p)?.trim().parse()?));
-                }
+        if self.opts.ref_log {
+            return Ok(self.log_refs.iter().map(|(k, v)| (k.clone(), *v)).collect());
+        }
+        file_refs(&self.root)
+    }
+}
+
+fn snap_missing_and_ref_files(root: &Path) -> bool {
+    !root.join("refs.snap").exists()
+        && fs::read_dir(root.join("refs")).is_ok_and(|mut d| d.next().is_some())
+}
+
+/// Refs kept as files under `root/refs`, sorted by name.
+fn file_refs(root: &Path) -> Result<Vec<(String, Id)>, Error> {
+    let mut out = Vec::new();
+    let base = root.join("refs");
+    let mut stack = vec![base.clone()];
+    while let Some(dir) = stack.pop() {
+        for e in fs::read_dir(&dir)? {
+            let e = e?;
+            let p = e.path();
+            if e.file_type()?.is_dir() {
+                stack.push(p);
+            } else if !p.to_string_lossy().ends_with(".lock") {
+                let name = p
+                    .strip_prefix(&base)
+                    .unwrap()
+                    .to_string_lossy()
+                    .into_owned();
+                out.push((name, fs::read_to_string(&p)?.trim().parse()?));
             }
         }
-        out.sort();
-        Ok(out)
+    }
+    out.sort();
+    Ok(out)
+}
+
+// ---------------------------------------------------------------------------
+// E170: packs for content, RocksDB for refs (and optionally the index).
+
+#[cfg(feature = "store-rocksdb")]
+pub mod hybrid {
+    //! Two hybrids of [`PackStore`](super::PackStore) and RocksDB (E170).
+    //!
+    //! - [`RefsHybrid`]: objects in packs with their own index, as in
+    //!   `PackStore`; refs in RocksDB. A commit is the pack's `sync_data`, then
+    //!   one synced RocksDB write of the ref, in place of a ref file written,
+    //!   synced and renamed.
+    //! - [`IndexHybrid`]: objects in append-only pack files with no index of
+    //!   their own; where each object lives, and the refs, in RocksDB. A
+    //!   commit is the pack's `sync_data`, then one synced RocksDB batch that
+    //!   holds the new objects' locations and the ref. Open reads no pack
+    //!   index or checkpoint: RocksDB's open is the whole cost.
+    //!
+    //! Both keep the store contract: bytes reach disk before the ref (or
+    //! location) that names them, and every read checks the record's CRC.
+    use super::rocks::Rocks;
+    use super::*;
+
+    /// Packs for objects, RocksDB for refs.
+    pub struct RefsHybrid {
+        packs: PackStore,
+        refs: Rocks,
+    }
+
+    impl RefsHybrid {
+        pub fn open(root: impl AsRef<Path>) -> Result<RefsHybrid, Error> {
+            let root = root.as_ref();
+            Ok(RefsHybrid {
+                packs: PackStore::open(root.join("packs-store"))?,
+                refs: Rocks::open(root.join("refs-db"), false)?,
+            })
+        }
+    }
+
+    impl Store for RefsHybrid {
+        fn write(&mut self, id: Id, encoded: &[u8]) -> Result<bool, Error> {
+            self.packs.write(id, encoded)
+        }
+        fn replace(&mut self, id: Id, encoded: &[u8]) -> Result<(), Error> {
+            self.packs.replace(id, encoded)
+        }
+        fn read(&self, id: &Id) -> Result<Vec<u8>, Error> {
+            self.packs.read(id)
+        }
+        fn read_head(&self, id: &Id, n: usize) -> Result<Vec<u8>, Error> {
+            self.packs.read_head(id, n)
+        }
+        fn stored_len(&self, id: &Id) -> Result<usize, Error> {
+            self.packs.stored_len(id)
+        }
+        fn has(&self, id: &Id) -> bool {
+            self.packs.has(id)
+        }
+        fn ids(&self) -> Result<Vec<Id>, Error> {
+            self.packs.ids()
+        }
+        fn ids_with_prefix(&self, prefix: &[u8]) -> Result<Vec<Id>, Error> {
+            self.packs.ids_with_prefix(prefix)
+        }
+        fn delete(&mut self, id: &Id) -> Result<(), Error> {
+            self.packs.delete(id)
+        }
+        fn get_ref(&self, name: &str) -> Result<Option<Id>, Error> {
+            check_ref_name(name)?;
+            Ok(self
+                .refs
+                .get(Table::Refs, name.as_bytes())?
+                .and_then(|v| parse_id(&v)))
+        }
+        fn set_ref(&mut self, name: &str, expected: Option<Id>, new: Id) -> Result<(), Error> {
+            check_ref_name(name)?;
+            if self.get_ref(name)? != expected {
+                return Err(Error::RefConflict(name.into()));
+            }
+            self.packs.sync()?; // objects first, then the ref that reaches them
+            let e = expected.map(|e| *e.as_bytes());
+            self.refs.apply(
+                &[KvOp {
+                    table: Table::Refs,
+                    key: name.as_bytes(),
+                    value: Some(new.as_bytes()),
+                }],
+                Some((name, e.as_ref().map(|e| &e[..]))),
+            )
+        }
+        fn refs(&self) -> Result<Vec<(String, Id)>, Error> {
+            let mut out = Vec::new();
+            for (k, v) in self.refs.entries(Table::Refs)? {
+                if let (Ok(name), Some(id)) = (String::from_utf8(k), parse_id(&v)) {
+                    out.push((name, id));
+                }
+            }
+            Ok(out)
+        }
+    }
+
+    /// Where an object's record starts: pack number, offset, body length.
+    #[derive(Clone, Copy)]
+    struct Loc {
+        pack: u32,
+        off: u64,
+        len: u32,
+    }
+
+    impl Loc {
+        fn bytes(&self) -> [u8; 16] {
+            let mut b = [0u8; 16];
+            b[..4].copy_from_slice(&self.pack.to_le_bytes());
+            b[4..12].copy_from_slice(&self.off.to_le_bytes());
+            b[12..].copy_from_slice(&self.len.to_le_bytes());
+            b
+        }
+        fn parse(b: &[u8]) -> Option<Loc> {
+            (b.len() == 16).then(|| Loc {
+                pack: u32::from_le_bytes(b[..4].try_into().unwrap()),
+                off: u64::from_le_bytes(b[4..12].try_into().unwrap()),
+                len: u32::from_le_bytes(b[12..].try_into().unwrap()),
+            })
+        }
+    }
+
+    /// Append-only pack files for objects; every location and every ref in
+    /// RocksDB. Records are `PackStore`'s (`id | len | bytes | crc32`).
+    pub struct IndexHybrid {
+        root: PathBuf,
+        db: Rocks,
+        packs: Vec<File>, // by number; the last is open for appends
+        buf: Vec<u8>,
+        flushed: u64,
+        /// Written since the last commit: readable now, durable with the next.
+        pending: BTreeMap<Id, Option<Loc>>,
+    }
+
+    impl IndexHybrid {
+        pub fn open(root: impl Into<PathBuf>) -> Result<IndexHybrid, Error> {
+            let root = root.into();
+            fs::create_dir_all(root.join("packs"))?;
+            let db = Rocks::open(root.join("index-db"), false)?;
+            let mut nos: Vec<u32> = fs::read_dir(root.join("packs"))?
+                .filter_map(|e| {
+                    e.ok()?
+                        .file_name()
+                        .to_str()?
+                        .strip_suffix(".pack")?
+                        .parse()
+                        .ok()
+                })
+                .collect();
+            nos.sort();
+            if nos.is_empty() {
+                nos.push(0);
+            }
+            let mut packs = Vec::new();
+            for n in 0..=*nos.last().unwrap() {
+                packs.push(
+                    OpenOptions::new()
+                        .create(true)
+                        .truncate(false)
+                        .read(true)
+                        .write(true)
+                        .open(root.join(format!("packs/{n:08}.pack")))?,
+                );
+            }
+            // A torn tail is past every location RocksDB holds, so it is
+            // unreachable; new records simply follow it.
+            let flushed = packs.last().unwrap().metadata()?.len();
+            Ok(IndexHybrid {
+                root,
+                db,
+                packs,
+                buf: Vec::new(),
+                flushed,
+                pending: BTreeMap::new(),
+            })
+        }
+
+        fn active(&self) -> u32 {
+            self.packs.len() as u32 - 1
+        }
+
+        fn append(&mut self, id: Id, bytes: &[u8]) -> Result<(), Error> {
+            let len = bytes.len() as u32;
+            let off = self.flushed + self.buf.len() as u64;
+            self.buf.extend_from_slice(id.as_bytes());
+            self.buf.extend_from_slice(&len.to_le_bytes());
+            self.buf.extend_from_slice(bytes);
+            self.buf
+                .extend_from_slice(&crc(&id, len, bytes).to_le_bytes());
+            let pack = self.active();
+            self.pending.insert(id, Some(Loc { pack, off, len }));
+            if self.buf.len() >= 1 << 20 {
+                self.flush()?;
+            }
+            Ok(())
+        }
+
+        fn flush(&mut self) -> Result<(), Error> {
+            if !self.buf.is_empty() {
+                let f = self.packs.last().unwrap();
+                f.write_all_at(&self.buf, self.flushed)?;
+                self.flushed += self.buf.len() as u64;
+                self.buf.clear();
+            }
+            Ok(())
+        }
+
+        /// Pack bytes durable, then one synced batch: locations and the ref.
+        fn commit(&mut self, guard: Option<(&str, Option<Id>, Id)>) -> Result<(), Error> {
+            if self.pending.is_empty() && guard.is_none() {
+                return Ok(());
+            }
+            self.flush()?;
+            if !self.pending.is_empty() {
+                self.packs.last().unwrap().sync_data()?;
+            }
+            let locs: Vec<(Id, Option<[u8; 16]>)> = self
+                .pending
+                .iter()
+                .map(|(id, l)| (*id, l.map(|l| l.bytes())))
+                .collect();
+            let mut ops: Vec<KvOp> = locs
+                .iter()
+                .map(|(id, l)| KvOp {
+                    table: Table::Objects,
+                    key: id.as_bytes(),
+                    value: l.as_ref().map(|b| &b[..]),
+                })
+                .collect();
+            let expected = guard.and_then(|(_, e, _)| e).map(|e| *e.as_bytes());
+            let new = guard.map(|(_, _, n)| *n.as_bytes());
+            if let (Some((name, _, _)), Some(new)) = (guard, new.as_ref()) {
+                ops.push(KvOp {
+                    table: Table::Refs,
+                    key: name.as_bytes(),
+                    value: Some(new),
+                });
+            }
+            let g = guard.map(|(name, _, _)| (name, expected.as_ref().map(|e| &e[..])));
+            self.db.apply(&ops, g)?;
+            self.pending.clear();
+            if self.flushed >= PACK_SEAL_BYTES {
+                let n = self.active() + 1;
+                self.packs.push(
+                    OpenOptions::new()
+                        .create(true)
+                        .truncate(false)
+                        .read(true)
+                        .write(true)
+                        .open(self.root.join(format!("packs/{n:08}.pack")))?,
+                );
+                self.flushed = 0;
+            }
+            Ok(())
+        }
+
+        fn locate(&self, id: &Id) -> Result<Option<Loc>, Error> {
+            if let Some(l) = self.pending.get(id) {
+                return Ok(*l);
+            }
+            Ok(self
+                .db
+                .get(Table::Objects, id.as_bytes())?
+                .and_then(|b| Loc::parse(&b)))
+        }
+
+        pub fn sync(&mut self) -> Result<(), Error> {
+            self.commit(None)
+        }
+    }
+
+    impl Drop for IndexHybrid {
+        fn drop(&mut self) {
+            let _ = self.commit(None);
+        }
+    }
+
+    impl Store for IndexHybrid {
+        fn write(&mut self, id: Id, encoded: &[u8]) -> Result<bool, Error> {
+            if self.has(&id) {
+                return Ok(false);
+            }
+            self.append(id, encoded)?;
+            Ok(true)
+        }
+        fn replace(&mut self, id: Id, encoded: &[u8]) -> Result<(), Error> {
+            self.append(id, encoded)
+        }
+        fn read(&self, id: &Id) -> Result<Vec<u8>, Error> {
+            let Some(l) = self.locate(id)? else {
+                return Err(Error::NotFound(*id));
+            };
+            let at = l.off + RECORD_HEAD;
+            if l.pack == self.active() && at >= self.flushed {
+                let s = (at - self.flushed) as usize;
+                return Ok(self.buf[s..s + l.len as usize].to_vec());
+            }
+            let mut rec = vec![0u8; RECORD_HEAD as usize + l.len as usize + 4];
+            self.packs[l.pack as usize].read_exact_at(&mut rec, l.off)?;
+            let (head, rest) = rec.split_at(RECORD_HEAD as usize);
+            let (body, c) = rest.split_at(l.len as usize);
+            if &head[..32] != id.as_bytes()
+                || u32::from_le_bytes(c.try_into().unwrap()) != crc(id, l.len, body)
+            {
+                return Err(Error::Corrupt(*id));
+            }
+            Ok(body.to_vec())
+        }
+        fn stored_len(&self, id: &Id) -> Result<usize, Error> {
+            match self.locate(id)? {
+                Some(l) => Ok(l.len as usize),
+                None => Err(Error::NotFound(*id)),
+            }
+        }
+        fn has(&self, id: &Id) -> bool {
+            matches!(self.locate(id), Ok(Some(_)))
+        }
+        fn ids(&self) -> Result<Vec<Id>, Error> {
+            self.ids_with_prefix(&[])
+        }
+        fn ids_with_prefix(&self, prefix: &[u8]) -> Result<Vec<Id>, Error> {
+            let mut live: BTreeMap<Id, bool> = BTreeMap::new();
+            for k in self.db.keys(Table::Objects, prefix)? {
+                if let Some(id) = parse_id(&k) {
+                    live.insert(id, true);
+                }
+            }
+            for (id, l) in &self.pending {
+                if id.as_bytes().starts_with(prefix) {
+                    live.insert(*id, l.is_some());
+                }
+            }
+            Ok(live
+                .into_iter()
+                .filter(|(_, l)| *l)
+                .map(|(id, _)| id)
+                .collect())
+        }
+        fn delete(&mut self, id: &Id) -> Result<(), Error> {
+            if !self.has(id) {
+                return Err(Error::NotFound(*id));
+            }
+            // The record stays in its pack until a cleaner runs; the
+            // location goes with the next commit.
+            self.pending.insert(*id, None);
+            Ok(())
+        }
+        fn get_ref(&self, name: &str) -> Result<Option<Id>, Error> {
+            check_ref_name(name)?;
+            Ok(self
+                .db
+                .get(Table::Refs, name.as_bytes())?
+                .and_then(|v| parse_id(&v)))
+        }
+        fn set_ref(&mut self, name: &str, expected: Option<Id>, new: Id) -> Result<(), Error> {
+            check_ref_name(name)?;
+            if self.get_ref(name)? != expected {
+                return Err(Error::RefConflict(name.into()));
+            }
+            self.commit(Some((name, expected, new)))
+        }
+        fn refs(&self) -> Result<Vec<(String, Id)>, Error> {
+            let mut out = Vec::new();
+            for (k, v) in self.db.entries(Table::Refs)? {
+                if let (Ok(name), Some(id)) = (String::from_utf8(k), parse_id(&v)) {
+                    out.push((name, id));
+                }
+            }
+            Ok(out)
+        }
     }
 }
 
@@ -1430,5 +2550,46 @@ mod pack_index_tests {
         for (id, at) in &index {
             assert_eq!(s.find(id).unwrap(), Some(*at));
         }
+    }
+
+    /// E175: through a filter every id is still found, few others are
+    /// searched for, and a damaged or stale filter file is rebuilt.
+    #[test]
+    fn sealed_filter_has_no_false_negatives() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::create_dir_all(dir.path().join("packs")).unwrap();
+        File::create(dir.path().join("packs/00000000.pack")).unwrap();
+        let mut index = HashMap::new();
+        for n in 0..100_000u32 {
+            index.insert(Id::of(&n.to_le_bytes()), (n as u64 * 7, n));
+        }
+        write_idx(&dir.path().join("packs/00000000.idx"), &index).unwrap();
+        let flt = dir.path().join("packs/00000000.flt");
+        let mut s = open_sealed(dir.path(), 0).unwrap();
+        let f = Filter::load_or_build(&flt, &s.idx, s.fanout[255]).unwrap();
+        s.filter = Some(Box::new(f));
+        for (id, at) in &index {
+            assert_eq!(s.find(id).unwrap(), Some(*at));
+        }
+        let f = s.filter.as_ref().unwrap();
+        let passed = (100_000..200_000u32)
+            .filter(|n| f.may_have(&Id::of(&n.to_le_bytes())))
+            .count();
+        assert!(passed < 2_000, "false positives {passed} of 100,000");
+        // A filter written for another index (wrong count) or damaged is not used.
+        assert!(Filter::load(&flt, 99_999).is_none());
+        let mut b = fs::read(&flt).unwrap();
+        b[100] ^= 1;
+        fs::write(&flt, &b).unwrap();
+        assert!(Filter::load(&flt, 100_000).is_none());
+        let f = Filter::load_or_build(&flt, &s.idx, 100_000).unwrap();
+        s.filter = Some(Box::new(f));
+        for (id, at) in &index {
+            assert_eq!(s.find(id).unwrap(), Some(*at));
+        }
+        assert!(
+            Filter::load(&flt, 100_000).is_some(),
+            "rebuilt and rewritten"
+        );
     }
 }

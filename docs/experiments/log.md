@@ -2524,3 +2524,110 @@ Newest last. Format and rules: `README.md`.
 - Result: ir and full both exact 22/22. ir 0.14 ms against 0.32 ms (one workbook evaluated against 24 renders parsed, 4,412 bytes; the corpus is small). Lazy: 18 of 22 edits leave an aggregate wrong; median error in the corpus dollar total $1,950,000 of $93,589,350.
 - Verdict: **measured**. The IR keeps table aggregates exact from one workbook's evaluation with no renderer run. At 24 small workbooks the time saved is small; the point is that it scales with the edited workbook, not the corpus.
 - Gates (E182 to E184): examples and scripts only; clippy `-D warnings` and fmt clean; the kernel is as at E169's gates.
+
+### E170 hybrid-store (content in packs, refs and index in RocksDB)
+- Question: on the Mac (E122's run of Nov 9) packs flushed a commit in 10.8 ms and RocksDB in 1.4 ms, and packs opened 1M objects in 69 ms. Does keeping content in packs but refs, or refs and the object index, in RocksDB get RocksDB's commit with packs' storage?
+- Change: `backends::hybrid` (feature `store-rocksdb`, off unless built with it): `RefsHybrid` is a PackStore for objects and a RocksDB for refs; a ref update syncs the pack, then writes the ref in one synced batch. `IndexHybrid` appends objects to its own packs and keeps each object's place (pack, offset, length) in RocksDB; a commit syncs the pack data, then writes the places and the ref in one synced batch, so a swap that adds no object is one flush. Reads check the id and CRC. `examples/stores.rs` gains `hybrid-refs` and `hybrid-index`; `tests/backends.rs` runs the store contract on both.
+- Result (Linux, ext4, the harness's db, crash and 1M phases):
+  - Single commit mean: packs 5.72 ms, RocksDB 4.90, hybrid-refs 5.30, hybrid-index 5.99. Ref swap p50: 464, 160, 189 and 162 us. A batch of 10k: 4.2, 4.7, 3.8 and 7.5 s.
+  - Flushes per commit (strace over 2,010 commits): packs 2 and a rename, RocksDB 1, hybrid-refs 2, hybrid-index 1.5 (swaps skip the pack sync). The hybrids do not cut a commit's flushes: content and ref still live in two files.
+  - Kills: 50 of 50 clean on both (7,411 and 5,914 events), nothing acknowledged lost.
+  - 1M objects: build 2.3 s packs, 11.7 RocksDB, 2.4 hybrid-refs, 4.2 hybrid-index; on disk 372, 590, 372 and 380 MB; open 205, 966, 252 and 663 ms; cold read p50 38, 50, 37 and 49 us; a missing id 0.2, 45, 0.2 and 5.8 us.
+- Verdict: **kept** as options, built only with `store-rocksdb`; not a winner. hybrid-refs costs RocksDB's build and open for faster ref swaps; hybrid-index gets one flush only on swaps and opens three times slower than packs. E172 gets one flush a commit without RocksDB.
+
+### E171 lazy-pack-open (open the active pack's checkpoint in place)
+- Question: a PackStore open reads every sealed index's fanout, but loads the open pack's whole checkpoint into a map: at 1M objects 205 ms on Linux and 69 ms on the Mac. Can open use the checkpoint where it lies, as a sealed index is used?
+- Change: `PackOptions::lazy_checkpoint` (off by default) with `PackStore::open_with`. The checkpoint is already a sorted index with a fanout; open checks its size, magic, fanout and coverage (not its hash) and searches it in place, scanning only the records after it. A checkpoint is then synced when written, and folded with the newer entries on the next checkpoint or seal. A torn or short checkpoint falls back to a full scan. Nothing stored changes: the files are the ones the default writes. `tests/backends.rs`: the contract with the option on; a lazy view equals a full load after deletes and replaces; a torn checkpoint falls back.
+- Result (Linux, 1M objects, three probes each):
+  - Open: 186 to 237 ms to 0.9 to 1.2 ms.
+  - Cold read p50 36 to 42 us becomes 78 to 80 us (one more read, into the checkpoint, until the page cache holds it); warm read p50 the same (30 to 38 us). A missing id 0.2 to about 2.5 us.
+  - Build of 1M: 2.5 to 4.4 s (each checkpoint is synced and rewritten whole).
+  - Kills (with E172's ref log, `packs-fast`): 50 of 50 clean.
+- Verdict: **kept** as an option, off by default; on its branch until Eric says to merge. Worth turning on for a server that restarts often or opens many stores; a long-running server pays the slower cold reads instead.
+
+### E172 pack-ref-log (refs as records in the open pack: one flush a commit)
+- Question: a PackStore commit is two flushes and a rename: the pack's data, then the ref file (written, synced, renamed). On the Mac each flush is an F_FULLFSYNC, which is most of the 10.8 ms. Can the ref ride in the same flush as the objects it names?
+- Change: `PackOptions::ref_log` (off by default). A ref update appends a ref record (a marker id, then the name and new id) after the objects, and syncs the pack once; no ref file is written. `refs.snap` keeps all refs at each checkpoint and seal (not synced: losing it only means a longer replay); open loads it and replays ref records after it. A store that kept refs as files carries them over on first open. A record torn ahead of a ref cuts the ref with it, so after a crash a ref only ever falls back to an earlier acknowledged value. Separately, in every mode, sealing a pack now syncs the packs directory after creating the next pack file (it did not before). `tests/backends.rs`: the contract with the option, alone and with E171; refs replay with no checkpoint or snapshot; a flipped byte in an object cuts it and the ref after it; refs carried over from files.
+- Result (Linux):
+  - Flushes per commit (strace over 2,010 commits): 2 and a rename to 1 and none. Files opened 10,068 to 3,028.
+  - Single commit mean 5.26 to 4.74 ms (on this disk a flush is about 40 us, so the time is mostly the harness's writes); ref swap p50 495 to 143 us, p99 1,356 to 310 us. RocksDB's is 160 us.
+  - Kills: 50 of 50 clean, alone and with E171 (7,672 and 7,682 events), nothing acknowledged lost.
+  - 1M objects: the same bytes on disk (+886 bytes), open as before (190 to 246 ms; 1.5 ms with E171), first ref 0.12 to 0.19 ms.
+- Verdict: **kept** as an option, off by default; on its branch until Eric says to merge. A stored-format addition (ref records and `refs.snap`), so turning it on for his stores needs his yes; a store written with it needs a kernel that knows the records. Expect it to halve a commit's flush time on the Mac; that is a Mac measurement.
+
+### E173 scale-10m (10M objects: packs, packs with E171 and E172, RocksDB, both hybrids)
+- Question: E122 measured 10M objects before E170 to E172. Do the new options and the hybrids hold up at 10M, and does lazy open still pay there?
+- Change: none in the kernel; the harness's build and probe phases at 10M (about 3.7 GB of small objects), each store built, probed three times and deleted before the next. `packs-fast` is PackStore with `lazy_checkpoint` and `ref_log`. The machine has 15 GB of memory and the probes do not drop the page cache, so "cold" reads here are partly cached; the Mac run should drop it.
+- Result (Linux, ext4):
+  - Build: packs 75 s, packs-fast 93, RocksDB 236, hybrid-refs 77, hybrid-index 157.
+  - On disk: packs and packs-fast 3.72 GB, hybrid-refs 3.72, RocksDB 4.32, hybrid-index 4.31.
+  - Open: packs 329 to 444 ms; packs-fast 2.0 to 2.5 ms; hybrid-refs 276 to 360 ms; RocksDB 3.6 s on the first open after the build, then 22 to 31 ms; hybrid-index 3.0 s, then 18 ms.
+  - Cold read p50: packs 146 to 162 us, packs-fast 191 to 208, RocksDB 122 to 209, hybrid-refs 156 to 165, hybrid-index 107 to 174. Warm read p50: packs 40 to 45 us, packs-fast 42 to 49, RocksDB 83 to 99, hybrid-refs 44 to 49, hybrid-index 80 to 88.
+  - A missing id p50: packs 142 to 148 us (a sealed index has no filter), RocksDB 161 to 182, hybrid-index 69 to 101.
+- Verdict: **measured**. PackStore with E171 and E172 is the best all-round store at 10M: the smallest, three times faster to build than RocksDB, open in 2 ms, warm reads twice as fast as RocksDB's; it gives up about 40 us on cold reads. RocksDB's open is fast only after it has compacted. A filter on sealed indexes would cut missing-id lookups (a next experiment). Repeat on APFS on the Mac with the page cache dropped.
+
+### Gates for E170 to E173 (Nov 10)
+- On exp/173-scale-10m (E172 plus docs): 176 kernel tests pass, 182 with the store features; clippy `-D warnings` clean with and without them (E171's lazy index is boxed so `examples/goal.rs`'s store enum stays small; exp/171 alone predates that fix); the fixed bench matches main (badc682) in every byte count and the north score (0.3035); cost score 0.2430 against 0.2486, from timings only.
+- `packages/kernel/scripts/mac-bakeoff.sh` gains two named steps, outside the default run: `fullfsync` builds a second stores binary with RocksDB on F_FULLFSYNC, in its own target folder; `night` measures commit cost (both RocksDB builds), kills and 1M probes for packs, packs-log, packs-fast, RocksDB and the hybrids (`NIGHT_OBJECTS="1000000 10000000"` adds 10M). On Darwin the script now points dyld at the Command Line Tools' libclang, so RocksDB builds through the asdf shim. Dry-run here with small sizes.
+
+### E174 kill-10m (the one-flush commit killed at random over a 10M-object store)
+- Question: E172's 100 clean kills were on small stores. Does a commit with refs in the pack stay crash safe on a store that already holds 10M objects, sealed packs and a checkpoint, and how fast does it reopen after a kill?
+- Change: none in the kernel. Two harness phases. `crash-big` runs E170's database crash child (through the Repo) over a store of N contents; at 10M a fresh Repo handle spends its whole kill window on its first write (it reads every stored content for the seed index, and `is_needed` reads the whole store before each drop; E129 and E131 have options for both), so it measured nothing. `crash-store` (on exp/176, where it was committed) is the same test on the store alone: a child writes 1 to 8 objects (100 bytes to 200 KB), a commit object naming them and the previous commit, moves `heads/log` and acknowledges; it is killed at a random moment. After each kill: the reopen time, the ref at or past the last acknowledged commit, the last 2,000 commits and every object they name read back and hash to their ids, and 100,000 of the 10M seed objects read back byte for byte.
+- Result (Linux, ext4, 10M seed objects, 30 kills each):
+  - packs-fast (lazy checkpoint and ref log): 30 of 30 clean, nothing acknowledged lost, 36,609 commits in the kill windows; reopen p50 16 ms, max 83 ms.
+  - packs (defaults): 30 of 30 clean, 20,178 commits; reopen p50 13 ms, max 294 ms (a reopen right after a seal scans the new pack).
+  - Objects checked after the kills: 264k and 253k, all matching their hashes.
+- Verdict: **measured**. The one-flush commit holds up at 10M and makes 1.8 times the commits in the same time. The Repo above the store is the next bottleneck on a big store (E178).
+
+### E175 pack-filters (a Bloom filter beside each pack index)
+- Question: at 10M a lookup searches the open pack's index, then each sealed pack's, newest first; a missing id costs a read in every one (142 us at 10M in E173), and a hit in an old pack pays for every newer one first. Does a filter per index close the cold-read gap to RocksDB?
+- Change: `PackOptions::filters` (off by default). Sealing a pack writes `NNNNNNNN.flt` beside its `.idx` (10 bits an id, 7 probes, about 1% false positives, a BLAKE3 trailer); a checkpoint with `lazy_checkpoint` writes `.cflt` for the open pack's saved index. A lookup skips an index whose filter says no. A filter that is missing or fails its check is rebuilt from its index at open, so the files are derived and never needed for correctness. `tests/backends.rs` `pack_store_filters`: the contract with the option, alone and with every option; 20,000 objects through a lazy checkpoint; a damaged filter rebuilt; a store written with filters opened without them. In-module: no false negatives.
+- Result (Linux, 10M objects, page cache dropped before each probe, three probes each):
+  - Cold read p50: packs 155 to 181 us, with filters 77 to 84 us; packs-fast 163 to 215 us, with filters 78 to 115 us.
+  - A missing id p50: 121 to 168 us without, 0.5 to 0.9 us with.
+  - Open: packs 289 to 396 ms, with filters 287 to 413 (the filters are read whole: 12.5 MB); packs-fast 2.4 to 59 ms, with filters 23 to 32 ms.
+  - Disk: 10.6 MB more (0.3%). Build faster with filters (35 s against 76 s, 41 against 97 s for packs-fast), because each write's "is it stored" check no longer reads every sealed index.
+- Verdict: **kept** as an option, off by default. It halves cold reads at 10M and makes missing ids almost free; with E171 and E172 it is about as fast cold as RocksDB was in E173 (122 to 209 us). The filter files are a stored-format addition, though derived and rebuilt when missing, so turning it on for his stores needs his yes. A prefetch of the indexes was not tried: at 10M they are 440 MB, more than prefetching should cost at open, and with filters a cold read is already one index probe and one record read.
+
+### E176 pack-compact (a pack cleaner, and its time at 10M)
+- Question: packs only grow; a replaced or deleted object stays until something rewrites the pack. What does cleaning cost at 10M?
+- Change: `PackStore::compact()` (called explicitly; nothing runs it on its own). It seals the open pack, copies the newest live record of each id out of the old packs into new ones (checking each record's CRC on the way), seals them, writes `refs.snap` when the ref log is on, syncs the directory, and only then deletes the old packs, oldest first, the pack before its index and filter, then syncs again. A kill at any point leaves either the old packs or both, and both read the same. Harness phase `churn`: delete 3 in 10 objects, replace 1 in 10 with new bytes, compact, reopen and check every 97th object. `tests/backends.rs` `pack_store_compact`: three option sets over four rounds of writes and deletes with compactions between, and simulated kills that leave old packs behind.
+- Result (Linux, 10M objects):
+  - packs-fast with filters: churn 22 s, compact 55 s, 4.33 GB to 2.61 GB, six packs to five; reopen 9 ms; 0 of the sampled objects wrong.
+  - packs: churn 29 s, compact 124 s, 4.31 to 2.60 GB; 0 wrong. The filters make the cleaner twice as fast, since it asks for each id where its newest record is.
+  - At 200k: 83.5 MB to 52.2 MB in 0.7 s.
+- Verdict: **kept** as a method, run by hand; nothing calls it. It needs the single writer the store already requires. A background or incremental cleaner (a pack at a time) is a later step.
+
+### E177 group-commit (many writers sharing one flush)
+- Question: a PackStore has one writer (`&mut self`); a server with many clients serializes their commits, each paying a whole flush while the others wait. With refs in the pack (E172), can one flush cover every commit that is waiting?
+- Change: `PackStore::stage_ref` (moves a ref and appends its record without a flush; needs the ref log) and `backends::GroupCommit`, a wrapper for one store shared by threads. A commit appends its objects and ref record under the lock; the first waiter that finds no flush running becomes the flusher, flushes outside the lock (a cloned handle to the open pack), and wakes every commit its flush covered. A commit returns only after a flush that began after its records were appended. When a seal or checkpoint is due, the flusher syncs again first, since records may have been appended during its flush and an index or snapshot must name only durable records. Nothing changes for a store not wrapped. Harness phases `writers` (each writer flushing alone under a shared lock, against group) and `crash-group` (writers sharing flushes, killed at random; after each kill every writer's ref is at or past its last acknowledged commit and its last 2,000 commits read back). `tests/backends.rs` `pack_store_group_commit`: eight threads, 300 commits each, a stale expected value refused, every chain whole after a reopen; a store without the ref log refused.
+- Result (Linux, ext4, a flush about 0.2 ms; 2,000 commits a writer, each 1 to 4 objects of 100 to 2,000 bytes; three runs):
+  - Commits a second, alone against group: 1 writer 3,000 to 4,300 against 3,100 to 4,900; 2 writers 3,200 to 3,900 against 5,100 to 5,500; 4 writers 3,500 to 4,200 against 5,400 to 7,200; 8 writers 3,800 to 4,600 against 8,900 to 11,200; 16 writers 3,800 to 4,300 against 12,500 to 15,500.
+  - Commits a flush: 1.0, 1.4, 2.2, 4.1 and 8.0 for 1 to 16 writers.
+  - Latency p99: alone grows with the queue (0.6 ms to 73 to 103 ms at 16 writers); group stays 0.5 to 2.7 ms. Group p50 is higher (0.2 to 1.2 ms), since a commit waits for the flush in progress before its own.
+  - Kills (8 and 2 writers, 30 each): 60 of 60 clean, nothing acknowledged lost.
+- Verdict: **kept** as an option (a wrapper nothing uses yet). Three times the commits at 16 writers here, and the p99 falls from about 80 ms to 2 ms. On the Mac a flush is an F_FULLFSYNC of several milliseconds, so the gain should be larger; the `night2` step measures it. `ikam serve` would need to share one store between requests to use it.
+
+### E178 repo-cost (one database commit through the Repo, against store size)
+- Question: E174's Repo-level kill test made almost no commits at 10M. What does a commit cost through the Repo on a fresh handle as the store grows, and do the E129 and E131 options remove it?
+- Change: none in the kernel. Harness phase `repo-cost`: a store of N small contents (put through the Repo), then on a fresh handle ten commits of one 50 to 250 KB content, 1 to 40 events and a `heads/db` move: with the defaults, with `needed_index` (E129), and with that and the seed scope set to nothing (E131).
+- Result (Linux, packs-fast; first commit, then p50 and max of the next nine):
+  - Defaults: 10k 10 ms, 11, 26; 100k 5 ms, 6, 175; 1M 5 ms, 10, 2,245 ms. Most commits are cheap, but one that drops a superseded copy reads the whole store first (`is_needed`), and that read grows with the store: 2.2 s at 1M, so about 22 s at 10M.
+  - `needed_index`: the first commit builds the index from one pass over the store (81 ms, 665 ms and 7.7 s), then 13, 14 and 13 ms with no spikes.
+  - `needed_index` and an empty seed scope: 6, 9 and 6 ms first, then 7, 10 and 8 ms, max 11 ms at every size.
+- Verdict: **measured**. The store is not the bottleneck at scale; the Repo's whole-store passes are. For a database writer (`ikam live`, the db layer), `needed_index` with a seed scope keeps a commit near 10 ms at 1M. The one pass `needed_index` makes on a fresh handle (7.7 s at 1M) is the next thing to remove: saving the needed set with the store, or keeping it current in a projection, would make the first commit as cheap as the rest.
+
+### E179 ckpt-after-crash (a scanned tail is saved by the open that scanned it)
+- Question: E177's kill test reopened in 460 ms p50 on a 455 MB open pack, where E174's reopened in 16 ms. Why?
+- Finding: an open that had to scan records after the last checkpoint (the process died before its next one) set `ckpt_at` to the end of the scan, as if those records were saved. So neither that handle's drop nor its next sync wrote a checkpoint until 64 MiB more had been appended, and a store killed again within each 64 MiB rescanned an ever longer tail on every open. This is on main too, in every PackStore mode; E174's commits were large enough to pass 64 MiB between kills, which hid it.
+- Change (kernel; no format change): `ckpt_at` starts where the saved checkpoint ends; an open that scanned 64 MiB or more syncs the pack and writes a checkpoint before returning. `tests/backends.rs` `pack_store_saves_a_scanned_tail` (fails before the change): 70 MiB written, the checkpoint removed as if the process had died, the next open saves one; with the defaults and with the lazy checkpoint and ref log.
+- Result: E177's kill test again (8 writers, 30 kills): reopen p50 460 to 35 ms, max 830 to 66 ms; 30 of 30 clean. crash-store at 100k: 10 of 10 clean.
+- Verdict: **kept** as a fix, on its branch until Eric says to merge. It changes no stored format; an open after a crash may now write one checkpoint.
+
+### Gates for E174 to E179 (Nov 10)
+- On exp/179-ckpt-after-crash (E174 to E179 stacked on exp/173): 181 kernel tests pass, 187 with the store features; clippy `-D warnings` clean with and without them; the fixed bench matches main (badc682) in every byte count and the north score (0.3035), with only timing fields different. `cargo fmt` was run on the changed files (backends.rs was already off-format on exp/173).
+- Branches: exp/174-kill-10m (crash-big phase), exp/175-pack-filters, exp/176-pack-compact (also the crash-store phase), exp/177-group-commit, exp/178-repo-cost (and the Mac `night2` step), exp/179-ckpt-after-crash (the fix, these docs). Each builds on the one before; nothing merged.
+- `packages/kernel/scripts/mac-bakeoff.sh` gains `night2`, outside the default run, with `BRANCH=exp/178-repo-cost` or later: store-level kills at 1M, filters and the cleaner at 1M, writers alone and grouped at 1, 4 and 16 threads, group kills, and Repo commit cost at 10k and 100k.
+
+### Merge of E170 to E179 into main (Nov 10)
+- On Eric's word ("Merge the appropriate changes"), exp/179-ckpt-after-crash (E170 to E179) merged onto main after the fragment merge (5a535de), with every option off by default: `PackOptions` `lazy_checkpoint`, `ref_log` and `filters` stay false, `compact` and `GroupCommit` run only when called, the hybrids build only with `store-rocksdb`, and FsStore stays the default store. The E179 fix (an open that scanned 64 MiB or more after a crash saves a checkpoint) applies to every PackStore. The log and registry kept both sides; the registry is in experiment order.
