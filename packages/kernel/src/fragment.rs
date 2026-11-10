@@ -95,6 +95,52 @@ impl<S: Store> Repo<S> {
             .id)
     }
 
+    /// Store `bytes` as a render over the pieces `cuts` gives (which must
+    /// cover it in order), for content whose structure is not paragraphs,
+    /// such as a table's rows (E164). With `fanout`, the pieces are grouped
+    /// into a tree of renders of at most `fanout` children each, so an edit
+    /// to one piece rewrites one render per level instead of one render
+    /// naming every piece. One piece is stored as itself.
+    pub fn put_cut(
+        &mut self,
+        bytes: &[u8],
+        cuts: &[Range<usize>],
+        fanout: Option<usize>,
+    ) -> Result<Id, Error> {
+        if cuts.len() < 2 {
+            return Ok(self.put_content(bytes)?.id);
+        }
+        let mut level: Vec<(Range<usize>, Id)> = Vec::with_capacity(cuts.len());
+        for r in cuts {
+            level.push((r.clone(), self.put_content(&bytes[r.clone()])?.id));
+        }
+        let width = fanout.unwrap_or(usize::MAX).max(2);
+        loop {
+            if level.len() <= width {
+                return self.put_render(bytes, &level);
+            }
+            let mut up = Vec::with_capacity(level.len() / width + 1);
+            for group in level.chunks(width) {
+                let r = group[0].0.start..group[group.len() - 1].0.end;
+                let id = if group.len() == 1 {
+                    group[0].1
+                } else {
+                    self.put_render(&bytes[r.clone()], group)?
+                };
+                up.push((r, id));
+            }
+            level = up;
+        }
+    }
+
+    fn put_render(&mut self, bytes: &[u8], parts: &[(Range<usize>, Id)]) -> Result<Id, Error> {
+        let args = parts.iter().map(|p| Arg::Whole(p.1)).collect();
+        let put = self.put_derivation(bytes, func::render(), args)?;
+        Ok(put
+            .ok_or(Error::Exec("render does not reproduce its input".into()))?
+            .id)
+    }
+
     /// The fragments a file renders, if it is stored as a render.
     pub fn fragments_of(&self, id: &Id) -> Result<Option<Vec<Id>>, Error> {
         Ok(self
