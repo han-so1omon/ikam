@@ -27,6 +27,9 @@
 
 pub mod query;
 pub mod schema;
+mod store;
+
+pub(crate) use store::{block_member, member};
 
 use std::collections::{HashMap, HashSet};
 

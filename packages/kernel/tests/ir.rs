@@ -544,3 +544,69 @@ fn huge_table_counts_are_refused() {
         assert!(decode(&parts).is_err(), "{rows} {lines} {len}");
     }
 }
+
+/// Files stored as members of an IR pack (E223), whole or in blocks, read
+/// back byte-exact by their ids after a repack, with a clean fsck; a
+/// member whose index is past its pack is an error, not a panic.
+#[test]
+fn ir_members_in_the_store() {
+    use ikam_kernel::{Id, Kind, MemStore, Object, Repo, TreeEntry};
+    let mut files = sample();
+    files.extend(big_tables());
+    let o = Options {
+        columns: true,
+        numbers: true,
+        siblings: true,
+        nearest: 16,
+        predict: true,
+        step: true,
+        prose: true,
+        route: true,
+        sort: true,
+        transpose: true,
+        bases: true,
+        ..Options::default()
+    };
+    for blocks in [None, Some(3)] {
+        let mut repo = Repo::new(MemStore::default());
+        let ids = match blocks {
+            None => repo.put_ir(&files, o).unwrap(),
+            Some(per) => repo.put_ir_blocks(&files, o, per).unwrap(),
+        };
+        for ((_, bytes), id) in files.iter().zip(&ids) {
+            assert_eq!(*id, Id::of_content(bytes));
+        }
+        let tree: Vec<TreeEntry> = files
+            .iter()
+            .zip(&ids)
+            .enumerate()
+            .map(|(i, ((n, _), id))| TreeEntry {
+                name: format!("{i}-{}", n.replace('/', "|")),
+                kind: Kind::File,
+                id: *id,
+            })
+            .collect();
+        let tree = repo.put(&Object::tree(tree).unwrap()).unwrap();
+        repo.commit("main", tree, "").unwrap();
+        repo.repack().unwrap();
+        for (_, bytes) in &files {
+            assert_eq!(repo.read_content(&Id::of_content(bytes)).unwrap(), *bytes);
+        }
+        assert!(repo.fsck().unwrap().is_empty());
+    }
+    let packed = pack(&encode(&files, o));
+    let mut repo = Repo::new(MemStore::default());
+    let pack_id = repo.put_content(&packed).unwrap().id;
+    let past = repo.put_content(b"999999").unwrap().id;
+    let put = repo
+        .put_derivation(
+            b"x",
+            ikam_kernel::func::ir_member(),
+            vec![
+                ikam_kernel::Arg::Whole(pack_id),
+                ikam_kernel::Arg::Whole(past),
+            ],
+        )
+        .unwrap();
+    assert!(put.is_none());
+}
