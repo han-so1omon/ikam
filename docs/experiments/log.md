@@ -3025,3 +3025,20 @@ Newest last. Format and rules: `README.md`.
 - Verdict: **measured**. The best real-table result yet: 0.942 of xz, a 6% gain where E207 started at 3%. The IR keeps about half of the prototype's gain over a plain transpose (0.909); the rest is lost in its cell framing, since the plain transpose of the unsorted table (0.953) also beats the IR's columns (0.966) on this table, and E210 ruled out the dictionary. Off by default.
 - Next: store a sorted table's columns as plain text runs instead of IR tokens (a transpose path inside `route`), which the prototype says is worth another 3 to 4% here.
 - Run: `cargo run --release --example ir_sort [corpus ...]` (about 5 minutes; the prototype is in the output file `ir_sort-output.md` of the night's notes).
+
+### E212 ir-transpose (a table stored plain, laid out by column)
+- Branch / parent: exp/212-ir-transpose / E211 (stacked)
+- Question: E211 left the registry at 0.942 of xz; the same sort over a plain transpose (Python) was at 0.909. Does storing a sorted table plain, laid out by column, close that gap?
+- Change: `Options::transpose` (off by default). A CSV table (the same lines `sort` accepts: no field across lines, 64 rows or more) that `route` or `prose` stores as it is goes into the raw part laid out by column: the header, each line's field count, then each column's fields one per line. The files part marks it with its line count and whether it ended in a newline (flag bit 64, file kind bit 4); the decoder joins each line's fields with commas, then unsorts it if `sort` rewrote it. `route` judges the IR against this layout, so it picks it only where it is smaller. Raw files are not in column queries, so a table stored this way cannot be queried by column (the query index skips it). Tests cover the E211 tables under a spread of option sets with `route` or `prose`, with and without `sort`, and blocks.
+- Result (registry, real, 10.8 MB; xz -9 over the pack against xz -9 over the files, with `prose` and `route`):
+
+  | variant | route | + sort | + transpose | + both |
+  | --- | ---: | ---: | ---: | ---: |
+  | columns | 0.966 | 0.947 | 0.965 | **0.930** |
+  | predict, step, tuned | 0.961 | 0.942 | 0.961 | **0.930** |
+
+  With both, `route` stores both registry files plain by column (11.5 MB raw part); with `transpose` alone it keeps the IR. The generated corpora have no CSV of 64 rows, so nothing changed there. Encode time is unchanged (14 s columns, 48 s tuned).
+- A Python check of where the rest of the prototype's gap goes: moving the stored key column, dropping the field counts, or leaving the key out of the sorted rows each change 0.000 to 0.003. The prototype parsed the CSV and so dropped 1.44 million quote characters, which is not exact; with quotes kept its layout is 0.927. Leaving out the quotes of a column whose every field is quoted (13 of the registry's 14) gives 0.913.
+- Verdict: **measured**. 0.942 to 0.930, within 0.003 of the exact bound for this layout, and with no tuning needed (0.930 with columns alone, at a third of the encode time). Off by default.
+- Next: E213, a column whose fields are all quoted stored without its quotes.
+- Run: `cargo run --release --example ir_transpose [corpus ...]` (about 7 minutes on the registry).

@@ -85,7 +85,7 @@ pub fn index(parts: &Parts, skeletons: &[Vec<u8>]) -> Result<Index, Error> {
             "ir query: rows stored in another order (sort)",
         ));
     }
-    let prose = flags & 4 != 0;
+    let prose = flags & (4 | 64) != 0;
     let mut at = 1;
     let n = get_usize(f, &mut at)?;
     for _ in 0..n {
@@ -95,7 +95,12 @@ pub fn index(parts: &Parts, skeletons: &[Vec<u8>]) -> Result<Index, Error> {
         if prose {
             let kind = *f.get(at).ok_or(Error::Decode("ir: truncated"))?;
             at += 1;
-            if kind == 1 {
+            if kind & 4 != 0 {
+                // a table laid out by column: its line count and newline
+                get_usize(f, &mut at)?;
+                at += 1;
+            }
+            if kind & 1 != 0 {
                 get_usize(f, &mut at)?;
                 ix.lines.push(Vec::new());
                 continue;

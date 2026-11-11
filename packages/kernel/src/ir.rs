@@ -85,6 +85,11 @@ pub struct Options {
     /// kept in file order, from which the decoder recovers the rows' order
     /// (a stable sort of it), so no permutation is stored.
     pub sort: bool,
+    /// E212: a CSV table stored as it is (by `route`, or as prose) is laid
+    /// out by column instead: the header, each line's field count, then
+    /// each column's fields one per line, so xz sees a column as one run.
+    /// A table `sort` rewrote is laid out by column after it is sorted.
+    pub transpose: bool,
 }
 
 /// An encoded set of files: the line skeletons, each file's lines and cell
@@ -1184,19 +1189,33 @@ fn encode_with(
             | u8::from(o.prose || o.route) << 2
             | u8::from(o.predict && o.columns) << 3
             | u8::from(o.step && o.predict && o.columns) << 4
-            | u8::from(sorted_any) << 5,
+            | u8::from(sorted_any) << 5
+            | u8::from(o.transpose) << 6,
     );
     put_var(&mut parts.files, files.len() as u128);
     for (fi, ((name, b), ls)) in files.iter().zip(lexed).enumerate() {
         put_bytes(&mut parts.files, name.as_bytes());
-        if o.prose || o.route || sorted_any {
+        if o.prose || o.route || sorted_any || o.transpose {
             let st = sorted.get(fi).copied().flatten();
-            parts
-                .files
-                .push(u8::from(raw[fi]) | u8::from(st.is_some()) << 1);
+            let tr = (raw[fi] && o.transpose && ext(name) == "csv")
+                .then(|| table_lines(b))
+                .flatten();
+            parts.files.push(
+                u8::from(raw[fi]) | u8::from(st.is_some()) << 1 | u8::from(tr.is_some()) << 2,
+            );
             if let Some((rows, trailing)) = st {
                 put_var(&mut parts.files, rows as u128);
                 parts.files.push(u8::from(trailing));
+            }
+            if let Some((header, lines, trailing)) = &tr {
+                put_var(&mut parts.files, lines.len() as u128);
+                parts.files.push(u8::from(*trailing));
+                let t = transposed(header, lines);
+                put_var(&mut parts.files, t.len() as u128);
+                parts.raw.extend_from_slice(&t);
+                all_cells.push(Vec::new());
+                cell_sets.push(HashSet::new());
+                continue;
             }
             if raw[fi] {
                 put_var(&mut parts.files, b.len() as u128);
@@ -1392,6 +1411,7 @@ fn decode_with(
         ..Options::default()
     };
     let sorted_any = flags & 32 != 0;
+    let transpose = flags & 64 != 0;
     let mut raw_at: usize = 0;
     let skels: Vec<Vec<&[u8]>> = skeletons
         .iter()
@@ -1425,10 +1445,13 @@ fn decode_with(
         let name = String::from_utf8(get_bytes(f, &mut at)?.to_vec())
             .map_err(|_| Error::Decode("ir: name"))?;
         let mut st = None;
-        if o.prose || sorted_any {
+        if o.prose || sorted_any || transpose {
             let kind = *f.get(at).ok_or(Error::Decode("ir: truncated"))?;
             at += 1;
-            if kind > 3 || (kind & 2 != 0 && !sorted_any) {
+            if kind > 7
+                || (kind & 2 != 0 && !sorted_any)
+                || (kind & 4 != 0 && (!transpose || kind & 1 == 0))
+            {
                 return Err(Error::Decode("ir: file kind"));
             }
             if kind & 2 != 0 {
@@ -1436,6 +1459,13 @@ fn decode_with(
                 let trailing = *f.get(at).ok_or(Error::Decode("ir: truncated"))? != 0;
                 at += 1;
                 st = Some((rows, trailing));
+            }
+            let mut tr = None;
+            if kind & 4 != 0 {
+                let lines = get_usize(f, &mut at)?;
+                let trailing = *f.get(at).ok_or(Error::Decode("ir: truncated"))? != 0;
+                at += 1;
+                tr = Some((lines, trailing));
             }
             if kind & 1 != 0 {
                 let len = get_usize(f, &mut at)?;
@@ -1445,9 +1475,13 @@ fn decode_with(
                     .ok_or(Error::Decode("ir: raw"))?;
                 raw_at += len;
                 all_cells.push(Vec::new());
-                let bytes = match st {
-                    Some((rows, trailing)) => unsort_table(bytes, rows, trailing)?,
+                let bytes = match tr {
+                    Some((lines, trailing)) => untransposed(bytes, lines, trailing)?,
                     None => bytes.to_vec(),
+                };
+                let bytes = match st {
+                    Some((rows, trailing)) => unsort_table(&bytes, rows, trailing)?,
+                    None => bytes,
                 };
                 out.push((name, bytes));
                 continue;
@@ -1673,6 +1707,96 @@ fn unsort_table(t: &[u8], rows: usize, trailing: bool) -> Result<Vec<u8>, Error>
     for r in back {
         out.push(b'\n');
         out.extend_from_slice(r);
+    }
+    if trailing {
+        out.push(b'\n');
+    }
+    Ok(out)
+}
+
+// ---------------------------------------------------------------- E212
+
+/// E212: a table's lines laid out by column, for storing plain: the
+/// header, each line's field count, then each column's fields, one per
+/// line (a line with fewer fields has none in the later columns). Lines
+/// are rebuilt by joining their fields with commas, so it is exact.
+fn transposed(header: &[u8], lines: &[&[u8]]) -> Vec<u8> {
+    let counts: Vec<usize> = lines.iter().map(|l| field_count(l)).collect();
+    let mut out =
+        Vec::with_capacity(lines.iter().map(|l| l.len() + 2).sum::<usize>() + header.len());
+    out.extend_from_slice(header);
+    out.push(b'\n');
+    for c in &counts {
+        out.extend_from_slice(c.to_string().as_bytes());
+        out.push(b'\n');
+    }
+    let fields: Vec<Vec<&[u8]>> = lines.iter().map(|l| fields(l)).collect();
+    let most = counts.iter().copied().max().unwrap_or(0);
+    for k in 0..most {
+        for f in &fields {
+            if let Some(v) = f.get(k) {
+                out.extend_from_slice(v);
+                out.push(b'\n');
+            }
+        }
+    }
+    out
+}
+
+/// A CSV line's fields as written (quotes included).
+fn fields(line: &[u8]) -> Vec<&[u8]> {
+    let (mut out, mut start, mut quoted) = (Vec::new(), 0, false);
+    for (i, &c) in line.iter().enumerate() {
+        match c {
+            b'"' => quoted = !quoted,
+            b',' if !quoted => {
+                out.push(&line[start..i]);
+                start = i + 1;
+            }
+            _ => {}
+        }
+    }
+    out.push(&line[start..]);
+    out
+}
+
+/// The table `transposed` laid out, given its line count and whether it
+/// ended in a newline.
+fn untransposed(t: &[u8], n: usize, trailing: bool) -> Result<Vec<u8>, Error> {
+    let bad = || Error::Decode("ir: transposed table");
+    let mut it = t.split(|&c| c == b'\n');
+    let header = it.next().ok_or_else(bad)?;
+    let counts: Vec<usize> = (0..n)
+        .map(|_| {
+            let c = it.next().ok_or_else(bad)?;
+            std::str::from_utf8(c)
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .filter(|&c: &usize| c >= 1 && c <= t.len())
+                .ok_or_else(bad)
+        })
+        .collect::<Result<_, _>>()?;
+    let mut lines: Vec<Vec<u8>> = vec![Vec::new(); n];
+    let most = counts.iter().copied().max().unwrap_or(0);
+    for k in 0..most {
+        for (l, &c) in lines.iter_mut().zip(&counts) {
+            if c > k {
+                if k > 0 {
+                    l.push(b',');
+                }
+                l.extend_from_slice(it.next().ok_or_else(bad)?);
+            }
+        }
+    }
+    // what is left is the empty piece after the last newline
+    if it.next() != Some(&[][..]) || it.next().is_some() {
+        return Err(bad());
+    }
+    let mut out = Vec::with_capacity(t.len());
+    out.extend_from_slice(header);
+    for l in lines {
+        out.push(b'\n');
+        out.extend_from_slice(&l);
     }
     if trailing {
         out.push(b'\n');

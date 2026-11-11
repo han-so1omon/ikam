@@ -20,6 +20,7 @@ fn all_options() -> Vec<Options> {
             tune: false,
             literal: false,
             sort: b % 3 == 0,
+            transpose: b % 5 == 1,
         })
         .collect()
 }
@@ -349,6 +350,43 @@ fn sorted_tables_roundtrip() {
         if o.columns {
             let parts = encode(&files, *o);
             assert!(ir::query::index(&parts, &parts.skeletons).is_err());
+        }
+    }
+}
+
+/// E212: the same tables laid out by column when stored as they are, with
+/// and without `sort`.
+#[test]
+fn transposed_tables_roundtrip() {
+    let files = big_tables();
+    let options: Vec<Options> = all_options_route()
+        .into_iter()
+        .filter(|o| o.route || o.prose)
+        .map(|o| Options {
+            transpose: true,
+            ..o
+        })
+        .step_by(7)
+        .collect();
+    assert!(options.iter().any(|o| o.sort) && options.iter().any(|o| !o.sort));
+    roundtrip_with(&files, &options);
+    // stored plain, a table is laid out by column: the raw part holds no
+    // row of it as written (a row of the multi-line table may stay)
+    let o = Options {
+        route: true,
+        transpose: true,
+        ..Options::default()
+    };
+    let parts = encode(&files, o);
+    if !parts.raw.is_empty() {
+        let row = files[0].1.split(|&c| c == b'\n').nth(5).unwrap();
+        assert!(!parts.raw.windows(row.len()).any(|w| w == row));
+    }
+    for o in &options {
+        if o.columns && !o.sort && !o.siblings && o.nearest == 0 {
+            let parts = encode(&files, *o);
+            let ix = ir::query::index(&parts, &parts.skeletons).unwrap();
+            let _ = ix;
         }
     }
 }
