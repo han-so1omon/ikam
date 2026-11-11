@@ -3152,3 +3152,22 @@ Newest last. Format and rules: `README.md`.
 - Result: before the fix, the huge-count test panicked (debug and release). After it, both tests pass in both builds; `ir_parity` hashes are identical to E206's (160 packs and blocks), so every stored pack decodes the same.
 - Side finding (no entry): Word, Excel and PowerPoint files unzipped and rezipped exactly (zlib level 6 reproduced every member of the cases fixtures) store at 0.17 to 0.54 of xz over the files, but the kernel has done this since E080 and E083 (`container.rs`), so files in the kernel already have it.
 - Verdict: **kept** (a fix and tests). Merge the stack from its top so the E211 fix comes with it.
+
+### E219 ir-scale (the E216 setting as a set of reports grows)
+- Branch / parent: exp/219-ir-scale / E218 (stacked)
+- Question: `sample` (E214) cuts only large files, so many small files are judged whole by `route` and `tune`. How do size and encode time grow with the number of reports, and can the sample cover many small files without misjudging (E214's first try, keeping every `r`th file, routed the drift reports plain)?
+- Change: when the files cut by `sample` are still over twice the budget, `route` and `tune` judge four runs of neighbouring files spread over the set, about a quarter of the budget each, so neighbours stay together. New `examples/ir_scale.rs` (drift and random reports at 300, 1,000 and 3,000 files).
+- Result (E216 setting, sample 1 MB; xz -9 over the pack against xz -9 over the files; encode time):
+
+  | reports | files | MB | untuned before | untuned with runs | tuned before | tuned with runs |
+  | --- | ---: | ---: | --- | --- | --- | --- |
+  | drift | 300 | 1.3 | 0.505 (0.3 s) | 0.505 (0.2 s) | 0.504 (0.7 s) | 0.504 (0.7 s) |
+  | drift | 1,000 | 5.6 | 0.359 (0.7 s) | 0.359 (0.5 s) | 0.356 (2.4 s) | 0.359 (0.9 s) |
+  | drift | 3,000 | 18.2 | 0.311 (2.4 s) | 0.311 (0.8 s) | 0.305 (7.1 s) | 0.311 (1.3 s) |
+  | random | 300 | 1.3 | 0.645 (0.4 s) | 0.645 (0.3 s) | 0.630 (1.4 s) | 0.630 (1.4 s) |
+  | random | 1,000 | 5.6 | 0.615 (1.4 s) | 0.615 (0.8 s) | 0.593 (4.9 s) | 0.599 (2.4 s) |
+  | random | 3,000 | 18.2 | 0.605 (4.7 s) | 0.605 (1.1 s) | 0.572 (16.3 s) | 0.586 (2.6 s) |
+
+  Untuned, every size is the same and encodes are 1.4 to 4x faster; tuned, they are 2 to 6x faster and up to 0.014 larger, since `tune` picks each column's coding from fewer rows. The nine E216 corpora give the same sizes as E216. Decode grows linearly (about 20 ms per MB). The ratio itself improves as the set grows: drift reports at 3,000 files are 0.31 of xz.
+- Verdict: **measured**. The setting scales linearly; with runs, 18 MB of reports encode in about a second untuned. Off by default (part of `sample`).
+- Run: `cargo run --release --example ir_scale [files ...]` (about 2 minutes).

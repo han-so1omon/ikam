@@ -92,8 +92,9 @@ pub struct Options {
     pub transpose: bool,
     /// E214: `route` and `tune` judge on a sample of about this many bytes
     /// (0: on every file): every file, each over its share (and 4 KB) cut
-    /// to its first line and an even spread of its other lines. What they
-    /// choose then applies to every file.
+    /// to its first line and an even spread of its other lines; E219: of
+    /// many small files, four runs of neighbouring files. What they choose
+    /// then applies to every file.
     pub sample: usize,
     /// E216 (with `route`): `route` also judges, per kind of file, whether
     /// its files diff against a base file (`siblings`, `nearest`) or store
@@ -1183,18 +1184,19 @@ fn route_modes(files: &[(String, Vec<u8>)], o: Options) -> (Vec<u8>, Modes) {
 }
 
 /// E214: what `route` and `tune` judge when `budget` is set (bytes, 0 is
-/// everything): the index of each file kept and its bytes. Every file is
-/// kept, since the IR's gain is across files (a first try that kept every
-/// `r`th file routed drift reports plain); a file over its share of the
-/// budget (and over 4 KB) keeps its first line and an even spread of the
-/// others, so only large files are cut.
+/// everything): the index of each file kept and its bytes. A file over its
+/// share of the budget (and over 4 KB) keeps its first line and an even
+/// spread of the others. E219: when the files so cut are still over twice
+/// the budget (many small files), four runs of neighbouring files are kept,
+/// spread over the set, about a quarter of the budget each; neighbours stay
+/// together since the IR's gain is across them (a first try that kept every
+/// `r`th file routed drift reports plain).
 fn sample(files: &[(String, Vec<u8>)], budget: usize) -> (Vec<usize>, Vec<(String, Vec<u8>)>) {
     let total: usize = files.iter().map(|(_, b)| b.len()).sum();
-    let kept = (0..files.len()).collect();
     if budget == 0 || total <= budget {
-        return (kept, files.to_vec());
+        return ((0..files.len()).collect(), files.to_vec());
     }
-    let out = files
+    let cut: Vec<(String, Vec<u8>)> = files
         .iter()
         .map(|(name, b)| {
             let share = (b.len() as u128 * budget as u128 / total as u128) as usize;
@@ -1210,6 +1212,22 @@ fn sample(files: &[(String, Vec<u8>)], budget: usize) -> (Vec<usize>, Vec<(Strin
             (name.clone(), cut)
         })
         .collect();
+    let left: usize = cut.iter().map(|(_, b)| b.len()).sum();
+    if left <= budget * 2 {
+        return ((0..files.len()).collect(), cut);
+    }
+    const RUNS: usize = 4;
+    let mut kept = Vec::new();
+    for r in 0..RUNS {
+        let mut i = files.len() * r / RUNS;
+        let mut got = 0;
+        while i < files.len() && got < budget / RUNS && kept.last().is_none_or(|&l| l < i) {
+            got += cut[i].1.len();
+            kept.push(i);
+            i += 1;
+        }
+    }
+    let out = kept.iter().map(|&i| cut[i].clone()).collect();
     (kept, out)
 }
 
