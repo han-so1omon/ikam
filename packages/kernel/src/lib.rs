@@ -20,6 +20,7 @@ mod group;
 mod history;
 mod id;
 mod ingest;
+pub mod ir;
 mod library;
 mod markup;
 pub mod matcher;

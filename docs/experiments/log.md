@@ -2704,3 +2704,79 @@ Newest last. Format and rules: `README.md`.
 
 ### Merge of E186 to E191 into main (Nov 11)
 - On Eric's word ("Merge both"), exp/190-pack-prefix (E190) and then exp/186-stored-summaries (E186 to E191) merged onto main a890aa6. The E190 fix applies to every PackStore and changes no stored format. Stored summaries are an example (`examples/stored_summaries.rs`, `functions/summary.wasm`) and are off unless an application commits the view. The log and registry kept both sides, in experiment order.
+
+### E192 ir-templates (cells and line templates: an opt-in IR codec)
+- Branch / parent: exp/192-ir-compression / E191 (main 17589ee, with E186 to E191 merged)
+- Question: Eric asked (Nov 11) how intermediate representations can find connections that aid dedup and compression. The kernel already templates bytes at repack (`template.rs`, E143, E144), and xz finds repeated text by itself. Does a format-aware IR (cells, and the skeleton around them, with each distinct line skeleton stored once) beat xz, gzip, zstd and the kernel on report-like files, and what else does it buy?
+- Grounding: E161 and E165 (a typed TableIR stores the three text formats in about half the bytes); LogShrink (`docs/research/kernel-direction.md` #15: a log line is a template plus variables, the variables stored by column); the Mercante report-copy demo (30 synthetic reports: 0.52 of raw in the live store before repack, 0.16 after repack, gzip -9 0.14, xz -9 0.11). The demo's 52% was the unrepacked store, so the gap to xz is 1.45x, not 4x.
+- Change:
+  - `src/ir.rs` (new, `pub mod ir`; nothing in put, repack or the bench calls it). Lexers: csv fields; json values (keys stay skeleton); md pipe-table cells; numbers in any other text. The skeleton is cut into lines at its newlines, and each distinct line skeleton is stored once. Cells go to token streams: the previous value again, a number as a delta, a string seen before by index, or a new string. Options (all off means templates with cells in file order): `columns`, `numbers`, `rows`, `siblings` (E193, E194). `decode` gives back every file byte-exact.
+  - `tests/ir.rs`: all 16 option combinations round-trip a hand-made set (quoted csv, escaped json, md tables, a NUL, files without a final newline) and arbitrary bytes by property (3,000 cases); a unit test pins the number forms (`-$1,650,000.50`, `12.5%`; `007`, `-0`, `1,23` stay strings).
+  - `examples/ir_compress.rs`: the corpora, baselines and measurements for E192 to E196. Every method is checked byte-exact; the kernel rows also pass fsck.
+- Corpora: `reports-drift`, 300 synthetic lead-lag reports modelled on mercante-personal's `leadlag/cli.py render()` (header, settings prose, an 11-column link table, paths, links), whose numbers move only when a month of data arrives (about every 20 runs), 1,302,537 B; `reports-random`, the same with every number redrawn each run (worst case), 1,270,467 B; `reports-30`, 30 random runs (the demo's shape), 79,535 B; `exports`, 100 drift runs with each table also as csv and json, 558,615 B; `tables`, `fixtures/tables` csv, json and md (24 real workbooks, 72 files), 19,624 B; `texts`, `fixtures/multiformat` md (24 prose texts, a control), 99,212 B.
+- Result, bytes (against xz -9 over all files as one stream):
+
+| method | reports-drift | reports-random | reports-30 | exports | tables | texts |
+|---|---|---|---|---|---|---|
+| gzip -9, one stream | 31,882 (1.891) | 92,950 (1.368) | 6,708 (1.221) | 17,905 (1.630) | 5,582 (1.115) | 25,856 (1.128) |
+| xz -9, one stream | 16,856 | 67,936 | 5,496 | 10,984 | 5,008 | 22,932 |
+| zstd -19, one stream | 16,984 (1.008) | 69,581 (1.024) | 5,620 (1.023) | 11,027 (1.004) | 5,185 (1.035) | 23,559 (1.027) |
+| zstd 3 + dictionary per file (bench baseline) | 201,343 (11.95) | 244,518 (3.599) | 14,181 (2.580) | 109,385 (9.959) | 10,097 (2.016) | 36,823 (1.606) |
+| kernel, one graph, archive weight, repacked | 27,657 (1.641) | 89,330 (1.315) | 6,551 (1.192) | 22,036 (2.006) | 6,508 (1.300) | 25,308 (1.104) |
+| IR templates, xz | 17,404 (1.033) | 59,552 (0.877) | 5,584 (1.016) | 7,612 (0.693) | 4,684 (0.935) | 28,652 (1.249) |
+
+  - Times (fastest of 3, ms, encode / decode): xz -9 on reports-drift 248 / 3.6; IR templates + xz 104 / 14; kernel ingest and repack 3,400, all reads 9.6.
+  - The IR over the 300 drift reports is 65 line skeletons; their layout is 4,404 B under xz.
+- Verdict: **measured**. Templates alone roughly tie xz on reports (xz already finds repeated layout in one stream) and win where the same layout recurs across formats (exports 0.693). On prose they lose 25% (texts), so the IR must be chosen per file type, never applied to everything. The gains come from E193 and E194.
+
+### E193 ir-columns (cells by column, numbers as deltas, rows keyed)
+- Branch / parent: exp/192-ir-compression / E192
+- Hypothesis: cells of one slot look alike, so streams per (line skeleton, slot) compress better than cells in file order; numbers stored as deltas against the previous number in their stream cost less than their text; and keying a table row's streams by its first cell (the link id) puts the same row of successive runs side by side, so an unchanged value is one token (source: LogShrink observation 2, column layout 36 to 103% smaller than row layout; E161's cell types).
+- Change: `ir::Options` `columns`, `numbers`, `rows` (each off by default).
+- Result (xz -9 over the pack, against xz -9 of the files; options added in order):
+
+| options | reports-drift | reports-random | reports-30 | exports | tables | texts |
+|---|---|---|---|---|---|---|
+| templates | 1.033 | 0.877 | 1.016 | 0.693 | 0.935 | 1.249 |
+| + columns | 0.926 | 0.717 | 0.917 | 0.662 | 1.082 | 1.291 |
+| + numbers as deltas | 0.767 | **0.669** | **0.840** | 0.645 | 1.105 | 1.291 |
+| + row keys | **0.591** | 0.677 | 0.905 | 0.661 | 1.312 | 1.327 |
+
+  - reports-drift: 9,968 B against xz's 16,856 (0.591), gzip's 31,882 and the kernel's 27,657. Encode 57 ms (xz alone 248), decode 12 ms (xz 3.6).
+  - With row keys the drift reports become 1,853 streams; an unchanged value costs one token, so the gain is largest where runs repeat values, as reruns on the same data do. With every number random (reports-random), row keys add stream overhead and numbers-as-deltas without them is best (0.669).
+  - On the real tables (24 small workbooks, 3 rows on average) columns cost more than they save (1.082): too few cells per column.
+- Verdict: **measured**. Columns plus numeric deltas are a 16 to 33% gain over xz on reports; row keys add a further 23% when values repeat across runs. Each is an option because the best combination depends on the data: row keys for reruns, no columns for small tables, nothing for prose.
+
+### E194 ir-siblings (one table as csv, json and md, stored once)
+- Branch / parent: exp/192-ir-compression / E193
+- Hypothesis: a file whose name differs from an earlier one's only by extension holds the same facts; storing its cells as a diff against that file's cells (copy runs plus inserted cells) stores the facts once across formats, a canonical form without a format-specific parser (source: E112's cross-type sharing, E161, E165).
+- Change: `ir::Options::siblings` (off by default). The diff is Myers over the two cell lists; inserted cells go to the streams as usual. Lexing makes the cell lists agree without per-format renderers: csv quotes, json keys and md pipes are skeleton.
+- Result (xz -9, against xz -9 of the files):
+  - exports (each report as md, csv and json): 5,300 B (0.483), from 7,256 without siblings; 0.507 without row keys. gzip 1.630, kernel 2.006.
+  - tables (real workbooks): 4,640 B (0.927) with numbers and siblings but no columns, the best of every combination; with columns and row keys 1.059.
+  - Corpora without siblings are unchanged.
+- Verdict: **measured**. Cross-format canonical storage halves exports against xz. It needs no renderer: the cell lists of csv, json and md agree once the lexers keep quoting, keys and pipes in the skeleton (json leaves out the header, which the diff handles as a skipped run).
+
+### E195 ir-in-kernel (the IR's parts stored as kernel contents)
+- Branch / parent: exp/192-ir-compression / E194
+- Question: the IR packs above are compressed by xz outside the kernel. Stored in the kernel as four contents (skeletons, files, stream directory, all streams), at the archive read weight and repacked, how do they compare with the kernel storing the files? And with each stream compressed alone by zstd -19 (each column readable on its own)?
+- Change: none in the kernel. `examples/ir_compress.rs` stores the best IR per corpus (chosen by the xz size) in a fresh repository: put, commit, repack, read back, fsck.
+- Result (bytes, against xz -9; kernel storing the files in brackets):
+  - reports-drift: 10,362 (0.615) [27,657, 1.641]: 63% smaller. Ingest and repack 218 ms against 3,400 ms.
+  - reports-random: 47,444 (0.698) [89,330]; reports-30: 4,703 (0.856) [6,551]; exports: 5,574 (0.507) [22,036]: 75% smaller; tables: 4,735 (0.945) [6,508]; texts: 27,127 (1.183) [25,308]: 7% larger, the control.
+  - zstd -19 per stream (each column alone): reports-random 49,013 (0.721), but reports-drift 37,832 (2.244) and exports 15,560 (1.417), as 674 to 1,853 small frames each pay their own header.
+  - Reading one report: the kernel 0.03 ms for the stored file; the IR decodes every file, 12 ms for the 300 drift reports.
+- Verdict: **measured**. Stored in the kernel, the IR beats xz on every report and table corpus and stores reports in a third to a quarter of what the kernel stores for the files, with ingest 15 times faster. The price is reads: one report costs a full decode, so this is an archive option (cold report history), or wants streams cut into blocks of runs before it serves reads.
+
+### E196 ir-benefits (what the IR buys beyond bytes)
+- Branch / parent: exp/192-ir-compression / E195
+- Question (Eric: "be creative when thinking about benefits as well"): what do the connections the IR exposes give besides size? Measured on reports-drift with columns, numbers and row keys.
+- Result:
+  - **Column query**: one link's dev rho over its 234 runs, from that link's stream alone (zstd -19 per stream): 0.08 ms reading 2,064 B (the stream and the compressed directory), against 0.46 ms scanning the 1.3 MB of text in memory and 3.8 ms from the xz archive (16,856 B, all of it decompressed). Answers equal.
+  - **Aggregates**: every link's mean dev rho (24 links): 0.92 ms reading 3,288 B against 1.6 ms scanning the text; equal.
+  - **Edit propagation**: one link's mechanism sentence revised in all 218 reports that list it. In the IR one line skeleton changes and every other part is byte-identical. The kernel adds 49,608 B for the 218 edited reports (482 ms; +31,999 B after repack) and 624 B for the edited IR (1.6 ms; +498 B after repack): 80 times fewer bytes.
+  - **Drift checks at ingest** (16 ms for 302 reports): a normal report puts at most 2 lines on a skeleton never seen before (a new link), a report whose table gains a column 26; a dev rho typed as 7.312 jumps 394 times its column's largest earlier move, against at most 4 times for every normal report.
+  - **Export consistency**: of 100 reports with csv exports, 5 csv files left one cell stale; the md-against-csv cell diff flags exactly those 5 (no false alarms) in 4 ms.
+  - **Layout apart from values**: the drift reports' layout is 4,404 B and their values 5,820 B under xz. The layout can be shared, versioned or reviewed without any number, and the values kept private (Mercante's licensed prices are never shared).
+- Verdict: **measured**. The IR turns text into addressable facts: column reads, aggregates and consistency checks without parsing reports, a layout edit as one object, and ingest-time checks for layout drift and impossible values.
+- Gates (E192 to E196): kernel tests pass (2 new in `tests/ir.rs`, 1 unit test); clippy `-D warnings` and `cargo fmt --check` clean on all targets; the fixed bench is unchanged against main (17589ee) in every byte count, read cost and the north score (see below).
