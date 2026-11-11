@@ -80,6 +80,11 @@ pub struct Options {
     /// full instead of as an index into its dictionary, which xz can match
     /// across the whole column better than an index.
     pub literal: bool,
+    /// E211: a CSV table's rows are stored sorted by the column whose order
+    /// xz judges smallest by column (a code, a city), with that column also
+    /// kept in file order, from which the decoder recovers the rows' order
+    /// (a stable sort of it), so no permutation is stored.
+    pub sort: bool,
 }
 
 /// An encoded set of files: the line skeletons, each file's lines and cell
@@ -849,10 +854,24 @@ fn stream_key(o: Options, slot: (usize, usize), first: &[u8]) -> (usize, usize, 
 
 /// Encodes `files` (names and bytes) with the given options.
 pub fn encode(files: &[(String, Vec<u8>)], o: Options) -> Parts {
-    let (plain, modes) = route_modes(files, o);
-    encode_modes(files, o, &plain, (&modes, 0))
+    let (files, sorted) = sort_files(files, o);
+    let (plain, modes) = route_modes(&files, o);
+    let mut table = Skeletons::default();
+    let mut parts = encode_with(
+        &files,
+        o,
+        plain.as_slice(),
+        (&modes, 0),
+        &sorted,
+        &mut table,
+        &mut EncState::default(),
+    );
+    parts.skeletons = table.list;
+    parts
 }
 
+/// An encode for judging (`route`, `tune`): no table rewritten by `sort`
+/// is marked as such, which changes a few bytes of the files part only.
 fn encode_modes(
     files: &[(String, Vec<u8>)],
     o: Options,
@@ -860,9 +879,56 @@ fn encode_modes(
     modes: (&Modes, u8),
 ) -> Parts {
     let mut table = Skeletons::default();
-    let mut parts = encode_with(files, o, plain, modes, &mut table, &mut EncState::default());
+    let mut parts = encode_with(
+        files,
+        o,
+        plain,
+        modes,
+        &[],
+        &mut table,
+        &mut EncState::default(),
+    );
     parts.skeletons = table.list;
     parts
+}
+
+/// What `sort` did to a file: its row count and whether it ended in a
+/// newline, or None when it is as given.
+type Sorted = Option<(usize, bool)>;
+
+/// E211: the files with each CSV table rewritten in its sorted order where
+/// `sort` finds one.
+fn sort_files(files: &[(String, Vec<u8>)], o: Options) -> (Vec<(String, Vec<u8>)>, Vec<Sorted>) {
+    let mut out = Vec::with_capacity(files.len());
+    let mut meta = Vec::with_capacity(files.len());
+    for (n, b) in files {
+        let t = (o.sort && ext(n) == "csv")
+            .then(|| table_lines(b))
+            .flatten()
+            .and_then(|(header, rows, trailing)| {
+                sort_key(b).map(|k| (sorted_table(header, &rows, k), rows.len(), trailing))
+            });
+        match t {
+            Some((t, rows, trailing)) => {
+                out.push((n.clone(), t));
+                meta.push(Some((rows, trailing)));
+            }
+            None => {
+                out.push((n.clone(), b.clone()));
+                meta.push(None);
+            }
+        }
+    }
+    (out, meta)
+}
+
+/// The column each CSV table would be sorted by under `sort`, by file
+/// (None: kept in its own order).
+pub fn sort_keys(files: &[(String, Vec<u8>)], o: Options) -> Vec<Option<usize>> {
+    files
+        .iter()
+        .map(|(n, b)| (o.sort && ext(n) == "csv").then(|| sort_key(b)).flatten())
+        .collect()
 }
 
 /// E209: per stream, which of numbers, predict and step its encoder uses.
@@ -1087,9 +1153,11 @@ fn encode_with(
     o: Options,
     plain: &[bool],
     (modes, modes_all): (&Modes, u8),
+    sorted: &[Sorted],
     table: &mut Skeletons,
     state: &mut EncState,
 ) -> Parts {
+    let sorted_any = sorted.iter().any(Option::is_some);
     let mut parts = Parts::default();
     let EncState { index, streams } = state;
     let first_new = streams.len();
@@ -1115,13 +1183,21 @@ fn encode_with(
             | u8::from(o.rows) << 1
             | u8::from(o.prose || o.route) << 2
             | u8::from(o.predict && o.columns) << 3
-            | u8::from(o.step && o.predict && o.columns) << 4,
+            | u8::from(o.step && o.predict && o.columns) << 4
+            | u8::from(sorted_any) << 5,
     );
     put_var(&mut parts.files, files.len() as u128);
     for (fi, ((name, b), ls)) in files.iter().zip(lexed).enumerate() {
         put_bytes(&mut parts.files, name.as_bytes());
-        if o.prose || o.route {
-            parts.files.push(u8::from(raw[fi]));
+        if o.prose || o.route || sorted_any {
+            let st = sorted.get(fi).copied().flatten();
+            parts
+                .files
+                .push(u8::from(raw[fi]) | u8::from(st.is_some()) << 1);
+            if let Some((rows, trailing)) = st {
+                put_var(&mut parts.files, rows as u128);
+                parts.files.push(u8::from(trailing));
+            }
             if raw[fi] {
                 put_var(&mut parts.files, b.len() as u128);
                 parts.raw.extend_from_slice(b);
@@ -1315,6 +1391,7 @@ fn decode_with(
         step: flags & 16 != 0,
         ..Options::default()
     };
+    let sorted_any = flags & 32 != 0;
     let mut raw_at: usize = 0;
     let skels: Vec<Vec<&[u8]>> = skeletons
         .iter()
@@ -1347,10 +1424,20 @@ fn decode_with(
     for _ in 0..n {
         let name = String::from_utf8(get_bytes(f, &mut at)?.to_vec())
             .map_err(|_| Error::Decode("ir: name"))?;
-        if o.prose {
+        let mut st = None;
+        if o.prose || sorted_any {
             let kind = *f.get(at).ok_or(Error::Decode("ir: truncated"))?;
             at += 1;
-            if kind == 1 {
+            if kind > 3 || (kind & 2 != 0 && !sorted_any) {
+                return Err(Error::Decode("ir: file kind"));
+            }
+            if kind & 2 != 0 {
+                let rows = get_usize(f, &mut at)?;
+                let trailing = *f.get(at).ok_or(Error::Decode("ir: truncated"))? != 0;
+                at += 1;
+                st = Some((rows, trailing));
+            }
+            if kind & 1 != 0 {
                 let len = get_usize(f, &mut at)?;
                 let bytes = parts
                     .raw
@@ -1358,7 +1445,11 @@ fn decode_with(
                     .ok_or(Error::Decode("ir: raw"))?;
                 raw_at += len;
                 all_cells.push(Vec::new());
-                out.push((name, bytes.to_vec()));
+                let bytes = match st {
+                    Some((rows, trailing)) => unsort_table(bytes, rows, trailing)?,
+                    None => bytes.to_vec(),
+                };
+                out.push((name, bytes));
                 continue;
             }
         }
@@ -1419,7 +1510,172 @@ fn decode_with(
             }
         }
         all_cells.push(cells);
+        let bytes = match st {
+            Some((rows, trailing)) => unsort_table(&bytes, rows, trailing)?,
+            None => bytes,
+        };
         out.push((name, bytes));
+    }
+    Ok(out)
+}
+
+// ---------------------------------------------------------------- E211 rows
+
+/// The fewest rows a table needs before `sort` tries an order for it.
+const SORT_MIN_ROWS: usize = 64;
+/// The rows of a table `sort` judges each candidate key on.
+const SORT_SAMPLE: usize = 4000;
+
+/// A CSV table's lines: header, rows, and whether the file ends in a
+/// newline. None when a quoted field could span lines (an odd number of
+/// quotes on some line) or there are too few rows.
+/// A table's header line, its rows, and whether it ends in a newline.
+type Table<'a> = (&'a [u8], Vec<&'a [u8]>, bool);
+
+fn table_lines(b: &[u8]) -> Option<Table<'_>> {
+    let trailing = b.last() == Some(&b'\n');
+    let body = if trailing { &b[..b.len() - 1] } else { b };
+    let mut it = body.split(|&c| c == b'\n');
+    let header = it.next()?;
+    let rows: Vec<&[u8]> = it.collect();
+    if rows.len() < SORT_MIN_ROWS
+        || std::iter::once(header)
+            .chain(rows.iter().copied())
+            .any(|l| l.iter().filter(|&&c| c == b'"').count() % 2 == 1)
+    {
+        return None;
+    }
+    Some((header, rows, trailing))
+}
+
+/// The `k`th field of a CSV line, as written (quotes included); empty when
+/// the line has fewer fields.
+fn field(line: &[u8], k: usize) -> &[u8] {
+    let (mut start, mut n, mut quoted) = (0, 0, false);
+    for (i, &c) in line.iter().enumerate() {
+        match c {
+            b'"' => quoted = !quoted,
+            b',' if !quoted => {
+                if n == k {
+                    return &line[start..i];
+                }
+                n += 1;
+                start = i + 1;
+            }
+            _ => {}
+        }
+    }
+    if n == k { &line[start..] } else { &[] }
+}
+
+/// The rows' order once stably sorted by their keys.
+fn sorted_order(keys: &[&[u8]]) -> Vec<usize> {
+    let mut order: Vec<usize> = (0..keys.len()).collect();
+    order.sort_by(|&a, &b| keys[a].cmp(keys[b]));
+    order
+}
+
+/// The table rewritten for column `k`: header, the rows sorted by their
+/// `k`th field, then that field of every row in file order, one per line,
+/// so the order needs no permutation stored. Every line ends in a newline.
+fn sorted_table(header: &[u8], rows: &[&[u8]], k: usize) -> Vec<u8> {
+    let keys: Vec<&[u8]> = rows.iter().map(|r| field(r, k)).collect();
+    let mut out = Vec::with_capacity(rows.iter().map(|r| r.len() + 1).sum::<usize>() * 11 / 10);
+    out.extend_from_slice(header);
+    out.push(b'\n');
+    for i in sorted_order(&keys) {
+        out.extend_from_slice(rows[i]);
+        out.push(b'\n');
+    }
+    for k in keys {
+        out.extend_from_slice(k);
+        out.push(b'\n');
+    }
+    out
+}
+
+/// Each column of the first `SORT_SAMPLE` rows, one after another: what
+/// `sort` judges an order by, since the IR stores a table by column.
+fn by_column(header: &[u8], rows: &[&[u8]], cols: usize) -> Vec<u8> {
+    let mut out = header.to_vec();
+    for k in 0..cols {
+        for r in rows {
+            out.extend_from_slice(field(r, k));
+            out.push(b'\n');
+        }
+    }
+    out
+}
+
+/// E211: the column to sort a CSV table's rows by, if any order judges
+/// smaller by column than the file's own.
+fn sort_key(b: &[u8]) -> Option<usize> {
+    let (header, rows, _) = table_lines(b)?;
+    let cols = field_count(header);
+    let sample = &rows[..rows.len().min(SORT_SAMPLE)];
+    let mut best = (judged_bytes(&by_column(header, sample, cols)), None);
+    for k in 0..cols {
+        let keys: Vec<&[u8]> = sample.iter().map(|r| field(r, k)).collect();
+        let mut distinct: Vec<&[u8]> = keys.clone();
+        distinct.sort_unstable();
+        distinct.dedup();
+        // a key that is near unique or constant buys no runs
+        if distinct.len() < 2 || distinct.len() * 4 > keys.len() {
+            continue;
+        }
+        let order = sorted_order(&keys);
+        let sorted: Vec<&[u8]> = order.iter().map(|&i| sample[i]).collect();
+        let mut t = by_column(header, &sorted, cols);
+        for key in &keys {
+            t.extend_from_slice(key);
+            t.push(b'\n');
+        }
+        let z = judged_bytes(&t);
+        // a hundredth smaller at least, so noise picks no order
+        if z * 100 < best.0 * 99 {
+            best = (z, Some(k));
+        }
+    }
+    best.1
+}
+
+fn field_count(line: &[u8]) -> usize {
+    let mut quoted = false;
+    1 + line
+        .iter()
+        .filter(|&&c| {
+            if c == b'"' {
+                quoted = !quoted;
+            }
+            c == b',' && !quoted
+        })
+        .count()
+}
+
+/// The table `sorted_table` rewrote, given its row count and whether the
+/// file ended in a newline.
+fn unsort_table(t: &[u8], rows: usize, trailing: bool) -> Result<Vec<u8>, Error> {
+    let body = t
+        .strip_suffix(b"\n")
+        .ok_or(Error::Decode("ir: sorted table"))?;
+    let lines: Vec<&[u8]> = body.split(|&c| c == b'\n').collect();
+    if lines.len() != 1 + 2 * rows {
+        return Err(Error::Decode("ir: sorted table lines"));
+    }
+    let (sorted, keys) = lines[1..].split_at(rows);
+    let order = sorted_order(keys);
+    let mut back: Vec<&[u8]> = vec![&[]; rows];
+    for (j, &i) in order.iter().enumerate() {
+        back[i] = sorted[j];
+    }
+    let mut out = Vec::with_capacity(t.len());
+    out.extend_from_slice(lines[0]);
+    for r in back {
+        out.push(b'\n');
+        out.extend_from_slice(r);
+    }
+    if trailing {
+        out.push(b'\n');
     }
     Ok(out)
 }
@@ -1453,17 +1709,32 @@ pub fn encode_blocks(
     keyframe: bool,
 ) -> Blocks {
     let per = per.max(1);
+    let (files, sorted) = sort_files(files, o);
+    let files = files.as_slice();
     let (plain, modes) = route_modes(files, o);
     let mut table = Skeletons::default();
     let mut key = EncState::default();
     let mut blocks = Vec::new();
-    for (i, (c, p)) in files.chunks(per).zip(plain.chunks(per)).enumerate() {
+    for (i, ((c, p), so)) in files
+        .chunks(per)
+        .zip(plain.chunks(per))
+        .zip(sorted.chunks(per))
+        .enumerate()
+    {
         let mut state = if keyframe && i > 0 {
             key.clone()
         } else {
             EncState::default()
         };
-        blocks.push(encode_with(c, o, p, (&modes, 0), &mut table, &mut state));
+        blocks.push(encode_with(
+            c,
+            o,
+            p,
+            (&modes, 0),
+            so,
+            &mut table,
+            &mut state,
+        ));
         if keyframe && i == 0 {
             key = state;
         }
@@ -1646,6 +1917,7 @@ mod tests {
                     o,
                     &[],
                     (&modes, 0),
+                    &[],
                     &mut table,
                     &mut state.clone(),
                 ));

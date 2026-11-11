@@ -19,6 +19,7 @@ fn all_options() -> Vec<Options> {
             route: false,
             tune: false,
             literal: false,
+            sort: b % 3 == 0,
         })
         .collect()
 }
@@ -273,6 +274,81 @@ fn query_matches(files: &[(String, Vec<u8>)]) {
                     assert_eq!(query::row(&ix, id, k, &key, &mut fetch).unwrap(), mine);
                 }
             }
+        }
+    }
+}
+
+/// E211: tables long enough to sort, in the shapes a real export takes.
+fn big_tables() -> Vec<(String, Vec<u8>)> {
+    let kinds = [
+        "\"Retail, food\"",
+        "Services",
+        "Construction",
+        "\"Rentals\"",
+    ];
+    let cities = ["SAN DIEGO", "LA JOLLA", "POWAY"];
+    let mut a = String::from("ID,NAME,KIND,CITY,AMOUNT\n");
+    let mut b = String::from("ID,NAME,KIND,CITY,AMOUNT\r\n");
+    let mut c = String::from("ID,NOTE\n");
+    let mut x: u64 = 7;
+    for i in 0..300u32 {
+        x = x
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        let k = ((x >> 33) % 4) as usize;
+        let row = format!(
+            "{},Name {},{},{},{} {} {},{}.{:02}",
+            1000 + i,
+            (x >> 40) % 101,
+            kinds[k],
+            cities[((x >> 50) % 3) as usize],
+            kinds[k],
+            "licensed under the city's business tax for this kind of work",
+            k * 17,
+            (x >> 20) % 997,
+            i % 100
+        );
+        a.push_str(&row);
+        a.push('\n');
+        if i % 50 == 7 {
+            // a short row, and an empty line
+            b.push_str("1,short\r\n\r\n");
+        }
+        b.push_str(&row);
+        b.push_str("\r\n");
+        c.push_str(&format!("{i},\"line {}\n", i % 5));
+        c.push_str("continued\"\n");
+    }
+    // no newline at the end of b
+    b.truncate(b.len() - 2);
+    vec![
+        ("t/a.csv".into(), a.into_bytes()),
+        ("t/b.csv".into(), b.into_bytes()),
+        ("t/c.csv".into(), c.into_bytes()),
+    ]
+}
+
+#[test]
+fn sorted_tables_roundtrip() {
+    let files = big_tables();
+    let o = Options {
+        sort: true,
+        ..Options::default()
+    };
+    let keys = ir::sort_keys(&files, o);
+    assert!(keys[0].is_some() && keys[1].is_some(), "{keys:?}");
+    // a field spans lines: kept in its own order
+    assert_eq!(keys[2], None);
+    let options: Vec<Options> = all_options_route()
+        .into_iter()
+        .filter(|o| o.sort)
+        .step_by(5)
+        .collect();
+    roundtrip_with(&files, &options);
+    for o in &options {
+        if o.columns {
+            let parts = encode(&files, *o);
+            assert!(ir::query::index(&parts, &parts.skeletons).is_err());
         }
     }
 }

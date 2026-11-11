@@ -80,6 +80,11 @@ pub fn index(parts: &Parts, skeletons: &[Vec<u8>]) -> Result<Index, Error> {
     if !ix.columns {
         return Err(Error::Decode("ir query: one stream for every column"));
     }
+    if flags & 32 != 0 {
+        return Err(Error::Decode(
+            "ir query: rows stored in another order (sort)",
+        ));
+    }
     let prose = flags & 4 != 0;
     let mut at = 1;
     let n = get_usize(f, &mut at)?;

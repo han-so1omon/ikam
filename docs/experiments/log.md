@@ -3008,3 +3008,20 @@ Newest last. Format and rules: `README.md`.
 - Result (best variant, with `prose`, `route` and `tune`; without / with `literal`): drift 0.504 / 0.504, random 0.633 / 0.633, exports 0.458 / 0.458, tables 0.936 / 0.936, cases text 0.995 / 0.995, cases with drift 0.940 / 0.940, registry 0.961 / **0.960** (8 of 41 streams written out). With `numbers` and no `predict`, written-out strings help more (drift 0.749 to 0.700, exports 0.638 to 0.630), but those variants were never the best. Blocks unchanged. Encode about 1.5 to 1.7 times longer than `tune` alone (79 s on the registry).
 - Verdict: **measured, no gain worth its cost**. The dictionary is not why the IR trails a plain transpose on the real table; the gap must come from the stream layout or token framing. Off by default; kept only because it costs nothing when off.
 - Run: `cargo run --release --example ir_literal [corpus ...]` (about 20 minutes).
+
+### E211 ir-sort (a table's rows stored in the order that compresses best)
+- Branch / parent: exp/211-ir-sort / E210 (stacked)
+- Question: a Python prototype put the real registry at 0.909 of xz when its rows are sorted by NAICS code and that column is kept in file order, so the order needs no permutation stored (0.905 sorted by NAICS then ZIP; a plain transpose without sorting is 0.953). How much of that does the IR keep?
+- Change: `Options::sort` (off by default). Before the IR, each CSV file whose lines are its rows (an even number of quotes on every line, so no field spans lines) and that has at least 64 rows is rewritten as: header, the rows stably sorted by one column, then that column of every row in file order, one per line. The column is the one whose order judges smallest by xz -6 over the first 4,000 rows laid out by column, among columns neither constant nor near unique (distinct values under a quarter of the rows), and only if it beats the file's own order by 1%. The files part marks a rewritten file with its row count and whether it ended in a newline (flag bit 32, file kind bit 2); the decoder stably sorts the stored column to recover where each row goes. Column queries refuse a pack with sorted tables (their rows are in another order). `ir::sort_keys` reports the choice. A test covers quotes with commas, CRLF lines, short rows, empty lines, no final newline, and a field across lines (left alone), under a spread of option sets with `route`, `tune` and blocks.
+- Result (xz -9 over the pack against xz -9 over the files, with `prose` and `route`; without / with `sort`):
+
+  | variant | registry (real, 10.8 MB) |
+  | --- | ---: |
+  | columns | 0.966 / 0.947 |
+  | numbers, tuned | 0.965 / 0.947 |
+  | predict, step, tuned | 0.961 / **0.942** |
+
+  Both registry files were sorted by NAICS, as in the prototype. The exports and tables fixtures have no CSV of 64 rows, so nothing changed there. Encode 51 s against 48 s (the key search adds about 3 s).
+- Verdict: **measured**. The best real-table result yet: 0.942 of xz, a 6% gain where E207 started at 3%. The IR keeps about half of the prototype's gain over a plain transpose (0.909); the rest is lost in its cell framing, since the plain transpose of the unsorted table (0.953) also beats the IR's columns (0.966) on this table, and E210 ruled out the dictionary. Off by default.
+- Next: store a sorted table's columns as plain text runs instead of IR tokens (a transpose path inside `route`), which the prototype says is worth another 3 to 4% here.
+- Run: `cargo run --release --example ir_sort [corpus ...]` (about 5 minutes; the prototype is in the output file `ir_sort-output.md` of the night's notes).

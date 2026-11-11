@@ -665,6 +665,7 @@ pub const T: Options = Options {
     route: false,
     tune: false,
     literal: false,
+    sort: false,
 };
 pub const TC: Options = Options { columns: true, ..T };
 pub const TCN: Options = Options {
