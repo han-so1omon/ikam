@@ -2816,3 +2816,22 @@ Newest last. Format and rules: `README.md`.
 - Tried and dropped: (1) keeping a line whole when no other line shares its skeleton: texts 1.225, mixed 0.967, tables 0.964 (worse); with file routing on top it added nothing. (2) Routing a file when most of its lines are such lines: blank lines are shared, so prose files stayed in the IR (texts 1.218). (3) Most of its bytes on lines no other file uses: texts 1.072, but the real tables went raw and lost their sibling gain (1.026). The spec files in the texts share a template of headings and labels, and the IR still loses on them (4,844 against xz's 3,772): xz's long matches already capture a shared template in running text; the IR wins on cells.
 - Verdict: **measured**. With `prose`, the IR is never worse than xz on these corpora, and a mixed folder drops from 1.013 to 0.826. Off by default.
 - Run: `cargo run --release --example ir_prose` (about 2 minutes).
+
+### E199 ir-nearest (cells diffed against the most similar earlier file)
+- Branch / parent: exp/199-ir-nearest / E198 (stacked: needs exp/197 and exp/198)
+- Question: `siblings` (E194) diffs a file only against the file with its stem. A rerun of a report shares most of its cells with some earlier run of another name. Does diffing against the nearest earlier file help, and where?
+- Change: `Options::nearest` (a window; 0 is off): among the last `nearest` files with the same extension (and the sibling), the one holding the most of this file's cells is chosen as the base, by a cheap count over a cell set, and the cell diff runs on the best two and the sibling. The stored format is E194's (a base and copy and insert runs), so decoding is unchanged. The cheap count keeps the full search's sizes (drift 0.576 both) at 118 ms against 724 ms for diffing all 16; counting cells equal at the same place instead picked worse bases (0.609).
+- Result, whole corpus (best IR variant, xz -9 over the pack, against xz -9 over the files; off / window 1 / 4 / 16): reports-drift 0.591 / 0.670 / 0.584 / 0.576; drift in a shuffled order 0.906 / 1.050 / 0.939 / **0.770**; reports-random 0.669 / 0.688 / 0.685 / 0.691; exports 0.483 / 0.561 / 0.465 / 0.466; tables 0.927 / 0.937. Encode 2 to 4 times slower at 16. A window of 1 is worse everywhere: with row keys a value repeated from the previous run already costs almost nothing, and a diff per file costs more.
+- Result, blocks in the kernel (E197), best variant (off / nearest 16):
+
+  | corpus | per block | independent | keyframe |
+  | --- | ---: | --- | --- |
+  | reports-drift | 20 | 0.984 / **0.759** | 0.958 / 0.743 |
+  | reports-drift | 50 | 0.885 / 0.700 | 0.839 / 0.690 |
+  | reports-drift | 100 | 0.736 / **0.624** | 0.699 / 0.617 |
+  | exports | 30 | 0.668 / 0.663 | 0.649 / 0.611 |
+  | exports | 60 | 0.564 / 0.526 | 0.555 / 0.523 |
+
+  In small blocks the winner drops row keys (columns and numbers only, E193's TCN): row keys make 1,853 streams that each restart in every block. With nearest, blocks of 20 reports read one report in 0.40 ms (the block decoded in memory) at 0.759 of xz, against the files in the kernel at 1.641 and 0.03 ms. E197's table used row keys for every block size, so it understates small blocks: its 1.227 at 20 per block is 0.984 with columns and numbers alone.
+- Verdict: **measured**. Use `nearest: 16` with blocks; whole-corpus packs gain little unless files arrive out of order. Off by default.
+- Run: `cargo run --release --example ir_nearest` (about 8 minutes).

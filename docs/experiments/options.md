@@ -305,7 +305,7 @@ Renderers and indexes outside the kernel (scripts and examples; no switch):
 | a word index (postings lists) in the same view | 35 to 60 times the bytes written per edit and 3.5 times the storage, for a fast first query after a restart | 29 ms reading 30 KB against 548 ms reading 5.2 MB at 18,000 fragments (E187, E189); bucketed lists do not write less (E191) |
 
 
-## IR codec options (E192 to E198)
+## IR codec options (E192 to E199)
 
 `ikam_kernel::ir::Options`, all off by default; nothing in put or repack uses the codec. `decode(encode(files, o))` is byte-exact for any bytes and options (`tests/ir.rs`).
 
@@ -320,3 +320,4 @@ Renderers and indexes outside the kernel (scripts and examples; no switch):
 | `encode_blocks(per)`: blocks of `per` files, one shared skeleton table, each block one kernel content | bytes grow as blocks shrink; a read decodes one block (about 0.03 ms per file in it) | drift, per 20: 1.227 of xz, 0.84 ms read; per 100: 0.756, 3.3 ms (E197) |
 | `encode_blocks(.., keyframe)`: blocks after the first go on from the first block's streams | a cold read decodes the first block too | drift per 50: 0.858 against 0.904; exports per 60: 0.630 against 0.729 (E197) |
 | `prose`: a file under a tenth of whose bytes are cells is stored as it is (raw part) | none measured | texts 1.000 against 1.249 without; mixed reports and prose 0.826 against 1.013 (E198) |
+| `nearest: n`: cells diffed against whichever of the last n files with the extension holds the most of them | encode 2 to 4 times slower at 16; worse at n = 1 | drift blocks of 20 in the kernel 0.759 against 0.984; shuffled reports 0.770 against 0.906 (E199) |

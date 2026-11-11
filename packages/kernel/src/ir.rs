@@ -25,7 +25,7 @@
 //! any options (`tests/ir.rs` checks this by property). The pack is
 //! uncompressed; a general compressor (xz, zstd) runs over it.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use similar::{Algorithm, DiffOp, capture_diff_slices};
 
@@ -41,6 +41,11 @@ pub struct Options {
     /// as it is, in one raw part with the other such
     /// files, so the general compressor sees running text.
     pub prose: bool,
+    /// E199: with a window of `nearest` (0 is off), a file's cells are
+    /// stored as a diff against whichever of the last `nearest` files with
+    /// its extension (or its sibling, with `siblings`) shares the most
+    /// cells with it, so a rerun stores only the cells that changed.
+    pub nearest: usize,
 }
 
 /// An encoded set of files: the line skeletons, each file's lines and cell
@@ -533,9 +538,12 @@ fn stem(name: &str) -> &str {
     name.rsplit_once('.').map_or(name, |(s, _)| s)
 }
 
-/// Copy and insert runs of `cells` against `base`, or None when nothing is
-/// shared.
-fn cell_diff(base: &[&[u8]], cells: &[&[u8]]) -> Option<Vec<(bool, usize, usize)>> {
+/// Copy (from, len) and insert (len) runs of a cell diff.
+type Ops = Vec<(bool, usize, usize)>;
+
+/// The cells `cells` shares with `base`, and its copy and insert runs
+/// against `base` (None when nothing is shared).
+fn cell_diff(base: &[&[u8]], cells: &[&[u8]]) -> (usize, Option<Ops>) {
     let mut ops = Vec::new();
     let mut shared = 0;
     for op in capture_diff_slices(Algorithm::Myers, base, cells) {
@@ -550,7 +558,7 @@ fn cell_diff(base: &[&[u8]], cells: &[&[u8]]) -> Option<Vec<(bool, usize, usize)
             DiffOp::Delete { .. } => {}
         }
     }
-    (shared > 0).then_some(ops)
+    (shared, (shared > 0).then_some(ops))
 }
 
 /// The stream a cell goes to: one stream, one per (skeleton, slot), or with
@@ -611,6 +619,8 @@ fn encode_with(
         .collect();
     let mut all_cells: Vec<Vec<&[u8]>> = Vec::new();
     let mut by_stem: HashMap<&str, usize> = HashMap::new();
+    let mut by_ext: HashMap<&str, Vec<usize>> = HashMap::new();
+    let mut cell_sets: Vec<HashSet<&[u8]>> = Vec::new();
     parts
         .files
         .push(u8::from(o.columns) | u8::from(o.rows) << 1 | u8::from(o.prose) << 2);
@@ -623,6 +633,7 @@ fn encode_with(
                 put_var(&mut parts.files, b.len() as u128);
                 parts.raw.extend_from_slice(b);
                 all_cells.push(Vec::new());
+                cell_sets.push(HashSet::new());
                 continue;
             }
         }
@@ -645,8 +656,32 @@ fn encode_with(
             at += l.cells.len();
         }
         let cells: Vec<&[u8]> = ls.iter().flat_map(|l| l.cells.iter().copied()).collect();
-        let base = by_stem.get(stem(name)).copied().filter(|_| o.siblings);
-        let ops = base.and_then(|bi| cell_diff(&all_cells[bi], &cells));
+        let sibling = by_stem.get(stem(name)).copied().filter(|_| o.siblings);
+        let recent = by_ext.get(ext(name)).map_or(&[][..], |v: &Vec<usize>| {
+            &v[v.len().saturating_sub(o.nearest)..]
+        });
+        // a cheap first look (how many of this file's cells each candidate
+        // holds anywhere) picks the two likeliest bases; the diff runs on
+        // those and the sibling only
+        let mut likely: Vec<(usize, usize)> = recent
+            .iter()
+            .map(|&bi| {
+                let have = &cell_sets[bi];
+                (cells.iter().filter(|c| have.contains(*c)).count(), bi)
+            })
+            .collect();
+        likely.sort_unstable_by(|a, b| b.cmp(a));
+        let mut best: (usize, Option<usize>, Option<Ops>) = (0, None, None);
+        for bi in sibling
+            .into_iter()
+            .chain(likely.iter().take(2).map(|x| x.1))
+        {
+            let (shared, ops) = cell_diff(&all_cells[bi], &cells);
+            if shared > best.0 {
+                best = (shared, Some(bi), ops);
+            }
+        }
+        let (_, base, ops) = best;
         put_var(
             &mut parts.files,
             ops.as_ref().map_or(0, |_| base.unwrap() + 1) as u128,
@@ -681,6 +716,14 @@ fn encode_with(
             streams[si].put(c, o.numbers);
         }
         by_stem.entry(stem(name)).or_insert(fi);
+        if o.nearest > 0 && !cells.is_empty() {
+            by_ext.entry(ext(name)).or_default().push(fi);
+        }
+        cell_sets.push(if o.nearest > 0 {
+            cells.iter().copied().collect()
+        } else {
+            HashSet::new()
+        });
         all_cells.push(cells);
     }
     parts.streams = streams
