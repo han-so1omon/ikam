@@ -2687,3 +2687,7 @@ Newest last. Format and rules: `README.md`.
 - Change: none in the kernel. Modes `stored+postings/16` and `/256` in `examples/stored_summaries.rs` (`w/<word>/<prefix>` to content); exact checks as E187.
 - Result: exact in every store, through gc and restart. Written per edit (p50) at 500 files: 70 KB lists, 76 KB with 16 buckets, 78 KB with 256. At 2,000 files: 135, 66 and 101 KB, but the first query slows from 39 to 105 and 78 ms and the store holds 2 to 3 times the objects. On E186's corpus: 517, 593 and 618 KB over 22 edits.
 - Verdict: **discarded**. The cost of postings is the number of words an edit touches (each a node rewritten in the view's tree), not the length of their lists. Fewer writes need fewer words per fragment or a delta log merged in the background (database mode), not smaller lists.
+
+### Gates for E186 to E191 (Nov 11)
+- On exp/186-stored-summaries: 187 kernel tests pass; clippy `-D warnings` and fmt clean; the fixed bench matches main (a890aa6) in every byte count and the north score (0.3035): the kernel is unchanged. E189 and E191 numbers were measured with E190 merged in locally (`trial` branch, not pushed); without it, PackStore opens of the postings modes take seconds.
+- Run: `cargo run --release --example stored_summaries` (E186, E187, E191; about 80 s), `-- crash` (E188), `-- scale 500` and `-- scale 2000` (E189, E191).
