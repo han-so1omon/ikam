@@ -90,6 +90,11 @@ pub struct Options {
     /// each column's fields one per line, so xz sees a column as one run.
     /// A table `sort` rewrote is laid out by column after it is sorted.
     pub transpose: bool,
+    /// E214: `route` and `tune` judge on a sample of about this many bytes
+    /// (0: on every file): every file, each over its share (and 4 KB) cut
+    /// to its first line and an even spread of its other lines. What they
+    /// choose then applies to every file.
+    pub sample: usize,
 }
 
 /// An encoded set of files: the line skeletons, each file's lines and cell
@@ -1073,7 +1078,8 @@ fn route_modes(files: &[(String, Vec<u8>)], o: Options) -> (Vec<bool>, Modes) {
     let n = files.len();
     if !o.route || n == 0 {
         let plain = vec![false; n];
-        let modes = tune(files, o, &plain);
+        let (_, s) = sample(files, o.sample);
+        let modes = tune(&s, o, &[]);
         return (plain, modes);
     }
     let keys: Vec<(&str, Option<Vec<u8>>)> = files
@@ -1102,6 +1108,7 @@ fn route_modes(files: &[(String, Vec<u8>)], o: Options) -> (Vec<bool>, Modes) {
     let mut last = Modes::default();
     for members in groups.values() {
         let g: Vec<(String, Vec<u8>)> = members.iter().map(|&i| files[i].clone()).collect();
+        let (_, g) = sample(&g, o.sample);
         let (ir, modes) = judged(&g, o, &[]);
         let (raw, _) = judged(&g, o, &vec![true; g.len()]);
         if raw < ir {
@@ -1121,15 +1128,48 @@ fn route_modes(files: &[(String, Vec<u8>)], o: Options) -> (Vec<bool>, Modes) {
     }
     let mut tries = vec![plain, vec![false; n], vec![true; n]];
     tries.dedup();
+    let (kept, s) = sample(files, o.sample);
     tries
         .into_iter()
         .map(|p| {
-            let (z, m) = judged(files, o, &p);
+            let sp: Vec<bool> = kept.iter().map(|&i| p[i]).collect();
+            let (z, m) = judged(&s, o, &sp);
             (z, p, m)
         })
         .min_by_key(|(z, _, _)| *z)
         .map(|(_, p, m)| (p, m))
         .unwrap_or_default()
+}
+
+/// E214: what `route` and `tune` judge when `budget` is set (bytes, 0 is
+/// everything): the index of each file kept and its bytes. Every file is
+/// kept, since the IR's gain is across files (a first try that kept every
+/// `r`th file routed drift reports plain); a file over its share of the
+/// budget (and over 4 KB) keeps its first line and an even spread of the
+/// others, so only large files are cut.
+fn sample(files: &[(String, Vec<u8>)], budget: usize) -> (Vec<usize>, Vec<(String, Vec<u8>)>) {
+    let total: usize = files.iter().map(|(_, b)| b.len()).sum();
+    let kept = (0..files.len()).collect();
+    if budget == 0 || total <= budget {
+        return (kept, files.to_vec());
+    }
+    let out = files
+        .iter()
+        .map(|(name, b)| {
+            let share = (b.len() as u128 * budget as u128 / total as u128) as usize;
+            if b.len() <= share.max(4096) {
+                return (name.clone(), b.clone());
+            }
+            let m = b.len().div_ceil(share.max(4096));
+            let mut it = b.split_inclusive(|&c| c == b'\n');
+            let mut cut = it.next().unwrap_or_default().to_vec();
+            for l in it.step_by(m) {
+                cut.extend_from_slice(l);
+            }
+            (name.clone(), cut)
+        })
+        .collect();
+    (kept, out)
 }
 
 /// A skeleton table shared by several encodes (E197 blocks).

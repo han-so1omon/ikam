@@ -3058,3 +3058,22 @@ Newest last. Format and rules: `README.md`.
 - Verdict: **measured**. The real registry at 0.911 of xz, from 0.966 at E207: 9% smaller, exactly, with the plain-columns variant and no tuning. Off by default, with `transpose`.
 - Next: the same columns layout for JSON arrays of records, which the real fixtures do not have yet; and `transpose` inside blocks for large tables, so one range of rows reads without the whole table.
 - Run: `cargo run --release --example ir_transpose [corpus ...]` (about 8 minutes).
+
+### E214 ir-sample (route and tune judged on a sample)
+- Branch / parent: exp/214-ir-sample / E213 (stacked)
+- Question: `route` and `tune` judge with xz over whole encodes: 13 s (columns) and 43 s (tuned) on the 10.8 MB registry, against well under a second to encode it. Do they choose the same on a sample?
+- Change: `Options::sample` (bytes, 0 is off). `route` and `tune` judge on every file, each file over its share of the budget (and over 4 KB) cut to its first line and an even spread of its other lines; what they choose applies to the whole set. Only the encoder changes. A first try also kept only every `r`th file of a large set: it misjudged, routing the drift reports plain (0.926 to 0.998 with columns) and the exports at 256 KB, since the IR's gain is across neighbouring files; so every file is kept.
+- Result (with `prose`, `route`, `sort` and `transpose`; xz -9 over the pack against xz -9 over the files; judging on everything / 1 MB / 256 KB):
+
+  | corpus | columns | encode ms | predict, step, tuned | encode ms |
+  | --- | --- | --- | --- | --- |
+  | reports-drift | 0.926 / 0.926 / 0.926 | 292 / 167 / 172 | 0.504 / 0.504 / 0.504 | 553 / 343 / 312 |
+  | reports-random | 0.717 / 0.717 / 0.717 | 338 / 198 / 195 | 0.630 / 0.630 / 0.630 | 634 / 494 / 440 |
+  | exports | 0.662 / 0.662 / 0.662 | 261 / 255 / 219 | 0.617 / 0.617 / 0.617 | 532 / 533 / 554 |
+  | cases text (real) | 0.996 / 0.996 / 0.996 | 1327 / 1271 / 725 | 0.995 / 0.995 / 0.995 | 4501 / 4371 / 3042 |
+  | cases text + drift | 0.989 / 0.989 / 0.989 | 1508 / 1107 / 1052 | 0.940 / 0.940 / 0.940 | 5518 / 4040 / 3620 |
+  | registry (real) | 0.911 / 0.911 / 0.911 | 13089 / 4999 / 4414 | 0.911 / 0.911 / 0.911 | 43383 / 7109 / 4583 |
+
+  Every size is the same as judging on everything, and every route choice too (same raw part). The drift and random times also fell where no file was cut; part of that is run order (the first encode of each row runs cold), so only the registry's are clear gains. About 3 s of the registry's remaining time is `sort` choosing its key.
+- Verdict: **measured**. 1 MB keeps every result and makes the registry's tuned encode 6x faster (43 to 7 s). Off by default; 1 MB is the value to try first.
+- Run: `cargo run --release --example ir_sample [corpus ...]` (about 6 minutes).
