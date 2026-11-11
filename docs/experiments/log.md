@@ -3281,3 +3281,7 @@ Newest last. Format and rules: `README.md`.
   Reads are unchanged (0.0 to 7 ms). Judging the frame against the raw part as it is (first run) instead of under xz -6 gave the same cases figures.
 - Verdict: **dropped** (the option stays, off). In the store, a framed raw part is worse wherever it is used: the kernel already compresses a block entry better (brotli or xz, its trained dictionary across entries) than zstd does with block 0 as dictionary, and a frame cannot be compressed again. E224's gain is real under one compressor but the store gets most of it already. A gain here would need the store itself to compress a block against block 0 (E057's related-content frames), not the IR.
 - Run: `cargo run --release --example ir_rawkey [corpus ...]` (about a minute).
+
+### Merge of E197 to E225 into main (Nov 11)
+- On Eric's word ("Merge it"), the stacked branches exp/197-ir-blocks to exp/225-ir-raw-dict merged onto main a831e15 as one squashed commit, 1b72f35 (its tree is exp/225's tree). The build files committed by mistake on exp/206 are not in main's history. Every IR option is off, and nothing in put, repack or the bench calls `ir`, `put_ir` or `put_ir_blocks`.
+- Gates on the merge: every kernel test suite passes (release); clippy `-D warnings` and fmt clean; the bench gives the same byte and count fields as main's last run (only times and peak memory differ) and north 0.3035; `ir_parity` hashes are identical to E206's.
