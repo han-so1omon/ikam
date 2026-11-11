@@ -2978,3 +2978,25 @@ Newest last. Format and rules: `README.md`.
 - Cost: encoding pays xz -6 over each group's IR and plain bytes, then up to three judgments of the whole set: 0.5 to 1.8 s for the 300 to 800 file corpora (12 to 57 ms without), and 13 s for the 10.8 MB registry (0.3 s without). That suits a background repack, not a live write.
 - Verdict: **measured**. With `route`, the IR is never worse than xz over the files on any corpus tried, real or generated, and it keeps every gain it had. Its price is encode time. Off by default.
 - Run: `cargo run --release --example ir_route [corpus ...]` (about 15 minutes, most of it the registry).
+
+### E209 ir-tune (each column picks its own coding)
+- Branch / parent: exp/209-ir-tune / E208 (stacked)
+- Question: `numbers`, `predict` and `step` are on or off for every column at once. On the real registry (E207) number deltas cost 5% overall and predict 4%, though some columns surely gain. Can each column choose?
+- Change: `Options::tune` (off by default). The encoder encodes once with each of: everything the options allow, no number deltas, no predicted cells, no stepped numbers, and their combinations; judges each stream's bytes with xz -6 under each; keeps per stream the smallest (by stream key: skeleton, slot, row key); and keeps the tuned pack only if xz judges the whole pack smaller than untuned. With `route`, the routing judges the IR as tuned, so a table the plain IR loses on can still win. The predictors still learn on every cell either way, so the decoder needs nothing new: each token says what it is. `ir::tune_modes` lists the choices. A unit test decodes every mode on every stream, mixed modes per stream, and blocks; the option tests run every option set with `tune`, and with `tune` and `route`.
+- Result (best variant, all with `prose` and `route`, xz -9 over the pack against xz -9 over the files; without / with `tune`):
+
+  | corpus | without | with | streams that changed coding |
+  | --- | ---: | ---: | --- |
+  | reports-drift | 0.505 | 0.504 | 4 of 23 |
+  | reports-random | 0.644 | **0.633** | 5 of 23 |
+  | exports | 0.459 | 0.458 | 4 of 35 |
+  | tables | 0.936 | 0.936 | none |
+  | cases text (real) | 0.995 | 0.995 | none (routed plain) |
+  | cases text + drift | 0.940 | 0.940 | none for the best variant |
+  | registry (real) | 1.000 (routed plain) | **0.961** | 15 of 41: 6 without number deltas, 9 without predicted cells, 10 without steps |
+
+  With `numbers` alone, tuned: drift 0.767 to 0.749, random 0.670 to 0.654. The registry's 0.961 beats its best untuned variant (columns alone, 0.966). In the kernel in blocks of 20 with a keyframe, tuning on the whole set does not carry to blocks: random reports 0.712 to 0.722, the rest unchanged.
+- Cost: up to 5 more encodes and an xz of every stream per try: 0.5 to 0.7 s for 300 reports (0.3 s with `route` alone), 5 s for the cases with drift reports, 47 s for the 10.8 MB registry (12 s with `route` alone).
+- Verdict: **measured**. Small gains on generated reports (up to 1.7%), and on the real table it turns a loss into a 4% win. Expensive at encode; suits a background repack. Off by default.
+- Side finding for the next entries: a plain transpose of the registry (each column's text one after another, no IR) is 0.953 of xz, better than any IR variant (0.961), so the IR's cell coding costs something on real tables; and sorting the rows by NAICS code, with the NAICS column kept in file order so the order needs no permutation stored, reaches 0.909 (Python prototype).
+- Run: `cargo run --release --example ir_tune [corpus ...]` (about 10 minutes).

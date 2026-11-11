@@ -17,15 +17,28 @@ fn all_options() -> Vec<Options> {
             group: b & 128 != 0,
             step: b & 256 != 0,
             route: false,
+            tune: false,
         })
         .collect()
 }
 
-/// Every option set, and each again with `route` (E208).
+/// Every option set, and each again with `route` (E208), with `tune`
+/// (E209) and with both.
 fn all_options_route() -> Vec<Options> {
     all_options()
         .into_iter()
-        .flat_map(|o| [o, Options { route: true, ..o }])
+        .flat_map(|o| {
+            [
+                o,
+                Options { route: true, ..o },
+                Options { tune: true, ..o },
+                Options {
+                    route: true,
+                    tune: true,
+                    ..o
+                },
+            ]
+        })
         .collect()
 }
 

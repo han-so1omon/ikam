@@ -69,6 +69,13 @@ pub struct Options {
     /// plain. The decoder needs nothing new (the files go in the raw part
     /// of `prose`).
     pub route: bool,
+    /// E209: each column (stream) chooses for itself whether it stores
+    /// numbers as deltas, predicted cells as one byte, and stepped numbers
+    /// as one byte, among what the other options turn on. The encoder tries
+    /// each choice on every stream, keeps per stream the one whose bytes xz
+    /// judges smallest, and keeps the result only if the whole pack is
+    /// smaller. The decoder needs nothing new (each token says what it is).
+    pub tune: bool,
 }
 
 /// An encoded set of files: the line skeletons, each file's lines and cell
@@ -535,6 +542,15 @@ struct Predictor {
     step_hits: usize,
 }
 
+/// E209 stream modes: what a column's encoder leaves out, though the options
+/// allow it.
+const NO_NUMBERS: u8 = 1;
+const NO_PREDICT: u8 = 2;
+const NO_STEP: u8 = 4;
+
+/// Per stream key, the mode `tune` chose (absent: 0).
+type Modes = FxMap<StreamKey, u8>;
+
 /// How many of a line's first cells a column may be predicted from (E200).
 const PREDICTORS: usize = 4;
 
@@ -625,18 +641,26 @@ impl Stream {
     }
 
     /// `put` with the line's earlier cells, when the column predicts.
-    fn put_in<L: AsRef<[u8]>>(&mut self, c: &[u8], numbers: bool, line: Option<&[L]>, step: bool) {
+    fn put_in<L: AsRef<[u8]>>(
+        &mut self,
+        c: &[u8],
+        numbers: bool,
+        line: Option<&[L]>,
+        step: bool,
+        mode: u8,
+    ) {
+        let numbers = numbers && mode & NO_NUMBERS == 0;
         let Some(line) = line else {
             return self.put(c, numbers);
         };
         let fresh = self.prev.as_deref() != Some(c);
-        if fresh && self.predicted(line).map(Vec::as_slice) == Some(c) {
+        if fresh && mode & NO_PREDICT == 0 && self.predicted(line).map(Vec::as_slice) == Some(c) {
             self.out.push(5);
             if let Some(n) = parse_num(c).filter(|_| numbers) {
                 self.num = Some(n);
             }
             self.prev = Some(c.to_vec());
-        } else if let Some(n) = (step && fresh)
+        } else if let Some(n) = (step && fresh && mode & NO_STEP == 0)
             .then(|| self.stepped(line))
             .flatten()
             .filter(|n| render_num(*n) == c)
@@ -815,15 +839,90 @@ fn stream_key(o: Options, slot: (usize, usize), first: &[u8]) -> (usize, usize, 
 
 /// Encodes `files` (names and bytes) with the given options.
 pub fn encode(files: &[(String, Vec<u8>)], o: Options) -> Parts {
-    let plain = route(files, o);
-    encode_plain(files, o, &plain)
+    let (plain, modes) = route_modes(files, o);
+    encode_modes(files, o, &plain, (&modes, 0))
 }
 
-fn encode_plain(files: &[(String, Vec<u8>)], o: Options, plain: &[bool]) -> Parts {
+fn encode_modes(
+    files: &[(String, Vec<u8>)],
+    o: Options,
+    plain: &[bool],
+    modes: (&Modes, u8),
+) -> Parts {
     let mut table = Skeletons::default();
-    let mut parts = encode_with(files, o, plain, &mut table, &mut EncState::default());
+    let mut parts = encode_with(files, o, plain, modes, &mut table, &mut EncState::default());
     parts.skeletons = table.list;
     parts
+}
+
+/// E209: per stream, which of numbers, predict and step its encoder uses.
+/// Each mode is tried on every stream at once; each stream keeps the mode
+/// under which xz judges its bytes smallest; the tuned pack is kept only if
+/// it judges smaller than the untuned one.
+/// Returns, for the streams that left something out, their key and mode
+/// (1 no number deltas, 2 no predicted cells, 4 no stepped numbers).
+pub fn tune_modes(files: &[(String, Vec<u8>)], o: Options) -> Vec<(StreamKey, u8)> {
+    let mut m: Vec<(StreamKey, u8)> = route_modes(files, o).1.into_iter().collect();
+    m.sort();
+    m
+}
+
+fn tune(files: &[(String, Vec<u8>)], o: Options, plain: &[bool]) -> Modes {
+    let mut modes = Modes::default();
+    if !o.tune || files.is_empty() || (!plain.is_empty() && plain.iter().all(|p| *p)) {
+        return modes;
+    }
+    let predicts = o.predict && o.columns;
+    let mut tries = vec![0u8];
+    if o.numbers {
+        tries.push(NO_NUMBERS);
+    }
+    if predicts {
+        tries.push(NO_PREDICT | NO_STEP);
+        if o.step {
+            tries.push(NO_STEP);
+        }
+        if o.numbers {
+            tries.push(NO_NUMBERS | NO_PREDICT | NO_STEP);
+        }
+    }
+    if tries.len() == 1 {
+        return modes;
+    }
+    let mut best: FxMap<StreamKey, (usize, u8)> = FxMap::default();
+    let mut base = None;
+    for &m in &tries {
+        let p = encode_modes(files, o, plain, (&Modes::default(), m));
+        for (k, s) in directory(&p)
+            .unwrap_or_default()
+            .into_iter()
+            .zip(&p.streams)
+        {
+            let z = judged_bytes(s);
+            let e = best.entry(k).or_insert((usize::MAX, 0));
+            if z < e.0 {
+                *e = (z, m);
+            }
+        }
+        if m == 0 {
+            base = Some(p);
+        }
+    }
+    modes = best
+        .into_iter()
+        .filter(|(_, (_, m))| *m != 0)
+        .map(|(k, (_, m))| (k, m))
+        .collect();
+    if modes.is_empty() {
+        return modes;
+    }
+    let tuned = judged_bytes(&pack(&encode_modes(files, o, plain, (&modes, 0))));
+    let untuned = base.map_or(usize::MAX, |p| judged_bytes(&pack(&p)));
+    if tuned < untuned {
+        modes
+    } else {
+        Modes::default()
+    }
 }
 
 /// The xz preset that judges `route`'s choices (E208 first judged with
@@ -853,8 +952,12 @@ fn judged_bytes(b: &[u8]) -> usize {
     e.finish().map_or(usize::MAX, |z| z.len())
 }
 
-fn judged(files: &[(String, Vec<u8>)], o: Options, plain: &[bool]) -> usize {
-    judged_bytes(&pack(&encode_plain(files, o, plain)))
+/// The judged size of the pack with `plain` stored as it is; with `tune`,
+/// of the pack as tuned (E209), so `route` weighs the IR at its best.
+fn judged(files: &[(String, Vec<u8>)], o: Options, plain: &[bool]) -> (usize, Modes) {
+    let modes = tune(files, o, plain);
+    let z = judged_bytes(&pack(&encode_modes(files, o, plain, (&modes, 0))));
+    (z, modes)
 }
 
 /// E208: which files `route` stores as they are. Files are grouped by kind:
@@ -865,9 +968,16 @@ fn judged(files: &[(String, Vec<u8>)], o: Options, plain: &[bool]) -> usize {
 /// smaller way; then the whole set so routed is judged against all IR and
 /// all plain, and the smallest of the three is kept.
 pub fn route(files: &[(String, Vec<u8>)], o: Options) -> Vec<bool> {
+    route_modes(files, o).0
+}
+
+/// `route`, with the stream modes `tune` chose for the files so routed.
+fn route_modes(files: &[(String, Vec<u8>)], o: Options) -> (Vec<bool>, Modes) {
     let n = files.len();
     if !o.route || n == 0 {
-        return vec![false; n];
+        let plain = vec![false; n];
+        let modes = tune(files, o, &plain);
+        return (plain, modes);
     }
     let keys: Vec<(&str, Option<Vec<u8>>)> = files
         .iter()
@@ -892,27 +1002,36 @@ pub fn route(files: &[(String, Vec<u8>)], o: Options) -> Vec<bool> {
         groups.entry(key).or_default().push(i);
     }
     let mut plain = vec![false; n];
+    let mut last = Modes::default();
     for members in groups.values() {
         let g: Vec<(String, Vec<u8>)> = members.iter().map(|&i| files[i].clone()).collect();
-        let ir = judged(&g, o, &[]);
-        let raw = judged(&g, o, &vec![true; g.len()]);
+        let (ir, modes) = judged(&g, o, &[]);
+        let (raw, _) = judged(&g, o, &vec![true; g.len()]);
         if raw < ir {
             for &i in members {
                 plain[i] = true;
             }
+        } else {
+            last = modes;
         }
     }
     // one group: its judgment was already of the whole set
     if groups.len() == 1 {
-        return plain;
+        if plain.iter().all(|p| *p) {
+            last = Modes::default();
+        }
+        return (plain, last);
     }
     let mut tries = vec![plain, vec![false; n], vec![true; n]];
     tries.dedup();
     tries
         .into_iter()
-        .map(|p| (judged(files, o, &p), p))
-        .min_by_key(|(z, _)| *z)
-        .map(|(_, p)| p)
+        .map(|p| {
+            let (z, m) = judged(files, o, &p);
+            (z, p, m)
+        })
+        .min_by_key(|(z, _, _)| *z)
+        .map(|(_, p, m)| (p, m))
         .unwrap_or_default()
 }
 
@@ -926,7 +1045,7 @@ struct Skeletons {
 /// The streams after an encode, so a later encode can go on from them (a
 /// block coded against a keyframe block, E197).
 /// A stream's key: line skeleton, slot, row key.
-type StreamKey = (usize, usize, Vec<u8>);
+pub type StreamKey = (usize, usize, Vec<u8>);
 
 #[derive(Clone, Default)]
 struct EncState {
@@ -941,6 +1060,7 @@ fn encode_with(
     files: &[(String, Vec<u8>)],
     o: Options,
     plain: &[bool],
+    (modes, modes_all): (&Modes, u8),
     table: &mut Skeletons,
     state: &mut EncState,
 ) -> Parts {
@@ -1061,7 +1181,8 @@ fn encode_with(
                 streams.push(Stream::default());
             }
             let line = (o.predict && o.columns).then(|| &cells[firsts[k]..k]);
-            streams[si].put_in(c, o.numbers, line, o.step && o.predict);
+            let mode = modes.get(&key).copied().unwrap_or(modes_all);
+            streams[si].put_in(c, o.numbers, line, o.step && o.predict, mode);
         }
         by_stem.entry(stem(name)).or_insert(fi);
         if o.nearest > 0 && !cells.is_empty() {
@@ -1306,7 +1427,7 @@ pub fn encode_blocks(
     keyframe: bool,
 ) -> Blocks {
     let per = per.max(1);
-    let plain = route(files, o);
+    let (plain, modes) = route_modes(files, o);
     let mut table = Skeletons::default();
     let mut key = EncState::default();
     let mut blocks = Vec::new();
@@ -1316,7 +1437,7 @@ pub fn encode_blocks(
         } else {
             EncState::default()
         };
-        blocks.push(encode_with(c, o, p, &mut table, &mut state));
+        blocks.push(encode_with(c, o, p, (&modes, 0), &mut table, &mut state));
         if keyframe && i == 0 {
             key = state;
         }
@@ -1443,6 +1564,76 @@ mod tests {
         }
         for s in ["007", "-0", "1,23", "1.", ".5", "$", "1e5"] {
             assert!(parse_num(s.as_bytes()).is_none(), "{s}");
+        }
+    }
+
+    /// E209: every stream mode, on every stream, decodes exactly, alone and
+    /// in blocks, and mixed per stream.
+    #[test]
+    fn every_stream_mode_decodes() {
+        let mut files: Vec<(String, Vec<u8>)> = Vec::new();
+        for r in 0..12u32 {
+            let rows: String = (0..6u32)
+                .map(|i| {
+                    format!(
+                        "l{i},{},{}.{:02},{}\n",
+                        ["up", "down"][(i % 2) as usize],
+                        r * 3 + i,
+                        (r * 7 + i) % 100,
+                        if r % 4 == 0 { "x" } else { "y" }
+                    )
+                })
+                .collect();
+            files.push((
+                format!("r{r:02}.csv"),
+                format!("id,dir,n,v,f\n{rows}").into_bytes(),
+            ));
+        }
+        let o = Options {
+            columns: true,
+            numbers: true,
+            predict: true,
+            step: true,
+            ..Options::default()
+        };
+        for rows in [false, true] {
+            let o = Options { rows, ..o };
+            for m in 0..8u8 {
+                let p = encode_modes(&files, o, &[], (&Modes::default(), m));
+                assert_eq!(decode(&p).unwrap(), files, "mode {m}");
+            }
+            // a different mode per stream
+            let keys = directory(&encode(&files, o)).unwrap();
+            let modes: Modes = keys
+                .into_iter()
+                .enumerate()
+                .map(|(i, k)| (k, (i % 8) as u8))
+                .collect();
+            let p = encode_modes(&files, o, &[], (&modes, 0));
+            assert_eq!(decode(&p).unwrap(), files);
+            let mut table = Skeletons::default();
+            let mut state = EncState::default();
+            let mut blocks = Vec::new();
+            for c in files.chunks(5) {
+                blocks.push(encode_with(
+                    c,
+                    o,
+                    &[],
+                    (&modes, 0),
+                    &mut table,
+                    &mut state.clone(),
+                ));
+                if blocks.len() == 1 {
+                    state = EncState::default();
+                }
+            }
+            let b = Blocks {
+                per: 5,
+                keyframe: false,
+                skeletons: table.list,
+                blocks,
+            };
+            assert_eq!(decode_blocks(&b).unwrap(), files);
         }
     }
 }
