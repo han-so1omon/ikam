@@ -101,7 +101,18 @@ pub fn norm(path: &str) -> String {
 
 impl Live {
     pub fn open(store_dir: &str, refname: &str) -> Result<Live, String> {
-        let repo = Repo::new(FsStore::open(store_dir).map_err(err)?);
+        Live::open_with(store_dir, refname, false)
+    }
+
+    /// `open`, with `deferred_sync`: the store makes edits durable when they
+    /// commit (`FsStore::open_deferred`, E227).
+    pub fn open_with(store_dir: &str, refname: &str, deferred_sync: bool) -> Result<Live, String> {
+        let store = if deferred_sync {
+            FsStore::open_deferred(store_dir)
+        } else {
+            FsStore::open(store_dir)
+        };
+        let repo = Repo::new(store.map_err(err)?);
         let store_dir = PathBuf::from(store_dir);
         let cache_dir = store_dir.join("cache");
         std::fs::create_dir_all(&cache_dir).map_err(err)?;

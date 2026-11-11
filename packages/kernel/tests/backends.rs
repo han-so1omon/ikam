@@ -111,6 +111,65 @@ fn fs_store() {
 }
 
 #[test]
+fn fs_store_deferred() {
+    all(&|p| FsStore::open_deferred(p).unwrap());
+}
+
+/// E227: a deferred store keeps a written object under a temporary name
+/// until a ref moves, so a crash before then leaves no object under its id,
+/// and the ref never names one that is not in place.
+#[test]
+fn fs_store_deferred_places_objects_when_a_ref_moves() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut s = FsStore::open_deferred(dir.path()).unwrap();
+    let placed = |n: u8| {
+        let hex = id(n).to_hex();
+        dir.path()
+            .join("objects")
+            .join(&hex[..2])
+            .join(&hex[2..])
+            .exists()
+    };
+    s.write(id(1), b"one").unwrap();
+    assert!(!placed(1), "waits under a temporary name");
+    assert_eq!(s.read(&id(1)).unwrap(), b"one");
+    assert!(s.has(&id(1)));
+    // Another handle (as after a crash) sees neither the object nor a ref.
+    let other = FsStore::open(dir.path()).unwrap();
+    assert!(!other.has(&id(1)) && other.ids().unwrap().is_empty());
+    s.write(id(2), b"two").unwrap();
+    s.delete(&id(2)).unwrap();
+    s.set_ref("heads/main", None, id(1)).unwrap();
+    assert!(placed(1) && !placed(2));
+    assert_eq!(other.read(&id(1)).unwrap(), b"one");
+    assert_eq!(other.get_ref("heads/main").unwrap(), Some(id(1)));
+    // No temporary file is left once the ref has moved.
+    let left: Vec<_> = walkdir(dir.path())
+        .into_iter()
+        .filter(|p| {
+            p.file_name()
+                .unwrap()
+                .to_string_lossy()
+                .starts_with(".pending-")
+        })
+        .collect();
+    assert!(left.is_empty(), "{left:?}");
+}
+
+fn walkdir(dir: &Path) -> Vec<std::path::PathBuf> {
+    let mut out = Vec::new();
+    for e in std::fs::read_dir(dir).unwrap() {
+        let p = e.unwrap().path();
+        if p.is_dir() {
+            out.extend(walkdir(&p));
+        } else {
+            out.push(p);
+        }
+    }
+    out
+}
+
+#[test]
 fn pack_store() {
     all(&|p| PackStore::open(p).unwrap());
 }

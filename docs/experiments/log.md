@@ -3285,3 +3285,44 @@ Newest last. Format and rules: `README.md`.
 ### Merge of E197 to E225 into main (Nov 11)
 - On Eric's word ("Merge it"), the stacked branches exp/197-ir-blocks to exp/225-ir-raw-dict merged onto main a831e15 as one squashed commit, 1b72f35 (its tree is exp/225's tree). The build files committed by mistake on exp/206 are not in main's history. Every IR option is off, and nothing in put, repack or the bench calls `ir`, `put_ir` or `put_ir_blocks`.
 - Gates on the merge: every kernel test suite passes (release); clippy `-D warnings` and fmt clean; the bench gives the same byte and count fields as main's last run (only times and peak memory differ) and north 0.3035; `ir_parity` hashes are identical to E206's.
+
+### E226 commit-cost (where a report copy's time goes, as `ikam live` stores it)
+- Branch / parent: exp/226-commit-cost / main 1c5efb9
+- Question: the Mercante report-copy demo on example-host (Nov 10) reported 47 ms a copy, with `store_ms` 4.7 and `tree_ms` 16.7 (`X-Ikam-Cost`), and E178 found a commit that drops a superseded copy reads the whole store (2.2 s at 1M). Where does a copy's time go: tree CPU, store reads, or writes?
+- Change: none in the kernel. `examples/commits.rs`: as `ikam live` does for one PUT, `put_content` of a lead-lag report (E211's `reports` generator), `edit_tree` at `reports/<name>`, then `Repo::commit`, on one handle reopened after setup, with N reports already in the folder; 20 copies after one warm-up, medians; a counting store wrapper reports writes, reads, whole-store scans and drops. FsStore in a temporary directory (ext4, this Linux box) and MemStore (CPU only).
+- Result (two runs; FsStore times vary about 2x between runs on this box, MemStore little):
+
+  | reports in folder | MemStore copy ms (tree ms) | FsStore copy ms (tree ms) | commit ms (FsStore) | first copy on a fresh handle ms (reads) |
+  | ---: | ---: | ---: | ---: | ---: |
+  | 2 | 0.93 / 0.97 (0.52 / 0.51) | 4.43 / 12.31 (2.90 / 8.49) | 1.00 / 2.68 | 3.3 / 10.5 (28) |
+  | 30 | 1.12 / 0.96 (0.64 / 0.51) | 5.07 / 11.03 (3.39 / 7.62) | 1.03 / 2.68 | 9.1 / 16.0 (162) |
+  | 300 | 2.30 / 1.74 (1.44 / 1.02) | 5.99 / 11.23 (4.00 / 7.73) | 0.92 / 2.34 | 43.3 / 71.1 (2,059) |
+  | 3000 | 9.89 / 8.10 (8.26 / 6.75) | 12.09 / 13.79 (9.06 / 10.29) | 1.02 / 1.17 | 355.5 / 348.0 (20,649) |
+
+  - Writes a copy, at every size: the report 2 (content and its derivation record), the trees 5 (the folder's tree as a slice of its last version plus its pointer, the root's tree plus its pointer), the commit 2 (the commit and the ref). Bytes stored a copy: report 526 to 1,420, trees 464 to 503, commit 86. FsStore syncs each of the 9.
+  - `edit_tree` already writes only the trees on the changed path; what grows with the folder is CPU in planning its one big tree (at 3,000 files a 157 KB encoding: template search about 3 ms, slice search 0.8, plain encoding 0.8).
+  - A drop with a whole-store scan (E178's `is_needed`) happened once in 21 copies, at 3,000 reports only. `Repo::commit` itself reads nothing; the whole-store passes are the first write on a fresh handle (ledger and seed index: 3 scans, about 7 reads per stored object) and such drops.
+- Reading of the Mac figures (inference, not measured on the Mac): CPU is under 1 ms a copy at 2 reports, so the demo's 16.7 ms of trees is about 3.3 ms for each of the 5 synced tree writes (on Apple systems `sync_all` is F_FULLFSYNC, a flush of the drive's cache), and its 4.7 ms of store is the report's 2.
+- Verdict: **measured**. On a small folder a copy's time is its synced writes, not tree work; tree CPU matters only for folders of thousands of files. Next: sync once per commit (E227); skip template search for trees (E228).
+- Run: `cargo run --release --example commits [--mem] [--deferred] [--no-object-templates] [--every K] [sizes ...]` (about a minute).
+
+### E227 deferred-sync (objects durable when a ref moves, in the FsStore layout)
+- Branch / parent: exp/226-commit-cost / E226
+- Question: PackStore (E122) already makes objects durable with one flush when a ref moves, but `ikam live` and its stores on the Mac use FsStore. Keeping FsStore's layout, so existing stores open unchanged, can a burst of writes pay one round of syncs at the commit instead of one sync each?
+- Change: `FsStore::open_deferred` (`FsStore::open` unchanged, the default). A write goes to `.pending-<pid>-<n>-<name>` in its object directory, readable at once through the handle; before a ref moves (`set_ref`) and when the handle drops, waiting objects are made durable and renamed into place: on Linux by one `syncfs` after the renames; on Apple systems by a plain fsync of each file and directory, the ref's own F_FULLFSYNC then flushing the drive once; elsewhere `sync_all` of each file and directory. A crash leaves only temporary files, never a partial object under its id, and no ref can name an object not in place. If `syncfs` fails, the objects just placed are removed and the ref does not move. `libc` becomes a dependency on Linux and Apple only. `ikam live --deferred-sync`. Tests (`tests/backends.rs`): the store contract and repository round trip on a deferred store; objects stay under temporary names, unseen by another handle, until a ref moves, and none is left after.
+- Result (E226's harness, FsStore against deferred, two runs; bytes and writes identical):
+  - A commit after each copy, 2 reports: copy 4.43 / 12.31 to 1.63 / 1.29 ms; 20 copies with their commits 123.6 / 305.8 to 67.6 / 66.9 ms. 300 reports: 138.3 / 268.5 to 125.4 / 91.4 ms. 3,000 reports: 289.5 / 344.6 to 284.8 / 304.8 ms (CPU-bound, see E228).
+  - One commit after 20 copies (as `ikam live` commits after a pause): 2 reports 154.7 / 126.8 to 51.4 / 46.7 ms, the commit's one round of syncs 6.2 / 8.3 ms; 3,000 reports 264.9 / 358.2 to 240.9 / 223.8 ms.
+  - `ikam live` on a temporary store, three PUTs into `reports/` (with E228's flag): `X-Ikam-Cost` the same new bytes (181, 223, 265), `store_ms` 0.89 to 1.21 against 0.18 to 0.29, `tree_ms` 2.72 to 3.19 against 0.25 to 0.31; after a stop, `ls` and `fsck` clean and no temporary file left.
+- Not measured: the Mac. There each of a copy's 9 synced writes is a full flush today; deferred, a PUT does no flush and a commit does one, so the demo's 21 ms of store and trees should fall to about its CPU (under 1 ms). That needs a run there.
+- Trade-off: edits are durable when they commit, not when each PUT returns (after a crash, up to `--commit-after` of edits is lost; with FsStore today the objects survive but no ref names them, so the files are lost either way unless someone commits their ids). `syncfs` flushes the whole filesystem, other programs' writes included, so on a busy disk a commit can take longer.
+- Verdict: **kept** as an option, off by default. A copy costs about its CPU, and a burst's syncs are paid once at the commit.
+
+### E228 live-tree-slices (`ikam live` planning trees only as slices)
+- Branch / parent: exp/226-commit-cost / E227
+- Question: E226 found template search is most of a large tree's planning. E144's `Repo::object_templates` (off: trees and view chunks planned only as slices of earlier versions) was never reachable from `ikam live`. What does it change on report copies?
+- Change: `ikam live --no-object-templates` sets it. No kernel change.
+- Result (E226's harness, MemStore, two runs): bytes a copy identical at every size (trees 464 to 503 B); tree ms 0.52 / 0.51 to 0.30 / 0.27 at 2 reports, 1.44 / 1.02 to 0.60 / 0.77 at 300, 8.26 / 6.75 to 3.03 / 3.01 at 3,000; reads a copy 21 to 17. With E227 on FsStore at 3,000 reports, 20 copies with their commits 284.8 / 304.8 to 202.6 / 243.3 ms.
+- Verdict: **kept** as an option, off by default, as E144 left it. What remains at 3,000 files (about 3 ms) is re-encoding and slicing the folder's whole tree; making that proportional to the change needs a tree split into chunks, a format change not tried here.
+
+Gates on the branch: every kernel test suite passes (release); clippy `-D warnings` and fmt clean; the bench gives the same byte and count fields as main 1c5efb9 run on the same machine (only times and peak memory differ), north 0.3035, cost score 0.2456 (main 0.2486, from timings).

@@ -138,6 +138,10 @@ impl Store for MemStore {
 /// Git-style layout: `objects/<hex[..2]>/<hex[2..]>` and `refs/<name>`.
 pub struct FsStore {
     root: PathBuf,
+    /// E227: with `open_deferred`, objects written since the last ref move,
+    /// under their temporary names. Made durable and renamed into place
+    /// before the next ref move (`sync`).
+    pending: Option<BTreeMap<Id, PathBuf>>,
 }
 
 impl FsStore {
@@ -145,13 +149,117 @@ impl FsStore {
         let root = root.into();
         fs::create_dir_all(root.join("objects"))?;
         fs::create_dir_all(root.join("refs"))?;
-        Ok(FsStore { root })
+        Ok(FsStore {
+            root,
+            pending: None,
+        })
+    }
+
+    /// The same layout, but an object is made durable only when a ref next
+    /// moves, so a burst of writes costs one round of syncs instead of one
+    /// sync each (E227). Until then it waits under a temporary name in its
+    /// directory: a crash leaves only temporary files (`.pending-*`, never
+    /// read), never a partial object under its id, and no ref can name an
+    /// object that is not durable.
+    pub fn open_deferred(root: impl Into<PathBuf>) -> Result<FsStore, Error> {
+        let mut s = FsStore::open(root)?;
+        s.pending = Some(BTreeMap::new());
+        Ok(s)
     }
 
     fn path(&self, id: &Id) -> PathBuf {
         let hex = id.to_hex();
         self.root.join("objects").join(&hex[..2]).join(&hex[2..])
     }
+
+    /// Where `id`'s bytes are now: its waiting file, or its own path.
+    fn located(&self, id: &Id) -> PathBuf {
+        match self.pending.as_ref().and_then(|p| p.get(id)) {
+            Some(tmp) => tmp.clone(),
+            None => self.path(id),
+        }
+    }
+
+    /// Make every waiting object durable and move it to its own path
+    /// (E227). Nothing to do for a store opened with `open`. On Apple
+    /// systems each file gets a plain fsync and the ref's own sync, a full
+    /// flush of the drive, makes them durable together.
+    pub fn sync(&mut self) -> Result<(), Error> {
+        let Some(pending) = self.pending.as_mut() else {
+            return Ok(());
+        };
+        // Linux: one syncfs writes every waiting file and directory entry
+        // (renames included) instead of one fsync each.
+        #[cfg(target_os = "linux")]
+        if !pending.is_empty() {
+            let mut moved = Vec::new();
+            while let Some((id, tmp)) = pending.pop_first() {
+                let hex = id.to_hex();
+                let path = self.root.join("objects").join(&hex[..2]).join(&hex[2..]);
+                if let Err(e) = fs::rename(&tmp, &path) {
+                    pending.insert(id, tmp);
+                    return Err(e.into());
+                }
+                moved.push(path);
+            }
+            use std::os::fd::AsRawFd;
+            let root = fs::File::open(&self.root)?;
+            // SAFETY: syncfs on an open descriptor held for the call.
+            if unsafe { libc::syncfs(root.as_raw_fd()) } != 0 {
+                // Not known durable: remove them (absent before `write`),
+                // so no later write skips one that a crash may have cut.
+                let e = io::Error::last_os_error();
+                for path in moved {
+                    let _ = fs::remove_file(path);
+                }
+                return Err(e.into());
+            }
+            return Ok(());
+        }
+        let mut dirs = std::collections::BTreeSet::new();
+        while let Some((id, tmp)) = pending.pop_first() {
+            let done = push_to_disk(&fs::File::open(&tmp)?).and_then(|()| {
+                let hex = id.to_hex();
+                let path = self.root.join("objects").join(&hex[..2]).join(&hex[2..]);
+                fs::rename(&tmp, &path)?;
+                dirs.insert(path.parent().unwrap().to_path_buf());
+                Ok(())
+            });
+            if let Err(e) = done {
+                pending.insert(id, tmp); // still waiting; the ref does not move
+                return Err(e.into());
+            }
+        }
+        for dir in dirs {
+            push_to_disk(&fs::File::open(dir)?)?;
+        }
+        Ok(())
+    }
+}
+
+impl Drop for FsStore {
+    /// Objects written but never named by a ref are still kept, as with
+    /// `open`: a later process may name them (`ikam put`, then a commit).
+    fn drop(&mut self) {
+        let _ = self.sync();
+    }
+}
+
+/// Write a file's data to the drive: `sync_all`, except on Apple systems,
+/// where `sync_all` also flushes the drive's cache (F_FULLFSYNC) and a plain
+/// fsync is enough before a later full flush.
+fn push_to_disk(file: &fs::File) -> io::Result<()> {
+    #[cfg(target_vendor = "apple")]
+    {
+        use std::os::fd::AsRawFd;
+        // SAFETY: fsync on an open descriptor this function borrows.
+        if unsafe { libc::fsync(file.as_raw_fd()) } != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
+    }
+    #[cfg(not(target_vendor = "apple"))]
+    file.sync_all()
 }
 
 /// The smallest id starting with `prefix`.
@@ -186,36 +294,55 @@ fn not_found_as<T>(r: io::Result<T>, missing: impl FnOnce() -> Error) -> Result<
 
 impl Store for FsStore {
     fn write(&mut self, id: Id, encoded: &[u8]) -> Result<bool, Error> {
-        let path = self.path(&id);
-        if path.exists() {
+        if self.has(&id) {
             return Ok(false);
         }
-        write_atomic(&path, encoded)?;
+        let path = self.path(&id);
+        match self.pending.as_mut() {
+            None => write_atomic(&path, encoded)?,
+            Some(pending) => {
+                let dir = path.parent().unwrap();
+                fs::create_dir_all(dir)?;
+                let name = path.file_name().unwrap().to_string_lossy();
+                // Unique per handle and write, so two handles never share one.
+                static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+                let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let tmp = dir.join(format!(".pending-{}-{n}-{name}", std::process::id()));
+                fs::write(&tmp, encoded)?;
+                pending.insert(id, tmp);
+            }
+        }
         Ok(true)
     }
 
     fn replace(&mut self, id: Id, encoded: &[u8]) -> Result<(), Error> {
-        write_atomic(&self.path(&id), encoded) // rename is atomic over an old file
+        // A replacement is durable at once, as with `open` (rename is atomic
+        // over an old file); a waiting copy of the same object is let go.
+        if let Some(tmp) = self.pending.as_mut().and_then(|p| p.remove(&id)) {
+            let _ = fs::remove_file(tmp);
+        }
+        write_atomic(&self.path(&id), encoded)
     }
 
     fn read(&self, id: &Id) -> Result<Vec<u8>, Error> {
-        not_found_as(fs::read(self.path(id)), || Error::NotFound(*id))
+        not_found_as(fs::read(self.located(id)), || Error::NotFound(*id))
     }
 
     fn stored_len(&self, id: &Id) -> Result<usize, Error> {
-        not_found_as(fs::metadata(self.path(id)), || Error::NotFound(*id)).map(|m| m.len() as usize)
+        not_found_as(fs::metadata(self.located(id)), || Error::NotFound(*id))
+            .map(|m| m.len() as usize)
     }
 
     fn read_head(&self, id: &Id, n: usize) -> Result<Vec<u8>, Error> {
         use std::io::Read;
-        let file = not_found_as(fs::File::open(self.path(id)), || Error::NotFound(*id))?;
+        let file = not_found_as(fs::File::open(self.located(id)), || Error::NotFound(*id))?;
         let mut out = Vec::with_capacity(n);
         file.take(n as u64).read_to_end(&mut out)?;
         Ok(out)
     }
 
     fn has(&self, id: &Id) -> bool {
-        self.path(id).exists()
+        self.pending.as_ref().is_some_and(|p| p.contains_key(id)) || self.path(id).exists()
     }
 
     fn ids(&self) -> Result<Vec<Id>, Error> {
@@ -229,6 +356,9 @@ impl Store for FsStore {
                     out.push(id);
                 }
             }
+        }
+        if let Some(pending) = &self.pending {
+            out.extend(pending.keys());
         }
         // Directory order depends on the filesystem (ext4 hashes names with a
         // per-filesystem seed, APFS sorts them). Callers that pick among
@@ -244,12 +374,12 @@ impl Store for FsStore {
         };
         let dir = self.root.join("objects").join(format!("{first:02x}"));
         let entries = match fs::read_dir(dir) {
-            Ok(entries) => entries,
-            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(vec![]),
+            Ok(entries) => Some(entries),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => None,
             Err(e) => return Err(e.into()),
         };
         let mut out = Vec::new();
-        for file in entries {
+        for file in entries.into_iter().flatten() {
             let name = file?.file_name().to_string_lossy().into_owned();
             if let Ok(id) = format!("{first:02x}{name}").parse::<Id>()
                 && id.as_bytes().starts_with(prefix)
@@ -257,11 +387,22 @@ impl Store for FsStore {
                 out.push(id);
             }
         }
+        if let Some(pending) = &self.pending {
+            out.extend(
+                pending
+                    .keys()
+                    .filter(|id| id.as_bytes().starts_with(prefix)),
+            );
+        }
         out.sort_unstable(); // as `ids` (E136)
         Ok(out)
     }
 
     fn delete(&mut self, id: &Id) -> Result<(), Error> {
+        if let Some(tmp) = self.pending.as_mut().and_then(|p| p.remove(id)) {
+            fs::remove_file(tmp)?;
+            return Ok(());
+        }
         not_found_as(fs::remove_file(self.path(id)), || Error::NotFound(*id))
     }
 
@@ -276,6 +417,7 @@ impl Store for FsStore {
 
     fn set_ref(&mut self, name: &str, expected: Option<Id>, new: Id) -> Result<(), Error> {
         check_ref_name(name)?;
+        self.sync()?; // E227: what the ref names is durable before it moves
         let path = self.root.join("refs").join(name);
         fs::create_dir_all(path.parent().unwrap())?;
         // The lock file serializes writers through an OS lock on it, not its

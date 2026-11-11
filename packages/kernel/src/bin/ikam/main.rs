@@ -51,6 +51,7 @@ const USAGE: &str = "usage: ikam [--store DIR] [--short-records] [--slow-codec-m
   live [PORT] [--watch DIR[:PREFIX]]... [--llm] [--commit-after MS]
        [--allow-host NAME]... [--log-requests] [--public]
        [--max-body BYTES] [--max-store BYTES] [--max-conns N] [--gc-every N]
+       [--deferred-sync] [--no-object-templates]
                                    run REF (default main) as a live filesystem:
                                    WebDAV at http://127.0.0.1:PORT/dav/ (mount it
                                    in Finder: Go > Connect to Server), a web page
@@ -58,6 +59,10 @@ const USAGE: &str = "usage: ikam [--store DIR] [--short-records] [--slow-codec-m
                                    tree as it changes. Edits commit after MS of
                                    quiet (default 1500). --llm lets questions be
                                    answered by Claude (needs ANTHROPIC_API_KEY).
+                                   --deferred-sync makes edits durable when they
+                                   commit, with one sync, not one per object;
+                                   --no-object-templates plans trees only as
+                                   slices of earlier versions (E227, E228).
                                    --allow-host also answers to NAME (such as the
                                    machine's Tailscale name behind Tailscale
                                    Serve); it still listens on 127.0.0.1 only. With
@@ -497,6 +502,12 @@ fn live_cmd(
         })
         .transpose()?;
     let before = args.len();
+    args.retain(|a| a != "--deferred-sync");
+    let deferred_sync = args.len() != before;
+    let before = args.len();
+    args.retain(|a| a != "--no-object-templates");
+    let object_templates = args.len() == before;
+    let before = args.len();
     args.retain(|a| a != "--public");
     let public = args.len() != before;
     let auth = auth::Auth::from_env()?;
@@ -522,8 +533,9 @@ fn live_cmd(
         },
     };
     let port: u16 = args.first().map_or(Ok(8737), |p| p.parse()).map_err(err)?;
-    let mut l = live::Live::open(store_dir, refname)?;
+    let mut l = live::Live::open_with(store_dir, refname, deferred_sync)?;
     l.repo.needed_index = needed_index;
+    l.repo.object_templates = object_templates;
     l.max_store = max_store.or(public.then_some(PUBLIC_MAX_STORE));
     l.gc_every = gc_every;
     if let Some(ms) = commit_after {
