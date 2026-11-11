@@ -303,3 +303,17 @@ Renderers and indexes outside the kernel (scripts and examples; no switch):
 | table aggregates kept fresh from the computed-table IR (`scripts/table_aggregates.py`) | per-workbook aggregates kept, and the IR's evaluator | exact 22/22 from one workbook's evaluation (E184) |
 | summaries stored as derivations of a WASM function beside the fragments, in a `summaries` graph committed with the files (`examples/stored_summaries.rs`, `functions/summary.wasm`); off unless an application commits the view | about the text's size again in storage and 2 to 7 ms per edit, for summaries that survive restarts, gc and kills and can be re-verified | exact through 22 edits, gc, restart and 60 kills; no query gain on its own (E186, E188, E189) |
 | a word index (postings lists) in the same view | 35 to 60 times the bytes written per edit and 3.5 times the storage, for a fast first query after a restart | 29 ms reading 30 KB against 548 ms reading 5.2 MB at 18,000 fragments (E187, E189); bucketed lists do not write less (E191) |
+
+
+## IR codec options (E192 to E196)
+
+`ikam_kernel::ir::Options`, all off by default; nothing in put or repack uses the codec. `decode(encode(files, o))` is byte-exact for any bytes and options (`tests/ir.rs`).
+
+| Setting | Trade | Measured (against xz -9 over all files) |
+| --- | --- | --- |
+| templates (the codec with every option off): cells lexed out, each distinct line skeleton stored once | a full decode to read one file; worse on prose | reports 0.88 to 1.03; md+csv+json exports 0.69; prose 1.25 (E192) |
+| `columns`: one cell stream per (line skeleton, slot) | stream overhead on small tables | reports 0.72 to 0.93; real tables 1.08 (E193) |
+| `numbers`: numeric cells (`-$1,650,000.50`, `12.5%`) as deltas in their stream | none measured beyond encode time | reports 0.67 to 0.84 (E193) |
+| `rows`: streams keyed by the line's first cell, so a report row lines up across runs | more streams; no gain when values do not repeat | reruns on the same data 0.591; random values 0.677 against 0.669 without (E193) |
+| `siblings`: a file with the same stem stores its cells as a diff against the first one (canonical form across csv, json, md) | a diff per sibling at encode | exports 0.483; real tables 0.927 (E194) |
+| IR parts stored in the kernel (four contents) | one-file reads decode everything (12 ms for 300 reports against 0.03 ms) | drift reports 10,362 B against 27,657 for the files, ingest 15 times faster (E195) |
