@@ -722,3 +722,41 @@ fn pack_store_saves_a_scanned_tail() {
         assert_eq!(s.ids().unwrap().len(), 70);
     }
 }
+
+#[test]
+fn pack_store_prefix_lookups_in_the_open_pack_match_a_mem_store() {
+    // E190: the open pack's index is ordered, so a prefix lookup is a
+    // range. Same answers as a MemStore for every prefix length, with
+    // deletes, before and after a reopen.
+    let dir = tempfile::tempdir().unwrap();
+    let mut mem = ikam_kernel::MemStore::default();
+    let ids: Vec<Id> = (0..2_000u32).map(|i| Id::of(&i.to_be_bytes())).collect();
+    {
+        let mut pack = PackStore::open(dir.path()).unwrap();
+        for (i, id) in ids.iter().enumerate() {
+            pack.write(*id, b"x").unwrap();
+            mem.write(*id, b"x").unwrap();
+            if i % 7 == 0 {
+                pack.delete(id).unwrap();
+                mem.delete(id).unwrap();
+            }
+        }
+        for id in ids.iter().step_by(13) {
+            for n in [0, 1, 2, 5, 32] {
+                let p = &id.as_bytes()[..n];
+                assert_eq!(
+                    pack.ids_with_prefix(p).unwrap(),
+                    mem.ids_with_prefix(p).unwrap()
+                );
+            }
+        }
+    }
+    let pack = PackStore::open(dir.path()).unwrap();
+    for id in ids.iter().step_by(13) {
+        let p = &id.as_bytes()[..2];
+        assert_eq!(
+            pack.ids_with_prefix(p).unwrap(),
+            mem.ids_with_prefix(p).unwrap()
+        );
+    }
+}
