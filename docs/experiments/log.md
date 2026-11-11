@@ -3077,3 +3077,26 @@ Newest last. Format and rules: `README.md`.
   Every size is the same as judging on everything, and every route choice too (same raw part). The drift and random times also fell where no file was cut; part of that is run order (the first encode of each row runs cold), so only the registry's are clear gains. About 3 s of the registry's remaining time is `sort` choosing its key.
 - Verdict: **measured**. 1 MB keeps every result and makes the registry's tuned encode 6x faster (43 to 7 s). Off by default; 1 MB is the value to try first.
 - Run: `cargo run --release --example ir_sample [corpus ...]` (about 6 minutes).
+
+### E215 ir-preset (one setting for every corpus)
+- Branch / parent: exp/215-ir-preset / E214 (stacked)
+- Question: each option so far was measured where it helps. Is one setting close to the best on every corpus, generated and real, and never worse than xz? That is what a default would need.
+- Change: none to the codec; new `examples/ir_preset.rs`. Every setting has `prose`, `route`, `sort`, `transpose` and `sample` at 1 MB.
+- Result (xz -9 over the pack against xz -9 over the files):
+
+  | corpus | safe (columns) | full | full, no row keys | full, tuned | predict, step | predict, step, tuned |
+  | --- | ---: | ---: | ---: | ---: | ---: | ---: |
+  | reports-drift | 0.926 | 0.593 | 0.539 | 0.593 | 0.505 | **0.504** |
+  | reports-random | 0.717 | 0.741 | 0.683 | 0.741 | 0.645 | **0.630** |
+  | exports | 0.662 | 0.528 | **0.459** | 0.528 | 0.617 | 0.617 |
+  | tables | 0.995 | 0.995 | **0.936** | 0.995 | 0.995 | 0.995 |
+  | texts | 1.000 | 1.000 | 1.000 | 1.000 | 1.000 | 1.000 |
+  | drift + texts | 0.969 | 0.827 | 0.802 | 0.829 | **0.789** | **0.789** |
+  | cases text (real) | 0.996 | 1.002 | 0.996 | 1.002 | **0.995** | **0.995** |
+  | cases text + drift | 0.989 | 0.956 | 0.944 | 0.955 | **0.940** | **0.940** |
+  | registry (real) | **0.911** | **0.911** | **0.911** | **0.911** | **0.911** | **0.911** |
+
+  Full is columns, numbers, siblings, row keys, nearest 16, predict and step. Encode times: under 1.6 s on every generated corpus, 1.1 to 4.8 s on the cases folder, 5 to 14 s on the registry (7.3 s for predict, step, tuned). Decode under 35 ms except the registry (160 to 220 ms).
+- Verdict: **measured**. Two settings split the corpora. "Predict, step, tuned" is best or tied on 7 of 9 and never worse than xz; it loses only where one file repeats another's cells (exports 0.617 against 0.459, tables 0.995 against 0.936), which `siblings` and `nearest` catch and which cost the reports 3 to 8%. Row keys make every corpus worse or no better once `route` and `predict` are on. No one setting is best everywhere yet.
+- Next: E216, `route` also judging per kind of file whether its files diff against a base file, so one setting can take both sides.
+- Run: `cargo run --release --example ir_preset [corpus ...]` (about 3 minutes).
