@@ -2631,3 +2631,13 @@ Newest last. Format and rules: `README.md`.
 
 ### Merge of E170 to E179 into main (Nov 10)
 - On Eric's word ("Merge the appropriate changes"), exp/179-ckpt-after-crash (E170 to E179) merged onto main after the fragment merge (5a535de), with every option off by default: `PackOptions` `lazy_checkpoint`, `ref_log` and `filters` stay false, `compact` and `GroupCommit` run only when called, the hybrids build only with `store-rocksdb`, and FsStore stays the default store. The E179 fix (an open that scanned 64 MiB or more after a crash saves a checkpoint) applies to every PackStore. The log and registry kept both sides; the registry is in experiment order.
+
+### Mac night2 on main (b27e9bf, Nov 10, from the Mac session's report)
+- With full fsync on both, packs-fast commits in 4.9 ms against RocksDB's 5.9 ms; packs-fast opens 1M objects in 0.2 ms; 16 writers sharing a flush make 2,550 commits a second against 317 alone, p99 103 to 10 ms; every crash test clean.
+- One step skipped: `churn packs-filter` panicked with "churn is for PackStore backends" (E185).
+
+### E185 churn-all-packs (one pack options table for every harness phase)
+- Finding: `examples/stores.rs` `churn` kept its own list of pack names (packs, packs-fast, packs-fast-filter) and missed packs-filter, so the Mac night2 churn step for filtered packs panicked.
+- Change (harness only; kernel untouched): `pack_options(name)` maps every `packs*` name to its `PackOptions`, and `open` and `churn` both read it. The stores example now runs its own tests (`test = true`): every `packs*` name in `BACKENDS` has options, and build plus churn at 2,000 objects runs on all six. The churn test fails on the old list.
+- Gates: 187 kernel tests, 195 with the store features; clippy clean with and without them; fmt clean; the bench is unchanged (the kernel is unchanged).
+- Verdict: **kept** as a fix, on exp/185-churn-all-packs until Eric says to merge. The Mac reruns `churn packs-filter` at 1M once Remote Control is back.
