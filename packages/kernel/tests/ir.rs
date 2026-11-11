@@ -5,7 +5,7 @@ use ikam_kernel::ir::{self, Options, decode, encode, pack, unpack};
 use proptest::prelude::*;
 
 fn all_options() -> Vec<Options> {
-    (0..256)
+    (0..512)
         .map(|b| Options {
             columns: b & 1 != 0,
             numbers: b & 2 != 0,
@@ -15,6 +15,7 @@ fn all_options() -> Vec<Options> {
             nearest: if b & 32 != 0 { 3 } else { 0 },
             predict: b & 64 != 0,
             group: b & 128 != 0,
+            step: b & 256 != 0,
         })
         .collect()
 }
@@ -53,6 +54,14 @@ fn sample() -> Vec<(String, Vec<u8>)> {
         (
             "r2.md",
             "run 13 at 2026-11-10 04:00, rho -0.29 and 008 and 2.\n",
+        ),
+        (
+            "c1.csv",
+            "id,n,x\na,1,-1\nb,9,0.9\na,2,0\nb,10,1.00\na,3,1\nb,11,$1,999\na,4,2%\nb,12,$2,000\n",
+        ),
+        (
+            "c2.csv",
+            "id,n,x\na,5,3%\nb,13,$2,001\na,6,4%\nb,14,007\na,7,5%\nb,15,008\n",
         ),
         ("empty.txt", ""),
         ("nl.txt", "\n\n\n"),

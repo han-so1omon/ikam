@@ -305,7 +305,7 @@ Renderers and indexes outside the kernel (scripts and examples; no switch):
 | a word index (postings lists) in the same view | 35 to 60 times the bytes written per edit and 3.5 times the storage, for a fast first query after a restart | 29 ms reading 30 KB against 548 ms reading 5.2 MB at 18,000 fragments (E187, E189); bucketed lists do not write less (E191) |
 
 
-## IR codec options (E192 to E203)
+## IR codec options (E192 to E204)
 
 `ikam_kernel::ir::Options`, all off by default; nothing in put or repack uses the codec. `decode(encode(files, o))` is byte-exact for any bytes and options (`tests/ir.rs`).
 
@@ -322,6 +322,7 @@ Renderers and indexes outside the kernel (scripts and examples; no switch):
 | `prose`: a file under a tenth of whose bytes are cells is stored as it is (raw part) | none measured | texts 1.000 against 1.249 without; mixed reports and prose 0.826 against 1.013 (E198) |
 | `nearest: n`: cells diffed against whichever of the last n files with the extension holds the most of them | encode 2 to 4 times slower at 16; worse at n = 1 | drift blocks of 20 in the kernel 0.759 against 0.984; shuffled reports 0.770 against 0.906 (E199) |
 | `predict` (with `columns`): each column learns which of its line's first 4 cells determines it; a right guess is one byte | decode about 2 times slower; no gain in small blocks | drift 0.543 against 0.591; exports 0.448 against 0.483 (E200) |
+| `step` (with `predict`): a number column predicts its last value beside a key plus the step it took then | decode about a third slower (28 to 37 ms for 300 reports with xz) | drift 0.505 against 0.543; exports 0.436 against 0.448 (E204) |
 | `group`: the streams an encode adds are sorted by key | none measured (encode sorts once) | with row keys 4 to 8% smaller; best overall only on reports-random, 0.638 against 0.654 (E201) |
 | `ir::schema` thresholds (E202, read side, not a codec option): `min_rows` and `min_strength` for a dependency; blips on every dependency or only on those holding 97%+ | stricter: fewer columns covered | every dependency: drift 91% of covered errors found, 93% precision; 97%+: 98% and 94%, but covers 42 of 180 errors instead of 154 |
 | Query-friendly layout (E203): columns and numbers only (no `siblings`, `nearest`, `predict`), each part one kernel content | drift 0.819 of xz against 0.543 for the smallest IR | one column of 300 reports in 0.6 to 1.1 ms against 18 to 25 ms reading the files; random reports smaller than the solid pack (0.643) |

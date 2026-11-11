@@ -58,6 +58,11 @@ pub struct Options {
     /// appear, so the same column of every row sits together for the
     /// general compressor.
     pub group: bool,
+    /// E204 (with `predict`): a number column also learns, per earlier
+    /// cell of its line, the step its value took beside each of that cell's
+    /// values last time, so a counter or a steady trend (one more each run)
+    /// is predicted as one byte too.
+    pub step: bool,
 }
 
 /// An encoded set of files: the line skeletons, each file's lines and cell
@@ -447,7 +452,8 @@ fn parse_num(c: &[u8]) -> Option<Num> {
 // Tokens: 0 the previous value again; 1 a number with the previous
 // number's scale and format, as a delta; 2 a number with its format, scale
 // and delta; 3 a string seen before in this stream, by index; 4 a new
-// string; 5 (E200, `predict`) the value the column's predictor gives.
+// string; 5 (E200, `predict`) the value the column's predictor gives; 6
+// (E204, `step`) the number its step predictor gives.
 
 /// One earlier cell's map: each of its values to this column's value.
 type Predictor = HashMap<Vec<u8>, Vec<u8>>;
@@ -465,7 +471,14 @@ struct Stream {
     /// For each of the line's first `PREDICTORS` cells, by place: the value this
     /// column last had beside each of its values, and how often that held.
     pred: Vec<(Predictor, usize)>,
+    /// E204: for each of those cells, by place: the number this column last
+    /// had beside each of its values and the step it took then, and how
+    /// often the step repeated.
+    steps: Vec<(Steps, usize)>,
 }
+
+/// One earlier cell's values to this column's last number and step (E204).
+type Steps = HashMap<Vec<u8>, (Num, i128)>;
 
 impl Stream {
     /// The value the best-scoring earlier cell of the line maps to.
@@ -482,6 +495,54 @@ impl Stream {
             }
         }
         best.map(|b| b.1)
+    }
+
+    /// The last number beside the best-scoring earlier cell's value plus
+    /// the step it took then (E204).
+    fn stepped(&self, line: &[&[u8]]) -> Option<Num> {
+        let mut best: Option<(usize, Num)> = None;
+        for (j, cell) in line.iter().take(PREDICTORS).enumerate() {
+            let Some((map, hits)) = self.steps.get(j) else {
+                break;
+            };
+            if let Some(&(n, d)) = map.get(*cell)
+                && d != 0
+                && best.is_none_or(|b| *hits > b.0)
+            {
+                best = Some((*hits, Num { m: n.m + d, ..n }));
+            }
+        }
+        best.map(|b| b.1)
+    }
+
+    fn learn_steps(&mut self, line: &[&[u8]], v: &[u8]) {
+        let Some(n) = parse_num(v) else {
+            return;
+        };
+        let line = &line[..line.len().min(PREDICTORS)];
+        if self.steps.len() < line.len() {
+            self.steps.resize_with(line.len(), Default::default);
+        }
+        for (j, cell) in line.iter().enumerate() {
+            let (map, hits) = &mut self.steps[j];
+            match map.get_mut(*cell) {
+                Some((old, d)) => {
+                    let nd = if old.scale == n.scale && old.fmt == n.fmt {
+                        n.m - old.m
+                    } else {
+                        0
+                    };
+                    if nd != 0 && nd == *d {
+                        *hits += 1;
+                    }
+                    *old = n;
+                    *d = nd;
+                }
+                None => {
+                    map.insert(cell.to_vec(), (n, 0));
+                }
+            }
+        }
     }
 
     fn learn(&mut self, line: &[&[u8]], v: &[u8]) {
@@ -502,20 +563,31 @@ impl Stream {
     }
 
     /// `put` with the line's earlier cells, when the column predicts.
-    fn put_in(&mut self, c: &[u8], numbers: bool, line: Option<&[&[u8]]>) {
+    fn put_in(&mut self, c: &[u8], numbers: bool, line: Option<&[&[u8]]>, step: bool) {
         let Some(line) = line else {
             return self.put(c, numbers);
         };
-        if self.prev.as_deref() != Some(c) && self.predicted(line).map(Vec::as_slice) == Some(c) {
+        let fresh = self.prev.as_deref() != Some(c);
+        if fresh && self.predicted(line).map(Vec::as_slice) == Some(c) {
             self.out.push(5);
             if let Some(n) = parse_num(c).filter(|_| numbers) {
                 self.num = Some(n);
             }
             self.prev = Some(c.to_vec());
+        } else if let Some(n) = self
+            .stepped(line)
+            .filter(|n| step && fresh && render_num(*n) == c)
+        {
+            self.out.push(6);
+            self.num = Some(n);
+            self.prev = Some(c.to_vec());
         } else {
             self.put(c, numbers);
         }
         self.learn(line, c);
+        if step {
+            self.learn_steps(line, c);
+        }
     }
 
     /// `get` with the line's earlier cells, when the column predicts.
@@ -524,11 +596,21 @@ impl Stream {
         b: &[u8],
         at: &mut usize,
         line: Option<&[&[u8]]>,
+        step: bool,
     ) -> Result<Vec<u8>, Error> {
         let Some(line) = line else {
             return self.get(b, at);
         };
-        let v = if b.get(*at) == Some(&5) {
+        let v = if step && b.get(*at) == Some(&6) {
+            *at += 1;
+            let n = self
+                .stepped(line)
+                .ok_or(Error::Decode("ir: no step predicted"))?;
+            let v = render_num(n);
+            self.num = Some(n);
+            self.prev = Some(v.clone());
+            v
+        } else if b.get(*at) == Some(&5) {
             *at += 1;
             let v = self
                 .predicted(line)
@@ -543,6 +625,9 @@ impl Stream {
             self.get(b, at)?
         };
         self.learn(line, &v);
+        if step {
+            self.learn_steps(line, &v);
+        }
         Ok(v)
     }
 
@@ -728,7 +813,8 @@ fn encode_with(
         u8::from(o.columns)
             | u8::from(o.rows) << 1
             | u8::from(o.prose) << 2
-            | u8::from(o.predict && o.columns) << 3,
+            | u8::from(o.predict && o.columns) << 3
+            | u8::from(o.step && o.predict && o.columns) << 4,
     );
     put_var(&mut parts.files, files.len() as u128);
     for (fi, ((name, b), ls)) in files.iter().zip(lexed).enumerate() {
@@ -820,7 +906,7 @@ fn encode_with(
                 streams.push(Stream::default());
             }
             let line = (o.predict && o.columns).then(|| &cells[firsts[k]..k]);
-            streams[si].put_in(c, o.numbers, line);
+            streams[si].put_in(c, o.numbers, line, o.step && o.predict);
         }
         by_stem.entry(stem(name)).or_insert(fi);
         if o.nearest > 0 && !cells.is_empty() {
@@ -890,7 +976,7 @@ impl Cursor<'_> {
             .states
             .get_mut(i)
             .ok_or(Error::Decode("ir: no stream"))?;
-        st.get_in(&self.streams[i], &mut self.pos[i], line)
+        st.get_in(&self.streams[i], &mut self.pos[i], line, self.o.step)
     }
 }
 
@@ -924,6 +1010,7 @@ fn decode_with(
         rows: flags & 2 != 0,
         prose: flags & 4 != 0,
         predict: flags & 8 != 0,
+        step: flags & 16 != 0,
         ..Options::default()
     };
     let mut raw_at: usize = 0;
