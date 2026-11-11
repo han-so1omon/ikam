@@ -2851,3 +2851,21 @@ Newest last. Format and rules: `README.md`.
 - Result (xz -9 over the pack, against xz -9 over the files; without / with): with row keys, drift 0.591 / 0.545, reports-random 0.677 / 0.638, exports 0.661 / 0.632 (with siblings 0.483 / 0.452). Without row keys there are few streams and nothing moves. The best of all variants changes only on reports-random, 0.654 / **0.638**; drift (0.543), exports (0.448) and tables (0.926) stay with predict, which needs no row keys. Blocks of 20 in the kernel: no change (0.759, 0.786, 0.719 / 0.717, 0.998 / 1.000). Predict on top of row keys adds nothing: the row-key streams are already one row's history each.
 - Verdict: **measured, small**. Worth it only with row keys on data whose rows repeat in no order. Off by default.
 - Run: `cargo run --release --example ir_order` (under a minute).
+
+### E202 ir-schema (the columns read out as a schema, and the cells that break it)
+- Branch / parent: exp/202-ir-schema / E201 (stacked; needs only `ir::lex_lines` and `ir::segments`, so it could sit on E192 alone)
+- Question: `predict` (E200) learns which column of a line another follows from, only to save bytes. Read out over a folder, is that a usable schema, and does it find errors in the data?
+- Change: `ir::schema` (new module; nothing in the codec or the stored format changes). `dependencies(files, min_rows, min_strength)`: for each line template and slot, the slot of the same line it follows from best, counted in file order as the share of lines that repeat the value their key had last time (a key's first line counts as a miss, so a near-unique column is no key), kept when it holds on `min_strength` of them and explains at least half of the slot's changes from line to line. `events(files, deps)`: per key along each dependency, a value that differs from the one before and is back on the next line (a **blip**), one that differs and holds (a **change**), and a key with two values in one file (a **conflict**: two rows share what should be an id; each row is then followed by place).
+- Result, schema (min 20 lines, 90%): reports-drift 11 dependencies in 60 ms, and they read as the table's meaning: link determines lag, lead, status and (between monthly reruns) every number; reports-random 2 (lag and the header); exports 21 (the same in md, csv and json); tables 0 (too few rows). The history comes out with it: 914 changes in the drift reports (the monthly reruns' numbers, status changes). It found a real fault in the generated data: two links share the id `fares-to-occupancy-us` (12 conflicts in the exports, 4 in the drift reports).
+- Result, errors put in (60 random cells of lines with 2+ cells, each set to another value its column has elsewhere, 3 seeds; the schema read from the corrupted files):
+
+  | corpus | blips on | errors in such a column | found of those | blips flagged that were errors | false blips on the clean corpus |
+  | --- | --- | ---: | ---: | ---: | ---: |
+  | reports-drift | every dependency | 154 of 180 | 91% | 93% | 5 |
+  | reports-drift | dependencies holding 97%+ | 42 of 180 | 98% | 94% | 1 |
+  | exports | every dependency | 146 of 180 | 87% | 98% | 0 |
+  | exports | dependencies holding 97%+ | 14 of 180 | 100% | 100% | 0 |
+
+  The errors no dependency covers are in columns that change on every run (a run counter, the trial counts in the prose line). The 5 false blips on the clean drift reports are real: numbers that moved in one monthly rerun and came back to the same 3 decimals in the next (checked by hand), and one status that changed and changed back.
+- Verdict: **measured**. The IR's templates give a schema and a change history for free, and a blip finder that catches about 9 in 10 errors in the columns it covers with few false alarms. A read-side tool, nothing to switch on.
+- Run: `cargo run --release --example ir_schema` (a few seconds).

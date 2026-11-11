@@ -101,3 +101,52 @@ fn blocks_roundtrip_and_read_alone() {
         }
     }
 }
+
+/// E202: a column that follows from the id is read out, and a blip, a
+/// change and a conflict along it are found where they were put.
+#[test]
+fn schema_dependencies_and_events() {
+    use ikam_kernel::ir::schema::{self, Kind};
+    let regions = ["north", "south", "east", "west"];
+    let mut files = Vec::new();
+    for run in 0..30 {
+        let mut s = String::from("id,region,count\n");
+        for i in 0..8 {
+            let mut region = regions[i % 4];
+            if i == 3 && run == 12 {
+                region = "south"; // a blip: back to east next run
+            }
+            if i == 5 && run >= 20 {
+                region = "east"; // a change that holds
+            }
+            s += &format!("link-{i},{region},{}\n", run * 7 + i * 3);
+        }
+        if run == 25 {
+            s += "link-1,west,1\n"; // a second row for link-1, another region
+        }
+        files.push((format!("runs/r{run:02}.csv"), s.into_bytes()));
+    }
+    let deps = schema::dependencies(&files, 20, 0.9);
+    let region = deps
+        .iter()
+        .position(|d| d.from == 0 && d.to == 1)
+        .expect("region follows from id");
+    assert!(deps[region].strength() > 0.9);
+    assert!(
+        !deps.iter().any(|d| d.to == 2),
+        "count changes every run: no key"
+    );
+    let ev: Vec<_> = schema::events(&files, &deps)
+        .into_iter()
+        .filter(|e| e.dep == region)
+        .collect();
+    let at = |k: Kind| -> Vec<(usize, Vec<u8>)> {
+        ev.iter()
+            .filter(|e| e.kind == k)
+            .map(|e| (e.at.0, e.key.clone()))
+            .collect()
+    };
+    assert_eq!(at(Kind::Blip), vec![(12, b"link-3".to_vec())]);
+    assert_eq!(at(Kind::Change), vec![(20, b"link-5".to_vec())]);
+    assert_eq!(at(Kind::Conflict), vec![(25, b"link-1".to_vec())]);
+}

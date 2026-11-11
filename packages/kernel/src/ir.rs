@@ -25,6 +25,8 @@
 //! any options (`tests/ir.rs` checks this by property). The pack is
 //! uncompressed; a general compressor (xz, zstd) runs over it.
 
+pub mod schema;
+
 use std::collections::{HashMap, HashSet};
 
 use similar::{Algorithm, DiffOp, capture_diff_slices};
