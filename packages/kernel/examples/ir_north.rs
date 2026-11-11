@@ -58,7 +58,8 @@ fn main() {
             "north/cases",
             walk(&kernel.join("../../tests/fixtures/cases"), &|p| {
                 !p.to_string_lossy().contains("_image_tools")
-                    && p.extension().is_some_and(|e| keep_cases.iter().any(|k| e == *k))
+                    && p.extension()
+                        .is_some_and(|e| keep_cases.iter().any(|k| e == *k))
             }),
         ),
         (
