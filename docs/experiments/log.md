@@ -2898,3 +2898,22 @@ Newest last. Format and rules: `README.md`.
 - Result (xz -9 over the pack, against xz -9 over the files; best predict variant without / with step): reports-drift 0.543 / **0.505**; reports-random 0.654 / 0.643; exports 0.448 / **0.436**; tables 0.926 / 0.926. With row keys nothing changes (each row's stream already holds one counter, which xz sees). Decode of 300 drift reports with xz 28 ms to 37 ms. Blocks of 20 in the kernel with a keyframe and nearest 16: drift 0.734 / 0.713, random 0.767 / 0.763, exports 0.714 / 0.716.
 - Verdict: **measured**. 7% smaller drift reports and 3% smaller exports for a third more decode time; best IR on drift is now 0.505 of xz. Off by default.
 - Run: `cargo run --release --example ir_step` (about 5 minutes).
+
+### E205 ir-query-predict (queries on the smallest IR: predict and step on)
+- Branch / parent: exp/205-ir-query-predict / E204 (stacked)
+- Question: E203's query refused `predict`, whose cells follow from other columns, so a queryable store cost 0.819 of xz on drift against 0.505 for the smallest IR. A predicted cell only follows from the first 4 cells of its own line, and those streams learn only from their own lines. Can the query decode just those columns, line by line, and keep the size?
+- Change: `ir::query` takes `predict` and `step`: a read of slot k decodes slots 0 to min(k, 4) - 1 and k of that skeleton's lines, in file order, each with its stream's own state (and with row keys, only the rows asked for in `row`). Without `predict` and row keys it decodes the one stream straight through, as in E203. `siblings` and `nearest` are still refused (copied cells are in no stream). The test checks every column and one row of every option set the query takes against the files, on the edge-case sample and on runs where the predict and step tokens occur.
+- Result (300 reports, IR parts in the kernel, each answer checked; stored against xz -9 over the files; the three E203 questions):
+
+  | corpus, layout | stored | every status | one link's status | dev q under 0.05 | streams read |
+  | --- | ---: | ---: | ---: | ---: | ---: |
+  | drift, files in the kernel | 1.641 | 17.3 ms | 17.3 ms | 17.3 ms | all files |
+  | drift, columns and numbers | 0.819 | 0.7 ms | 1.1 ms | 1.0 ms | 1 / 2 / 1 of 23 |
+  | drift, + predict | 0.587 | 11.3 ms | 10.5 ms | 10.8 ms | 5 / 5 / 5 of 23 |
+  | drift, + predict + step | **0.548** | 13.4 ms | 13.4 ms | 14.7 ms | 5 / 5 / 5 of 23 |
+  | random, columns and numbers | 0.643 | 0.8 ms | 1.2 ms | 1.2 ms | 1 / 2 / 1 of 23 |
+  | random, + predict + step | **0.619** | 13.2 ms | 13.4 ms | 15.1 ms | 5 / 5 / 5 of 23 |
+
+  The smallest IR overall (predict, step, siblings, nearest; not queryable) is 0.505 of xz on drift and 0.643 on random: with predict and step, a queryable store costs 1.08 of it on drift and 0.96 on random. The query then reads 5 of 23 streams, and the time goes to the predictors learning on every cell (a full decode of all 300 reports takes 25 to 36 ms in memory with them, 13 ms without), not to the reads.
+- Verdict: **measured**. A store can now be both nearly the smallest and queryable: 0.548 of xz with column queries in about 13 ms (1.3 times faster than reading the files), or 0.819 with queries in about 1 ms. The predictors' speed is the next thing to fix. Row-key layouts go through the line-by-line path and are slower than in E203 (2 to 3.5 ms); they lose on size anyway.
+- Run: `cargo run --release --example ir_query` (about a minute).

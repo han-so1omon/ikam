@@ -17,9 +17,12 @@
 //!   archive weight; `ir::query` reads the files part and the streams the
 //!   question needs.
 //!
-//! The query needs every cell in its stream, so `siblings`, `nearest` and
-//! `predict` are off; the size each layout costs is given against xz -9
-//! over the files, and against the smallest IR without that limit (E200).
+//! The query needs every cell in its file's own streams, so `siblings` and
+//! `nearest` are off. E205 adds `predict` and `step`: a column then follows
+//! from its line's first cells, and the query decodes those columns too.
+//! The size each layout costs is given against xz -9 over the files, and
+//! against the smallest IR without that limit (predict and step with
+//! siblings and nearest 16).
 
 mod ir_common;
 
@@ -91,17 +94,39 @@ fn main() {
     for name in ["reports-drift", "reports-random"] {
         let files = corpus(name);
         let base = xz(&solid(&files)).len() as f64;
-        let best_any = xz(&ir::pack(&ir::encode(
-            &files,
-            Options {
-                predict: true,
-                rows: false,
-                nearest: 16,
-                ..ALL
-            },
-        )))
-        .len() as f64;
-        for (oname, o) in [("columns+numbers", TCN), ("+row keys", TCNR)] {
+        let best_any = [0, 16]
+            .map(|nearest| {
+                xz(&ir::pack(&ir::encode(
+                    &files,
+                    Options {
+                        predict: true,
+                        step: true,
+                        rows: false,
+                        nearest,
+                        ..ALL
+                    },
+                )))
+                .len()
+            })
+            .into_iter()
+            .min()
+            .unwrap() as f64;
+        let predict = Options {
+            predict: true,
+            ..TCN
+        };
+        for (oname, o) in [
+            ("columns+numbers", TCN),
+            ("+row keys", TCNR),
+            ("+predict", predict),
+            (
+                "+predict+step",
+                Options {
+                    step: true,
+                    ..predict
+                },
+            ),
+        ] {
             let parts = ir::encode(&files, o);
             // the table: the skeleton with 10+ slots and the most lines
             let ix = query::index(&parts, &parts.skeletons).unwrap();

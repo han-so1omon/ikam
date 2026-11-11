@@ -160,12 +160,31 @@ fn schema_dependencies_and_events() {
     assert_eq!(at(Kind::Conflict), vec![(25, b"link-1".to_vec())]);
 }
 
-/// E203: a column read from its stream alone equals the column read from the
+/// E203, E205: a column read from its stream alone (and with `predict`, the
+/// streams of the line's first cells) equals the column read from the
 /// files, for every option set the query takes; the others are refused.
 #[test]
 fn query_column_and_row_match_the_files() {
+    query_matches(&sample());
+    // runs where columns follow from the id and a counter steps, so the
+    // predict and step tokens are read too
+    let mut runs = Vec::new();
+    for run in 0..12 {
+        let mut s = String::from("id,region,count,n\n");
+        for i in 0..6 {
+            if (run + i) % 5 == 0 {
+                continue;
+            }
+            let region = ["north", "south", "east"][i % 3];
+            s += &format!("link-{i},{region},{},{}.5\n", run * 2 + i, run * 7 + i);
+        }
+        runs.push((format!("runs/r{run:02}.csv"), s.into_bytes()));
+    }
+    query_matches(&runs);
+}
+
+fn query_matches(files: &[(String, Vec<u8>)]) {
     use ikam_kernel::ir::query;
-    let files = sample();
     // the truth, from the files
     type Column = Vec<((usize, usize), Vec<u8>)>;
     let mut truth: std::collections::HashMap<(Vec<u8>, usize), Column> = Default::default();
@@ -180,9 +199,9 @@ fn query_column_and_row_match_the_files() {
         }
     }
     for o in all_options() {
-        let parts = ir::encode(&files, o);
+        let parts = ir::encode(files, o);
         let ix = query::index(&parts, &parts.skeletons);
-        if !o.columns || o.siblings || o.nearest > 0 || o.predict {
+        if !o.columns || o.siblings || o.nearest > 0 {
             // refused, unless nothing was copied or predicted after all
             if !o.columns {
                 assert!(ix.is_err(), "{o:?}");

@@ -305,7 +305,7 @@ Renderers and indexes outside the kernel (scripts and examples; no switch):
 | a word index (postings lists) in the same view | 35 to 60 times the bytes written per edit and 3.5 times the storage, for a fast first query after a restart | 29 ms reading 30 KB against 548 ms reading 5.2 MB at 18,000 fragments (E187, E189); bucketed lists do not write less (E191) |
 
 
-## IR codec options (E192 to E204)
+## IR codec options (E192 to E205)
 
 `ikam_kernel::ir::Options`, all off by default; nothing in put or repack uses the codec. `decode(encode(files, o))` is byte-exact for any bytes and options (`tests/ir.rs`).
 
@@ -326,3 +326,4 @@ Renderers and indexes outside the kernel (scripts and examples; no switch):
 | `group`: the streams an encode adds are sorted by key | none measured (encode sorts once) | with row keys 4 to 8% smaller; best overall only on reports-random, 0.638 against 0.654 (E201) |
 | `ir::schema` thresholds (E202, read side, not a codec option): `min_rows` and `min_strength` for a dependency; blips on every dependency or only on those holding 97%+ | stricter: fewer columns covered | every dependency: drift 91% of covered errors found, 93% precision; 97%+: 98% and 94%, but covers 42 of 180 errors instead of 154 |
 | Query-friendly layout (E203): columns and numbers only (no `siblings`, `nearest`, `predict`), each part one kernel content | drift 0.819 of xz against 0.543 for the smallest IR | one column of 300 reports in 0.6 to 1.1 ms against 18 to 25 ms reading the files; random reports smaller than the solid pack (0.643) |
+| Query-friendly layout with `predict` and `step` (E205): siblings and nearest off, each part one kernel content | column queries about 13 ms instead of 1 ms (the predictors learn on every cell) | drift 0.548 of xz against 0.819; random 0.619 against 0.643 |

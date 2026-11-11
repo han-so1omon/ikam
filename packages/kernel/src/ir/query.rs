@@ -9,12 +9,14 @@
 //! files is the key column's stream and that row's stream.
 //!
 //! This needs the cells in their streams: an encode with `siblings` or
-//! `nearest` (cells copied from another file) or `predict` (cells that
-//! follow from other columns) is refused with an error.
+//! `nearest` (cells copied from another file) is refused with an error.
+//! With `predict` (and `step`), a cell follows from the first cells of its
+//! line (E200, E204), so those columns are decoded too, line by line, and
+//! no others (E205).
 
 use std::collections::HashMap;
 
-use super::{Error, Parts, Stream, directory, get_bytes, get_usize};
+use super::{Error, PREDICTORS, Parts, Stream, directory, get_bytes, get_usize};
 
 /// A place in the files: file index, line index within the file.
 pub type Place = (usize, usize);
@@ -27,6 +29,8 @@ pub struct Index {
     pub lines: Vec<Vec<usize>>,
     columns: bool,
     rows: bool,
+    predict: bool,
+    step: bool,
     /// Stream index by key (skeleton, slot, row key).
     streams: HashMap<(usize, usize, Vec<u8>), usize>,
     /// Cells per skeleton (its slots).
@@ -61,11 +65,6 @@ impl Index {
 pub fn index(parts: &Parts, skeletons: &[Vec<u8>]) -> Result<Index, Error> {
     let f = &parts.files;
     let flags = *f.first().ok_or(Error::Decode("ir: empty"))?;
-    if flags & 8 != 0 {
-        return Err(Error::Decode(
-            "ir query: cells predicted from other columns",
-        ));
-    }
     let slots = skeletons
         .iter()
         .map(|s| super::segments(s).map(|g| g.len() - 1))
@@ -73,6 +72,8 @@ pub fn index(parts: &Parts, skeletons: &[Vec<u8>]) -> Result<Index, Error> {
     let mut ix = Index {
         columns: flags & 1 != 0,
         rows: flags & 2 != 0,
+        predict: flags & 8 != 0,
+        step: flags & 16 != 0,
         slots,
         ..Index::default()
     };
@@ -113,21 +114,127 @@ pub fn index(parts: &Parts, skeletons: &[Vec<u8>]) -> Result<Index, Error> {
     Ok(ix)
 }
 
-/// A stream's values, decoded on their own.
-fn values(b: &[u8]) -> Result<Vec<Vec<u8>>, Error> {
-    let (mut s, mut at, mut out) = (Stream::default(), 0, Vec::new());
-    while at < b.len() {
-        out.push(s.get(b, &mut at)?);
+/// Gives the bytes of stream `i` (from memory, or from storage).
+pub type Fetch<'a> = dyn FnMut(usize) -> Result<Vec<u8>, Error> + 'a;
+
+/// One stream being decoded: its state and where it is.
+struct Open {
+    bytes: Vec<u8>,
+    at: usize,
+    state: Stream,
+}
+
+/// The cells in `want` (sorted, and closed under what they follow from) of
+/// every line with skeleton `skeleton`, decoded line by line. With `rows`
+/// and `only`, the lines with another row key are skipped (their streams
+/// are their own).
+fn lines_of(
+    ix: &Index,
+    skeleton: usize,
+    want: &[usize],
+    only: Option<&[u8]>,
+    fetch: &mut Fetch,
+) -> Result<Vec<(Place, Vec<Vec<u8>>)>, Error> {
+    let places = ix.places(skeleton);
+    if !ix.predict && !ix.rows {
+        // each column on its own: decode each stream straight through
+        let mut cols = Vec::with_capacity(want.len());
+        for &slot in want {
+            let si = *ix
+                .streams
+                .get(&(skeleton, slot, Vec::new()))
+                .ok_or(Error::Decode("ir query: no stream"))?;
+            let b = fetch(si)?;
+            let (mut st, mut at, mut vs) = (Stream::default(), 0, Vec::with_capacity(places.len()));
+            while at < b.len() {
+                vs.push(st.get(&b, &mut at)?);
+            }
+            if vs.len() != places.len() {
+                return Err(Error::Decode("ir query: stream length"));
+            }
+            cols.push(vs.into_iter());
+        }
+        return Ok(places
+            .into_iter()
+            .map(|p| (p, cols.iter_mut().map(|c| c.next().unwrap()).collect()))
+            .collect());
+    }
+    let mut open: HashMap<(usize, Vec<u8>), Open> = HashMap::new();
+    let mut out = Vec::new();
+    for at in places {
+        let mut cells: Vec<Vec<u8>> = Vec::with_capacity(want.len());
+        let mut skip = false;
+        for (wi, &slot) in want.iter().enumerate() {
+            let row = if ix.rows && slot > 0 {
+                // slot 0 comes first in `want` whenever rows are on
+                cells[0].clone()
+            } else {
+                Vec::new()
+            };
+            if wi == 1
+                && ix.rows
+                && let Some(k) = only
+                && cells[0] != k
+            {
+                skip = true;
+                break;
+            }
+            let key = (slot, row);
+            if !open.contains_key(&key) {
+                let si = *ix
+                    .streams
+                    .get(&(skeleton, key.0, key.1.clone()))
+                    .ok_or(Error::Decode("ir query: no stream"))?;
+                let bytes = fetch(si)?;
+                open.insert(
+                    key.clone(),
+                    Open {
+                        bytes,
+                        at: 0,
+                        state: Stream::default(),
+                    },
+                );
+            }
+            let o = open.get_mut(&key).unwrap();
+            let line: Vec<&[u8]> = cells
+                .iter()
+                .take(wi.min(PREDICTORS))
+                .map(Vec::as_slice)
+                .collect();
+            let v = o.state.get_in(
+                &o.bytes,
+                &mut o.at,
+                ix.predict.then_some(&line[..]),
+                ix.step,
+            )?;
+            cells.push(v);
+        }
+        if !skip {
+            out.push((at, cells));
+        }
     }
     Ok(out)
 }
 
-/// Gives the bytes of stream `i` (from memory, or from storage).
-pub type Fetch<'a> = dyn FnMut(usize) -> Result<Vec<u8>, Error> + 'a;
+/// The slots a read of `slot` decodes: with `predict`, the line's first
+/// cells it may follow from; with `rows`, the row key.
+fn closure(ix: &Index, slot: usize) -> Vec<usize> {
+    let mut want: Vec<usize> = if ix.predict {
+        (0..slot.min(PREDICTORS)).collect()
+    } else {
+        Vec::new()
+    };
+    if ix.rows && slot > 0 && want.first() != Some(&0) {
+        want.insert(0, 0);
+    }
+    want.push(slot);
+    want
+}
 
 /// The value of column (`skeleton`, `slot`) on every line that has it, with
 /// its place. Reads the column's stream (and with `rows`, the key column's
-/// and every row's stream of this column).
+/// and every row's stream of this column; with `predict`, the streams of
+/// the line's first cells).
 pub fn column(
     ix: &Index,
     skeleton: usize,
@@ -137,40 +244,15 @@ pub fn column(
     if ix.slots.get(skeleton).is_none_or(|&n| slot >= n) {
         return Err(Error::Decode("ir query: no such column"));
     }
-    let places = ix.places(skeleton);
-    if !ix.rows || slot == 0 {
-        let Some(&si) = ix.streams.get(&(skeleton, slot, Vec::new())) else {
-            return Ok(Vec::new());
-        };
-        let vs = values(&fetch(si)?)?;
-        if vs.len() != places.len() {
-            return Err(Error::Decode("ir query: stream length"));
-        }
-        return Ok(places.into_iter().zip(vs).collect());
-    }
-    let keys = column(ix, skeleton, 0, fetch)?;
-    let mut per: HashMap<Vec<u8>, std::vec::IntoIter<Vec<u8>>> = HashMap::new();
-    let mut out = Vec::with_capacity(keys.len());
-    for (place, k) in keys {
-        if !per.contains_key(&k) {
-            let si = *ix
-                .streams
-                .get(&(skeleton, slot, k.clone()))
-                .ok_or(Error::Decode("ir query: no stream"))?;
-            per.insert(k.clone(), values(&fetch(si)?)?.into_iter());
-        }
-        let v = per
-            .get_mut(&k)
-            .and_then(Iterator::next)
-            .ok_or(Error::Decode("ir query: stream length"))?;
-        out.push((place, v));
-    }
-    Ok(out)
+    Ok(lines_of(ix, skeleton, &closure(ix, slot), None, fetch)?
+        .into_iter()
+        .map(|(p, mut c)| (p, c.pop().unwrap()))
+        .collect())
 }
 
 /// Column (`skeleton`, `slot`) on the lines whose first cell is `key`: one
 /// row's history across the files. With `rows` this reads the key column's
-/// stream and that row's stream only.
+/// stream and that row's streams only.
 pub fn row(
     ix: &Index,
     skeleton: usize,
@@ -178,29 +260,16 @@ pub fn row(
     key: &[u8],
     fetch: &mut Fetch,
 ) -> Result<Vec<(Place, Vec<u8>)>, Error> {
-    let keys = column(ix, skeleton, 0, fetch)?;
-    let mine: Vec<Place> = keys
-        .iter()
-        .filter(|(_, k)| k == key)
-        .map(|(p, _)| *p)
-        .collect();
-    if slot == 0 {
-        return Ok(mine.into_iter().map(|p| (p, key.to_vec())).collect());
+    if ix.slots.get(skeleton).is_none_or(|&n| slot >= n) {
+        return Err(Error::Decode("ir query: no such column"));
     }
-    if !ix.rows {
-        return Ok(column(ix, skeleton, slot, fetch)?
-            .into_iter()
-            .zip(&keys)
-            .filter(|(_, (_, k))| k == key)
-            .map(|(x, _)| x)
-            .collect());
+    let mut want = closure(ix, slot);
+    if want[0] != 0 {
+        want.insert(0, 0);
     }
-    let Some(&si) = ix.streams.get(&(skeleton, slot, key.to_vec())) else {
-        return Ok(Vec::new());
-    };
-    let vs = values(&fetch(si)?)?;
-    if vs.len() != mine.len() {
-        return Err(Error::Decode("ir query: stream length"));
-    }
-    Ok(mine.into_iter().zip(vs).collect())
+    Ok(lines_of(ix, skeleton, &want, Some(key), fetch)?
+        .into_iter()
+        .filter(|(_, c)| c[0] == key)
+        .map(|(p, mut c)| (p, c.pop().unwrap()))
+        .collect())
 }
