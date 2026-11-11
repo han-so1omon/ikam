@@ -3326,3 +3326,7 @@ Newest last. Format and rules: `README.md`.
 - Verdict: **kept** as an option, off by default, as E144 left it. What remains at 3,000 files (about 3 ms) is re-encoding and slicing the folder's whole tree; making that proportional to the change needs a tree split into chunks, a format change not tried here.
 
 Gates on the branch: every kernel test suite passes (release); clippy `-D warnings` and fmt clean; the bench gives the same byte and count fields as main 1c5efb9 run on the same machine (only times and peak memory differ), north 0.3035, cost score 0.2456 (main 0.2486, from timings).
+
+### Merge of E226 to E228 into main (Nov 11)
+- On Eric's word ("Merge it"), exp/226-commit-cost (c0d333c) fast-forwarded onto main 1c5efb9. `FsStore::open` is unchanged and stays the default; `FsStore::open_deferred`, `ikam live --deferred-sync` and `ikam live --no-object-templates` are off unless asked for.
+- Gates, run on c0d333c before the merge (main had not moved): every kernel test suite passes (release); clippy `-D warnings` and fmt clean; the bench gives the same byte and count fields as main 1c5efb9 on the same machine (only times and peak memory differ), north 0.3035.
