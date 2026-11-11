@@ -2781,3 +2781,7 @@ Newest last. Format and rules: `README.md`.
 - Verdict: **measured**. The IR turns text into addressable facts: column reads, aggregates and consistency checks without parsing reports, a layout edit as one object, and ingest-time checks for layout drift and impossible values.
 - Gates (E192 to E196): 191 kernel tests pass (2 new in `tests/ir.rs`, 1 unit test); clippy `-D warnings` and `cargo fmt --check` clean on all targets; the fixed bench matches main (17589ee) in every byte count, read cost, proxy score and the north score (0.3035); cost score 0.2404 against 0.2398, from timings only.
 - Real reports: `cargo run --release --example ir_compress dir:<folder>` runs the size table over any folder and prints only sizes and times.
+
+### Merge of E192 to E196 into main (Nov 11)
+- On Eric's word ("Merge it"), exp/192-ir-compression merged onto main 17589ee as f46d252 (the merge tree is the branch tree). Every IR option is off: nothing in put, repack or the bench calls `ir`; it is a module an application or an experiment chooses.
+- Gates on the merge: 191 kernel tests pass; clippy `-D warnings` and fmt clean; the fixed bench gives the same 147 byte and count fields as main's last two runs (E186, E190) and north 0.3035.
