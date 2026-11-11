@@ -2869,3 +2869,24 @@ Newest last. Format and rules: `README.md`.
   The errors no dependency covers are in columns that change on every run (a run counter, the trial counts in the prose line). The 5 false blips on the clean drift reports are real: numbers that moved in one monthly rerun and came back to the same 3 decimals in the next (checked by hand), and one status that changed and changed back.
 - Verdict: **measured**. The IR's templates give a schema and a change history for free, and a blip finder that catches about 9 in 10 errors in the columns it covers with few false alarms. A read-side tool, nothing to switch on.
 - Run: `cargo run --release --example ir_schema` (a few seconds).
+
+### E203 ir-query (one column of every report without rebuilding the reports)
+- Branch / parent: exp/203-ir-query / E202 (stacked; uses only E192's format, so it could sit on main alone)
+- Question: the IR already keeps each column in a stream of its own. Can a question about one column ("every row's status", "one link's status in every report", "rows with dev q under 0.05") be answered from that stream and the files part alone, and how fast against reading and splitting the files?
+- Change: `ir::query` (new module; nothing in the codec or stored format changes). `index(parts, skeletons)` reads the files part and the directory only: which skeleton each line of each file has. `column(ix, skeleton, slot, fetch)` decodes that column's stream and pairs each value with its file and line; `row(ix, skeleton, slot, key, fetch)` gives one row's values across files (with row keys, the key column's stream and that row's stream). `fetch` gives a stream's bytes by index, so a store can hand over only the streams asked for. An encode with `siblings`, `nearest` or `predict` is refused: their cells are not all in their own column's stream.
+- Result (300 reports; best of 7; each answer checked equal to the one from the files; stored size against xz -9 over the files):
+
+  | corpus, layout | stored | every status | one link's status | dev q under 0.05 | streams read |
+  | --- | ---: | ---: | ---: | ---: | ---: |
+  | drift, files in the kernel | 1.641 | 17.9 ms | 17.9 ms | 17.9 ms | all files |
+  | drift, solid IR (columns, numbers), decoded | 0.767 | 24.8 ms | 24.8 ms | 24.8 ms | all |
+  | drift, same bytes, `ir::query` | 0.767 | 1.5 ms | 1.9 ms | 1.8 ms | all decompressed |
+  | drift, IR parts in the kernel (columns, numbers) | 0.819 | **0.6 ms** | **1.1 ms** | **1.0 ms** | 1 / 2 / 1 of 23 |
+  | drift, IR parts in the kernel, row keys | 1.293 | 1.8 ms | 1.1 ms | 2.2 ms | 26 / 2 / 26 of 1,853 |
+  | random, files in the kernel | 1.315 | 25.0 ms | 25.0 ms | 25.0 ms | all files |
+  | random, solid IR (columns, numbers), decoded | 0.669 | 25.2 ms | 25.2 ms | 25.2 ms | all |
+  | random, IR parts in the kernel (columns, numbers) | **0.643** | **0.6 ms** | **1.1 ms** | **1.0 ms** | 1 / 2 / 1 of 23 |
+
+  The smallest IR without the query's limits (predict, nearest, siblings) is 0.543 of xz on drift: the query costs 1.4 times that there, and nothing on random reports, where the parts in the kernel are smaller than the solid pack (the kernel's own deltas and dictionaries across 23 streams beat one xz window). Row keys make 1,853 small streams, which cost size in the kernel and buy nothing here.
+- Verdict: **measured**. Columns and numbers, stored as one kernel content per part, answer a column question in about 1 ms, 18 to 25 times faster than reading the files, at 0.64 to 0.82 of xz. A read-side module; which layout to store is a choice of options already there. Not wired into the store or `serve` yet.
+- Run: `cargo run --release --example ir_query` (about a minute).

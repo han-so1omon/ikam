@@ -150,3 +150,69 @@ fn schema_dependencies_and_events() {
     assert_eq!(at(Kind::Change), vec![(20, b"link-5".to_vec())]);
     assert_eq!(at(Kind::Conflict), vec![(25, b"link-1".to_vec())]);
 }
+
+/// E203: a column read from its stream alone equals the column read from the
+/// files, for every option set the query takes; the others are refused.
+#[test]
+fn query_column_and_row_match_the_files() {
+    use ikam_kernel::ir::query;
+    let files = sample();
+    // the truth, from the files
+    type Column = Vec<((usize, usize), Vec<u8>)>;
+    let mut truth: std::collections::HashMap<(Vec<u8>, usize), Column> = Default::default();
+    for (fi, (n, b)) in files.iter().enumerate() {
+        for (li, (sk, cells)) in ir::lex_lines(n, b).into_iter().enumerate() {
+            for (k, c) in cells.into_iter().enumerate() {
+                truth
+                    .entry((sk.clone(), k))
+                    .or_default()
+                    .push(((fi, li), c));
+            }
+        }
+    }
+    for o in all_options() {
+        let parts = ir::encode(&files, o);
+        let ix = query::index(&parts, &parts.skeletons);
+        if !o.columns || o.siblings || o.nearest > 0 || o.predict {
+            // refused, unless nothing was copied or predicted after all
+            if !o.columns {
+                assert!(ix.is_err(), "{o:?}");
+            }
+            continue;
+        }
+        if o.prose && ix.is_err() {
+            panic!("{o:?}: {:?}", ix.err());
+        }
+        let ix = ix.unwrap();
+        let mut fetch = |i: usize| Ok(parts.streams[i].clone());
+        for (id, sk) in parts.skeletons.iter().enumerate() {
+            let slots = ir::segments(sk).unwrap().len() - 1;
+            for k in 0..slots {
+                let mut want = truth.get(&(sk.clone(), k)).cloned().unwrap_or_default();
+                // files stored as they are have no lines in the index
+                want.retain(|(p, _)| !ix.lines[p.0].is_empty());
+                let got = query::column(&ix, id, k, &mut fetch).unwrap();
+                assert_eq!(got, want, "{o:?} skeleton {id} slot {k}");
+                if let Some((_, key)) = want.first().map(|(p, _)| {
+                    (
+                        p,
+                        truth[&(sk.clone(), 0)]
+                            .iter()
+                            .find(|x| x.0 == *p)
+                            .unwrap()
+                            .1
+                            .clone(),
+                    )
+                }) {
+                    let keys = &truth[&(sk.clone(), 0)];
+                    let mine: Vec<_> = want
+                        .iter()
+                        .filter(|(p, _)| keys.iter().any(|x| x.0 == *p && x.1 == key))
+                        .cloned()
+                        .collect();
+                    assert_eq!(query::row(&ix, id, k, &key, &mut fetch).unwrap(), mine);
+                }
+            }
+        }
+    }
+}
