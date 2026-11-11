@@ -2642,6 +2642,45 @@ Newest last. Format and rules: `README.md`.
 - Gates: 187 kernel tests, 195 with the store features; clippy clean with and without them; fmt clean; the bench is unchanged (the kernel is unchanged).
 - Verdict: **kept** as a fix, on exp/185-churn-all-packs until Eric says to merge. The Mac reruns `churn packs-filter` at 1M once Remote Control is back.
 
+### E186 stored-summaries (per-fragment summaries stored as derivations beside the fragments)
+- Branch / parent: exp/186-stored-summaries / main (a890aa6, E182 to E184)
+- Question: E182 kept summaries in memory, so a restart rebuilds them from every fragment. Stored as derivations beside the fragments, do they survive restarts, gc and crashes exactly, and what do they cost to keep against eager in-memory and lazy summaries?
+- Change: none in the kernel. `functions/summary/` is a no_std WASM summary function (8,375 bytes; words of three or more alphanumerics, dollar amounts, dates, headings and list items, ported from E182's `Summary::of`), output as LEB128 varints. It equals the native summary on all 2,008 blocks of the corpus (280 ms for all). `examples/stored_summaries.rs`: each fragment's summary is `repo.apply(summary.wasm, fragment)`, recorded in the ledger; a view graph labels `f/<fragment>` to its summary; each commit's tree is `files` plus `summaries`, so one ref swap moves both and gc keeps live summaries. Summaries are keyed by content id, so they can be missing but never stale. `examples/common/insights.rs` holds the corpus and edit code shared with `fragment_insights.rs` (whose output is unchanged). Modes: memory (E182's cache), stored (WASM derivations), native (the same summary bytes put as plain content, no derivation), and stored with postings (E187). Every write mode turns on `needed_index`, an empty seed scope with `replace_hints`, and `read_memo` after the corpus is stored. The corpus is E182's: 407 files, 214,129 bytes, 675 fragments; 22 edits; FsStore, PackStore and MemStore.
+- Result:
+  - Exact: after every one of the 22 edits, the view names exactly the head's fragments and every summary equals the native function's bytes, in every mode and store; then gc (2 objects deleted, view intact), fsck and fsck deep clean, and again after a restart.
+  - Upkeep over 22 edits, MemStore: memory 1.56 ms; stored 50.6 ms (2.3 ms per edit); native 45.4 ms. PackStore: 1.36, 56 and 44 ms. FsStore: 2, 200 and 216 ms (one fsync per object).
+  - Written beyond memory over 22 edits: stored 62,993 bytes, native 61,774. Store at the end: memory 226,727 bytes, stored 447,490, native 406,279 (a summary holds every word, so summaries are about as big as the text).
+  - First goal query after a restart (FsStore): memory rebuilds, 25 ms reading 120 KB; stored scans summaries, 21 ms reading 163 KB. Warm queries are the same in every mode (0.35 to 0.9 ms).
+  - Before `needed_index`, view upkeep read 4.2 MB over 22 edits: `is_needed` scans the whole store for each replaced chunk. With it, 367 KB.
+- Verdict: **measured**. Stored summaries are exact through edits, gc and restart, and checkable (each is a recorded derivation of a pure function). WASM costs about what native does. Without an index they do not make queries faster: a summary scan reads as much as rebuilding.
+
+### E187 summary-postings (a word index stored in the view)
+- Branch / parent: exp/186-stored-summaries / E186
+- Question: a goal query asks which fragments hold a word. Stored next to the summaries, how much does a word index save on the first query after a restart, and what does keeping it cost per edit?
+- Change: none in the kernel. In `examples/stored_summaries.rs`, two layouts in the same view graph: lists (`w/<word>` to content holding the sorted fragment ids) and node postings (`w/<word>/<fragment>`, one node per pair, no content). Checked equal to the summaries' words after every edit.
+- Result (22 edits): exact in every store. First goal query after a restart: lists 0.73 ms reading 21 KB, node postings 1.24 ms reading 36 KB, against 21 to 25 ms and 120 to 163 KB. Upkeep: lists 319 ms on MemStore, 494 on PackStore, 1,676 on FsStore; node postings 490, 599 and 1,842. Written beyond memory: lists 514 to 518 KB, node postings 558,818 bytes, against 63 KB without postings. Store: about 1.26 and 1.23 MB.
+- Verdict: **measured**. Postings make a cold query about 30 times cheaper and an edit about 8 times dearer in bytes written. Lists beat node postings on both counts.
+
+### E188 summaries-kill (kills during view upkeep)
+- Branch / parent: exp/186-stored-summaries / E187
+- Question: the files and the view move in one ref swap. Does a kill at any point leave a head whose view matches its files?
+- Change: none in the kernel. `stored_summaries crash`: a child builds the corpus and loops edits with list postings, committing after each; the parent kills it after 150 to 1,050 ms (fixed seed), reopens, and checks fsck and the full view check on the head.
+- Result: FsStore 30 kills, 22 heads checked (8 kills came before the first commit), 57 edits committed; PackStore 30 kills, 30 heads, 51 edits. Every head exact, fsck clean.
+- Verdict: **measured**. One commit carries files and summaries, so there is no window where they disagree.
+
+### E189 summaries-scale (stored summaries at 4,500 and 18,000 fragments)
+- Branch / parent: exp/186-stored-summaries / E188
+- Question: at E186's size every mode is fast. How do upkeep, opening, the first query and storage grow with the corpus?
+- Change: none in the kernel. `stored_summaries scale N`: a synthetic corpus (N files of 8 paragraphs from a 20,000-word skewed vocabulary, dollar amounts in a third of paragraphs, a date in a fifth) on PackStore; build, 20 single-file edits (p50 and max), restart (open, ledger load timed apart), first goal query, store bytes.
+- Result:
+  - 500 files (1.2 MB, 4,500 fragments), upkeep p50: memory 0.97 ms, native 2.96 ms, stored 3.86 ms (24 KB read, 2.1 KB written), list postings 38 ms (452 KB read, 71 KB written).
+  - 2,000 files (4.8 MB, 18,000 fragments): memory 1.0 ms, native 7.7 ms, stored 7.1 ms (30 KB read, 2.2 KB written), postings 50 to 68 ms (712 KB read, 122 to 135 KB written).
+  - First query after a restart at 2,000 files: memory 472 ms reading 3.2 MB; stored 548 ms reading 5.2 MB; postings 29 to 39 ms reading 30 KB.
+  - Store at 2,000 files: memory 3.6 MB, native 8.7 MB, stored 9.7 MB, postings 34.1 MB.
+  - The first run found PackStore opens slow with many short derivation records: the ledger load took 142, 333, 1,069 and 4,251 ms at 500 files (memory, native, stored, postings). That is E190; with it, 11, 19, 36 and 93 ms.
+  - The first edit that drops a fragment builds `needed_index` (one pass over the store, up to 9.6 MB read); the p50 leaves it out.
+- Verdict: **measured**. Stored summaries cost about 7 ms and 2 KB per edit at 18,000 fragments, but save nothing on queries without an index. Postings make the first query 12 to 16 times faster and cost 35 to 60 times the bytes per edit and 3.5 times the storage.
+
 ### E190 pack-prefix (prefix lookups in the open pack without a scan)
 - Branch / parent: exp/190-pack-prefix / main (a890aa6)
 - Finding: E189 (exp/186-stored-summaries) opened a PackStore of 38,862 objects, most of them short derivation records, in 4.25 s of ledger load. The ledger resolves each short record's abbreviated ids through `ids_with_prefix`, and PackStore answered that for the open pack by scanning its whole index, so the load was quadratic in the open pack. Writing a short record runs the same lookup.
@@ -2651,3 +2690,17 @@ Newest last. Format and rules: `README.md`.
   - Store level at 200,000 objects (`stores build` and `probe`, packs, two runs each): build 0.3 s, open 30 to 32 ms, point read p50 1.1 to 1.3 us, missing p50 0.1 us; main 0.3 s, 33 to 42 ms, 1.1 to 1.2 us and 0.1 us. A first version that made the open pack's index a BTreeMap was as fast on prefixes but opened in 58 to 67 ms with reads at 1.4 us, so it was replaced.
 - Verdict: **kept** as a fix, on its branch until Eric says to merge. No trade-off measured, so no option.
 - Gates: 188 kernel tests, 196 with the store features; clippy `-D warnings` clean with and without them; fmt clean; the fixed bench matches main (a890aa6) in every byte count and the north score (0.3035).
+
+### E191 bucketed-postings (a word's list split by fragment id)
+- Branch / parent: exp/186-stored-summaries / E189
+- Question: postings rewrite a word's whole list when one fragment changes. Split by the first 1 or 2 hex digits of the fragment id (16 or 256 buckets), does an edit write less?
+- Change: none in the kernel. Modes `stored+postings/16` and `/256` in `examples/stored_summaries.rs` (`w/<word>/<prefix>` to content); exact checks as E187.
+- Result: exact in every store, through gc and restart. Written per edit (p50) at 500 files: 70 KB lists, 76 KB with 16 buckets, 78 KB with 256. At 2,000 files: 135, 66 and 101 KB, but the first query slows from 39 to 105 and 78 ms and the store holds 2 to 3 times the objects. On E186's corpus: 517, 593 and 618 KB over 22 edits.
+- Verdict: **discarded**. The cost of postings is the number of words an edit touches (each a node rewritten in the view's tree), not the length of their lists. Fewer writes need fewer words per fragment or a delta log merged in the background (database mode), not smaller lists.
+
+### Gates for E186 to E191 (Nov 11)
+- On exp/186-stored-summaries: 187 kernel tests pass; clippy `-D warnings` and fmt clean; the fixed bench matches main (a890aa6) in every byte count and the north score (0.3035): the kernel is unchanged. E189 and E191 numbers were measured with E190 merged in locally (`trial` branch, not pushed); without it, PackStore opens of the postings modes take seconds.
+- Run: `cargo run --release --example stored_summaries` (E186, E187, E191; about 80 s), `-- crash` (E188), `-- scale 500` and `-- scale 2000` (E189, E191).
+
+### Merge of E186 to E191 into main (Nov 11)
+- On Eric's word ("Merge both"), exp/190-pack-prefix (E190) and then exp/186-stored-summaries (E186 to E191) merged onto main a890aa6. The E190 fix applies to every PackStore and changes no stored format. Stored summaries are an example (`examples/stored_summaries.rs`, `functions/summary.wasm`) and are off unless an application commits the view. The log and registry kept both sides, in experiment order.
