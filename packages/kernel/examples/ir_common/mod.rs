@@ -662,6 +662,7 @@ pub const T: Options = Options {
     predict: false,
     group: false,
     step: false,
+    route: false,
 };
 pub const TC: Options = Options { columns: true, ..T };
 pub const TCN: Options = Options {

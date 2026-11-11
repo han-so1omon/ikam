@@ -2955,3 +2955,26 @@ Newest last. Format and rules: `README.md`.
   By kind of file in the cases folder, the IR lost on every one (json 1.09, md 1.26, py 1.27, txt 1.31, log 1.46 with templates alone; columns made each worse). The schema found one dependency on the registry, ACTIVITY DESC from NAICS (held on 45,066 of 46,176 lines, 1,110 codes, no breaks), in 1.1 s. A column query on ownership type with predict and step took 105 ms against 72 ms splitting the files, because the predictors pull in the first columns of each row, which are near-unique ids and names.
 - Verdict: **measured, and a caveat on everything before it**. On a real table the IR gains 3% over xz (columns only; numbers, predict and step add nothing, row keys cost 27%). On a real mixed folder it loses 8 to 37%, even with `prose`. The large gains of E192 to E206 hold for generated, repetitive reports; real data needs the IR to be chosen per file kind, never forced (E208).
 - Run: `cargo run --release --example ir_real` (about 2 minutes).
+
+### E208 ir-route (never lose to xz: each kind of file goes the smaller way)
+- Branch / parent: exp/208-ir-route / E207 (stacked)
+- Question: E207 found the IR loses to xz on a real mixed folder, by 8% even with `prose`, and that on a real table only one variant wins. Can the encoder find, per kind of file, whether the IR or the plain bytes compress smaller, so that turning the IR on never costs more than not having it?
+- Change: `Options::route` (off by default). Files are grouped by extension and the skeleton of their first line, so reports from one template form one group and a folder's notes of the same extension another; groups of one file are pooled per extension. Each group is judged alone: xz -6 over its IR pack against its files stored plain (the raw part of E198), and goes the smaller way. The routed set is then judged as a whole against all IR and all plain, and the smallest of the three is kept. `ir::route` returns the choice. The decoder needs nothing new. The tests run every option set with `route` on the sample, and a spread of them in the property test.
+- First pass, judged by zstd -9 with groups by extension only: zstd disagreed with xz -9 often enough to make the IR worse (drift reports with columns 0.927 to 0.998, because every md file, the reports included, went plain). That is why the judge is xz and the groups include the first-line template.
+- Result (best variant, all with `prose`, xz -9 over the pack against xz -9 over the files; without / with `route`):
+
+  | corpus | without | with | stored plain |
+  | --- | ---: | ---: | --- |
+  | reports-drift | 0.505 | 0.505 | none |
+  | reports-random | 0.644 | 0.644 | none |
+  | exports | 0.459 | 0.459 | none |
+  | tables | 0.936 | 0.936 (0.995 for variants that lost) | csv, json, md where the IR lost |
+  | drift + texts | 0.789 | 0.789 | none (prose already plain) |
+  | cases text (real) | 1.105 | **0.995** | json, log, md, txt |
+  | cases text + drift reports | 1.041 | **0.940** | json, log, the case md notes, txt |
+  | registry (real) | 0.966 | 0.966 (1.000 for variants that lost) | csv where the IR lost |
+
+  The worst result of any variant with `route` is 1.000 of xz; without it, 1.115. In the kernel in blocks of 20 with a keyframe, the cases text goes from 1.351 to 1.201 and tables from 1.169 to 0.980 (blocks pay their own restarts; the generated corpora are unchanged).
+- Cost: encoding pays xz -6 over each group's IR and plain bytes, then up to three judgments of the whole set: 0.5 to 1.8 s for the 300 to 800 file corpora (12 to 57 ms without), and 13 s for the 10.8 MB registry (0.3 s without). That suits a background repack, not a live write.
+- Verdict: **measured**. With `route`, the IR is never worse than xz over the files on any corpus tried, real or generated, and it keeps every gain it had. Its price is encode time. Off by default.
+- Run: `cargo run --release --example ir_route [corpus ...]` (about 15 minutes, most of it the registry).

@@ -63,6 +63,12 @@ pub struct Options {
     /// values last time, so a counter or a steady trend (one more each run)
     /// is predicted as one byte too.
     pub step: bool,
+    /// E208: each kind of file (extension and first-line template) is
+    /// stored as it is when that compresses smaller than its IR, judged by
+    /// xz over the pack, so the IR never costs more than storing the files
+    /// plain. The decoder needs nothing new (the files go in the raw part
+    /// of `prose`).
+    pub route: bool,
 }
 
 /// An encoded set of files: the line skeletons, each file's lines and cell
@@ -809,10 +815,105 @@ fn stream_key(o: Options, slot: (usize, usize), first: &[u8]) -> (usize, usize, 
 
 /// Encodes `files` (names and bytes) with the given options.
 pub fn encode(files: &[(String, Vec<u8>)], o: Options) -> Parts {
+    let plain = route(files, o);
+    encode_plain(files, o, &plain)
+}
+
+fn encode_plain(files: &[(String, Vec<u8>)], o: Options, plain: &[bool]) -> Parts {
     let mut table = Skeletons::default();
-    let mut parts = encode_with(files, o, &mut table, &mut EncState::default());
+    let mut parts = encode_with(files, o, plain, &mut table, &mut EncState::default());
     parts.skeletons = table.list;
     parts
+}
+
+/// The xz preset that judges `route`'s choices (E208 first judged with
+/// zstd -9, which disagreed with xz -9 on which pack was smaller).
+const ROUTE_PRESET: u32 = 6;
+
+fn judged_bytes(b: &[u8]) -> usize {
+    use std::io::Write;
+    use xz2::stream::{Check, Filters, LzmaOptions, Stream};
+    // the preset's settings with a window no larger than the input (the
+    // same output for inputs under it, and far less to set up for small
+    // ones)
+    let Ok(mut opts) = LzmaOptions::new_preset(ROUTE_PRESET) else {
+        return usize::MAX;
+    };
+    let window = b.len().next_power_of_two().clamp(4096, 8 << 20);
+    opts.dict_size(u32::try_from(window).unwrap_or(8 << 20));
+    let mut filters = Filters::new();
+    filters.lzma2(&opts);
+    let Ok(stream) = Stream::new_stream_encoder(&filters, Check::None) else {
+        return usize::MAX;
+    };
+    let mut e = xz2::write::XzEncoder::new_stream(Vec::new(), stream);
+    if e.write_all(b).is_err() {
+        return usize::MAX;
+    }
+    e.finish().map_or(usize::MAX, |z| z.len())
+}
+
+fn judged(files: &[(String, Vec<u8>)], o: Options, plain: &[bool]) -> usize {
+    judged_bytes(&pack(&encode_plain(files, o, plain)))
+}
+
+/// E208: which files `route` stores as they are. Files are grouped by kind:
+/// extension and the skeleton of their first line, so reports from one
+/// template are one group and a folder's prose of the same extension is
+/// another (groups of one file are pooled per extension). Each group is
+/// judged on its own, its IR against its files stored plain, and goes the
+/// smaller way; then the whole set so routed is judged against all IR and
+/// all plain, and the smallest of the three is kept.
+pub fn route(files: &[(String, Vec<u8>)], o: Options) -> Vec<bool> {
+    let n = files.len();
+    if !o.route || n == 0 {
+        return vec![false; n];
+    }
+    let keys: Vec<(&str, Option<Vec<u8>>)> = files
+        .iter()
+        .map(|(name, b)| {
+            let first = lines(b, &lex(name, b))
+                .first()
+                .map(|l| skeleton_bytes(&l.segs));
+            (ext(name), first)
+        })
+        .collect();
+    let mut count: HashMap<&(&str, Option<Vec<u8>>), usize> = HashMap::new();
+    for k in &keys {
+        *count.entry(k).or_default() += 1;
+    }
+    let mut groups: HashMap<(&str, Option<&[u8]>), Vec<usize>> = HashMap::new();
+    for (i, k) in keys.iter().enumerate() {
+        let key = if count[k] > 1 {
+            (k.0, Some(k.1.as_deref().unwrap_or(&[])))
+        } else {
+            (k.0, None)
+        };
+        groups.entry(key).or_default().push(i);
+    }
+    let mut plain = vec![false; n];
+    for members in groups.values() {
+        let g: Vec<(String, Vec<u8>)> = members.iter().map(|&i| files[i].clone()).collect();
+        let ir = judged(&g, o, &[]);
+        let raw = judged(&g, o, &vec![true; g.len()]);
+        if raw < ir {
+            for &i in members {
+                plain[i] = true;
+            }
+        }
+    }
+    // one group: its judgment was already of the whole set
+    if groups.len() == 1 {
+        return plain;
+    }
+    let mut tries = vec![plain, vec![false; n], vec![true; n]];
+    tries.dedup();
+    tries
+        .into_iter()
+        .map(|p| (judged(files, o, &p), p))
+        .min_by_key(|(z, _)| *z)
+        .map(|(_, p)| p)
+        .unwrap_or_default()
 }
 
 /// A skeleton table shared by several encodes (E197 blocks).
@@ -839,6 +940,7 @@ struct EncState {
 fn encode_with(
     files: &[(String, Vec<u8>)],
     o: Options,
+    plain: &[bool],
     table: &mut Skeletons,
     state: &mut EncState,
 ) -> Parts {
@@ -851,9 +953,11 @@ fn encode_with(
     let raw: Vec<bool> = files
         .iter()
         .zip(&lexed)
-        .map(|((_, b), fl)| {
+        .enumerate()
+        .map(|(i, ((_, b), fl))| {
             let cells: usize = fl.iter().flat_map(|l| &l.cells).map(|c| c.len()).sum();
-            o.prose && !b.is_empty() && cells * 10 < b.len()
+            plain.get(i).copied().unwrap_or(false)
+                || (o.prose && !b.is_empty() && cells * 10 < b.len())
         })
         .collect();
     let mut all_cells: Vec<Vec<&[u8]>> = Vec::new();
@@ -863,14 +967,14 @@ fn encode_with(
     parts.files.push(
         u8::from(o.columns)
             | u8::from(o.rows) << 1
-            | u8::from(o.prose) << 2
+            | u8::from(o.prose || o.route) << 2
             | u8::from(o.predict && o.columns) << 3
             | u8::from(o.step && o.predict && o.columns) << 4,
     );
     put_var(&mut parts.files, files.len() as u128);
     for (fi, ((name, b), ls)) in files.iter().zip(lexed).enumerate() {
         put_bytes(&mut parts.files, name.as_bytes());
-        if o.prose {
+        if o.prose || o.route {
             parts.files.push(u8::from(raw[fi]));
             if raw[fi] {
                 put_var(&mut parts.files, b.len() as u128);
@@ -1202,16 +1306,17 @@ pub fn encode_blocks(
     keyframe: bool,
 ) -> Blocks {
     let per = per.max(1);
+    let plain = route(files, o);
     let mut table = Skeletons::default();
     let mut key = EncState::default();
     let mut blocks = Vec::new();
-    for (i, c) in files.chunks(per).enumerate() {
+    for (i, (c, p)) in files.chunks(per).zip(plain.chunks(per)).enumerate() {
         let mut state = if keyframe && i > 0 {
             key.clone()
         } else {
             EncState::default()
         };
-        blocks.push(encode_with(c, o, &mut table, &mut state));
+        blocks.push(encode_with(c, o, p, &mut table, &mut state));
         if keyframe && i == 0 {
             key = state;
         }

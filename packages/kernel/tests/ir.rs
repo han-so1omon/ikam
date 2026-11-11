@@ -16,12 +16,25 @@ fn all_options() -> Vec<Options> {
             predict: b & 64 != 0,
             group: b & 128 != 0,
             step: b & 256 != 0,
+            route: false,
         })
         .collect()
 }
 
+/// Every option set, and each again with `route` (E208).
+fn all_options_route() -> Vec<Options> {
+    all_options()
+        .into_iter()
+        .flat_map(|o| [o, Options { route: true, ..o }])
+        .collect()
+}
+
 fn roundtrip(files: &[(String, Vec<u8>)]) {
-    for o in all_options() {
+    roundtrip_with(files, &all_options());
+}
+
+fn roundtrip_with(files: &[(String, Vec<u8>)], options: &[Options]) {
+    for &o in options {
         let parts = encode(files, o);
         let back = unpack(&pack(&parts)).unwrap();
         assert_eq!(back, parts);
@@ -74,7 +87,7 @@ fn sample() -> Vec<(String, Vec<u8>)> {
 
 #[test]
 fn tables_reports_and_edge_cases_roundtrip() {
-    roundtrip(&sample());
+    roundtrip_with(&sample(), &all_options_route());
 }
 
 proptest! {
@@ -91,6 +104,10 @@ proptest! {
         files.sort_by(|a, b| a.0.cmp(&b.0));
         files.dedup_by(|a, b| a.0 == b.0);
         roundtrip(&files);
+        // E208: a spread of option sets with `route`, which may store any
+        // kind plain
+        let routed: Vec<Options> = all_options_route().into_iter().skip(1).step_by(37).collect();
+        roundtrip_with(&files, &routed);
     }
 }
 
@@ -198,7 +215,7 @@ fn query_matches(files: &[(String, Vec<u8>)]) {
             }
         }
     }
-    for o in all_options() {
+    for o in all_options_route() {
         let parts = ir::encode(files, o);
         let ix = query::index(&parts, &parts.skeletons);
         if !o.columns || o.siblings || o.nearest > 0 {
