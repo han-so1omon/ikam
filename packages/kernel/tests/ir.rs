@@ -358,7 +358,28 @@ fn sorted_tables_roundtrip() {
 /// and without `sort`.
 #[test]
 fn transposed_tables_roundtrip() {
-    let files = big_tables();
+    let mut files = big_tables();
+    // E213: columns quoted in every row (one with empty and inner quotes),
+    // one quoted in most rows, and a short row
+    let mut q = String::from("\"ID\",\"NAME\",\"CODE\",NOTE\n");
+    for i in 0..300u32 {
+        let name = match i % 7 {
+            0 => String::new(),
+            1 => format!("a \"\"b\"\" {i}"),
+            _ => format!("name, {}", i % 11),
+        };
+        let code = if i % 50 == 3 {
+            "7".to_string()
+        } else {
+            format!("\"{}\"", i % 4)
+        };
+        if i == 99 {
+            q.push_str(&format!("\"{i}\"\n"));
+        } else {
+            q.push_str(&format!("\"{i}\",\"{name}\",{code},n{}\n", i % 3));
+        }
+    }
+    files.push(("t/q.csv".into(), q.into_bytes()));
     let options: Vec<Options> = all_options_route()
         .into_iter()
         .filter(|o| o.route || o.prose)

@@ -3042,3 +3042,19 @@ Newest last. Format and rules: `README.md`.
 - Verdict: **measured**. 0.942 to 0.930, within 0.003 of the exact bound for this layout, and with no tuning needed (0.930 with columns alone, at a third of the encode time). Off by default.
 - Next: E213, a column whose fields are all quoted stored without its quotes.
 - Run: `cargo run --release --example ir_transpose [corpus ...]` (about 7 minutes on the registry).
+
+### E213 ir-quotes (a column quoted in every row stored without its quotes)
+- Branch / parent: exp/213-ir-quotes / E212 (stacked)
+- Question: 13 of the registry's 14 columns quote every field. A Python check put the E212 layout at 0.913 with those quotes left out. Does the kernel get it?
+- Change: no new option; it changes the `transpose` layout (E212, not merged). After the header, one byte per column: `q` where every field of the column starts and ends with a quote (those two are left out of its fields), `-` elsewhere. The decoder puts them back. A field such as `""` or one with inner quotes comes back exactly, since only the outer two are dropped. A unit test covers empty quoted fields, inner quotes, a short row and a longer one; the table test gains a table with columns quoted in every row, in most rows, and never.
+- Result (xz -9 over the pack against xz -9 over the files, with `prose` and `route`):
+
+  | variant | route | + sort | + transpose | + both |
+  | --- | ---: | ---: | ---: | ---: |
+  | columns | 0.966 | 0.947 | 0.954 | **0.911** |
+  | predict, step, tuned | 0.961 | 0.942 | 0.954 | **0.911** |
+
+  The raw part shrinks from 11.5 to 10.1 MB. `transpose` alone, unsorted, now beats the IR on this table too (0.954). Exports, tables and the cases folder are unchanged. Encode 14 s with columns.
+- Verdict: **measured**. The real registry at 0.911 of xz, from 0.966 at E207: 9% smaller, exactly, with the plain-columns variant and no tuning. Off by default, with `transpose`.
+- Next: the same columns layout for JSON arrays of records, which the real fixtures do not have yet; and `transpose` inside blocks for large tables, so one range of rows reads without the whole table.
+- Run: `cargo run --release --example ir_transpose [corpus ...]` (about 8 minutes).

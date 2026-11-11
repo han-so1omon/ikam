@@ -1720,22 +1720,35 @@ fn unsort_table(t: &[u8], rows: usize, trailing: bool) -> Result<Vec<u8>, Error>
 /// header, each line's field count, then each column's fields, one per
 /// line (a line with fewer fields has none in the later columns). Lines
 /// are rebuilt by joining their fields with commas, so it is exact.
+/// E213: after the header, one byte per column, `q` where every field of
+/// the column is quoted (the quotes are left out of its fields) and `-`
+/// elsewhere, since an export often quotes every text field.
 fn transposed(header: &[u8], lines: &[&[u8]]) -> Vec<u8> {
     let counts: Vec<usize> = lines.iter().map(|l| field_count(l)).collect();
     let mut out =
         Vec::with_capacity(lines.iter().map(|l| l.len() + 2).sum::<usize>() + header.len());
     out.extend_from_slice(header);
     out.push(b'\n');
+    let fields: Vec<Vec<&[u8]>> = lines.iter().map(|l| fields(l)).collect();
+    let most = counts.iter().copied().max().unwrap_or(0);
+    let quoted: Vec<bool> = (0..most)
+        .map(|k| {
+            fields
+                .iter()
+                .filter_map(|f| f.get(k))
+                .all(|v| v.len() >= 2 && v[0] == b'"' && v[v.len() - 1] == b'"')
+        })
+        .collect();
+    out.extend(quoted.iter().map(|&q| if q { b'q' } else { b'-' }));
+    out.push(b'\n');
     for c in &counts {
         out.extend_from_slice(c.to_string().as_bytes());
         out.push(b'\n');
     }
-    let fields: Vec<Vec<&[u8]>> = lines.iter().map(|l| fields(l)).collect();
-    let most = counts.iter().copied().max().unwrap_or(0);
-    for k in 0..most {
+    for (k, &q) in quoted.iter().enumerate() {
         for f in &fields {
             if let Some(v) = f.get(k) {
-                out.extend_from_slice(v);
+                out.extend_from_slice(if q { &v[1..v.len() - 1] } else { v });
                 out.push(b'\n');
             }
         }
@@ -1766,6 +1779,10 @@ fn untransposed(t: &[u8], n: usize, trailing: bool) -> Result<Vec<u8>, Error> {
     let bad = || Error::Decode("ir: transposed table");
     let mut it = t.split(|&c| c == b'\n');
     let header = it.next().ok_or_else(bad)?;
+    let quoted = it.next().ok_or_else(bad)?;
+    if quoted.iter().any(|&c| c != b'q' && c != b'-') {
+        return Err(bad());
+    }
     let counts: Vec<usize> = (0..n)
         .map(|_| {
             let c = it.next().ok_or_else(bad)?;
@@ -1778,13 +1795,23 @@ fn untransposed(t: &[u8], n: usize, trailing: bool) -> Result<Vec<u8>, Error> {
         .collect::<Result<_, _>>()?;
     let mut lines: Vec<Vec<u8>> = vec![Vec::new(); n];
     let most = counts.iter().copied().max().unwrap_or(0);
-    for k in 0..most {
+    if quoted.len() != most {
+        return Err(bad());
+    }
+    for (k, &q) in quoted.iter().enumerate() {
         for (l, &c) in lines.iter_mut().zip(&counts) {
             if c > k {
                 if k > 0 {
                     l.push(b',');
                 }
-                l.extend_from_slice(it.next().ok_or_else(bad)?);
+                let v = it.next().ok_or_else(bad)?;
+                if q == b'q' {
+                    l.push(b'"');
+                    l.extend_from_slice(v);
+                    l.push(b'"');
+                } else {
+                    l.extend_from_slice(v);
+                }
             }
         }
     }
@@ -1990,6 +2017,33 @@ mod tests {
 
     /// E209: every stream mode, on every stream, decodes exactly, alone and
     /// in blocks, and mixed per stream.
+    #[test]
+    fn transposed_tables_come_back() {
+        let lines: Vec<&[u8]> = vec![
+            b"\"1\",\"a, b\",x,\"\"",
+            b"\"2\",\"\"\"q\"\"\",\"y\",\"\"",
+            b"\"3\"",
+            b"\"4\",\"\",z,\"\",extra",
+        ];
+        let t = transposed(b"H1,H2,H3,H4", &lines);
+        assert!(
+            t.starts_with(b"H1,H2,H3,H4\nqq-q-\n"),
+            "{}",
+            String::from_utf8_lossy(&t)
+        );
+        for trailing in [false, true] {
+            let back = untransposed(&t, lines.len(), trailing).unwrap();
+            let mut want = b"H1,H2,H3,H4\n".to_vec();
+            want.extend(lines.join(&b'\n'));
+            if trailing {
+                want.push(b'\n');
+            }
+            assert_eq!(back, want);
+        }
+        assert!(untransposed(&t[..t.len() - 1], lines.len(), false).is_err());
+        assert!(untransposed(&t, lines.len() + 1, false).is_err());
+    }
+
     #[test]
     fn every_stream_mode_decodes() {
         let mut files: Vec<(String, Vec<u8>)> = Vec::new();

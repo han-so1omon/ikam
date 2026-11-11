@@ -7,7 +7,8 @@
 //! costs about half of what the sort gains. With `transpose`, a CSV table
 //! that `route` stores as it is goes into the raw part laid out by column:
 //! the header, each line's field count, then each column's fields one per
-//! line. `route` then judges the IR against that layout. For each corpus
+//! line (E213: without the quotes of a column whose every field is
+//! quoted). `route` then judges the IR against that layout. For each corpus
 //! and variant (all with `prose` and `route`), xz -9 over the pack with
 //! neither, `sort`, `transpose` and both, against xz -9 over the files, and
 //! the size of the raw part (what was stored plain). Registry values are not
