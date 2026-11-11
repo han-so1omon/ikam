@@ -2641,3 +2641,13 @@ Newest last. Format and rules: `README.md`.
 - Change (harness only; kernel untouched): `pack_options(name)` maps every `packs*` name to its `PackOptions`, and `open` and `churn` both read it. The stores example now runs its own tests (`test = true`): every `packs*` name in `BACKENDS` has options, and build plus churn at 2,000 objects runs on all six. The churn test fails on the old list.
 - Gates: 187 kernel tests, 195 with the store features; clippy clean with and without them; fmt clean; the bench is unchanged (the kernel is unchanged).
 - Verdict: **kept** as a fix, on exp/185-churn-all-packs until Eric says to merge. The Mac reruns `churn packs-filter` at 1M once Remote Control is back.
+
+### E190 pack-prefix (prefix lookups in the open pack without a scan)
+- Branch / parent: exp/190-pack-prefix / main (a890aa6)
+- Finding: E189 (exp/186-stored-summaries) opened a PackStore of 38,862 objects, most of them short derivation records, in 4.25 s of ledger load. The ledger resolves each short record's abbreviated ids through `ids_with_prefix`, and PackStore answered that for the open pack by scanning its whole index, so the load was quadratic in the open pack. Writing a short record runs the same lookup.
+- Change (kernel; no format change): the open pack's index stays a HashMap, so open and point lookups are untouched. A sorted list of its ids is built on the first prefix lookup and answered by binary search, with ids written since the sort kept in a short unsorted tail that is merged every 4,096 writes; both are dropped when the open pack is checkpointed or sealed. `tests/backends.rs` `pack_store_prefix_lookups_in_the_open_pack_match_a_mem_store`: 2,000 ids with every seventh deleted, prefixes of 0, 1, 2, 5 and 32 bytes, equal to a MemStore, again after reopen.
+- Result:
+  - E189's ledger load at 500 synthetic files: 142, 333, 1,069 and 4,251 ms (memory, native, stored, postings modes) to 11, 19, 36 and 93 ms. At 2,000 files: 39 to 257 ms.
+  - Store level at 200,000 objects (`stores build` and `probe`, packs, two runs each): build 0.3 s, open 30 to 32 ms, point read p50 1.1 to 1.3 us, missing p50 0.1 us; main 0.3 s, 33 to 42 ms, 1.1 to 1.2 us and 0.1 us. A first version that made the open pack's index a BTreeMap was as fast on prefixes but opened in 58 to 67 ms with reads at 1.4 us, so it was replaced.
+- Verdict: **kept** as a fix, on its branch until Eric says to merge. No trade-off measured, so no option.
+- Gates: 188 kernel tests, 196 with the store features; clippy `-D warnings` clean with and without them; fmt clean; the fixed bench matches main (a890aa6) in every byte count and the north score (0.3035).
