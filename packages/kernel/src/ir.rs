@@ -46,6 +46,10 @@ pub struct Options {
     /// its extension (or its sibling, with `siblings`) shares the most
     /// cells with it, so a rerun stores only the cells that changed.
     pub nearest: usize,
+    /// E200 (with `columns`): each column learns which earlier cell of its
+    /// line determines it (a client's region, a link's sensor) and stores
+    /// a cell its predictor gets right as one byte.
+    pub predict: bool,
 }
 
 /// An encoded set of files: the line skeletons, each file's lines and cell
@@ -435,7 +439,13 @@ fn parse_num(c: &[u8]) -> Option<Num> {
 // Tokens: 0 the previous value again; 1 a number with the previous
 // number's scale and format, as a delta; 2 a number with its format, scale
 // and delta; 3 a string seen before in this stream, by index; 4 a new
-// string.
+// string; 5 (E200, `predict`) the value the column's predictor gives.
+
+/// One earlier cell's map: each of its values to this column's value.
+type Predictor = HashMap<Vec<u8>, Vec<u8>>;
+
+/// How many of a line's first cells a column may be predicted from (E200).
+const PREDICTORS: usize = 4;
 
 #[derive(Clone, Default)]
 struct Stream {
@@ -444,9 +454,90 @@ struct Stream {
     num: Option<Num>,
     dict: HashMap<Vec<u8>, usize>,
     seen: Vec<Vec<u8>>,
+    /// For each of the line's first `PREDICTORS` cells, by place: the value this
+    /// column last had beside each of its values, and how often that held.
+    pred: Vec<(Predictor, usize)>,
 }
 
 impl Stream {
+    /// The value the best-scoring earlier cell of the line maps to.
+    fn predicted(&self, line: &[&[u8]]) -> Option<&Vec<u8>> {
+        let mut best: Option<(usize, &Vec<u8>)> = None;
+        for (j, cell) in line.iter().take(PREDICTORS).enumerate() {
+            let Some((map, hits)) = self.pred.get(j) else {
+                break;
+            };
+            if let Some(v) = map.get(*cell)
+                && best.is_none_or(|b| *hits > b.0)
+            {
+                best = Some((*hits, v));
+            }
+        }
+        best.map(|b| b.1)
+    }
+
+    fn learn(&mut self, line: &[&[u8]], v: &[u8]) {
+        let line = &line[..line.len().min(PREDICTORS)];
+        if self.pred.len() < line.len() {
+            self.pred.resize_with(line.len(), Default::default);
+        }
+        for (j, cell) in line.iter().enumerate() {
+            let (map, hits) = &mut self.pred[j];
+            match map.get_mut(*cell) {
+                Some(old) if old.as_slice() == v => *hits += 1,
+                Some(old) => *old = v.to_vec(),
+                None => {
+                    map.insert(cell.to_vec(), v.to_vec());
+                }
+            }
+        }
+    }
+
+    /// `put` with the line's earlier cells, when the column predicts.
+    fn put_in(&mut self, c: &[u8], numbers: bool, line: Option<&[&[u8]]>) {
+        let Some(line) = line else {
+            return self.put(c, numbers);
+        };
+        if self.prev.as_deref() != Some(c) && self.predicted(line).map(Vec::as_slice) == Some(c) {
+            self.out.push(5);
+            if let Some(n) = parse_num(c).filter(|_| numbers) {
+                self.num = Some(n);
+            }
+            self.prev = Some(c.to_vec());
+        } else {
+            self.put(c, numbers);
+        }
+        self.learn(line, c);
+    }
+
+    /// `get` with the line's earlier cells, when the column predicts.
+    fn get_in(
+        &mut self,
+        b: &[u8],
+        at: &mut usize,
+        line: Option<&[&[u8]]>,
+    ) -> Result<Vec<u8>, Error> {
+        let Some(line) = line else {
+            return self.get(b, at);
+        };
+        let v = if b.get(*at) == Some(&5) {
+            *at += 1;
+            let v = self
+                .predicted(line)
+                .cloned()
+                .ok_or(Error::Decode("ir: nothing predicted"))?;
+            if let Some(n) = parse_num(&v) {
+                self.num = Some(n);
+            }
+            self.prev = Some(v.clone());
+            v
+        } else {
+            self.get(b, at)?
+        };
+        self.learn(line, &v);
+        Ok(v)
+    }
+
     fn put(&mut self, c: &[u8], numbers: bool) {
         if self.prev.as_deref() == Some(c) {
             self.out.push(0);
@@ -621,9 +712,12 @@ fn encode_with(
     let mut by_stem: HashMap<&str, usize> = HashMap::new();
     let mut by_ext: HashMap<&str, Vec<usize>> = HashMap::new();
     let mut cell_sets: Vec<HashSet<&[u8]>> = Vec::new();
-    parts
-        .files
-        .push(u8::from(o.columns) | u8::from(o.rows) << 1 | u8::from(o.prose) << 2);
+    parts.files.push(
+        u8::from(o.columns)
+            | u8::from(o.rows) << 1
+            | u8::from(o.prose) << 2
+            | u8::from(o.predict && o.columns) << 3,
+    );
     put_var(&mut parts.files, files.len() as u128);
     for (fi, ((name, b), ls)) in files.iter().zip(lexed).enumerate() {
         put_bytes(&mut parts.files, name.as_bytes());
@@ -713,7 +807,8 @@ fn encode_with(
             if si == streams.len() {
                 streams.push(Stream::default());
             }
-            streams[si].put(c, o.numbers);
+            let line = (o.predict && o.columns).then(|| &cells[firsts[k]..k]);
+            streams[si].put_in(c, o.numbers, line);
         }
         by_stem.entry(stem(name)).or_insert(fi);
         if o.nearest > 0 && !cells.is_empty() {
@@ -749,7 +844,12 @@ struct Cursor<'a> {
 }
 
 impl Cursor<'_> {
-    fn next(&mut self, slot: (usize, usize), first: &[u8]) -> Result<Vec<u8>, Error> {
+    fn next(
+        &mut self,
+        slot: (usize, usize),
+        first: &[u8],
+        line: Option<&[&[u8]]>,
+    ) -> Result<Vec<u8>, Error> {
         let key = stream_key(self.o, slot, first);
         let i = *self
             .state
@@ -761,7 +861,7 @@ impl Cursor<'_> {
             .states
             .get_mut(i)
             .ok_or(Error::Decode("ir: no stream"))?;
-        st.get(&self.streams[i], &mut self.pos[i])
+        st.get_in(&self.streams[i], &mut self.pos[i], line)
     }
 }
 
@@ -794,6 +894,7 @@ fn decode_with(
         columns: flags & 1 != 0,
         rows: flags & 2 != 0,
         prose: flags & 4 != 0,
+        predict: flags & 8 != 0,
         ..Options::default()
     };
     let mut raw_at: usize = 0;
@@ -882,12 +983,17 @@ fn decode_with(
                 Some(i) => all_cells[base - 1][*i].clone(),
                 None => {
                     let (slot, first) = slots[k];
+                    let line: Vec<&[u8]> = if o.predict {
+                        cells[first..k].iter().map(Vec::as_slice).collect()
+                    } else {
+                        Vec::new()
+                    };
                     let first = if first < k {
                         cells[first].clone()
                     } else {
                         Vec::new()
                     };
-                    cur.next(slot, &first)?
+                    cur.next(slot, &first, o.predict.then_some(&line[..]))?
                 }
             };
             cells.push(v);

@@ -5,7 +5,7 @@ use ikam_kernel::ir::{self, Options, decode, encode, pack, unpack};
 use proptest::prelude::*;
 
 fn all_options() -> Vec<Options> {
-    (0..64)
+    (0..128)
         .map(|b| Options {
             columns: b & 1 != 0,
             numbers: b & 2 != 0,
@@ -13,6 +13,7 @@ fn all_options() -> Vec<Options> {
             rows: b & 8 != 0,
             prose: b & 16 != 0,
             nearest: if b & 32 != 0 { 3 } else { 0 },
+            predict: b & 64 != 0,
         })
         .collect()
 }

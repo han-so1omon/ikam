@@ -659,6 +659,7 @@ pub const T: Options = Options {
     rows: false,
     prose: false,
     nearest: 0,
+    predict: false,
 };
 pub const TC: Options = Options { columns: true, ..T };
 pub const TCN: Options = Options {
