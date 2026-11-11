@@ -3278,6 +3278,6 @@ Newest last. Format and rules: `README.md`.
   | cases text (real) | 0.672 | 0.833 / 1.249 | 0.819 / 0.869 |
   | cases text + drift | 0.611 | 0.781 / 1.126 | 0.749 / 0.785 |
 
-  Reads are unchanged (0.0 to 7 ms). Judging the frame against the raw part compressed with zstd alone instead of xz -6 (first run) gave the same cases figures.
+  Reads are unchanged (0.0 to 7 ms). Judging the frame against the raw part as it is (first run) instead of under xz -6 gave the same cases figures.
 - Verdict: **dropped** (the option stays, off). In the store, a framed raw part is worse wherever it is used: the kernel already compresses a block entry better (brotli or xz, its trained dictionary across entries) than zstd does with block 0 as dictionary, and a frame cannot be compressed again. E224's gain is real under one compressor but the store gets most of it already. A gain here would need the store itself to compress a block against block 0 (E057's related-content frames), not the IR.
 - Run: `cargo run --release --example ir_rawkey [corpus ...]` (about a minute).
