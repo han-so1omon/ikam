@@ -2917,3 +2917,21 @@ Newest last. Format and rules: `README.md`.
   The smallest IR overall (predict, step, siblings, nearest; not queryable) is 0.505 of xz on drift and 0.643 on random: with predict and step, a queryable store costs 1.08 of it on drift and 0.96 on random. The query then reads 5 of 23 streams, and the time goes to the predictors learning on every cell (a full decode of all 300 reports takes 25 to 36 ms in memory with them, 13 ms without), not to the reads.
 - Verdict: **measured**. A store can now be both nearly the smallest and queryable: 0.548 of xz with column queries in about 13 ms (1.3 times faster than reading the files), or 0.819 with queries in about 1 ms. The predictors' speed is the next thing to fix. Row-key layouts go through the line-by-line path and are slower than in E203 (2 to 3.5 ms); they lose on size anyway.
 - Run: `cargo run --release --example ir_query` (about a minute).
+
+### E206 ir-fast-predict (faster predictors, same bytes)
+- Branch / parent: exp/206-ir-fast-predict / E205 (stacked)
+- Question: with `predict` and `step`, decoding 300 drift reports took 36 ms against 13 ms without, and a column query 14 ms against 0.6 ms. Where does the time go, and how much comes back without touching the format?
+- Change (no format change): a callgrind profile put a quarter of the time in malloc and free, then SipHash and `format!`. So: the value and step predictors share one map per earlier cell (one lookup instead of two); the predictor, dictionary and stream-index maps use a fixed FxHash; predictors take the line's cells by reference instead of a new vector per cell; numbers render and parse without `format!` or a digit vector; and the query opens its streams once instead of looking them up per cell. New `examples/ir_parity.rs` hashes the packs and blocks of 5 corpora under 32 option sets: identical before and after, so every stored IR decodes the same.
+- Result (in memory, best of 25, 300 reports, before / after; this machine's times move by about 10% from run to run):
+
+  | corpus | options | encode ms | decode ms | column query ms |
+  | --- | --- | ---: | ---: | ---: |
+  | drift | columns, numbers | 19.0 / 18.1 | 12.5 / 10.6 | 0.59 / 0.53 |
+  | drift | + predict | 31.9 / 25.2 | 28.3 / 19.2 | 11.3 / **3.3** |
+  | drift | + predict + step | 47.0 / 28.6 | 36.1 / **23.4** | 13.7 / **4.1** |
+  | random | + predict + step | 50.9 / 39.8 | 33.7 / 26.0 | 10.8 / 4.1 |
+  | exports | + predict + step | 19.4 / 17.3 | 17.6 / 11.8 | 2.6 / 0.9 |
+
+  With the parts in the kernel (E205's layout), a column query on the 0.548-of-xz drift store now takes 4.0 ms (was 13.4), against 17.4 ms reading the files; on random reports 4.0 ms at 0.619 of xz.
+- Verdict: **measured**. Same bytes; queries on the predicting IR 3 times faster, decode a third faster. Not an option: it changes no output.
+- Run: `cargo run --release --example ir_speed` (about a minute), `cargo run --release --example ir_parity` (about 2 minutes; compare its output across commits).

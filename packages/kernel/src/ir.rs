@@ -381,26 +381,47 @@ const COMMAS: u8 = 2;
 const PERCENT: u8 = 4;
 
 fn render_num(n: Num) -> Vec<u8> {
-    let mut out = Vec::new();
+    let scale = usize::from(n.scale);
+    let mut out = Vec::with_capacity(scale + 24);
     if n.m < 0 {
         out.push(b'-');
     }
     if n.fmt & DOLLAR != 0 {
         out.push(b'$');
     }
-    let digits = n.m.unsigned_abs().to_string();
-    let scale = usize::from(n.scale);
-    let padded = format!("{digits:0>width$}", width = scale + 1);
-    let (int, frac) = padded.split_at(padded.len() - scale);
-    for (i, c) in int.bytes().enumerate() {
-        if n.fmt & COMMAS != 0 && i > 0 && (int.len() - i) % 3 == 0 {
+    // the digits of |m|, at least scale + 1 of them
+    let mut buf = [0u8; 300];
+    let mut i = buf.len();
+    let mut v = n.m.unsigned_abs();
+    while v > u128::from(u64::MAX) {
+        i -= 1;
+        buf[i] = b'0' + (v % 10) as u8;
+        v /= 10;
+    }
+    let mut w = v as u64;
+    loop {
+        i -= 1;
+        buf[i] = b'0' + (w % 10) as u8;
+        w /= 10;
+        if w == 0 {
+            break;
+        }
+    }
+    while buf.len() - i < scale + 1 {
+        i -= 1;
+        buf[i] = b'0';
+    }
+    let digits = &buf[i..];
+    let (int, frac) = digits.split_at(digits.len() - scale);
+    for (k, &c) in int.iter().enumerate() {
+        if n.fmt & COMMAS != 0 && k > 0 && (int.len() - k) % 3 == 0 {
             out.push(b',');
         }
         out.push(c);
     }
     if scale > 0 {
         out.push(b'.');
-        out.extend_from_slice(frac.as_bytes());
+        out.extend_from_slice(frac);
     }
     if n.fmt & PERCENT != 0 {
         out.push(b'%');
@@ -429,16 +450,23 @@ fn parse_num(c: &[u8]) -> Option<Num> {
         Some(i) => (&s[..i], &s[i + 1..]),
         None => (s, &s[..0]),
     };
-    let digits: Vec<u8> = int
-        .iter()
-        .chain(frac)
-        .copied()
-        .filter(|&c| c != b',')
-        .collect();
-    if digits.is_empty() || digits.len() > 30 || !digits.iter().all(u8::is_ascii_digit) {
+    let (mut m, mut count) = (0i128, 0usize);
+    for &c in int.iter().chain(frac) {
+        if c == b',' {
+            continue;
+        }
+        if !c.is_ascii_digit() {
+            return None;
+        }
+        count += 1;
+        if count > 30 {
+            return None;
+        }
+        m = m * 10 + i128::from(c - b'0');
+    }
+    if count == 0 {
         return None;
     }
-    let m: i128 = std::str::from_utf8(&digits).ok()?.parse().ok()?;
     let n = Num {
         m: if neg { -m } else { m },
         scale: u8::try_from(frac.len()).ok()?,
@@ -455,8 +483,51 @@ fn parse_num(c: &[u8]) -> Option<Num> {
 // string; 5 (E200, `predict`) the value the column's predictor gives; 6
 // (E204, `step`) the number its step predictor gives.
 
-/// One earlier cell's map: each of its values to this column's value.
-type Predictor = HashMap<Vec<u8>, Vec<u8>>;
+/// A fast, fixed hash for the predictors' short keys (FxHash): the maps
+/// are rebuilt the same way by the decoder, so no seed is needed.
+#[derive(Clone, Copy, Default)]
+struct Fx(u64);
+
+impl std::hash::Hasher for Fx {
+    fn write(&mut self, bytes: &[u8]) {
+        const K: u64 = 0x517c_c1b7_2722_0a95;
+        let mut c = bytes.chunks_exact(8);
+        for w in &mut c {
+            let w = u64::from_le_bytes(w.try_into().unwrap());
+            self.0 = (self.0.rotate_left(5) ^ w).wrapping_mul(K);
+        }
+        for &x in c.remainder() {
+            self.0 = (self.0.rotate_left(5) ^ u64::from(x)).wrapping_mul(K);
+        }
+    }
+
+    fn write_usize(&mut self, n: usize) {
+        self.0 = (self.0.rotate_left(5) ^ n as u64).wrapping_mul(0x517c_c1b7_2722_0a95);
+    }
+
+    fn finish(&self) -> u64 {
+        self.0
+    }
+}
+
+type FxMap<K, V> = HashMap<K, V, std::hash::BuildHasherDefault<Fx>>;
+
+/// What a column last had beside one value of an earlier cell: its value,
+/// and (E204, with `step`) its last number and the step it took then.
+#[derive(Clone)]
+struct Seen {
+    value: Vec<u8>,
+    num: Option<(Num, i128)>,
+}
+
+/// One earlier cell's map: each of its values to what this column had
+/// beside it, and how often the value repeated and the step repeated.
+#[derive(Clone, Default)]
+struct Predictor {
+    map: FxMap<Vec<u8>, Seen>,
+    hits: usize,
+    step_hits: usize,
+}
 
 /// How many of a line's first cells a column may be predicted from (E200).
 const PREDICTORS: usize = 4;
@@ -466,32 +537,22 @@ struct Stream {
     out: Vec<u8>,
     prev: Option<Vec<u8>>,
     num: Option<Num>,
-    dict: HashMap<Vec<u8>, usize>,
+    dict: FxMap<Vec<u8>, usize>,
     seen: Vec<Vec<u8>>,
-    /// For each of the line's first `PREDICTORS` cells, by place: the value this
-    /// column last had beside each of its values, and how often that held.
-    pred: Vec<(Predictor, usize)>,
-    /// E204: for each of those cells, by place: the number this column last
-    /// had beside each of its values and the step it took then, and how
-    /// often the step repeated.
-    steps: Vec<(Steps, usize)>,
+    /// For each of the line's first `PREDICTORS` cells, by place: what this
+    /// column last had beside each of its values (E200, E204).
+    pred: Vec<Predictor>,
 }
-
-/// One earlier cell's values to this column's last number and step (E204).
-type Steps = HashMap<Vec<u8>, (Num, i128)>;
 
 impl Stream {
     /// The value the best-scoring earlier cell of the line maps to.
-    fn predicted(&self, line: &[&[u8]]) -> Option<&Vec<u8>> {
+    fn predicted<L: AsRef<[u8]>>(&self, line: &[L]) -> Option<&Vec<u8>> {
         let mut best: Option<(usize, &Vec<u8>)> = None;
-        for (j, cell) in line.iter().take(PREDICTORS).enumerate() {
-            let Some((map, hits)) = self.pred.get(j) else {
-                break;
-            };
-            if let Some(v) = map.get(*cell)
-                && best.is_none_or(|b| *hits > b.0)
+        for (p, cell) in self.pred.iter().zip(line.iter().take(PREDICTORS)) {
+            if let Some(e) = p.map.get(cell.as_ref())
+                && best.is_none_or(|b| p.hits > b.0)
             {
-                best = Some((*hits, v));
+                best = Some((p.hits, &e.value));
             }
         }
         best.map(|b| b.1)
@@ -499,71 +560,66 @@ impl Stream {
 
     /// The last number beside the best-scoring earlier cell's value plus
     /// the step it took then (E204).
-    fn stepped(&self, line: &[&[u8]]) -> Option<Num> {
+    fn stepped<L: AsRef<[u8]>>(&self, line: &[L]) -> Option<Num> {
         let mut best: Option<(usize, Num)> = None;
-        for (j, cell) in line.iter().take(PREDICTORS).enumerate() {
-            let Some((map, hits)) = self.steps.get(j) else {
-                break;
-            };
-            if let Some(&(n, d)) = map.get(*cell)
+        for (p, cell) in self.pred.iter().zip(line.iter().take(PREDICTORS)) {
+            if let Some(&(n, d)) = p.map.get(cell.as_ref()).and_then(|e| e.num.as_ref())
                 && d != 0
-                && best.is_none_or(|b| *hits > b.0)
+                && best.is_none_or(|b| p.step_hits > b.0)
             {
-                best = Some((*hits, Num { m: n.m + d, ..n }));
+                best = Some((p.step_hits, Num { m: n.m + d, ..n }));
             }
         }
         best.map(|b| b.1)
     }
 
-    fn learn_steps(&mut self, line: &[&[u8]], v: &[u8]) {
-        let Some(n) = parse_num(v) else {
-            return;
-        };
-        let line = &line[..line.len().min(PREDICTORS)];
-        if self.steps.len() < line.len() {
-            self.steps.resize_with(line.len(), Default::default);
-        }
-        for (j, cell) in line.iter().enumerate() {
-            let (map, hits) = &mut self.steps[j];
-            match map.get_mut(*cell) {
-                Some((old, d)) => {
-                    let nd = if old.scale == n.scale && old.fmt == n.fmt {
-                        n.m - old.m
-                    } else {
-                        0
-                    };
-                    if nd != 0 && nd == *d {
-                        *hits += 1;
-                    }
-                    *old = n;
-                    *d = nd;
-                }
-                None => {
-                    map.insert(cell.to_vec(), (n, 0));
-                }
-            }
-        }
-    }
-
-    fn learn(&mut self, line: &[&[u8]], v: &[u8]) {
+    fn learn<L: AsRef<[u8]>>(&mut self, line: &[L], v: &[u8], step: bool) {
         let line = &line[..line.len().min(PREDICTORS)];
         if self.pred.len() < line.len() {
             self.pred.resize_with(line.len(), Default::default);
         }
-        for (j, cell) in line.iter().enumerate() {
-            let (map, hits) = &mut self.pred[j];
-            match map.get_mut(*cell) {
-                Some(old) if old.as_slice() == v => *hits += 1,
-                Some(old) => *old = v.to_vec(),
+        let n = if step { parse_num(v) } else { None };
+        for (p, cell) in self.pred.iter_mut().zip(line) {
+            match p.map.get_mut(cell.as_ref()) {
+                Some(e) => {
+                    if e.value == v {
+                        p.hits += 1;
+                    } else {
+                        e.value.clear();
+                        e.value.extend_from_slice(v);
+                    }
+                    if let Some(n) = n {
+                        e.num = Some(match e.num {
+                            Some((old, d)) => {
+                                let nd = if old.scale == n.scale && old.fmt == n.fmt {
+                                    n.m - old.m
+                                } else {
+                                    0
+                                };
+                                if nd != 0 && nd == d {
+                                    p.step_hits += 1;
+                                }
+                                (n, nd)
+                            }
+                            None => (n, 0),
+                        });
+                    }
+                }
                 None => {
-                    map.insert(cell.to_vec(), v.to_vec());
+                    p.map.insert(
+                        cell.as_ref().to_vec(),
+                        Seen {
+                            value: v.to_vec(),
+                            num: n.map(|n| (n, 0)),
+                        },
+                    );
                 }
             }
         }
     }
 
     /// `put` with the line's earlier cells, when the column predicts.
-    fn put_in(&mut self, c: &[u8], numbers: bool, line: Option<&[&[u8]]>, step: bool) {
+    fn put_in<L: AsRef<[u8]>>(&mut self, c: &[u8], numbers: bool, line: Option<&[L]>, step: bool) {
         let Some(line) = line else {
             return self.put(c, numbers);
         };
@@ -574,9 +630,10 @@ impl Stream {
                 self.num = Some(n);
             }
             self.prev = Some(c.to_vec());
-        } else if let Some(n) = self
-            .stepped(line)
-            .filter(|n| step && fresh && render_num(*n) == c)
+        } else if let Some(n) = (step && fresh)
+            .then(|| self.stepped(line))
+            .flatten()
+            .filter(|n| render_num(*n) == c)
         {
             self.out.push(6);
             self.num = Some(n);
@@ -584,18 +641,15 @@ impl Stream {
         } else {
             self.put(c, numbers);
         }
-        self.learn(line, c);
-        if step {
-            self.learn_steps(line, c);
-        }
+        self.learn(line, c, step);
     }
 
     /// `get` with the line's earlier cells, when the column predicts.
-    fn get_in(
+    fn get_in<L: AsRef<[u8]>>(
         &mut self,
         b: &[u8],
         at: &mut usize,
-        line: Option<&[&[u8]]>,
+        line: Option<&[L]>,
         step: bool,
     ) -> Result<Vec<u8>, Error> {
         let Some(line) = line else {
@@ -624,10 +678,7 @@ impl Stream {
         } else {
             self.get(b, at)?
         };
-        self.learn(line, &v);
-        if step {
-            self.learn_steps(line, &v);
-        }
+        self.learn(line, &v, step);
         Ok(v)
     }
 
@@ -778,7 +829,7 @@ type StreamKey = (usize, usize, Vec<u8>);
 
 #[derive(Clone, Default)]
 struct EncState {
-    index: HashMap<StreamKey, usize>,
+    index: FxMap<StreamKey, usize>,
     streams: Vec<Stream>,
 }
 
@@ -946,7 +997,7 @@ fn encode_with(
 /// The streams after a decode (the decoding side of `EncState`).
 #[derive(Clone, Default)]
 struct DecState {
-    index: HashMap<StreamKey, usize>,
+    index: FxMap<StreamKey, usize>,
     states: Vec<Stream>,
 }
 
@@ -963,7 +1014,7 @@ impl Cursor<'_> {
         &mut self,
         slot: (usize, usize),
         first: &[u8],
-        line: Option<&[&[u8]]>,
+        line: Option<&[Vec<u8>]>,
     ) -> Result<Vec<u8>, Error> {
         let key = stream_key(self.o, slot, first);
         let i = *self
@@ -1099,17 +1150,9 @@ fn decode_with(
                 Some(i) => all_cells[base - 1][*i].clone(),
                 None => {
                     let (slot, first) = slots[k];
-                    let line: Vec<&[u8]> = if o.predict {
-                        cells[first..k].iter().map(Vec::as_slice).collect()
-                    } else {
-                        Vec::new()
-                    };
-                    let first = if first < k {
-                        cells[first].clone()
-                    } else {
-                        Vec::new()
-                    };
-                    cur.next(slot, &first, o.predict.then_some(&line[..]))?
+                    let line = &cells[first..k];
+                    let key = line.first().map_or(&[][..], Vec::as_slice);
+                    cur.next(slot, key, o.predict.then_some(line))?
                 }
             };
             cells.push(v);

@@ -162,6 +162,34 @@ fn lines_of(
             .map(|p| (p, cols.iter_mut().map(|c| c.next().unwrap()).collect()))
             .collect());
     }
+    if !ix.rows {
+        // one stream per wanted slot: open them all, then go line by line
+        let mut open = Vec::with_capacity(want.len());
+        for &slot in want {
+            let si = *ix
+                .streams
+                .get(&(skeleton, slot, Vec::new()))
+                .ok_or(Error::Decode("ir query: no stream"))?;
+            open.push(Open {
+                bytes: fetch(si)?,
+                at: 0,
+                state: Stream::default(),
+            });
+        }
+        let mut out = Vec::with_capacity(places.len());
+        for at in places {
+            let mut cells: Vec<Vec<u8>> = Vec::with_capacity(want.len());
+            for (wi, o) in open.iter_mut().enumerate() {
+                let line = &cells[..wi.min(PREDICTORS)];
+                let v = o
+                    .state
+                    .get_in(&o.bytes, &mut o.at, ix.predict.then_some(line), ix.step)?;
+                cells.push(v);
+            }
+            out.push((at, cells));
+        }
+        return Ok(out);
+    }
     let mut open: HashMap<(usize, Vec<u8>), Open> = HashMap::new();
     let mut out = Vec::new();
     for at in places {
@@ -199,17 +227,10 @@ fn lines_of(
                 );
             }
             let o = open.get_mut(&key).unwrap();
-            let line: Vec<&[u8]> = cells
-                .iter()
-                .take(wi.min(PREDICTORS))
-                .map(Vec::as_slice)
-                .collect();
-            let v = o.state.get_in(
-                &o.bytes,
-                &mut o.at,
-                ix.predict.then_some(&line[..]),
-                ix.step,
-            )?;
+            let line = &cells[..wi.min(PREDICTORS)];
+            let v = o
+                .state
+                .get_in(&o.bytes, &mut o.at, ix.predict.then_some(line), ix.step)?;
             cells.push(v);
         }
         if !skip {
