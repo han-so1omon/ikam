@@ -1,7 +1,7 @@
 //! E192: the IR codec returns every file byte-exact, for any bytes and any
-//! options.
+//! options. E197: so do blocks, each read on its own.
 
-use ikam_kernel::ir::{Options, decode, encode, pack, unpack};
+use ikam_kernel::ir::{self, Options, decode, encode, pack, unpack};
 use proptest::prelude::*;
 
 fn all_options() -> Vec<Options> {
@@ -21,12 +21,15 @@ fn roundtrip(files: &[(String, Vec<u8>)]) {
         let back = unpack(&pack(&parts)).unwrap();
         assert_eq!(back, parts);
         assert_eq!(decode(&parts).unwrap(), files, "{o:?}");
+        for keyframe in [false, true] {
+            let b = ir::encode_blocks(files, o, 2, keyframe);
+            assert_eq!(ir::decode_blocks(&b).unwrap(), files, "{o:?} blocks");
+        }
     }
 }
 
-#[test]
-fn tables_reports_and_edge_cases_roundtrip() {
-    let files: Vec<(String, Vec<u8>)> = [
+fn sample() -> Vec<(String, Vec<u8>)> {
+    [
         (
             "a.csv",
             "\"Client\",\"Amount\"\n\"Vista \"\"A\"\"\",\"$1,650,000\"\n,x,\r\n\"open",
@@ -53,8 +56,12 @@ fn tables_reports_and_edge_cases_roundtrip() {
     ]
     .iter()
     .map(|(n, b)| (n.to_string(), b.as_bytes().to_vec()))
-    .collect();
-    roundtrip(&files);
+    .collect()
+}
+
+#[test]
+fn tables_reports_and_edge_cases_roundtrip() {
+    roundtrip(&sample());
 }
 
 proptest! {
@@ -71,5 +78,22 @@ proptest! {
         files.sort_by(|a, b| a.0.cmp(&b.0));
         files.dedup_by(|a, b| a.0 == b.0);
         roundtrip(&files);
+    }
+}
+
+#[test]
+fn blocks_roundtrip_and_read_alone() {
+    let files = sample();
+    for per in [1, 2, 3, 7, 100] {
+        for o in all_options() {
+            for keyframe in [false, true] {
+                let b = ir::encode_blocks(&files, o, per, keyframe);
+                assert_eq!(ir::decode_blocks(&b).unwrap(), files, "per {per} {o:?}");
+                // backwards, so no block is read after the one before it
+                for (i, chunk) in files.chunks(per).enumerate().rev() {
+                    assert_eq!(ir::decode_block(&b, i).unwrap(), chunk);
+                }
+            }
+        }
     }
 }

@@ -426,7 +426,7 @@ fn parse_num(c: &[u8]) -> Option<Num> {
 // and delta; 3 a string seen before in this stream, by index; 4 a new
 // string.
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 struct Stream {
     out: Vec<u8>,
     prev: Option<Vec<u8>>,
@@ -560,10 +560,38 @@ fn stream_key(o: Options, slot: (usize, usize), first: &[u8]) -> (usize, usize, 
 
 /// Encodes `files` (names and bytes) with the given options.
 pub fn encode(files: &[(String, Vec<u8>)], o: Options) -> Parts {
-    let mut skel_ids: HashMap<Vec<u8>, usize> = HashMap::new();
+    let mut table = Skeletons::default();
+    let mut parts = encode_with(files, o, &mut table, &mut EncState::default());
+    parts.skeletons = table.list;
+    parts
+}
+
+/// A skeleton table shared by several encodes (E197 blocks).
+#[derive(Default)]
+struct Skeletons {
+    ids: HashMap<Vec<u8>, usize>,
+    list: Vec<Vec<u8>>,
+}
+
+/// The streams after an encode, so a later encode can go on from them (a
+/// block coded against a keyframe block, E197).
+#[derive(Clone, Default)]
+struct EncState {
+    index: HashMap<(usize, usize, Vec<u8>), usize>,
+    streams: Vec<Stream>,
+}
+
+/// `encode` against a skeleton table that outlives it, going on from the
+/// streams in `state`: the returned parts have no skeletons of their own,
+/// and their directory names only the streams this encode added.
+fn encode_with(
+    files: &[(String, Vec<u8>)],
+    o: Options,
+    table: &mut Skeletons,
+    state: &mut EncState,
+) -> Parts {
     let mut parts = Parts::default();
-    let mut index: HashMap<(usize, usize, Vec<u8>), usize> = HashMap::new();
-    let mut streams: Vec<Stream> = Vec::new();
+    let EncState { index, streams } = state;
     let mut all_cells: Vec<Vec<&[u8]>> = Vec::new();
     let mut by_stem: HashMap<&str, usize> = HashMap::new();
     parts
@@ -577,9 +605,9 @@ pub fn encode(files: &[(String, Vec<u8>)], o: Options) -> Parts {
         let mut slots = Vec::new();
         for l in &ls {
             let key = skeleton_bytes(&l.segs);
-            let next = skel_ids.len();
-            let id = *skel_ids.entry(key.clone()).or_insert_with(|| {
-                parts.skeletons.push(key);
+            let next = table.list.len();
+            let id = *table.ids.entry(key.clone()).or_insert_with(|| {
+                table.list.push(key);
                 next
             });
             put_var(&mut parts.files, id as u128);
@@ -630,27 +658,42 @@ pub fn encode(files: &[(String, Vec<u8>)], o: Options) -> Parts {
         by_stem.entry(stem(name)).or_insert(fi);
         all_cells.push(cells);
     }
-    parts.streams = streams.into_iter().map(|s| s.out).collect();
+    parts.streams = streams
+        .iter_mut()
+        .map(|s| std::mem::take(&mut s.out))
+        .collect();
     parts
+}
+
+/// The streams after a decode (the decoding side of `EncState`).
+#[derive(Clone, Default)]
+struct DecState {
+    index: HashMap<(usize, usize, Vec<u8>), usize>,
+    states: Vec<Stream>,
 }
 
 /// Reads cells from the streams in the order `encode` wrote them.
 struct Cursor<'a> {
     streams: &'a [Vec<u8>],
-    states: Vec<(Stream, usize)>,
-    index: HashMap<(usize, usize, Vec<u8>), usize>,
+    state: &'a mut DecState,
+    pos: Vec<usize>,
     o: Options,
 }
 
 impl Cursor<'_> {
     fn next(&mut self, slot: (usize, usize), first: &[u8]) -> Result<Vec<u8>, Error> {
         let key = stream_key(self.o, slot, first);
-        let i = *self.index.get(&key).ok_or(Error::Decode("ir: no stream"))?;
-        let (st, at) = self
+        let i = *self
+            .state
+            .index
+            .get(&key)
+            .ok_or(Error::Decode("ir: no stream"))?;
+        let st = self
+            .state
             .states
             .get_mut(i)
             .ok_or(Error::Decode("ir: no stream"))?;
-        st.get(&self.streams[i], at)
+        st.get(&self.streams[i], &mut self.pos[i])
     }
 }
 
@@ -667,6 +710,16 @@ pub fn directory(parts: &Parts) -> Result<Vec<(usize, usize, Vec<u8>)>, Error> {
 
 /// The files `encode` was given, byte-exact.
 pub fn decode(parts: &Parts) -> Result<Vec<(String, Vec<u8>)>, Error> {
+    decode_with(parts, &parts.skeletons, &mut DecState::default())
+}
+
+/// `decode` with the skeletons given apart from the parts, going on from the
+/// streams in `state` (E197 blocks).
+fn decode_with(
+    parts: &Parts,
+    skeletons: &[Vec<u8>],
+    state: &mut DecState,
+) -> Result<Vec<(String, Vec<u8>)>, Error> {
     let f = &parts.files;
     let flags = *f.first().ok_or(Error::Decode("ir: empty"))?;
     let o = Options {
@@ -674,28 +727,28 @@ pub fn decode(parts: &Parts) -> Result<Vec<(String, Vec<u8>)>, Error> {
         rows: flags & 2 != 0,
         ..Options::default()
     };
-    let skels: Vec<Vec<&[u8]>> = parts
-        .skeletons
+    let skels: Vec<Vec<&[u8]>> = skeletons
         .iter()
         .map(|s| segments(s))
         .collect::<Result<_, _>>()?;
-    let mut index: HashMap<_, _> = directory(parts)?
-        .into_iter()
-        .enumerate()
-        .map(|(i, k)| (k, i))
-        .collect();
-    if !o.columns {
-        index.insert((0, 0, Vec::new()), 0);
+    let base = state.states.len();
+    let keys = directory(parts)?;
+    if parts.streams.len() != base + keys.len() {
+        return Err(Error::Decode("ir: stream count"));
     }
-    let states = parts
-        .streams
-        .iter()
-        .map(|_| (Stream::default(), 0))
-        .collect();
+    for (i, k) in keys.into_iter().enumerate() {
+        state.index.insert(k, base + i);
+    }
+    if !o.columns {
+        state.index.entry((0, 0, Vec::new())).or_insert(0);
+    }
+    state
+        .states
+        .resize_with(parts.streams.len(), Stream::default);
     let mut cur = Cursor {
         streams: &parts.streams,
-        states,
-        index,
+        state,
+        pos: vec![0; parts.streams.len()],
         o,
     };
     let mut at = 1;
@@ -766,6 +819,109 @@ pub fn decode(parts: &Parts) -> Result<Vec<(String, Vec<u8>)>, Error> {
         }
         all_cells.push(cells);
         out.push((name, bytes));
+    }
+    Ok(out)
+}
+
+// ---- blocks (E197) ----
+
+/// Files cut into blocks of a fixed number of files, in order. One skeleton
+/// table is shared by every block; each block's cells, streams and diffs are
+/// its own, so reading one file decodes one block, not every file. Siblings
+/// (`Options::siblings`) only reach files in the same block.
+///
+/// With `keyframe`, every block after the first goes on from the streams as
+/// the first block left them (its strings, its last numbers), as a video
+/// frame is coded against a keyframe: a read decodes the first block (once,
+/// it can be kept) and the block it wants, and no block restarts its deltas
+/// from nothing.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Blocks {
+    pub per: usize,
+    pub keyframe: bool,
+    pub skeletons: Vec<Vec<u8>>,
+    /// Each block's parts, with no skeletons of their own.
+    pub blocks: Vec<Parts>,
+}
+
+/// Encodes `files` as blocks of `per` files (at least 1).
+pub fn encode_blocks(
+    files: &[(String, Vec<u8>)],
+    o: Options,
+    per: usize,
+    keyframe: bool,
+) -> Blocks {
+    let per = per.max(1);
+    let mut table = Skeletons::default();
+    let mut key = EncState::default();
+    let mut blocks = Vec::new();
+    for (i, c) in files.chunks(per).enumerate() {
+        let mut state = if keyframe && i > 0 {
+            key.clone()
+        } else {
+            EncState::default()
+        };
+        blocks.push(encode_with(c, o, &mut table, &mut state));
+        if keyframe && i == 0 {
+            key = state;
+        }
+    }
+    Blocks {
+        per,
+        keyframe,
+        skeletons: table.list,
+        blocks,
+    }
+}
+
+type Files = Vec<(String, Vec<u8>)>;
+
+/// Reads blocks one at a time, keeping the decoded keyframe (if any) between
+/// reads.
+pub struct Reader<'a> {
+    b: &'a Blocks,
+    key: Option<(Files, DecState)>,
+}
+
+/// A reader of `b`'s blocks, which decodes the keyframe at most once.
+pub fn reader(b: &Blocks) -> Reader<'_> {
+    Reader { b, key: None }
+}
+
+impl Reader<'_> {
+    /// The files of block `i`, byte-exact.
+    pub fn block(&mut self, i: usize) -> Result<Vec<(String, Vec<u8>)>, Error> {
+        let b = self.b;
+        let p = b.blocks.get(i).ok_or(Error::Decode("ir: no block"))?;
+        if !b.keyframe {
+            return decode_with(p, &b.skeletons, &mut DecState::default());
+        }
+        if self.key.is_none() {
+            let mut st = DecState::default();
+            let first = b.blocks.first().ok_or(Error::Decode("ir: no block"))?;
+            let files = decode_with(first, &b.skeletons, &mut st)?;
+            self.key = Some((files, st));
+        }
+        let (files, st) = self.key.as_ref().expect("set above");
+        if i == 0 {
+            return Ok(files.clone());
+        }
+        decode_with(p, &b.skeletons, &mut st.clone())
+    }
+}
+
+/// The files of block `i`, byte-exact (decoding the keyframe first if `b`
+/// has one).
+pub fn decode_block(b: &Blocks, i: usize) -> Result<Vec<(String, Vec<u8>)>, Error> {
+    reader(b).block(i)
+}
+
+/// Every file of every block, in order.
+pub fn decode_blocks(b: &Blocks) -> Result<Vec<(String, Vec<u8>)>, Error> {
+    let mut r = reader(b);
+    let mut out = Vec::new();
+    for i in 0..b.blocks.len() {
+        out.extend(r.block(i)?);
     }
     Ok(out)
 }

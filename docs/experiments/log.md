@@ -2785,3 +2785,25 @@ Newest last. Format and rules: `README.md`.
 ### Merge of E192 to E196 into main (Nov 11)
 - On Eric's word ("Merge it"), exp/192-ir-compression merged onto main 17589ee as f46d252 (the merge tree is the branch tree). Every IR option is off: nothing in put, repack or the bench calls `ir`; it is a module an application or an experiment chooses.
 - Gates on the merge: 191 kernel tests pass; clippy `-D warnings` and fmt clean; the fixed bench gives the same 147 byte and count fields as main's last two runs (E186, E190) and north 0.3035.
+
+### E197 ir-blocks (read one report without decoding every report)
+- Branch / parent: exp/197-ir-blocks / main a831e15 (E192 to E196 merged)
+- Question: E195 left one catch: the IR is one solid pack, so reading one of 300 reports decodes all 300 (12 ms, against 0.03 ms for a file stored in the kernel). Can the IR be cut so a read decodes a small part, and what does that cost in bytes?
+- Change: `ir::encode_blocks(files, options, per, keyframe)` cuts the files, in order, into blocks of `per`. One skeleton table is shared by every block; each block's streams, dictionaries and sibling diffs are its own, so `ir::reader(&blocks).block(i)` decodes one block. With `keyframe`, each block after the first goes on from the streams as the first block left them (its strings and last numbers), like video frames coded against a keyframe: a cold read decodes the first block and its own, and a reader keeps the first. Each block is stored three ways: xz -9 per block; zstd -19 per block with one trained dictionary (counted); and the kernel, one content per block, repacked at the archive weight. The examples' corpora and compressors moved to `examples/ir_common/` unchanged (`ir_compress` prints the same table).
+- Result (stored bytes against xz -9 over all 300 files, and the time to read the middle file, cold):
+
+  | corpus | per block | independent, kernel | keyframe, kernel |
+  | --- | ---: | --- | --- |
+  | reports-drift | 1 | 1.967, 0.15 ms | 1.943, 0.24 ms |
+  | reports-drift | 20 | 1.227, 0.84 ms | 1.129, 1.35 ms |
+  | reports-drift | 50 | 0.904, 1.9 ms | 0.858, 3.3 ms |
+  | reports-drift | 100 | 0.756, 3.3 ms | 0.718, 6.6 ms |
+  | reports-drift | 300 (one block) | 0.636, 9.7 ms | same |
+  | reports-random | 20 | 0.938, 1.0 ms | 0.863, 2.3 ms |
+  | reports-random | 50 | 0.816, 2.9 ms | 0.792, 4.1 ms |
+  | exports (md, csv, json) | 30 | 0.891, 0.58 ms | 0.769, 1.0 ms |
+  | exports | 60 | 0.729, 0.81 ms | 0.630, 1.8 ms |
+
+  The kernel is the best home for blocks at every size: its repack deltas reach across blocks where xz and zstd per block cannot (drift, 20 per block: kernel 1.227, xz per block 1.798, zstd with a dictionary 2.150). The files themselves in the kernel are 1.641 with 0.03 ms reads. A read costs about 0.03 ms per report in the block, so the block size is a dial between bytes and read time; the keyframe saves 4 to 14% at the cost of a second block decode on a cold read.
+- Verdict: **measured**. Blocks of 20 to 100 reports in the kernel keep most of the IR's gain (0.72 to 1.13 of xz against the files' 1.641) with 1 to 7 ms reads; small blocks (under 10) lose to storing the files. Off unless an application calls `encode_blocks`.
+- Run: `cargo run --release --example ir_blocks [reports-drift|reports-random|exports]` (about 6 minutes).
