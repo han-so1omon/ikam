@@ -118,63 +118,41 @@ impl Store for Dyn {
     }
 }
 
+/// The options behind each `packs*` backend name, shared by every phase so a
+/// new pack name works everywhere at once (E185: `churn` had its own list and
+/// missed `packs-filter`).
+fn pack_options(name: &str) -> Option<ikam_kernel::backends::PackOptions> {
+    use ikam_kernel::backends::PackOptions;
+    let d = PackOptions::default();
+    Some(match name {
+        "packs" => d,
+        "packs-lazy" => PackOptions {
+            lazy_checkpoint: true,
+            ..d
+        },
+        "packs-log" => PackOptions { ref_log: true, ..d },
+        "packs-fast" => PackOptions {
+            lazy_checkpoint: true,
+            ref_log: true,
+            ..d
+        },
+        "packs-filter" => PackOptions { filters: true, ..d },
+        "packs-fast-filter" => PackOptions {
+            lazy_checkpoint: true,
+            ref_log: true,
+            filters: true,
+        },
+        _ => return None,
+    })
+}
+
 fn open(name: &str, dir: &Path) -> Dyn {
     use ikam_kernel::backends::*;
     let s: Box<dyn Store> = match name {
         "files" => Box::new(FsStore::open(dir).unwrap()),
-        "packs" => Box::new(ikam_kernel::backends::PackStore::open(dir).unwrap()),
-        "packs-lazy" => Box::new(
-            PackStore::open_with(
-                dir,
-                PackOptions {
-                    lazy_checkpoint: true,
-                    ..PackOptions::default()
-                },
-            )
-            .unwrap(),
-        ),
-        "packs-log" => Box::new(
-            PackStore::open_with(
-                dir,
-                PackOptions {
-                    ref_log: true,
-                    ..PackOptions::default()
-                },
-            )
-            .unwrap(),
-        ),
-        "packs-fast" => Box::new(
-            PackStore::open_with(
-                dir,
-                PackOptions {
-                    lazy_checkpoint: true,
-                    ref_log: true,
-                    ..PackOptions::default()
-                },
-            )
-            .unwrap(),
-        ),
-        "packs-filter" => Box::new(
-            PackStore::open_with(
-                dir,
-                PackOptions {
-                    filters: true,
-                    ..PackOptions::default()
-                },
-            )
-            .unwrap(),
-        ),
-        "packs-fast-filter" => Box::new(
-            PackStore::open_with(
-                dir,
-                PackOptions {
-                    lazy_checkpoint: true,
-                    ref_log: true,
-                    filters: true,
-                },
-            )
-            .unwrap(),
-        ),
+        p if pack_options(p).is_some() => {
+            Box::new(PackStore::open_with(dir, pack_options(p).unwrap()).unwrap())
+        }
         "sqlite" => Box::new(sqlite::open(dir, sqlite::Sync::Full).unwrap()),
         "sqlite-normal" => Box::new(sqlite::open(dir, sqlite::Sync::Normal).unwrap()),
         "lmdb" => Box::new(lmdb::open(dir).unwrap()),
@@ -775,21 +753,8 @@ fn churned(i: u64) -> Option<Vec<u8>> {
 }
 
 fn churn(name: &str, dir: &Path, n: u64) {
-    use ikam_kernel::backends::{PackOptions, PackStore};
-    let opts = match name {
-        "packs" => PackOptions::default(),
-        "packs-fast" => PackOptions {
-            lazy_checkpoint: true,
-            ref_log: true,
-            ..PackOptions::default()
-        },
-        "packs-fast-filter" => PackOptions {
-            lazy_checkpoint: true,
-            ref_log: true,
-            filters: true,
-        },
-        _ => panic!("churn is for PackStore backends"),
-    };
+    use ikam_kernel::backends::PackStore;
+    let opts = pack_options(name).expect("churn is for PackStore backends");
     let t = Instant::now();
     let mut s = PackStore::open_with(dir, opts).unwrap();
     for i in 0..n {
@@ -1353,5 +1318,32 @@ fn repo_cost(work: &Path, name: &str, n: u64) {
             pct(&mut rest, 0.5),
             rest.iter().cloned().fold(0.0, f64::max),
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Every pack name in the backend list has options, so `churn` and every
+    /// other pack phase accept it.
+    #[test]
+    fn every_pack_backend_has_options() {
+        for b in BACKENDS.iter().filter(|b| b.starts_with("packs")) {
+            assert!(pack_options(b).is_some(), "{b} has no pack options");
+        }
+        assert!(pack_options("rocksdb").is_none());
+    }
+
+    /// Build, churn and clean a small store for each pack backend.
+    #[test]
+    fn churn_runs_on_every_pack_backend() {
+        for b in BACKENDS.iter().filter(|b| b.starts_with("packs")) {
+            let dir = std::env::temp_dir().join(format!("ikam-churn-{}-{b}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            build(b, &dir, 2_000);
+            churn(b, &dir, 2_000);
+            std::fs::remove_dir_all(&dir).unwrap();
+        }
     }
 }

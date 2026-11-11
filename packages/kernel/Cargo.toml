@@ -52,3 +52,4 @@ opt-level = 2
 [[example]]
 name = "stores"
 required-features = ["stores"]
+test = true
