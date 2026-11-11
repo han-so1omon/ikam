@@ -37,6 +37,10 @@ pub struct Options {
     pub numbers: bool,
     pub siblings: bool,
     pub rows: bool,
+    /// E198: a file under a tenth of whose bytes are cells (prose) is stored
+    /// as it is, in one raw part with the other such
+    /// files, so the general compressor sees running text.
+    pub prose: bool,
 }
 
 /// An encoded set of files: the line skeletons, each file's lines and cell
@@ -48,6 +52,8 @@ pub struct Parts {
     pub files: Vec<u8>,
     pub directory: Vec<u8>,
     pub streams: Vec<Vec<u8>>,
+    /// Files stored as they are (`Options::prose`), one after another.
+    pub raw: Vec<u8>,
 }
 
 /// A lexed line: its skeleton (segments around the cells) and its cells.
@@ -592,15 +598,34 @@ fn encode_with(
 ) -> Parts {
     let mut parts = Parts::default();
     let EncState { index, streams } = state;
+    let lexed: Vec<Vec<Line>> = files.iter().map(|(n, b)| lines(b, &lex(n, b))).collect();
+    // prose: under a tenth of the file's bytes are cells (E198 measured 2 to
+    // 5% for prose, 14% and up for reports and tables)
+    let raw: Vec<bool> = files
+        .iter()
+        .zip(&lexed)
+        .map(|((_, b), fl)| {
+            let cells: usize = fl.iter().flat_map(|l| &l.cells).map(|c| c.len()).sum();
+            o.prose && !b.is_empty() && cells * 10 < b.len()
+        })
+        .collect();
     let mut all_cells: Vec<Vec<&[u8]>> = Vec::new();
     let mut by_stem: HashMap<&str, usize> = HashMap::new();
     parts
         .files
-        .push(u8::from(o.columns) | u8::from(o.rows) << 1);
+        .push(u8::from(o.columns) | u8::from(o.rows) << 1 | u8::from(o.prose) << 2);
     put_var(&mut parts.files, files.len() as u128);
-    for (fi, (name, b)) in files.iter().enumerate() {
-        let ls = lines(b, &lex(name, b));
+    for (fi, ((name, b), ls)) in files.iter().zip(lexed).enumerate() {
         put_bytes(&mut parts.files, name.as_bytes());
+        if o.prose {
+            parts.files.push(u8::from(raw[fi]));
+            if raw[fi] {
+                put_var(&mut parts.files, b.len() as u128);
+                parts.raw.extend_from_slice(b);
+                all_cells.push(Vec::new());
+                continue;
+            }
+        }
         put_var(&mut parts.files, ls.len() as u128);
         let mut slots = Vec::new();
         for l in &ls {
@@ -725,8 +750,10 @@ fn decode_with(
     let o = Options {
         columns: flags & 1 != 0,
         rows: flags & 2 != 0,
+        prose: flags & 4 != 0,
         ..Options::default()
     };
+    let mut raw_at: usize = 0;
     let skels: Vec<Vec<&[u8]>> = skeletons
         .iter()
         .map(|s| segments(s))
@@ -758,6 +785,21 @@ fn decode_with(
     for _ in 0..n {
         let name = String::from_utf8(get_bytes(f, &mut at)?.to_vec())
             .map_err(|_| Error::Decode("ir: name"))?;
+        if o.prose {
+            let kind = *f.get(at).ok_or(Error::Decode("ir: truncated"))?;
+            at += 1;
+            if kind == 1 {
+                let len = get_usize(f, &mut at)?;
+                let bytes = parts
+                    .raw
+                    .get(raw_at..raw_at.saturating_add(len))
+                    .ok_or(Error::Decode("ir: raw"))?;
+                raw_at += len;
+                all_cells.push(Vec::new());
+                out.push((name, bytes.to_vec()));
+                continue;
+            }
+        }
         let nl = get_usize(f, &mut at)?;
         let ids: Vec<usize> = (0..nl)
             .map(|_| get_usize(f, &mut at))
@@ -935,6 +977,11 @@ pub fn pack(p: &Parts) -> Vec<u8> {
     put_bytes(&mut out, &p.directory);
     put_var(&mut out, p.streams.len() as u128);
     p.streams.iter().for_each(|s| put_bytes(&mut out, s));
+    // E198: the raw part only when there is one, so packs without it read
+    // as before
+    if !p.raw.is_empty() {
+        put_bytes(&mut out, &p.raw);
+    }
     out
 }
 
@@ -954,11 +1001,17 @@ pub fn unpack(b: &[u8]) -> Result<Parts, Error> {
     let files = get_bytes(b, &mut at)?.to_vec();
     let directory = get_bytes(b, &mut at)?.to_vec();
     let streams = list(&mut at)?;
+    let raw = if at < b.len() {
+        get_bytes(b, &mut at)?.to_vec()
+    } else {
+        Vec::new()
+    };
     Ok(Parts {
         skeletons,
         files,
         directory,
         streams,
+        raw,
     })
 }
 

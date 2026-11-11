@@ -626,6 +626,8 @@ pub fn ir_zstd_parts(files: &Files, o: Options) -> Row {
             files: parts[1].clone(),
             directory: parts[2].clone(),
             streams,
+            // `ir_compress` never sets `prose`, so there is no raw part
+            ..Parts::default()
         };
         ir::decode(&p).unwrap()
     });
@@ -655,6 +657,7 @@ pub const T: Options = Options {
     numbers: false,
     siblings: false,
     rows: false,
+    prose: false,
 };
 pub const TC: Options = Options { columns: true, ..T };
 pub const TCN: Options = Options {
