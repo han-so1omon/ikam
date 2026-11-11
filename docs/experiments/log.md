@@ -3189,3 +3189,22 @@ Newest last. Format and rules: `README.md`.
   Python's xz decodes the two whole files in 147 ms.
 - Verdict: **measured, not built**. Groups lose the gain fast: at 10,000 rows half of it is gone, and below about 4,000 rows the groups are larger than xz over the plain files, even after group 0. Reads get faster only in proportion to the group size. If row ranges are needed, 10,000-row groups after a keyframe are the knee (0.955, about a third of the whole-table read).
 - Run: `python3 -I packages/kernel/scripts/ir_row_groups.py tests/fixtures/san-diego-business-registry/*.csv` (about a minute).
+
+### E221 ir-block-raw (each block's raw text as its own store entry)
+- Branch / parent: exp/221-ir-block-raw / E220 (stacked)
+- Question: E217's blocks lost about a fifth of the whole pack's gain on prose-heavy folders (cases: 0.672 whole, 0.819 in blocks of 50). Each block's raw part (E198, files kept as they are) was packed with its streams in one entry. If each raw part were its own entry, would the kernel's repack (templates, trained dictionaries) win some of that back by seeing the raw parts as similar entries?
+- Change: none to the kernel. New `examples/ir_blockraw.rs` stores E216's setting (untuned) in blocks of 20 and 50 with a keyframe, with each block's raw part packed with its streams (as E217) or as its own entry.
+- Result (against the files in the kernel):
+
+  | corpus | whole pack | blocks of 20: together / raw apart | blocks of 50: together / raw apart |
+  | --- | ---: | ---: | ---: |
+  | reports-drift | 0.303 | 0.432 / 0.432 | 0.381 / 0.381 |
+  | exports | 0.228 | 0.358 / 0.358 | 0.277 / 0.277 |
+  | tables | 0.700 | 0.775 / 0.775 | 0.738 / 0.738 |
+  | texts | 0.849 | 0.863 / 0.912 | 0.851 / 0.851 |
+  | drift + texts | 0.560 | 0.635 / 0.657 | 0.597 / 0.600 |
+  | cases text (real) | 0.672 | 0.833 / 0.821 | 0.819 / 0.811 |
+  | cases text + drift | 0.611 | 0.781 / 0.798 | 0.749 / 0.760 |
+
+- Verdict: **dropped**. Raw parts apart win at most 0.012 (cases alone) and lose up to 0.049 elsewhere; the repack does not recover what a block's raw text loses by being compressed apart from the rest of the folder. Blocks of 50 stay the better block size. What would help is a raw part that later blocks compress against (as the keyframe does for streams), which needs a dictionary in the block format, not a different layout in the store.
+- Run: `cargo run --release --example ir_blockraw [corpus ...]` (about a minute).
