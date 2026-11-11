@@ -1118,10 +1118,42 @@ pub struct PackStore {
     active: File,
     active_no: u32,
     active_index: HashMap<Id, (u64, u32)>,
+    /// E190: the open pack's ids in order, built on the first prefix lookup
+    /// (`ids_with_prefix`, which the ledger runs once per short derivation
+    /// record), so that lookup is a binary search, not a scan of every
+    /// record in the open pack. Point lookups and open are unchanged.
+    prefix_ix: std::sync::Mutex<PrefixIx>,
     buf: Vec<u8>,
     flushed: u64,
     ckpt_at: u64, // where the open pack's last checkpoint ends
     _lock: File,
+}
+
+/// E190: ids of the open pack, sorted, plus those written since the sort.
+#[derive(Default)]
+struct PrefixIx {
+    sorted: Option<Vec<Id>>,
+    recent: Vec<Id>,
+}
+
+impl PrefixIx {
+    /// How many writes may wait unsorted before they are merged in.
+    const RECENT: usize = 4096;
+
+    fn note(&mut self, id: Id) {
+        if let Some(sorted) = &mut self.sorted {
+            self.recent.push(id);
+            if self.recent.len() >= Self::RECENT {
+                sorted.append(&mut self.recent);
+                sorted.sort_unstable();
+                sorted.dedup();
+            }
+        }
+    }
+
+    fn clear(&mut self) {
+        *self = PrefixIx::default();
+    }
 }
 
 fn crc(id: &Id, len: u32, bytes: &[u8]) -> u32 {
@@ -1268,6 +1300,7 @@ impl PackStore {
             active,
             active_no,
             active_index,
+            prefix_ix: Default::default(),
             buf: Vec::new(),
             flushed: good,
             // E179: not `good`: a tail scanned after a crash is not saved,
@@ -1293,7 +1326,9 @@ impl PackStore {
         self.buf.extend_from_slice(body);
         self.buf
             .extend_from_slice(&crc(&id, len, body).to_le_bytes());
-        self.active_index.insert(id, (off, len));
+        if self.active_index.insert(id, (off, len)).is_none() {
+            self.prefix_ix.get_mut().unwrap().note(id);
+        }
         if self.buf.len() >= 1 << 20 {
             self.flush()?;
         }
@@ -1357,6 +1392,7 @@ impl PackStore {
                 filter,
             }));
             self.active_index.clear();
+            self.prefix_ix.get_mut().unwrap().clear();
         }
         Ok(())
     }
@@ -1413,6 +1449,7 @@ impl PackStore {
         // E172: the new pack's name must be durable before records in it are.
         sync_dir(&self.root.join("packs"))?;
         self.active_index.clear();
+        self.prefix_ix.get_mut().unwrap().clear();
         self.flushed = 0;
         self.ckpt_at = 0;
         Ok(())
@@ -2036,10 +2073,24 @@ impl Store for PackStore {
                 }
             }
         }
-        for (id, &(_, len)) in &self.active_index {
-            if id.as_bytes().starts_with(prefix) {
-                live.insert(*id, len != TOMBSTONE);
-            }
+        let mut ix = self.prefix_ix.lock().unwrap();
+        let ix = &mut *ix;
+        let sorted = ix.sorted.get_or_insert_with(|| {
+            let mut v: Vec<Id> = self.active_index.keys().copied().collect();
+            v.sort_unstable();
+            v
+        });
+        let lo = sorted.partition_point(|id| id.as_bytes()[..] < *prefix);
+        let found = sorted[lo..]
+            .iter()
+            .take_while(|id| id.as_bytes().starts_with(prefix))
+            .chain(
+                ix.recent
+                    .iter()
+                    .filter(|id| id.as_bytes().starts_with(prefix)),
+            );
+        for id in found {
+            live.insert(*id, self.active_index[id].1 != TOMBSTONE);
         }
         Ok(live
             .into_iter()
