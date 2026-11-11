@@ -3208,3 +3208,20 @@ Newest last. Format and rules: `README.md`.
 
 - Verdict: **dropped**. Raw parts apart win at most 0.012 (cases alone) and lose up to 0.049 elsewhere; the repack does not recover what a block's raw text loses by being compressed apart from the rest of the folder. Blocks of 50 stay the better block size. What would help is a raw part that later blocks compress against (as the keyframe does for streams), which needs a dictionary in the block format, not a different layout in the store.
 - Run: `cargo run --release --example ir_blockraw [corpus ...]` (about a minute).
+
+### E222 ir-north (the E216 setting on the north corpora)
+- Branch / parent: exp/222-ir-north / E221 (stacked)
+- Question: before the IR goes behind a put or repack option, what would it do to the north score (E099), whose three corpora mix text files with office and pdf files that share their facts? The kernel already shares text across formats (E112 and earlier), and an IR pack takes the text files out of that sharing.
+- Change: none to the kernel. New `examples/ir_north.rs` stores each north corpus (the same files as `bench north`) in the kernel as it is, and with its text files (md, html, json, jsonl, csv, log, py) replaced by one IR pack of them under E216's setting (untuned), office and pdf files left to the kernel; and the text files alone, in the kernel and as the pack in the kernel.
+- Result (bytes stored; the kernel over every file matches the bench's `kernel` field for each corpus):
+
+  | corpus | files (text) | kernel, every file | text as one IR pack | text alone: kernel / IR pack in the kernel |
+  | --- | ---: | ---: | ---: | ---: |
+  | north/cases | 792 (510) | 391,496 | 319,992 (0.817) | 190,312 / 125,339 (0.659) |
+  | north/multiformat | 96 (48) | 332,403 | 321,975 (0.969) | 45,619 / 33,457 (0.733) |
+  | north/tables | 144 (72) | 135,551 | 162,554 (1.199) | 6,497 / 4,636 (0.714) |
+
+  Geometric mean: 0.983 for the whole corpora (north score 0.3035 would become about 0.298), 0.701 for the text files alone. Encode 1.5 s at most.
+- Verdict: **measured**. On text files alone the IR stores 0.66 to 0.73 of what the kernel stores. In a mixed corpus it wins where the text stands on its own (cases 0.817) and loses where the text repeats an office or pdf file's facts (tables 1.199: the kernel's sharing of the same records across csv, json, md, xlsx, docx and pdf saves more than the IR's coding of the csv, json and md alone). So an IR option in repack needs a judge at the store, as `route` (E208) is in the pack: keep the IR pack only where the store is smaller with it. With that judge the three corpora would be 0.817, 0.969 and 1.000, a geometric mean of 0.925 (north about 0.281), at the cost of a second repack of the text files.
+- Next: an `ir` repack option that encodes a tree's text files with the E216 setting and keeps the pack only when the stored bytes go down; then the bench's north score with it on.
+- Run: `cargo run --release --example ir_north` (about 1.5 minutes).
