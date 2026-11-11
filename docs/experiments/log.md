@@ -2935,3 +2935,23 @@ Newest last. Format and rules: `README.md`.
   With the parts in the kernel (E205's layout), a column query on the 0.548-of-xz drift store now takes 4.0 ms (was 13.4), against 17.4 ms reading the files; on random reports 4.0 ms at 0.619 of xz.
 - Verdict: **measured**. Same bytes; queries on the predicting IR 3 times faster, decode a third faster. Not an option: it changes no output.
 - Run: `cargo run --release --example ir_speed` (about a minute), `cargo run --release --example ir_parity` (about 2 minutes; compare its output across commits).
+
+### E207 ir-real (the IR on real files, not generated ones)
+- Branch / parent: exp/207-ir-real / E206 (stacked)
+- Question: E192 to E206 measured on generated reports, which were made to have the structure the IR looks for. How does it do on files made elsewhere?
+- Change (measurement only): `examples/ir_real.rs` runs every IR variant, with and without `prose`, on two folders in the repo: the San Diego business tax registry fixture (2 CSV files, 51,000 rows, 10.8 MB) and the text files of the cases fixture (526 notes, playbooks, forms, scripts and logs of 18 sample businesses, 832 KB). Then the schema (E202) and a column query (E203, E205) on the registry. Only column names and counts are printed, no values.
+- Result (xz -9 over the pack, against xz -9 over the files; every variant decoded byte-exact):
+
+  | variant | registry (xz is 0.177 of the bytes) | cases text (0.156) | cases text, with prose |
+  | --- | ---: | ---: | ---: |
+  | templates | 1.041 | 1.304 | 1.081 |
+  | columns | **0.966** | 1.360 | 1.105 |
+  | numbers | 1.013 | 1.366 | 1.107 |
+  | row keys | 1.271 | 1.442 | 1.138 |
+  | predict | 1.009 | 1.367 | 1.107 |
+  | predict, step | 1.009 | 1.367 | 1.107 |
+  | + siblings, nearest 16 | 1.039 | 1.407 | 1.115 |
+
+  By kind of file in the cases folder, the IR lost on every one (json 1.09, md 1.26, py 1.27, txt 1.31, log 1.46 with templates alone; columns made each worse). The schema found one dependency on the registry, ACTIVITY DESC from NAICS (held on 45,066 of 46,176 lines, 1,110 codes, no breaks), in 1.1 s. A column query on ownership type with predict and step took 105 ms against 72 ms splitting the files, because the predictors pull in the first columns of each row, which are near-unique ids and names.
+- Verdict: **measured, and a caveat on everything before it**. On a real table the IR gains 3% over xz (columns only; numbers, predict and step add nothing, row keys cost 27%). On a real mixed folder it loses 8 to 37%, even with `prose`. The large gains of E192 to E206 hold for generated, repetitive reports; real data needs the IR to be chosen per file kind, never forced (E208).
+- Run: `cargo run --release --example ir_real` (about 2 minutes).
