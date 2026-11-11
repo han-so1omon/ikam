@@ -11,7 +11,8 @@
 //! - `reports-30`: 30 random runs (the shape of the Mercante demo's test);
 //! - `exports`: 100 drift runs, each report's table also as csv and json;
 //! - `tables`: `fixtures/tables` csv, json and md (24 real workbooks);
-//! - `texts`: `fixtures/multiformat` md (24 prose texts, a control).
+//! - `texts`: `fixtures/multiformat` md (24 prose texts, a control);
+//! - `dir:<path>`: every file directly in a folder (only sizes are printed).
 //!
 //! Methods: gzip -9, xz -9 and zstd -19 over all files as one stream; zstd 3
 //! with a trained dictionary per file (the bench's baseline); the kernel
@@ -365,6 +366,24 @@ fn fixture(dir: &str, exts: &[&str]) -> Files {
         .collect()
 }
 
+/// Every file directly in `dir`, by name (read only; for real reports, such
+/// as Mercante's `research/reports`). Only sizes and times are printed.
+fn folder(dir: &Path) -> Files {
+    let mut out: Files = std::fs::read_dir(dir)
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .filter(|p| p.is_file())
+        .map(|p| {
+            (
+                p.file_name().unwrap().to_string_lossy().into_owned(),
+                std::fs::read(&p).unwrap(),
+            )
+        })
+        .collect();
+    out.sort();
+    out
+}
+
 fn corpus(name: &str) -> Files {
     match name {
         "reports-drift" => reports(300, false, 1),
@@ -373,7 +392,10 @@ fn corpus(name: &str) -> Files {
         "exports" => exports(100),
         "tables" => fixture("tables", &["csv", "json", "md"]),
         "texts" => fixture("multiformat", &["md"]),
-        _ => panic!("unknown corpus {name}"),
+        _ => match name.strip_prefix("dir:") {
+            Some(dir) => folder(Path::new(dir)),
+            None => panic!("unknown corpus {name}"),
+        },
     }
 }
 
@@ -1091,6 +1113,9 @@ fn main() {
     let want = |n: &str| args.is_empty() || args.iter().any(|a| a == n);
     for n in names.iter().filter(|n| want(n)) {
         sizes(n, &corpus(n));
+    }
+    for d in args.iter().filter(|a| a.starts_with("dir:")) {
+        sizes("folder", &corpus(d));
     }
     if want("benefits") {
         let drifted = corpus("reports-drift");
