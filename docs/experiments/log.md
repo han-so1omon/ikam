@@ -3245,3 +3245,19 @@ Newest last. Format and rules: `README.md`.
 - Why so little, when the pack alone stores 0.66 to 0.73 of the text (E222): every member costs one derivation record holding its file's 32-byte id (cases text: 549 records, 30 KB short, 74 KB plain, against a 125 KB pack), and the kernel's files were already small (92 bytes a report after templates and the dictionary). And the planner stores the pack with zstd, not brotli (cases text 195 KB against 144 KB alone), because it charges a decode of the pack for each member read; teaching its read model about the member cache (first try, reverted) did not change the codec, since repack also plans some text files as slices of the pack, and those count the pack's reads again. Blocks make reads fast (0.1 to 4 ms) but cost more records per file and lose the cross-block bases.
 - Verdict: **measured, not worth turning on**. The members work and stay exact, but at rest they do not beat the kernel's own files except by about 2% on the fixture cases. E222's forecast of north 0.281 assumed files no one reads by id; it does not hold for files kept addressable. The IR's size gains belong where whole folders are written and read together (exports, archives, E217's blocks as entries), not as a per-file storage plan.
 - Run: `cargo run --release --example ir_repack [corpus ...]` (about 7 minutes).
+
+### E224 ir-raw-keyframe (raw text of blocks compressed after the keyframe)
+- Branch / parent: exp/224-ir-raw-keyframe / E223 (stacked)
+- Question: E221 found that storing blocks' raw parts apart does not win back what prose-heavy folders lose in blocks. How much would it win if each block's raw text were compressed after the keyframe block's (block 0's) raw text, as the keyframe already does for streams?
+- Change: none to the kernel. Prototype `packages/kernel/scripts/ir_raw_keyframe.py`: the fixture cases' text files (the raw part, since `route` keeps them plain) in blocks, each block compressed with xz -9 alone, after block 0 (estimated as xz(block 0 + block) minus xz(block 0)), or after a sample of every block's first file.
+- Result (526 files, 832 KB; against xz -9 over every file at once, 128,968 B):
+
+  | blocks of | blocks | alone | after block 0 | after a sample |
+  | ---: | ---: | ---: | ---: | ---: |
+  | 20 | 27 | 1.830 | 1.725 | 1.455 |
+  | 50 | 11 | 1.531 | 1.222 | 1.375 |
+  | 100 | 6 | 1.334 | 1.104 | 1.306 |
+
+- Verdict: **measured, worth building**. Compressing a block's raw text after block 0's cuts blocks of 50 by a fifth (1.531 to 1.222 of the whole), and a reader of any block already decodes block 0 for the keyframe, so the read cost is small. The kernel's related-content frames (E057) could in principle do this, but E221 shows they do not fire for raw parts stored apart. Building it needs the block format to name block 0's raw part as the frame's dictionary (zstd with a raw-content dictionary), or the planner to pick it as the related base.
+- Next: raw parts of later blocks as zstd frames with block 0's raw part as dictionary, in `encode_blocks` with `keyframe`; measure E217's cases blocks again (now 0.819 against 0.672 whole).
+- Run: `python3 -I packages/kernel/scripts/ir_raw_keyframe.py tests/fixtures/cases` (about a minute).
