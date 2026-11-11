@@ -52,3 +52,4 @@ tests/fixtures/wiki/enwik9
 
 # Rust build output
 packages/kernel/target/
+/target-*/

@@ -2785,3 +2785,499 @@ Newest last. Format and rules: `README.md`.
 ### Merge of E192 to E196 into main (Nov 11)
 - On Eric's word ("Merge it"), exp/192-ir-compression merged onto main 17589ee as f46d252 (the merge tree is the branch tree). Every IR option is off: nothing in put, repack or the bench calls `ir`; it is a module an application or an experiment chooses.
 - Gates on the merge: 191 kernel tests pass; clippy `-D warnings` and fmt clean; the fixed bench gives the same 147 byte and count fields as main's last two runs (E186, E190) and north 0.3035.
+
+### E197 ir-blocks (read one report without decoding every report)
+- Branch / parent: exp/197-ir-blocks / main a831e15 (E192 to E196 merged)
+- Question: E195 left one catch: the IR is one solid pack, so reading one of 300 reports decodes all 300 (12 ms, against 0.03 ms for a file stored in the kernel). Can the IR be cut so a read decodes a small part, and what does that cost in bytes?
+- Change: `ir::encode_blocks(files, options, per, keyframe)` cuts the files, in order, into blocks of `per`. One skeleton table is shared by every block; each block's streams, dictionaries and sibling diffs are its own, so `ir::reader(&blocks).block(i)` decodes one block. With `keyframe`, each block after the first goes on from the streams as the first block left them (its strings and last numbers), like video frames coded against a keyframe: a cold read decodes the first block and its own, and a reader keeps the first. Each block is stored three ways: xz -9 per block; zstd -19 per block with one trained dictionary (counted); and the kernel, one content per block, repacked at the archive weight. The examples' corpora and compressors moved to `examples/ir_common/` unchanged (`ir_compress` prints the same table).
+- Result (stored bytes against xz -9 over all 300 files, and the time to read the middle file, cold):
+
+  | corpus | per block | independent, kernel | keyframe, kernel |
+  | --- | ---: | --- | --- |
+  | reports-drift | 1 | 1.967, 0.15 ms | 1.943, 0.24 ms |
+  | reports-drift | 20 | 1.227, 0.84 ms | 1.129, 1.35 ms |
+  | reports-drift | 50 | 0.904, 1.9 ms | 0.858, 3.3 ms |
+  | reports-drift | 100 | 0.756, 3.3 ms | 0.718, 6.6 ms |
+  | reports-drift | 300 (one block) | 0.636, 9.7 ms | same |
+  | reports-random | 20 | 0.938, 1.0 ms | 0.863, 2.3 ms |
+  | reports-random | 50 | 0.816, 2.9 ms | 0.792, 4.1 ms |
+  | exports (md, csv, json) | 30 | 0.891, 0.58 ms | 0.769, 1.0 ms |
+  | exports | 60 | 0.729, 0.81 ms | 0.630, 1.8 ms |
+
+  The kernel is the best home for blocks at every size: its repack deltas reach across blocks where xz and zstd per block cannot (drift, 20 per block: kernel 1.227, xz per block 1.798, zstd with a dictionary 2.150). The files themselves in the kernel are 1.641 with 0.03 ms reads. A read costs about 0.03 ms per report in the block, so the block size is a dial between bytes and read time; the keyframe saves 4 to 14% at the cost of a second block decode on a cold read.
+- Verdict: **measured**. Blocks of 20 to 100 reports in the kernel keep most of the IR's gain (0.72 to 1.13 of xz against the files' 1.641) with 1 to 7 ms reads; small blocks (under 10) lose to storing the files. Off unless an application calls `encode_blocks`.
+- Run: `cargo run --release --example ir_blocks [reports-drift|reports-random|exports]` (about 6 minutes).
+
+### E198 ir-prose (prose stored as it is)
+- Branch / parent: exp/198-ir-prose / E197 (stacked: needs exp/197-ir-blocks)
+- Question: the IR lost on prose (texts 1.249 of xz, E192) and a real folder mixes reports with prose notes. Can prose be routed around the IR without losing the reports' gain?
+- Change: `Options::prose`: a file under a tenth of whose bytes are cells is stored as it is, in a new raw part (`Parts::raw`, packed only when non-empty, so earlier packs read as before) with the other such files; the rest go through the IR as before. The share separates cleanly on every corpus: prose texts have 2 to 5% of their bytes in cells, the reports 18 to 21%, real tables 14 to 81%.
+- Result (xz -9 over the pack, against xz -9 over the files; best IR variant without and with `prose`): reports-drift 0.591 / 0.592; reports-random 0.669 / 0.670; exports 0.483 / 0.482; tables 0.927 / 0.929; texts 1.249 / **1.000**; mixed (the drift reports and the texts in one folder) 1.013 / **0.826**.
+- Tried and dropped: (1) keeping a line whole when no other line shares its skeleton: texts 1.225, mixed 0.967, tables 0.964 (worse); with file routing on top it added nothing. (2) Routing a file when most of its lines are such lines: blank lines are shared, so prose files stayed in the IR (texts 1.218). (3) Most of its bytes on lines no other file uses: texts 1.072, but the real tables went raw and lost their sibling gain (1.026). The spec files in the texts share a template of headings and labels, and the IR still loses on them (4,844 against xz's 3,772): xz's long matches already capture a shared template in running text; the IR wins on cells.
+- Verdict: **measured**. With `prose`, the IR is never worse than xz on these corpora, and a mixed folder drops from 1.013 to 0.826. Off by default.
+- Run: `cargo run --release --example ir_prose` (about 2 minutes).
+
+### E199 ir-nearest (cells diffed against the most similar earlier file)
+- Branch / parent: exp/199-ir-nearest / E198 (stacked: needs exp/197 and exp/198)
+- Question: `siblings` (E194) diffs a file only against the file with its stem. A rerun of a report shares most of its cells with some earlier run of another name. Does diffing against the nearest earlier file help, and where?
+- Change: `Options::nearest` (a window; 0 is off): among the last `nearest` files with the same extension (and the sibling), the one holding the most of this file's cells is chosen as the base, by a cheap count over a cell set, and the cell diff runs on the best two and the sibling. The stored format is E194's (a base and copy and insert runs), so decoding is unchanged. The cheap count keeps the full search's sizes (drift 0.576 both) at 118 ms against 724 ms for diffing all 16; counting cells equal at the same place instead picked worse bases (0.609).
+- Result, whole corpus (best IR variant, xz -9 over the pack, against xz -9 over the files; off / window 1 / 4 / 16): reports-drift 0.591 / 0.670 / 0.584 / 0.576; drift in a shuffled order 0.906 / 1.050 / 0.939 / **0.770**; reports-random 0.669 / 0.688 / 0.685 / 0.691; exports 0.483 / 0.561 / 0.465 / 0.466; tables 0.927 / 0.937. Encode 2 to 4 times slower at 16. A window of 1 is worse everywhere: with row keys a value repeated from the previous run already costs almost nothing, and a diff per file costs more.
+- Result, blocks in the kernel (E197), best variant (off / nearest 16):
+
+  | corpus | per block | independent | keyframe |
+  | --- | ---: | --- | --- |
+  | reports-drift | 20 | 0.984 / **0.759** | 0.958 / 0.743 |
+  | reports-drift | 50 | 0.885 / 0.700 | 0.839 / 0.690 |
+  | reports-drift | 100 | 0.736 / **0.624** | 0.699 / 0.617 |
+  | exports | 30 | 0.668 / 0.663 | 0.649 / 0.611 |
+  | exports | 60 | 0.564 / 0.526 | 0.555 / 0.523 |
+
+  In small blocks the winner drops row keys (columns and numbers only, E193's TCN): row keys make 1,853 streams that each restart in every block. With nearest, blocks of 20 reports read one report in 0.40 ms (the block decoded in memory) at 0.759 of xz, against the files in the kernel at 1.641 and 0.03 ms. E197's table used row keys for every block size, so it understates small blocks: its 1.227 at 20 per block is 0.984 with columns and numbers alone.
+- Verdict: **measured**. Use `nearest: 16` with blocks; whole-corpus packs gain little unless files arrive out of order. Off by default.
+- Run: `cargo run --release --example ir_nearest` (about 8 minutes).
+
+### E200 ir-predict (columns that predict each other: generator plus residual)
+- Branch / parent: exp/200-ir-predict / E199 (stacked)
+- Question: a table often has columns that follow from another column of the same row (a link's sensor and target from its id, a status from its label). Row keys (E193) catch only "follows from the first cell, and repeats from the last run". Can each column learn its own generator and store only where it is wrong?
+- Change: `Options::predict` (with `columns`): each column keeps, for each of its line's first 4 cells, a map from that cell's value to the value the column last had beside it, and how often the map held. A cell the best-scoring map gets right is token 5 (one byte); any other cell is stored as before (the residual), and every map learns it. The decoder learns the same maps from the cells it has already decoded, so nothing about the maps is stored. A flag bit tells the decoder to learn.
+- Result (xz -9 over the pack, against xz -9 over the files; best variant without / with): reports-drift 0.591 / **0.543** (columns and numbers with predict, no row keys: prediction does row keys' job and more); reports-random 0.669 / 0.654; exports 0.483 / **0.448**; tables 0.927 / 0.926. Decode of 300 drift reports 11 ms to 26 ms (31 ms with every earlier cell as a predictor; 4 kept the sizes). In blocks of 20 in the kernel with nearest 16 (E199) the gain goes: independent 0.759 / 0.760, keyframe 0.743 / 0.734. A block's maps start empty, and 20 reports are too few to learn from; a keyframe's maps carry over and help a little.
+- Verdict: **measured**. For whole-corpus packs, `predict` replaces row keys with a better generator (8% smaller on reports, 7% on exports). Not worth it in small blocks. Off by default. The maps are also a learned schema: which column determines which. Reading them out is a next step, not done here.
+- Run: `cargo run --release --example ir_predict` (about 6 minutes).
+
+### E201 ir-order (streams laid out by key)
+- Branch / parent: exp/201-ir-order / E200 (stacked)
+- Question: the IR's streams sit in the pack in the order they first appear, so with row keys (E193) one row's columns sit together and the same column of different rows lies far apart. Does sorting the streams by key (skeleton, slot, row key) give xz closer matches?
+- Change: `Options::group`: at the end of an encode, the streams it added are sorted by key and the directory is rebuilt in that order. Decoding is unchanged (the directory names each stream).
+- Result (xz -9 over the pack, against xz -9 over the files; without / with): with row keys, drift 0.591 / 0.545, reports-random 0.677 / 0.638, exports 0.661 / 0.632 (with siblings 0.483 / 0.452). Without row keys there are few streams and nothing moves. The best of all variants changes only on reports-random, 0.654 / **0.638**; drift (0.543), exports (0.448) and tables (0.926) stay with predict, which needs no row keys. Blocks of 20 in the kernel: no change (0.759, 0.786, 0.719 / 0.717, 0.998 / 1.000). Predict on top of row keys adds nothing: the row-key streams are already one row's history each.
+- Verdict: **measured, small**. Worth it only with row keys on data whose rows repeat in no order. Off by default.
+- Run: `cargo run --release --example ir_order` (under a minute).
+
+### E202 ir-schema (the columns read out as a schema, and the cells that break it)
+- Branch / parent: exp/202-ir-schema / E201 (stacked; needs only `ir::lex_lines` and `ir::segments`, so it could sit on E192 alone)
+- Question: `predict` (E200) learns which column of a line another follows from, only to save bytes. Read out over a folder, is that a usable schema, and does it find errors in the data?
+- Change: `ir::schema` (new module; nothing in the codec or the stored format changes). `dependencies(files, min_rows, min_strength)`: for each line template and slot, the slot of the same line it follows from best, counted in file order as the share of lines that repeat the value their key had last time (a key's first line counts as a miss, so a near-unique column is no key), kept when it holds on `min_strength` of them and explains at least half of the slot's changes from line to line. `events(files, deps)`: per key along each dependency, a value that differs from the one before and is back on the next line (a **blip**), one that differs and holds (a **change**), and a key with two values in one file (a **conflict**: two rows share what should be an id; each row is then followed by place).
+- Result, schema (min 20 lines, 90%): reports-drift 11 dependencies in 60 ms, and they read as the table's meaning: link determines lag, lead, status and (between monthly reruns) every number; reports-random 2 (lag and the header); exports 21 (the same in md, csv and json); tables 0 (too few rows). The history comes out with it: 914 changes in the drift reports (the monthly reruns' numbers, status changes). It found a real fault in the generated data: two links share the id `fares-to-occupancy-us` (12 conflicts in the exports, 4 in the drift reports).
+- Result, errors put in (60 random cells of lines with 2+ cells, each set to another value its column has elsewhere, 3 seeds; the schema read from the corrupted files):
+
+  | corpus | blips on | errors in such a column | found of those | blips flagged that were errors | false blips on the clean corpus |
+  | --- | --- | ---: | ---: | ---: | ---: |
+  | reports-drift | every dependency | 154 of 180 | 91% | 93% | 5 |
+  | reports-drift | dependencies holding 97%+ | 42 of 180 | 98% | 94% | 1 |
+  | exports | every dependency | 146 of 180 | 87% | 98% | 0 |
+  | exports | dependencies holding 97%+ | 14 of 180 | 100% | 100% | 0 |
+
+  The errors no dependency covers are in columns that change on every run (a run counter, the trial counts in the prose line). The 5 false blips on the clean drift reports are real: numbers that moved in one monthly rerun and came back to the same 3 decimals in the next (checked by hand), and one status that changed and changed back.
+- Verdict: **measured**. The IR's templates give a schema and a change history for free, and a blip finder that catches about 9 in 10 errors in the columns it covers with few false alarms. A read-side tool, nothing to switch on.
+- Run: `cargo run --release --example ir_schema` (a few seconds).
+
+### E203 ir-query (one column of every report without rebuilding the reports)
+- Branch / parent: exp/203-ir-query / E202 (stacked; uses only E192's format, so it could sit on main alone)
+- Question: the IR already keeps each column in a stream of its own. Can a question about one column ("every row's status", "one link's status in every report", "rows with dev q under 0.05") be answered from that stream and the files part alone, and how fast against reading and splitting the files?
+- Change: `ir::query` (new module; nothing in the codec or stored format changes). `index(parts, skeletons)` reads the files part and the directory only: which skeleton each line of each file has. `column(ix, skeleton, slot, fetch)` decodes that column's stream and pairs each value with its file and line; `row(ix, skeleton, slot, key, fetch)` gives one row's values across files (with row keys, the key column's stream and that row's stream). `fetch` gives a stream's bytes by index, so a store can hand over only the streams asked for. An encode with `siblings`, `nearest` or `predict` is refused: their cells are not all in their own column's stream.
+- Result (300 reports; best of 7; each answer checked equal to the one from the files; stored size against xz -9 over the files):
+
+  | corpus, layout | stored | every status | one link's status | dev q under 0.05 | streams read |
+  | --- | ---: | ---: | ---: | ---: | ---: |
+  | drift, files in the kernel | 1.641 | 17.9 ms | 17.9 ms | 17.9 ms | all files |
+  | drift, solid IR (columns, numbers), decoded | 0.767 | 24.8 ms | 24.8 ms | 24.8 ms | all |
+  | drift, same bytes, `ir::query` | 0.767 | 1.5 ms | 1.9 ms | 1.8 ms | all decompressed |
+  | drift, IR parts in the kernel (columns, numbers) | 0.819 | **0.6 ms** | **1.1 ms** | **1.0 ms** | 1 / 2 / 1 of 23 |
+  | drift, IR parts in the kernel, row keys | 1.293 | 1.8 ms | 1.1 ms | 2.2 ms | 26 / 2 / 26 of 1,853 |
+  | random, files in the kernel | 1.315 | 25.0 ms | 25.0 ms | 25.0 ms | all files |
+  | random, solid IR (columns, numbers), decoded | 0.669 | 25.2 ms | 25.2 ms | 25.2 ms | all |
+  | random, IR parts in the kernel (columns, numbers) | **0.643** | **0.6 ms** | **1.1 ms** | **1.0 ms** | 1 / 2 / 1 of 23 |
+
+  The smallest IR without the query's limits (predict, nearest, siblings) is 0.543 of xz on drift: the query costs 1.4 times that there, and nothing on random reports, where the parts in the kernel are smaller than the solid pack (the kernel's own deltas and dictionaries across 23 streams beat one xz window). Row keys make 1,853 small streams, which cost size in the kernel and buy nothing here.
+- Verdict: **measured**. Columns and numbers, stored as one kernel content per part, answer a column question in about 1 ms, 18 to 25 times faster than reading the files, at 0.64 to 0.82 of xz. A read-side module; which layout to store is a choice of options already there. Not wired into the store or `serve` yet.
+- Run: `cargo run --release --example ir_query` (about a minute).
+
+### E204 ir-step (number columns that step: a counter, a steady trend)
+- Branch / parent: exp/204-ir-delta2 / E203 (stacked; the codec change sits on E200's `predict`)
+- Question: after E200 the largest stream left in the drift reports is "earlier runs" (1,036 of 9,152 bytes under xz): a counter that is one more each time its link runs. `predict` only gets a value right when it repeats. Can a column also predict "last value beside this key, plus the step it took last time"?
+- Change: `Options::step` (with `predict`): each number column keeps, for each of its line's first 4 cells, a map from that cell's value to the column's last number and step beside it, and how often the step repeated. A cell that is the best such map's last number plus its step (and is not already a repeat or a `predict` hit) is token 6, one byte. The decoder learns the same maps from the cells it decodes; flag bit 4 tells it to. Tests cover every option set (now 512), with counters that cross scales, signs, commas and percent signs.
+- Result (xz -9 over the pack, against xz -9 over the files; best predict variant without / with step): reports-drift 0.543 / **0.505**; reports-random 0.654 / 0.643; exports 0.448 / **0.436**; tables 0.926 / 0.926. With row keys nothing changes (each row's stream already holds one counter, which xz sees). Decode of 300 drift reports with xz 28 ms to 37 ms. Blocks of 20 in the kernel with a keyframe and nearest 16: drift 0.734 / 0.713, random 0.767 / 0.763, exports 0.714 / 0.716.
+- Verdict: **measured**. 7% smaller drift reports and 3% smaller exports for a third more decode time; best IR on drift is now 0.505 of xz. Off by default.
+- Run: `cargo run --release --example ir_step` (about 5 minutes).
+
+### E205 ir-query-predict (queries on the smallest IR: predict and step on)
+- Branch / parent: exp/205-ir-query-predict / E204 (stacked)
+- Question: E203's query refused `predict`, whose cells follow from other columns, so a queryable store cost 0.819 of xz on drift against 0.505 for the smallest IR. A predicted cell only follows from the first 4 cells of its own line, and those streams learn only from their own lines. Can the query decode just those columns, line by line, and keep the size?
+- Change: `ir::query` takes `predict` and `step`: a read of slot k decodes slots 0 to min(k, 4) - 1 and k of that skeleton's lines, in file order, each with its stream's own state (and with row keys, only the rows asked for in `row`). Without `predict` and row keys it decodes the one stream straight through, as in E203. `siblings` and `nearest` are still refused (copied cells are in no stream). The test checks every column and one row of every option set the query takes against the files, on the edge-case sample and on runs where the predict and step tokens occur.
+- Result (300 reports, IR parts in the kernel, each answer checked; stored against xz -9 over the files; the three E203 questions):
+
+  | corpus, layout | stored | every status | one link's status | dev q under 0.05 | streams read |
+  | --- | ---: | ---: | ---: | ---: | ---: |
+  | drift, files in the kernel | 1.641 | 17.3 ms | 17.3 ms | 17.3 ms | all files |
+  | drift, columns and numbers | 0.819 | 0.7 ms | 1.1 ms | 1.0 ms | 1 / 2 / 1 of 23 |
+  | drift, + predict | 0.587 | 11.3 ms | 10.5 ms | 10.8 ms | 5 / 5 / 5 of 23 |
+  | drift, + predict + step | **0.548** | 13.4 ms | 13.4 ms | 14.7 ms | 5 / 5 / 5 of 23 |
+  | random, columns and numbers | 0.643 | 0.8 ms | 1.2 ms | 1.2 ms | 1 / 2 / 1 of 23 |
+  | random, + predict + step | **0.619** | 13.2 ms | 13.4 ms | 15.1 ms | 5 / 5 / 5 of 23 |
+
+  The smallest IR overall (predict, step, siblings, nearest; not queryable) is 0.505 of xz on drift and 0.643 on random: with predict and step, a queryable store costs 1.08 of it on drift and 0.96 on random. The query then reads 5 of 23 streams, and the time goes to the predictors learning on every cell (a full decode of all 300 reports takes 25 to 36 ms in memory with them, 13 ms without), not to the reads.
+- Verdict: **measured**. A store can now be both nearly the smallest and queryable: 0.548 of xz with column queries in about 13 ms (1.3 times faster than reading the files), or 0.819 with queries in about 1 ms. The predictors' speed is the next thing to fix. Row-key layouts go through the line-by-line path and are slower than in E203 (2 to 3.5 ms); they lose on size anyway.
+- Run: `cargo run --release --example ir_query` (about a minute).
+
+### E206 ir-fast-predict (faster predictors, same bytes)
+- Branch / parent: exp/206-ir-fast-predict / E205 (stacked)
+- Question: with `predict` and `step`, decoding 300 drift reports took 36 ms against 13 ms without, and a column query 14 ms against 0.6 ms. Where does the time go, and how much comes back without touching the format?
+- Change (no format change): a callgrind profile put a quarter of the time in malloc and free, then SipHash and `format!`. So: the value and step predictors share one map per earlier cell (one lookup instead of two); the predictor, dictionary and stream-index maps use a fixed FxHash; predictors take the line's cells by reference instead of a new vector per cell; numbers render and parse without `format!` or a digit vector; and the query opens its streams once instead of looking them up per cell. New `examples/ir_parity.rs` hashes the packs and blocks of 5 corpora under 32 option sets: identical before and after, so every stored IR decodes the same.
+- Result (in memory, best of 25, 300 reports, before / after; this machine's times move by about 10% from run to run):
+
+  | corpus | options | encode ms | decode ms | column query ms |
+  | --- | --- | ---: | ---: | ---: |
+  | drift | columns, numbers | 19.0 / 18.1 | 12.5 / 10.6 | 0.59 / 0.53 |
+  | drift | + predict | 31.9 / 25.2 | 28.3 / 19.2 | 11.3 / **3.3** |
+  | drift | + predict + step | 47.0 / 28.6 | 36.1 / **23.4** | 13.7 / **4.1** |
+  | random | + predict + step | 50.9 / 39.8 | 33.7 / 26.0 | 10.8 / 4.1 |
+  | exports | + predict + step | 19.4 / 17.3 | 17.6 / 11.8 | 2.6 / 0.9 |
+
+  With the parts in the kernel (E205's layout), a column query on the 0.548-of-xz drift store now takes 4.0 ms (was 13.4), against 17.4 ms reading the files; on random reports 4.0 ms at 0.619 of xz.
+- Verdict: **measured**. Same bytes; queries on the predicting IR 3 times faster, decode a third faster. Not an option: it changes no output.
+- Run: `cargo run --release --example ir_speed` (about a minute), `cargo run --release --example ir_parity` (about 2 minutes; compare its output across commits).
+
+### E207 ir-real (the IR on real files, not generated ones)
+- Branch / parent: exp/207-ir-real / E206 (stacked)
+- Question: E192 to E206 measured on generated reports, which were made to have the structure the IR looks for. How does it do on files made elsewhere?
+- Change (measurement only): `examples/ir_real.rs` runs every IR variant, with and without `prose`, on two folders in the repo: the San Diego business tax registry fixture (2 CSV files, 51,000 rows, 10.8 MB) and the text files of the cases fixture (526 notes, playbooks, forms, scripts and logs of 18 sample businesses, 832 KB). Then the schema (E202) and a column query (E203, E205) on the registry. Only column names and counts are printed, no values.
+- Result (xz -9 over the pack, against xz -9 over the files; every variant decoded byte-exact):
+
+  | variant | registry (xz is 0.177 of the bytes) | cases text (0.156) | cases text, with prose |
+  | --- | ---: | ---: | ---: |
+  | templates | 1.041 | 1.304 | 1.081 |
+  | columns | **0.966** | 1.360 | 1.105 |
+  | numbers | 1.013 | 1.366 | 1.107 |
+  | row keys | 1.271 | 1.442 | 1.138 |
+  | predict | 1.009 | 1.367 | 1.107 |
+  | predict, step | 1.009 | 1.367 | 1.107 |
+  | + siblings, nearest 16 | 1.039 | 1.407 | 1.115 |
+
+  By kind of file in the cases folder, the IR lost on every one (json 1.09, md 1.26, py 1.27, txt 1.31, log 1.46 with templates alone; columns made each worse). The schema found one dependency on the registry, ACTIVITY DESC from NAICS (held on 45,066 of 46,176 lines, 1,110 codes, no breaks), in 1.1 s. A column query on ownership type with predict and step took 105 ms against 72 ms splitting the files, because the predictors pull in the first columns of each row, which are near-unique ids and names.
+- Verdict: **measured, and a caveat on everything before it**. On a real table the IR gains 3% over xz (columns only; numbers, predict and step add nothing, row keys cost 27%). On a real mixed folder it loses 8 to 37%, even with `prose`. The large gains of E192 to E206 hold for generated, repetitive reports; real data needs the IR to be chosen per file kind, never forced (E208).
+- Run: `cargo run --release --example ir_real` (about 2 minutes).
+
+### E208 ir-route (never lose to xz: each kind of file goes the smaller way)
+- Branch / parent: exp/208-ir-route / E207 (stacked)
+- Question: E207 found the IR loses to xz on a real mixed folder, by 8% even with `prose`, and that on a real table only one variant wins. Can the encoder find, per kind of file, whether the IR or the plain bytes compress smaller, so that turning the IR on never costs more than not having it?
+- Change: `Options::route` (off by default). Files are grouped by extension and the skeleton of their first line, so reports from one template form one group and a folder's notes of the same extension another; groups of one file are pooled per extension. Each group is judged alone: xz -6 over its IR pack against its files stored plain (the raw part of E198), and goes the smaller way. The routed set is then judged as a whole against all IR and all plain, and the smallest of the three is kept. `ir::route` returns the choice. The decoder needs nothing new. The tests run every option set with `route` on the sample, and a spread of them in the property test.
+- First pass, judged by zstd -9 with groups by extension only: zstd disagreed with xz -9 often enough to make the IR worse (drift reports with columns 0.927 to 0.998, because every md file, the reports included, went plain). That is why the judge is xz and the groups include the first-line template.
+- Result (best variant, all with `prose`, xz -9 over the pack against xz -9 over the files; without / with `route`):
+
+  | corpus | without | with | stored plain |
+  | --- | ---: | ---: | --- |
+  | reports-drift | 0.505 | 0.505 | none |
+  | reports-random | 0.644 | 0.644 | none |
+  | exports | 0.459 | 0.459 | none |
+  | tables | 0.936 | 0.936 (0.995 for variants that lost) | csv, json, md where the IR lost |
+  | drift + texts | 0.789 | 0.789 | none (prose already plain) |
+  | cases text (real) | 1.105 | **0.995** | json, log, md, txt |
+  | cases text + drift reports | 1.041 | **0.940** | json, log, the case md notes, txt |
+  | registry (real) | 0.966 | 0.966 (1.000 for variants that lost) | csv where the IR lost |
+
+  The worst result of any variant with `route` is 1.000 of xz; without it, 1.115. In the kernel in blocks of 20 with a keyframe, the cases text goes from 1.351 to 1.201 and tables from 1.169 to 0.980 (blocks pay their own restarts; the generated corpora are unchanged).
+- Cost: encoding pays xz -6 over each group's IR and plain bytes, then up to three judgments of the whole set: 0.5 to 1.8 s for the 300 to 800 file corpora (12 to 57 ms without), and 13 s for the 10.8 MB registry (0.3 s without). That suits a background repack, not a live write.
+- Verdict: **measured**. With `route`, the IR is never worse than xz over the files on any corpus tried, real or generated, and it keeps every gain it had. Its price is encode time. Off by default.
+- Run: `cargo run --release --example ir_route [corpus ...]` (about 15 minutes, most of it the registry).
+
+### E209 ir-tune (each column picks its own coding)
+- Branch / parent: exp/209-ir-tune / E208 (stacked)
+- Question: `numbers`, `predict` and `step` are on or off for every column at once. On the real registry (E207) number deltas cost 5% overall and predict 4%, though some columns surely gain. Can each column choose?
+- Change: `Options::tune` (off by default). The encoder encodes once with each of: everything the options allow, no number deltas, no predicted cells, no stepped numbers, and their combinations; judges each stream's bytes with xz -6 under each; keeps per stream the smallest (by stream key: skeleton, slot, row key); and keeps the tuned pack only if xz judges the whole pack smaller than untuned. With `route`, the routing judges the IR as tuned, so a table the plain IR loses on can still win. The predictors still learn on every cell either way, so the decoder needs nothing new: each token says what it is. `ir::tune_modes` lists the choices. A unit test decodes every mode on every stream, mixed modes per stream, and blocks; the option tests run every option set with `tune`, and with `tune` and `route`.
+- Result (best variant, all with `prose` and `route`, xz -9 over the pack against xz -9 over the files; without / with `tune`):
+
+  | corpus | without | with | streams that changed coding |
+  | --- | ---: | ---: | --- |
+  | reports-drift | 0.505 | 0.504 | 4 of 23 |
+  | reports-random | 0.644 | **0.633** | 5 of 23 |
+  | exports | 0.459 | 0.458 | 4 of 35 |
+  | tables | 0.936 | 0.936 | none |
+  | cases text (real) | 0.995 | 0.995 | none (routed plain) |
+  | cases text + drift | 0.940 | 0.940 | none for the best variant |
+  | registry (real) | 1.000 (routed plain) | **0.961** | 15 of 41: 6 without number deltas, 9 without predicted cells, 10 without steps |
+
+  With `numbers` alone, tuned: drift 0.767 to 0.749, random 0.670 to 0.654. The registry's 0.961 beats its best untuned variant (columns alone, 0.966). In the kernel in blocks of 20 with a keyframe, tuning on the whole set does not carry to blocks: random reports 0.712 to 0.722, the rest unchanged.
+- Cost: up to 5 more encodes and an xz of every stream per try: 0.5 to 0.7 s for 300 reports (0.3 s with `route` alone), 5 s for the cases with drift reports, 47 s for the 10.8 MB registry (12 s with `route` alone).
+- Verdict: **measured**. Small gains on generated reports (up to 1.7%), and on the real table it turns a loss into a 4% win. Expensive at encode; suits a background repack. Off by default.
+- Side finding for the next entries: a plain transpose of the registry (each column's text one after another, no IR) is 0.953 of xz, better than any IR variant (0.961), so the IR's cell coding costs something on real tables; and sorting the rows by NAICS code, with the NAICS column kept in file order so the order needs no permutation stored, reaches 0.909 (Python prototype).
+- Run: `cargo run --release --example ir_tune [corpus ...]` (about 10 minutes).
+
+### E210 ir-literal (strings written out in full where xz matches them better)
+- Branch / parent: exp/210-ir-literal / E209 (stacked)
+- Question: a plain transpose of the real registry is 0.953 of xz, under the best IR (0.961). Does the IR lose it by writing repeated strings as indexes into each column's dictionary, where xz could match the strings themselves?
+- Change: `Options::literal` (with `tune`, off by default): tuning also tries every stream with each string written out in full and no dictionary index. Because streams judged alone can mislead about the whole pack (a first run made random reports worse, 0.633 to 0.644), `tune` now judges the whole pack under no tuning, the picks without literal and the picks with it, and keeps the smallest; without `literal` it picks exactly as in E209. The decoder needs nothing new.
+- Result (best variant, with `prose`, `route` and `tune`; without / with `literal`): drift 0.504 / 0.504, random 0.633 / 0.633, exports 0.458 / 0.458, tables 0.936 / 0.936, cases text 0.995 / 0.995, cases with drift 0.940 / 0.940, registry 0.961 / **0.960** (8 of 41 streams written out). With `numbers` and no `predict`, written-out strings help more (drift 0.749 to 0.700, exports 0.638 to 0.630), but those variants were never the best. Blocks unchanged. Encode about 1.5 to 1.7 times longer than `tune` alone (79 s on the registry).
+- Verdict: **measured, no gain worth its cost**. The dictionary is not why the IR trails a plain transpose on the real table; the gap must come from the stream layout or token framing. Off by default; kept only because it costs nothing when off.
+- Run: `cargo run --release --example ir_literal [corpus ...]` (about 20 minutes).
+
+### E211 ir-sort (a table's rows stored in the order that compresses best)
+- Branch / parent: exp/211-ir-sort / E210 (stacked)
+- Question: a Python prototype put the real registry at 0.909 of xz when its rows are sorted by NAICS code and that column is kept in file order, so the order needs no permutation stored (0.905 sorted by NAICS then ZIP; a plain transpose without sorting is 0.953). How much of that does the IR keep?
+- Change: `Options::sort` (off by default). Before the IR, each CSV file whose lines are its rows (an even number of quotes on every line, so no field spans lines) and that has at least 64 rows is rewritten as: header, the rows stably sorted by one column, then that column of every row in file order, one per line. The column is the one whose order judges smallest by xz -6 over the first 4,000 rows laid out by column, among columns neither constant nor near unique (distinct values under a quarter of the rows), and only if it beats the file's own order by 1%. The files part marks a rewritten file with its row count and whether it ended in a newline (flag bit 32, file kind bit 2); the decoder stably sorts the stored column to recover where each row goes. Column queries refuse a pack with sorted tables (their rows are in another order). `ir::sort_keys` reports the choice. A test covers quotes with commas, CRLF lines, short rows, empty lines, no final newline, and a field across lines (left alone), under a spread of option sets with `route`, `tune` and blocks.
+- Result (xz -9 over the pack against xz -9 over the files, with `prose` and `route`; without / with `sort`):
+
+  | variant | registry (real, 10.8 MB) |
+  | --- | ---: |
+  | columns | 0.966 / 0.947 |
+  | numbers, tuned | 0.965 / 0.947 |
+  | predict, step, tuned | 0.961 / **0.942** |
+
+  Both registry files were sorted by NAICS, as in the prototype. The exports and tables fixtures have no CSV of 64 rows, so nothing changed there. Encode 51 s against 48 s (the key search adds about 3 s).
+- Verdict: **measured**. The best real-table result yet: 0.942 of xz, a 6% gain where E207 started at 3%. The IR keeps about half of the prototype's gain over a plain transpose (0.909); the rest is lost in its cell framing, since the plain transpose of the unsorted table (0.953) also beats the IR's columns (0.966) on this table, and E210 ruled out the dictionary. Off by default.
+- Next: store a sorted table's columns as plain text runs instead of IR tokens (a transpose path inside `route`), which the prototype says is worth another 3 to 4% here.
+- Run: `cargo run --release --example ir_sort [corpus ...]` (about 5 minutes; the prototype is in the output file `ir_sort-output.md` of the night's notes).
+
+### E212 ir-transpose (a table stored plain, laid out by column)
+- Branch / parent: exp/212-ir-transpose / E211 (stacked)
+- Question: E211 left the registry at 0.942 of xz; the same sort over a plain transpose (Python) was at 0.909. Does storing a sorted table plain, laid out by column, close that gap?
+- Change: `Options::transpose` (off by default). A CSV table (the same lines `sort` accepts: no field across lines, 64 rows or more) that `route` or `prose` stores as it is goes into the raw part laid out by column: the header, each line's field count, then each column's fields one per line. The files part marks it with its line count and whether it ended in a newline (flag bit 64, file kind bit 4); the decoder joins each line's fields with commas, then unsorts it if `sort` rewrote it. `route` judges the IR against this layout, so it picks it only where it is smaller. Raw files are not in column queries, so a table stored this way cannot be queried by column (the query index skips it). Tests cover the E211 tables under a spread of option sets with `route` or `prose`, with and without `sort`, and blocks.
+- Result (registry, real, 10.8 MB; xz -9 over the pack against xz -9 over the files, with `prose` and `route`):
+
+  | variant | route | + sort | + transpose | + both |
+  | --- | ---: | ---: | ---: | ---: |
+  | columns | 0.966 | 0.947 | 0.965 | **0.930** |
+  | predict, step, tuned | 0.961 | 0.942 | 0.961 | **0.930** |
+
+  With both, `route` stores both registry files plain by column (11.5 MB raw part); with `transpose` alone it keeps the IR. The generated corpora have no CSV of 64 rows, so nothing changed there. Encode time is unchanged (14 s columns, 48 s tuned).
+- A Python check of where the rest of the prototype's gap goes: moving the stored key column, dropping the field counts, or leaving the key out of the sorted rows each change 0.000 to 0.003. The prototype parsed the CSV and so dropped 1.44 million quote characters, which is not exact; with quotes kept its layout is 0.927. Leaving out the quotes of a column whose every field is quoted (13 of the registry's 14) gives 0.913.
+- Verdict: **measured**. 0.942 to 0.930, within 0.003 of the exact bound for this layout, and with no tuning needed (0.930 with columns alone, at a third of the encode time). Off by default.
+- Next: E213, a column whose fields are all quoted stored without its quotes.
+- Run: `cargo run --release --example ir_transpose [corpus ...]` (about 7 minutes on the registry).
+
+### E213 ir-quotes (a column quoted in every row stored without its quotes)
+- Branch / parent: exp/213-ir-quotes / E212 (stacked)
+- Question: 13 of the registry's 14 columns quote every field. A Python check put the E212 layout at 0.913 with those quotes left out. Does the kernel get it?
+- Change: no new option; it changes the `transpose` layout (E212, not merged). After the header, one byte per column: `q` where every field of the column starts and ends with a quote (those two are left out of its fields), `-` elsewhere. The decoder puts them back. A field such as `""` or one with inner quotes comes back exactly, since only the outer two are dropped. A unit test covers empty quoted fields, inner quotes, a short row and a longer one; the table test gains a table with columns quoted in every row, in most rows, and never.
+- Result (xz -9 over the pack against xz -9 over the files, with `prose` and `route`):
+
+  | variant | route | + sort | + transpose | + both |
+  | --- | ---: | ---: | ---: | ---: |
+  | columns | 0.966 | 0.947 | 0.954 | **0.911** |
+  | predict, step, tuned | 0.961 | 0.942 | 0.954 | **0.911** |
+
+  The raw part shrinks from 11.5 to 10.1 MB. `transpose` alone, unsorted, now beats the IR on this table too (0.954). Exports, tables and the cases folder are unchanged. Encode 14 s with columns.
+- Verdict: **measured**. The real registry at 0.911 of xz, from 0.966 at E207: 9% smaller, exactly, with the plain-columns variant and no tuning. Off by default, with `transpose`.
+- Next: the same columns layout for JSON arrays of records, which the real fixtures do not have yet; and `transpose` inside blocks for large tables, so one range of rows reads without the whole table.
+- Run: `cargo run --release --example ir_transpose [corpus ...]` (about 8 minutes).
+
+### E214 ir-sample (route and tune judged on a sample)
+- Branch / parent: exp/214-ir-sample / E213 (stacked)
+- Question: `route` and `tune` judge with xz over whole encodes: 13 s (columns) and 43 s (tuned) on the 10.8 MB registry, against well under a second to encode it. Do they choose the same on a sample?
+- Change: `Options::sample` (bytes, 0 is off). `route` and `tune` judge on every file, each file over its share of the budget (and over 4 KB) cut to its first line and an even spread of its other lines; what they choose applies to the whole set. Only the encoder changes. A first try also kept only every `r`th file of a large set: it misjudged, routing the drift reports plain (0.926 to 0.998 with columns) and the exports at 256 KB, since the IR's gain is across neighbouring files; so every file is kept.
+- Result (with `prose`, `route`, `sort` and `transpose`; xz -9 over the pack against xz -9 over the files; judging on everything / 1 MB / 256 KB):
+
+  | corpus | columns | encode ms | predict, step, tuned | encode ms |
+  | --- | --- | --- | --- | --- |
+  | reports-drift | 0.926 / 0.926 / 0.926 | 292 / 167 / 172 | 0.504 / 0.504 / 0.504 | 553 / 343 / 312 |
+  | reports-random | 0.717 / 0.717 / 0.717 | 338 / 198 / 195 | 0.630 / 0.630 / 0.630 | 634 / 494 / 440 |
+  | exports | 0.662 / 0.662 / 0.662 | 261 / 255 / 219 | 0.617 / 0.617 / 0.617 | 532 / 533 / 554 |
+  | cases text (real) | 0.996 / 0.996 / 0.996 | 1327 / 1271 / 725 | 0.995 / 0.995 / 0.995 | 4501 / 4371 / 3042 |
+  | cases text + drift | 0.989 / 0.989 / 0.989 | 1508 / 1107 / 1052 | 0.940 / 0.940 / 0.940 | 5518 / 4040 / 3620 |
+  | registry (real) | 0.911 / 0.911 / 0.911 | 13089 / 4999 / 4414 | 0.911 / 0.911 / 0.911 | 43383 / 7109 / 4583 |
+
+  Every size is the same as judging on everything, and every route choice too (same raw part). The drift and random times also fell where no file was cut; part of that is run order (the first encode of each row runs cold), so only the registry's are clear gains. About 3 s of the registry's remaining time is `sort` choosing its key.
+- Verdict: **measured**. 1 MB keeps every result and makes the registry's tuned encode 6x faster (43 to 7 s). Off by default; 1 MB is the value to try first.
+- Run: `cargo run --release --example ir_sample [corpus ...]` (about 6 minutes).
+
+### E215 ir-preset (one setting for every corpus)
+- Branch / parent: exp/215-ir-preset / E214 (stacked)
+- Question: each option so far was measured where it helps. Is one setting close to the best on every corpus, generated and real, and never worse than xz? That is what a default would need.
+- Change: none to the codec; new `examples/ir_preset.rs`. Every setting has `prose`, `route`, `sort`, `transpose` and `sample` at 1 MB.
+- Result (xz -9 over the pack against xz -9 over the files):
+
+  | corpus | safe (columns) | full | full, no row keys | full, tuned | predict, step | predict, step, tuned |
+  | --- | ---: | ---: | ---: | ---: | ---: | ---: |
+  | reports-drift | 0.926 | 0.593 | 0.539 | 0.593 | 0.505 | **0.504** |
+  | reports-random | 0.717 | 0.741 | 0.683 | 0.741 | 0.645 | **0.630** |
+  | exports | 0.662 | 0.528 | **0.459** | 0.528 | 0.617 | 0.617 |
+  | tables | 0.995 | 0.995 | **0.936** | 0.995 | 0.995 | 0.995 |
+  | texts | 1.000 | 1.000 | 1.000 | 1.000 | 1.000 | 1.000 |
+  | drift + texts | 0.969 | 0.827 | 0.802 | 0.829 | **0.789** | **0.789** |
+  | cases text (real) | 0.996 | 1.002 | 0.996 | 1.002 | **0.995** | **0.995** |
+  | cases text + drift | 0.989 | 0.956 | 0.944 | 0.955 | **0.940** | **0.940** |
+  | registry (real) | **0.911** | **0.911** | **0.911** | **0.911** | **0.911** | **0.911** |
+
+  Full is columns, numbers, siblings, row keys, nearest 16, predict and step. Encode times: under 1.6 s on every generated corpus, 1.1 to 4.8 s on the cases folder, 5 to 14 s on the registry (7.3 s for predict, step, tuned). Decode under 35 ms except the registry (160 to 220 ms).
+- Verdict: **measured**. Two settings split the corpora. "Predict, step, tuned" is best or tied on 7 of 9 and never worse than xz; it loses only where one file repeats another's cells (exports 0.617 against 0.459, tables 0.995 against 0.936), which `siblings` and `nearest` catch and which cost the reports 3 to 8%. Row keys make every corpus worse or no better once `route` and `predict` are on. No one setting is best everywhere yet.
+- Next: E216, `route` also judging per kind of file whether its files diff against a base file, so one setting can take both sides.
+- Run: `cargo run --release --example ir_preset [corpus ...]` (about 3 minutes).
+
+### E216 ir-bases (route also judges whether files diff against a base)
+- Branch / parent: exp/216-ir-bases / E215 (stacked)
+- Question: E215 found two settings split the corpora: `siblings` and `nearest` win where one file repeats another's cells (exports, tables) and cost the reports 3 to 8%, whose columns the predictors already catch. Can `route` take each side where it wins?
+- Change: `Options::bases` (off by default; with `route` and `siblings` or `nearest`). For each kind of file, `route` now judges three ways: through the IR, as it is, and through the IR with no base file (every cell stored, predicted and stepped as usual). The files part already says per file whether it has a base, so the decoder needs nothing new. `ir::unbased` reports the choice. The option sets in the tests take `bases` in three of four.
+- Result (all with `prose`, `route`, `sort`, `transpose`, `sample` at 1 MB, and no row keys; xz -9 over the pack against xz -9 over the files; encode time):
+
+  | corpus | predict, step, tuned (E215) | + siblings, nearest 16 | + siblings, nearest, bases | same, untuned |
+  | --- | ---: | ---: | ---: | ---: |
+  | reports-drift | 0.504 (0.3 s) | 0.537 | **0.504** (0.7 s) | 0.505 (0.3 s) |
+  | reports-random | 0.630 (0.4 s) | 0.673 | **0.630** (1.3 s) | 0.645 (0.4 s) |
+  | exports | 0.617 | 0.458 | **0.458** (1.0 s) | 0.459 (0.3 s) |
+  | tables | 0.995 | 0.936 | **0.936** | 0.936 |
+  | texts | 1.000 | 1.000 | 1.000 | 1.000 |
+  | drift + texts | 0.789 | 0.802 | **0.789** (1.6 s) | 0.789 (0.6 s) |
+  | cases text (real) | 0.995 (4.1 s) | 0.996 | **0.995** (6.1 s) | 0.995 (1.4 s) |
+  | cases text + drift | 0.940 | 0.944 | **0.940** (5.9 s) | 0.940 (1.7 s) |
+  | registry (real) | 0.911 (7.2 s) | 0.911 | **0.911** (10.2 s) | 0.911 (5.5 s) |
+
+  Never worse than xz on any corpus. Decode 4 to 31 ms on the generated and cases corpora, 173 ms on the registry.
+- Verdict: **measured**. With `bases`, one setting is best or tied on all nine corpora: columns, numbers, siblings, nearest 16, predict, step, tune, prose, route, sort, transpose, bases and a 1 MB sample. Untuned, it gives up at most 0.015 (reports-random) for 2 to 4x faster encodes. This is the setting to make the default if the IR is ever turned on; every option stays off by default here.
+- Run: `cargo run --release --example ir_bases [corpus ...]` (about 4 minutes).
+
+### E217 ir-store (the E216 setting in ikam's store)
+- Branch / parent: exp/217-ir-store / E216 (stacked)
+- Question: E216's setting was measured as one pack under xz. What does ikam's kernel store with it, against storing the files themselves, whole and in blocks a read can open alone?
+- Change: none to the codec; new `examples/ir_store.rs`. The example helper that turns a pack into kernel entries now includes the raw part (it had no caller with one, so no earlier number changes).
+- Result (untuned; tuned is within 0.007 everywhere). Each cell is against the files in the kernel, then against xz -9 over the files; one file read from the middle in memory:
+
+  | corpus | files | files in the kernel (of xz) | pack, one entry | blocks of 20 (read) | blocks of 50 (read) |
+  | --- | ---: | ---: | ---: | ---: | ---: |
+  | reports-drift | 300 | 1.641 | **0.303** / 0.498 | 0.432 / 0.709 (2.1 ms) | 0.381 / 0.625 (5.3 ms) |
+  | reports-random | 300 | 1.315 | **0.502** / 0.660 | 0.541 / 0.711 (2.4 ms) | 0.523 / 0.688 (9.8 ms) |
+  | exports | 300 | 2.006 | **0.228** / 0.458 | 0.358 / 0.717 (0.8 ms) | 0.277 / 0.557 (1.3 ms) |
+  | tables | 72 | 1.300 | **0.700** / 0.910 | 0.775 / 1.007 (0.3 ms) | 0.738 / 0.959 (0.3 ms) |
+  | texts | 24 | 1.104 | **0.849** / 0.937 | 0.863 / 0.953 | 0.851 / 0.939 |
+  | drift + texts | 324 | 1.354 | **0.560** / 0.759 | 0.635 / 0.859 (2.0 ms) | 0.597 / 0.808 (5.3 ms) |
+  | cases text (real) | 526 | 1.441 | **0.672** / 0.968 | 0.833 / 1.201 (0.5 ms) | 0.819 / 1.180 (0.9 ms) |
+  | cases text + drift | 826 | 1.503 | **0.611** / 0.919 | 0.781 / 1.175 (0.5 ms) | 0.749 / 1.126 (0.9 ms) |
+  | registry (real) | 2 | 1.005 | **0.916** / 0.920 | 0.916 / 0.920 (54 ms) | same |
+
+- Verdict: **measured**. In the store, the setting is smaller than the files on every corpus: a third of the bytes for drift reports, under a quarter for exports, two thirds for the real cases folder, 0.916 for the real registry. Blocks keep most of that with 1 to 10 ms reads; for prose-heavy folders (cases) blocks lose a fifth of the gain, since each block's raw part restarts its compression. A large table is one file, so its blocks are the whole table (54 ms); row ranges would need a table cut into blocks of rows.
+- Next: blocks that share one raw part's dictionary across blocks (as the keyframe does for streams), and row-range blocks for large tables.
+- Run: `cargo run --release --example ir_store [corpus ...]` (about 4 minutes).
+
+### E218 ir-damage (a damaged pack never crashes the decoder)
+- Branch / parent: exp/218-ir-damage / E217 (stacked)
+- Question: E208 to E216 added new layouts (plain files, sorted and transposed tables, quoted columns, unbased files, tuned streams). Before any becomes a default: does a damaged pack or block ever panic the decoder instead of returning an error?
+- Change: two tests. `damaged_packs_never_panic` encodes the sample and big tables under four settings (E216's, without route, with row keys, group and literal, and plain), then decodes 3,000 changed packs per setting (a byte set, a byte dropped, the pack cut short) and 1,000 blocks with one part changed, in release and debug builds. `huge_table_counts_are_refused` hands the decoder a sorted, transposed table whose row, line and length counts are huge. Fixes: the sorted-table check `1 + 2 * rows` (E211) overflowed on a huge count; in a release build it wrapped, passed, and then sliced past the end, a crash. It is now a checked multiply. Number deltas and steps (E192, E204) now add and subtract wrapping, so a damaged delta cannot overflow (valid numbers have at most 30 digits, so no valid pack changes).
+- Result: before the fix, the huge-count test panicked (debug and release). After it, both tests pass in both builds; `ir_parity` hashes are identical to E206's (160 packs and blocks), so every stored pack decodes the same.
+- Side finding (no entry): Word, Excel and PowerPoint files unzipped and rezipped exactly (zlib level 6 reproduced every member of the cases fixtures) store at 0.17 to 0.54 of xz over the files, but the kernel has done this since E080 and E083 (`container.rs`), so files in the kernel already have it.
+- Verdict: **kept** (a fix and tests). Merge the stack from its top so the E211 fix comes with it.
+
+### E219 ir-scale (the E216 setting as a set of reports grows)
+- Branch / parent: exp/219-ir-scale / E218 (stacked)
+- Question: `sample` (E214) cuts only large files, so many small files are judged whole by `route` and `tune`. How do size and encode time grow with the number of reports, and can the sample cover many small files without misjudging (E214's first try, keeping every `r`th file, routed the drift reports plain)?
+- Change: when the files cut by `sample` are still over twice the budget, `route` and `tune` judge four runs of neighbouring files spread over the set, about a quarter of the budget each, so neighbours stay together. New `examples/ir_scale.rs` (drift and random reports at 300, 1,000 and 3,000 files).
+- Result (E216 setting, sample 1 MB; xz -9 over the pack against xz -9 over the files; encode time):
+
+  | reports | files | MB | untuned before | untuned with runs | tuned before | tuned with runs |
+  | --- | ---: | ---: | --- | --- | --- | --- |
+  | drift | 300 | 1.3 | 0.505 (0.3 s) | 0.505 (0.2 s) | 0.504 (0.7 s) | 0.504 (0.7 s) |
+  | drift | 1,000 | 5.6 | 0.359 (0.7 s) | 0.359 (0.5 s) | 0.356 (2.4 s) | 0.359 (0.9 s) |
+  | drift | 3,000 | 18.2 | 0.311 (2.4 s) | 0.311 (0.8 s) | 0.305 (7.1 s) | 0.311 (1.3 s) |
+  | random | 300 | 1.3 | 0.645 (0.4 s) | 0.645 (0.3 s) | 0.630 (1.4 s) | 0.630 (1.4 s) |
+  | random | 1,000 | 5.6 | 0.615 (1.4 s) | 0.615 (0.8 s) | 0.593 (4.9 s) | 0.599 (2.4 s) |
+  | random | 3,000 | 18.2 | 0.605 (4.7 s) | 0.605 (1.1 s) | 0.572 (16.3 s) | 0.586 (2.6 s) |
+
+  Untuned, every size is the same and encodes are 1.4 to 4x faster; tuned, they are 2 to 6x faster and up to 0.014 larger, since `tune` picks each column's coding from fewer rows. The nine E216 corpora give the same sizes as E216. Decode grows linearly (about 20 ms per MB). The ratio itself improves as the set grows: drift reports at 3,000 files are 0.31 of xz.
+- Verdict: **measured**. The setting scales linearly; with runs, 18 MB of reports encode in about a second untuned. Off by default (part of `sample`).
+- Run: `cargo run --release --example ir_scale [files ...]` (about 2 minutes).
+
+### E220 ir-row-groups (a large table cut into row groups)
+- Branch / parent: exp/220-ir-row-groups / E219 (stacked)
+- Question: E217 left a large table as one block (the whole registry file, 54 ms to read). If a table were cut into groups of rows, each its own block, how much of E213's gain survives, and how fast is one group to read? A keyframe (E197) or a shared dictionary would let each group go on from the first.
+- Change: none to the kernel. Prototype `packages/kernel/scripts/ir_row_groups.py` lays each group out as E213 does (sorted by NAICS with the key in file order, columns one after another, outer quotes of always-quoted columns left out) and compresses it with xz -9, alone or after group 0 (estimated as xz(group 0 + group) minus xz(group 0)).
+- Result (real registry, two files of about 25,600 rows; against xz -9 over the files):
+
+  | rows per group | groups | independent | after group 0 | read one group |
+  | ---: | ---: | ---: | ---: | ---: |
+  | whole tables | 2 | 0.912 (solid) | | |
+  | 30,000 (one per file) | 2 | 0.925 | 0.925 | 57 ms |
+  | 10,000 | 6 | 0.981 | 0.955 | 43 ms |
+  | 3,000 | 18 | 1.065 | 1.017 | 15 ms |
+  | 1,000 | 52 | 1.183 | 1.106 | 5 ms |
+
+  Python's xz decodes the two whole files in 147 ms.
+- Verdict: **measured, not built**. Groups lose the gain fast: at 10,000 rows half of it is gone, and below about 4,000 rows the groups are larger than xz over the plain files, even after group 0. Reads get faster only in proportion to the group size. If row ranges are needed, 10,000-row groups after a keyframe are the knee (0.955, about a third of the whole-table read).
+- Run: `python3 -I packages/kernel/scripts/ir_row_groups.py tests/fixtures/san-diego-business-registry/*.csv` (about a minute).
+
+### E221 ir-block-raw (each block's raw text as its own store entry)
+- Branch / parent: exp/221-ir-block-raw / E220 (stacked)
+- Question: E217's blocks lost about a fifth of the whole pack's gain on prose-heavy folders (cases: 0.672 whole, 0.819 in blocks of 50). Each block's raw part (E198, files kept as they are) was packed with its streams in one entry. If each raw part were its own entry, would the kernel's repack (templates, trained dictionaries) win some of that back by seeing the raw parts as similar entries?
+- Change: none to the kernel. New `examples/ir_blockraw.rs` stores E216's setting (untuned) in blocks of 20 and 50 with a keyframe, with each block's raw part packed with its streams (as E217) or as its own entry.
+- Result (against the files in the kernel):
+
+  | corpus | whole pack | blocks of 20: together / raw apart | blocks of 50: together / raw apart |
+  | --- | ---: | ---: | ---: |
+  | reports-drift | 0.303 | 0.432 / 0.432 | 0.381 / 0.381 |
+  | exports | 0.228 | 0.358 / 0.358 | 0.277 / 0.277 |
+  | tables | 0.700 | 0.775 / 0.775 | 0.738 / 0.738 |
+  | texts | 0.849 | 0.863 / 0.912 | 0.851 / 0.851 |
+  | drift + texts | 0.560 | 0.635 / 0.657 | 0.597 / 0.600 |
+  | cases text (real) | 0.672 | 0.833 / 0.821 | 0.819 / 0.811 |
+  | cases text + drift | 0.611 | 0.781 / 0.798 | 0.749 / 0.760 |
+
+- Verdict: **dropped**. Raw parts apart win at most 0.012 (cases alone) and lose up to 0.049 elsewhere; the repack does not recover what a block's raw text loses by being compressed apart from the rest of the folder. Blocks of 50 stay the better block size. What would help is a raw part that later blocks compress against (as the keyframe does for streams), which needs a dictionary in the block format, not a different layout in the store.
+- Run: `cargo run --release --example ir_blockraw [corpus ...]` (about a minute).
+
+### E222 ir-north (the E216 setting on the north corpora)
+- Branch / parent: exp/222-ir-north / E221 (stacked)
+- Question: before the IR goes behind a put or repack option, what would it do to the north score (E099), whose three corpora mix text files with office and pdf files that share their facts? The kernel already shares text across formats (E112 and earlier), and an IR pack takes the text files out of that sharing.
+- Change: none to the kernel. New `examples/ir_north.rs` stores each north corpus (the same files as `bench north`) in the kernel as it is, and with its text files (md, html, json, jsonl, csv, log, py) replaced by one IR pack of them under E216's setting (untuned), office and pdf files left to the kernel; and the text files alone, in the kernel and as the pack in the kernel.
+- Result (bytes stored; the kernel over every file matches the bench's `kernel` field for each corpus):
+
+  | corpus | files (text) | kernel, every file | text as one IR pack | text alone: kernel / IR pack in the kernel |
+  | --- | ---: | ---: | ---: | ---: |
+  | north/cases | 792 (510) | 391,496 | 319,992 (0.817) | 190,312 / 125,339 (0.659) |
+  | north/multiformat | 96 (48) | 332,403 | 321,975 (0.969) | 45,619 / 33,457 (0.733) |
+  | north/tables | 144 (72) | 135,551 | 162,554 (1.199) | 6,497 / 4,636 (0.714) |
+
+  Geometric mean: 0.983 for the whole corpora (north score 0.3035 would become about 0.298), 0.701 for the text files alone. Encode 1.5 s at most.
+- Verdict: **measured**. On text files alone the IR stores 0.66 to 0.73 of what the kernel stores. In a mixed corpus it wins where the text stands on its own (cases 0.817) and loses where the text repeats an office or pdf file's facts (tables 1.199: the kernel's sharing of the same records across csv, json, md, xlsx, docx and pdf saves more than the IR's coding of the csv, json and md alone). So an IR option in repack needs a judge at the store, as `route` (E208) is in the pack: keep the IR pack only where the store is smaller with it. With that judge the three corpora would be 0.817, 0.969 and 1.000, a geometric mean of 0.925 (north about 0.281), at the cost of a second repack of the text files. (E223: with the files kept readable by id, this does not hold; judged 0.993.)
+- Next: an `ir` repack option that encodes a tree's text files with the E216 setting and keeps the pack only when the stored bytes go down; then the bench's north score with it on.
+- Run: `cargo run --release --example ir_north` (about 1.5 minutes).
+
+### E223 ir-repack (files kept readable as members of an IR pack in the store)
+- Branch / parent: exp/223-ir-repack / E222 (stacked)
+- Question: E222 replaced a corpus's text files with one IR pack, so those files could no longer be read by their ids. Kept addressable, as members of the pack in the store, how much of that gain is left, and would a store-level judge (keep whichever is smaller) move the north score?
+- Change: two builtins, `ir-member/1` (`ir_member(pack, index)`) and `ir-block-member/1` (`ir_block_member(skeletons, block, index)`, blocks without a keyframe), appended to the builtin table, and `Repo::put_ir` and `Repo::put_ir_blocks` (`src/ir/store.rs`): the pack (or each block) is content, each file the fact naming it, so repack keeps the pack and drops the files' own bytes. The last pack or block decoded on each thread is kept, so reading a pack's files in turn decodes it once. Nothing calls these unless asked; put and repack are unchanged. Test `ir_members_in_the_store` (whole and blocks, read back after repack, fsck clean; an index past the pack is refused). New `examples/ir_repack.rs` stores each corpus with its text files (md, html, json, jsonl, csv, log, py) as themselves, as one IR pack's members, or as blocks of 50 or 20, every file read back by id after repack and fsck clean.
+- Result (bytes after repack against the files with short records; E104's `short_records`, which IR members need; read time of one text file):
+
+  | corpus | files (text) | files | short records: files | IR pack (read ms first / next) | blocks of 50 (read ms) | blocks of 20 (read ms) | judged |
+  | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+  | north/cases | 792 (510) | 391,496 | 361,242 | 0.982 (28.8 / 1.2) | 1.113 (0.1) | 1.096 (0.3) | 0.982 |
+  | north/multiformat | 96 (48) | 332,403 | 310,415 | 0.999 (0.7 / 0.5) | 0.997 (0.5) | 1.031 (0.5) | 0.997 |
+  | north/tables | 144 (72) | 135,551 | 122,678 | 1.016 (0.9 / 0.2) | 1.039 (0.7) | 1.039 (0.6) | 1.000 |
+  | reports-drift | 300 (300) | 27,657 | 27,657 | 1.072 (19.0 / 0.2) | 1.394 (4.1) | 1.397 (2.5) | 1.000 |
+  | exports | 300 (300) | 22,036 | 22,036 | 1.193 (3.5 / 0.4) | 1.493 (0.9) | 1.795 (0.8) | 1.000 |
+  | cases text | 549 (549) | 216,843 | 210,521 | 1.124 (34.7 / 1.7) | 1.298 (2.3) | 1.267 (1.1) | 1.000 |
+
+  North corpora (geometric mean against the files with plain records): short records alone 0.920; judged with IR members 0.914, so the IR adds 0.007 on top of short records.
+- Why so little, when the pack alone stores 0.66 to 0.73 of the text (E222): every member costs one derivation record holding its file's 32-byte id (cases text: 549 records, 30 KB short, 74 KB plain, against a 125 KB pack), and the kernel's files were already small (92 bytes a report after templates and the dictionary). And the planner stores the pack with zstd, not brotli (cases text 195 KB against 144 KB alone), because it charges a decode of the pack for each member read; teaching its read model about the member cache (first try, reverted) did not change the codec, since repack also plans some text files as slices of the pack, and those count the pack's reads again. Blocks make reads fast (0.1 to 4 ms) but cost more records per file and lose the cross-block bases.
+- Verdict: **measured, not worth turning on**. The members work and stay exact, but at rest they do not beat the kernel's own files except by about 2% on the fixture cases. E222's forecast of north 0.281 assumed files no one reads by id; it does not hold for files kept addressable. The IR's size gains belong where whole folders are written and read together (exports, archives, E217's blocks as entries), not as a per-file storage plan.
+- Run: `cargo run --release --example ir_repack [corpus ...]` (about 7 minutes).
+
+### E224 ir-raw-keyframe (raw text of blocks compressed after the keyframe)
+- Branch / parent: exp/224-ir-raw-keyframe / E223 (stacked)
+- Question: E221 found that storing blocks' raw parts apart does not win back what prose-heavy folders lose in blocks. How much would it win if each block's raw text were compressed after the keyframe block's (block 0's) raw text, as the keyframe already does for streams?
+- Change: none to the kernel. Prototype `packages/kernel/scripts/ir_raw_keyframe.py`: the fixture cases' text files (the raw part, since `route` keeps them plain) in blocks, each block compressed with xz -9 alone, after block 0 (estimated as xz(block 0 + block) minus xz(block 0)), or after a sample of every block's first file.
+- Result (526 files, 832 KB; against xz -9 over every file at once, 128,968 B):
+
+  | blocks of | blocks | alone | after block 0 | after a sample |
+  | ---: | ---: | ---: | ---: | ---: |
+  | 20 | 27 | 1.830 | 1.725 | 1.455 |
+  | 50 | 11 | 1.531 | 1.222 | 1.375 |
+  | 100 | 6 | 1.334 | 1.104 | 1.306 |
+
+- Verdict: **measured, worth building**. Compressing a block's raw text after block 0's cuts blocks of 50 by a fifth (1.531 to 1.222 of the whole), and a reader of any block already decodes block 0 for the keyframe, so the read cost is small. The kernel's related-content frames (E057) could in principle do this, but E221 shows they do not fire for raw parts stored apart. Building it needs the block format to name block 0's raw part as the frame's dictionary (zstd with a raw-content dictionary), or the planner to pick it as the related base.
+- Next: raw parts of later blocks as zstd frames with block 0's raw part as dictionary, in `encode_blocks` with `keyframe`; measure E217's cases blocks again (now 0.819 against 0.672 whole).
+- Run: `python3 -I packages/kernel/scripts/ir_raw_keyframe.py tests/fixtures/cases` (about a minute).
+
+### E225 ir-raw-dict (later blocks' raw text compressed against the keyframe's, in the store)
+- Branch / parent: exp/225-ir-raw-dict / E224 (stacked)
+- Question: E224's prototype (under xz) found a block's raw text a fifth smaller after block 0's. Does that hold in ikam's store, which compresses each block entry with its own codecs and a trained dictionary?
+- Change: `Options::raw_keyframe` (off by default; blocks with a keyframe only): `encode_blocks` stores each later block's raw part as a zstd -19 frame with the first block's raw part as its dictionary, where that is smaller than the raw part under xz -6 (as `route` judges); `Blocks::raw_framed` marks those blocks, and `Reader` unframes them before decoding (a frame over 4 GiB is refused). `tests/ir.rs` turns it on in half of its option sets. New `examples/ir_rawkey.rs` (E217's blocks in the kernel, without and with it).
+- Result (each block one entry in the kernel; against the files in the kernel; read ms of the middle block):
+
+  | corpus | whole pack | blocks of 20: before / raw keyframe | blocks of 50: before / raw keyframe |
+  | --- | ---: | ---: | ---: |
+  | reports-drift | 0.303 | 0.432 / 0.432 | 0.381 / 0.381 |
+  | exports | 0.228 | 0.358 / 0.358 | 0.277 / 0.277 |
+  | tables | 0.700 | 0.775 / 0.775 | 0.738 / 0.738 |
+  | texts | 0.849 | 0.863 / 0.864 | 0.851 / 0.851 |
+  | drift + texts | 0.560 | 0.635 / 0.635 | 0.597 / 0.597 |
+  | cases text (real) | 0.672 | 0.833 / 1.249 | 0.819 / 0.869 |
+  | cases text + drift | 0.611 | 0.781 / 1.126 | 0.749 / 0.785 |
+
+  Reads are unchanged (0.0 to 7 ms). Judging the frame against the raw part as it is (first run) instead of under xz -6 gave the same cases figures.
+- Verdict: **dropped** (the option stays, off). In the store, a framed raw part is worse wherever it is used: the kernel already compresses a block entry better (brotli or xz, its trained dictionary across entries) than zstd does with block 0 as dictionary, and a frame cannot be compressed again. E224's gain is real under one compressor but the store gets most of it already. A gain here would need the store itself to compress a block against block 0 (E057's related-content frames), not the IR.
+- Run: `cargo run --release --example ir_rawkey [corpus ...]` (about a minute).

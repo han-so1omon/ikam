@@ -31,9 +31,28 @@ pub fn render() -> Id {
     builtin("render/1")
 }
 
+/// One file of an IR pack (E223, `ir.rs`): `ir_member(pack, index)`, the
+/// index as decimal text. A fact like `render`: repack keeps it.
+pub fn ir_member() -> Id {
+    builtin("ir-member/1")
+}
+
+/// One file of an IR block (E223): `ir_block_member(skeletons, block,
+/// index)`, the block encoded without a keyframe, the index as decimal text.
+pub fn ir_block_member() -> Id {
+    builtin("ir-block-member/1")
+}
+
 /// Builtins by index, for short derivation records (`abbrev.rs`). Stored
 /// records depend on this order: only append.
-const BUILTINS: [&str; 4] = ["concat/1", "deflate-pack/1", "fill/1", "render/1"];
+const BUILTINS: [&str; 6] = [
+    "concat/1",
+    "deflate-pack/1",
+    "fill/1",
+    "render/1",
+    "ir-member/1",
+    "ir-block-member/1",
+];
 
 pub(crate) fn builtin_index(func: &Id) -> Option<u8> {
     BUILTINS
@@ -53,7 +72,12 @@ pub fn is_plan(func: &Id) -> bool {
 }
 
 pub fn is_builtin(func: &Id) -> bool {
-    *func == concat() || *func == deflate_pack() || *func == fill() || *func == render()
+    *func == concat()
+        || *func == deflate_pack()
+        || *func == fill()
+        || *func == render()
+        || *func == ir_member()
+        || *func == ir_block_member()
 }
 
 /// Run `func` on `args`: its output and the decode work it took (bytes
@@ -70,6 +94,10 @@ pub fn run(
         container::pack(args, memo)?
     } else if *func == fill() {
         template::fill(args)?
+    } else if *func == ir_member() {
+        return crate::ir::member(args);
+    } else if *func == ir_block_member() {
+        return crate::ir::block_member(args);
     } else {
         let module = module.ok_or_else(|| Error::Exec(format!("{func}: no such function")))?;
         let (out, fuel) = wasm::run(module, args)?;
