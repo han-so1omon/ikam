@@ -190,12 +190,18 @@ enum Mode {
     Stored,
     Postings,
     NodePostings,
+    /// E191: a word's list split by the first `n` hex digits of the
+    /// fragment id, so an edit rewrites only the buckets it touches.
+    Bucketed(usize),
     Native,
 }
 
 impl Mode {
     fn postings(self) -> bool {
-        matches!(self, Mode::Postings | Mode::NodePostings)
+        matches!(
+            self,
+            Mode::Postings | Mode::NodePostings | Mode::Bucketed(_)
+        )
     }
 
     fn name(self) -> &'static str {
@@ -204,6 +210,8 @@ impl Mode {
             Mode::Stored => "stored",
             Mode::Postings => "stored+postings",
             Mode::NodePostings => "stored+node-postings",
+            Mode::Bucketed(1) => "stored+postings/16",
+            Mode::Bucketed(_) => "stored+postings/256",
             Mode::Native => "native",
         }
     }
@@ -240,8 +248,21 @@ fn plabel(w: &[u8], f: &Id) -> String {
     format!("w/{}/{}", String::from_utf8_lossy(w), f.to_hex())
 }
 
-/// The fragments holding `wd`, from either kind of postings.
+/// A bucket of a word's list: fragments whose id starts with `b`.
+fn blabel(w: &[u8], f: &Id, n: usize) -> String {
+    format!("w/{}/{}", String::from_utf8_lossy(w), &f.to_hex()[..n])
+}
+
+/// The fragments holding `wd`, from any kind of postings.
 fn candidates<S: Store>(repo: &Repo<S>, root: &Id, mode: Mode, wd: &[u8]) -> BTreeSet<Id> {
+    if let Mode::Bucketed(_) = mode {
+        let p = format!("{}/", wlabel(wd));
+        let mut out = BTreeSet::new();
+        for n in repo.graph_prefix(root, &p).unwrap() {
+            out.extend(ids_of(&repo.read_content(&content_of(&n)).unwrap()));
+        }
+        return out;
+    }
     if mode == Mode::NodePostings {
         let p = format!("{}/", wlabel(wd));
         return repo
@@ -300,7 +321,7 @@ impl View {
     /// The summary content of fragment `f`, made and stored.
     fn summarize<S: Store>(&self, repo: &mut Repo<S>, f: &Id) -> Id {
         match self.mode {
-            Mode::Stored | Mode::Postings | Mode::NodePostings => {
+            Mode::Stored | Mode::Postings | Mode::NodePostings | Mode::Bucketed(_) => {
                 repo.apply(self.func, vec![Arg::Whole(*f)]).unwrap()
             }
             Mode::Native => {
@@ -379,6 +400,38 @@ impl View {
             for (w, fs) in &minus {
                 for f in fs {
                     edits.insert(plabel(w, f), None);
+                }
+            }
+        }
+        if let Mode::Bucketed(n) = self.mode {
+            let mut lists: BTreeMap<String, BTreeSet<Id>> = BTreeMap::new();
+            for (w, fs) in plus.iter().chain(&minus) {
+                for f in fs {
+                    lists.entry(blabel(w, f, n)).or_default();
+                }
+            }
+            let labels: BTreeSet<String> = lists.keys().cloned().collect();
+            for nd in repo.graph_nodes_in(&self.root, &labels).unwrap() {
+                let ids = ids_of(&repo.read_content(&content_of(&nd)).unwrap());
+                lists.insert(nd.label, ids);
+            }
+            for (w, fs) in &plus {
+                for f in fs {
+                    lists.get_mut(&blabel(w, f, n)).unwrap().insert(*f);
+                }
+            }
+            for (w, fs) in &minus {
+                for f in fs {
+                    lists.get_mut(&blabel(w, f, n)).unwrap().remove(f);
+                }
+            }
+            for (label, ids) in lists {
+                if ids.is_empty() {
+                    edits.insert(label, None);
+                } else {
+                    let b: Vec<u8> = ids.iter().flat_map(|i| *i.as_bytes()).collect();
+                    let id = repo.put_content(&b).unwrap().id;
+                    edits.insert(label.clone(), Some(node(label, id)));
                 }
             }
         }
@@ -570,8 +623,13 @@ fn check_view<S: Store>(repo: &Repo<S>, root: &Id, units: &BTreeMap<String, Vec<
                 .or_default()
                 .insert(f.parse().unwrap());
         } else {
+            // A whole list `w/<word>`, or one bucket `w/<word>/<prefix>`.
             let ids = ids_of(&repo.read_content(&content_of(&n)).unwrap());
-            got.insert(n.label.clone(), ids);
+            let w = match n.label[2..].split_once('/') {
+                Some((w, _)) => format!("w/{w}"),
+                None => n.label.clone(),
+            };
+            got.entry(w).or_default().extend(ids);
         }
     }
     if !got.is_empty() {
@@ -860,7 +918,7 @@ fn run(
                 files_and_agg(&units, &sums).1,
             )
         }
-        Mode::Postings | Mode::NodePostings => (
+        Mode::Postings | Mode::NodePostings | Mode::Bucketed(_) => (
             candidates(&repo, &root.unwrap(), mode, &words[0]),
             Agg::default(),
         ),
@@ -910,7 +968,7 @@ fn run(
     // Warm goal queries: candidates from the cache, a summary scan, or postings.
     let by_word: HashMap<Vec<u8>, BTreeSet<Id>> = match mode {
         Mode::Memory => warm_cache.1,
-        Mode::Postings | Mode::NodePostings => HashMap::new(),
+        Mode::Postings | Mode::NodePostings | Mode::Bucketed(_) => HashMap::new(),
         _ => {
             let v = View {
                 root: root.unwrap(),
@@ -1143,6 +1201,12 @@ fn crash() {
     }
 }
 
+fn p50<T: Copy + PartialOrd>(v: &[T]) -> T {
+    let mut v = v.to_vec();
+    v.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    v[v.len() / 2]
+}
+
 // ---- E189: scale -------------------------------------------------------------
 
 fn lcg(x: &mut u64) -> u64 {
@@ -1207,7 +1271,14 @@ fn scale(nfiles: usize) {
     let files = synthetic(nfiles);
     let bytes: usize = files.iter().map(|f| f.1.len()).sum();
     let tmp = tempfile::tempdir().unwrap();
-    for mode in [Mode::Memory, Mode::Native, Mode::Stored, Mode::Postings] {
+    for mode in [
+        Mode::Memory,
+        Mode::Native,
+        Mode::Stored,
+        Mode::Postings,
+        Mode::Bucketed(1),
+        Mode::Bucketed(2),
+    ] {
         KIND.with(|k| *k.borrow_mut() = format!("pack/{nfiles}"));
         let dir = tmp.path().join(mode.name());
         let c = Arc::new(Counts::default());
@@ -1246,7 +1317,7 @@ fn scale(nfiles: usize) {
             ),
         );
         // 20 single-file edits.
-        let (mut up_ms, mut up_w, mut up_r) = (0.0, 0, 0);
+        let (mut up_ms, mut up_w, mut up_r) = (Vec::new(), Vec::new(), Vec::new());
         let mut x = 0x9e3779b97f4a7c15u64;
         for step in 0..20 {
             let path = keys[lcg(&mut x) as usize % keys.len()].clone();
@@ -1280,18 +1351,20 @@ fn scale(nfiles: usize) {
             let (added, removed) = v.diff(&old, &w.units, std::slice::from_ref(&path));
             v.update(&mut w.repo, &added, &removed);
             commit(&mut w.repo, w.tree, &v, "edit");
-            up_ms += ms(t);
-            up_w += c.written.load(Relaxed) - w0;
-            up_r += c.read.load(Relaxed) - r0;
+            up_ms.push(ms(t));
+            up_w.push(c.written.load(Relaxed) - w0);
+            up_r.push(c.read.load(Relaxed) - r0);
         }
         sline(
             "scale edits",
             format!(
-                "\"mode\":\"{}\",\"edits\":20,\"upkeep_ms_per_edit\":{:.2},\"upkeep_read_per_edit\":{},\"written_per_edit_incl_commit\":{}",
+                "\"mode\":\"{}\",\"edits\":20,\"upkeep_ms_p50\":{:.2},\"upkeep_ms_max\":{:.1},\"upkeep_read_p50\":{},\"upkeep_read_max\":{},\"written_p50_incl_commit\":{}",
                 mode.name(),
-                up_ms / 20.0,
-                up_r / 20,
-                up_w / 20
+                p50(&up_ms),
+                up_ms.iter().cloned().fold(0.0, f64::max),
+                p50(&up_r),
+                up_r.iter().max().unwrap(),
+                p50(&up_w)
             ),
         );
         let units = w.units.clone();
@@ -1326,7 +1399,9 @@ fn scale(nfiles: usize) {
                 })
                 .copied()
                 .collect(),
-            Mode::Postings => candidates(&repo, &root.unwrap(), mode, &words[0]),
+            Mode::Postings | Mode::Bucketed(_) => {
+                candidates(&repo, &root.unwrap(), mode, &words[0])
+            }
             _ => {
                 let v = View {
                     root: root.unwrap(),
@@ -1371,6 +1446,8 @@ fn main() {
             Mode::Stored,
             Mode::Postings,
             Mode::NodePostings,
+            Mode::Bucketed(1),
+            Mode::Bucketed(2),
             Mode::Native,
         ] {
             run(kind, mode, &files, &dir.join(mode.name()), Some(&base));
