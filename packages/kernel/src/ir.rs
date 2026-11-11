@@ -50,6 +50,11 @@ pub struct Options {
     /// line determines it (a client's region, a link's sensor) and stores
     /// a cell its predictor gets right as one byte.
     pub predict: bool,
+    /// E201: the streams an encode adds are laid out sorted by their key
+    /// (line skeleton, slot, row key) instead of in the order they first
+    /// appear, so the same column of every row sits together for the
+    /// general compressor.
+    pub group: bool,
 }
 
 /// An encoded set of files: the line skeletons, each file's lines and cell
@@ -680,9 +685,12 @@ struct Skeletons {
 
 /// The streams after an encode, so a later encode can go on from them (a
 /// block coded against a keyframe block, E197).
+/// A stream's key: line skeleton, slot, row key.
+type StreamKey = (usize, usize, Vec<u8>);
+
 #[derive(Clone, Default)]
 struct EncState {
-    index: HashMap<(usize, usize, Vec<u8>), usize>,
+    index: HashMap<StreamKey, usize>,
     streams: Vec<Stream>,
 }
 
@@ -697,6 +705,7 @@ fn encode_with(
 ) -> Parts {
     let mut parts = Parts::default();
     let EncState { index, streams } = state;
+    let first_new = streams.len();
     let lexed: Vec<Vec<Line>> = files.iter().map(|(n, b)| lines(b, &lex(n, b))).collect();
     // prose: under a tenth of the file's bytes are cells (E198 measured 2 to
     // 5% for prose, 14% and up for reports and tables)
@@ -821,6 +830,23 @@ fn encode_with(
         });
         all_cells.push(cells);
     }
+    if o.group && streams.len() > first_new + 1 {
+        let mut keys: Vec<(StreamKey, usize)> = index
+            .iter()
+            .filter(|(_, i)| **i >= first_new)
+            .map(|(k, i)| (k.clone(), *i))
+            .collect();
+        keys.sort_unstable();
+        let mut moved: Vec<Option<Stream>> = streams.drain(first_new..).map(Some).collect();
+        parts.directory.clear();
+        for (key, old) in keys {
+            put_var(&mut parts.directory, key.0 as u128);
+            put_var(&mut parts.directory, key.1 as u128);
+            put_bytes(&mut parts.directory, &key.2);
+            index.insert(key, streams.len());
+            streams.push(moved[old - first_new].take().expect("each stream once"));
+        }
+    }
     parts.streams = streams
         .iter_mut()
         .map(|s| std::mem::take(&mut s.out))
@@ -831,7 +857,7 @@ fn encode_with(
 /// The streams after a decode (the decoding side of `EncState`).
 #[derive(Clone, Default)]
 struct DecState {
-    index: HashMap<(usize, usize, Vec<u8>), usize>,
+    index: HashMap<StreamKey, usize>,
     states: Vec<Stream>,
 }
 
