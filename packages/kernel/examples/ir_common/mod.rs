@@ -673,6 +673,7 @@ pub const T: Options = Options {
     transpose: false,
     sample: 0,
     bases: false,
+    raw_keyframe: false,
 };
 pub const TC: Options = Options { columns: true, ..T };
 pub const TCN: Options = Options {

@@ -73,6 +73,7 @@ fn read_from(b: &Blocks, k: usize, open: &mut dyn FnMut(usize) -> Parts, want: &
         keyframe: b.keyframe,
         skeletons: b.skeletons.clone(),
         blocks,
+        raw_framed: b.raw_framed.clone(),
     };
     ir::decode_block(&one, k)
         .unwrap()

@@ -105,6 +105,13 @@ pub struct Options {
     /// costs reports whose columns the predictors already catch. The
     /// decoder needs nothing new (each file says whether it has a base).
     pub bases: bool,
+    /// E225 (blocks with a keyframe only): every later block's raw part
+    /// (the files stored as they are) is a zstd frame with the first
+    /// block's raw part as its dictionary, where that is smaller than the
+    /// raw part under xz -6, so a
+    /// block's prose is compressed after the keyframe's as its streams go
+    /// on from the keyframe's. A reader decodes the first block anyway.
+    pub raw_keyframe: bool,
 }
 
 /// How `route` stores a file: through the IR (0), as it is (`PLAIN`), or
@@ -1961,6 +1968,9 @@ pub struct Blocks {
     pub skeletons: Vec<Vec<u8>>,
     /// Each block's parts, with no skeletons of their own.
     pub blocks: Vec<Parts>,
+    /// E225: which blocks' raw parts are zstd frames against the first
+    /// block's raw part (empty: none).
+    pub raw_framed: Vec<bool>,
 }
 
 /// Encodes `files` as blocks of `per` files (at least 1).
@@ -2001,13 +2011,35 @@ pub fn encode_blocks(
             key = state;
         }
     }
+    let mut raw_framed = Vec::new();
+    if keyframe && o.raw_keyframe && blocks.len() > 1 {
+        raw_framed = vec![false; blocks.len()];
+        let dict = blocks[0].raw.clone();
+        for (p, framed) in blocks.iter_mut().zip(&mut raw_framed).skip(1) {
+            if p.raw.is_empty() {
+                continue;
+            }
+            // Judged against the raw part compressed on its own (xz -6, as
+            // `route` judges), since the store would compress it anyway.
+            if let Some(z) = crate::dict::zstd_frame(&p.raw, &dict, crate::dict::STORE_LEVEL)
+                && z.len() < judged_bytes(&p.raw)
+            {
+                p.raw = z;
+                *framed = true;
+            }
+        }
+    }
     Blocks {
         per,
         keyframe,
         skeletons: table.list,
         blocks,
+        raw_framed,
     }
 }
+
+/// Raw parts larger than this are refused when unframed (a damaged frame).
+const RAW_LIMIT: usize = 1 << 32;
 
 type Files = Vec<(String, Vec<u8>)>;
 
@@ -2040,6 +2072,13 @@ impl Reader<'_> {
         let (files, st) = self.key.as_ref().expect("set above");
         if i == 0 {
             return Ok(files.clone());
+        }
+        if b.raw_framed.get(i).copied().unwrap_or(false) {
+            let dict = &b.blocks.first().ok_or(Error::Decode("ir: no block"))?.raw;
+            let raw = crate::dict::unzstd_prefix(&p.raw, dict, RAW_LIMIT)
+                .ok_or(Error::Decode("ir: raw frame"))?;
+            let p = Parts { raw, ..p.clone() };
+            return decode_with(&p, &b.skeletons, &mut st.clone());
         }
         decode_with(p, &b.skeletons, &mut st.clone())
     }
@@ -2219,6 +2258,7 @@ mod tests {
                 keyframe: false,
                 skeletons: table.list,
                 blocks,
+                raw_framed: Vec::new(),
             };
             assert_eq!(decode_blocks(&b).unwrap(), files);
         }

@@ -3261,3 +3261,23 @@ Newest last. Format and rules: `README.md`.
 - Verdict: **measured, worth building**. Compressing a block's raw text after block 0's cuts blocks of 50 by a fifth (1.531 to 1.222 of the whole), and a reader of any block already decodes block 0 for the keyframe, so the read cost is small. The kernel's related-content frames (E057) could in principle do this, but E221 shows they do not fire for raw parts stored apart. Building it needs the block format to name block 0's raw part as the frame's dictionary (zstd with a raw-content dictionary), or the planner to pick it as the related base.
 - Next: raw parts of later blocks as zstd frames with block 0's raw part as dictionary, in `encode_blocks` with `keyframe`; measure E217's cases blocks again (now 0.819 against 0.672 whole).
 - Run: `python3 -I packages/kernel/scripts/ir_raw_keyframe.py tests/fixtures/cases` (about a minute).
+
+### E225 ir-raw-dict (later blocks' raw text compressed against the keyframe's, in the store)
+- Branch / parent: exp/225-ir-raw-dict / E224 (stacked)
+- Question: E224's prototype (under xz) found a block's raw text a fifth smaller after block 0's. Does that hold in ikam's store, which compresses each block entry with its own codecs and a trained dictionary?
+- Change: `Options::raw_keyframe` (off by default; blocks with a keyframe only): `encode_blocks` stores each later block's raw part as a zstd -19 frame with the first block's raw part as its dictionary, where that is smaller than the raw part under xz -6 (as `route` judges); `Blocks::raw_framed` marks those blocks, and `Reader` unframes them before decoding (a frame over 4 GiB is refused). `tests/ir.rs` turns it on in half of its option sets. New `examples/ir_rawkey.rs` (E217's blocks in the kernel, without and with it).
+- Result (each block one entry in the kernel; against the files in the kernel; read ms of the middle block):
+
+  | corpus | whole pack | blocks of 20: before / raw keyframe | blocks of 50: before / raw keyframe |
+  | --- | ---: | ---: | ---: |
+  | reports-drift | 0.303 | 0.432 / 0.432 | 0.381 / 0.381 |
+  | exports | 0.228 | 0.358 / 0.358 | 0.277 / 0.277 |
+  | tables | 0.700 | 0.775 / 0.775 | 0.738 / 0.738 |
+  | texts | 0.849 | 0.863 / 0.864 | 0.851 / 0.851 |
+  | drift + texts | 0.560 | 0.635 / 0.635 | 0.597 / 0.597 |
+  | cases text (real) | 0.672 | 0.833 / 1.249 | 0.819 / 0.869 |
+  | cases text + drift | 0.611 | 0.781 / 1.126 | 0.749 / 0.785 |
+
+  Reads are unchanged (0.0 to 7 ms). Judging the frame against the raw part compressed with zstd alone instead of xz -6 (first run) gave the same cases figures.
+- Verdict: **dropped** (the option stays, off). In the store, a framed raw part is worse wherever it is used: the kernel already compresses a block entry better (brotli or xz, its trained dictionary across entries) than zstd does with block 0 as dictionary, and a frame cannot be compressed again. E224's gain is real under one compressor but the store gets most of it already. A gain here would need the store itself to compress a block against block 0 (E057's related-content frames), not the IR.
+- Run: `cargo run --release --example ir_rawkey [corpus ...]` (about a minute).
