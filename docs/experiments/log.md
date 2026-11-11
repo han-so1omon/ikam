@@ -3171,3 +3171,21 @@ Newest last. Format and rules: `README.md`.
   Untuned, every size is the same and encodes are 1.4 to 4x faster; tuned, they are 2 to 6x faster and up to 0.014 larger, since `tune` picks each column's coding from fewer rows. The nine E216 corpora give the same sizes as E216. Decode grows linearly (about 20 ms per MB). The ratio itself improves as the set grows: drift reports at 3,000 files are 0.31 of xz.
 - Verdict: **measured**. The setting scales linearly; with runs, 18 MB of reports encode in about a second untuned. Off by default (part of `sample`).
 - Run: `cargo run --release --example ir_scale [files ...]` (about 2 minutes).
+
+### E220 ir-row-groups (a large table cut into row groups)
+- Branch / parent: exp/220-ir-row-groups / E219 (stacked)
+- Question: E217 left a large table as one block (the whole registry file, 54 ms to read). If a table were cut into groups of rows, each its own block, how much of E213's gain survives, and how fast is one group to read? A keyframe (E197) or a shared dictionary would let each group go on from the first.
+- Change: none to the kernel. Prototype `packages/kernel/scripts/ir_row_groups.py` lays each group out as E213 does (sorted by NAICS with the key in file order, columns one after another, outer quotes of always-quoted columns left out) and compresses it with xz -9, alone or after group 0 (estimated as xz(group 0 + group) minus xz(group 0)).
+- Result (real registry, two files of about 25,600 rows; against xz -9 over the files):
+
+  | rows per group | groups | independent | after group 0 | read one group |
+  | ---: | ---: | ---: | ---: | ---: |
+  | whole tables | 2 | 0.912 (solid) | | |
+  | 30,000 (one per file) | 2 | 0.925 | 0.925 | 57 ms |
+  | 10,000 | 6 | 0.981 | 0.955 | 43 ms |
+  | 3,000 | 18 | 1.065 | 1.017 | 15 ms |
+  | 1,000 | 52 | 1.183 | 1.106 | 5 ms |
+
+  Python's xz decodes the two whole files in 147 ms.
+- Verdict: **measured, not built**. Groups lose the gain fast: at 10,000 rows half of it is gone, and below about 4,000 rows the groups are larger than xz over the plain files, even after group 0. Reads get faster only in proportion to the group size, so a row query is better served by E203's column query (one column's stream) than by small row groups. If row ranges are needed, 10,000-row groups after a keyframe are the knee (0.955, about a third of the whole-table read).
+- Run: `python3 -I packages/kernel/scripts/ir_row_groups.py tests/fixtures/san-diego-business-registry/*.csv` (about a minute).
