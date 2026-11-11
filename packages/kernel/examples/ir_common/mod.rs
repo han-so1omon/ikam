@@ -668,6 +668,7 @@ pub const T: Options = Options {
     sort: false,
     transpose: false,
     sample: 0,
+    bases: false,
 };
 pub const TC: Options = Options { columns: true, ..T };
 pub const TCN: Options = Options {

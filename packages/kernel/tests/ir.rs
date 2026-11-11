@@ -22,6 +22,7 @@ fn all_options() -> Vec<Options> {
             sort: b % 3 == 0,
             transpose: b % 5 == 1,
             sample: if b % 7 == 2 { 600 } else { 0 },
+            bases: b % 4 != 3,
         })
         .collect()
 }

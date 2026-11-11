@@ -95,7 +95,18 @@ pub struct Options {
     /// to its first line and an even spread of its other lines. What they
     /// choose then applies to every file.
     pub sample: usize,
+    /// E216 (with `route`): `route` also judges, per kind of file, whether
+    /// its files diff against a base file (`siblings`, `nearest`) or store
+    /// every cell, since a base helps exports that repeat each other and
+    /// costs reports whose columns the predictors already catch. The
+    /// decoder needs nothing new (each file says whether it has a base).
+    pub bases: bool,
 }
+
+/// How `route` stores a file: through the IR (0), as it is (`PLAIN`), or
+/// through the IR with no base file (`UNBASED`, E216).
+const PLAIN: u8 = 1;
+const UNBASED: u8 = 2;
 
 /// An encoded set of files: the line skeletons, each file's lines and cell
 /// diff, and the cell streams (one, or one per column in (skeleton, slot)
@@ -885,7 +896,7 @@ pub fn encode(files: &[(String, Vec<u8>)], o: Options) -> Parts {
 fn encode_modes(
     files: &[(String, Vec<u8>)],
     o: Options,
-    plain: &[bool],
+    plain: &[u8],
     modes: (&Modes, u8),
 ) -> Parts {
     let mut table = Skeletons::default();
@@ -953,9 +964,9 @@ pub fn tune_modes(files: &[(String, Vec<u8>)], o: Options) -> Vec<(StreamKey, u8
     m
 }
 
-fn tune(files: &[(String, Vec<u8>)], o: Options, plain: &[bool]) -> Modes {
+fn tune(files: &[(String, Vec<u8>)], o: Options, plain: &[u8]) -> Modes {
     let modes = Modes::default();
-    if !o.tune || files.is_empty() || (!plain.is_empty() && plain.iter().all(|p| *p)) {
+    if !o.tune || files.is_empty() || (!plain.is_empty() && plain.iter().all(|p| p & PLAIN != 0)) {
         return modes;
     }
     let predicts = o.predict && o.columns;
@@ -1056,7 +1067,7 @@ fn judged_bytes(b: &[u8]) -> usize {
 
 /// The judged size of the pack with `plain` stored as it is; with `tune`,
 /// of the pack as tuned (E209), so `route` weighs the IR at its best.
-fn judged(files: &[(String, Vec<u8>)], o: Options, plain: &[bool]) -> (usize, Modes) {
+fn judged(files: &[(String, Vec<u8>)], o: Options, plain: &[u8]) -> (usize, Modes) {
     let modes = tune(files, o, plain);
     let z = judged_bytes(&pack(&encode_modes(files, o, plain, (&modes, 0))));
     (z, modes)
@@ -1070,14 +1081,27 @@ fn judged(files: &[(String, Vec<u8>)], o: Options, plain: &[bool]) -> (usize, Mo
 /// smaller way; then the whole set so routed is judged against all IR and
 /// all plain, and the smallest of the three is kept.
 pub fn route(files: &[(String, Vec<u8>)], o: Options) -> Vec<bool> {
-    route_modes(files, o).0
+    route_modes(files, o)
+        .0
+        .into_iter()
+        .map(|p| p & PLAIN != 0)
+        .collect()
+}
+
+/// E216: which files `route` stores through the IR with no base file.
+pub fn unbased(files: &[(String, Vec<u8>)], o: Options) -> Vec<bool> {
+    route_modes(files, o)
+        .0
+        .into_iter()
+        .map(|p| p & UNBASED != 0)
+        .collect()
 }
 
 /// `route`, with the stream modes `tune` chose for the files so routed.
-fn route_modes(files: &[(String, Vec<u8>)], o: Options) -> (Vec<bool>, Modes) {
+fn route_modes(files: &[(String, Vec<u8>)], o: Options) -> (Vec<u8>, Modes) {
     let n = files.len();
     if !o.route || n == 0 {
-        let plain = vec![false; n];
+        let plain = vec![0; n];
         let (_, s) = sample(files, o.sample);
         let modes = tune(&s, o, &[]);
         return (plain, modes);
@@ -1104,35 +1128,46 @@ fn route_modes(files: &[(String, Vec<u8>)], o: Options) -> (Vec<bool>, Modes) {
         };
         groups.entry(key).or_default().push(i);
     }
-    let mut plain = vec![false; n];
+    let mut plain = vec![0; n];
     let mut last = Modes::default();
+    let ways: &[u8] = if o.bases && (o.siblings || o.nearest > 0) {
+        &[PLAIN, UNBASED]
+    } else {
+        &[PLAIN]
+    };
     for members in groups.values() {
         let g: Vec<(String, Vec<u8>)> = members.iter().map(|&i| files[i].clone()).collect();
         let (_, g) = sample(&g, o.sample);
-        let (ir, modes) = judged(&g, o, &[]);
-        let (raw, _) = judged(&g, o, &vec![true; g.len()]);
-        if raw < ir {
-            for &i in members {
-                plain[i] = true;
+        let mut best = judged(&g, o, &[]);
+        let mut way = 0;
+        for &w in ways {
+            let (z, modes) = judged(&g, o, &vec![w; g.len()]);
+            if z < best.0 {
+                best = (z, modes);
+                way = w;
             }
-        } else {
-            last = modes;
+        }
+        for &i in members {
+            plain[i] = way;
+        }
+        if way != PLAIN {
+            last = best.1;
         }
     }
     // one group: its judgment was already of the whole set
     if groups.len() == 1 {
-        if plain.iter().all(|p| *p) {
+        if plain.iter().all(|p| p & PLAIN != 0) {
             last = Modes::default();
         }
         return (plain, last);
     }
-    let mut tries = vec![plain, vec![false; n], vec![true; n]];
+    let mut tries = vec![plain, vec![0; n], vec![PLAIN; n]];
     tries.dedup();
     let (kept, s) = sample(files, o.sample);
     tries
         .into_iter()
         .map(|p| {
-            let sp: Vec<bool> = kept.iter().map(|&i| p[i]).collect();
+            let sp: Vec<u8> = kept.iter().map(|&i| p[i]).collect();
             let (z, m) = judged(&s, o, &sp);
             (z, p, m)
         })
@@ -1196,7 +1231,7 @@ struct EncState {
 fn encode_with(
     files: &[(String, Vec<u8>)],
     o: Options,
-    plain: &[bool],
+    plain: &[u8],
     (modes, modes_all): (&Modes, u8),
     sorted: &[Sorted],
     table: &mut Skeletons,
@@ -1215,7 +1250,7 @@ fn encode_with(
         .enumerate()
         .map(|(i, ((_, b), fl))| {
             let cells: usize = fl.iter().flat_map(|l| &l.cells).map(|c| c.len()).sum();
-            plain.get(i).copied().unwrap_or(false)
+            plain.get(i).is_some_and(|p| p & PLAIN != 0)
                 || (o.prose && !b.is_empty() && cells * 10 < b.len())
         })
         .collect();
@@ -1284,10 +1319,17 @@ fn encode_with(
             at += l.cells.len();
         }
         let cells: Vec<&[u8]> = ls.iter().flat_map(|l| l.cells.iter().copied()).collect();
-        let sibling = by_stem.get(stem(name)).copied().filter(|_| o.siblings);
-        let recent = by_ext.get(ext(name)).map_or(&[][..], |v: &Vec<usize>| {
-            &v[v.len().saturating_sub(o.nearest)..]
-        });
+        let based = plain.get(fi).is_none_or(|p| p & UNBASED == 0);
+        let sibling = by_stem
+            .get(stem(name))
+            .copied()
+            .filter(|_| o.siblings && based);
+        let recent = by_ext
+            .get(ext(name))
+            .filter(|_| based)
+            .map_or(&[][..], |v: &Vec<usize>| {
+                &v[v.len().saturating_sub(o.nearest)..]
+            });
         // a cheap first look (how many of this file's cells each candidate
         // holds anywhere) picks the two likeliest bases; the diff runs on
         // those and the sibling only

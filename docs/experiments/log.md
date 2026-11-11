@@ -3100,3 +3100,25 @@ Newest last. Format and rules: `README.md`.
 - Verdict: **measured**. Two settings split the corpora. "Predict, step, tuned" is best or tied on 7 of 9 and never worse than xz; it loses only where one file repeats another's cells (exports 0.617 against 0.459, tables 0.995 against 0.936), which `siblings` and `nearest` catch and which cost the reports 3 to 8%. Row keys make every corpus worse or no better once `route` and `predict` are on. No one setting is best everywhere yet.
 - Next: E216, `route` also judging per kind of file whether its files diff against a base file, so one setting can take both sides.
 - Run: `cargo run --release --example ir_preset [corpus ...]` (about 3 minutes).
+
+### E216 ir-bases (route also judges whether files diff against a base)
+- Branch / parent: exp/216-ir-bases / E215 (stacked)
+- Question: E215 found two settings split the corpora: `siblings` and `nearest` win where one file repeats another's cells (exports, tables) and cost the reports 3 to 8%, whose columns the predictors already catch. Can `route` take each side where it wins?
+- Change: `Options::bases` (off by default; with `route` and `siblings` or `nearest`). For each kind of file, `route` now judges three ways: through the IR, as it is, and through the IR with no base file (every cell stored, predicted and stepped as usual). The files part already says per file whether it has a base, so the decoder needs nothing new. `ir::unbased` reports the choice. The option sets in the tests take `bases` in three of four.
+- Result (all with `prose`, `route`, `sort`, `transpose`, `sample` at 1 MB, and no row keys; xz -9 over the pack against xz -9 over the files; encode time):
+
+  | corpus | predict, step, tuned (E215) | + siblings, nearest 16 | + siblings, nearest, bases | same, untuned |
+  | --- | ---: | ---: | ---: | ---: |
+  | reports-drift | 0.504 (0.3 s) | 0.537 | **0.504** (0.7 s) | 0.505 (0.3 s) |
+  | reports-random | 0.630 (0.4 s) | 0.673 | **0.630** (1.3 s) | 0.645 (0.4 s) |
+  | exports | 0.617 | 0.458 | **0.458** (1.0 s) | 0.459 (0.3 s) |
+  | tables | 0.995 | 0.936 | **0.936** | 0.936 |
+  | texts | 1.000 | 1.000 | 1.000 | 1.000 |
+  | drift + texts | 0.789 | 0.802 | **0.789** (1.6 s) | 0.789 (0.6 s) |
+  | cases text (real) | 0.995 (4.1 s) | 0.996 | **0.995** (6.1 s) | 0.995 (1.4 s) |
+  | cases text + drift | 0.940 | 0.944 | **0.940** (5.9 s) | 0.940 (1.7 s) |
+  | registry (real) | 0.911 (7.2 s) | 0.911 | **0.911** (10.2 s) | 0.911 (5.5 s) |
+
+  Never worse than xz on any corpus. Decode 4 to 31 ms on the generated and cases corpora, 173 ms on the registry.
+- Verdict: **measured**. With `bases`, one setting is best or tied on all nine corpora: columns, numbers, siblings, nearest 16, predict, step, tune, prose, route, sort, transpose, bases and a 1 MB sample. Untuned, it gives up at most 0.015 (reports-random) for 2 to 4x faster encodes. This is the setting to make the default if the IR is ever turned on; every option stays off by default here.
+- Run: `cargo run --release --example ir_bases [corpus ...]` (about 4 minutes).
