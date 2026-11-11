@@ -622,7 +622,13 @@ impl Stream {
                 && d != 0
                 && best.is_none_or(|b| p.step_hits > b.0)
             {
-                best = Some((p.step_hits, Num { m: n.m + d, ..n }));
+                best = Some((
+                    p.step_hits,
+                    Num {
+                        m: n.m.wrapping_add(d),
+                        ..n
+                    },
+                ));
             }
         }
         best.map(|b| b.1)
@@ -647,7 +653,7 @@ impl Stream {
                         e.num = Some(match e.num {
                             Some((old, d)) => {
                                 let nd = if old.scale == n.scale && old.fmt == n.fmt {
-                                    n.m - old.m
+                                    n.m.wrapping_sub(old.m)
                                 } else {
                                     0
                                 };
@@ -760,7 +766,7 @@ impl Stream {
             } else {
                 self.out.extend([2, n.fmt, n.scale]);
             }
-            put_var(&mut self.out, zigzag(n.m - p.m));
+            put_var(&mut self.out, zigzag(n.m.wrapping_sub(p.m)));
             self.num = Some(n);
         } else if let Some(&i) = self.dict.get(c).filter(|_| dict) {
             self.out.push(3);
@@ -799,7 +805,7 @@ impl Stream {
                 }
                 let p = p?;
                 let n = Num {
-                    m: p.m + unzigzag(get_var(b, at)?),
+                    m: p.m.wrapping_add(unzigzag(get_var(b, at)?)),
                     ..p
                 };
                 self.num = Some(n);
@@ -1775,7 +1781,9 @@ fn unsort_table(t: &[u8], rows: usize, trailing: bool) -> Result<Vec<u8>, Error>
         .strip_suffix(b"\n")
         .ok_or(Error::Decode("ir: sorted table"))?;
     let lines: Vec<&[u8]> = body.split(|&c| c == b'\n').collect();
-    if lines.len() != 1 + 2 * rows {
+    // E218: a damaged count could overflow `1 + 2 * rows` (and, wrapped,
+    // pass the check and split past the end)
+    if rows.checked_mul(2).and_then(|r| r.checked_add(1)) != Some(lines.len()) {
         return Err(Error::Decode("ir: sorted table lines"));
     }
     let (sorted, keys) = lines[1..].split_at(rows);

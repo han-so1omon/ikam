@@ -413,3 +413,134 @@ fn transposed_tables_roundtrip() {
         }
     }
 }
+
+/// E218: a damaged pack or block never panics the decoder: it decodes to
+/// something or returns an error. Every byte position of a pack is not
+/// tried; a fixed stream of changes (a byte set, a byte dropped, the pack
+/// cut short) is, over packs of every new layout (sorted and transposed
+/// tables, plain files, unbased files, tuned streams).
+#[test]
+fn damaged_packs_never_panic() {
+    let mut files = sample();
+    files.extend(big_tables());
+    let one = Options {
+        columns: true,
+        numbers: true,
+        siblings: true,
+        nearest: 16,
+        predict: true,
+        step: true,
+        prose: true,
+        route: true,
+        sort: true,
+        transpose: true,
+        bases: true,
+        tune: true,
+        ..Options::default()
+    };
+    let settings = [
+        one,
+        Options {
+            route: false,
+            ..one
+        },
+        Options {
+            rows: true,
+            group: true,
+            literal: true,
+            ..one
+        },
+        Options {
+            columns: false,
+            ..Options::default()
+        },
+    ];
+    let mut seed: u64 = 0x5eed;
+    let mut next = |n: usize| {
+        seed = seed
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        ((seed >> 33) as usize) % n.max(1)
+    };
+    for o in settings {
+        let packed = pack(&encode(&files, o));
+        assert_eq!(decode(&unpack(&packed).unwrap()).unwrap(), files);
+        for _ in 0..3000 {
+            let mut b = packed.clone();
+            match next(4) {
+                0 | 1 => {
+                    let at = next(b.len());
+                    b[at] = next(256) as u8;
+                }
+                2 => {
+                    b.remove(next(b.len()));
+                }
+                _ => b.truncate(next(b.len())),
+            }
+            if let Ok(p) = unpack(&b) {
+                let _ = decode(&p);
+            }
+        }
+        // the parts as stored by blocks, each changed alone
+        let blocks = ir::encode_blocks(&files, o, 3, true);
+        for _ in 0..1000 {
+            let mut bl = blocks.clone();
+            let i = next(bl.blocks.len());
+            let part = &mut bl.blocks[i];
+            let target = match next(4) {
+                0 => &mut part.files,
+                1 => &mut part.raw,
+                2 => &mut part.directory,
+                _ => match part.streams.len() {
+                    0 => &mut part.files,
+                    n => &mut part.streams[next(n)],
+                },
+            };
+            if target.is_empty() {
+                continue;
+            }
+            let at = next(target.len());
+            target[at] = next(256) as u8;
+            let _ = ir::decode_blocks(&bl);
+            let _ = ir::reader(&bl).block(i);
+        }
+    }
+}
+
+/// E218: a files part that claims huge row and line counts for a sorted,
+/// transposed table returns an error and allocates nothing for them.
+#[test]
+fn huge_table_counts_are_refused() {
+    fn var(out: &mut Vec<u8>, mut v: u128) {
+        while v >= 0x80 {
+            out.push((v as u8) | 0x80);
+            v >>= 7;
+        }
+        out.push(v as u8);
+    }
+    let raw = b"h\n-\n1\n1\nx\ny\n".to_vec();
+    for (rows, lines, len) in [
+        (u64::MAX as u128, 2, raw.len() as u128),
+        (1, u64::MAX as u128, raw.len() as u128),
+        (usize::MAX as u128 / 2 + 1, 2, raw.len() as u128),
+        (1, 2, u64::MAX as u128),
+        (u128::MAX >> 2, u128::MAX >> 2, u128::MAX >> 2),
+    ] {
+        let mut f = vec![4 | 32 | 64];
+        var(&mut f, 1);
+        var(&mut f, 5);
+        f.extend_from_slice(b"a.csv");
+        f.push(7);
+        var(&mut f, rows);
+        f.push(1);
+        var(&mut f, lines);
+        f.push(1);
+        var(&mut f, len);
+        let parts = ir::Parts {
+            files: f,
+            raw: raw.clone(),
+            ..ir::Parts::default()
+        };
+        assert!(decode(&parts).is_err(), "{rows} {lines} {len}");
+    }
+}
