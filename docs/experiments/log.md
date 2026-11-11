@@ -3122,3 +3122,25 @@ Newest last. Format and rules: `README.md`.
   Never worse than xz on any corpus. Decode 4 to 31 ms on the generated and cases corpora, 173 ms on the registry.
 - Verdict: **measured**. With `bases`, one setting is best or tied on all nine corpora: columns, numbers, siblings, nearest 16, predict, step, tune, prose, route, sort, transpose, bases and a 1 MB sample. Untuned, it gives up at most 0.015 (reports-random) for 2 to 4x faster encodes. This is the setting to make the default if the IR is ever turned on; every option stays off by default here.
 - Run: `cargo run --release --example ir_bases [corpus ...]` (about 4 minutes).
+
+### E217 ir-store (the E216 setting in ikam's store)
+- Branch / parent: exp/217-ir-store / E216 (stacked)
+- Question: E216's setting was measured as one pack under xz. What does ikam's kernel store with it, against storing the files themselves, whole and in blocks a read can open alone?
+- Change: none to the codec; new `examples/ir_store.rs`. The example helper that turns a pack into kernel entries now includes the raw part (it had no caller with one, so no earlier number changes).
+- Result (untuned; tuned is within 0.007 everywhere). Each cell is against the files in the kernel, then against xz -9 over the files; one file read from the middle in memory:
+
+  | corpus | files | files in the kernel (of xz) | pack, one entry | blocks of 20 (read) | blocks of 50 (read) |
+  | --- | ---: | ---: | ---: | ---: | ---: |
+  | reports-drift | 300 | 1.641 | **0.303** / 0.498 | 0.432 / 0.709 (2.1 ms) | 0.381 / 0.625 (5.3 ms) |
+  | reports-random | 300 | 1.315 | **0.502** / 0.660 | 0.541 / 0.711 (2.4 ms) | 0.523 / 0.688 (9.8 ms) |
+  | exports | 300 | 2.006 | **0.228** / 0.458 | 0.358 / 0.717 (0.8 ms) | 0.277 / 0.557 (1.3 ms) |
+  | tables | 72 | 1.300 | **0.700** / 0.910 | 0.775 / 1.007 (0.3 ms) | 0.738 / 0.959 (0.3 ms) |
+  | texts | 24 | 1.104 | **0.849** / 0.937 | 0.863 / 0.953 | 0.851 / 0.939 |
+  | drift + texts | 324 | 1.354 | **0.560** / 0.759 | 0.635 / 0.859 (2.0 ms) | 0.597 / 0.808 (5.3 ms) |
+  | cases text (real) | 526 | 1.441 | **0.672** / 0.968 | 0.833 / 1.201 (0.5 ms) | 0.819 / 1.180 (0.9 ms) |
+  | cases text + drift | 826 | 1.503 | **0.611** / 0.919 | 0.781 / 1.175 (0.5 ms) | 0.749 / 1.126 (0.9 ms) |
+  | registry (real) | 2 | 1.005 | **0.916** / 0.920 | 0.916 / 0.920 (54 ms) | same |
+
+- Verdict: **measured**. In the store, the setting is smaller than the files on every corpus: a third of the bytes for drift reports, under a quarter for exports, two thirds for the real cases folder, 0.916 for the real registry. Blocks keep most of that with 1 to 10 ms reads; for prose-heavy folders (cases) blocks lose a fifth of the gain, since each block's raw part restarts its compression. A large table is one file, so its blocks are the whole table (54 ms); row ranges would need a table cut into blocks of rows.
+- Next: blocks that share one raw part's dictionary across blocks (as the keyframe does for streams), and row-range blocks for large tables.
+- Run: `cargo run --release --example ir_store [corpus ...]` (about 4 minutes).

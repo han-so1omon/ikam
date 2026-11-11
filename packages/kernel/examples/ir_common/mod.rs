@@ -575,6 +575,10 @@ pub fn part_entries_split(p: &Parts, split: bool) -> Files {
         ("ir/files".to_string(), p.files.clone()),
         ("ir/directory".to_string(), p.directory.clone()),
     ];
+    // E198 on: the files stored as they are
+    if !p.raw.is_empty() {
+        out.push(("ir/raw".to_string(), p.raw.clone()));
+    }
     if split {
         out.extend(
             p.streams
