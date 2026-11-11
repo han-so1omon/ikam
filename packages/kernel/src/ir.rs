@@ -76,6 +76,10 @@ pub struct Options {
     /// judges smallest, and keeps the result only if the whole pack is
     /// smaller. The decoder needs nothing new (each token says what it is).
     pub tune: bool,
+    /// E210 (with `tune`): a stream may also write every string out in
+    /// full instead of as an index into its dictionary, which xz can match
+    /// across the whole column better than an index.
+    pub literal: bool,
 }
 
 /// An encoded set of files: the line skeletons, each file's lines and cell
@@ -547,6 +551,9 @@ struct Predictor {
 const NO_NUMBERS: u8 = 1;
 const NO_PREDICT: u8 = 2;
 const NO_STEP: u8 = 4;
+/// E210: strings always written out, never as an index into the stream's
+/// dictionary (xz finds the repeats itself).
+const NO_DICT: u8 = 8;
 
 /// Per stream key, the mode `tune` chose (absent: 0).
 type Modes = FxMap<StreamKey, u8>;
@@ -650,8 +657,9 @@ impl Stream {
         mode: u8,
     ) {
         let numbers = numbers && mode & NO_NUMBERS == 0;
+        let dict = mode & NO_DICT == 0;
         let Some(line) = line else {
-            return self.put(c, numbers);
+            return self.put(c, numbers, dict);
         };
         let fresh = self.prev.as_deref() != Some(c);
         if fresh && mode & NO_PREDICT == 0 && self.predicted(line).map(Vec::as_slice) == Some(c) {
@@ -669,7 +677,7 @@ impl Stream {
             self.num = Some(n);
             self.prev = Some(c.to_vec());
         } else {
-            self.put(c, numbers);
+            self.put(c, numbers, dict);
         }
         self.learn(line, c, step);
     }
@@ -712,7 +720,7 @@ impl Stream {
         Ok(v)
     }
 
-    fn put(&mut self, c: &[u8], numbers: bool) {
+    fn put(&mut self, c: &[u8], numbers: bool, dict: bool) {
         if self.prev.as_deref() == Some(c) {
             self.out.push(0);
         } else if let Some(n) = parse_num(c).filter(|_| numbers) {
@@ -728,13 +736,15 @@ impl Stream {
             }
             put_var(&mut self.out, zigzag(n.m - p.m));
             self.num = Some(n);
-        } else if let Some(&i) = self.dict.get(c) {
+        } else if let Some(&i) = self.dict.get(c).filter(|_| dict) {
             self.out.push(3);
             put_var(&mut self.out, i as u128);
         } else {
             self.out.push(4);
             put_bytes(&mut self.out, c);
-            self.dict.insert(c.to_vec(), self.dict.len());
+            if dict {
+                self.dict.insert(c.to_vec(), self.dict.len());
+            }
         }
         self.prev = Some(c.to_vec());
     }
@@ -868,7 +878,7 @@ pub fn tune_modes(files: &[(String, Vec<u8>)], o: Options) -> Vec<(StreamKey, u8
 }
 
 fn tune(files: &[(String, Vec<u8>)], o: Options, plain: &[bool]) -> Modes {
-    let mut modes = Modes::default();
+    let modes = Modes::default();
     if !o.tune || files.is_empty() || (!plain.is_empty() && plain.iter().all(|p| *p)) {
         return modes;
     }
@@ -886,10 +896,17 @@ fn tune(files: &[(String, Vec<u8>)], o: Options, plain: &[bool]) -> Modes {
             tries.push(NO_NUMBERS | NO_PREDICT | NO_STEP);
         }
     }
+    // E210: each of those again with every string written out
+    if o.literal {
+        let with: Vec<u8> = tries.iter().map(|m| m | NO_DICT).collect();
+        tries.extend(with);
+    }
     if tries.len() == 1 {
         return modes;
     }
-    let mut best: FxMap<StreamKey, (usize, u8)> = FxMap::default();
+    // per stream, the best mode among the tries without NO_DICT ([0]) and
+    // among all of them ([1])
+    let mut best: [FxMap<StreamKey, (usize, u8)>; 2] = Default::default();
     let mut base = None;
     for &m in &tries {
         let p = encode_modes(files, o, plain, (&Modes::default(), m));
@@ -899,30 +916,39 @@ fn tune(files: &[(String, Vec<u8>)], o: Options, plain: &[bool]) -> Modes {
             .zip(&p.streams)
         {
             let z = judged_bytes(s);
-            let e = best.entry(k).or_insert((usize::MAX, 0));
-            if z < e.0 {
-                *e = (z, m);
+            for b in &mut best[usize::from(m & NO_DICT != 0)..] {
+                let e = b.entry(k.clone()).or_insert((usize::MAX, 0));
+                if z < e.0 {
+                    *e = (z, m);
+                }
             }
         }
         if m == 0 {
             base = Some(p);
         }
     }
-    modes = best
-        .into_iter()
-        .filter(|(_, (_, m))| *m != 0)
-        .map(|(k, (_, m))| (k, m))
-        .collect();
-    if modes.is_empty() {
-        return modes;
-    }
-    let tuned = judged_bytes(&pack(&encode_modes(files, o, plain, (&modes, 0))));
+    // streams judged alone can mislead about the whole pack, so the whole
+    // pack decides among no tuning and each set of picks
     let untuned = base.map_or(usize::MAX, |p| judged_bytes(&pack(&p)));
-    if tuned < untuned {
-        modes
-    } else {
-        Modes::default()
+    let mut picked: Vec<Modes> = Vec::new();
+    for b in best {
+        let m: Modes = b
+            .into_iter()
+            .filter(|(_, (_, m))| *m != 0)
+            .map(|(k, (_, m))| (k, m))
+            .collect();
+        if !m.is_empty() && !picked.contains(&m) {
+            picked.push(m);
+        }
     }
+    let mut keep = (untuned, Modes::default());
+    for m in picked {
+        let z = judged_bytes(&pack(&encode_modes(files, o, plain, (&m, 0))));
+        if z < keep.0 {
+            keep = (z, m);
+        }
+    }
+    keep.1
 }
 
 /// The xz preset that judges `route`'s choices (E208 first judged with
@@ -1598,7 +1624,7 @@ mod tests {
         };
         for rows in [false, true] {
             let o = Options { rows, ..o };
-            for m in 0..8u8 {
+            for m in 0..16u8 {
                 let p = encode_modes(&files, o, &[], (&Modes::default(), m));
                 assert_eq!(decode(&p).unwrap(), files, "mode {m}");
             }
@@ -1607,7 +1633,7 @@ mod tests {
             let modes: Modes = keys
                 .into_iter()
                 .enumerate()
-                .map(|(i, k)| (k, (i % 8) as u8))
+                .map(|(i, k)| (k, (i % 16) as u8))
                 .collect();
             let p = encode_modes(&files, o, &[], (&modes, 0));
             assert_eq!(decode(&p).unwrap(), files);

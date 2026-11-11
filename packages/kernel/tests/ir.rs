@@ -18,6 +18,7 @@ fn all_options() -> Vec<Options> {
             step: b & 256 != 0,
             route: false,
             tune: false,
+            literal: false,
         })
         .collect()
 }
@@ -35,6 +36,7 @@ fn all_options_route() -> Vec<Options> {
                 Options {
                     route: true,
                     tune: true,
+                    literal: true,
                     ..o
                 },
             ]
