@@ -117,6 +117,9 @@ pub fn index(parts: &Parts, skeletons: &[Vec<u8>]) -> Result<Index, Error> {
 /// Gives the bytes of stream `i` (from memory, or from storage).
 pub type Fetch<'a> = dyn FnMut(usize) -> Result<Vec<u8>, Error> + 'a;
 
+/// A line's place and the cells asked for.
+type Line = (Place, Vec<Vec<u8>>);
+
 /// One stream being decoded: its state and where it is.
 struct Open {
     bytes: Vec<u8>,
@@ -134,7 +137,7 @@ fn lines_of(
     want: &[usize],
     only: Option<&[u8]>,
     fetch: &mut Fetch,
-) -> Result<Vec<(Place, Vec<Vec<u8>>)>, Error> {
+) -> Result<Vec<Line>, Error> {
     let places = ix.places(skeleton);
     if !ix.predict && !ix.rows {
         // each column on its own: decode each stream straight through
