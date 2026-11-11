@@ -3187,5 +3187,5 @@ Newest last. Format and rules: `README.md`.
   | 1,000 | 52 | 1.183 | 1.106 | 5 ms |
 
   Python's xz decodes the two whole files in 147 ms.
-- Verdict: **measured, not built**. Groups lose the gain fast: at 10,000 rows half of it is gone, and below about 4,000 rows the groups are larger than xz over the plain files, even after group 0. Reads get faster only in proportion to the group size, so a row query is better served by E203's column query (one column's stream) than by small row groups. If row ranges are needed, 10,000-row groups after a keyframe are the knee (0.955, about a third of the whole-table read).
+- Verdict: **measured, not built**. Groups lose the gain fast: at 10,000 rows half of it is gone, and below about 4,000 rows the groups are larger than xz over the plain files, even after group 0. Reads get faster only in proportion to the group size. If row ranges are needed, 10,000-row groups after a keyframe are the knee (0.955, about a third of the whole-table read).
 - Run: `python3 -I packages/kernel/scripts/ir_row_groups.py tests/fixtures/san-diego-business-registry/*.csv` (about a minute).
