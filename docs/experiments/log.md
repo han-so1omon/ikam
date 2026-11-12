@@ -3484,3 +3484,45 @@ Gates on the branch: every kernel test suite passes (release); clippy `-D warnin
 - Trade-off: none found. The diff reads fewer objects and gives the same changes.
 - Verdict: **kept (option off).** Every incremental view (joins: E250; the word index; Tantivy kept from the log) pays for its table's size on each small update without it. With it, small updates cost in proportion to what changed.
 - Run: `cargo run --release --features search-tantivy --example search_segments -- 50000 0.1 10 100 1000` and `cargo run --release --features search-tantivy --example search_tantivy_view -- 50000 10 100 1000`.
+
+### E251 block-postings (Tantivy's postings layout for the segments' base)
+- Branch / parent: exp/251-block-postings / exp/249-pruned-diff
+- Question: E247 to E249 made the word index fast to update, but its base is one graph node per posting (`word US row`). Tantivy stores postings as integer doc ids in blocks of 128, bitpacked, behind skip data, with its term dictionary as an FST. Is that layout smaller, faster to build and faster to query in ikam? Notes: docs/research/search-engines.md (Tantivy's source, read on disk).
+- Change: `SegmentOpts::block_base`, off by default.
+  - `postblocks.rs`: rows are numbered in key order (doc ids). Each word's ids are stored as delta-encoded, bitpacked blocks of 128 behind a skip table (the last id and bit width of each block, 5 bytes as Tantivy's basic skip entry), with the tail as varints.
+  - Lists are packed into contents of about 16 KB, with each word's node pointing at its byte range (Tantivy's doc store blocks are 16 KB). The doc map (id to row key) is stored as contents of 256 keys.
+  - An intersection walks the rarest list and seeks the others through the skip table, as Tantivy's leapfrog does.
+  - With a block base, a segmented query is the base's intersection less the moved rows, plus the delta's intersection. That is equivalent, because every moved row's base postings are dead and only moved rows have delta postings.
+  - A merge rebuilds the blocks (`text_segments_merge_at`), as Tantivy writes a merged segment anew.
+  - Tests: lists round-trip and seek at every size around 128, intersections are exact, and segment answers with a block base equal a build's over 30 random rounds, merging at 5% and never.
+- Result:
+  - Setup: `examples/search_segments.rs` as E249, on E244's 50,000 documents and batches, median of 5, with E249's `prune_diff` on for both bases.
+  - Machine: an Apple M3 Pro laptop, through OpenResearch's local backend.
+  - Every answer equals Tantivy's, and merged blocks equal a fresh build.
+
+  | | Tantivy in RAM | E249 graph base | E251 block base |
+  |---|---|---|---|
+  | Build | 130 ms | 3,821 ms | 758 ms |
+  | Index bytes after build | | 3.82 MB | 1.55 MB |
+  | Bytes after build and updates | | 10.3 MB | 5.8 MB |
+  | Update 10 documents | 1.0 ms | 3.0 ms | 3.2 ms |
+  | Update 100 documents | 1.8 ms | 27.7 ms | 29.2 ms |
+  | Update 1,000 documents | 6.7 ms | 147.4 ms | 169.7 ms |
+  | Final merge | | 899 ms | 501 ms |
+  | Query `ka` (39,986 rows) | 17.55 ms | 7.03 ms | 12.95 ms |
+  | Query `mine` (2,379 rows) | 0.98 ms | 0.53 ms | 7.50 ms |
+  | Query `vevenelo` (25 rows) | 0.01 ms | 0.13 ms | 1.95 ms |
+  | Query `ne vemi` (1,363 rows) | 0.64 ms | 4.25 ms | 7.67 ms |
+  | Query `lo zi suri` (162 rows) | 0.13 ms | 7.27 ms | 4.40 ms |
+
+  - Term dictionary: the 19,995 words of the vocabulary (151 KB of text) are 1,108 bytes as an FST (`tantivy-fst`), against 13,621 stored bytes as a graph of word labels. A lookup takes 0.49 µs against 34 µs. The words are syllable strings from E244's generator, which an FST compresses unusually well.
+  - The harness counts a merge by the graph base's root changing. A block base leaves that field unused, so its merges are not counted.
+- Not measured: ranking and block-max WAND (ikam ranks nothing yet); positions; real text; returning ids without keys.
+- Trade-off:
+  - The block base answers in ids, and turning hits back into row keys reads one doc-map content per 256 rows that hold a hit.
+  - That makes single-word queries 1.8 to 15 times slower than the graph base, whose answers are the keys themselves; Tantivy pays the same kind of cost in its doc store.
+  - Only the three-word query, whose intersection is small, is faster (4.4 against 7.3 ms).
+- Verdict: **kept (option off), for bytes and build.**
+  - The block base is 2.5 times smaller and builds 5 times faster, merges in about half the time, and updates as fast.
+  - It is not yet a better query path. Next: keep results as row ids (E240's ordered row ids would make the doc map the `kv` view itself) and resolve keys only for the rows a caller reads.
+- Run: `cargo run --release --features search-tantivy --example search_segments -- 50000 0.1 10 100 1000`.
