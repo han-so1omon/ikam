@@ -3331,8 +3331,8 @@ Gates on the branch: every kernel test suite passes (release); clippy `-D warnin
 - On Eric's word ("Merge it"), exp/226-commit-cost (c0d333c) fast-forwarded onto main 1c5efb9. `FsStore::open` is unchanged and stays the default; `FsStore::open_deferred`, `ikam live --deferred-sync` and `ikam live --no-object-templates` are off unless asked for.
 - Gates, run on c0d333c before the merge (main had not moved): every kernel test suite passes (release); clippy `-D warnings` and fmt clean; the bench gives the same byte and count fields as main 1c5efb9 on the same machine (only times and peak memory differ), north 0.3035.
 
-### E229 mac-commit-cost (E226 to E228 on macOS, APFS)
-- Branch / parent: exp/229-mac-results / main 6138eba
+### E230 mac-commit-cost (E226 to E228 on macOS, APFS)
+- Branch / parent: exp/230-mac-results / main 6138eba (numbered after exp/229-db-api's E229)
 - Question: E226 to E228 were measured on Linux ext4. E226 inferred that on macOS a copy's time is its synced writes (std's `sync_all` is F_FULLFSYNC there). Is that so, and what do `--deferred-sync` and `--no-object-templates` give on APFS?
 - Change: none. E226's harness (`examples/commits.rs`) built from main 6138eba in a temporary worktree on an M3 Pro MacBook (APFS), Nov 11; 20 copies after one warm-up into folders of 2, 30 and 300 reports, then a three-PUT `ikam live` check on a temporary store. The worktree, build and stores were removed afterwards.
 - Result (medians a copy; ranges are across 2, 30 and 300 reports; bytes and writes identical in every mode, no drops):
