@@ -135,14 +135,21 @@ fn main() {
         memo: true,
         ..Default::default()
     };
-    let mut ways: Vec<(&str, f64)> = ["update", "plain", "memo", "update_fast"]
-        .map(|w| (w, 0.0))
-        .to_vec();
+    let mut ways: Vec<(&str, f64)> = [
+        "update",
+        "plain",
+        "memo",
+        "update_fast",
+        "update_fast_pruned",
+    ]
+    .map(|w| (w, 0.0))
+    .to_vec();
     ways.extend(shares.iter().map(|&s| ("switch", s)));
     ways.extend([("recompute", 0.0), ("recompute_fast", 0.0)]);
     for (way, share) in ways {
         let mut r = Repo::new(repo.store().copy());
         r.object_templates = false;
+        r.prune_diff = way.ends_with("pruned"); // E249
         let opts = match way {
             "plain" => JoinOpts {
                 plain_writes: true,
@@ -152,7 +159,7 @@ fn main() {
                 memo: true,
                 ..Default::default()
             },
-            "update_fast" | "recompute_fast" => fast,
+            "update_fast" | "update_fast_pruned" | "recompute_fast" => fast,
             "switch" => JoinOpts {
                 recompute_above: Some(share),
                 ..fast
