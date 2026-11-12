@@ -3465,3 +3465,32 @@ Gates on the branch: every kernel test suite passes (release); clippy `-D warnin
   - Sharing an arrangement pays a little, growing with the number of views (11 to 24% at 8). That is why E243 saw almost nothing at 2.
   - Sharing the join itself is what pays: the cost is flat in the number of views. Views over the same join should read one kept join, not keep one each.
 - Run: `cargo run --release --example join_views -- 20000 1000 100 1000`.
+
+### E250 pruned-diff-joins (E249's pruned diff on the joins line)
+- Branch / parent: exp/250-pruned-diff-joins / exp/246-join-views. The kernel change is E249's (exp/249-pruned-diff, on the search line), carried over unchanged.
+- Question: E245's updates at 10 changes cost 15 ms at 20,000 rows but 41 ms at 100,000, which means a fixed cost that grows with the table. E249 traced that cost to `graph_diff`, which lists every leaf of both graphs. Does skipping the subtrees both graphs share make small join updates independent of table size?
+- Change: E249's `Repo::prune_diff`, off by default: `graph_diff` walks both graphs a level at a time and drops chunk ids found on both frontiers. `tests/prune_diff.rs` checks that the changes are the same as a full diff's. `join_switch` gains an `update_fast_pruned` way.
+- Result (`examples/join_switch.rs` as E245: E243's tables and changes, median of 5, an Apple M3 Pro laptop, through OpenResearch's local backend; every way ends with the same rows):
+
+  | 20,000 rows | 10 | 30 | 100 | 300 | 1,000 |
+  |---|---|---|---|---|---|
+  | Update (E243) | 21.0 ms | 39.9 ms | 98.6 ms | 194 ms | 323 ms |
+  | E245's `plain_writes` + `memo` | 15.4 ms | 26.0 ms | 57.5 ms | 97.6 ms | 134 ms |
+  | Same + `prune_diff` | 9.5 ms | 19.8 ms | 52.7 ms | 96.6 ms | 133 ms |
+  | Recompute (E245, fastest) | 95.1 ms | 96.2 ms | 102 ms | 101 ms | 105 ms |
+
+  | 100,000 rows | 10 | 30 | 100 | 300 | 1,000 |
+  |---|---|---|---|---|---|
+  | Update (E243) | 52.9 ms | 73.6 ms | 151 ms | 345 ms | 781 ms |
+  | E245's `plain_writes` + `memo` | 41.4 ms | 55.0 ms | 103 ms | 216 ms | 437 ms |
+  | Same + `prune_diff` | 11.6 ms | 25.5 ms | 74.0 ms | 186 ms | 410 ms |
+  | Recompute (E245, fastest) | 517 ms | 523 ms | 529 ms | 538 ms | 550 ms |
+
+  - With `prune_diff`, a 10-change update reads 437 objects instead of 1,175 at 20,000 rows, and 668 instead of 4,151 at 100,000.
+  - At 100,000 rows a 10-change update is 11.6 ms, close to the 9.5 ms at 20,000.
+  - Against E243 as it was, a 10-change update at 100,000 rows is 4.6 times faster, and 45 times faster than the fastest recompute.
+  - At 1,000 changes the gain is small (437 to 410 ms), because there the diff is a small part of the work.
+- Not measured: durable stores, tables beyond 100,000 rows.
+- Trade-off: none found. The diff reads fewer objects, and gives the same changes.
+- Verdict: **kept (option off).** Small join updates no longer pay for the size of the table they read. Large batches are still bounded by the per-key seeks and writes of E245.
+- Run: `cargo run --release --example join_switch -- 20000 1000 0.4 10 30 100 300 1000`, and again with 100000.
