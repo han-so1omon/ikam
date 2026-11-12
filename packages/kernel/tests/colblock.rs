@@ -118,3 +118,52 @@ fn blocks_in_the_database_read_back_exactly() {
         rows
     );
 }
+
+#[test]
+fn fast_numbers_round_trip_and_read_one_value() {
+    use colblock::ColOpts;
+    let mut rng = Lcg(77);
+    let shapes: [fn(&mut Lcg, usize) -> String; 6] = [
+        |_, i| (1_700_000_000 + 60 * i as i64).to_string(),
+        |r, i| (1_700_000_000 + 60 * i as i64 + (r.next() % 7) as i64).to_string(),
+        |r, _| (r.next() % 1000).to_string(),
+        |r, _| format!("{}.{:02}", r.next() % 50, r.next() % 100),
+        |r, _| {
+            ["9223372036854775807", "-9223372036854775808", "0", "-1"][r.next() as usize % 4]
+                .to_string()
+        },
+        |r, i| format!("-{}.{:03}", i, r.next() % 1000),
+    ];
+    for n in [1, 2, 511, 512, 513, 3000] {
+        for shape in &shapes {
+            let rows: Vec<Vec<u8>> = (0..n)
+                .map(|i| format!("{},{}", shape(&mut rng, i), i % 3).into_bytes())
+                .collect();
+            let refs: Vec<&[u8]> = rows.iter().map(Vec::as_slice).collect();
+            for opts in [
+                ColOpts {
+                    fast_numbers: true,
+                    compress_fast: false,
+                },
+                ColOpts {
+                    fast_numbers: true,
+                    compress_fast: true,
+                },
+                ColOpts::default(),
+            ] {
+                let block = colblock::encode_with(&refs, b',', &opts).unwrap();
+                assert_eq!(colblock::decode(&block).unwrap(), rows, "{n} {opts:?}");
+                let col = colblock::column(&block, 0).unwrap();
+                for i in [0, n / 2, n - 1] {
+                    assert_eq!(
+                        colblock::value(&block, 0, i).unwrap(),
+                        col[i],
+                        "{n} {opts:?} row {i}"
+                    );
+                }
+                let ints = colblock::ints(&block, 1).unwrap();
+                assert_eq!(ints, (0..n).map(|i| (i % 3) as i64).collect::<Vec<_>>());
+            }
+        }
+    }
+}

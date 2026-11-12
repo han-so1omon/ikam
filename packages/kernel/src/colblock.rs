@@ -29,6 +29,170 @@ const RAW: u8 = 0;
 const INT: u8 = 1;
 const DECIMAL: u8 = 2;
 const DICT: u8 = 3;
+/// E252: integers and decimals in a fast-field codec (after Tantivy's).
+const FAST_INT: u8 = 4;
+const FAST_DEC: u8 = 5;
+/// On a stored column's kind: its payload is stored as is, no zstd frame,
+/// so a value can be read without decoding the column.
+const AS_IS: u8 = 0x80;
+/// Rows a blockwise-linear block (Tantivy's `BLOCK_SIZE`).
+const LINE_BLOCK: usize = 512;
+
+/// Options for writing blocks (E252); the default is E241's encoding.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct ColOpts {
+    /// Integer and decimal columns in Tantivy's fast-field codecs: bitpacked
+    /// with min and gcd, or blockwise linear, whichever is smaller.
+    pub fast_numbers: bool,
+    /// Compress those columns with zstd as the others are; off, they are
+    /// stored as is and one value reads in constant time.
+    pub compress_fast: bool,
+}
+
+fn width(v: u64) -> u8 {
+    (64 - v.leading_zeros()) as u8
+}
+
+fn gcd(a: u64, b: u64) -> u64 {
+    if b == 0 { a } else { gcd(b, a % b) }
+}
+
+fn pack(out: &mut Vec<u8>, vals: impl Iterator<Item = u64>, bits: u8) {
+    let (mut acc, mut held) = (0u128, 0u32);
+    for v in vals {
+        acc |= u128::from(v) << held;
+        held += u32::from(bits);
+        while held >= 8 {
+            out.push(acc as u8);
+            acc >>= 8;
+            held -= 8;
+        }
+    }
+    if held > 0 {
+        out.push(acc as u8);
+    }
+}
+
+/// Value `i` of `bits`-bit values packed from `b`.
+fn unpack_at(b: &[u8], bits: u8, i: usize) -> u64 {
+    if bits == 0 {
+        return 0;
+    }
+    let pos = i * usize::from(bits);
+    let mut w = [0u8; 16];
+    let at = pos / 8;
+    let end = (at + 16).min(b.len());
+    w[..end - at].copy_from_slice(&b[at..end]);
+    let v = u128::from_le_bytes(w) >> (pos % 8);
+    (v & (u128::MAX >> (128 - u32::from(bits)))) as u64
+}
+
+fn le(b: &[u8], at: usize) -> Result<u64, Error> {
+    Ok(u64::from_le_bytes(
+        b.get(at..at + 8)
+            .ok_or_else(bad)?
+            .try_into()
+            .map_err(|_| bad())?,
+    ))
+}
+
+/// Bitpacked: `[0][min][gcd][bits][packed (v - min) / gcd]`.
+fn fast_bitpacked(nums: &[i64]) -> Vec<u8> {
+    let min = nums.iter().copied().min().unwrap_or(0);
+    let offs: Vec<u64> = nums.iter().map(|&v| v.wrapping_sub(min) as u64).collect();
+    let g = offs.iter().fold(0, |a, &b| gcd(a, b)).max(1);
+    let bits = width(offs.iter().max().copied().unwrap_or(0) / g);
+    let mut out = vec![0];
+    out.extend_from_slice(&min.to_le_bytes());
+    out.extend_from_slice(&g.to_le_bytes());
+    out.push(bits);
+    pack(&mut out, offs.iter().map(|o| o / g), bits);
+    out
+}
+
+/// Blockwise linear: `[1]`, then a header a block (first value, slope,
+/// residual minimum, bits, payload offset: 29 bytes), then each block's
+/// residuals bitpacked against its line.
+fn fast_linear(nums: &[i64]) -> Vec<u8> {
+    let blocks: Vec<&[i64]> = nums.chunks(LINE_BLOCK).collect();
+    let (mut heads, mut body) = (vec![1u8], Vec::new());
+    for blk in &blocks {
+        let (a, n) = (blk[0], blk.len() as i64);
+        let s = if n > 1 {
+            blk[blk.len() - 1].wrapping_sub(a) / (n - 1)
+        } else {
+            0
+        };
+        let res: Vec<i64> = blk
+            .iter()
+            .enumerate()
+            .map(|(i, &v)| v.wrapping_sub(a.wrapping_add(s.wrapping_mul(i as i64))))
+            .collect();
+        let m = res.iter().copied().min().unwrap_or(0);
+        let bits = width(
+            res.iter()
+                .map(|&r| r.wrapping_sub(m) as u64)
+                .max()
+                .unwrap_or(0),
+        );
+        for x in [a, s, m] {
+            heads.extend_from_slice(&x.to_le_bytes());
+        }
+        heads.push(bits);
+        heads.extend_from_slice(&(body.len() as u32).to_le_bytes());
+        pack(
+            &mut body,
+            res.iter().map(|&r| r.wrapping_sub(m) as u64),
+            bits,
+        );
+    }
+    heads.extend_from_slice(&body);
+    heads
+}
+
+/// The smaller of the two codecs, as Tantivy picks by estimated size.
+fn fast_encode(nums: &[i64]) -> Vec<u8> {
+    let (b, l) = (fast_bitpacked(nums), fast_linear(nums));
+    if l.len() < b.len() { l } else { b }
+}
+
+/// Value `i` of a fast payload of `n` values.
+fn fast_get(p: &[u8], n: usize, i: usize) -> Result<i64, Error> {
+    if i >= n {
+        return Err(bad());
+    }
+    match p.first() {
+        Some(0) => {
+            let (min, g, bits) = (le(p, 1)? as i64, le(p, 9)?, *p.get(17).ok_or_else(bad)?);
+            Ok(min.wrapping_add((unpack_at(&p[18..], bits, i).wrapping_mul(g)) as i64))
+        }
+        Some(1) => {
+            let blocks = n.div_ceil(LINE_BLOCK);
+            let h = 1 + (i / LINE_BLOCK) * 29;
+            let (a, s, m) = (
+                le(p, h)? as i64,
+                le(p, h + 8)? as i64,
+                le(p, h + 16)? as i64,
+            );
+            let bits = *p.get(h + 24).ok_or_else(bad)?;
+            let off = u32::from_le_bytes(
+                p.get(h + 25..h + 29)
+                    .ok_or_else(bad)?
+                    .try_into()
+                    .map_err(|_| bad())?,
+            ) as usize;
+            let body = p.get(1 + blocks * 29 + off..).ok_or_else(bad)?;
+            let j = i % LINE_BLOCK;
+            let r = m.wrapping_add(unpack_at(body, bits, j) as i64);
+            Ok(a.wrapping_add(s.wrapping_mul(j as i64)).wrapping_add(r))
+        }
+        _ => Err(bad()),
+    }
+}
+
+fn fast_all(p: &[u8], n: usize) -> Result<Vec<i64>, Error> {
+    (0..n).map(|i| fast_get(p, n, i)).collect()
+}
 
 fn bad() -> Error {
     Error::Decode("column block")
@@ -160,6 +324,21 @@ fn decode_column(kind: u8, mut b: &[u8], n: usize) -> Result<Vec<Vec<u8>>, Error
                 .map(|v| format_decimal(v, p).into_bytes())
                 .collect()
         }
+        FAST_INT => {
+            let nums = fast_all(b, n)?;
+            *b = &[];
+            nums.into_iter()
+                .map(|v| v.to_string().into_bytes())
+                .collect()
+        }
+        FAST_DEC => {
+            let p = take(b, 1)?[0] as usize;
+            let nums = fast_all(b, n)?;
+            *b = &[];
+            nums.into_iter()
+                .map(|v| format_decimal(v, p).into_bytes())
+                .collect()
+        }
         DICT => {
             let mut dict = Vec::new();
             for _ in 0..varint(b).ok_or_else(bad)? {
@@ -191,6 +370,11 @@ fn decode_column(kind: u8, mut b: &[u8], n: usize) -> Result<Vec<Vec<u8>>, Error
 /// field counts as an integer column, then each field column. Each column
 /// is its kind, its row count, its compressed length and its zstd frame.
 pub fn encode(rows: &[&[u8]], sep: u8) -> Result<Vec<u8>, Error> {
+    encode_with(rows, sep, &ColOpts::default())
+}
+
+/// `encode` with E252's options.
+pub fn encode_with(rows: &[&[u8]], sep: u8, opts: &ColOpts) -> Result<Vec<u8>, Error> {
     let split: Vec<Vec<&[u8]>> = rows
         .iter()
         .map(|r| r.split(|&b| b == sep).collect())
@@ -208,10 +392,21 @@ pub fn encode(rows: &[&[u8]], sep: u8) -> Result<Vec<u8>, Error> {
     put_varint(&mut out, rows.len());
     out.push(sep);
     put_varint(&mut out, columns.len());
-    for col in &columns {
-        let (kind, raw) = encode_column(col);
-        let packed = zstd::bulk::compress(&raw, LEVEL).map_err(Error::Io)?;
-        out.push(kind);
+    for (c, col) in columns.iter().enumerate() {
+        let (mut kind, mut raw) = encode_column(col);
+        if opts.fast_numbers && c > 0 && (kind == INT || kind == DECIMAL) {
+            let mut b = &raw[usize::from(kind == DECIMAL)..];
+            let nums = get_deltas(&mut b, col.len())?;
+            let places = (kind == DECIMAL).then(|| raw[0]);
+            raw = places.into_iter().chain(fast_encode(&nums)).collect();
+            kind = if places.is_some() { FAST_DEC } else { FAST_INT };
+        }
+        let as_is = matches!(kind, FAST_INT | FAST_DEC) && !opts.compress_fast;
+        let packed = match as_is {
+            true => raw.clone(),
+            false => zstd::bulk::compress(&raw, LEVEL).map_err(Error::Io)?,
+        };
+        out.push(kind | if as_is { AS_IS } else { 0 });
         put_varint(&mut out, col.len());
         put_varint(&mut out, raw.len());
         put_varint(&mut out, packed.len());
@@ -246,9 +441,46 @@ fn columns(block: &[u8]) -> Result<(usize, u8, Vec<Packed<'_>>), Error> {
     Ok((rows, sep, out))
 }
 
+fn raw_of(c: &Packed) -> Result<Vec<u8>, Error> {
+    match c.0 & AS_IS {
+        0 => zstd::bulk::decompress(c.3, c.2).map_err(Error::Io),
+        _ => Ok(c.3.to_vec()),
+    }
+}
+
 fn unpack(c: &Packed) -> Result<Vec<Vec<u8>>, Error> {
-    let raw = zstd::bulk::decompress(c.3, c.2).map_err(Error::Io)?;
-    decode_column(c.0, &raw, c.1)
+    decode_column(c.0 & !AS_IS, &raw_of(c)?, c.1)
+}
+
+/// Field `j` of every row as integers (decimals scaled by their places),
+/// for a numeric column (E252's accessor; E241's kinds decode their deltas).
+pub fn ints(block: &[u8], j: usize) -> Result<Vec<i64>, Error> {
+    let (_, _, cols) = columns(block)?;
+    let c = cols.get(j + 1).ok_or_else(bad)?;
+    let raw = raw_of(c)?;
+    let mut b = raw.as_slice();
+    match c.0 & !AS_IS {
+        INT => get_deltas(&mut b, c.1),
+        DECIMAL => get_deltas(&mut &b[1..], c.1),
+        FAST_INT => fast_all(b, c.1),
+        FAST_DEC => fast_all(&b[1..], c.1),
+        _ => Err(bad()),
+    }
+}
+
+/// Field `j` of row `i` (rows that have it), as text. A fast column stored
+/// as is reads the one value; any other column is decoded.
+pub fn value(block: &[u8], j: usize, i: usize) -> Result<Vec<u8>, Error> {
+    let (_, _, cols) = columns(block)?;
+    let c = cols.get(j + 1).ok_or_else(bad)?;
+    match c.0 {
+        k if k == FAST_INT | AS_IS => Ok(fast_get(c.3, c.1, i)?.to_string().into_bytes()),
+        k if k == FAST_DEC | AS_IS => {
+            let p = *c.3.first().ok_or_else(bad)? as usize;
+            Ok(format_decimal(fast_get(&c.3[1..], c.1, i)?, p).into_bytes())
+        }
+        _ => unpack(c)?.into_iter().nth(i).ok_or_else(bad),
+    }
 }
 
 /// Every row of a block, byte for byte as given to `encode`.
