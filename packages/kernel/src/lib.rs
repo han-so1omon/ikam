@@ -8,6 +8,7 @@ mod abbrev;
 pub mod backends;
 mod claims;
 mod codec;
+pub mod colblock;
 mod container;
 mod db;
 mod dict;

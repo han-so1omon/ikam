@@ -3446,6 +3446,35 @@ Gates on the branch (E229 to E233): every kernel test suite passes (release); cl
 - Verdict: **kept**, `db_range_drop` off by default; `RemoveRange` and `db_insert` are new calls. On merging after E229 to E233 (Nov 12): this branch's own range reader was dropped for E229's `graph_range`, and a database that keeps E233's counts lists a removed range instead of dropping it, because the counts need each removed key (tested in tests/db_range.rs). The measurements above were taken before the merge, with the branch's own reader on the off path.
 - Run: `cargo run --release --example row_ids -- 10000 100000 1000000`.
 
+### E241 column-blocks (a large append-only table as compressed column blocks, after Apache Arrow)
+- Branch / parent: exp/241-column-blocks / main 9c4c708 (numbered E240 to E244 to stay clear of E229 to E232 on other branches)
+- Question: in database mode a table's rows are one event each, and each event is a log entry, an `ids` entry and a `kv` entry. For a large append-only table (many rows of the same few fields) what does that cost per row, and does a columnar block (Apache Arrow's layout and dictionary arrays, from what is known of them; nothing was re-read for this entry) store and scan it for less while every row still reads back byte for byte?
+- Change (opt-in; nothing calls it unless asked):
+  - `colblock` (src/colblock.rs): rows split into fields at a separator byte; each field position a column; a column of canonical integers stored as zigzag deltas, of fixed-point decimals with one number of places as scaled zigzag deltas, of at most 255 distinct values (a quarter of the rows or fewer) as a dictionary and one byte a row, else length-prefixed bytes; each column a zstd 19 frame of its own, so one column decodes alone. A value is typed only if formatting it back gives its exact text (`007`, `-0`, `+5`, `-0.00` stay bytes). `encode` decodes its own output and refuses a block that does not give back the rows.
+  - `Repo::put_column_block` (one content) and `Repo::db_append_block` (one database event whose value is the block, so the log holds the rows and `db_rebuild` is unchanged); `colblock::decode` and `colblock::column`.
+  - Tests (tests/colblock.rs): 300 random blocks of odd values (empty fields, leading zeros, signs, exponents, non-UTF-8 bytes, varying field counts, two separators) round-trip; typed columns round-trip and one column reads alone; a block in the database reads back exactly and rebuilds.
+- Result (`examples/column_blocks.rs`, generated rows `time,id,reading,count,status` of about 30.6 bytes as CSV, MemStore; times from a 4-core cloud machine with other runs going, so rough):
+
+  | Rows | Way | Stored bytes a row | Write | Sum one column | Read all rows |
+  |---|---|---|---|---|---|
+  | 100,000 | row events (`db_append`, one a row) | 199.6 | 3.8 to 6.4 s | 10.7 to 18.7 s | same scan |
+  | 100,000 | one CSV file (`put_content`) | 10.21 | 59 ms | 14 ms | 14 ms |
+  | 100,000 | zstd 19 of the CSV (reference, no store) | 7.30 | 1.4 s | | 5 ms |
+  | 100,000 | column blocks of 4,096 rows | 4.05 | 0.20 s | 13 ms | 42 ms |
+  | 100,000 | column blocks of 65,536 rows | 3.65 | 0.24 s | 12 ms | 43 ms |
+  | 1,000,000 | row events | 200.9 | 92 s | 141 s | same scan |
+  | 1,000,000 | one CSV file | 10.27 | 0.9 s | 0.29 s | 0.29 s |
+  | 1,000,000 | zstd 19 of the CSV | 7.30 | 53 s | | 0.11 s |
+  | 1,000,000 | column blocks of 4,096 rows | 4.30 | 4.4 s | 0.39 s | 1.0 s |
+  | 1,000,000 | column blocks of 65,536 rows | 3.65 | 3.4 s | 0.16 s | 0.77 s |
+
+  - Blocks are about 55 times smaller than row events and half of zstd 19 over the whole CSV; summing one column over a million rows takes 0.16 s against 141 s for a scan of row events. Every way's rows were checked against the originals.
+  - Most of a row event's 200 bytes is the three graph entries (log, ids, kv) and their labels, not the row.
+- Not measured: tables that change rows in place (blocks suit append-only tables; a rewrite means a new block or a row event beside it), wide or text-heavy rows, a read of one row (decodes its block's columns), the Mac.
+- Trade-off: a block is written whole, so rows arrive in batches; a single row read decodes a block; an append-only table loses per-row keys in `kv` (one key a block).
+- Verdict: **kept** as an option (opt-in API, off unless called). Next: a block per table segment kept beside a few recent row events, and a `kv` range view of block keys so a time range finds its blocks.
+- Run: `cargo run --release --example column_blocks -- 100000 1000000`.
+
 ### E242 view-graph (named derived views with dependencies, after dbt's models)
 - Branch / parent: exp/242-view-graph / main 9c4c708 (numbered E240 to E244 to stay clear of E229 to E232 on other branches)
 - Question: database mode keeps two views of its log (`ids` and `kv`). Can callers define more, as dbt defines models: named views that read other views, built in dependency order, each computed on read, stored and rebuilt, or stored and updated from its inputs' changes, with a row check after each build (dbt's ideas from what is known of them; nothing was re-read for this entry)? What does an incremental update cost against a rebuild?
