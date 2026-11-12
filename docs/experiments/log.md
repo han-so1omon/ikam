@@ -3603,3 +3603,31 @@ Gates on the branch: every kernel test suite passes (release); clippy `-D warnin
   - With signals of similar strength, fusion lifts nDCG@10 by 27 to 29% over the better one, and convex leads RRF at every vector strength.
   - For filters, the measurements give a planner's rule: post-filter when the filter keeps half or more, and pre-filter exactly at about 10% kept or less, where it gives full recall in under 0.4 ms. Filter inside the graph in between, or when exact is too large to scan.
 - Run: `cargo run --release --features search-tantivy,vectors-hnsw --example hybrid -- 50000`.
+
+### E255 embed-cache (embeddings keyed by content hash, rebuilt on model change)
+- Branch / parent: exp/255-embed-cache / exp/254-hybrid
+- Question: where should embeddings be computed and kept so identical fragments share one embedding, and what does a model change cost? LangChain's cache keys embeddings by model and a hash of the text, and Weaviate re-vectorizes a collection on a model change (docs/research/search-engines.md). In ikam a fragment's content id is already its hash.
+- Change (opt-in module, `embeds.rs`):
+  - A cache graph `model US content-id` maps each fragment's embedding to a vector content.
+  - A row view `row US index` maps each fragment of a row to its vector. A row's fragments are its lines.
+  - `embeds_update` reads the `kv` diff, looks up the changed rows' fragments in the cache in one pass, and embeds only those missing. A new model id finds nothing cached, so the row view is rebuilt embedding each distinct fragment once; the old model's entries stay under their own id.
+  - Test: after a build, random batches and a model change, every row's vectors equal its fragments embedded directly, and each build embeds exactly the distinct fragments.
+- Result:
+  - Setup: `examples/embed_cache.rs`, 50,000 rows of 3 lines, each line drawn from a pool of 20,000 with Zipf frequencies, so fragments repeat as boilerplate does. E249's `prune_diff` is on.
+  - The model is synthetic: character trigrams hashed into 64 dimensions, normalized. It costs about 0.13 µs a call, far less than a real model, so calls are the measure.
+  - Machine: an Apple M3 Pro laptop, through OpenResearch's local backend.
+
+  | Phase | Calls, every occurrence | Calls, by content hash | Time, by content hash | Stored |
+  |---|---|---|---|---|
+  | Build (50,000 rows) | 150,000 | 15,732 | 1,193 ms | 7.1 MB (38.4 MB as a vector per occurrence) |
+  | Update of 10 rows | 30 | 1.0 | 5.0 ms | |
+  | Update of 100 rows | 300 | 10.8 | 37.6 ms | |
+  | Update of 1,000 rows | 3,000 | 88 | 276 ms | |
+  | Model change (all rows) | 150,000 | 15,690 | 1,220 ms | 7.2 MB more |
+
+  - Updates call the model for about 3% of their fragments, since most new lines are in the cache already.
+  - The view's own work (lookups and edits) is about 1.2 s a build. It pays for itself once a model call costs more than about 9 µs: the build saves 134,268 calls for about 1.2 s.
+- Not measured: a real model; fragments other than lines (paragraphs, chunks); dropping an old model's entries; embedding inside a view graph (E242).
+- Trade-off: a cache lookup per fragment, and the cache keeps every model's vectors until dropped. Distinct fragments are embedded once however many rows hold them.
+- Verdict: **kept (opt-in).** Keyed by content id, which ikam already computes, a build and a model change each embed 9.5 times fewer fragments here, updates about 30 times fewer, and the vectors are stored once.
+- Run: `cargo run --release --example embed_cache -- 50000 20000 10 100 1000`.
