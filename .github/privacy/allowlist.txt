@@ -1,0 +1,12 @@
+# Exceptions for scan.py. One per line:
+#   text <regex>   ignore a hit when this regex matches the hit and up to 40
+#                  characters around it
+#   path <glob>    skip a file entirely (keep these few and specific)
+# Keep entries to placeholders and public data; never add a real private value.
+
+# Placeholder hostnames in ikam's own tests and README.
+text (?i)\bmac(?:\.(?:example|tail1234))?\.ts\.net\b
+# A LibreOffice version number in fixture notes, not an address.
+text LibreOffice \d+\.\d+\.\d+\.\d+
+# Example paths in the vendored upstream skills (public text, not this machine).
+text /Users/jesse/

@@ -1,0 +1,39 @@
+# Fails when a push or pull request adds private details (home-folder paths,
+# tailnet names, IP addresses, keys or tokens) to this public repository.
+# Same check as the local hooks: .github/privacy/scan.py.
+name: privacy
+on:
+  push:
+  pull_request:
+permissions:
+  contents: read
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Scan added lines and commit messages
+        env:
+          EVENT: ${{ github.event_name }}
+          PR_BASE: ${{ github.event.pull_request.base.sha }}
+          PR_HEAD: ${{ github.event.pull_request.head.sha }}
+          BEFORE: ${{ github.event.before }}
+          AFTER: ${{ github.sha }}
+        run: |
+          if [ "$EVENT" = pull_request ]; then
+            base=$(git merge-base "$PR_BASE" "$PR_HEAD"); head=$PR_HEAD
+          elif [ -z "$BEFORE" ] || [ "$BEFORE" = 0000000000000000000000000000000000000000 ]; then
+            # A new branch: what it adds over main.
+            base=$(git merge-base "$AFTER" origin/main 2>/dev/null || true); head=$AFTER
+          elif git cat-file -e "$BEFORE^{commit}" 2>/dev/null; then
+            base=$BEFORE; head=$AFTER
+          else
+            base=  # a force push from a commit no longer here
+          fi
+          if [ -n "$base" ] && [ "$base" != "$head" ]; then
+            python3 .github/privacy/scan.py --range "$base..$head"
+          fi
+          # Every push also checks the whole tree as it now stands.
+          python3 .github/privacy/scan.py --all

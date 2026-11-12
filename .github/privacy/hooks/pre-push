@@ -1,0 +1,13 @@
+#!/bin/sh
+# Scans what each push adds (lines and commit messages) before it leaves this machine.
+top=$(git rev-parse --show-toplevel)
+zero=0000000000000000000000000000000000000000
+while read -r _ local_sha _ remote_sha; do
+  [ "$local_sha" = "$zero" ] && continue          # a branch delete
+  if [ "$remote_sha" = "$zero" ]; then             # a new branch: compare with main
+    base=$(git merge-base "$local_sha" origin/main 2>/dev/null) || base=$(git rev-list --max-parents=0 "$local_sha" | tail -1)
+  else
+    base=$remote_sha
+  fi
+  python3 "$top/.github/privacy/scan.py" --range "$base..$local_sha" || exit 1
+done

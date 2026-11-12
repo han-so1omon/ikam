@@ -1,0 +1,3 @@
+#!/bin/sh
+# Install once per clone: git config core.hooksPath .github/privacy/hooks
+exec python3 "$(git rev-parse --show-toplevel)/.github/privacy/scan.py" --staged
