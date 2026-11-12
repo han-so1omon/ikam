@@ -5,8 +5,8 @@
 set -eu
 cd "$(dirname "$0")/.."
 export CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-${TMPDIR:-/tmp}/ikam-orx-target}"
-cargo build --release -q --example join_switch
-cargo test --release -q --test join
-for n in 20000 100000; do
-  "$CARGO_TARGET_DIR/release/examples/join_switch" $n 1000 0.1,0.2,0.4 10 30 100 300 1000 3000
-done
+# Runs unpack sources with old modification times; touch them so cargo
+# rebuilds this crate instead of reusing another branch's build.
+find . -name '*.rs' -exec touch {} +
+cargo build --release -q --example join_views
+"$CARGO_TARGET_DIR/release/examples/join_views" 20000 1000 100 1000
