@@ -68,6 +68,10 @@ name = "search_segments"
 required-features = ["search-tantivy"]
 
 [[example]]
+name = "search_tantivy_view"
+required-features = ["search-tantivy"]
+
+[[example]]
 name = "stores"
 required-features = ["stores"]
 test = true
