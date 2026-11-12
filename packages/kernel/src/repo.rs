@@ -119,6 +119,12 @@ pub struct Repo<S: Store> {
     /// E104), at the price of a two-pass ledger build and a prefix lookup per
     /// id. Reading always accepts both forms, so it can be switched at will.
     pub short_records: bool,
+    /// Drop a removed key range from the `kv` view a chunk at a time (E240):
+    /// chunks wholly inside the range are cut out without being read, and
+    /// only the chunks at its two ends are rewritten. Off by default, when
+    /// a subtree remove lists every key below it and drops them one by
+    /// one. Either way the view's root is the same.
+    pub db_range_drop: bool,
     /// Split the words of a zip's markup members (docx, xlsx, pptx XML)
     /// from their tags at ingest (E112): one skeleton member and one text
     /// member per zip, so the words compress with the same text in other
@@ -241,6 +247,7 @@ impl<S: Store> Repo<S> {
             search_rate: 0.0,
             search_sample: Vec::new(),
             short_records: false,
+            db_range_drop: false,
             markup_layers: false,
             slow_codec_max: usize::MAX,
             group_size: crate::group::GROUP_SIZE,

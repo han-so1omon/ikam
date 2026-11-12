@@ -3409,3 +3409,39 @@ Gates on the branch: every kernel test suite passes (release); clippy `-D warnin
 - Run: `cargo run --release --example db_kept_counts -- DIR [ROWS] [APPENDS] [off|after|load]`; `python3 scripts/db_contention.py URL` against `ikam db serve --keep-counts 3` on a store written with `after`.
 
 Gates on the branch (E229 to E233): every kernel test suite passes (release); clippy `-D warnings` and fmt clean; the bench gives the same byte and count fields as the code it builds on, run alongside it on the same machine (only times and peak memory differ), north 0.3109; the privacy check passes.
+
+### E240 row-ids (stable row ids, a range remove, and dropping a key range a chunk at a time)
+- Branch / parent: exp/240-row-ids / main 9c4c708 (numbered E240 to E244 to stay clear of E229 to E232 on other branches)
+- Question: in database mode, removing many rows is one `Remove` event per row, or a subtree `Remove` whose view edit lists every key below the prefix and drops them one by one. With stable, ordered row ids, can a whole table or a range of ids go in one log entry, and can the `kv` view drop it without reading the chunks inside the range?
+- Change (all opt-in; default behaviour unchanged):
+  - `Op::RemoveRange { end }` (`Event::remove_range`): one event drops every key in `[key, end)`; encoded as `D` and the end, so earlier events decode as before; a reversed or empty range is refused.
+  - `Repo::db_insert(db, table, rows)`: rows keyed `table/` and the log sequence number of the event inserting them (20 digits, as log labels), so ids are never reused and sort in insertion order; a retried idempotency key keeps its first id. `Db::row_key(table, seq)` names one, for a range over ids.
+  - `Repo::graph_drop_range` (graph.rs): leaves wholly inside the range are cut out unread; the leaves at its ends, and those after it until the content-defined cut falls back into step, are re-cut; parents are rebuilt from the leaf list (read from parent chunks only). Equals `put_graph` of the remaining nodes.
+  - `Repo::db_range_drop` (off): a subtree remove or a range remove drops its range from `kv` with `graph_drop_range` instead of listing and dropping each key. Off, a range remove lists its keys with E229's `graph_range`, as a subtree remove does.
+  - Tests (tests/db_range.rs): `graph_drop_range` equals `put_graph` of the rest on graphs of 0 to 30,000 nodes (two levels) and random ranges, bounded and not; subtree removes mixed with writes before and after give the same roots with `db_range_drop` off and on, and equal `db_rebuild`; range removes drop exactly their keys; row ids are stable across retries and not reused after a range remove.
+- Result (`examples/row_ids.rs`, MemStore, three generated tables of N rows each, removing one table or the first half of its row ids; each case on a fresh copy of the same store, after one warm-up append; reads are store reads during the append):
+
+  | Rows a table | Case | Log | ms | Reads | Bytes read |
+  |---|---|---|---|---|---|
+  | 10,000 | a `Remove` a row (table) | 10,000 events, 730 KB | 2,678 | 122,917 | 11.8 MB |
+  | 10,000 | subtree `Remove` | 1 event | 32.0 | 774 | 1.18 MB |
+  | 10,000 | subtree `Remove`, `db_range_drop` | 1 event | 12.6 | 240 | 0.44 MB |
+  | 10,000 | `RemoveRange` of half the ids | 1 event | 14.8 | 381 | 0.50 MB |
+  | 10,000 | `RemoveRange`, `db_range_drop` | 1 event | 3.6 | 100 | 0.12 MB |
+  | 100,000 | a `Remove` a row (table) | 100,000 events, 7.3 MB | 23,685 | 2,505,360 | 329 MB |
+  | 100,000 | a `Remove` a row (half) | 50,000 events, 3.7 MB | 12,150 | 1,523,857 | 220 MB |
+  | 100,000 | subtree `Remove` | 1 event | 326.6 | 5,703 | 7.9 MB |
+  | 100,000 | subtree `Remove`, `db_range_drop` | 1 event | 18.7 | 366 | 0.47 MB |
+  | 100,000 | `RemoveRange` of half the ids | 1 event | 142.7 | 3,021 | 4.2 MB |
+  | 100,000 | `RemoveRange`, `db_range_drop` | 1 event | 13.2 | 330 | 0.42 MB |
+  | 1,000,000 | subtree `Remove` | 1 event | 3,628 | 54,630 | 76 MB |
+  | 1,000,000 | subtree `Remove`, `db_range_drop` | 1 event | 93.0 | 1,604 | 2.0 MB |
+  | 1,000,000 | `RemoveRange` of half the ids | 1 event | 1,481 | 27,986 | 39 MB |
+  | 1,000,000 | `RemoveRange`, `db_range_drop` | 1 event | 83.4 | 1,416 | 1.7 MB |
+
+  - Row-by-row removes were skipped at a million rows (minutes). New bytes written are the same with `db_range_drop` off and on (the roots are equal); what changes is what is read: the chunks inside the range are never opened, so the cost follows the number of leaves (parent chunks) rather than the rows.
+  - What is left at a million rows (about 90 ms, 1,600 reads) is mostly the parent levels rebuilt from the whole leaf list and the log and ids edits; rebuilding only the parents on the paths to the range's ends would make it independent of the table's size.
+- Not measured: FsStore (reads there are file opens, so the read counts matter more), the Mac, ranges inside a table being written at the same time.
+- Trade-off: none in results (same roots); `db_range_drop` is off by the rule that new paths start as options. Row ids are 20 digits, as log labels, so keys are longer than a short counter's (the store compresses chunks).
+- Verdict: **kept**, `db_range_drop` off by default; `RemoveRange` and `db_insert` are new calls. On merging after E229 to E233 (Nov 12): this branch's own range reader was dropped for E229's `graph_range`, and a database that keeps E233's counts lists a removed range instead of dropping it, because the counts need each removed key (tested in tests/db_range.rs). The measurements above were taken before the merge, with the branch's own reader on the off path.
+- Run: `cargo run --release --example row_ids -- 10000 100000 1000000`.

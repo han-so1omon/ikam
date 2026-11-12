@@ -29,9 +29,9 @@
 //!
 //! Frames (`application/x-ikam-kv`): for each pair, key length (u32, big
 //! endian), key, value length, value. Events (`application/x-ikam-events`):
-//! for each, an op byte (0 upsert, 1 remove, 2 remove with its subtree),
-//! then key, idempotency key and (upsert only) value, each as a u32 length
-//! and its bytes.
+//! for each, an op byte (0 upsert, 1 remove, 2 remove with its subtree,
+//! 3 remove a key range, E240), then key, idempotency key and the value
+//! (upsert) or the range's end (3), each as a u32 length and its bytes.
 //!
 //! A password: `IKAM_AUTH` for every request, as in `ikam live`;
 //! `IKAM_READ_AUTH` (another `ikam passwd` line) may also read.
@@ -189,6 +189,7 @@ pub fn decode_events(mut b: &[u8]) -> Result<Vec<Event>, String> {
         out.push(match op {
             0 => Event::upsert(&key, take(&mut b)?, &idem),
             1 | 2 => Event::remove(&key, op == 2, &idem),
+            3 => Event::remove_range(&key, &text(take(&mut b)?)?, &idem),
             _ => return Err(format!("unknown op {op}")),
         });
     }
@@ -215,6 +216,12 @@ pub fn encode_events(events: &[Event]) -> Vec<u8> {
                 out.push(if *subtree { 2 } else { 1 });
                 put(&mut out, e.key.as_bytes());
                 put(&mut out, e.idempotency_key.as_bytes());
+            }
+            ikam_kernel::Op::RemoveRange { end } => {
+                out.push(3);
+                put(&mut out, e.key.as_bytes());
+                put(&mut out, e.idempotency_key.as_bytes());
+                put(&mut out, end.as_bytes());
             }
         }
     }
@@ -553,6 +560,7 @@ mod tests {
             Event::upsert("t/a/2", b"", "i2"),
             Event::remove("t/a", true, "i3"),
             Event::remove("t/b", false, "i4"),
+            Event::remove_range("t/c/1", "t/c/5", "i5"),
         ];
         assert_eq!(decode_events(&encode_events(&events)).unwrap(), events);
         assert!(decode_events(&[0, 0, 0, 0, 9]).is_err());

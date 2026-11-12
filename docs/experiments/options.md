@@ -36,6 +36,7 @@ below together is the simplest interface; today callers set the fields.
 | `short_records` (new, E104) | off | derivation records store 8-byte id prefixes and a builtin index: about a third less record bytes; reading resolves prefixes (a two-pass ledger build) | north 0.3035 -> 0.2793 (8%); cost score up about 4.5% on four runs with identical instruction counts (timing, not work); see below |
 | `markup_layers` (new, E112) | off | a zip's text-heavy XML parts (docx body, sheets, slides) stored as one skeleton member and one text member, so their words compress with the same text in other formats; repack CPU to split and rebuild them | north 0.3035 -> 0.3005; cases one graph -4.0%, multiformat +1.4%, tables -0.2%; office corpus cost up (0.33-0.35 -> 0.40-0.46); single-type real office corpora -0.1% to +0.9% |
 | `plain_db_events` (new, E229) | off | database events (`db_append`) stored as they are, without a slice or template plan search: append time against room a plan could save on similar rows | 2,000-row batches 368 to 140 us an event, same bytes on synthetic rows; with `object_templates` off 79 us; `ikam db serve --plain-events` |
+| `db_range_drop` (new, E240) | off | a subtree or range remove drops its key range from the database's `kv` view a chunk at a time, chunks inside the range unread; same roots either way | 1M-row table remove 3,628 -> 93 ms, 54,630 -> 1,604 store reads |
 
 Reading accepts every stored form whatever the settings, so a setting can be
 changed on an existing store; the next repack re-plans under it.
