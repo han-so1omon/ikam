@@ -43,6 +43,9 @@ pub enum Op {
     Upsert(Vec<u8>),
     /// Drop the key; with `subtree`, every key below it too.
     Remove { subtree: bool },
+    /// Drop every key in `[key, end)` (E240): one entry for a range of
+    /// rows, such as row ids up to a cut-off.
+    RemoveRange { end: String },
 }
 
 /// One log entry. `key` is the identity the fold groups by: segments joined
@@ -66,6 +69,14 @@ pub struct Db {
     pub kv: Id,
     pub ids_at: u64,
     pub kv_at: u64,
+}
+
+impl Db {
+    /// The row key `db_insert` gives the event logged at `seq`, for a
+    /// `RemoveRange` over row ids (E240).
+    pub fn row_key(table: &str, seq: u64) -> String {
+        format!("{table}/{}", seq_label(seq))
+    }
 }
 
 fn put_str(out: &mut Vec<u8>, s: &str) {
@@ -94,8 +105,18 @@ impl Event {
         }
     }
 
+    /// Drop every key from `key` up to, not including, `end`.
+    pub fn remove_range(key: &str, end: &str, idempotency_key: &str) -> Event {
+        Event {
+            key: key.into(),
+            op: Op::RemoveRange { end: end.into() },
+            idempotency_key: idempotency_key.into(),
+        }
+    }
+
     /// Canonical bytes: magic, idempotency key, key, then `U` and the value
-    /// (last, so it is the tail a view points at) or `R` and 0/1 for subtree.
+    /// (last, so it is the tail a view points at), `R` and 0/1 for subtree,
+    /// or `D` and the range's end.
     pub fn encode(&self) -> Vec<u8> {
         let mut out = MAGIC.to_vec();
         put_str(&mut out, &self.idempotency_key);
@@ -106,6 +127,10 @@ impl Event {
                 out.extend_from_slice(value);
             }
             Op::Remove { subtree } => out.extend([b'R', *subtree as u8]),
+            Op::RemoveRange { end } => {
+                out.push(b'D');
+                out.extend_from_slice(end.as_bytes());
+            }
         }
         out
     }
@@ -129,6 +154,10 @@ impl Event {
         let op = match (bytes.get(at), bytes.get(at + 1..)) {
             (Some(b'U'), Some(value)) => Op::Upsert(value.to_vec()),
             (Some(b'R'), Some([s @ (0 | 1)])) => Op::Remove { subtree: *s == 1 },
+            (Some(b'D'), Some(end)) => match String::from_utf8(end.to_vec()) {
+                Ok(end) if end > key => Op::RemoveRange { end },
+                _ => return Err(bad()),
+            },
             _ => return Err(bad()),
         };
         if !valid_key(&key) || idempotency_key.is_empty() {
@@ -180,6 +209,15 @@ fn fold(
                 len: (len - value_at) as u64,
             };
             changes.insert(event.key.clone(), Some(range));
+        }
+        Op::RemoveRange { end } => {
+            let pending: Vec<String> = changes
+                .range(event.key.clone()..end.clone())
+                .map(|(k, _)| k.clone())
+                .collect();
+            for k in pending.into_iter().chain(below.iter().cloned()) {
+                changes.insert(k, None);
+            }
         }
         Op::Remove { subtree } => {
             changes.insert(event.key.clone(), None);
@@ -295,7 +333,8 @@ impl<S: Store> Repo<S> {
         }
         let mut fresh = Vec::new();
         for e in events {
-            if !valid_key(&e.key) || e.idempotency_key.is_empty() {
+            let bad_end = matches!(&e.op, Op::RemoveRange { end } if *end <= e.key);
+            if !valid_key(&e.key) || e.idempotency_key.is_empty() || bad_end {
                 return Err(Error::InvalidName(e.key.clone()));
             }
             let bytes = e.encode();
@@ -312,6 +351,7 @@ impl<S: Store> Repo<S> {
             return Ok(*db);
         }
         let (mut log, mut ids, mut changes) = (BTreeMap::new(), BTreeMap::new(), Changes::new());
+        let mut drops: Vec<(String, String)> = Vec::new();
         let mut seq = head;
         for (e, bytes, id) in fresh {
             seq += 1;
@@ -322,13 +362,25 @@ impl<S: Store> Repo<S> {
             let entry = entry(seq, e, id);
             log.insert(entry.log.label.clone(), Some(entry.log));
             ids.insert(entry.id.label.clone(), Some(entry.id));
-            let below = match e.op {
-                Op::Remove { subtree: true } => self
-                    .graph_prefix(&db.kv, &format!("{}/", e.key))?
+            let range = match &e.op {
+                // `/` is followed by `0`: the keys below `k` are [k/, k0).
+                Op::Remove { subtree: true } => {
+                    Some((format!("{}/", e.key), format!("{}0", e.key)))
+                }
+                Op::RemoveRange { end } => Some((e.key.clone(), end.clone())),
+                _ => None,
+            };
+            let below = match range {
+                Some(r) if self.db_range_drop => {
+                    drops.push(r);
+                    Vec::new()
+                }
+                Some((lo, hi)) => self
+                    .graph_in_range(&db.kv, &lo, Some(&hi))?
                     .into_iter()
                     .map(|n| n.label)
                     .collect(),
-                _ => Vec::new(),
+                None => Vec::new(),
             };
             fold(
                 &mut changes,
@@ -346,13 +398,54 @@ impl<S: Store> Repo<S> {
                 (k, node)
             })
             .collect();
+        let mut kv_root = db.kv;
+        for (lo, hi) in drops {
+            kv_root = self.graph_drop_range(&kv_root, &lo, Some(&hi))?;
+        }
         Ok(Db {
             log: self.graph_edit(&db.log, log)?,
             ids: self.graph_edit_with(&db.ids, ids, Keys::Any)?,
-            kv: self.graph_edit_with(&db.kv, kv, Keys::Any)?,
+            kv: self.graph_edit_with(&kv_root, kv, Keys::Any)?,
             ids_at: seq,
             kv_at: seq,
         })
+    }
+
+    /// Insert rows into `table` under stable row ids (E240): a row's key is
+    /// `table/` and the log sequence number of the event that inserts it,
+    /// zero-padded, so ids are never reused, sort in insertion order and a
+    /// range of them is one `RemoveRange`. A row whose idempotency key is
+    /// already logged keeps the key it was given. Returns the new roots
+    /// and each row's key.
+    pub fn db_insert(
+        &mut self,
+        db: &Db,
+        table: &str,
+        rows: &[(&[u8], &str)],
+    ) -> Result<(Db, Vec<String>), Error> {
+        let keys = rows.iter().map(|r| r.1.to_string()).collect();
+        let mut known: BTreeMap<String, String> = BTreeMap::new();
+        for n in self.graph_nodes_in(&db.ids, &keys)? {
+            let Target::Content(a) = n.target else {
+                return Err(Error::Decode("db ids"));
+            };
+            known.insert(n.label, Event::decode(&self.read_content(&a.id())?)?.0.key);
+        }
+        let (mut seq, mut events, mut out) = (self.db_head(&db.log)?, Vec::new(), Vec::new());
+        for (value, idem) in rows {
+            let key = match known.get(*idem) {
+                Some(key) => key.clone(),
+                None => {
+                    seq += 1;
+                    let key = Db::row_key(table, seq);
+                    known.insert(idem.to_string(), key.clone());
+                    events.push(Event::upsert(&key, value, idem));
+                    key
+                }
+            };
+            out.push(key);
+        }
+        Ok((self.db_append(db, &events)?, out))
     }
 
     /// The log's events in order, read back from the store.
