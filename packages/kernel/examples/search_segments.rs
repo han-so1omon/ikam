@@ -221,9 +221,17 @@ fn main() {
     let want = tantivy("tantivy_disk", false, &docs, &rounds, &queries);
     assert_eq!(want, tantivy("tantivy_ram", true, &docs, &rounds, &queries));
 
-    for way in ["view", "view_plain", "segments", "segments_plain"] {
+    for way in [
+        "view",
+        "view_plain",
+        "view_pruned",
+        "segments",
+        "segments_plain",
+        "segments_pruned",
+    ] {
         let mut r = Repo::new(repo.store().copy());
         r.object_templates = false; // derived data (E228's option), as E244
+        r.prune_diff = way.ends_with("pruned"); // E249
         let opts = SegmentOpts {
             merge_above,
             plain_writes: way.ends_with("plain"),
@@ -231,7 +239,7 @@ fn main() {
         let stored0 = r.store().stored();
         let t = Instant::now();
         let mut kept = match way {
-            "view" | "view_plain" => {
+            w if w.starts_with("view") => {
                 if opts.plain_writes {
                     r.read_weight = f64::INFINITY;
                 }
