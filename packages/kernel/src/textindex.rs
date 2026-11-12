@@ -115,6 +115,9 @@ pub struct SegmentOpts {
     /// Store chunks plain, without the slice search (as E245's
     /// `plain_writes`): the index can be rebuilt from the rows.
     pub plain_writes: bool,
+    /// Keep the base as block lists of row ids (E251, after Tantivy's
+    /// postings) instead of a graph of postings; a merge rebuilds it.
+    pub block_base: bool,
 }
 
 /// A text index kept as segments (E247), after Lucene's segments and
@@ -132,6 +135,8 @@ pub struct Segments {
     pub base_postings: usize,
     pub delta_postings: usize,
     pub dead_postings: usize,
+    /// E251: the base as block lists (then `base` is unused).
+    pub block: Option<crate::postblocks::BlockIndex>,
 }
 
 impl<S: Store> Repo<S> {
@@ -147,7 +152,7 @@ impl<S: Store> Repo<S> {
     }
 
     /// A row's value from its `kv` node, without looking the key up again.
-    fn kv_value(&self, n: &Node) -> Result<Vec<u8>, Error> {
+    pub(crate) fn kv_value(&self, n: &Node) -> Result<Vec<u8>, Error> {
         match &n.target {
             Target::Content(crate::Arg::Range { id, start, len }) => {
                 let bytes = self.read_content(id)?;
@@ -167,9 +172,17 @@ impl<S: Store> Repo<S> {
         opts: &SegmentOpts,
     ) -> Result<Segments, Error> {
         self.plain_scope(opts, |r| {
-            let base = r.text_index_build(db, prefix)?;
-            let base_postings = r.graph_nodes(&base)?.len();
             let empty = r.put_graph_with(Vec::new(), Keys::Any)?;
+            let (base, block, base_postings) = match opts.block_base {
+                true => {
+                    let b = r.block_index_build(db, prefix)?;
+                    (empty, Some(b), b.postings)
+                }
+                false => {
+                    let base = r.text_index_build(db, prefix)?;
+                    (base, None, r.graph_nodes(&base)?.len())
+                }
+            };
             Ok(Segments {
                 base,
                 delta: empty,
@@ -178,6 +191,7 @@ impl<S: Store> Repo<S> {
                 base_postings,
                 delta_postings: 0,
                 dead_postings: 0,
+                block,
             })
         })
     }
@@ -250,18 +264,39 @@ impl<S: Store> Repo<S> {
             if (next.delta_postings + next.dead_postings) as f64
                 > opts.merge_above * next.base_postings.max(1) as f64
             {
-                return r.text_segments_merge(&next, opts);
+                return r.text_segments_merge_at(&next, new, prefix, opts);
             }
             Ok(next)
         })
     }
 
-    /// Fold `seg`'s delta and dead postings into its base.
+    /// Merge `seg`, kept at `db`: a graph base takes its delta and dead
+    /// postings in one edit; a block base (E251) is rebuilt at `db`, as
+    /// Tantivy writes a merged segment anew.
+    pub fn text_segments_merge_at(
+        &mut self,
+        seg: &Segments,
+        db: &Db,
+        prefix: &str,
+        opts: &SegmentOpts,
+    ) -> Result<Segments, Error> {
+        match seg.block {
+            Some(_) => self.text_segments_build(db, prefix, opts),
+            None => self.text_segments_merge(seg, opts),
+        }
+    }
+
+    /// Fold `seg`'s delta and dead postings into its base (a graph base).
     pub fn text_segments_merge(
         &mut self,
         seg: &Segments,
         opts: &SegmentOpts,
     ) -> Result<Segments, Error> {
+        if seg.block.is_some() {
+            return Err(Error::Decode(
+                "a block base merges with text_segments_merge_at",
+            ));
+        }
         let mut edits: BTreeMap<String, Option<Node>> = BTreeMap::new();
         for n in self.graph_nodes(&seg.dead)? {
             edits.insert(n.label, None);
@@ -281,6 +316,7 @@ impl<S: Store> Repo<S> {
                 base_postings,
                 delta_postings: 0,
                 dead_postings: 0,
+                block: None,
             })
         })
     }
@@ -293,6 +329,9 @@ impl<S: Store> Repo<S> {
                 .filter_map(|n| n.label.split_once(US).map(|(_, r)| r.to_string()))
                 .collect())
         };
+        if let Some(b) = &seg.block {
+            return self.block_segments_search(seg, b, query, &rows);
+        }
         let mut hits: Option<BTreeSet<String>> = None;
         for w in words(query.as_bytes()) {
             let mut here = rows(self, &seg.base, &w)?;
@@ -309,5 +348,39 @@ impl<S: Store> Repo<S> {
             }
         }
         Ok(hits.unwrap_or_default().into_iter().collect())
+    }
+
+    /// E251's search: every moved row's base postings are dead and only
+    /// moved rows have delta postings, so the rows are the base's
+    /// intersection less the moved rows, plus the delta's intersection.
+    fn block_segments_search(
+        &self,
+        seg: &Segments,
+        b: &crate::postblocks::BlockIndex,
+        query: &str,
+        rows: &dyn Fn(&Self, &Id, &str) -> Result<BTreeSet<String>, Error>,
+    ) -> Result<Vec<String>, Error> {
+        let ws: Vec<String> = words(query.as_bytes()).into_iter().collect();
+        if ws.is_empty() {
+            return Ok(Vec::new());
+        }
+        let ids = self.block_index_ids(b, &ws)?;
+        let base: BTreeSet<String> = self.block_index_keys(b, &ids)?.into_iter().collect();
+        let moved: BTreeSet<String> = self
+            .graph_nodes_in(&seg.moved, &base)?
+            .into_iter()
+            .map(|n| n.label)
+            .collect();
+        let mut hits: BTreeSet<String> = base.difference(&moved).cloned().collect();
+        let mut delta: Option<BTreeSet<String>> = None;
+        for w in &ws {
+            let here = rows(self, &seg.delta, w)?;
+            delta = Some(match delta {
+                Some(d) => d.intersection(&here).cloned().collect(),
+                None => here,
+            });
+        }
+        hits.extend(delta.unwrap_or_default());
+        Ok(hits.into_iter().collect())
     }
 }

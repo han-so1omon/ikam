@@ -95,10 +95,18 @@ fn updates_equal_a_build_and_searches_equal_a_scan() {
 #[test]
 fn segments_answer_as_a_build_and_merge_into_one() {
     use ikam_kernel::textindex::SegmentOpts;
-    for (merge_above, plain_writes) in [(0.05, false), (0.3, true), (1e9, false)] {
+    let cases = [
+        (0.05, false, false),
+        (0.3, true, false),
+        (1e9, false, false),
+        (0.05, false, true),
+        (1e9, false, true),
+    ];
+    for (merge_above, plain_writes, block_base) in cases {
         let opts = SegmentOpts {
             merge_above,
             plain_writes,
+            block_base,
         };
         let mut rng = Lcg(23);
         let mut repo = Repo::new(MemStore::default());
@@ -148,7 +156,16 @@ fn segments_answer_as_a_build_and_merge_into_one() {
                 );
             }
         }
-        let merged = repo.text_segments_merge(&seg, &opts).unwrap();
+        let merged = repo
+            .text_segments_merge_at(&seg, &db, "doc/", &opts)
+            .unwrap();
+        if block_base {
+            assert_eq!(
+                merged.block,
+                Some(repo.block_index_build(&db, "doc/").unwrap())
+            );
+            continue;
+        }
         assert_eq!(
             merged.base,
             repo.text_index_build(&db, "doc/").unwrap(),
@@ -159,4 +176,35 @@ fn segments_answer_as_a_build_and_merge_into_one() {
             repo.graph_nodes(&merged.base).unwrap().len()
         );
     }
+}
+
+#[test]
+fn block_lists_round_trip_and_intersect() {
+    use ikam_kernel::postblocks::{Ids, encode_ids, intersect};
+    let mut rng = Lcg(31);
+    for n in [0, 1, 127, 128, 129, 300, 5000] {
+        let mut ids: Vec<u32> = (0..n).map(|_| (rng.next() % 200_000) as u32).collect();
+        ids.sort();
+        ids.dedup();
+        let bytes = encode_ids(&ids);
+        let mut l = Ids::new(&bytes).unwrap();
+        assert_eq!(l.all(), ids, "{n}");
+        for t in [0, 1, 1000, 99_999, 199_999, 250_000] {
+            assert_eq!(
+                l.seek(t),
+                ids.iter().copied().find(|&x| x >= t),
+                "{n} seek {t}"
+            );
+        }
+    }
+    let lists: Vec<Vec<u32>> = [3, 5, 7]
+        .iter()
+        .map(|m| (0..20_000).filter(|x| x % m == 0).collect())
+        .collect();
+    let bytes: Vec<Vec<u8>> = lists.iter().map(|l| encode_ids(l)).collect();
+    let mut ids: Vec<Ids> = bytes.iter().map(|b| Ids::new(b).unwrap()).collect();
+    assert_eq!(
+        intersect(&mut ids),
+        (0..20_000).filter(|x| x % 105 == 0).collect::<Vec<u32>>()
+    );
 }
