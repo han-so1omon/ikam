@@ -3561,3 +3561,45 @@ Gates on the branch: every kernel test suite passes (release); clippy `-D warnin
   - For ikam's log-fed views the flat int8 view is the safe default up to tens of thousands of rows.
   - IVF trades recall for speed, and HNSW is the fast path, needing a consolidation policy (FreshDiskANN) before it is a view.
 - Run: `cargo run --release --features vectors-hnsw --example vector_views -- 50000 64 10 100 1000`.
+
+### E254 hybrid (BM25 with vectors, and metadata filters)
+- Branch / parent: exp/254-hybrid / exp/253-vector-views
+- Question: when does fusing keyword and vector rankings beat either alone, and does RRF or a convex combination hold up better? Filtering by metadata breaks approximate indexes as filters tighten (pgvector, ACORN); at what selectivity, and what should a planner do? Notes: docs/research/search-engines.md (Cormack et al. via Bruch et al.; ACORN; pgvector).
+- Change (opt-in functions in `vectors.rs`):
+  - `rrf` is reciprocal rank fusion: a row's score is the sum over lists of `1/(k + rank)`, here with k = 60.
+  - `convex` min-max normalizes two scored lists, then combines them as `alpha·a + (1−alpha)·b`.
+  - Test: both order as their formulas say.
+- Result:
+  - Setup: `examples/hybrid.rs`, 50,000 synthetic documents in 100 topics of 10 facets.
+  - Text: a facet has 3 synonyms, and a document names its facet by one, among topic and common words. Facet words also appear by chance in 3% of other documents.
+  - Vectors: a document's vector is its topic's and facet's meaning plus noise, whichever synonym its text uses.
+  - Queries: a facet by one synonym plus a topic word, with a vector of the same meaning. The relevant documents are the topic's documents with that facet.
+  - So words find a third of the relevant documents, and vectors blur between facets. There are three vector strengths (facet weight against noise), 200 queries each.
+  - Measures: nDCG@10, with recall@50 in brackets. BM25 is Tantivy's top 100 and vectors are exact top 100; both lists are fused.
+  - Machine: an Apple M3 Pro laptop, through OpenResearch's local backend.
+
+  | Vectors know (facet weight, noise) | BM25 (Tantivy) | Vectors (exact) | RRF, k 60 | Convex, alpha 0.5 |
+  |---|---|---|---|---|
+  | 0.4, 0.8 | 0.576 (0.40) | 0.652 (0.48) | 0.829 (0.50) | 0.842 (0.53) |
+  | 0.3, 1 | 0.576 (0.40) | 0.280 (0.22) | 0.565 (0.34) | 0.625 (0.31) |
+  | 0.2, 1.5 | 0.576 (0.40) | 0.128 (0.10) | 0.369 (0.29) | 0.517 (0.21) |
+
+  - Query times: BM25 0.06 ms, exact vectors 3.1 ms, and fusing their two top-100 lists adds under 0.05 ms.
+  - Filters run on a metadata field kept for a share of the rows. Each way's recall@10 is against the exact top 10 among the kept rows, with HNSW at ef 128; building the HNSW took 7.5 s:
+
+  | Filter keeps | Pre-filter, exact | Post-filter, HNSW top 100 | Filter inside the HNSW search |
+  |---|---|---|---|
+  | 50% | 1.00 at 1.57 ms | 1.00 at 0.21 ms | 1.00 at 0.45 ms |
+  | 10% | 1.00 at 0.37 ms | 0.88 at 0.19 ms | 1.00 at 3.38 ms |
+  | 2% | 1.00 at 0.13 ms | 0.22 at 0.18 ms | 1.00 at 11.27 ms |
+  | 0.5% | 1.00 at 0.07 ms | 0.05 at 0.20 ms | 1.00 at 28.75 ms |
+
+  - Pre-filtering here scans in-memory vectors of the kept rows; in ikam it would read them through a view.
+- Not measured: real queries and judgments; RRF's k and convex's alpha tuned; a planner choosing the filter path by selectivity; filters inside the IVF view.
+- Trade-off:
+  - Fusion pays only when both signals carry information. With weak vectors, RRF falls below BM25 alone (0.37 against 0.58), and convex loses less (0.52), as Bruch et al. report.
+  - Filtering inside the graph keeps recall but costs more as the filter tightens (0.45 to 29 ms). Post-filtering stays cheap but loses recall (0.88 at 10% kept, 0.05 at 0.5%).
+- Verdict: **measured.**
+  - With signals of similar strength, fusion lifts nDCG@10 by 27 to 29% over the better one, and convex leads RRF at every vector strength.
+  - For filters, the measurements give a planner's rule: post-filter when the filter keeps half or more, and pre-filter exactly at about 10% kept or less, where it gives full recall in under 0.4 ms. Filter inside the graph in between, or when exact is too large to scan.
+- Run: `cargo run --release --features search-tantivy,vectors-hnsw --example hybrid -- 50000`.
