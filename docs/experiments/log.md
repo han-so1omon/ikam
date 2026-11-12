@@ -3427,3 +3427,41 @@ Gates on the branch: every kernel test suite passes (release); clippy `-D warnin
   - `recompute_above` keeps the small-batch numbers but is not recommended with the other options.
   - The per-key seeks are the next target (E250 removes the diff's share of small updates).
 - Run: `cargo run --release --example join_switch -- 20000 1000 0.1,0.2,0.4 10 30 100 300 1000 3000`, and again with 100000.
+
+### E246 join-views (several views over one join: what sharing saves)
+- Branch / parent: exp/246-join-views / exp/245-join-options
+- Question: E243 found that sharing an index between two joins saved 3 to 5% of reads and no bytes. Does sharing pay off when several views read the same join, and is it the index or the join that should be shared? Hypothesis from Shared Arrangements (docs/research/incremental-views.md): sharing pays as more queries read the same indexed state.
+- Change: none in the kernel. `examples/join_views.rs` keeps k views (1, 2, 4, 8) over the join of table `a` (20,000 rows, 1,000 groups) with table `b` (one row per group) in three ways:
+  - `apart`: each view has its own arrangements and its own join.
+  - `shared arrangements`: one arrangement per table, and one join per view. Each view has its own combine function, so each is a distinct result.
+  - `shared join`: one join that every view reads, for views that read the same rows.
+  - Batches are 90% changes to `a` and 10% to `b`, median of 5. After the batches, every view's rows equal its join recomputed.
+- Result (an Apple M3 Pro laptop, through OpenResearch's local backend):
+
+  | E243's defaults | 1 view | 2 | 4 | 8 |
+  |---|---|---|---|---|
+  | 100 changes, apart | 69 ms | 108 ms | 199 ms | 355 ms |
+  | 100 changes, shared arrangements | 66 ms | 98 ms | 160 ms | 283 ms |
+  | 100 changes, shared join | 66 ms | 67 ms | 66 ms | 67 ms |
+  | 1,000 changes, apart | 181 ms | 309 ms | 560 ms | 1070 ms |
+  | 1,000 changes, shared arrangements | 180 ms | 290 ms | 506 ms | 952 ms |
+  | 1,000 changes, shared join | 180 ms | 180 ms | 181 ms | 180 ms |
+
+  | E245's `plain_writes` and `memo` | 1 view | 2 | 4 | 8 |
+  |---|---|---|---|---|
+  | 100 changes, apart | 45 ms | 69 ms | 123 ms | 217 ms |
+  | 100 changes, shared arrangements | 44 ms | 61 ms | 94 ms | 165 ms |
+  | 100 changes, shared join | 45 ms | 44 ms | 44 ms | 44 ms |
+  | 1,000 changes, apart | 89 ms | 140 ms | 245 ms | 455 ms |
+  | 1,000 changes, shared arrangements | 89 ms | 127 ms | 205 ms | 364 ms |
+  | 1,000 changes, shared join | 90 ms | 89 ms | 89 ms | 89 ms |
+
+  - At 8 views, sharing the arrangements saves 11 to 24% against keeping them apart.
+  - A shared join costs the same at 8 views as at 1, so it is 4.9 to 5.9 times cheaper than 8 views kept apart.
+  - Each extra view costs 55 to 70% of the first when kept apart, and 39 to 61% with shared arrangements. The first view also carries work every view shares, such as diffing the table.
+- Not measured: views that read a join through a further view (E242's view graph), durable stores, more than 8 views.
+- Trade-off: a shared join serves only views that need the same rows. Views that differ in what they combine can share only the arrangements.
+- Verdict: **measured.**
+  - Sharing an arrangement pays a little, growing with the number of views (11 to 24% at 8). That is why E243 saw almost nothing at 2.
+  - Sharing the join itself is what pays: the cost is flat in the number of views. Views over the same join should read one kept join, not keep one each.
+- Run: `cargo run --release --example join_views -- 20000 1000 100 1000`.
