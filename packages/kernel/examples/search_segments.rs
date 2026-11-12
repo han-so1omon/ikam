@@ -63,6 +63,7 @@ fn key(i: usize) -> String {
 }
 
 /// One way's index: E244's single graph or E247's segments.
+#[allow(clippy::large_enum_variant)] // a benchmark's one value
 enum Kept {
     View(Id),
     Segments(Segments),

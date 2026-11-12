@@ -26,6 +26,7 @@ mod markup;
 pub mod matcher;
 mod object;
 mod pdftext;
+pub mod postblocks;
 mod range;
 mod repack;
 mod repo;
@@ -33,8 +34,8 @@ mod search;
 pub mod snapshot;
 mod store;
 mod template;
-pub mod postblocks;
 pub mod textindex;
+pub mod vectors;
 mod wasm;
 pub mod worktree;
 
