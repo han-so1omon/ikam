@@ -35,6 +35,7 @@ below together is the simplest interface; today callers set the fields.
 | `slow_codec_max` (new, E109) | off (`usize::MAX`) | contents larger than this many bytes skip brotli when repack picks their encoding: repack time against the few percent brotli wins on large content | pandas repack 130 -> 82 s at 4 MiB, same bytes (brotli lost on its 23.6 MB tar); peak 791 -> 849 MiB; see below |
 | `short_records` (new, E104) | off | derivation records store 8-byte id prefixes and a builtin index: about a third less record bytes; reading resolves prefixes (a two-pass ledger build) | north 0.3035 -> 0.2793 (8%); cost score up about 4.5% on four runs with identical instruction counts (timing, not work); see below |
 | `markup_layers` (new, E112) | off | a zip's text-heavy XML parts (docx body, sheets, slides) stored as one skeleton member and one text member, so their words compress with the same text in other formats; repack CPU to split and rebuild them | north 0.3035 -> 0.3005; cases one graph -4.0%, multiformat +1.4%, tables -0.2%; office corpus cost up (0.33-0.35 -> 0.40-0.46); single-type real office corpora -0.1% to +0.9% |
+| `plain_db_events` (new, E229) | off | database events (`db_append`) stored as they are, without a slice or template plan search: append time against room a plan could save on similar rows | 2,000-row batches 368 to 140 us an event, same bytes on synthetic rows; with `object_templates` off 79 us; `ikam db serve --plain-events` |
 
 Reading accepts every stored form whatever the settings, so a setting can be
 changed on an existing store; the next repack re-plans under it.
@@ -338,3 +339,16 @@ Renderers and indexes outside the kernel (scripts and examples; no switch):
 | `bases` (E216): `route` also judges per kind of file whether its files diff against a base | encode about 1.5x longer (a third judged way per kind) | with siblings and nearest: reports-drift 0.537 to 0.504, random 0.673 to 0.630, exports and tables kept at 0.458 and 0.936 |
 
 One setting for every corpus tried (E216): `columns`, `numbers`, `siblings`, `nearest: 16`, `predict`, `step`, `prose`, `route`, `sort`, `transpose`, `bases`, `sample: 1 << 20`, no `rows`; `tune` on for the last 0.015. Against xz -9 over the files it is best or tied on all nine corpora and never worse than xz (drift reports 0.504, exports 0.458, real cases text 0.995, real registry 0.911). In the kernel (E217) it stores 0.23 to 0.92 of the files; blocks of 50 with a keyframe keep most of that with 1 to 10 ms reads. With `sample`'s runs (E219) 18 MB of reports encode in about a second untuned. As a per-file storage plan (E223, `Repo::put_ir`, files kept readable as members of the pack) it adds only 0.007 to the north score on top of `short_records`, so it is not a put or repack default; it pays where whole folders are written and read together. Not worth it: `literal` (E210), large tables cut into row groups (E220), block raw parts as their own entries (E221), `raw_keyframe` (E225).
+
+
+## `ikam db serve` (E229)
+
+| Flag | Default | Trade-off | Measured |
+| --- | --- | --- | --- |
+| `--packs` | off (FsStore) | many small events in a few pack files (E122) against a store only a pack-aware handle opens | used by every E229 run |
+| `--plain-events` | off | `Repo::plain_db_events`: faster appends against plans that could save room on similar rows | 2,000-row batches 368 to 140 us an event, 79 with the next flag; same bytes |
+| `--no-object-templates` | off | `Repo::object_templates` off (E144): view chunks planned only as slices | 368 to 312 us an event |
+| `--concurrent-reads` | off | reads on sibling handles of a shared store (E232): appends stop waiting for page reads, at a lock per object read and a handle per concurrent reader | 3 readers and a writer: appends p50 305 to 7.5 ms, reads 10.5 to 31.3 a second |
+| `--edit-index` | off | plans each write against the chunks it read (E232), not an index of the whole store built on the first write; cannot slice against contents the edit did not read | first write after a restart 5.1 to 0.5 s, peak resident 172 to 30 MB at 200,000 rows; same bytes on disk |
+| `--keep-counts N` | off (0) | keeps the number of keys under each prefix of up to N segments (E233), edited by every append; `count?prefix=` and `span` read it | 200 prefix counts 243 to 0.42 ms, span 170 to 51 ms; appends about 2 ms slower; same bytes |
+| `--allow-host NAME`, `--log-requests` | none, off | as for `ikam live` | not scored |

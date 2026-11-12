@@ -22,11 +22,17 @@
 //!   keys whose `node_key`s collide are stored, read and rebuilt like any
 //!   others. The log's labels are sequence numbers and keep the check.
 //!
+//! - Kept counts (E233, off unless asked for): a view from each key prefix
+//!   of up to `depth` segments (`a/`, `a/b/`, ...) to how many keys start
+//!   with it, edited by each append, so a page's counts read one node each
+//!   instead of every key in the range.
+//!
 //! In a commit the database is the tree entry `db`: `db/log`, and
 //! `db/views/ids` and `db/views/kv` with their positions in `ids.at` and
-//! `kv.at`; files beside it are kept as they are.
+//! `kv.at` (and, with kept counts, `counts`, `counts.at` and
+//! `counts.depth`); files beside it are kept as they are.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use crate::{
     Arg, Edge, Error, Id, Keys, Kind, Node, Object, Repo, Store, Target, TreeEntry, node_key,
@@ -66,6 +72,34 @@ pub struct Db {
     pub kv: Id,
     pub ids_at: u64,
     pub kv_at: u64,
+    /// Kept counts (E233), if this database keeps them.
+    pub counts: Option<Counts>,
+}
+
+/// The kept-counts view (E233): labels are key prefixes ending in `/` of
+/// 1 to `depth` segments, each with the number of keys under it as decimal
+/// content; a prefix with no keys has no node. `at` is the log position it
+/// reflects.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Counts {
+    pub root: Id,
+    pub depth: u32,
+    pub at: u64,
+}
+
+/// The prefixes a key is counted under: its first 1 to `depth` segments,
+/// each with a trailing `/`, leaving out the key itself.
+fn count_prefixes(key: &str, depth: u32) -> impl Iterator<Item = &str> {
+    key.match_indices('/')
+        .take(depth as usize)
+        .map(move |(i, _)| &key[..=i])
+}
+
+/// Is `prefix` one that a view of this depth keeps a count for?
+fn kept_prefix(prefix: &str, depth: u32) -> bool {
+    prefix.ends_with('/')
+        && valid_key(&prefix[..prefix.len() - 1])
+        && prefix.matches('/').count() <= depth as usize
 }
 
 fn put_str(out: &mut Vec<u8>, s: &str) {
@@ -220,6 +254,20 @@ fn entry(seq: u64, e: &Event, id: Id) -> Entry {
     }
 }
 
+/// The first string after every string that starts with `prefix`, in byte
+/// order, or `None` when there is none (`prefix` is empty or all U+10FFFF).
+pub fn prefix_end(prefix: &str) -> Option<String> {
+    let mut chars: Vec<char> = prefix.chars().collect();
+    while let Some(c) = chars.pop() {
+        let next = (c as u32 + 1..=char::MAX as u32).find_map(char::from_u32);
+        if let Some(n) = next {
+            chars.push(n);
+            return Some(chars.into_iter().collect());
+        }
+    }
+    None
+}
+
 fn parse_seq(label: &str) -> Result<u64, Error> {
     match label.parse() {
         Ok(seq) if label.len() == SEQ_DIGITS => Ok(seq),
@@ -237,6 +285,7 @@ impl<S: Store> Repo<S> {
             kv: empty,
             ids_at: 0,
             kv_at: 0,
+            counts: None,
         })
     }
 
@@ -259,12 +308,21 @@ impl<S: Store> Repo<S> {
                 None => Ok(head),
             }
         };
+        let counts = match self.tree_entry(&views, "counts")? {
+            Some(root) => Some(Counts {
+                root,
+                depth: at(self, "counts.depth")? as u32,
+                at: at(self, "counts.at")?,
+            }),
+            None => None,
+        };
         Ok(Db {
             log,
             ids: get(self, &views, "ids")?,
             kv: get(self, &views, "kv")?,
             ids_at: at(self, "ids.at")?,
             kv_at: at(self, "kv.at")?,
+            counts,
         })
     }
 
@@ -281,7 +339,7 @@ impl<S: Store> Repo<S> {
     /// database, and gives the roots `db_rebuild` would.
     pub fn db_append(&mut self, db: &Db, events: &[Event]) -> Result<Db, Error> {
         let head = self.db_head(&db.log)?;
-        if db.ids_at != head || db.kv_at != head {
+        if db.ids_at != head || db.kv_at != head || db.counts.is_some_and(|c| c.at != head) {
             return Err(Error::Decode("db views are behind the log"));
         }
         // Every idempotency key in the batch, looked up in one pass.
@@ -315,7 +373,14 @@ impl<S: Store> Repo<S> {
         let mut seq = head;
         for (e, bytes, id) in fresh {
             seq += 1;
-            self.put_content(&bytes)?;
+            if self.plain_db_events {
+                if !self.has_content(&id)? {
+                    let plain = self.encode_plain(&bytes);
+                    self.materialize(id, &plain, &bytes)?;
+                }
+            } else {
+                self.put_content(&bytes)?;
+            }
             if matches!(e.op, Op::Upsert(ref v) if v.is_empty()) {
                 self.put_content(&[])?;
             }
@@ -339,6 +404,14 @@ impl<S: Store> Repo<S> {
                 bytes.len(),
             );
         }
+        let counts = match db.counts {
+            Some(c) => Some(Counts {
+                root: self.count_edit(db, &c, &changes)?,
+                at: seq,
+                ..c
+            }),
+            None => None,
+        };
         let kv = changes
             .into_iter()
             .map(|(k, a)| {
@@ -352,7 +425,152 @@ impl<S: Store> Repo<S> {
             kv: self.graph_edit_with(&db.kv, kv, Keys::Any)?,
             ids_at: seq,
             kv_at: seq,
+            counts,
         })
+    }
+
+    /// The counts view after `changes`: each key that appears adds one to
+    /// its prefixes and each that goes takes one away, read from the
+    /// chunks of `kv` the changed keys fall in and the counts of their
+    /// prefixes (E233).
+    fn count_edit(&mut self, db: &Db, c: &Counts, changes: &Changes) -> Result<Id, Error> {
+        let keys: BTreeSet<String> = changes.keys().cloned().collect();
+        let before: BTreeSet<String> = self
+            .graph_nodes_in(&db.kv, &keys)?
+            .into_iter()
+            .map(|n| n.label)
+            .collect();
+        let mut delta: BTreeMap<String, i64> = BTreeMap::new();
+        for (k, a) in changes {
+            let d = match (before.contains(k), a.is_some()) {
+                (false, true) => 1,
+                (true, false) => -1,
+                _ => continue,
+            };
+            for p in count_prefixes(k, c.depth) {
+                *delta.entry(p.to_string()).or_default() += d;
+            }
+        }
+        delta.retain(|_, d| *d != 0);
+        if delta.is_empty() {
+            return Ok(c.root);
+        }
+        let labels = delta.keys().cloned().collect();
+        let mut now: BTreeMap<String, i64> = BTreeMap::new();
+        for n in self.graph_nodes_in(&c.root, &labels)? {
+            now.insert(n.label.clone(), self.count_value(&n)? as i64);
+        }
+        let mut edits = BTreeMap::new();
+        for (p, d) in delta {
+            let n = now.get(&p).copied().unwrap_or(0) + d;
+            let node = match n {
+                0 => None,
+                n if n > 0 => Some(self.count_node(&p, n as u64)?),
+                _ => return Err(Error::Decode("db counts below zero")),
+            };
+            edits.insert(p, node);
+        }
+        self.graph_edit_with(&c.root, edits, Keys::Any)
+    }
+
+    fn count_node(&mut self, prefix: &str, n: u64) -> Result<Node, Error> {
+        let id = self.put_content(n.to_string().as_bytes())?.id;
+        Ok(target_node(
+            prefix,
+            Target::Content(Arg::Whole(id)),
+            Vec::new(),
+        ))
+    }
+
+    fn count_value(&self, n: &Node) -> Result<u64, Error> {
+        let Target::Content(Arg::Whole(id)) = n.target else {
+            return Err(Error::Decode("db counts"));
+        };
+        String::from_utf8(self.read_content(&id)?)
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .ok_or(Error::Decode("db counts"))
+    }
+
+    /// The counts view of `kv` from scratch, the reference the view kept by
+    /// appends must equal: every key's prefixes of up to `depth` segments,
+    /// read from the labels alone.
+    pub fn db_counts_rebuild(&mut self, kv: &Id, depth: u32) -> Result<Id, Error> {
+        let mut counts: BTreeMap<String, u64> = BTreeMap::new();
+        for n in self.graph_nodes(kv)? {
+            for p in count_prefixes(&n.label, depth) {
+                *counts.entry(p.to_string()).or_default() += 1;
+            }
+        }
+        let mut nodes = Vec::with_capacity(counts.len());
+        for (p, n) in counts {
+            nodes.push(self.count_node(&p, n)?);
+        }
+        self.put_graph_with(nodes, Keys::Any)
+    }
+
+    /// `db` keeping counts of up to `depth` segments from now on (E233):
+    /// builds the view from `kv` when it has none or another depth; the
+    /// next commit records it. `depth` 0 drops the view.
+    pub fn db_keep_counts(&mut self, db: &Db, depth: u32) -> Result<Db, Error> {
+        if depth == 0 {
+            return Ok(Db {
+                counts: None,
+                ..*db
+            });
+        }
+        if db.counts.is_some_and(|c| c.depth == depth) {
+            return Ok(*db);
+        }
+        if db.kv_at != self.db_head(&db.log)? {
+            return Err(Error::Decode("db views are behind the log"));
+        }
+        let root = self.db_counts_rebuild(&db.kv, depth)?;
+        Ok(Db {
+            counts: Some(Counts {
+                root,
+                depth,
+                at: db.kv_at,
+            }),
+            ..*db
+        })
+    }
+
+    /// How many keys start with `prefix`: one node of the kept counts when
+    /// the view is current and keeps this prefix (E233), else `db_count`
+    /// over the prefix's span.
+    pub fn db_count_prefix(&self, db: &Db, prefix: &str) -> Result<usize, Error> {
+        Ok(self.db_count_prefixes(db, &[prefix])?[0])
+    }
+
+    /// `db_count_prefix` for each prefix, in order; the kept ones read in
+    /// one pass over the chunks of the counts view they fall in.
+    pub fn db_count_prefixes(&self, db: &Db, prefixes: &[&str]) -> Result<Vec<usize>, Error> {
+        let kept = |p: &str| {
+            db.counts
+                .filter(|c| c.at == db.kv_at && kept_prefix(p, c.depth))
+        };
+        let mut found: BTreeMap<String, usize> = BTreeMap::new();
+        if let Some(c) = db.counts {
+            let labels: BTreeSet<String> = prefixes
+                .iter()
+                .filter(|p| kept(p).is_some())
+                .map(|p| p.to_string())
+                .collect();
+            for n in self.graph_nodes_in(&c.root, &labels)? {
+                found.insert(n.label.clone(), self.count_value(&n)? as usize);
+            }
+        }
+        prefixes
+            .iter()
+            .map(|p| match kept(p) {
+                Some(_) => Ok(found.get(*p).copied().unwrap_or(0)),
+                None => {
+                    let end = prefix_end(p);
+                    self.db_count(db, p, end.as_deref())
+                }
+            })
+            .collect()
     }
 
     /// The log's events in order, read back from the store.
@@ -394,6 +612,60 @@ impl<S: Store> Repo<S> {
         Ok(out)
     }
 
+    /// Keys from `start` (inclusive) to `end` (exclusive; `None`: to the
+    /// last key) with their values, in key order or, with `reverse`, from
+    /// the last; at most `limit` (E229). Reads only the chunks the range
+    /// falls in, and each event once, however many keys it wrote.
+    pub fn db_range(
+        &self,
+        db: &Db,
+        start: &str,
+        end: Option<&str>,
+        limit: usize,
+        reverse: bool,
+    ) -> Result<Vec<(String, Vec<u8>)>, Error> {
+        let nodes = self.graph_range(&db.kv, start, end, limit, reverse)?;
+        let mut events: BTreeMap<Id, Vec<u8>> = BTreeMap::new();
+        let mut out = Vec::with_capacity(nodes.len());
+        for n in nodes {
+            let value = match n.target {
+                Target::Content(Arg::Range { id, start, len }) => {
+                    if let std::collections::btree_map::Entry::Vacant(e) = events.entry(id) {
+                        e.insert(self.read_content(&id)?);
+                    }
+                    crate::repo::select(&events[&id], start, len)
+                        .ok_or(Error::Corrupt(id))?
+                        .to_vec()
+                }
+                Target::Content(Arg::Whole(id)) => self.read_content(&id)?,
+                _ => return Err(Error::Decode("db kv")),
+            };
+            out.push((n.label, value));
+        }
+        Ok(out)
+    }
+
+    /// How many keys fall from `start` to `end` (as in `db_range`), reading
+    /// the chunks the range falls in and no values.
+    pub fn db_count(&self, db: &Db, start: &str, end: Option<&str>) -> Result<usize, Error> {
+        Ok(self
+            .graph_range(&db.kv, start, end, usize::MAX, false)?
+            .len())
+    }
+
+    /// Keys under `prefix` (every key starting with it) with their values;
+    /// `db_range` over the prefix's span.
+    pub fn db_prefix(
+        &self,
+        db: &Db,
+        prefix: &str,
+        limit: usize,
+        reverse: bool,
+    ) -> Result<Vec<(String, Vec<u8>)>, Error> {
+        let end = prefix_end(prefix);
+        self.db_range(db, prefix, end.as_deref(), limit, reverse)
+    }
+
     /// Fold a log from scratch with `put_graph`, the reference the views
     /// maintained in place must equal byte for byte.
     pub fn db_rebuild(&mut self, log: &Id) -> Result<Db, Error> {
@@ -404,6 +676,7 @@ impl<S: Store> Repo<S> {
             kv: empty,
             ids_at: 0,
             kv_at: 0,
+            counts: None,
         };
         let (mut log_nodes, mut ids, mut changes) = (Vec::new(), Vec::new(), Changes::new());
         let mut seen = BTreeMap::new();
@@ -438,6 +711,7 @@ impl<S: Store> Repo<S> {
             kv: self.put_graph_with(kv, Keys::Any)?,
             ids_at: seq,
             kv_at: seq,
+            counts: None,
         };
         if rebuilt.log != *log {
             return Err(Error::Decode("db log is not canonical"));
@@ -469,12 +743,13 @@ impl<S: Store> Repo<S> {
             })
         };
         let (ids_at, kv_at) = (at(self, "ids.at", db.ids_at)?, at(self, "kv.at", db.kv_at)?);
-        let views = self.put(&Object::tree(vec![
-            graph("ids", db.ids),
-            graph("kv", db.kv),
-            ids_at,
-            kv_at,
-        ])?)?;
+        let mut views = vec![graph("ids", db.ids), graph("kv", db.kv), ids_at, kv_at];
+        if let Some(c) = db.counts {
+            views.push(graph("counts", c.root));
+            views.push(at(self, "counts.at", c.at)?);
+            views.push(at(self, "counts.depth", c.depth as u64)?);
+        }
+        let views = self.put(&Object::tree(views)?)?;
         let views = TreeEntry {
             name: "views".into(),
             kind: Kind::Tree,

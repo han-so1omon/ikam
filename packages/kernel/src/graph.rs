@@ -237,6 +237,77 @@ impl<S: Store> Repo<S> {
         }
     }
 
+    /// Nodes with `start <= label < end` (no `end`: to the last label), in
+    /// label order or, with `reverse`, from the last; at most `limit`. Reads
+    /// only the chunks that can hold such a label, and stops once it has
+    /// `limit`, so a page of a long range costs one path plus its leaves.
+    pub fn graph_range(
+        &self,
+        root: &Id,
+        start: &str,
+        end: Option<&str>,
+        limit: usize,
+        reverse: bool,
+    ) -> Result<Vec<Node>, Error> {
+        let mut out = Vec::new();
+        if limit > 0 && end.is_none_or(|e| start < e) {
+            self.collect_range(root, start, end, limit, reverse, &mut out)?;
+        }
+        Ok(out)
+    }
+
+    fn collect_range(
+        &self,
+        id: &Id,
+        start: &str,
+        end: Option<&str>,
+        limit: usize,
+        reverse: bool,
+        out: &mut Vec<Node>,
+    ) -> Result<(), Error> {
+        let inside = |l: &str| l >= start && end.is_none_or(|e| l < e);
+        match self.graph_chunk(id)? {
+            Graph::Nodes(nodes) => {
+                let take = limit - out.len();
+                if reverse {
+                    out.extend(
+                        nodes
+                            .into_iter()
+                            .rev()
+                            .filter(|n| inside(&n.label))
+                            .take(take),
+                    );
+                } else {
+                    out.extend(nodes.into_iter().filter(|n| inside(&n.label)).take(take));
+                }
+            }
+            Graph::Children(_, children) => {
+                // Child i holds labels from its first (the first child: from
+                // the start) up to the next child's first.
+                let mut picked = Vec::new();
+                for (i, (first, child)) in children.iter().enumerate() {
+                    let low_ok = end.is_none_or(|e| i == 0 || first.as_str() < e);
+                    let high_ok = children
+                        .get(i + 1)
+                        .is_none_or(|(next, _)| next.as_str() > start);
+                    if low_ok && high_ok {
+                        picked.push(*child);
+                    }
+                }
+                if reverse {
+                    picked.reverse();
+                }
+                for child in picked {
+                    if out.len() >= limit {
+                        break;
+                    }
+                    self.collect_range(&child, start, end, limit, reverse, out)?;
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Nodes whose labels start with `prefix`, in label order, reading only
     /// the chunks that can hold them.
     pub fn graph_prefix(&self, root: &Id, prefix: &str) -> Result<Vec<Node>, Error> {
