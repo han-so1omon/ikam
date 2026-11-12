@@ -3457,3 +3457,30 @@ Gates on the branch: every kernel test suite passes (release); clippy `-D warnin
 - Trade-off: a second store to keep, and its own durability. The ikam log stays the record, and the view can always be rebuilt from it in about 0.3 s at 50,000 rows.
 - Verdict: **measured.** Kept from the log with its state in the commit payload, Tantivy matches or beats E247's segments for updates and is far faster for queries of several words. Its catch-up cost is mostly ikam's diff, which E249 addresses.
 - Run: `cargo run --release --features search-tantivy --example search_tantivy_view -- 50000 10 100 1000`.
+
+### E249 pruned-diff (graph_diff skips the subtrees both graphs share)
+- Branch / parent: exp/249-pruned-diff / exp/248-tantivy-view
+- Question: a profile of E248's catch-up at 10 documents put 80% of it in `graph_diff`. `graph_diff` lists every leaf of both graphs, reading every inner chunk of both, before comparing leaf ids, so every incremental view pays for the size of the table it reads. In a content-addressed graph, subtrees both sides share have the same id. Does skipping them make small diffs cheap? (A profile finding, not a paper's.)
+- Change: `Repo::prune_diff`, off by default. With it, `graph_diff` walks both graphs a level at a time and drops a chunk id found on both frontiers from each. Labels are unique in a graph, so a shared subtree holds the same nodes on both sides and no change. Leaves the walk reaches are compared as before. `tests/prune_diff.rs` checks it against a full diff over 40 random batches (1 to 1,000 changes, removes, subtree removes) and many state pairs. The search harnesses gain `_pruned` ways.
+- Result: E247's and E248's harnesses unchanged apart from those ways, on E244's 50,000 documents. Median of 5, an Apple M3 Pro laptop, through OpenResearch's local backend. Every way's answers are unchanged, and every merged base equals a fresh build.
+  | Update of | 10 documents | 100 | 1,000 |
+  |---|---|---|---|
+  | E244 view | 103.0 ms | 504.6 ms | 1101.5 ms |
+  | E244 view + `prune_diff` | 76.5 ms | 477.5 ms | 1078.9 ms |
+  | E247 segments | 28.0 ms | 51.0 ms | 153.5 ms |
+  | E247 segments + `prune_diff` | 3.1 ms | 28.0 ms | 148.4 ms |
+  | E248 Tantivy view, in RAM | 27.6 ms | 36.7 ms | 72.2 ms |
+  | E248 Tantivy view, in RAM + `prune_diff` | 2.4 ms | 13.2 ms | 67.6 ms |
+  | E248 Tantivy view, on disk | 99.1 ms | 126.6 ms | 184.0 ms |
+  | E248 Tantivy view, on disk + `prune_diff` | 69.0 ms | 97.1 ms | 183.9 ms |
+  | Tantivy fed directly, in RAM | 0.9 ms | 1.7 ms | 7.1 ms |
+  | Tantivy fed directly, on disk | 70.3 ms | 104.6 ms | 124.6 ms |
+
+  - E247's segments with `prune_diff` update 10 documents with 248 reads instead of 3,798, and 100 documents with 1,967 instead of 5,267.
+  - At 10 documents the segments are now 33 times faster than E244's view, 3.4 times slower than Tantivy in RAM, and 23 times faster than Tantivy's synced commit.
+  - At 1,000 documents the diff is a small part of an update, and the gain is 0 to 6%.
+  - Query times are unchanged.
+- Not measured: durable stores; graphs deeper than these (a single 50,000-row table).
+- Trade-off: none found. The diff reads fewer objects and gives the same changes.
+- Verdict: **kept (option off).** Every incremental view (joins: E250; the word index; Tantivy kept from the log) pays for its table's size on each small update without it. With it, small updates cost in proportion to what changed.
+- Run: `cargo run --release --features search-tantivy --example search_segments -- 50000 0.1 10 100 1000` and `cargo run --release --features search-tantivy --example search_tantivy_view -- 50000 10 100 1000`.
