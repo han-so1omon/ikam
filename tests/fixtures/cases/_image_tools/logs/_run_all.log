@@ -638,10 +638,10 @@ TOTAL expected=64 present=64 missing=0
 [61/73] submitted diagrams-012 -> f700f144-f912-4e58-8717-269b2df6d45a (assets/images/diagrams/diagrams-012.png)
 [62/73] submitted diagrams-013 -> bb9c3f8a-1258-45c5-be31-93cf34048878 (assets/images/diagrams/diagrams-013.png)
 Traceback (most recent call last):
-  File "/path/to/ingenierias-lentas/narraciones-de-economicos/tests/fixtures/cases/_image_tools/run_images_comfy.py", line 188, in <module>
+  File "<narraciones-de-economicos>/tests/fixtures/cases/_image_tools/run_images_comfy.py", line 188, in <module>
     main()
     ~~~~^^
-  File "/path/to/ingenierias-lentas/narraciones-de-economicos/tests/fixtures/cases/_image_tools/run_images_comfy.py", line 174, in main
+  File "<narraciones-de-economicos>/tests/fixtures/cases/_image_tools/run_images_comfy.py", line 174, in main
     wait_for_prompt(
     ~~~~~~~~~~~~~~~^
         comfy_url,
@@ -651,9 +651,9 @@ Traceback (most recent call last):
         ^^^^^^^^^^^^^^^^^^^^^
     )
     ^
-  File "/path/to/ingenierias-lentas/narraciones-de-economicos/tests/fixtures/cases/_image_tools/run_images_comfy.py", line 43, in wait_for_prompt
+  File "<narraciones-de-economicos>/tests/fixtures/cases/_image_tools/run_images_comfy.py", line 43, in wait_for_prompt
     h = comfy_get_json(comfy_url, f"/history/{prompt_id}")
-  File "/path/to/ingenierias-lentas/narraciones-de-economicos/tests/fixtures/cases/_image_tools/run_images_comfy.py", line 30, in comfy_get_json
+  File "<narraciones-de-economicos>/tests/fixtures/cases/_image_tools/run_images_comfy.py", line 30, in comfy_get_json
     with urllib.request.urlopen(comfy_url + path, timeout=timeout) as resp:
          ~~~~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
   File "/opt/homebrew/Cellar/python@3.14/3.14.2_1/Frameworks/Python.framework/Versions/3.14/lib/python3.14/urllib/request.py", line 187, in urlopen

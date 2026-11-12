@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-ROOT="/path/to/ingenierias-lentas/narraciones-de-economicos/tests/fixtures/cases"
+ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+export ROOT
 TOOLS="$ROOT/_image_tools"
 LOGDIR="$TOOLS/logs"
 
@@ -10,8 +11,9 @@ mkdir -p "$LOGDIR"
 # Build list: (count case)
 CASE_LIST_FILE="$LOGDIR/_case_list.txt"
 python3 - <<'PY' > "$CASE_LIST_FILE"
+import os
 from pathlib import Path
-root=Path('/path/to/ingenierias-lentas/narraciones-de-economicos/tests/fixtures/cases')
+root=Path(os.environ['ROOT'])
 rows=[]
 for case_dir in sorted([p for p in root.iterdir() if p.is_dir() and not p.name.startswith('_')]):
     pp=case_dir/'assets/images/prompts.jsonl'

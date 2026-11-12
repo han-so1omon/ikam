@@ -2,12 +2,11 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import shutil
 from pathlib import Path
 
-DEFAULT_COMFY_OUTPUT_DIR = Path(
-    "/path/to/ingenierias-lentas/narraciones-de-economicos/tools/ComfyUI/output"
-)
+DEFAULT_COMFY_OUTPUT_DIR = Path(os.environ.get("COMFYUI_DIR", "tools/ComfyUI")) / "output"
 
 
 def main():

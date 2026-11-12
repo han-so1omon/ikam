@@ -7,7 +7,7 @@ import urllib.request
 from pathlib import Path
 
 CASE_DIR = Path(__file__).resolve().parent
-WORKFLOW_PATH = Path("/path/to/ingenierias-lentas/narraciones-de-economicos/tools/ComfyUI/workflows/sdxl_basic_api.json")
+WORKFLOW_PATH = Path(os.environ.get("COMFYUI_DIR", "tools/ComfyUI")) / "workflows/sdxl_basic_api.json"
 PROMPTS_PATH = CASE_DIR / "assets/images/prompts.jsonl"
 COMFY_URL = os.environ.get("COMFY_URL", "http://127.0.0.1:8188")
 

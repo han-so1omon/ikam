@@ -7,8 +7,8 @@ import urllib.request
 from pathlib import Path
 
 CASE_DIR = Path(__file__).resolve().parent
-COMFY_DIR = Path("/path/to/ingenierias-lentas/narraciones-de-economicos/tools/ComfyUI")
-WORKFLOW_PATH = Path("/path/to/ingenierias-lentas/narraciones-de-economicos/tools/ComfyUI/workflows/sdxl_basic_api.json")
+COMFY_DIR = Path(os.environ.get("COMFYUI_DIR", "tools/ComfyUI"))
+WORKFLOW_PATH = COMFY_DIR / "workflows/sdxl_basic_api.json"
 PROMPTS_PATH = CASE_DIR / "assets/images/prompts.jsonl"
 OUT_ROOT = CASE_DIR  # we'll post filename_prefix rooted in outputs; then move if needed
 

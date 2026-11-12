@@ -8,9 +8,7 @@ import urllib.request
 from pathlib import Path
 
 # Defaults match the rest of this repo
-DEFAULT_COMFY_DIR = Path(
-    "/path/to/ingenierias-lentas/narraciones-de-economicos/tools/ComfyUI"
-)
+DEFAULT_COMFY_DIR = Path(os.environ.get("COMFYUI_DIR", "tools/ComfyUI"))
 DEFAULT_WORKFLOW_PATH = DEFAULT_COMFY_DIR / "workflows/sdxl_basic_api.json"
 
 

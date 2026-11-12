@@ -8,14 +8,14 @@ Use the repo's ComfyUI run script (recommended) and keep it running.
 If you hit BrokenPipe issues, run with nohup + log redirect:
 
 ```bash
-cd /path/to/ingenierias-lentas/narraciones-de-economicos/tools/ComfyUI
+cd "$COMFYUI_DIR"   # your ComfyUI checkout
 nohup python main.py --listen 127.0.0.1 --port 8188 --disable-all-custom-nodes > comfy.log 2>&1 &
 ```
 
 ## 2) Generate images for a case (resumable)
 
 ```bash
-cd /path/to/ingenierias-lentas/narraciones-de-economicos/tests/fixtures/cases
+cd tests/fixtures/cases
 python3 _image_tools/run_images_comfy.py --case-dir ./xl-manufacturing-v01
 ```
 

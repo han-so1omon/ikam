@@ -1,9 +1,9 @@
 #!/bin/bash
-# The bake-off measurements that need macOS (E122 to E152), for example-host.
+# The bake-off measurements that need macOS (E122 to E152), for a Mac.
 #
 # Safe by design: it runs as you, writes only under $ROOT, needs no sudo,
-# loads no LaunchAgent, opens no port, and leaves /path/to/ikam,
-# ikam-live and ikam-test alone (the repository is cloned, not changed).
+# loads no LaunchAgent, opens no port, and leaves the repository and
+# any running ikam service alone (the repository is cloned, not changed).
 # Delete $ROOT afterwards to undo everything.
 #
 #   bash mac-bakeoff.sh            # every step
@@ -17,8 +17,8 @@
 # Results: $ROOT/results/*.jsonl and $ROOT/results/summary.txt.
 set -euo pipefail
 
-ROOT=${ROOT:-/path/to/ikam-bakeoff}
-SRC=${SRC:-/path/to/ikam}         # cloned from, never changed
+SRC=${SRC:-$(cd "$(dirname "$0")/../../.." && pwd)}  # this repository; cloned from, never changed
+ROOT=${ROOT:-$(dirname "$SRC")/ikam-bakeoff}         # next to the repository
 BRANCH=${BRANCH:-exp/152-held-index}
 KILLS=${KILLS:-50}                       # crash runs per backend
 OBJECTS=${OBJECTS:-"100000 1000000"}     # store sizes for the APFS step
