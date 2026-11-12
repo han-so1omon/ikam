@@ -3499,3 +3499,40 @@ Gates on the branch (E229 to E233): every kernel test suite passes (release); cl
 - Trade-off: an incremental view's roots depend on its update history, so two stores with the same rows can hold different roots for it; rows, not roots, are the comparison.
 - Verdict: **kept** as an option (opt-in API). Incremental updates are 100 to 400 times faster than rebuilding at 100,000 rows, and a stored view reads about 1,000 times faster than one computed on read.
 - Run: `cargo run --release --example view_graph -- 100000 10 100 1000` (`TEMPLATES=1` keeps object templates on).
+
+### E252 fast-fields (Tantivy's fast-field codecs in column blocks)
+- Branch / parent: exp/252-fast-fields / main 6986d6e (numbered after E251, on the search line)
+- Question: E241's column blocks store an integer column as zigzag deltas in varints, compressed by zstd 19, so reading one value decodes its whole column. Tantivy's fast fields store numbers as bitpacked values (min and gcd) or blockwise-linear residuals, picking the smaller, and read any value in constant time. Notes: docs/research/search-engines.md. What does each cost in bytes, scans and point reads, on E241's rows?
+- Change: `ColOpts::fast_numbers`, off by default; blocks written without it are unchanged.
+  - Integer and decimal columns are written in two codecs, and the smaller wins, as Tantivy's estimators pick:
+    - bitpacked: the minimum and gcd, then `(v - min) / gcd` at the needed width;
+    - blockwise linear: blocks of 512, each a line (first value and slope) plus bitpacked residuals over their minimum, behind a 29-byte header a block.
+  - `ColOpts::compress_fast` adds zstd 19 over them. Without it a column is stored as is, flagged in its kind byte.
+  - `colblock::value` reads one value (in constant time from a column stored as is). `colblock::ints` reads a numeric column as integers.
+  - Tests: values at every shape (regular and jittered times, small counts, decimals, the i64 extremes) across the 512 boundary round-trip under every option, and `value` and `ints` agree with the decoded column.
+- Result:
+  - Setup: `examples/fast_fields.rs`, E241's generated rows `time,id,reading,count,status`, in blocks of 65,536 rows. Bytes are block bytes; a column's bytes are the block's less the block with that column emptied.
+  - Times: summing `reading` over every block, and 10,000 reads of one `count` value at random rows.
+  - Machine: an Apple M3 Pro laptop, through OpenResearch's local backend. Every way's rows equal the originals.
+
+  | Rows | Way | Bytes a row | time / reading / count | Encode | Sum `reading` | One `count` value |
+  |---|---|---|---|---|---|---|
+  | 100,000 | E241 (zigzag deltas, zstd 19) | 3.64 | 0.000 / 0.806 / 1.871 | 129 ms | 0.38 ms | 1,722.6 µs |
+  | 100,000 | Fast codecs, stored as is | 3.95 | 0.056 / 1.308 / 1.625 | 114 ms | 0.59 ms | 0.2 µs |
+  | 100,000 | Fast codecs, then zstd 19 | 3.86 | 0.004 / 1.266 / 1.625 | 124 ms | 0.62 ms | 1,816.7 µs |
+  | 1,000,000 | E241 (zigzag deltas, zstd 19) | 3.63 | 0.000 / 0.806 / 1.871 | 1,254 ms | 3.28 ms | 2,024.9 µs |
+  | 1,000,000 | Fast codecs, stored as is | 3.95 | 0.056 / 1.308 / 1.625 | 1,161 ms | 5.87 ms | 0.2 µs |
+  | 1,000,000 | Fast codecs, then zstd 19 | 3.85 | 0.004 / 1.266 / 1.625 | 1,298 ms | 6.27 ms | 2,140.5 µs |
+
+  - `time` (one row a minute) is a line, so it is free in either codec family: blockwise linear stores only its headers, and E241's deltas are all equal before zstd.
+  - `count` (uniform below 5,000) is 13 bits bitpacked, 1.63 bytes against E241's 1.87.
+  - `reading` (a sawtooth with noise) is 1.31 bytes against 0.81, where zstd over equal-ish deltas wins.
+- Not measured: columns read through the store (a block is one content, so a point read through `Repo` still decodes the content first); real tables; the codec choice per column against E241's encoding.
+- Trade-off:
+  - Fast codecs cost 6 to 9% more bytes on these rows, and summing a column is 1.6 to 1.9 times slower (each value is unpacked on its own).
+  - A single value reads 8,600 to 10,000 times faster when stored as is; zstd over the fast codecs gives that back.
+- Verdict: **kept (option off).**
+  - For columns read a value at a time, such as a view's lookup by row, a fast column stored as is answers in 0.2 µs against about 2 ms.
+  - For scans, E241's encoding stays smaller and faster.
+  - The next step is Tantivy's own rule, applied across both families: estimate every codec, E241's included, and keep the smallest, unless point reads are wanted.
+- Run: `cargo run --release --example fast_fields -- 100000 1000000`.
