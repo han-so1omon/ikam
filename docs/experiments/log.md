@@ -3368,3 +3368,62 @@ Gates on the branch: every kernel test suite passes (release); clippy `-D warnin
 - Trade-off: an update reads in proportion to the join rows its changes reach; a change on the one-row-per-group side reaches every row of its group, so at a batch of 1,000 here the update reads most of what a recompute reads and takes twice as long.
 - Verdict: **measured**. Updating beats recomputing about 8 times for 10 changes and 1.7 times for 100, and loses at 1,000. Sharing the index adds little here, because the store already keeps one copy of identical indexes. Not recommended to merge as is; a version that recomputes when a batch reaches more than a set share of join keys would be the next step.
 - Run: `cargo run --release --example shared_joins -- 20000 1000 10 100 1000` (`TEMPLATES=1` keeps object templates on).
+
+### E245 join-options (where a join update's time goes, and options for it)
+- Branch / parent: exp/245-join-options / exp/243-shared-joins c3b2914 (numbered after E240 to E244, which are on their own branches)
+- Question: E243's joins beat recomputing at 10 changes but lost at 1,000, and its 100,000-row run never finished. Where does an update's time go at large batches? What made 100,000 rows slow? Does switching to a recompute above a share of touched join keys keep the small-batch win? Notes: docs/research/incremental-views.md.
+- Reproduced first: E243's benchmark unchanged, on this Mac, gives exactly E243's reads.
+  - Reads at 10, 100 and 1,000 changes: 1,907, 7,940 and 36,837.
+  - Times: 18, 88 and 292 ms, against 172 to 176 ms recomputed.
+  - So on this Mac updating wins 9.5 times at 10 changes and 2 times at 100, and loses 1.7 times at 1,000.
+- Found by profiling with macOS `sample`:
+  - The 100,000-row stall is in the harness, not the update. `join_rows` reads each row with a fresh cache, and a join's values are one shared content, so each row decodes and hashes the whole content. The cost grows with rows times content size.
+  - At 1,000 changes about 65% of an update is graph edits writing new chunks. Most of that is the write planner's slice search, which decodes and checks older chunks to store each new one as slices of them.
+  - About 26% is per-key seeks (`at_key`) that decode the same arrangement chunks again for every touched key.
+- Change (all off by default; `joins_update`, `join_recompute` and `join_rows` behave as before):
+  - `JoinOpts` has four fields:
+    - `read_once`: each content is decoded once per call.
+    - `plain_writes`: derived chunks are stored plain, without the slice search, since they can be rebuilt.
+    - `memo`: the repository's read memo is kept for the whole update or recompute.
+    - `recompute_above`: a join is recomputed when a batch touches more than that share of the join keys it had when last computed. `JoinState.keys` records that count.
+  - Entry points: `joins_update_with`, `join_recompute_with` and `join_rows_with`.
+  - Tests (tests/join.rs): over 25 random rounds, with each option alone and the switch at shares 0, 0.5 and 2, every join's rows equal a recompute.
+- Result (`examples/join_switch.rs`):
+  - Setup: E243's tables and change mix, 1,000 groups, median of 5 batches per size, object templates off, each way on its own copy of the store.
+  - Machine: an Apple M3 Pro laptop (macOS). Each run went through OpenResearch (`orx`, local backend), one run at a time.
+  - "Bytes added" counts what the way stored over its build and all 30 batches.
+
+  | 20,000 rows | 10 | 100 | 1,000 | 3,000 | Bytes added |
+  |---|---|---|---|---|---|
+  | Update (E243) | 21 ms | 97 ms | 312 ms | 448 ms | 22.1 MB |
+  | `plain_writes` | 18 ms | 63 ms | 155 ms | 202 ms | 36.9 MB |
+  | `memo` | 17 ms | 70 ms | 193 ms | 246 ms | 22.1 MB |
+  | Both | 15 ms | 60 ms | 133 ms | 165 ms | 36.9 MB |
+  | Both + `recompute_above: 0.4` | 16 ms | 58 ms | 143 ms | 150 ms | 36.9 MB |
+  | Recompute (E243) | 160 ms | 158 ms | 165 ms | 168 ms | 28.0 MB |
+  | Recompute, both + `read_once` | 95 ms | 103 ms | 105 ms | 107 ms | 28.0 MB |
+
+  | 100,000 rows | 10 | 100 | 1,000 | 3,000 | Bytes added |
+  |---|---|---|---|---|---|
+  | Update (E243) | 54 ms | 149 ms | 788 ms | 1,234 ms | 46.9 MB |
+  | `plain_writes` | 48 ms | 113 ms | 457 ms | 675 ms | 99.3 MB |
+  | `memo` | 43 ms | 119 ms | 544 ms | 823 ms | 46.9 MB |
+  | Both | 40 ms | 103 ms | 428 ms | 630 ms | 99.3 MB |
+  | Both + `recompute_above: 0.4` | 41 ms | 104 ms | 661 ms | 733 ms | 106.6 MB |
+  | Recompute (E243) | 866 ms | 871 ms | 900 ms | 895 ms | 109.1 MB |
+  | Recompute, both + `read_once` | 519 ms | 528 ms | 554 ms | 563 ms | 109.1 MB |
+
+  - With `read_once` in the harness, 100,000 rows now run. The whole run, both sizes, took 3.5 minutes.
+  - Every way ends with the same rows.
+  - At 100,000 rows, E243's update beats recomputing up to 1,000 changes.
+  - Shares 0.1 and 0.2 trigger the switch at smaller batches, where it costs more: at 100,000 rows, 527 to 573 ms against 103 to 216 ms updated.
+- Not measured: durable stores, joins of more than two tables, alternating seeks in one ordered pass in place of `memo`.
+- Trade-off:
+  - `plain_writes` adds 1.7 to 2.1 times the bytes, because updated chunks are no longer stored as slices of the old ones. `memo` costs no bytes.
+  - The switch must still update the arrangements before it recomputes, so with the other two options on it saves time only at 3,000 changes on 20,000 rows (150 against 165 ms).
+- Verdict: **kept, all options off by default.**
+  - `read_once` fixes the 100,000-row stall.
+  - `memo` alone cuts updates by 19 to 45% at no byte cost; with `plain_writes` the cut is 26 to 63%, at more bytes.
+  - `recompute_above` keeps the small-batch numbers but is not recommended with the other options.
+  - The per-key seeks are the next target (E250 removes the diff's share of small updates).
+- Run: `cargo run --release --example join_switch -- 20000 1000 0.1,0.2,0.4 10 30 100 300 1000 3000`, and again with 100000.
