@@ -3375,3 +3375,58 @@ Gates on the branch: every kernel test suite passes (release); clippy `-D warnin
 - Not measured: real text, ranking (the built-in view only filters), phrase queries, Tantivy's own merge and multi-thread settings, the Mac.
 - Verdict: **measured**; the built-in view is not recommended as the search path. Index bytes are about equal, Tantivy builds about 18 times faster, updates 15 to 90 times faster and answers multi-word queries 6 to 60 times faster. Next, if search is wanted: Tantivy as a derived cache of a database state, rebuilt or caught up from the log, with the database root it was built at recorded beside it.
 - Run: `cargo run --release --features search-tantivy --example search_view -- 50000 10 100 1000`.
+
+### E247 search-segments (the word index kept as segments: base, delta, dead postings)
+- Branch / parent: exp/247-search-segments / exp/244-search-view 9421421 (numbered after E240 to E244, which are on their own branches)
+- Question: E244's word index updated 15 to 90 times slower than Tantivy. Why are its updates slow (segments, merges, per-document cost)? Can a segment and merge design close the gap? Notes: docs/research/incremental-views.md.
+- Reproduced first: E244's benchmark unchanged, on this Mac.
+  - It gives E244's bytes and reads exactly: 3,820,863 index bytes, and 5,626, 24,096 and 69,094 reads for updates of 10, 100 and 1,000 documents.
+  - Times: built-in 98, 496 and 1,086 ms; Tantivy 67, 77 and 111 ms.
+  - The gap here is 1.5 to 10 times, not 15 to 90, because Tantivy's commit syncs to disk and a sync costs much more on this Mac (APFS) than on the cloud machine (E230). The built-in index runs in a memory store and syncs nothing, so E244 compared a durable index with one in memory.
+- Found by profiling with macOS `sample`:
+  - The postings are one graph sorted by word, and each document holds about 25 words spread over the vocabulary. So updating a few documents edits leaves across the whole index; 1,000 documents rewrite most of it.
+  - About half of an update is those leaf writes, through the write planner's slice search. The rest is two key lookups per changed row and the diff.
+  - Tantivy instead writes only the new documents into a new segment and marks the old ones deleted.
+- Change (opt-in; `text_index_*` unchanged):
+  - `Segments { base, delta, dead, moved, counts }`, after Lucene's segments and deletes:
+    - `base` holds the postings as of the last merge, and `delta` the postings of rows changed since.
+    - `dead` holds the base postings those changes made stale, and `moved` the changed rows.
+    - A word's rows are `base - dead + delta`.
+  - `text_segments_update` edits only `delta`, `dead` and `moved`, reading changed rows from the diff's nodes instead of looking each key up twice.
+  - `text_segments_merge` folds them into `base` in one edit. Updates merge on their own when delta and dead postings pass `SegmentOpts.merge_above` of the base (two levels, the simplest form of logarithmic merging).
+  - `SegmentOpts.plain_writes` stores chunks without the slice search.
+  - Tests (tests/textindex.rs): over 30 random rounds, with merges at 5% and 30% and never, every query equals a fresh build's; after a merge the base equals a fresh build.
+- Result (`examples/search_segments.rs`):
+  - Setup: E244's 50,000 generated documents and update batches, median of 5 rounds, MemStore, object templates off.
+  - Tantivy 0.24.2 with one indexing thread, both on disk as E244 ran it and in RAM.
+  - Machine: an Apple M3 Pro laptop, through OpenResearch's local backend.
+  - Every way's answers equal Tantivy's after the updates. A final merge's base equals a fresh build.
+  | Update of | 10 documents | 100 | 1,000 | Bytes after build and updates |
+  |---|---|---|---|---|
+  | Tantivy on disk (each commit synced) | 67.7 ms | 92.0 ms | 121.2 ms | n/a |
+  | Tantivy in RAM | 0.9 ms | 1.6 ms | 6.7 ms | n/a |
+  | E244 view | 103.6 ms | 510.9 ms | 1108.2 ms | 27.4 MB |
+  | E244 view, plain writes | 84.8 ms | 386.1 ms | 780.6 ms | 36.7 MB |
+  | Segments | 28.4 ms | 51.0 ms | 151.2 ms | 10.3 MB |
+  | Segments, plain writes | 28.2 ms | 46.7 ms | 142.8 ms | 10.3 MB |
+
+  | Query (rows) | Tantivy | E244 view | Segments |
+  |---|---|---|---|
+  | `ka` (39,986) | 17.86 ms | 6.21 ms | 7.04 ms |
+  | `mine` (2,379) | 0.98 ms | 0.39 ms | 0.52 ms |
+  | `vevenelo` (25) | 0.01 ms | 0.08 ms | 0.13 ms |
+  | `ne vemi` (1,363) | 0.64 ms | 3.63 ms | 4.26 ms |
+  | `lo zi suri` (162) | 0.13 ms | 6.23 ms | 7.33 ms |
+
+  - Building the index takes 3.3 to 3.9 s for every built-in way. Tantivy builds in 0.14 to 0.18 s.
+  - Merging (with `merge_above` 0.1): the 15 rounds (5,550 document edits) merged once, and a final merge takes 0.6 to 0.9 s. The medians above leave merge rounds out; spread over the edits, a merge adds about 0.16 ms per edited document.
+- Not measured: more than two levels; durable stores for the built-in index (the comparison in RAM is the fair one); real text; ranking and phrases.
+- Trade-off:
+  - Queries are 13 to 62% slower than E244's view (rare words most, relative to their small base time), since each word also reads the delta and dead postings.
+  - Merges are a periodic cost.
+  - `plain_writes` changes little here, since segment edits are small.
+- Verdict: **kept (opt-in).**
+  - Segments make updates 3.6 to 10 times faster than E244's view, with a third of the bytes after the updates.
+  - They update faster than Tantivy's synced commit at 10 and 100 documents.
+  - They are still 22 to 32 times slower than Tantivy in RAM. At 10 documents that floor is the diff (E249), not the segments.
+- Run: `cargo run --release --features search-tantivy --example search_segments -- 50000 0.1 10 100 1000`.
