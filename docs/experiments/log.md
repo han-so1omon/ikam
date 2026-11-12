@@ -3345,3 +3345,33 @@ Gates on the branch: every kernel test suite passes (release); clippy `-D warnin
 - Verdict: **measured**. On APFS deferred sync makes a report copy about 15 times faster (31 to 33 ms to about 2 ms) and a burst of 20 about 10 times faster; the trade-off stays E227's (a crash loses edits made since the last commit, which `ikam live` makes after 1.5 s of quiet; a clean stop on SIGTERM commits first). `--no-object-templates` adds little below thousands of files. Both stay off by default in the code.
 - Follow-up (Nov 12): `--deferred-sync` turned on for one private `ikam live` deployment on that Mac. After the restart the process carries the flag, the server answers, its log is clean, `fsck` ok and no `.pending-*` file is left while idle.
 - Run: `cargo build --release --example commits --bin ikam`, then `commits [--deferred] [--no-object-templates] --every 1|20 2 30 300`.
+
+### E244 search-view (a word index kept as a view of the database, against Tantivy)
+- Branch / parent: exp/244-search-view / main 9c4c708 (numbered E240 to E244 to stay clear of E229 to E232 on other branches)
+- Question: database mode has no word search; the trigram index (E050, src/search.rs) finds substrings of files, not words of rows. Can a word index be kept as one more view of the database (an inverted index stored as a graph, edited from the `kv` diff like the other views), and how does it compare with a dedicated engine, Tantivy (Lucene's design in Rust; from what is known of it, nothing was re-read for this entry), on the same rows?
+- Change (opt-in; nothing indexes text unless a caller asks):
+  - `textindex` (src/textindex.rs): one graph node `word US rowkey` per posting (US is U+001F), so a word's postings are one prefix. Words are split as Tantivy's default tokenizer splits them: runs of alphanumeric characters, lowercased, words of 40 bytes or more dropped. `Repo::text_index_build(db, prefix)`, `Repo::text_index_update(index, old, new, prefix)` (edits only the postings of rows in the `kv` diff), `Repo::text_search(index, query)` (rows holding every word).
+  - Feature `search-tantivy` (tantivy pinned to 0.24.2), used only by `examples/search_view.rs`; the default build does not compile it.
+  - Tests (tests/textindex.rs): word splitting; 30 rounds of random upserts and removes (words with accents, digits, hyphens, case) where the updated index equals a fresh build and every query equals a scan of the rows.
+- Result (`examples/search_view.rs`, 50,000 generated documents of 10 to 40 made-up words, word `r` about as common as 1/r over 20,000 words, MemStore against Tantivy on disk with one indexing thread; a 4-core cloud machine with other runs going, so times are rough). Every query's rows were checked equal between the two, before and after the updates, and the updated built-in index equals a fresh build:
+
+  | | Built-in view | Tantivy |
+  |---|---|---|
+  | Index bytes | 3.82 MB | 3.94 MB (4.51 MB after the updates, before merging segments) |
+  | Build | 6.9 s | 0.38 s |
+  | Common word (39,990 rows) | 30 ms | 52 ms |
+  | Middling word (2,402 rows) | 1.5 ms | 2.6 ms |
+  | Rare word (26 rows) | 0.18 ms | 0.04 ms |
+  | Two words (1,342 rows) | 12 ms | 1.9 ms |
+  | Three words (151 rows) | 21 ms | 0.33 ms |
+  | Update 10 documents | 246 ms (5,626 reads) | 13 ms |
+  | Update 100 documents | 1.4 s (24,096 reads) | 16 ms |
+  | Update 1,000 documents | 3.4 s (69,094 reads) | 196 ms |
+
+  - Tantivy's query time includes reading each hit's key from its document store, which is why one common word is slower there; the built-in answer is the posting labels themselves.
+  - The built-in view is slow where Tantivy is built for it: queries of several words intersect whole posting lists (no skip lists), and an update touches one graph leaf per changed word, so a few documents edit leaves across the whole index.
+  - In a 5,000-document run the shape was the same (build 556 ms against 48 ms, update of 10 documents 163 ms against 11 ms).
+- What the built-in view has that Tantivy lacks: it is versioned with the database (each database state has an index root, two states diff, and an update gives the same root as a rebuild), and it needs no second store.
+- Not measured: real text, ranking (the built-in view only filters), phrase queries, Tantivy's own merge and multi-thread settings, the Mac.
+- Verdict: **measured**; the built-in view is not recommended as the search path. Index bytes are about equal, Tantivy builds about 18 times faster, updates 15 to 90 times faster and answers multi-word queries 6 to 60 times faster. Next, if search is wanted: Tantivy as a derived cache of a database state, rebuilt or caught up from the log, with the database root it was built at recorded beside it.
+- Run: `cargo run --release --features search-tantivy --example search_view -- 50000 10 100 1000`.

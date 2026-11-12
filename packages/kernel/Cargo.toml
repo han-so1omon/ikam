@@ -27,6 +27,10 @@ redb = { version = "4.5.0", optional = true }
 rocksdb = { version = "0.25.0", optional = true, default-features = false, features = ["lz4", "zstd"] }
 rusqlite = { version = "0.41.1", optional = true, features = ["bundled"] }
 
+# E244: Tantivy, for comparing the built-in word index with it. Only the
+# `search_view` example uses it; the default build does not.
+tantivy = { version = "=0.24.2", optional = true }
+
 # E227: one syncfs on Linux, and a plain fsync on Apple systems (where
 # std's sync_all is F_FULLFSYNC), for FsStore::open_deferred.
 [target.'cfg(any(target_os = "linux", target_vendor = "apple"))'.dependencies]
@@ -39,6 +43,7 @@ store-redb = ["dep:redb"]
 store-rocksdb = ["dep:rocksdb"]
 store-sqlite = ["dep:rusqlite"]
 stores = ["store-fjall", "store-lmdb", "store-redb", "store-rocksdb", "store-sqlite"]
+search-tantivy = ["dep:tantivy"]
 
 [dev-dependencies]
 libc = "=0.2.189"
@@ -53,6 +58,10 @@ path = "src/bin/ikam/main.rs"
 # Dependencies (wasmi, zlib, zstd) are far slower unoptimized; tests run them heavily.
 [profile.dev.package."*"]
 opt-level = 2
+
+[[example]]
+name = "search_view"
+required-features = ["search-tantivy"]
 
 [[example]]
 name = "stores"
