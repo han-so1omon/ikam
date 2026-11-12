@@ -3526,3 +3526,38 @@ Gates on the branch: every kernel test suite passes (release); clippy `-D warnin
   - The block base is 2.5 times smaller and builds 5 times faster, merges in about half the time, and updates as fast.
   - It is not yet a better query path. Next: keep results as row ids (E240's ordered row ids would make the doc map the `kv` view itself) and resolve keys only for the rows a caller reads.
 - Run: `cargo run --release --features search-tantivy --example search_segments -- 50000 0.1 10 100 1000`.
+
+### E253 vector-views (vector indexes kept as views: flat int8, IVF, HNSW)
+- Branch / parent: exp/253-vector-views / exp/251-block-postings
+- Question: semantic search needs a vector index. Which of the common indexes can be kept as a view of the ikam log? What do they cost to build, query and update from the `kv` diff, and how well do they recall? Notes: docs/research/search-engines.md (HNSW, IVF, FreshDiskANN, Lance).
+- Change (opt-in module, `vectors.rs`):
+  - An IVF view: spherical k-means centroids stored as a content, and lists as graph nodes `list US row`, each pointing at the row's int8 code (scalar quantization: components times 127) in a packed content.
+  - A search probes the nearest lists, scores their codes, and rescores the best 40 with the exact vectors read from `kv`. One list is a flat int8 scan.
+  - `ivf_update` edits only the rows in the `kv` diff: an insert joins its nearest list, a delete leaves its list. Centroids stay as trained.
+  - HNSW comes from `hnsw_rs` 0.3.5 (feature `vectors-hnsw`, benchmark only), kept in memory and fed the same changes. Its deletes are tombstones filtered during the search, since `hnsw_rs` documents no delete.
+  - Tests: an IVF view probing every list returns exactly the brute-force top rows, and after random batches its lists hold exactly what a build's hold.
+- Result:
+  - Setup: `examples/vector_views.rs`, 50,000 synthetic unit vectors of 64 dimensions (100 clusters: a center plus noise), 200 queries from the same distribution, recall@10 against exact search.
+  - Updates: batches of 70% new vectors for existing rows, 15% new rows and 15% removes, 5 of each size, with E249's `prune_diff` on.
+  - Machine: an Apple M3 Pro laptop, through OpenResearch's local backend.
+
+  | Way | Build | Stored | Query | Recall@10 | Update 10 / 100 / 1,000 | Recall after |
+  |---|---|---|---|---|---|---|
+  | Exact (every row read from ikam) | | | 1,661 ms | 1.000 | | |
+  | Flat int8 (one list), best 40 rescored | 0.61 s | 2.66 MB | 20.59 ms | 1.000 | 3.2 / 24.1 / 163.4 ms | 1.000 |
+  | IVF, 223 lists, 8 probed | 1.12 s | 2.94 MB | 5.86 ms | 0.735 | 5.0 / 40.3 / 213.1 ms | 0.723 |
+  | IVF, 223 lists, 32 probed | 1.13 s | 2.94 MB | 8.39 ms | 0.895 | 5.0 / 40.3 / 211.9 ms | 0.890 |
+  | HNSW (hnsw_rs, M 16, ef 100/64) | 18.78 s | in memory | 0.90 ms | 0.951 | 4.2 / 41.7 / 427.4 ms | 0.944 |
+
+  - k-means over 5,000 sampled vectors (223 centroids, 8 rounds) took 0.50 s.
+  - After the 5,550 changes, HNSW held 4,681 tombstones among 54,725 points.
+  - Recall held after the updates in every way, since the changes come from the training distribution.
+- Not measured: drift (new vectors away from the centroids), consolidating HNSW's tombstones, HNSW stored as a view, other dimensions, a real embedding model.
+- Trade-off:
+  - HNSW recalls best per millisecond but builds 17 to 31 times slower than the IVF views, is held outside the store, and only marks deletes.
+  - IVF stays in the store and updates like any view, but needs many probes for high recall.
+  - Flat int8 with rescoring is exact here at 20 ms a query, and is the simplest view to keep.
+- Verdict: **measured; the IVF view is kept (opt-in).**
+  - For ikam's log-fed views the flat int8 view is the safe default up to tens of thousands of rows.
+  - IVF trades recall for speed, and HNSW is the fast path, needing a consolidation policy (FreshDiskANN) before it is a view.
+- Run: `cargo run --release --features vectors-hnsw --example vector_views -- 50000 64 10 100 1000`.
