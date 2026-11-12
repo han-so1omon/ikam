@@ -3345,3 +3345,26 @@ Gates on the branch: every kernel test suite passes (release); clippy `-D warnin
 - Verdict: **measured**. On APFS deferred sync makes a report copy about 15 times faster (31 to 33 ms to about 2 ms) and a burst of 20 about 10 times faster; the trade-off stays E227's (a crash loses edits made since the last commit, which `ikam live` makes after 1.5 s of quiet; a clean stop on SIGTERM commits first). `--no-object-templates` adds little below thousands of files. Both stay off by default in the code.
 - Follow-up (Nov 12): `--deferred-sync` turned on for one private `ikam live` deployment on that Mac. After the restart the process carries the flag, the server answers, its log is clean, `fsck` ok and no `.pending-*` file is left while idle.
 - Run: `cargo build --release --example commits --bin ikam`, then `commits [--deferred] [--no-object-templates] --every 1|20 2 30 300`.
+
+### E243 shared-joins (joins kept up to date from shared indexes, after Differential Dataflow's arrangements)
+- Branch / parent: exp/243-shared-joins / main 9c4c708 (numbered E240 to E244 to stay clear of E229 to E232 on other branches)
+- Question: can two joins over one large table be kept up to date from a batch of changes, without recomputing them, by indexing the table by its join key once and sharing that index between the joins, as Differential Dataflow shares an arrangement between operators (from what is known of it; nothing was re-read for this entry)? What does sharing save over one index per join, and where does updating stop beating recomputing?
+- Change (opt-in; nothing arranges or joins unless a caller asks):
+  - `join` (src/join.rs): `Arrangement { name, table, key }` indexes a table of the database's `kv` view as a graph with one node `joinkey US rowkey` per row, pointing at the row's own bytes (no value is copied). `Join { name, left, right, combine }` keeps one node `joinkey US left US right` per matching pair. `Repo::joins_build`, `Repo::joins_update` (reads the `kv` diff, updates each arrangement once, then each join only at the join keys the changes touched, pairing a changed row with the other side's rows there), `Repo::join_rows`, and `Repo::join_recompute`, the reference.
+  - Tests (tests/join.rs): 40 random batches on three tables with three joins sharing two arrangements, one of them many-to-many; after every batch each join's rows equal a recompute and the arrangements equal a fresh build. The example checks separate arrangements the same way.
+- Result (`examples/shared_joins.rs`: table `a` of generated rows in 1,000 groups, tables `b` and `c` with one row per group, joins `a` with `b` and `a` with `c` on the group; batches of 80% changes to `a` and 10% each to `b` and `c`, where a change to `b` or `c` reaches every `a` row in its group; median of 5 batches; object templates off for derived data, E228's option; a 4-core cloud machine with other runs going, so times are rough). At 20,000 rows:
+
+  | Batch | Shared index | One index per join | Recompute both joins |
+  |---|---|---|---|
+  | 10 | 46 ms (1,907 reads) | 45 ms (1,959 reads) | 372 ms (50,262 reads) |
+  | 100 | 212 ms (7,940 reads) | 245 ms (8,339 reads) | 352 ms (50,449 reads) |
+  | 1,000 | 862 ms (36,837 reads) | 830 ms (37,886 reads) | 395 ms (50,395 reads) |
+
+  - Building the indexes and both joins takes 0.6 s at 20,000 rows and 2.9 s at 100,000.
+  - The two per-join indexes of `a` are the same graph as the shared one (content addressing stores one), so sharing saves no bytes, and only 3 to 5% of reads.
+  - After every batch both incremental ways equal the recompute.
+  - The 100,000-row run built in 2.9 s but had not finished its batches after 2 hours, mostly in the harness's own appends and checks between timed updates; it was stopped, so there are no 100,000-row update numbers.
+- Not measured: 100,000 rows and up, joins of more than two tables, joins whose output feeds E242's views, the Mac.
+- Trade-off: an update reads in proportion to the join rows its changes reach; a change on the one-row-per-group side reaches every row of its group, so at a batch of 1,000 here the update reads most of what a recompute reads and takes twice as long.
+- Verdict: **measured**. Updating beats recomputing about 8 times for 10 changes and 1.7 times for 100, and loses at 1,000. Sharing the index adds little here, because the store already keeps one copy of identical indexes. Not recommended to merge as is; a version that recomputes when a batch reaches more than a set share of join keys would be the next step.
+- Run: `cargo run --release --example shared_joins -- 20000 1000 10 100 1000` (`TEMPLATES=1` keeps object templates on).
