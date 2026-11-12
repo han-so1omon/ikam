@@ -9,5 +9,5 @@ export CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-${TMPDIR:-/tmp}/ikam-orx-target}"
 # rebuilds this crate instead of reusing another branch's build.
 find . -name '*.rs' -exec touch {} +
 cargo test --release -q --test vectors
-cargo build --release -q --features vectors-hnsw --example vector_views
-"$CARGO_TARGET_DIR/release/examples/vector_views" 50000 64 10 100 1000
+cargo build --release -q --features search-tantivy,vectors-hnsw --example hybrid
+"$CARGO_TARGET_DIR/release/examples/hybrid" 50000
