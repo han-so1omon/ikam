@@ -237,6 +237,77 @@ impl<S: Store> Repo<S> {
         }
     }
 
+    /// Nodes with `start <= label < end` (no `end`: to the last label), in
+    /// label order or, with `reverse`, from the last; at most `limit`. Reads
+    /// only the chunks that can hold such a label, and stops once it has
+    /// `limit`, so a page of a long range costs one path plus its leaves.
+    pub fn graph_range(
+        &self,
+        root: &Id,
+        start: &str,
+        end: Option<&str>,
+        limit: usize,
+        reverse: bool,
+    ) -> Result<Vec<Node>, Error> {
+        let mut out = Vec::new();
+        if limit > 0 && end.is_none_or(|e| start < e) {
+            self.collect_range(root, start, end, limit, reverse, &mut out)?;
+        }
+        Ok(out)
+    }
+
+    fn collect_range(
+        &self,
+        id: &Id,
+        start: &str,
+        end: Option<&str>,
+        limit: usize,
+        reverse: bool,
+        out: &mut Vec<Node>,
+    ) -> Result<(), Error> {
+        let inside = |l: &str| l >= start && end.is_none_or(|e| l < e);
+        match self.graph_chunk(id)? {
+            Graph::Nodes(nodes) => {
+                let take = limit - out.len();
+                if reverse {
+                    out.extend(
+                        nodes
+                            .into_iter()
+                            .rev()
+                            .filter(|n| inside(&n.label))
+                            .take(take),
+                    );
+                } else {
+                    out.extend(nodes.into_iter().filter(|n| inside(&n.label)).take(take));
+                }
+            }
+            Graph::Children(_, children) => {
+                // Child i holds labels from its first (the first child: from
+                // the start) up to the next child's first.
+                let mut picked = Vec::new();
+                for (i, (first, child)) in children.iter().enumerate() {
+                    let low_ok = end.is_none_or(|e| i == 0 || first.as_str() < e);
+                    let high_ok = children
+                        .get(i + 1)
+                        .is_none_or(|(next, _)| next.as_str() > start);
+                    if low_ok && high_ok {
+                        picked.push(*child);
+                    }
+                }
+                if reverse {
+                    picked.reverse();
+                }
+                for child in picked {
+                    if out.len() >= limit {
+                        break;
+                    }
+                    self.collect_range(&child, start, end, limit, reverse, out)?;
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Nodes whose labels start with `prefix`, in label order, reading only
     /// the chunks that can hold them.
     pub fn graph_prefix(&self, root: &Id, prefix: &str) -> Result<Vec<Node>, Error> {
@@ -699,5 +770,95 @@ impl<S: Store> Repo<S> {
             runs.push((old, new));
         }
         Ok(runs)
+    }
+}
+
+/// True if `label` is in `[lo, hi)`; `hi` of `None` is unbounded.
+fn in_range(label: &str, lo: &str, hi: Option<&str>) -> bool {
+    label >= lo && hi.is_none_or(|h| label < h)
+}
+
+impl<S: Store> Repo<S> {
+    /// `(first label, id)` of every leaf chunk, in label order, reading only
+    /// the parent chunks.
+    fn graph_leaf_list(&self, root: &Id) -> Result<Vec<(String, Id)>, Error> {
+        let Graph::Children(mut height, mut level) = self.graph_chunk(root)? else {
+            return Ok(vec![(String::new(), *root)]);
+        };
+        while height > 1 {
+            let mut next = Vec::new();
+            for (_, id) in &level {
+                match self.graph_chunk(id)? {
+                    Graph::Children(_, children) => next.extend(children),
+                    Graph::Nodes(_) => return Err(Error::WrongKind(*id)),
+                }
+            }
+            (level, height) = (next, height - 1);
+        }
+        Ok(level)
+    }
+
+    /// The graph at `root` without the labels in `[lo, hi)` (E240). Equals
+    /// `put_graph` of the remaining nodes. Leaves wholly inside the range
+    /// are dropped unread; the leaves at its ends, and the ones after it
+    /// until the content-defined cut falls back into step, are read and
+    /// re-cut; the parent levels are rebuilt from the leaf list.
+    pub fn graph_drop_range(&mut self, root: &Id, lo: &str, hi: Option<&str>) -> Result<Id, Error> {
+        let leaves = self.graph_leaf_list(root)?;
+        let next_first = |i: usize| leaves.get(i + 1).map(|l| l.0.as_str());
+        // A leaf holds labels in [its first, the next leaf's first).
+        let before = |i: usize| next_first(i).is_some_and(|n| n <= lo);
+        let after = |i: usize| hi.is_some_and(|h| leaves[i].0.as_str() >= h);
+        let Some(a) = (0..leaves.len()).find(|&i| !before(i)) else {
+            return Ok(*root);
+        };
+        let b = (a..leaves.len())
+            .find(|&i| after(i))
+            .unwrap_or(leaves.len());
+        if a == b {
+            return Ok(*root);
+        }
+        let inside = |i: usize| {
+            leaves[i].0.as_str() >= lo && hi.is_none_or(|h| next_first(i).is_some_and(|n| n <= h))
+        };
+        let mut out: Vec<(String, Id)> = leaves[..a].to_vec();
+        let (mut buf, mut acc) = (Vec::new(), 0);
+        let mut emit = |r: &mut Self, buf: &mut Vec<Node>| -> Result<(), Error> {
+            let chunk = std::mem::take(buf);
+            let first = chunk[0].label.clone();
+            out.push((first, r.put(&Object::Graph(Graph::Nodes(chunk)))?));
+            Ok(())
+        };
+        let mut i = a;
+        while i < leaves.len() {
+            if i >= b && buf.is_empty() {
+                break;
+            }
+            if i < b && inside(i) {
+                i += 1;
+                continue;
+            }
+            let Graph::Nodes(nodes) = self.graph_chunk(&leaves[i].1)? else {
+                return Err(Error::WrongKind(leaves[i].1));
+            };
+            for n in nodes.into_iter().filter(|n| !in_range(&n.label, lo, hi)) {
+                acc += node_size(&n);
+                let ends = ends_chunk(&n.label, acc);
+                buf.push(n);
+                if ends {
+                    emit(self, &mut buf)?;
+                    acc = 0;
+                }
+            }
+            i += 1;
+        }
+        if !buf.is_empty() {
+            emit(self, &mut buf)?;
+        }
+        out.extend(leaves[i..].iter().cloned());
+        if out.is_empty() {
+            return self.put_graph(Vec::new());
+        }
+        self.put_parents(out, 1)
     }
 }

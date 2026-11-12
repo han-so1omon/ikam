@@ -3346,6 +3346,106 @@ Gates on the branch: every kernel test suite passes (release); clippy `-D warnin
 - Follow-up (Nov 12): `--deferred-sync` turned on for one private `ikam live` deployment on that Mac. After the restart the process carries the flag, the server answers, its log is clean, `fsck` ok and no `.pending-*` file is left while idle.
 - Run: `cargo build --release --example commits --bin ikam`, then `commits [--deferred] [--no-object-templates] --every 1|20 2 30 300`.
 
+### E229 db-api (database mode for another program: ranges, an HTTP API, cheaper appends)
+- Branch / parent: exp/233-kept-counts (with E231 to E233) / main 9c4c708
+- Question: step 1 of the database mode (Nov 9) has a log and a kv view, but only whole scans and point gets, and no way for another program to reach it. What does a first client need, and what does it cost?
+- Change:
+  - `Repo::graph_range` (graph.rs): nodes with labels in [start, end), in order or reversed, up to a limit, reading only the chunks that can hold them. `db_range`, `db_prefix`, `db_count` (db.rs) on the kv view, reading each event once; `prefix_end`.
+  - `ikam db serve` (src/bin/ikam/dbserve.rs): each database NAME is the ref `db/NAME`; `POST append` (binary events, `If-Head` for optimistic writers, every answered append already committed), `GET get`, `POST get`, `GET scan`, `GET count`, `POST span` (count, first and last per prefix in one request), `GET head`, `GET /db/`; reads take `at=COMMIT`. Auth and host checks as `ikam live` (IKAM_AUTH; IKAM_READ_AUTH for GETs only). Listens on 127.0.0.1 only.
+  - `Repo::plain_db_events` (off): events stored plain, no plan search. `ikam db serve --plain-events`, `--no-object-templates` (E144's option).
+  - Tests: ranges and prefixes equal a filtered scan (6,000 events, random ranges, limits, both directions); `prefix_end`; counts; the server's event round trip, appends, scans, `span`, reads at an older commit, 409 on a moved head.
+- Result (`examples/db_append_cost.rs`, MemStore, 10 batches of 2,000 upserts with random row keys): per event over the run 368 us; `plain_db_events` 140 us; `object_templates` off 312 us; both 79 us. Bytes written 5.8 MB in all four (synthetic rows that a plan could not shrink anyway). Most of the default's time is the plan search for each event; `span` answers a list of 20 groups in one request where counts and ends took 60.
+- Not measured: real workloads, macOS, rows that share much (where a plan search could pay for itself).
+- Trade-off: `--plain-events` can store similar rows larger than a plan would. Every append commits, so a writer that sends one row a request pays a commit a row.
+- Verdict: **kept**, both options off by default. Next: aggregate views kept by appends (so a count or a min is not a range read), batching the ids and kv edits across a writer's requests, and a typed value form for rows (JSON arrays today).
+- Run: `cargo run --release --example db_append_cost [BATCHES] [PER] [plain] [notemplates]`.
+
+### E231 db-size-order (where a database's bytes go, and what row order costs)
+- Branch / parent: exp/233-kept-counts / main 9c4c708
+- Question: rows kept in the database mode (E229) take more room than their encoded events, and rows loaded out of key order load far slower. Where do the bytes go per row, and how much does order matter?
+- Change: none in the kernel. `examples/db_size_breakdown.rs` writes grouped numeric rows (a JSON array of nine fields under `t/rows/GROUP/SEQ`, idempotency keys as a bulk load makes them) into pack stores, batched (2,000 an append, a commit each) or in one append, in key order or shuffled, and prints the parts of an event and the bytes on disk.
+- Result (300 groups x 1,200 rows, 360,000 rows, `--plain-events` and `--no-object-templates`):
+  - Parts: values 47.8 MB, keys 6.8 MB, idempotency keys 16.6 MB; encoded events 80.2 MB. On disk 136.6 MB batched (379 bytes a row, 1.70x the events) and 135.5 MB in one append, so commits are not the cost. With object templates on: 136.7 MB, and the load takes 26 s against 17 s.
+  - Per row the log repeats the key inside the event, keeps an idempotency key of about 46 bytes, and the three views add about 150 bytes; events of 200 to 250 bytes are too small for their encoding to find anything to share.
+  - Order (100 groups x 1,200 rows, batched): shuffled rows take 186.7 MB and 90.8 s against 45.5 MB and 4.3 s in key order (4.1x the bytes, 21x the time), because every append rewrites chunks all over the views and the old versions are kept. In one append the order does not matter (45.1 MB both ways). A bulk load that writes each table in key order avoids the cost.
+- Trade-off: none taken; a measurement.
+- Verdict: **measured**. Next: columnar blocks for large tables, shorter or dropped idempotency keys for bulk loads, kept counts so a list reads no ranges (E233).
+- Run: `cargo run --release --example db_size_breakdown [GROUPS] [PER_GROUP] [plain] [notemplates] [shuffle] [edit-index]`.
+
+### E232 fast-writes (appends that do not wait for reads, and a cheap first write after a restart)
+- Branch / parent: exp/233-kept-counts / main 9c4c708
+- Question: small appends to `ikam db serve` took 50 ms and more in an end-to-end test while list views were being read. A write path in the style of Rama's depots answers an append as soon as the log has it, whatever readers are doing. What does an append cost in ikam itself, and what makes it slow?
+- Change:
+  - `examples/db_write_path.rs` (an append's steps on a pack store holding 200,000 rows, and the first append after reopening) and `scripts/db_contention.py` (readers loop over a span of 200 prefixes and one prefix's scan while a writer appends a row every 50 ms; standard library only).
+  - `SharedStore` (store.rs): a store several `Repo`s share, each call locking for one object or ref. `Repo::sibling`: another handle on it that shares the ledger, so it reads chunks the writer derived after it started. The ledger is now `Arc<RwLock<Option<Ledger>>>` behind `ledger()`, shared by siblings and unchanged for a single handle.
+  - `ikam db serve --concurrent-reads` (off): reads run on sibling handles from a pool; only appends take the writer's lock. Every read still works from the roots of the head it saw when it started.
+  - `ikam db serve --edit-index` (off): plans each write against the chunks the edit read (E133's empty scope with replace hints) instead of an index of every stored object.
+  - Test: a sibling reads what the writer derived after the sibling built its ledger (fails with an unshared handle: the newer chunks are not found).
+- Result (pack store, 200,000 rows over 200 groups, 68.3 MB, plain events, no object templates):
+  - An append alone costs about 4 ms in ikam (the event, log, ids and kv edits 3.3 ms, the commit with its sync 0.9 ms) and about 0.5 ms more over HTTP. The 50 ms were waiting: each request took the server's one lock, so an append queued behind every read in flight.
+  - With 3 readers and a writer, default: appends p50 305 ms (p95 393), 3.5 a second against the 20 asked for; span p50 355 ms, scan 212 ms, 10.5 reads a second.
+  - With `--concurrent-reads`: appends p50 7.5 ms (p95 11.1), all 20 a second; span 176 ms and scan 22 ms, about the same as with no writer (168 and 24); 31.3 reads a second.
+  - The first append after a restart took 4.5 to 5.1 s: the first plan builds an index of every stored object. With `--edit-index` it takes 4 ms in the example and 0.48 s over HTTP (most of it the ledger, built once), and the server's peak resident memory is 30 MB against 172 MB; steady appends and bytes on disk are unchanged (68.3 MB both ways; E231's 360,000 rows 136.6 MB both ways, and 136.7 MB both ways with object templates on).
+- Not measured: several writers at once (group commit is the next step), real workloads, macOS.
+- Trade-off: `--concurrent-reads` takes a lock per object read and keeps a handle per concurrent reader. `--edit-index` cannot slice a new chunk against stored contents this edit did not read; on these rows that saved nothing.
+- Verdict: **kept**, both off by default. Next: group commit for several writers, and views kept by appends so lists read counts instead of ranges (E233).
+- Run: `cargo run --release --example db_write_path -- DIR [ROWS] [APPENDS] [PER] [edit-index]`; `python3 scripts/db_contention.py URL [--readers 3] [--appends 200]` against `ikam db serve --packs --plain-events --no-object-templates` on a copy of a store written with `APPENDS` 0.
+
+### E233 kept-counts (a view of how many keys fall under each prefix, kept by appends)
+- Branch / parent: exp/233-kept-counts / main 9c4c708
+- Question: a list view asks for the number of rows under each of a few hundred prefixes (one per group). `db_count` reads every key in a prefix's range, so the list costs as much as reading the table's keys, and grows with it. Rama keeps such sizes in its indexed views; can the database mode keep a count per prefix, edited by each append, and read it in one pass?
+- Change:
+  - `Db::counts: Option<Counts>`: a fourth view, from each key prefix of 1 to `depth` segments (`t/`, `t/rows/`, `t/rows/G0007/` for depth 3) to the number of keys starting with it, as decimal content; a prefix with no keys has no node. A commit stores it as `db/views/counts` with `counts.at` and `counts.depth`, only when kept, so a database without it commits exactly as before.
+  - `db_append` edits it from the keys whose presence an append changes (read from the chunks of `kv` those keys fall in); `db_counts_rebuild` builds it from `kv`'s labels, the reference the kept view must equal; `db_keep_counts(db, depth)` turns it on for an existing database (0 turns it off).
+  - `db_count_prefixes` (and `db_count_prefix`): kept prefixes in one pass over the view's chunks, any other prefix by its range as before.
+  - `ikam db serve --keep-counts N` (off): builds the view on a database's next append when it has none; `count?prefix=` and `span` use it.
+  - `examples/db_kept_counts.rs`; tests: kept counts equal counts from scratch after new keys, overwrites, removes, subtree removes and retries over 30 rounds, every prefix's kept count equals its range count, a commit keeps the view, turning it on later builds the same view, and the server's routes answer the same with and without it.
+- Result (pack store, 200,000 rows over 200 groups, plain events, no object templates, depth 3):
+  - Counts of the 200 groups and the table: 243 ms by range, 0.42 ms kept. Over HTTP with `--concurrent-reads --edit-index`, `span` of the 200 groups (count, first and last pair each) 170 to 51 ms p50 alone and 167 to 51 ms with a writer, and reads a second 32.5 to 83.9; the rest of a span is its 400 first and last reads.
+  - Building the view after a load: 0.18 s; keeping it during the load: 8.3 s against 6.8 s. Bytes on disk after either: unchanged at 57.2 MB to the first decimal.
+  - One-row appends with commit: p50 3.2 to 5.1 ms; over HTTP with 3 readers, 8.0 to 9.5 ms. 200 appends grew the store 1.5 MB against 1.3 MB without the view (the view's chunk is rewritten each time).
+- Trade-off: about 2 ms and 1 KB more per small append, for counts that no longer grow with the table. Only prefixes ending in `/` of up to `depth` segments are kept; any other range counts as before.
+- Verdict: **kept**, off by default. Next: first and last pair per prefix kept the same way (the rest of `span`), and counted interior nodes for any range.
+- Run: `cargo run --release --example db_kept_counts -- DIR [ROWS] [APPENDS] [off|after|load]`; `python3 scripts/db_contention.py URL` against `ikam db serve --keep-counts 3` on a store written with `after`.
+
+Gates on the branch (E229 to E233): every kernel test suite passes (release); clippy `-D warnings` and fmt clean; the bench gives the same byte and count fields as the code it builds on, run alongside it on the same machine (only times and peak memory differ), north 0.3109; the privacy check passes.
+
+### E240 row-ids (stable row ids, a range remove, and dropping a key range a chunk at a time)
+- Branch / parent: exp/240-row-ids / main 9c4c708 (numbered E240 to E244 to stay clear of E229 to E232 on other branches)
+- Question: in database mode, removing many rows is one `Remove` event per row, or a subtree `Remove` whose view edit lists every key below the prefix and drops them one by one. With stable, ordered row ids, can a whole table or a range of ids go in one log entry, and can the `kv` view drop it without reading the chunks inside the range?
+- Change (all opt-in; default behaviour unchanged):
+  - `Op::RemoveRange { end }` (`Event::remove_range`): one event drops every key in `[key, end)`; encoded as `D` and the end, so earlier events decode as before; a reversed or empty range is refused.
+  - `Repo::db_insert(db, table, rows)`: rows keyed `table/` and the log sequence number of the event inserting them (20 digits, as log labels), so ids are never reused and sort in insertion order; a retried idempotency key keeps its first id. `Db::row_key(table, seq)` names one, for a range over ids.
+  - `Repo::graph_drop_range` (graph.rs): leaves wholly inside the range are cut out unread; the leaves at its ends, and those after it until the content-defined cut falls back into step, are re-cut; parents are rebuilt from the leaf list (read from parent chunks only). Equals `put_graph` of the remaining nodes.
+  - `Repo::db_range_drop` (off): a subtree remove or a range remove drops its range from `kv` with `graph_drop_range` instead of listing and dropping each key. Off, a range remove lists its keys with E229's `graph_range`, as a subtree remove does.
+  - Tests (tests/db_range.rs): `graph_drop_range` equals `put_graph` of the rest on graphs of 0 to 30,000 nodes (two levels) and random ranges, bounded and not; subtree removes mixed with writes before and after give the same roots with `db_range_drop` off and on, and equal `db_rebuild`; range removes drop exactly their keys; row ids are stable across retries and not reused after a range remove.
+- Result (`examples/row_ids.rs`, MemStore, three generated tables of N rows each, removing one table or the first half of its row ids; each case on a fresh copy of the same store, after one warm-up append; reads are store reads during the append):
+
+  | Rows a table | Case | Log | ms | Reads | Bytes read |
+  |---|---|---|---|---|---|
+  | 10,000 | a `Remove` a row (table) | 10,000 events, 730 KB | 2,678 | 122,917 | 11.8 MB |
+  | 10,000 | subtree `Remove` | 1 event | 32.0 | 774 | 1.18 MB |
+  | 10,000 | subtree `Remove`, `db_range_drop` | 1 event | 12.6 | 240 | 0.44 MB |
+  | 10,000 | `RemoveRange` of half the ids | 1 event | 14.8 | 381 | 0.50 MB |
+  | 10,000 | `RemoveRange`, `db_range_drop` | 1 event | 3.6 | 100 | 0.12 MB |
+  | 100,000 | a `Remove` a row (table) | 100,000 events, 7.3 MB | 23,685 | 2,505,360 | 329 MB |
+  | 100,000 | a `Remove` a row (half) | 50,000 events, 3.7 MB | 12,150 | 1,523,857 | 220 MB |
+  | 100,000 | subtree `Remove` | 1 event | 326.6 | 5,703 | 7.9 MB |
+  | 100,000 | subtree `Remove`, `db_range_drop` | 1 event | 18.7 | 366 | 0.47 MB |
+  | 100,000 | `RemoveRange` of half the ids | 1 event | 142.7 | 3,021 | 4.2 MB |
+  | 100,000 | `RemoveRange`, `db_range_drop` | 1 event | 13.2 | 330 | 0.42 MB |
+  | 1,000,000 | subtree `Remove` | 1 event | 3,628 | 54,630 | 76 MB |
+  | 1,000,000 | subtree `Remove`, `db_range_drop` | 1 event | 93.0 | 1,604 | 2.0 MB |
+  | 1,000,000 | `RemoveRange` of half the ids | 1 event | 1,481 | 27,986 | 39 MB |
+  | 1,000,000 | `RemoveRange`, `db_range_drop` | 1 event | 83.4 | 1,416 | 1.7 MB |
+
+  - Row-by-row removes were skipped at a million rows (minutes). New bytes written are the same with `db_range_drop` off and on (the roots are equal); what changes is what is read: the chunks inside the range are never opened, so the cost follows the number of leaves (parent chunks) rather than the rows.
+  - What is left at a million rows (about 90 ms, 1,600 reads) is mostly the parent levels rebuilt from the whole leaf list and the log and ids edits; rebuilding only the parents on the paths to the range's ends would make it independent of the table's size.
+- Not measured: FsStore (reads there are file opens, so the read counts matter more), the Mac, ranges inside a table being written at the same time.
+- Trade-off: none in results (same roots); `db_range_drop` is off by the rule that new paths start as options. Row ids are 20 digits, as log labels, so keys are longer than a short counter's (the store compresses chunks).
+- Verdict: **kept**, `db_range_drop` off by default; `RemoveRange` and `db_insert` are new calls. On merging after E229 to E233 (Nov 12): this branch's own range reader was dropped for E229's `graph_range`, and a database that keeps E233's counts lists a removed range instead of dropping it, because the counts need each removed key (tested in tests/db_range.rs). The measurements above were taken before the merge, with the branch's own reader on the off path.
+- Run: `cargo run --release --example row_ids -- 10000 100000 1000000`.
+
 ### E242 view-graph (named derived views with dependencies, after dbt's models)
 - Branch / parent: exp/242-view-graph / main 9c4c708 (numbered E240 to E244 to stay clear of E229 to E232 on other branches)
 - Question: database mode keeps two views of its log (`ids` and `kv`). Can callers define more, as dbt defines models: named views that read other views, built in dependency order, each computed on read, stored and rebuilt, or stored and updated from its inputs' changes, with a row check after each build (dbt's ideas from what is known of them; nothing was re-read for this entry)? What does an incremental update cost against a rebuild?

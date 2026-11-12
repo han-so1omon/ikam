@@ -4,6 +4,7 @@ mod ask;
 mod auth;
 mod corpus;
 mod dav;
+mod dbserve;
 mod http;
 mod json;
 mod live;
@@ -26,6 +27,9 @@ const USAGE: &str = "usage: ikam [--store DIR] [--short-records] [--slow-codec-m
   ls [REV[:PATH]] [-r]             list a directory of REV (default main)
   grep TEXT [REV]                  files of REV containing TEXT, with lines
   stats [REV]                      objects and bytes the store holds
+  db serve [--packs] [--plain-events] [--no-object-templates] [--concurrent-reads] [--edit-index] [--keep-counts N] [PORT]
+                                   the store's databases over HTTP, for programs
+                                   (default port 8740, 127.0.0.1 only; dbserve.rs)
   serve [PORT]                     browse, read and search in a local web page
                                    (default port 8737, 127.0.0.1 only)
   REV, ID and PATH arguments take a ref, a hex id or unique prefix, or REV:PATH.
@@ -109,12 +113,156 @@ fn main() -> ExitCode {
             }
         };
     }
+    if args.first().map(String::as_str) == Some("db") {
+        return match db_cmd(&store_dir, &args[1..]) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(msg) => {
+                eprintln!("{msg}");
+                ExitCode::FAILURE
+            }
+        };
+    }
     match run(&store_dir, &mut args) {
         Ok(()) => ExitCode::SUCCESS,
         Err(msg) => {
             eprintln!("{msg}");
             ExitCode::FAILURE
         }
+    }
+}
+
+/// `ikam db serve [--packs] [--plain-events] [--no-object-templates]
+/// [--concurrent-reads] [--edit-index] [--keep-counts N] [--allow-host NAME]...
+/// [--log-requests] [PORT]`:
+/// the store's databases over HTTP (`dbserve.rs`), on 127.0.0.1:PORT (default
+/// 8740). With `--packs` the store is a pack store (E122), which keeps many
+/// small events in a few files; a store keeps the backend it was made with.
+/// `--plain-events` stores row events without a plan search and
+/// `--no-object-templates` plans view chunks as slices only (E229: both
+/// together make a bulk load about five times faster; both off by default).
+/// `--concurrent-reads` (E232, off by default) gives reads their own `Repo`
+/// on a shared store, so they wait neither for an append nor for each other;
+/// `--edit-index` (E232, off) plans each write against the chunks it read
+/// instead of an index of the whole store, which a restarted server builds
+/// on its first write. `--keep-counts N` (E233, off) keeps the number of
+/// keys under each prefix of up to N segments, edited by every append, so
+/// `count?prefix=` and `span` read one node per prefix.
+fn db_cmd(store_dir: &str, args: &[String]) -> Result<(), String> {
+    let mut args = args.to_vec();
+    if args.first().map(String::as_str) != Some("serve") {
+        return Err("usage: ikam [--store DIR] db serve [--packs] [--plain-events] [--no-object-templates] [--concurrent-reads] [--edit-index] [--keep-counts N] [--allow-host NAME]... [--log-requests] [PORT]".into());
+    }
+    args.remove(0);
+    let mut allowed = Vec::new();
+    while let Some(h) = take_flag(&mut args, "--allow-host") {
+        allowed.push(h);
+    }
+    let keep_counts: u32 = match take_flag(&mut args, "--keep-counts") {
+        Some(n) => n.parse().map_err(err)?,
+        None => 0,
+    };
+    let before = args.len();
+    args.retain(|a| a != "--packs");
+    let packs = args.len() != before;
+    let before = args.len();
+    args.retain(|a| a != "--log-requests");
+    let log_requests = args.len() != before;
+    let before = args.len();
+    args.retain(|a| a != "--plain-events");
+    let plain_events = args.len() != before;
+    let before = args.len();
+    args.retain(|a| a != "--no-object-templates");
+    let object_templates = args.len() == before;
+    let before = args.len();
+    args.retain(|a| a != "--concurrent-reads");
+    let concurrent_reads = args.len() != before;
+    let before = args.len();
+    args.retain(|a| a != "--edit-index");
+    let edit_index = args.len() != before;
+    let serve_opts = DbServeOpts {
+        concurrent_reads,
+        edit_index,
+        plain_events,
+        object_templates,
+        keep_counts,
+    };
+    let port: u16 = args.first().map_or(Ok(8740), |p| p.parse()).map_err(err)?;
+    auth::catch_stop_signals();
+    std::thread::spawn(|| {
+        // Every answered append is committed already, so a stop has
+        // nothing to flush.
+        loop {
+            std::thread::sleep(Duration::from_millis(250));
+            if auth::stopping() {
+                eprintln!("{} stopped", live::stamp());
+                std::process::exit(0);
+            }
+        }
+    });
+    if packs {
+        let opts = ikam_kernel::backends::PackOptions {
+            lazy_checkpoint: true,
+            ref_log: false,
+            filters: true,
+        };
+        let store = ikam_kernel::backends::PackStore::open_with(store_dir, opts).map_err(err)?;
+        serve_db(store, serve_opts, port, allowed, log_requests)
+    } else {
+        let store = FsStore::open(store_dir).map_err(err)?;
+        serve_db(store, serve_opts, port, allowed, log_requests)
+    }
+}
+
+#[derive(Clone, Copy)]
+struct DbServeOpts {
+    concurrent_reads: bool,
+    edit_index: bool,
+    plain_events: bool,
+    object_templates: bool,
+    keep_counts: u32,
+}
+
+/// `db serve` on `store`; with `concurrent_reads` the store is shared, so
+/// reads get `Repo`s of their own (E232).
+fn serve_db<S: ikam_kernel::Store + Send + Sync + 'static>(
+    store: S,
+    o: DbServeOpts,
+    port: u16,
+    allowed: Vec<String>,
+    log_requests: bool,
+) -> Result<(), String> {
+    fn tune<T: ikam_kernel::Store>(mut r: Repo<T>, o: DbServeOpts) -> Repo<T> {
+        r.plain_db_events = o.plain_events;
+        r.object_templates = o.object_templates;
+        if o.edit_index {
+            // E232: plan against what each edit reads (E133's scope and
+            // hints), not an index of every stored object built on the
+            // first write.
+            r.set_seed_scope(Some(Vec::new()));
+            r.replace_hints = true;
+        }
+        r
+    }
+    if o.concurrent_reads {
+        let shared = ikam_kernel::SharedStore::new(store);
+        let make: dbserve::ReaderFactory<_> = Box::new(|w: &Repo<_>| w.sibling());
+        dbserve::serve(
+            tune(Repo::new(shared), o),
+            Some(make),
+            o.keep_counts,
+            port,
+            allowed,
+            log_requests,
+        )
+    } else {
+        dbserve::serve(
+            tune(Repo::new(store), o),
+            None,
+            o.keep_counts,
+            port,
+            allowed,
+            log_requests,
+        )
     }
 }
 

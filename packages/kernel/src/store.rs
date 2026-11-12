@@ -42,6 +42,73 @@ pub trait Store {
     fn refs(&self) -> Result<Vec<(String, Id)>, Error>;
 }
 
+/// A store several `Repo`s share (E232): each call takes a lock for that
+/// one object or ref only, so readers working from fixed roots interleave
+/// with a writer object by object instead of waiting for its whole append.
+/// Objects are immutable once written and a reader holds the roots it
+/// started from, so what it reads does not change under it. Clones share
+/// the store.
+pub struct SharedStore<S>(std::sync::Arc<std::sync::RwLock<S>>);
+
+impl<S> Clone for SharedStore<S> {
+    fn clone(&self) -> Self {
+        SharedStore(self.0.clone())
+    }
+}
+
+impl<S: Store> SharedStore<S> {
+    pub fn new(store: S) -> SharedStore<S> {
+        SharedStore(std::sync::Arc::new(std::sync::RwLock::new(store)))
+    }
+
+    fn r(&self) -> std::sync::RwLockReadGuard<'_, S> {
+        self.0.read().unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn w(&self) -> std::sync::RwLockWriteGuard<'_, S> {
+        self.0.write().unwrap_or_else(|e| e.into_inner())
+    }
+}
+
+impl<S: Store> Store for SharedStore<S> {
+    fn write(&mut self, id: Id, encoded: &[u8]) -> Result<bool, Error> {
+        self.w().write(id, encoded)
+    }
+    fn replace(&mut self, id: Id, encoded: &[u8]) -> Result<(), Error> {
+        self.w().replace(id, encoded)
+    }
+    fn read(&self, id: &Id) -> Result<Vec<u8>, Error> {
+        self.r().read(id)
+    }
+    fn read_head(&self, id: &Id, n: usize) -> Result<Vec<u8>, Error> {
+        self.r().read_head(id, n)
+    }
+    fn stored_len(&self, id: &Id) -> Result<usize, Error> {
+        self.r().stored_len(id)
+    }
+    fn has(&self, id: &Id) -> bool {
+        self.r().has(id)
+    }
+    fn ids(&self) -> Result<Vec<Id>, Error> {
+        self.r().ids()
+    }
+    fn ids_with_prefix(&self, prefix: &[u8]) -> Result<Vec<Id>, Error> {
+        self.r().ids_with_prefix(prefix)
+    }
+    fn delete(&mut self, id: &Id) -> Result<(), Error> {
+        self.w().delete(id)
+    }
+    fn get_ref(&self, name: &str) -> Result<Option<Id>, Error> {
+        self.r().get_ref(name)
+    }
+    fn set_ref(&mut self, name: &str, expected: Option<Id>, new: Id) -> Result<(), Error> {
+        self.w().set_ref(name, expected, new)
+    }
+    fn refs(&self) -> Result<Vec<(String, Id)>, Error> {
+        self.r().refs()
+    }
+}
+
 /// Ref names are `/`-separated segments of `[A-Za-z0-9._-]`, none starting with `.`.
 pub fn check_ref_name(name: &str) -> Result<(), Error> {
     let ok = name.split('/').all(|seg| {
