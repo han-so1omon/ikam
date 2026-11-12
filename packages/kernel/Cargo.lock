@@ -883,6 +883,7 @@ dependencies = [
  "rusqlite",
  "similar",
  "tantivy",
+ "tantivy-fst",
  "tempfile",
  "thiserror",
  "wasmi",

@@ -164,6 +164,51 @@ fn tantivy(
     want
 }
 
+/// E251: the vocabulary as an FST (tantivy-fst, Tantivy's term
+/// dictionary) against a graph of word labels in the store.
+fn term_dictionary(repo: &Repo<Counting>, docs: &[String]) {
+    let vocab: std::collections::BTreeSet<String> = docs
+        .iter()
+        .flat_map(|d| ikam_kernel::textindex::words(d.as_bytes()))
+        .collect();
+    let raw: usize = vocab.iter().map(String::len).sum();
+    let mut b = tantivy_fst::MapBuilder::memory();
+    for (i, w) in vocab.iter().enumerate() {
+        b.insert(w, i as u64).unwrap();
+    }
+    let bytes = b.into_inner().unwrap();
+    let fst_bytes = bytes.len();
+    let fst = tantivy_fst::Map::from_bytes(bytes).unwrap();
+    let mut r = Repo::new(repo.store().copy());
+    let before = r.store().stored();
+    let nodes = vocab
+        .iter()
+        .map(|w| ikam_kernel::Node {
+            label: w.clone(),
+            target: ikam_kernel::Target::None,
+            edges: Vec::new(),
+        })
+        .collect();
+    let root = r.put_graph_with(nodes, ikam_kernel::Keys::Any).unwrap();
+    let graph = r.store().stored() - before;
+    let t = Instant::now();
+    let mut hits = 0;
+    for w in vocab.iter().step_by(97) {
+        hits += usize::from(fst.get(w).is_some());
+    }
+    let fst_ns = t.elapsed().as_nanos() as f64 / hits as f64;
+    let t = Instant::now();
+    for w in vocab.iter().step_by(97) {
+        r.graph_node(&root, w).unwrap().unwrap();
+    }
+    let graph_ns = t.elapsed().as_nanos() as f64 / hits as f64;
+    println!(
+        "{{\"words\":{},\"raw_bytes\":{raw},\"fst_bytes\":{},\"graph_bytes\":{graph},\"fst_lookup_ns\":{fst_ns:.0},\"graph_lookup_ns\":{graph_ns:.0}}}",
+        vocab.len(),
+        fst_bytes
+    );
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let n: usize = args[0].parse().unwrap();
@@ -218,6 +263,7 @@ fn main() {
         format!("{} {} {}", word(1), word(10), word(100)),
     ];
 
+    term_dictionary(&repo, &docs);
     let want = tantivy("tantivy_disk", false, &docs, &rounds, &queries);
     assert_eq!(want, tantivy("tantivy_ram", true, &docs, &rounds, &queries));
 
@@ -228,6 +274,8 @@ fn main() {
         "segments",
         "segments_plain",
         "segments_pruned",
+        "segments_block",
+        "segments_block_pruned",
     ] {
         let mut r = Repo::new(repo.store().copy());
         r.object_templates = false; // derived data (E228's option), as E244
@@ -235,6 +283,7 @@ fn main() {
         let opts = SegmentOpts {
             merge_above,
             plain_writes: way.ends_with("plain"),
+            block_base: way.contains("block"),
         };
         let stored0 = r.store().stored();
         let t = Instant::now();
@@ -300,13 +349,22 @@ fn main() {
         }
         if let Kept::Segments(s) = &kept {
             let t = Instant::now();
-            let m = r.text_segments_merge(s, &opts).unwrap();
+            let m = r
+                .text_segments_merge_at(s, dbs.last().unwrap(), "doc/", &opts)
+                .unwrap();
             let merge_ms = ms(t);
-            assert_eq!(
-                m.base,
-                r.text_index_build(dbs.last().unwrap(), "doc/").unwrap(),
-                "{way}: merged base equals a build"
-            );
+            match m.block {
+                Some(b) => assert_eq!(
+                    b,
+                    r.block_index_build(dbs.last().unwrap(), "doc/").unwrap(),
+                    "{way}: merged blocks equal a build"
+                ),
+                None => assert_eq!(
+                    m.base,
+                    r.text_index_build(dbs.last().unwrap(), "doc/").unwrap(),
+                    "{way}: merged base equals a build"
+                ),
+            }
             println!(
                 "{{\"way\":\"{way}\",\"final_merge_ms\":{merge_ms:.0},\"merged_equals_build\":true}}"
             );

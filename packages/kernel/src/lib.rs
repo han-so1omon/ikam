@@ -33,6 +33,7 @@ mod search;
 pub mod snapshot;
 mod store;
 mod template;
+pub mod postblocks;
 pub mod textindex;
 mod wasm;
 pub mod worktree;
