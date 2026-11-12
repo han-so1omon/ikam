@@ -3474,3 +3474,28 @@ Gates on the branch (E229 to E233): every kernel test suite passes (release); cl
 - Trade-off: a block is written whole, so rows arrive in batches; a single row read decodes a block; an append-only table loses per-row keys in `kv` (one key a block).
 - Verdict: **kept** as an option (opt-in API, off unless called). Next: a block per table segment kept beside a few recent row events, and a `kv` range view of block keys so a time range finds its blocks.
 - Run: `cargo run --release --example column_blocks -- 100000 1000000`.
+
+### E242 view-graph (named derived views with dependencies, after dbt's models)
+- Branch / parent: exp/242-view-graph / main 9c4c708 (numbered E240 to E244 to stay clear of E229 to E232 on other branches)
+- Question: database mode keeps two views of its log (`ids` and `kv`). Can callers define more, as dbt defines models: named views that read other views, built in dependency order, each computed on read, stored and rebuilt, or stored and updated from its inputs' changes, with a row check after each build (dbt's ideas from what is known of them; nothing was re-read for this entry)? What does an incremental update cost against a rebuild?
+- Change (opt-in; nothing defines or updates views unless a caller does):
+  - `views` (src/views.rs): `View { name, input, mode, op, check }` with `Mode::{OnRead, Stored, Incremental}` and `ViewOp::{Map, GroupSum}` (a group keeps `count,sum` and is dropped when its count reaches 0). `ViewGraph::new` orders views by dependency and refuses cycles, unknown inputs, duplicate names and a stored view reading an on-read one. `Repo::views_build`, `Repo::views_update` (stored views rebuild and keep their roots when unchanged; incremental views apply only the delta of their input), `Repo::view_rows`.
+  - Each build or update stores its rows' values as one plain content that the rows point into (one content a row cost about 20 times the reads), so an incremental update gives the same rows as a build under other roots; a stored rebuild gives a build's roots.
+  - Tests (tests/views.rs): random batches where each mode's rows equal a full build's, a view of a view, checks that fail on a bad row, and the graph errors.
+- Result (`examples/view_graph.rs`: a generated table of rows `time,id,reading,count,status` and three views, counts per id, the flagged rows, and counts per id over the flagged rows; batches of 70% rewrites, 20% new rows, 10% removes; median of 5 batches; object templates off for derived data, E228's option; a 4-core cloud machine with other runs going, so times are rough):
+
+  | Rows | Batch | Incremental | Stored, rebuilt |
+  |---|---|---|---|
+  | 20,000 | 10 | 24 ms (1,320 reads) | 4.8 s (356k reads) |
+  | 20,000 | 100 | 53 ms (2,325 reads) | 5.2 s |
+  | 100,000 | 10 | 115 ms (5,571 reads) | 46 s (1.78M reads) |
+  | 100,000 | 100 | 149 ms (7,034 reads) | 48 s (2.28M reads) |
+  | 100,000 | 1,000 | 480 ms (16,359 reads) | 51 s (1.94M reads) |
+
+  - A full build of the three views takes 3.8 s at 20,000 rows and 31 s at 100,000.
+  - Reading the per-id view at 100,000 rows: 14 ms (66 reads) stored, 14 s (981k reads) computed on read.
+  - After every batch the incremental rows equal a full build and the rebuilt roots equal a fresh build's.
+- Not measured: joins between views (E243 is the join), wide fan-out graphs, a view whose delta is large against its input, the Mac. The rebuild cost is mostly reading every input row's value, which E241's column blocks would cut for append-only tables.
+- Trade-off: an incremental view's roots depend on its update history, so two stores with the same rows can hold different roots for it; rows, not roots, are the comparison.
+- Verdict: **kept** as an option (opt-in API). Incremental updates are 100 to 400 times faster than rebuilding at 100,000 rows, and a stored view reads about 1,000 times faster than one computed on read.
+- Run: `cargo run --release --example view_graph -- 100000 10 100 1000` (`TEMPLATES=1` keeps object templates on).

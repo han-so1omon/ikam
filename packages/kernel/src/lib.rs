@@ -34,6 +34,7 @@ mod search;
 pub mod snapshot;
 mod store;
 mod template;
+pub mod views;
 mod wasm;
 pub mod worktree;
 
