@@ -98,7 +98,7 @@ fn list_label(c: usize, row: &str) -> String {
 }
 
 impl<S: Store> Repo<S> {
-    fn store_plain(&mut self, bytes: &[u8]) -> Result<Id, Error> {
+    pub(crate) fn store_plain(&mut self, bytes: &[u8]) -> Result<Id, Error> {
         let id = Id::of_content(bytes);
         if !self.has_content(&id)? {
             let encoded = self.encode_plain(bytes);
