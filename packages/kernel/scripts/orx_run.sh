@@ -8,6 +8,6 @@ export CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-${TMPDIR:-/tmp}/ikam-orx-target}"
 # Runs unpack sources with old modification times; touch them so cargo
 # rebuilds this crate instead of reusing another branch's build.
 find . -name '*.rs' -exec touch {} +
-cargo test --release -q --test textindex
-cargo build --release -q --features search-tantivy --example search_segments
-"$CARGO_TARGET_DIR/release/examples/search_segments" 50000 0.1 10 100 1000
+cargo test --release -q --test vectors
+cargo build --release -q --features vectors-hnsw --example vector_views
+"$CARGO_TARGET_DIR/release/examples/vector_views" 50000 64 10 100 1000

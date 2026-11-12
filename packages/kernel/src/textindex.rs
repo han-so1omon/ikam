@@ -17,6 +17,9 @@ use std::collections::{BTreeMap, BTreeSet};
 use crate::{Db, Error, Id, Keys, Node, Repo, Store, Target};
 
 const US: char = '\u{1f}';
+
+/// A word's rows in one graph of postings (E251's search takes it).
+type RowsOf<R> = dyn Fn(&R, &Id, &str) -> Result<BTreeSet<String>, Error>;
 /// Longest word kept, in bytes (Tantivy's `RemoveLongFilter` default).
 const MAX_WORD: usize = 40;
 
@@ -358,7 +361,7 @@ impl<S: Store> Repo<S> {
         seg: &Segments,
         b: &crate::postblocks::BlockIndex,
         query: &str,
-        rows: &dyn Fn(&Self, &Id, &str) -> Result<BTreeSet<String>, Error>,
+        rows: &RowsOf<Self>,
     ) -> Result<Vec<String>, Error> {
         let ws: Vec<String> = words(query.as_bytes()).into_iter().collect();
         if ws.is_empty() {

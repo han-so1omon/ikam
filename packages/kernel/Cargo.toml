@@ -31,6 +31,7 @@ rusqlite = { version = "0.41.1", optional = true, features = ["bundled"] }
 # `search_view` example uses it; the default build does not.
 tantivy = { version = "=0.24.2", optional = true }
 tantivy-fst = { version = "=0.5.0", optional = true }
+hnsw_rs = { version = "0.3", optional = true }
 
 # E227: one syncfs on Linux, and a plain fsync on Apple systems (where
 # std's sync_all is F_FULLFSYNC), for FsStore::open_deferred.
@@ -45,6 +46,8 @@ store-rocksdb = ["dep:rocksdb"]
 store-sqlite = ["dep:rusqlite"]
 stores = ["store-fjall", "store-lmdb", "store-redb", "store-rocksdb", "store-sqlite"]
 search-tantivy = ["dep:tantivy", "dep:tantivy-fst"]
+# E253: HNSW (hnsw_rs) for the vector benchmark only
+vectors-hnsw = ["dep:hnsw_rs"]
 
 [dev-dependencies]
 libc = "=0.2.189"
@@ -71,6 +74,10 @@ required-features = ["search-tantivy"]
 [[example]]
 name = "search_tantivy_view"
 required-features = ["search-tantivy"]
+
+[[example]]
+name = "vector_views"
+required-features = ["vectors-hnsw"]
 
 [[example]]
 name = "stores"
