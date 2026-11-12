@@ -91,3 +91,72 @@ fn updates_equal_a_build_and_searches_equal_a_scan() {
         }
     }
 }
+
+#[test]
+fn segments_answer_as_a_build_and_merge_into_one() {
+    use ikam_kernel::textindex::SegmentOpts;
+    for (merge_above, plain_writes) in [(0.05, false), (0.3, true), (1e9, false)] {
+        let opts = SegmentOpts {
+            merge_above,
+            plain_writes,
+        };
+        let mut rng = Lcg(23);
+        let mut repo = Repo::new(MemStore::default());
+        let empty = repo.db_empty().unwrap();
+        let start: Vec<Event> = (0..600)
+            .map(|i| {
+                Event::upsert(
+                    &format!("doc/{i:04}"),
+                    text(&mut rng).as_bytes(),
+                    &format!("s{i}"),
+                )
+            })
+            .chain([Event::upsert("other/1", b"alpha beta", "o1")])
+            .collect();
+        let mut db = repo.db_append(&empty, &start).unwrap();
+        let mut seg = repo.text_segments_build(&db, "doc/", &opts).unwrap();
+        for round in 0..30 {
+            let batch: Vec<Event> = (0..1 + rng.next() % 40)
+                .map(|j| {
+                    let k = format!("doc/{:04}", rng.next() % 700);
+                    let idem = format!("g{round}-{j}");
+                    match rng.next() % 4 {
+                        0 => Event::remove(&k, false, &idem),
+                        _ => Event::upsert(&k, text(&mut rng).as_bytes(), &idem),
+                    }
+                })
+                .collect();
+            let next = repo.db_append(&db, &batch).unwrap();
+            seg = repo
+                .text_segments_update(&seg, &db, &next, "doc/", &opts)
+                .unwrap();
+            db = next;
+            let built = repo.text_index_build(&db, "doc/").unwrap();
+            for q in [
+                "alpha",
+                "beta gamma",
+                "x ray",
+                "ÉTÉ data",
+                "missing",
+                "42 the of",
+            ] {
+                let want = repo.text_search(&built, q).unwrap();
+                assert_eq!(
+                    repo.text_segments_search(&seg, q).unwrap(),
+                    want,
+                    "{merge_above} round {round}: {q}"
+                );
+            }
+        }
+        let merged = repo.text_segments_merge(&seg, &opts).unwrap();
+        assert_eq!(
+            merged.base,
+            repo.text_index_build(&db, "doc/").unwrap(),
+            "{merge_above}"
+        );
+        assert_eq!(
+            merged.base_postings,
+            repo.graph_nodes(&merged.base).unwrap().len()
+        );
+    }
+}

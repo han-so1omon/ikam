@@ -105,3 +105,209 @@ impl<S: Store> Repo<S> {
         Ok(hits.unwrap_or_default().into_iter().collect())
     }
 }
+
+/// Options for a segmented text index (E247).
+#[derive(Clone, Copy, Debug)]
+pub struct SegmentOpts {
+    /// Merge the delta and dead postings into the base when together they
+    /// pass this share of the base's postings.
+    pub merge_above: f64,
+    /// Store chunks plain, without the slice search (as E245's
+    /// `plain_writes`): the index can be rebuilt from the rows.
+    pub plain_writes: bool,
+}
+
+/// A text index kept as segments (E247), after Lucene's segments and
+/// deletes: `base` holds postings as of its last merge, `delta` the
+/// postings of rows changed since, `dead` the base postings those changes
+/// made stale, and `moved` the changed rows. An update edits only `delta`,
+/// `dead` and `moved`; a merge folds them into `base` in one edit. A
+/// word's rows are `base - dead + delta`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Segments {
+    pub base: Id,
+    pub delta: Id,
+    pub dead: Id,
+    pub moved: Id,
+    pub base_postings: usize,
+    pub delta_postings: usize,
+    pub dead_postings: usize,
+}
+
+impl<S: Store> Repo<S> {
+    /// Run `f` with `opts.plain_writes` in force.
+    fn plain_scope<T>(&mut self, opts: &SegmentOpts, f: impl FnOnce(&mut Self) -> T) -> T {
+        let saved = self.read_weight;
+        if opts.plain_writes {
+            self.read_weight = f64::INFINITY;
+        }
+        let out = f(self);
+        self.read_weight = saved;
+        out
+    }
+
+    /// A row's value from its `kv` node, without looking the key up again.
+    fn kv_value(&self, n: &Node) -> Result<Vec<u8>, Error> {
+        match &n.target {
+            Target::Content(crate::Arg::Range { id, start, len }) => {
+                let bytes = self.read_content(id)?;
+                let v = crate::repo::select(&bytes, *start, *len).ok_or(Error::Corrupt(*id))?;
+                Ok(v.to_vec())
+            }
+            Target::Content(crate::Arg::Whole(id)) => self.read_content(id),
+            _ => Err(Error::Decode("db kv")),
+        }
+    }
+
+    /// Segments with every posting in the base (E247).
+    pub fn text_segments_build(
+        &mut self,
+        db: &Db,
+        prefix: &str,
+        opts: &SegmentOpts,
+    ) -> Result<Segments, Error> {
+        self.plain_scope(opts, |r| {
+            let base = r.text_index_build(db, prefix)?;
+            let base_postings = r.graph_nodes(&base)?.len();
+            let empty = r.put_graph_with(Vec::new(), Keys::Any)?;
+            Ok(Segments {
+                base,
+                delta: empty,
+                dead: empty,
+                moved: empty,
+                base_postings,
+                delta_postings: 0,
+                dead_postings: 0,
+            })
+        })
+    }
+
+    /// Bring `seg`, kept at `old`, up to `new`; merges when the delta and
+    /// dead postings pass `opts.merge_above` of the base.
+    pub fn text_segments_update(
+        &mut self,
+        seg: &Segments,
+        old: &Db,
+        new: &Db,
+        prefix: &str,
+        opts: &SegmentOpts,
+    ) -> Result<Segments, Error> {
+        let changes: Vec<_> = self
+            .graph_diff(&old.kv, &new.kv)?
+            .into_iter()
+            .filter(|c| c.0.starts_with(prefix))
+            .collect();
+        if changes.iter().any(|c| c.0.contains(US)) {
+            return Err(Error::InvalidName(prefix.to_string()));
+        }
+        let labels: BTreeSet<String> = changes.iter().map(|c| c.0.clone()).collect();
+        let moved: BTreeSet<String> = self
+            .graph_nodes_in(&seg.moved, &labels)?
+            .into_iter()
+            .map(|n| n.label)
+            .collect();
+        let (mut delta, mut dead, mut rows) = (BTreeMap::new(), BTreeMap::new(), BTreeMap::new());
+        let mut next = *seg;
+        for (row, before, after) in &changes {
+            let was = match before {
+                Some(n) => words(&self.kv_value(n)?),
+                None => BTreeSet::new(),
+            };
+            let now = match after {
+                Some(n) => words(&self.kv_value(n)?),
+                None => BTreeSet::new(),
+            };
+            if moved.contains(row) {
+                for w in was.difference(&now) {
+                    delta.insert(format!("{w}{US}{row}"), None);
+                }
+                next.delta_postings -= was.len();
+            } else {
+                for w in &was {
+                    let p = posting(w, row);
+                    dead.insert(p.label.clone(), Some(p));
+                }
+                next.dead_postings += was.len();
+                rows.insert(
+                    row.clone(),
+                    Some(Node {
+                        label: row.clone(),
+                        target: Target::None,
+                        edges: Vec::new(),
+                    }),
+                );
+            }
+            for w in &now {
+                let p = posting(w, row);
+                delta.insert(p.label.clone(), Some(p));
+            }
+            next.delta_postings += now.len();
+        }
+        self.plain_scope(opts, |r| {
+            next.delta = r.graph_edit_with(&seg.delta, delta, Keys::Any)?;
+            next.dead = r.graph_edit_with(&seg.dead, dead, Keys::Any)?;
+            next.moved = r.graph_edit_with(&seg.moved, rows, Keys::Any)?;
+            if (next.delta_postings + next.dead_postings) as f64
+                > opts.merge_above * next.base_postings.max(1) as f64
+            {
+                return r.text_segments_merge(&next, opts);
+            }
+            Ok(next)
+        })
+    }
+
+    /// Fold `seg`'s delta and dead postings into its base.
+    pub fn text_segments_merge(
+        &mut self,
+        seg: &Segments,
+        opts: &SegmentOpts,
+    ) -> Result<Segments, Error> {
+        let mut edits: BTreeMap<String, Option<Node>> = BTreeMap::new();
+        for n in self.graph_nodes(&seg.dead)? {
+            edits.insert(n.label, None);
+        }
+        for n in self.graph_nodes(&seg.delta)? {
+            edits.insert(n.label.clone(), Some(n));
+        }
+        self.plain_scope(opts, |r| {
+            let base = r.graph_edit_with(&seg.base, edits, Keys::Any)?;
+            let empty = r.put_graph_with(Vec::new(), Keys::Any)?;
+            let base_postings = seg.base_postings + seg.delta_postings - seg.dead_postings;
+            Ok(Segments {
+                base,
+                delta: empty,
+                dead: empty,
+                moved: empty,
+                base_postings,
+                delta_postings: 0,
+                dead_postings: 0,
+            })
+        })
+    }
+
+    /// `text_search` over segments: each word's rows are `base - dead + delta`.
+    pub fn text_segments_search(&self, seg: &Segments, query: &str) -> Result<Vec<String>, Error> {
+        let rows = |r: &Self, root: &Id, w: &str| -> Result<BTreeSet<String>, Error> {
+            Ok(r.graph_prefix(root, &format!("{w}{US}"))?
+                .into_iter()
+                .filter_map(|n| n.label.split_once(US).map(|(_, r)| r.to_string()))
+                .collect())
+        };
+        let mut hits: Option<BTreeSet<String>> = None;
+        for w in words(query.as_bytes()) {
+            let mut here = rows(self, &seg.base, &w)?;
+            for d in rows(self, &seg.dead, &w)? {
+                here.remove(&d);
+            }
+            here.extend(rows(self, &seg.delta, &w)?);
+            hits = Some(match hits {
+                Some(h) => h.intersection(&here).cloned().collect(),
+                None => here,
+            });
+            if hits.as_ref().is_some_and(BTreeSet::is_empty) {
+                break;
+            }
+        }
+        Ok(hits.unwrap_or_default().into_iter().collect())
+    }
+}

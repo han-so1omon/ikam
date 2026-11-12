@@ -5,5 +5,6 @@
 set -eu
 cd "$(dirname "$0")/.."
 export CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-${TMPDIR:-/tmp}/ikam-orx-target}"
-cargo build --release -q --features search-tantivy --example search_view
-"$CARGO_TARGET_DIR/release/examples/search_view" 50000 10 100 1000
+cargo build --release -q --features search-tantivy --example search_segments
+cargo test --release -q --test textindex
+"$CARGO_TARGET_DIR/release/examples/search_segments" 50000 0.1 10 100 1000
