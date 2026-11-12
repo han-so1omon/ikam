@@ -11,6 +11,7 @@ mod codec;
 mod container;
 mod db;
 mod dict;
+pub mod embeds;
 mod exec;
 mod fragment;
 pub mod func;
