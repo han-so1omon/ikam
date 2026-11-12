@@ -51,6 +51,27 @@ pub struct JoinState {
     pub arranged: BTreeMap<String, Id>,
     pub joins: BTreeMap<String, Id>,
     pub db: Db,
+    /// Distinct join keys on each join's left side when it was last
+    /// computed from scratch (E245's `recompute_above` reads it).
+    pub keys: BTreeMap<String, usize>,
+}
+
+/// Options for keeping joins (E245). The default is E243's behavior.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct JoinOpts {
+    /// Decode each content once per call when reading or recomputing a
+    /// join. A join's rows point into one shared content, so reading them
+    /// one at a time decodes that content once per row.
+    pub read_once: bool,
+    /// Recompute a join instead of updating it when a batch touches more
+    /// than this share of the join keys it had when last recomputed.
+    pub recompute_above: Option<f64>,
+    /// Store the joins' and arrangements' chunks plain, without searching
+    /// for an older chunk to store them as a slice of: they can be rebuilt.
+    pub plain_writes: bool,
+    /// Keep every content decoded during one update or recompute for the
+    /// rest of it (the repository's read memo, scoped to the call).
+    pub memo: bool,
 }
 
 fn bad_key(k: &str) -> Error {
@@ -186,11 +207,52 @@ impl<S: Store> Repo<S> {
         j: &Join,
         db: &Db,
     ) -> Result<(Id, Rows), Error> {
+        self.join_recompute_with(arrs, j, db, &JoinOpts::default())
+    }
+
+    /// `join_recompute` with E245's options (`read_once`).
+    pub fn join_recompute_with(
+        &mut self,
+        arrs: &[Arrangement],
+        j: &Join,
+        db: &Db,
+        opts: &JoinOpts,
+    ) -> Result<(Id, Rows), Error> {
+        let (root, rows, _) = self.scoped(opts, |r| r.recompute(arrs, j, db, opts))?;
+        Ok((root, rows))
+    }
+
+    /// Run `f` with `opts.plain_writes` and `opts.memo` in force.
+    fn scoped<T>(&mut self, opts: &JoinOpts, f: impl FnOnce(&mut Self) -> T) -> T {
+        let saved = (self.read_weight, self.read_memo);
+        if opts.plain_writes {
+            self.read_weight = f64::INFINITY;
+        }
+        self.read_memo |= opts.memo;
+        let began = self.begin_memo();
+        let out = f(self);
+        self.end_memo(began);
+        (self.read_weight, self.read_memo) = saved;
+        out
+    }
+
+    /// `join_recompute`, also returning the left side's distinct join keys.
+    fn recompute(
+        &mut self,
+        arrs: &[Arrangement],
+        j: &Join,
+        db: &Db,
+        opts: &JoinOpts,
+    ) -> Result<(Id, Rows, usize), Error> {
         let get = |n: &str| arrs.iter().find(|a| a.name == n).ok_or_else(|| bad_key(n));
-        let side = |r: &Self, a: &Arrangement| -> Result<Sides, Error> {
+        let mut seen = Seen::new();
+        let mut side = |r: &Self, a: &Arrangement| -> Result<Sides, Error> {
             let mut by: Sides = BTreeMap::new();
             for n in r.graph_prefix(&db.kv, &format!("{}/", a.table))? {
-                let v = r.value_of(&n.target)?;
+                let v = match opts.read_once {
+                    true => r.value_seen(&n.target, &mut seen)?,
+                    false => r.value_of(&n.target)?,
+                };
                 if let Some(jk) = (a.key)(&n.label, &v) {
                     by.entry(jk).or_default().push((n.label, v));
                 }
@@ -207,7 +269,7 @@ impl<S: Store> Repo<S> {
             }
         }
         let nodes = self.rows_nodes(&out)?;
-        Ok((self.put_graph_with(nodes, crate::Keys::Any)?, out))
+        Ok((self.put_graph_with(nodes, crate::Keys::Any)?, out, l.len()))
     }
 
     /// Arrange every table and build every join from `db`.
@@ -221,14 +283,16 @@ impl<S: Store> Repo<S> {
             arranged: BTreeMap::new(),
             joins: BTreeMap::new(),
             db: *db,
+            keys: BTreeMap::new(),
         };
         for a in arrs {
             let root = self.arrange(a, db)?;
             state.arranged.insert(a.name.clone(), root);
         }
         for j in joins {
-            let root = self.join_recompute(arrs, j, db)?.0;
+            let (root, _, keys) = self.recompute(arrs, j, db, &JoinOpts::default())?;
             state.joins.insert(j.name.clone(), root);
+            state.keys.insert(j.name.clone(), keys);
         }
         Ok(state)
     }
@@ -244,11 +308,35 @@ impl<S: Store> Repo<S> {
         state: &JoinState,
         db: &Db,
     ) -> Result<JoinState, Error> {
+        self.joins_update_with(arrs, joins, state, db, &JoinOpts::default())
+    }
+
+    /// `joins_update` with E245's options.
+    pub fn joins_update_with(
+        &mut self,
+        arrs: &[Arrangement],
+        joins: &[Join],
+        state: &JoinState,
+        db: &Db,
+        opts: &JoinOpts,
+    ) -> Result<JoinState, Error> {
+        self.scoped(opts, |r| r.update(arrs, joins, state, db, opts))
+    }
+
+    fn update(
+        &mut self,
+        arrs: &[Arrangement],
+        joins: &[Join],
+        state: &JoinState,
+        db: &Db,
+        opts: &JoinOpts,
+    ) -> Result<JoinState, Error> {
         let changes = self.graph_diff(&state.db.kv, &db.kv)?;
         let mut next = JoinState {
             arranged: state.arranged.clone(),
             joins: state.joins.clone(),
             db: *db,
+            keys: state.keys.clone(),
         };
         let mut touched: BTreeMap<String, Touched> = BTreeMap::new();
         let mut seen = Seen::new();
@@ -288,6 +376,16 @@ impl<S: Store> Repo<S> {
                 touched.get(&j.right).unwrap_or(&none),
             );
             let keys: BTreeSet<&String> = tl.keys().chain(tr.keys()).collect();
+            let had = state.keys.get(&j.name).copied().unwrap_or(0).max(1);
+            if opts
+                .recompute_above
+                .is_some_and(|s| keys.len() as f64 > s * had as f64)
+            {
+                let (root, _, k) = self.recompute(arrs, j, db, opts)?;
+                next.joins.insert(j.name.clone(), root);
+                next.keys.insert(j.name.clone(), k);
+                continue;
+            }
             let (mut edits, mut fresh) = (BTreeMap::new(), Rows::new());
             for jk in keys {
                 let (cl, cr) = (tl.get(jk), tr.get(jk));
@@ -347,9 +445,23 @@ impl<S: Store> Repo<S> {
 
     /// A join's rows at `state`.
     pub fn join_rows(&self, state: &JoinState, name: &str) -> Result<Rows, Error> {
-        let mut out = Rows::new();
+        self.join_rows_with(state, name, &JoinOpts::default())
+    }
+
+    /// `join_rows`; with `read_once`, each content is decoded once.
+    pub fn join_rows_with(
+        &self,
+        state: &JoinState,
+        name: &str,
+        opts: &JoinOpts,
+    ) -> Result<Rows, Error> {
+        let (mut out, mut seen) = (Rows::new(), Seen::new());
         for n in self.graph_nodes(&state.joins[name])? {
-            out.insert(n.label.clone(), self.value_of(&n.target)?);
+            let v = match opts.read_once {
+                true => self.value_seen(&n.target, &mut seen)?,
+                false => self.value_of(&n.target)?,
+            };
+            out.insert(n.label.clone(), v);
         }
         Ok(out)
     }

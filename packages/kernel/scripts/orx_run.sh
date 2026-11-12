@@ -5,5 +5,8 @@
 set -eu
 cd "$(dirname "$0")/.."
 export CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-${TMPDIR:-/tmp}/ikam-orx-target}"
-cargo build --release -q --example shared_joins
-"$CARGO_TARGET_DIR/release/examples/shared_joins" 20000 1000 10 100 1000
+cargo build --release -q --example join_switch
+cargo test --release -q --test join
+for n in 20000 100000; do
+  "$CARGO_TARGET_DIR/release/examples/join_switch" $n 1000 0.1,0.2,0.4 10 30 100 300 1000 3000
+done

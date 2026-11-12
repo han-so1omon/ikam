@@ -131,3 +131,74 @@ fn updates_equal_a_recompute() {
     }
     assert!(!repo.join_rows(&state, "a_c").unwrap().is_empty());
 }
+
+#[test]
+fn options_give_the_same_rows() {
+    use ikam_kernel::join::JoinOpts;
+    let mut rng = Lcg(9);
+    let mut repo = Repo::new(MemStore::default());
+    let empty = repo.db_empty().unwrap();
+    let start: Vec<Event> = (0..600)
+        .map(|i| change(&mut rng, format!("s{i}")))
+        .collect();
+    let db0 = repo.db_append(&empty, &start).unwrap();
+    let (arrs, joins) = (arrs(), joins());
+    let fast = JoinOpts {
+        read_once: true,
+        plain_writes: true,
+        memo: true,
+        ..Default::default()
+    };
+    let ways = [
+        JoinOpts {
+            plain_writes: true,
+            ..Default::default()
+        },
+        JoinOpts {
+            memo: true,
+            ..Default::default()
+        },
+        JoinOpts {
+            recompute_above: Some(0.0),
+            ..fast
+        },
+        JoinOpts {
+            recompute_above: Some(0.5),
+            ..fast
+        },
+        JoinOpts {
+            recompute_above: Some(2.0),
+            ..fast
+        },
+    ];
+    let mut states: Vec<_> = ways
+        .iter()
+        .map(|_| repo.joins_build(&arrs, &joins, &db0).unwrap())
+        .collect();
+    let mut db = db0;
+    for round in 0..25 {
+        let batch: Vec<Event> = (0..1 + rng.next() % 60)
+            .map(|i| change(&mut rng, format!("o{round}-{i}")))
+            .collect();
+        db = repo.db_append(&db, &batch).unwrap();
+        for (state, opts) in states.iter_mut().zip(&ways) {
+            *state = repo
+                .joins_update_with(&arrs, &joins, state, &db, opts)
+                .unwrap();
+            for j in &joins {
+                let want = repo.join_recompute(&arrs, j, &db).unwrap().1;
+                assert_eq!(
+                    repo.join_rows_with(state, &j.name, opts).unwrap(),
+                    want,
+                    "round {round}: {}",
+                    j.name
+                );
+                assert_eq!(repo.join_rows(state, &j.name).unwrap(), want);
+                assert_eq!(
+                    repo.join_recompute_with(&arrs, j, &db, opts).unwrap().1,
+                    want
+                );
+            }
+        }
+    }
+}
