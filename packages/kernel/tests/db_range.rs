@@ -45,7 +45,7 @@ fn drop_range_equals_put_graph_of_the_rest() {
                 let want = repo.put_graph(rest.clone()).unwrap();
                 let got = repo.graph_drop_range(&root, &lo, hi).unwrap();
                 assert_eq!(got, want, "n={n} lo={lo} hi={hi:?}");
-                let inside = repo.graph_in_range(&root, &lo, hi).unwrap();
+                let inside = repo.graph_range(&root, &lo, hi, usize::MAX, false).unwrap();
                 assert_eq!(inside.len() + rest.len(), n);
             }
         }
@@ -173,4 +173,31 @@ fn row_ids_are_stable_and_retries_keep_them() {
             Db::row_key("t", 5)
         ]
     );
+}
+
+/// With kept counts (E233) on, a range or subtree remove under
+/// `db_range_drop` still leaves counts equal to counts from scratch.
+#[test]
+fn range_drop_keeps_counts_right() {
+    for rows in [3, 400, 5000] {
+        let mut repo = Repo::new(MemStore::default());
+        repo.db_range_drop = true;
+        let plain = base(&mut repo, rows);
+        let db = repo.db_keep_counts(&plain, 2).unwrap();
+        let after = repo
+            .db_append(
+                &db,
+                &[
+                    Event::remove("b", true, "rm-b"),
+                    Event::remove_range("a/00001", "a/00003", "rr-a"),
+                    Event::upsert("c/new", b"n", "u1"),
+                ],
+            )
+            .unwrap();
+        assert_eq!(
+            repo.db_counts_rebuild(&after.kv, 2).unwrap(),
+            after.counts.unwrap().root,
+            "rows={rows}"
+        );
+    }
 }
