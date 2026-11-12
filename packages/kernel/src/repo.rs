@@ -166,6 +166,10 @@ pub struct Repo<S: Store> {
     /// checked against their id are kept, and evaluation work is counted
     /// as before, so the bytes written are the same either way.
     pub read_memo: bool,
+    /// E249: `graph_diff` walks both graphs level by level and skips the
+    /// subtrees both share (same id), instead of listing every leaf of
+    /// both. The same changes either way; off by default.
+    pub prune_diff: bool,
     pub(crate) memo: std::sync::Mutex<Option<Memo>>,
     /// With a `seed_scope`, add each old tree and graph chunk that a tree
     /// or view edit reads to the seed index before the edit writes its new
@@ -232,6 +236,7 @@ impl<S: Store> Repo<S> {
             level: crate::dict::MEASURE_LEVEL,
             deflate_memo: None,
             read_memo: false,
+            prune_diff: false,
             memo: Default::default(),
             replace_hints: false,
             exact_short_search: false,

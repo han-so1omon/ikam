@@ -8,5 +8,7 @@ export CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-${TMPDIR:-/tmp}/ikam-orx-target}"
 # Runs unpack sources with old modification times; touch them so cargo
 # rebuilds this crate instead of reusing another branch's build.
 find . -name '*.rs' -exec touch {} +
-cargo build --release -q --features search-tantivy --example search_tantivy_view
+cargo test --release -q --test prune_diff --test textindex
+cargo build --release -q --features search-tantivy --example search_segments --example search_tantivy_view
+"$CARGO_TARGET_DIR/release/examples/search_segments" 50000 0.1 10 100 1000
 "$CARGO_TARGET_DIR/release/examples/search_tantivy_view" 50000 10 100 1000

@@ -250,10 +250,11 @@ fn main() {
         .collect();
     let dir = std::env::temp_dir().join(format!("e248-tantivy-{}", std::process::id()));
     let lag_dir = std::env::temp_dir().join(format!("e248-tantivy-lag-{}", std::process::id()));
-    for way in ["disk", "ram"] {
+    for way in ["disk", "ram", "disk_pruned", "ram_pruned"] {
+        repo.prune_diff = way.ends_with("pruned"); // E249
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        let d = (way == "disk").then_some(dir.as_path());
+        let d = way.starts_with("disk").then_some(dir.as_path());
         let t = Instant::now();
         let mut v = View::build(d, &repo, &dbs[0]);
         println!(
