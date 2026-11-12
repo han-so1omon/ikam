@@ -80,6 +80,10 @@ name = "vector_views"
 required-features = ["vectors-hnsw"]
 
 [[example]]
+name = "hybrid"
+required-features = ["search-tantivy", "vectors-hnsw"]
+
+[[example]]
 name = "stores"
 required-features = ["stores"]
 test = true

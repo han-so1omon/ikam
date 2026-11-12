@@ -246,3 +246,45 @@ impl<S: Store> Repo<S> {
         Ok(exact)
     }
 }
+
+/// Reciprocal rank fusion (E254; Cormack, Clarke and Buettcher, 2009): a
+/// row's score is the sum over lists of `1 / (k + rank)`, ranks from 1.
+pub fn rrf(lists: &[Vec<String>], k: f32) -> Vec<(String, f32)> {
+    let mut score: BTreeMap<String, f32> = BTreeMap::new();
+    for list in lists {
+        for (r, key) in list.iter().enumerate() {
+            *score.entry(key.clone()).or_default() += 1.0 / (k + r as f32 + 1.0);
+        }
+    }
+    let mut out: Vec<(String, f32)> = score.into_iter().collect();
+    out.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    out
+}
+
+/// A convex combination of two scored lists (E254; Bruch et al., 2022):
+/// each list's scores min-max normalized, then `alpha * a + (1 - alpha) * b`;
+/// a row missing from a list scores 0 there.
+pub fn convex(a: &[(String, f32)], b: &[(String, f32)], alpha: f32) -> Vec<(String, f32)> {
+    let norm = |l: &[(String, f32)]| -> BTreeMap<String, f32> {
+        let (lo, hi) = l.iter().fold((f32::MAX, f32::MIN), |(lo, hi), x| {
+            (lo.min(x.1), hi.max(x.1))
+        });
+        let span = if hi > lo { hi - lo } else { 1.0 };
+        l.iter()
+            .map(|(k, s)| (k.clone(), (s - lo) / span))
+            .collect()
+    };
+    let (na, nb) = (norm(a), norm(b));
+    let keys: BTreeSet<&String> = na.keys().chain(nb.keys()).collect();
+    let mut out: Vec<(String, f32)> = keys
+        .into_iter()
+        .map(|k| {
+            (
+                k.clone(),
+                alpha * na.get(k).unwrap_or(&0.0) + (1.0 - alpha) * nb.get(k).unwrap_or(&0.0),
+            )
+        })
+        .collect();
+    out.sort_by(|x, y| y.1.total_cmp(&x.1).then_with(|| x.0.cmp(&y.0)));
+    out
+}

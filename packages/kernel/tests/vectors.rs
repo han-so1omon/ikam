@@ -81,3 +81,18 @@ fn ivf_view_is_exact_when_probing_all_and_updates_like_a_build() {
         );
     }
 }
+
+#[test]
+fn fusion_orders_as_its_formula() {
+    use ikam_kernel::vectors::{convex, rrf};
+    let s = |v: &[&str]| v.iter().map(|x| x.to_string()).collect::<Vec<_>>();
+    let r = rrf(&[s(&["a", "b", "c"]), s(&["c", "a", "d"])], 60.0);
+    let keys: Vec<&str> = r.iter().map(|x| x.0.as_str()).collect();
+    assert_eq!(keys, ["a", "c", "b", "d"]);
+    assert!((r[0].1 - (1.0 / 61.0 + 1.0 / 62.0)).abs() < 1e-6);
+    let a = vec![("x".to_string(), 10.0), ("y".to_string(), 0.0)];
+    let b = vec![("y".to_string(), 3.0), ("z".to_string(), 1.0)];
+    let c = convex(&a, &b, 0.5);
+    assert_eq!(c[0].0, "x");
+    assert!((c[0].1 - 0.5).abs() < 1e-6 && (c[1].1 - 0.5).abs() < 1e-6 && c[2].1 == 0.0);
+}
