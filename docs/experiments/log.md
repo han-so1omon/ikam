@@ -3430,3 +3430,30 @@ Gates on the branch: every kernel test suite passes (release); clippy `-D warnin
   - They update faster than Tantivy's synced commit at 10 and 100 documents.
   - They are still 22 to 32 times slower than Tantivy in RAM. At 10 documents that floor is the diff (E249), not the segments.
 - Run: `cargo run --release --features search-tantivy --example search_segments -- 50000 0.1 10 100 1000`.
+
+### E248 tantivy-view (Tantivy kept as a rebuildable view over the ikam log)
+- Branch / parent: exp/248-tantivy-view / exp/247-search-segments
+- Question: E244's next step was Tantivy as a derived cache of a database state, rebuilt or caught up from the log, with the state recorded beside it. What does that cost, kept from ikam rather than fed documents directly, and how does it compare with E247's segments? Hypothesis from the data-lake search paper (docs/research/incremental-views.md): an index derived from the system of record can stay close to current at small cost.
+- Change: none in the kernel. `examples/search_tantivy_view.rs` keeps the view this way:
+  - The index is built from the rows read from ikam (`graph_prefix` over `kv`, values read from their event contents).
+  - It catches up from the `kv` diff: delete each changed key, and add its new value if it has one.
+  - Each commit's payload is `log kv`, the roots of the state the index reflects. An index reopened from disk reads its payload and catches up from there; one that is lost or names an unknown state is rebuilt.
+  - All of this runs on E247's documents and batches.
+- Result (an Apple M3 Pro laptop, through OpenResearch's local backend). Answers equal the built-in index built at the same state, after the updates, after a lagged catch-up, and after a reopen.
+
+  | | On disk (each commit synced) | In RAM |
+  |---|---|---|
+  | Build from ikam (50,000 rows) | 305 ms | 216 ms |
+  | Catch up 10 documents | 102 ms | 26.2 ms |
+  | Catch up 100 documents | 132 ms | 34.8 ms |
+  | Catch up 1,000 documents | 196 ms | 68.6 ms |
+  | Catch up after a lag of 5 batches (4,746 rows) | 147 ms | 97.5 ms |
+  | Reopen and read the payload | 0.6 ms | |
+
+  - E247 ran Tantivy fed the documents directly at 0.9, 1.6 and 6.7 ms in RAM. Kept from ikam, the difference is reading the changes: a profile of the catch-up at 10 documents puts 80% of it in `graph_diff`, which lists every leaf of both `kv` graphs (E249).
+  - The view against E247's segments: 26 against 28 ms at 10 documents, 35 against 51 at 100, and 69 against 151 at 1,000, both in memory. Queries of several words stay 6 to 56 times faster in Tantivy (E247).
+  - Catching up once after five batches costs about as much as one batch of 1,000, so a view that lags and catches up in one go pays one commit, not five.
+- Not measured: a crash between ikam's commit and the view's (the payload makes the view's state known, so a restart catches up or rebuilds); ranking; real text.
+- Trade-off: a second store to keep, and its own durability. The ikam log stays the record, and the view can always be rebuilt from it in about 0.3 s at 50,000 rows.
+- Verdict: **measured.** Kept from the log with its state in the commit payload, Tantivy matches or beats E247's segments for updates and is far faster for queries of several words. Its catch-up cost is mostly ikam's diff, which E249 addresses.
+- Run: `cargo run --release --features search-tantivy --example search_tantivy_view -- 50000 10 100 1000`.
