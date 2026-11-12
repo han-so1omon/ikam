@@ -37,7 +37,7 @@ mod wasm;
 pub mod worktree;
 
 pub use container::expand;
-pub use db::{Db, Event, Op};
+pub use db::{Counts, Db, Event, Op, prefix_end};
 pub use dict::decode_cost;
 pub use fragment::{FragmentIndex, blocks};
 pub use grant::{Denied, FileGrant, FragmentGrant, Grant, Sections, windows_around};
@@ -50,7 +50,7 @@ pub use range::ReadSession;
 pub use repack::Repacked;
 pub use repo::{DEFAULT_READ_WEIGHT, Form, Put, Repo};
 pub use search::{SEARCH_REF, SearchIndex};
-pub use store::{FsStore, MemStore, Store};
+pub use store::{FsStore, MemStore, SharedStore, Store};
 pub use worktree::Edit;
 
 #[derive(Debug, thiserror::Error)]

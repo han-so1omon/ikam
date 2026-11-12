@@ -11,7 +11,7 @@
 //! - Derivations enter the ledger only after they reproduce their output.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock, RwLock, RwLockReadGuard};
 
 use crate::dict::object_tag;
 use crate::matcher::Index;
@@ -40,6 +40,16 @@ pub enum Form {
 pub struct Put {
     pub id: Id,
     pub form: Form,
+}
+
+/// The ledger, read: derefs to the ledger, which is built by then.
+pub(crate) struct LedgerRef<'a>(RwLockReadGuard<'a, Option<Ledger>>);
+
+impl std::ops::Deref for LedgerRef<'_> {
+    type Target = Ledger;
+    fn deref(&self) -> &Ledger {
+        self.0.as_ref().expect("built before it is handed out")
+    }
 }
 
 /// Ledger projection: rebuilt from derivation objects on demand.
@@ -82,7 +92,9 @@ impl Cx {
 pub struct Repo<S: Store> {
     pub(crate) store: S,
     pub(crate) index: Option<Index>,
-    ledger: OnceLock<Ledger>,
+    /// Shared with `sibling`s (E232), so a derivation the writer records
+    /// is seen by every handle reading the same store.
+    ledger: Arc<RwLock<Option<Ledger>>>,
     /// Current shared dictionary (see `dict.rs`), loaded on first use.
     pub(crate) dict: OnceLock<Option<(Id, Vec<u8>)>>,
     /// Encoded bytes newly written through this handle.
@@ -188,6 +200,12 @@ pub struct Repo<S: Store> {
     /// earlier content, and the edit does not read the similar chunks a
     /// template plan would be tried against.
     pub object_templates: bool,
+    /// Store database events as they are, without looking for a slice or
+    /// template plan (E229). Off by default. A row event is small and
+    /// rarely shares much with earlier ones, so the search mostly costs
+    /// time; on, an append skips it, and a batch of similar rows may take
+    /// more room.
+    pub plain_db_events: bool,
     pub(crate) writing_object: bool,
 }
 
@@ -215,7 +233,7 @@ impl<S: Store> Repo<S> {
         Repo {
             store,
             index: None,
-            ledger: OnceLock::new(),
+            ledger: Default::default(),
             dict: OnceLock::new(),
             bytes_written: 0,
             read_weight: DEFAULT_READ_WEIGHT,
@@ -236,6 +254,7 @@ impl<S: Store> Repo<S> {
             replace_hints: false,
             exact_short_search: false,
             object_templates: true,
+            plain_db_events: false,
             writing_object: false,
             hints: Default::default(),
         }
@@ -393,9 +412,12 @@ impl<S: Store> Repo<S> {
         &self.store
     }
 
-    pub(crate) fn ledger(&self) -> Result<&Ledger, Error> {
-        if let Some(ledger) = self.ledger.get() {
-            return Ok(ledger);
+    pub(crate) fn ledger(&self) -> Result<LedgerRef<'_>, Error> {
+        {
+            let got = self.ledger.read().unwrap_or_else(|e| e.into_inner());
+            if got.is_some() {
+                return Ok(LedgerRef(got));
+            }
         }
         let mut ledger = Ledger::default();
         // Records' outputs first: short records resolve their arguments
@@ -453,7 +475,37 @@ impl<S: Store> Repo<S> {
                 *slot = Some(set);
             }
         }
-        Ok(self.ledger.get_or_init(|| ledger))
+        {
+            let mut slot = self.ledger.write().unwrap_or_else(|e| e.into_inner());
+            if slot.is_none() {
+                *slot = Some(ledger);
+            }
+        }
+        Ok(LedgerRef(
+            self.ledger.read().unwrap_or_else(|e| e.into_inner()),
+        ))
+    }
+
+    /// Another handle on the same store (one whose clones share it, such as
+    /// `SharedStore`), for reads on another thread (E232). It shares the
+    /// ledger, so it reads what this handle derives, and copies the
+    /// dictionary and the options; it plans nothing, so it has no index.
+    pub fn sibling(&self) -> Repo<S>
+    where
+        S: Clone,
+    {
+        let mut r = Repo::new(self.store.clone());
+        r.ledger = self.ledger.clone();
+        if let Some(d) = self.dict.get() {
+            let _ = r.dict.set(d.clone());
+        }
+        r.read_weight = self.read_weight;
+        r.short_records = self.short_records;
+        r.markup_layers = self.markup_layers;
+        r.object_templates = self.object_templates;
+        r.plain_db_events = self.plain_db_events;
+        r.exact_short_search = self.exact_short_search;
+        r
     }
 
     /// Change `seed_scope`, dropping the seed index so the next write builds
@@ -466,7 +518,7 @@ impl<S: Store> Repo<S> {
 
     pub(crate) fn reset_projections(&mut self) {
         self.index = None;
-        self.ledger = OnceLock::new();
+        *self.ledger.write().unwrap_or_else(|e| e.into_inner()) = None;
         self.dict = OnceLock::new();
         *self.needed.get_mut().unwrap() = None;
     }
@@ -559,7 +611,11 @@ impl<S: Store> Repo<S> {
         let encoded = Object::Derivation(d.clone()).encode();
         let id = Id::of(&encoded);
         if self.write(id, &encoded)?
-            && let Some(ledger) = self.ledger.get_mut()
+            && let Some(ledger) = self
+                .ledger
+                .write()
+                .unwrap_or_else(|e| e.into_inner())
+                .as_mut()
         {
             ledger.insert(d);
         }
