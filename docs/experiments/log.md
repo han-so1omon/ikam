@@ -3288,7 +3288,7 @@ Newest last. Format and rules: `README.md`.
 
 ### E226 commit-cost (where a report copy's time goes, as `ikam live` stores it)
 - Branch / parent: exp/226-commit-cost / main 1c5efb9
-- Question: the Mercante report-copy demo on example-host (Nov 10) reported 47 ms a copy, with `store_ms` 4.7 and `tree_ms` 16.7 (`X-Ikam-Cost`), and E178 found a commit that drops a superseded copy reads the whole store (2.2 s at 1M). Where does a copy's time go: tree CPU, store reads, or writes?
+- Question: the Mercante report-copy demo on a Mac (Nov 10) reported 47 ms a copy, with `store_ms` 4.7 and `tree_ms` 16.7 (`X-Ikam-Cost`), and E178 found a commit that drops a superseded copy reads the whole store (2.2 s at 1M). Where does a copy's time go: tree CPU, store reads, or writes?
 - Change: none in the kernel. `examples/commits.rs`: as `ikam live` does for one PUT, `put_content` of a lead-lag report (E211's `reports` generator), `edit_tree` at `reports/<name>`, then `Repo::commit`, on one handle reopened after setup, with N reports already in the folder; 20 copies after one warm-up, medians; a counting store wrapper reports writes, reads, whole-store scans and drops. FsStore in a temporary directory (ext4, this Linux box) and MemStore (CPU only).
 - Result (two runs; FsStore times vary about 2x between runs on this box, MemStore little):
 
@@ -3330,3 +3330,18 @@ Gates on the branch: every kernel test suite passes (release); clippy `-D warnin
 ### Merge of E226 to E228 into main (Nov 11)
 - On Eric's word ("Merge it"), exp/226-commit-cost (c0d333c) fast-forwarded onto main 1c5efb9. `FsStore::open` is unchanged and stays the default; `FsStore::open_deferred`, `ikam live --deferred-sync` and `ikam live --no-object-templates` are off unless asked for.
 - Gates, run on c0d333c before the merge (main had not moved): every kernel test suite passes (release); clippy `-D warnings` and fmt clean; the bench gives the same byte and count fields as main 1c5efb9 on the same machine (only times and peak memory differ), north 0.3035.
+
+### E229 mac-commit-cost (E226 to E228 on macOS, APFS)
+- Branch / parent: exp/229-mac-results / main 6138eba
+- Question: E226 to E228 were measured on Linux ext4. E226 inferred that on macOS a copy's time is its synced writes (std's `sync_all` is F_FULLFSYNC there). Is that so, and what do `--deferred-sync` and `--no-object-templates` give on APFS?
+- Change: none. E226's harness (`examples/commits.rs`) built from main 6138eba in a temporary worktree on an M3 Pro MacBook (APFS), Nov 11; 20 copies after one warm-up into folders of 2, 30 and 300 reports, then a three-PUT `ikam live` check on a temporary store. The worktree, build and stores were removed afterwards.
+- Result (medians a copy; ranges are across 2, 30 and 300 reports; bytes and writes identical in every mode, no drops):
+  - Default FsStore, a commit after each copy: store 9.9 to 10.0 ms (2 writes), tree 20.9 to 23.2 ms (5 writes), commit 8.5 to 9.6 ms (2 writes); copy 30.9 to 33.1 ms; 20 copies with their commits 810 to 857 ms. That is about 4.5 ms for each synced write, so E226's inference holds: tree CPU is about 1 ms of the 21.
+  - `open_deferred`, a commit after each copy: store 0.9 to 1.1, tree 1.1 to 1.4, commit 4.3 to 5.2 ms; copy 1.9 to 2.5 ms; 20 copies 125 to 155 ms.
+  - Deferred with `object_templates` off: tree 0.9 to 1.0 ms, reads a tree 21 to 17; copy 1.7 to 2.1 ms; 20 copies 130 to 140 ms. About 0.2 to 0.4 ms a copy, as small as E228 found at these sizes.
+  - A commit after every 20 copies (as `ikam live` does when edits come in a burst): default 616 to 670 ms for the 20; deferred 55 to 67 ms, the one commit taking 16 to 23 ms.
+  - A fresh handle's first copy at 300 reports: 115.5 / 122.5 ms default against 45.2 to 46.8 ms deferred.
+  - `ikam live --deferred-sync --no-object-templates`, three PUTs into `reports/`: `X-Ikam-Cost` new_bytes 176 / 218 / 260, store_ms 0.22 to 0.36, tree_ms 0.65 to 0.89, index_ms 0.07 to 0.11. After a stop, `ls main:reports` lists r1.md to r3.md (9 B each), `fsck` ok, no `.pending-*` file left.
+- Verdict: **measured**. On APFS deferred sync makes a report copy about 15 times faster (31 to 33 ms to about 2 ms) and a burst of 20 about 10 times faster; the trade-off stays E227's (a crash loses edits made since the last commit, which `ikam live` makes after 1.5 s of quiet; a clean stop on SIGTERM commits first). `--no-object-templates` adds little below thousands of files. Both stay off by default in the code.
+- Follow-up (Nov 12): `--deferred-sync` turned on for one private `ikam live` deployment on that Mac. After the restart the process carries the flag, the server answers, its log is clean, `fsck` ok and no `.pending-*` file is left while idle.
+- Run: `cargo build --release --example commits --bin ikam`, then `commits [--deferred] [--no-object-templates] --every 1|20 2 30 300`.
