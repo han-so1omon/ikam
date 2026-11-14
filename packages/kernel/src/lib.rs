@@ -22,6 +22,7 @@ mod group;
 mod history;
 mod id;
 mod ingest;
+pub mod integrate;
 pub mod ir;
 pub mod join;
 mod library;

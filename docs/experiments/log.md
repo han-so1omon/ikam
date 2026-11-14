@@ -3738,3 +3738,41 @@ Gates on the branch (E229 to E233): every kernel test suite passes (release); cl
 - Verdict: **kept** as an option (opt-in API). A draft as a branch gives the staging model's three properties (invisible, promoted whole, dropped by gc) with E265's merge and one new store operation, at about a millisecond to open and promote.
 - Run: `cargo run --release --example drafts`; `cargo test --release --test drafts`.
 - Gates on the branch: every kernel test suite passes (release); clippy `-D warnings` and fmt clean; the bench gives the same byte fields as main d82414f, north 0.3096. As for E265, the corpora built from git history were left out (their pinned commits are not in the rewritten history).
+
+### E262 background-integrator (views kept current on another thread while appends return)
+- Branch / parent: exp/262-integrator / main d82414f, rebased on f4cc649 (E266)
+- Question: E260 found that keeping views current after every append is most of a session of single appends (37 s against 4.0 s caught up once, 100,000 rows). Can a worker on another thread keep the views close behind the log, so the writer pays what "caught up once" pays and a reader still finds views a few events behind, without breaking the swap law (a view state equals a full build at the same log position)?
+- Change (opt-in, library only; nothing starts a worker unless a caller does):
+  - `integrate` (src/integrate.rs): `Integrator::start(repo, graph, state, Policy { min_events, max_lag })` runs `views_update` on a sibling handle (`Repo::sibling`, E232) whenever the views lag the newest database by at least `min_events`, folding all that has arrived in one pass. `advance(db)` returns at once, or waits while the lag exceeds `max_lag` (backpressure); `current()`, `lag()`, `passes()`; `wait(db)` folds now and returns the views at `db`; `stop()` catches up and ends the worker. The worker's chunks look for repeats only in the views' own chunks (`seed_scope`, E133).
+  - Kernel: handles made with `Repo::sibling` now share the needed index (E129) and copy `needed_index`, so a writer and a worker on one store count as one writer and neither can drop a stored copy the other's encodings need. Single-handle behaviour is unchanged.
+  - Tests (tests/integrate.rs): every state the worker writes, and the one `wait` returns, equals `views_build` at the same database (an incremental and a stored view); `wait` sees its own write; below `min_events` nothing folds and `stop` catches up; the lag cap holds after every `advance`; on an FsStore with the opt-ins the log rebuilds to the same database and `fsck_deep` is clean; siblings share the index.
+- Result (`examples/integrator.rs`: E260's W2, 100,000 generated rows and its per-id sum view (incremental), FsStore with deferred sync (E227), `plain_db_events` (E232) and `needed_index` (E129), writer and worker sharing the store through `SharedStore`; a commit after every append; each case from a copy of one loaded store after a warm-up append; a 4-core cloud machine, nothing else running; two runs, both given):
+
+  200 single appends:
+
+  | Views | Session | Writer's wait per append, p50 / p99 | Lag p99 (events) | Last read waits | Passes |
+  |---|---|---|---|---|---|
+  | after every append | 30.7 / 26.8 s | 149 / 221, 133 / 186 ms | 0 | 0 | 200 |
+  | once at the end | 5.5 / 3.0 s | 26 / 40, 15 / 24 ms | 198 | 190 / 153 ms | 1 |
+  | background, min 1 | 3.3 / 2.9 s | 16 / 28, 14 / 19 ms | 36 / 32 | 147 / 138 ms | 14 |
+  | background, min 50 | 3.0 / 3.1 s | 14 / 23, 15 / 25 ms | 66 / 65 | 132 / 130 ms | 4 |
+  | background, min 1, lag cap 20 | 4.0 / 3.9 s | 17 / 73, 17 / 75 ms | 20 | 148 / 230 ms | 20 / 21 |
+
+  2,000 events in batches of 100:
+
+  | Views | Session | Writer's wait per batch, p50 / p99 | Lag p99 (events) | Last read waits | Passes |
+  |---|---|---|---|---|---|
+  | after every batch | 7.0 / 7.1 s | 354 / 438, 368 / 444 ms | 0 | 0 | 20 |
+  | once at the end | 3.5 / 3.2 s | 170 / 259, 164 / 221 ms | 2,000 | 452 / 395 ms | 1 |
+  | background, min 1 | 3.9 / 3.8 s | 195 / 252, 186 / 243 ms | 400 | 413 / 364 ms | 14 / 15 |
+  | background, min 1, lag cap 200 | 3.9 / 4.3 s | 187 / 268, 205 / 320 ms | 200 | 223 / 246 ms | 16 |
+
+  - Single appends: the writer pays what "once at the end" pays (the first run's end case, 5.5 s, is the outlier; the second gives 3.0 s), 9 times less than updating after every append, and the views stay 30 to 70 events behind instead of up to 200.
+  - A pass costs 130 to 230 ms at 100,000 rows almost whatever it folds (one event or forty): the worker can never fold a single append before the next arrives, so the lag settles where one pass's time covers the appends that come in meanwhile. The same fixed cost is why updating after every append is slow; `min_events` hardly changes the writer's cost, only how far behind the views are.
+  - Batches of 100: the worker halves the session against updating after every batch, but the writer waits 10 to 15% longer than with views caught up once, from sharing the store's lock and the CPU with the worker.
+  - The lag cap holds exactly; the writer then waits for passes now and then (single appends p99 73 to 75 ms against 19 to 28 uncapped).
+  - In every case the last state equals `views_build` at the same database.
+- Not measured: a crash while the worker runs (its state is in memory; a restart begins from the last state the caller saved, or rebuilds); gc while the worker runs (not supported: gc does not count the worker's state as live); several view graphs, joins (E243) and kept counts on workers; 1M rows; macOS (E260's Mac part).
+- Verdict: **kept** as an option (opt-in API). For a stream of small appends a background worker gives the writer the "caught up once" cost with views tens of events behind; for large batches it trades a little writer latency for a much shorter lag. The next cost to attack is the fixed cost of a pass, not when it runs.
+- Run: `cargo run --release --example integrator -- 100000`; `cargo test --release --test integrate`.
+- Gates on the branch: every kernel test suite passes (release, 233 tests; 239 after the rebase on f4cc649); clippy `-D warnings` and fmt clean; the bench gives the same byte fields as main d82414f, north 0.3096 (corpora from git history left out, as for E265).
