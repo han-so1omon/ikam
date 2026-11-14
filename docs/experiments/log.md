@@ -3666,3 +3666,31 @@ Gates on the branch: every kernel test suite passes (release); clippy `-D warnin
 - Trade-off: the cache trades a lookup a fragment for a model call a distinct fragment. With a cheap static model that is about even; with a transformer the calls dominate.
 - Verdict: **measured; E255's option holds for edits, not for corpus-wide duplicates.** Real duplicates are few (19% of paragraphs), so a build saves little. Real edits leave 81 to 86% of a changed README's paragraphs as they were, so updates embed 5 to 7 times fewer paragraphs, as E255 found. Next: skip rows whose value did not change before looking up their fragments, and cut the view's cost a fragment.
 - Run: `python3 examples/real_text/fetch.py PROJECTS.jsonl 45000 2000 SIMPLE_INDEX.json`, `WORDLLAMA_DIR=... python3 examples/real_text/prepare.py PROJECTS.jsonl DIR`, then `cargo run --release --example embed_real -- DIR`.
+
+### E257 real-vector-views (E253's vector views on real vectors, with drift)
+- Branch / parent: exp/257-real-vector-views / exp/256-real-embed-cache
+- Question: E253 measured flat int8, IVF and HNSW on 50,000 synthetic 64-dimension vectors drawn from 100 clusters, whose queries came from the same distribution. How do they recall on real embeddings of real text, queried by real queries, and what happens when data arrives from regions the IVF centroids were never trained on (E253's "drift", not measured)? Notes: docs/research/search-engines.md (HNSW, IVF, FreshDiskANN).
+- Change: none to the kernel. `examples/vector_real.rs` over E256's data:
+  - Rows are WordLlama vectors (256 dimensions): every README whole (`docs`, 13,055 rows) or an even sample of 100,000 of the 431,766 distinct paragraphs (`frags`). Queries are the vectors of 300 project summaries (E258's known-item queries).
+  - Drift: 20-means over a sample of the rows; the rows nearest two of the 20 centroids (8% of READMEs, 5% of paragraphs) are held out. Every way is built on the rest (IVF centroids trained on them), queried, fed the held-out rows in batches of 10, 100, 1,000 and the remainder, and queried again against exact search over all rows.
+  - Ways as E253: exact (every row read from ikam), flat int8 (one list, best 40 rescored), IVF (sqrt(N) lists, 8 or 32 probed, best 40 rescored) and HNSW (`hnsw_rs`, in memory, M 16, ef 100 to build, 64 or 128 to search).
+- Result (recall@10 against exact search; a 4-core cloud machine; HNSW builds single-threaded):
+
+  | Way | READMEs (13,055): query, recall, after drift | Paragraphs (100,000): query, recall, after drift | Update of 10 / 1,000 rows (paragraphs) |
+  |---|---|---|---|
+  | Exact, every row read from ikam | 976 ms, 1.000 | 9,451 ms, 1.000 | |
+  | Flat int8, best 40 rescored | 14.3 ms, 1.000, 1.000 | 128 ms, 1.000, 1.000 | 5.7 / 267 ms |
+  | IVF, 8 probed (109 / 307 lists) | 6.8 ms, 0.692, 0.693 | 59 ms, 0.707, 0.708 | 7.1 / 440 ms |
+  | IVF, 32 probed | 11.9 ms, 0.926, 0.923 | 75 ms, 0.839, 0.838 | 10.4 / 474 ms |
+  | HNSW, ef 64 | 0.51 ms, 0.812, 0.817 | 1.5 ms, 0.897, 0.893 | 20 / 2,209 ms |
+  | HNSW, ef 128 | 0.93 ms, 0.872, 0.883 | 2.5 ms, 0.937, 0.937 | |
+
+  - Builds: HNSW 8.1 s for 12,054 READMEs and 158 s for 94,746 paragraphs; flat int8 views 0.9 s and 8.1 s; IVF views 1.0 s and 16.6 s, after k-means of 1.4 s and 4.1 s. Stored: 2.0 MB and 15.9 MB (flat), 2.2 MB and 16.6 MB (IVF).
+  - Against E253's synthetic data, real vectors are harder for every approximate way. HNSW at ef 64 recalled 0.95 there and 0.81 to 0.90 here; ef 128 brings it to 0.87 to 0.94 for 0.4 to 1.0 ms more. IVF at 32 probes recalled 0.90 there and 0.84 here at 100,000 rows.
+  - Flat int8 with rescoring stayed exact, as in E253, but at 100,000 paragraphs it takes 128 ms a query, too slow to be the only index at that size. It stays the safe default up to about 10,000 rows (14 ms).
+  - Drift did not cost recall in any way: after the held-out regions arrived, every way recalled within 0.01 of before. The held-out rows were 5 to 8% of the data; IVF puts them in the nearest trained list, which grows, and HNSW links them like any insert.
+  - Updates cost more than E253's: 10 rows take 11 to 20 ms in HNSW (E253: 4.2 ms) and 2 to 10 ms in the views.
+- Not measured: a transformer embedder's vectors (their geometry differs from a static model's); larger drift than 8%; HNSW deletes on real data; HNSW stored as a view; building HNSW on several threads; the Mac.
+- Trade-off: as E253. HNSW is the only way here under 3 ms at 100,000 rows, but builds in minutes on one thread and lives outside the store; the views are in the store and update cheaply but are slow or lossy at this size.
+- Verdict: **measured.** On real vectors HNSW still gives the best recall per millisecond, but needs ef 128 (not 64) for about 0.94 recall at 100,000 rows. Flat int8 is exact and fine to about 10,000 rows. IVF needs many probes on these vectors. Moderate drift (5 to 8% from unseen regions) did not hurt any of them.
+- Run: `cargo run --release --features vectors-hnsw --example vector_real -- DIR docs 20000` and `-- DIR frags 100000` (DIR from E256's `prepare.py`).

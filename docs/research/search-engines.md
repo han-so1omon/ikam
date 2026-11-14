@@ -110,6 +110,7 @@ These were read partly through `orx paper`, which fetches a paper's full text th
 4. **IVF and HNSW.** Both can be kept from the kv diff; HNSW gives the best recall per millisecond, IVF is a stored view.
    - Change: E253's `vectors` (IVF as a view; HNSW in memory).
    - Status: **measured by E253.**
+   - **E257 on real vectors (WordLlama, 13,055 READMEs and 100,000 paragraphs, real summary queries):** every approximate way recalls less than on E253's synthetic clusters (HNSW ef 64: 0.81 to 0.90, against 0.95; ef 128 reaches 0.87 to 0.94). Flat int8 stays exact but takes 128 ms at 100,000 rows. Data from regions the IVF centroids never saw (5 to 8% of rows) cost no recall.
 5. **Bruch et al. on fusion.** Fusion beats either signal when both are informative; a convex combination holds up better than RRF when one is weak.
    - Change: E254's `rrf` and `convex`.
    - Status: **confirmed by E254 on synthetic data.**
