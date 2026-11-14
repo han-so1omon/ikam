@@ -92,6 +92,10 @@ name = "hybrid_real"
 required-features = ["search-tantivy"]
 
 [[example]]
+name = "fusion_tune"
+required-features = ["search-tantivy"]
+
+[[example]]
 name = "stores"
 required-features = ["stores"]
 test = true

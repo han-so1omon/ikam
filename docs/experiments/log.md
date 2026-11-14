@@ -3728,3 +3728,24 @@ Gates on the branch: every kernel test suite passes (release); clippy `-D warnin
 - Trade-off: none new; fusion costs a second list and 0.07 ms.
 - Verdict: **measured; E254's findings hold on real text.** Fuse with a convex combination, not RRF: it gains where the signals are matched (+21% on topics) and costs little where vectors are weak (−2% on known items, with better recall), where RRF costs 13%. Fragment vectors can stand in for a document's vector with this model.
 - Run: `cargo run --release --features search-tantivy --example hybrid_real -- DIR` (DIR from E256's `prepare.py`).
+
+### E259 fusion-tune (are E254's fusion settings right for real text, and do tuned ones carry over?)
+- Branch / parent: exp/259-fusion-tune / exp/258-real-hybrid
+- Question: E254 and E258 fused with RRF k 60 and convex alpha 0.5, untuned. Bruch et al. report that a tuned convex combination beats RRF and that RRF is sensitive to k (docs/research/search-engines.md). On E258's data, what settings are best, does a setting tuned on half the queries hold on the other half, and does it carry from one kind of query to the other?
+- Change: none to the kernel. `examples/fusion_tune.rs` over E258's lists (BM25 and whole-README vectors, top 100 each). Queries are split in half by a hash of their id: known items 518 dev and 482 test, topics 61 and 81. Convex alpha (weight on BM25) is swept from 0 to 1 by 0.1 and RRF's k over 1, 10, 30, 60 and 100. The best on dev by nDCG@10 is scored on test, beside the defaults and beside the setting tuned on the other task's dev.
+- Result (nDCG@10 on the test half; a 4-core cloud machine):
+
+  | Task | BM25 | Vectors | Convex 0.5 | Convex, tuned on dev | Convex, tuned on the other task | RRF 60 | RRF, tuned on dev | RRF, tuned on the other task |
+  |---|---|---|---|---|---|---|---|---|
+  | Known item | 0.792 | 0.514 | 0.773 | 0.805 (alpha 0.7) | 0.718 (0.4) | 0.694 | 0.767 (k 1) | 0.744 (k 10) |
+  | Topic | 0.117 | 0.110 | 0.140 | 0.138 (alpha 0.4) | 0.133 (0.7) | 0.149 | 0.143 (k 10) | 0.130 (k 1) |
+
+  - Convex alpha 0.6, between the two tasks' best, scores 0.801 on known items and 0.137 on topics: within 0.004 of each task's best on test.
+  - Known items want BM25 weighted up (alpha 0.7; dev 0.827), and RRF does best with k 1, which lets the top of the stronger list dominate. Topics want equal weights (alpha 0.4 to 0.5) and a large k.
+  - A setting tuned on one task costs the other: topics' alpha 0.4 takes known items from 0.805 to 0.718, and known items' k 1 gives topics 0.130 against 0.143 with their own dev's k.
+  - Tuned convex beats BM25 alone on known items by 0.013 on test, about the size of E258's standard errors, so with these weak vectors fusion at best ties BM25 there.
+  - Topic halves have 61 and 81 queries, too few to tune on: the dev-best settings score no better on test than the defaults.
+- Not measured: a stronger embedding model (the best alpha moves with how good the vectors are; with stronger vectors it should move toward them, an inference); choosing the weight per query (for instance by query length); other normalizations (Bruch et al. find them less important once alpha is tuned).
+- Trade-off: none in cost. One fixed weight is a compromise across kinds of query.
+- Verdict: **measured.** Bruch et al.'s findings mostly hold: tuned convex beats tuned RRF on known items (0.805 against 0.767), RRF is ahead on topics by 0.005 to 0.009, within noise for 81 queries, and RRF's best k swings from 1 to 100 with the task. For ikam with these vectors, a convex alpha of 0.6 on BM25 is a safe single default (within 0.004 of the best on both tasks). Retune it on a few hundred judged queries whenever the embedding model changes.
+- Run: `cargo run --release --features search-tantivy --example fusion_tune -- DIR` (DIR from E256's `prepare.py`).
