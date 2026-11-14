@@ -1,4 +1,4 @@
-//! E226: where a commit's time goes on a Mercante-style report copy.
+//! E226: where a commit's time goes on a report copy (synthetic reports).
 //!
 //! `cargo run --release --example commits [folder sizes ...]`
 //!

@@ -4,14 +4,14 @@
 
 ## Question
 
-Eric (Nov 11): how can abstractions (intermediate representations) find connections that aid dedup and compression, and what other benefits follow? The test case is Mercante's run reports (markdown lead-lag reports, one per research run), which the kernel stored at 0.16 of raw against xz -9's 0.11 in the report-copy demo.
+The owner (Nov 11): how can abstractions (intermediate representations) find connections that aid dedup and compression, and what other benefits follow? The test case is a downstream app's run reports (markdown reports with a results table, one per research run), which the kernel stored at 0.16 of raw against xz -9's 0.11 in a report-copy demo on synthetic reports.
 
 ## Sources
 
 - LogShrink (Li et al., ICSE 2024), already summarised in `kernel-direction.md` #15 [read there]: template plus variables, variables by column; column layout 36 to 103% smaller than row layout. H1 there (columnar fillers in repack) is still open; E193 measures the same idea outside repack.
 - E161, E165 [read]: a typed TableIR reproduces csv, json and md exactly and stores them in about half the bytes; cell types are what it must keep.
 - E143, E144, `template.rs` [read]: the kernel's byte-level templates (anti-unification at repack). They find shared layout, but not that a value repeats in the same row of the next run.
-- mercante-personal `leadlag/cli.py render()` (branch exp/ikam-reports) [read]: the report layout the synthetic corpora copy.
+- `examples/ir_common/mod.rs` `reports` [read]: the synthetic report generator the corpora use (header, settings prose, a results table, paths, links).
 
 ## Hypotheses and status
 
@@ -23,6 +23,6 @@ Eric (Nov 11): how can abstractions (intermediate representations) find connecti
 
 ## Unknowns
 
-- Real Mercante reports: the corpora are synthetic. How often a real rerun repeats its numbers decides whether row keys pay [inf]. The demo run on the Mac (asked for Nov 10) can answer it with the real reports.
+- Real reports: the corpora are synthetic. How often a real rerun repeats its numbers decides whether row keys pay [inf]; `examples/ir_compress.rs dir:<path>` can answer it on a folder of real reports.
 - Prose: the codec loses 7 to 25% there; an encoder that keeps a file out of the IR when it has few cells per line would avoid it [inf], not built.
 - Reads: streams cut into blocks (say 32 runs) would bound a one-file read; not built.

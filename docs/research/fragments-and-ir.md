@@ -4,7 +4,7 @@
 
 ## Question
 
-Eric asked (Nov 9) for experiments on efficient edits that propagate to many render endpoints (files) in a corpus, using the fragment concept from the Python version; on efficient fragmentation; on insight generation and querying; and on intermediate representations, all from the repo's history. What did the Python version define, and which parts earn a place in the Rust kernel?
+The owner asked (Nov 9) for experiments on efficient edits that propagate to many render endpoints (files) in a corpus, using the fragment concept from the Python version; on efficient fragmentation; on insight generation and querying; and on intermediate representations, all from the repo's history. What did the Python version define, and which parts earn a place in the Rust kernel?
 
 ## What the Python version defined [read]
 

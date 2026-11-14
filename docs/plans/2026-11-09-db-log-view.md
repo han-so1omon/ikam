@@ -1,6 +1,6 @@
 # An event log and views in the kernel (step 1 of the database roadmap)
 
-Eric, Nov 9: start step 1 of the five-step roadmap for ikam as a database as
+The owner, Nov 9: start step 1 of the five-step roadmap for ikam as a database as
 well as a file store. Step 1 is the append-only log in the kernel, idempotent
 appends and one last-write-wins view, with tests for exact read-back, rebuild
 equality and reads at older commits, and the April fold tests as laws. Kernel
@@ -65,7 +65,7 @@ Events are about 220 bytes over 500 keys; nothing was committed or gc'd, so
 
 ## In-place edits and view positions (E119, branch exp/db-inplace)
 
-Eric, Nov 9: build in-place graph edits, with each view's log position
+The owner, Nov 9: build in-place graph edits, with each view's log position
 recorded, on a branch from exp/db-log-view.
 
 - `Repo::graph_edit(root, edits)` re-cuts only the chunks the edits fall in,
@@ -100,7 +100,7 @@ store new chunks plain on the fast path and let repack find the slices.
 
 ## Loose ends fixed (E120, branch exp/db-inplace)
 
-Eric, Nov 9: do both fixes from the loose ends in the design doc.
+The owner, Nov 9: do both fixes from the loose ends in the design doc.
 
 - **Label clashes.** `Keys::Any` lets a graph's label keys repeat;
   `put_graph_with` and `graph_edit_with` take it, and agree on every graph,

@@ -119,7 +119,7 @@ pub fn links(rng: &mut Rng) -> Vec<Link> {
             Link {
                 id: format!("{s}-to-{t}-{r}"),
                 kind: ["leading", "coincident", "contrarian"][i % 3],
-                who: ["eric", "agent", "literature"][rng.below(3) as usize],
+                who: ["user", "agent", "literature"][rng.below(3) as usize],
                 sensor: format!("{}:{}_{}", ["fred", "google", "zillow", "bls"][i % 4], s, r),
                 target: format!("{}:{}_{}", ["zillow", "census", "bls"][i % 3], t, r),
                 mechanism: format!("{}.", m.join(" ")),
@@ -347,8 +347,8 @@ pub fn fixture(dir: &str, exts: &[&str]) -> Files {
         .collect()
 }
 
-/// Every file directly in `dir`, by name (read only; for real reports, such
-/// as Mercante's `research/reports`). Only sizes and times are printed.
+/// Every file directly in `dir`, by name (read only; for a folder of real
+/// reports). Only sizes and times are printed.
 pub fn folder(dir: &Path) -> Files {
     let mut out: Files = std::fs::read_dir(dir)
         .unwrap()
