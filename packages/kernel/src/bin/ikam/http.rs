@@ -7,7 +7,7 @@
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Duration;
 
 /// A header line longer than this, or more headers than `MAX_HEADERS`, ends
@@ -148,11 +148,9 @@ pub fn serve(port: u16, handler: Arc<Handler>, limits: Limits) -> Result<(), Str
             continue;
         }
         let handler = handler.clone();
-        let open = open.clone();
-        open.fetch_add(1, Ordering::SeqCst);
+        let slot = Slot::take(&open);
         std::thread::spawn(move || {
-            let result = connection(stream, &*handler, limits);
-            open.fetch_sub(1, Ordering::SeqCst);
+            let result = connection(stream, &*handler, limits, slot);
             if let Err(e) = result
                 && !matches!(
                     e.kind(),
@@ -192,7 +190,37 @@ fn line(input: &mut BufReader<TcpStream>) -> std::io::Result<Option<String>> {
 const TOO_LONG: &str = "header line too long";
 const TOO_LARGE: &str = "body too large";
 
-fn refuse(out: &mut TcpStream, status: u16, msg: &str) -> std::io::Result<()> {
+/// A connection's place under `max_conns`. It is given back before the
+/// socket closes, or before a refusal is drained, so a client that has
+/// read its whole response never finds its own connection still counted.
+struct Slot {
+    open: Arc<AtomicUsize>,
+    held: AtomicBool,
+}
+
+impl Slot {
+    fn take(open: &Arc<AtomicUsize>) -> Self {
+        open.fetch_add(1, Ordering::SeqCst);
+        Slot {
+            open: open.clone(),
+            held: AtomicBool::new(true),
+        }
+    }
+
+    fn release(&self) {
+        if self.held.swap(false, Ordering::SeqCst) {
+            self.open.fetch_sub(1, Ordering::SeqCst);
+        }
+    }
+}
+
+impl Drop for Slot {
+    fn drop(&mut self) {
+        self.release();
+    }
+}
+
+fn refuse(out: &mut TcpStream, slot: &Slot, status: u16, msg: &str) -> std::io::Result<()> {
     let head = format!(
         "HTTP/1.1 {status} {}\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{msg}",
         reason(status),
@@ -200,6 +228,7 @@ fn refuse(out: &mut TcpStream, status: u16, msg: &str) -> std::io::Result<()> {
     );
     out.write_all(head.as_bytes())?;
     out.flush()?;
+    slot.release();
     // Take a little of what is still coming, so closing does not reset the
     // connection before the client reads the refusal.
     let _ = out.shutdown(std::net::Shutdown::Write);
@@ -217,16 +246,26 @@ fn is(e: &std::io::Error, what: &str) -> bool {
     e.kind() == std::io::ErrorKind::InvalidData && e.to_string() == what
 }
 
-fn connection(stream: TcpStream, handler: &Handler, limits: Limits) -> std::io::Result<()> {
+fn connection(
+    stream: TcpStream,
+    handler: &Handler,
+    limits: Limits,
+    slot: Slot,
+) -> std::io::Result<()> {
     stream.set_read_timeout(Some(limits.idle))?;
     let _ = stream.set_nodelay(true);
     let mut out = stream.try_clone()?;
     let mut input = BufReader::new(stream);
+    // Declared after the streams, so it is dropped (given back) before
+    // they close the socket.
+    let slot = slot;
     loop {
         let line = match line(&mut input) {
             Ok(Some(l)) => l,
             Ok(None) => return Ok(()),
-            Err(e) if is(&e, TOO_LONG) => return refuse(&mut out, 431, "request line too long"),
+            Err(e) if is(&e, TOO_LONG) => {
+                return refuse(&mut out, &slot, 431, "request line too long");
+            }
             Err(e) => return Err(e),
         };
         let line = line.trim_end();
@@ -243,7 +282,7 @@ fn connection(stream: TcpStream, handler: &Handler, limits: Limits) -> std::io::
                 Ok(Some(h)) => h,
                 Ok(None) => return Ok(()),
                 Err(e) if is(&e, TOO_LONG) => {
-                    return refuse(&mut out, 431, "header line too long");
+                    return refuse(&mut out, &slot, 431, "header line too long");
                 }
                 Err(e) => return Err(e),
             };
@@ -252,7 +291,7 @@ fn connection(stream: TcpStream, handler: &Handler, limits: Limits) -> std::io::
                 break;
             }
             if headers.len() >= MAX_HEADERS {
-                return refuse(&mut out, 431, "too many headers");
+                return refuse(&mut out, &slot, 431, "too many headers");
             }
             if let Some((k, v)) = h.split_once(':') {
                 headers.push((k.trim().to_string(), v.trim().to_string()));
@@ -273,14 +312,14 @@ fn connection(stream: TcpStream, handler: &Handler, limits: Limits) -> std::io::
                 None => Some(0),
                 Some(n) => match n.parse() {
                     Ok(n) => Some(n),
-                    Err(_) => return refuse(&mut out, 400, "bad Content-Length"),
+                    Err(_) => return refuse(&mut out, &slot, 400, "bad Content-Length"),
                 },
             }
         };
         let too_large = |n: usize| limits.max_body.is_some_and(|max| n > max);
         if length.is_some_and(too_large) {
             // Refused before reading it (or sending 100 Continue).
-            return refuse(&mut out, 413, &too_large_msg(limits));
+            return refuse(&mut out, &slot, 413, &too_large_msg(limits));
         }
         if get("expect").is_some_and(|e| e.eq_ignore_ascii_case("100-continue")) {
             out.write_all(b"HTTP/1.1 100 Continue\r\n\r\n")?;
@@ -289,7 +328,7 @@ fn connection(stream: TcpStream, handler: &Handler, limits: Limits) -> std::io::
             None => match chunked(&mut input, limits.max_body) {
                 Ok(b) => b,
                 Err(e) if is(&e, TOO_LARGE) => {
-                    return refuse(&mut out, 413, &too_large_msg(limits));
+                    return refuse(&mut out, &slot, 413, &too_large_msg(limits));
                 }
                 Err(e) => return Err(e),
             },
@@ -536,12 +575,20 @@ mod tests {
             b"GET / HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n",
         );
         assert!(r.starts_with("HTTP/1.1 503"), "{r}");
+        // Closed by the client, so the server frees their places only once
+        // it reads the close; on a busy machine that can take a while.
         drop((a, b));
-        std::thread::sleep(Duration::from_millis(200));
-        let r = send(
-            port,
-            b"GET / HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n",
-        );
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let r = loop {
+            std::thread::sleep(Duration::from_millis(50));
+            let r = send(
+                port,
+                b"GET / HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n",
+            );
+            if !r.starts_with("HTTP/1.1 503") || std::time::Instant::now() > deadline {
+                break r;
+            }
+        };
         assert!(r.starts_with("HTTP/1.1 200"), "{r}");
     }
 
