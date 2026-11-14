@@ -89,6 +89,11 @@ These were read partly through `orx paper`, which fetches a paper's full text th
 - **LangChain CacheBackedEmbeddings (source):** the key is namespace (the model) plus a hash of the text.
 - **Weaviate (forum and docs, search summary):** a vectorizer cannot be changed in place; you re-vectorize into a new collection or add a named vector.
 - **BCT (arXiv 2003.11942; abstract):** training a new model to stay compatible with the old one's embeddings avoids backfilling. Shown on face recognition.
+- **WordLlama (`wordllama` 0.4.0 on PyPI, MIT; its bundled RESULTS.md and loader source, read for E256 to E259):**
+  - A static embedding model: token embeddings concatenated from several large language models that share one tokenizer (the default, l2_supercat, uses Llama 2's), trained for similarity and mean pooled; no attention. The 256-dimension weights and the tokenizer ship in the wheel.
+  - Its MTEB table (for the l3_supercat variant, which RESULTS.md says is a little better or worse than l2 depending on the task) puts it well below all-MiniLM-L6-v2 on retrieval (CQA DupStack 24.2 against 41.3 at 256 dimensions) and above GloVe. So it is a weak semantic signal by the standard of transformer embedders.
+  - Mean pooling means a text's vector is a token-weighted mean of its parts' vectors before normalization, which bears on caching vectors by fragment (E256, E258).
+- **Known-item and topic judgments (method, no paper read for E256 to E259):** BEIR's sets with human judgments could not be downloaded from the cloud machine. The harness builds two tasks from a sample of PyPI projects' own structure instead: a project's summary as the query for its README, and a Trove `Topic ::` classifier as the query for the projects tagged with it. Tags are incomplete, so topic scores are lower bounds, as BEIR's are with incomplete judgments.
 - **Not read:** product quantization (Jégou et al. 2011), Filtered-DiskANN, the Ding and Suel block-max WAND paper, and Paul Masurel's blog posts (one URL found; not fetched).
 
 ## Hypotheses and status
@@ -114,8 +119,9 @@ These were read partly through `orx paper`, which fetches a paper's full text th
 7. **LangChain's cache keys.** Embeddings keyed by model and content hash embed each distinct fragment once, in a build, an update and a model change.
    - Change: E255's `embeds`.
    - Status: **confirmed by E255 for calls.** The synthetic model is too cheap to show the time saved.
+   - **E256 on real READMEs and release histories: holds for edits, not for corpus-wide duplicates.** A changed README is 14 to 19% new paragraphs (updates embed 5 to 7 times fewer), but only 19% of a corpus's paragraphs repeat. With WordLlama (about 100 µs a paragraph) the view's own cost about cancels the saving; the case rests on a costlier model.
 
 ## Unknowns
 - Ranking (BM25 and block-max WAND inside ikam) is not built. Neither are positions and phrase queries.
 - Lance-style unindexed fragments and FreshDiskANN-style delete consolidation for HNSW are not tried. E253 keeps HNSW in memory with tombstones; storing it as a view is not tried.
-- Real text and a real embedding model are not used: everything here is synthetic. A real model's cost per call (milliseconds on a CPU, by common report; not measured here) would make E255's call counts the main saving.
+- E256 to E259 use real text (PyPI READMEs) and a real but static embedding model (WordLlama), because the cloud machine could not download a transformer model or BEIR's judged sets. A transformer's cost per call (milliseconds on a CPU, by common report; not measured here) and quality, and human relevance judgments, are still untested.

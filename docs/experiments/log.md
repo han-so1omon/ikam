@@ -3631,3 +3631,38 @@ Gates on the branch: every kernel test suite passes (release); clippy `-D warnin
 - Trade-off: a cache lookup per fragment, and the cache keeps every model's vectors until dropped. Distinct fragments are embedded once however many rows hold them.
 - Verdict: **kept (opt-in).** Keyed by content id, which ikam already computes, a build and a model change each embed 9.5 times fewer fragments here, updates about 30 times fewer, and the vectors are stored once.
 - Run: `cargo run --release --example embed_cache -- 50000 20000 10 100 1000`.
+
+### E256 real-embed-cache (E255's embeddings keyed by content hash, on real READMEs and their release histories)
+- Branch / parent: exp/256-real-embed-cache / exp/255-embed-cache (the code under test is not on main)
+- Question: E255 measured the cache on synthetic rows whose lines repeat with Zipf frequencies (9.5 times fewer calls on a build). How often do real documents repeat a fragment, and how much of a real edit is new text? Does the cache pay with a real model's cost a call? Notes: docs/research/search-engines.md (WordLlama; LangChain's cache keys).
+- Change: none to the kernel. A harness:
+  - `examples/real_text/fetch.py` samples 45,000 project names from PyPI's simple index (seeded) and reads each project's JSON: summary, README (the long description) and classifiers. It keeps projects with an OSI-approved license classifier, a summary of 5 to 30 words and a mostly ASCII README of 600 to 60,000 characters (13,078 of 45,000). For 2,000 of those with four or more releases it also reads the last six releases' READMEs.
+  - `examples/real_text/prepare.py` splits each README into paragraphs (blank lines; whitespace collapsed), embeds them with WordLlama (`wordllama` 0.4.0, l2_supercat, 256 dimensions, CPU) and times the model. The wheel holds the weights and tokenizer, but its loader looks for the tokenizer under `tokenizer/` while the wheel has `tokenizers/`; `WORDLLAMA_DIR` names a folder with `weights/` and `tokenizer/` linking to the wheel's files, loaded with downloads off.
+  - `examples/embed_real.rs` loads the READMEs as rows, one fragment a paragraph, and runs `embeds_update` for the build, then replays the release histories: the oldest README of each project, then each later release as one batch.
+  - The model inside the harness is a stand-in of the same dimension (hashed trigrams), so calls and bytes embedded are the measure, and the real model's measured cost turns them into time. Nothing from the data is committed; the harness reads it from a folder given on the command line.
+- Result:
+  - Data: 13,055 READMEs (after removing duplicate names and READMEs of fewer than two paragraphs), 535,589 paragraphs, 70.1 MB of text. Release histories for 1,981 projects, 11,025 READMEs.
+  - Model: WordLlama took 83 µs a paragraph in batches and 110 µs called one at a time.
+  - Machine: a 4-core cloud machine.
+
+  | Phase | Paragraphs (rows changed) | Calls, by content hash | Bytes embedded, by hash | Bytes, whole changed READMEs | View time |
+  |---|---|---|---|---|---|
+  | Build, 13,055 READMEs | 535,589 | 431,766 (81%) | 67.0 MB | 70.1 MB | 26.3 s |
+  | History, first release (1,981) | 76,535 | 64,170 (84%) | 9.66 MB | 10.1 MB | 4.2 s |
+  | Release 2 (910 of 1,981 changed) | 43,433 | 8,462 (19%) | 1.68 MB | 6.00 MB | 2.3 s |
+  | Release 3 (906 changed) | 44,189 | 7,545 (17%) | 1.51 MB | 6.11 MB | 2.9 s |
+  | Release 4 (875 of 1,962) | 45,661 | 7,008 (15%) | 1.54 MB | 6.39 MB | 3.1 s |
+  | Release 5 (737 of 1,680) | 40,917 | 5,690 (14%) | 1.33 MB | 5.84 MB | 3.2 s |
+  | Release 6 (615 of 1,440) | 36,066 | 4,925 (14%) | 1.12 MB | 5.29 MB | 3.1 s |
+
+  - Percentages are calls over the paragraphs of the rows that changed.
+  - Across a corpus, real READMEs repeat far less than E255's synthetic rows: 19% of paragraph occurrences are repeats (badges, install lines, license notes), against 90% there, and the repeats are short (4% of bytes).
+  - Across releases, the cache does what E255 claimed: a changed README is 14 to 19% new paragraphs, so updates embed 5 to 7 times fewer paragraphs and 3.6 to 4.7 times fewer bytes than re-embedding each changed README.
+  - About 55% of the projects republish an identical README with a release. Those rows still come through the `kv` diff (the new event changes the row's node), so the view looks up all their paragraphs and finds them cached: no model calls, but view time.
+  - Raw vector bytes: 442 MB keyed by hash against 548 MB a vector per occurrence (19% less). The store's own byte count is not reported, because the stand-in vectors are sparse and compress far better than real ones.
+  - With this model the cache does not pay in time. The view costs about 49 µs a paragraph on a build (26.3 s for 535,589), more than E255's 8 µs, because these rows are larger. Over the five update steps it saves 176,636 calls, about 14.7 s of WordLlama, for 14.7 s of view time; on the build it saves 8.6 s for 26.3 s.
+  - WordLlama is a static model, about 100 µs a paragraph. A transformer embedder on a CPU costs milliseconds a paragraph by common report (not measured here: no transformer model could be downloaded on this machine), and at 1 ms a call the update steps would save about 177 s for 15 s of view time.
+- Not measured: a transformer model's cost and quality (the Mac or any machine that can reach Hugging Face could run one); fragments other than paragraphs; skipping identical rewrites before the view; the Mac.
+- Trade-off: the cache trades a lookup a fragment for a model call a distinct fragment. With a cheap static model that is about even; with a transformer the calls dominate.
+- Verdict: **measured; E255's option holds for edits, not for corpus-wide duplicates.** Real duplicates are few (19% of paragraphs), so a build saves little. Real edits leave 81 to 86% of a changed README's paragraphs as they were, so updates embed 5 to 7 times fewer paragraphs, as E255 found. Next: skip rows whose value did not change before looking up their fragments, and cut the view's cost a fragment.
+- Run: `python3 examples/real_text/fetch.py PROJECTS.jsonl 45000 2000 SIMPLE_INDEX.json`, `WORDLLAMA_DIR=... python3 examples/real_text/prepare.py PROJECTS.jsonl DIR`, then `cargo run --release --example embed_real -- DIR`.
