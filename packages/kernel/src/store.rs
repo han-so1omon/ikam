@@ -40,6 +40,12 @@ pub trait Store {
     /// Compare-and-swap: move `name` to `new` only if it currently equals `expected`.
     fn set_ref(&mut self, name: &str, expected: Option<Id>, new: Id) -> Result<(), Error>;
     fn refs(&self) -> Result<Vec<(String, Id)>, Error>;
+    /// Compare-and-swap delete (E266): remove `name` only if it currently
+    /// points at `expected`. Stores that cannot remove a ref refuse.
+    fn delete_ref(&mut self, name: &str, expected: Id) -> Result<(), Error> {
+        let _ = (name, expected);
+        Err(Error::Exec("this store cannot delete refs".into()))
+    }
 }
 
 /// A store several `Repo`s share (E232): each call takes a lock for that
@@ -106,6 +112,9 @@ impl<S: Store> Store for SharedStore<S> {
     }
     fn refs(&self) -> Result<Vec<(String, Id)>, Error> {
         self.r().refs()
+    }
+    fn delete_ref(&mut self, name: &str, expected: Id) -> Result<(), Error> {
+        self.w().delete_ref(name, expected)
     }
 }
 
@@ -199,6 +208,14 @@ impl Store for MemStore {
 
     fn refs(&self) -> Result<Vec<(String, Id)>, Error> {
         Ok(self.refs.iter().map(|(k, v)| (k.clone(), *v)).collect())
+    }
+
+    fn delete_ref(&mut self, name: &str, expected: Id) -> Result<(), Error> {
+        if self.get_ref(name)? != Some(expected) {
+            return Err(Error::RefConflict(name.into()));
+        }
+        self.refs.remove(name);
+        Ok(())
     }
 }
 
@@ -359,6 +376,52 @@ fn not_found_as<T>(r: io::Result<T>, missing: impl FnOnce() -> Error) -> Result<
     })
 }
 
+impl FsStore {
+    /// Run `f` holding the lock of ref `name` (its file, the lock file and
+    /// the ref's path). The lock file serializes writers through an OS lock
+    /// on it, not its existence: a writer killed mid-update leaves the file
+    /// behind, and an existence lock would refuse every later update of the
+    /// ref (E122). The OS drops the lock with the process. On an error the
+    /// lock file is removed.
+    fn with_ref_lock(
+        &mut self,
+        name: &str,
+        f: impl FnOnce(&Self, &mut fs::File, &std::path::Path, &std::path::Path) -> Result<(), Error>,
+    ) -> Result<(), Error> {
+        let path = self.root.join("refs").join(name);
+        fs::create_dir_all(path.parent().unwrap())?;
+        let lock = path.with_file_name(format!(
+            "{}.lock",
+            path.file_name().unwrap().to_string_lossy()
+        ));
+        let conflict = || Error::RefConflict(name.into());
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&lock)
+            .map_err(|_| conflict())?;
+        file.try_lock().map_err(|_| conflict())?;
+        // The file locked must still be the one at the lock path: a writer
+        // that opened it just before another renamed it into place holds
+        // the ref file itself.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            let held = file.metadata()?.ino();
+            if fs::metadata(&lock).map(|m| m.ino()).ok() != Some(held) {
+                return Err(conflict());
+            }
+        }
+        file.set_len(0)?;
+        let result = f(self, &mut file, &lock, &path);
+        if result.is_err() {
+            let _ = fs::remove_file(&lock);
+        }
+        result
+    }
+}
+
 impl Store for FsStore {
     fn write(&mut self, id: Id, encoded: &[u8]) -> Result<bool, Error> {
         if self.has(&id) {
@@ -485,49 +548,27 @@ impl Store for FsStore {
     fn set_ref(&mut self, name: &str, expected: Option<Id>, new: Id) -> Result<(), Error> {
         check_ref_name(name)?;
         self.sync()?; // E227: what the ref names is durable before it moves
-        let path = self.root.join("refs").join(name);
-        fs::create_dir_all(path.parent().unwrap())?;
-        // The lock file serializes writers through an OS lock on it, not its
-        // existence: a writer killed mid-update leaves the file behind, and
-        // an existence lock would refuse every later update of the ref
-        // (E122). The OS drops the lock with the process.
-        let lock = path.with_file_name(format!(
-            "{}.lock",
-            path.file_name().unwrap().to_string_lossy()
-        ));
-        let conflict = || Error::RefConflict(name.into());
-        let mut file = fs::OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .open(&lock)
-            .map_err(|_| conflict())?;
-        file.try_lock().map_err(|_| conflict())?;
-        // The file locked must still be the one at the lock path: a writer
-        // that opened it just before another renamed it into place holds
-        // the ref file itself.
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::MetadataExt;
-            let held = file.metadata()?.ino();
-            if fs::metadata(&lock).map(|m| m.ino()).ok() != Some(held) {
-                return Err(conflict());
-            }
-        }
-        file.set_len(0)?;
-        let result = (|| {
-            if self.get_ref(name)? != expected {
+        self.with_ref_lock(name, |this, file, lock, path| {
+            if this.get_ref(name)? != expected {
                 return Err(Error::RefConflict(name.into()));
             }
             file.write_all(format!("{new}\n").as_bytes())?;
             file.sync_all()?;
-            fs::rename(&lock, &path)?;
+            fs::rename(lock, path)?;
             Ok(())
-        })();
-        if result.is_err() {
-            let _ = fs::remove_file(&lock);
-        }
-        result
+        })
+    }
+
+    fn delete_ref(&mut self, name: &str, expected: Id) -> Result<(), Error> {
+        check_ref_name(name)?;
+        self.with_ref_lock(name, |this, _, lock, path| {
+            if this.get_ref(name)? != Some(expected) {
+                return Err(Error::RefConflict(name.into()));
+            }
+            fs::remove_file(path)?;
+            fs::remove_file(lock)?;
+            Ok(())
+        })
     }
 
     fn refs(&self) -> Result<Vec<(String, Id)>, Error> {
