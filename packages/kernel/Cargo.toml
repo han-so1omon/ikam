@@ -88,6 +88,10 @@ name = "vector_real"
 required-features = ["vectors-hnsw"]
 
 [[example]]
+name = "hybrid_real"
+required-features = ["search-tantivy"]
+
+[[example]]
 name = "stores"
 required-features = ["stores"]
 test = true

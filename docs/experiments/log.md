@@ -3694,3 +3694,37 @@ Gates on the branch: every kernel test suite passes (release); clippy `-D warnin
 - Trade-off: as E253. HNSW is the only way here under 3 ms at 100,000 rows, but builds in minutes on one thread and lives outside the store; the views are in the store and update cheaply but are slow or lossy at this size.
 - Verdict: **measured.** On real vectors HNSW still gives the best recall per millisecond, but needs ef 128 (not 64) for about 0.94 recall at 100,000 rows. Flat int8 is exact and fine to about 10,000 rows. IVF needs many probes on these vectors. Moderate drift (5 to 8% from unseen regions) did not hurt any of them.
 - Run: `cargo run --release --features vectors-hnsw --example vector_real -- DIR docs 20000` and `-- DIR frags 100000` (DIR from E256's `prepare.py`).
+
+### E258 real-hybrid (E254's hybrid ranking on real text and judgments from the data's structure)
+- Branch / parent: exp/258-real-hybrid / exp/257-real-vector-views
+- Question: E254 found, on synthetic data, that fusing BM25 with vectors lifts nDCG@10 by 27 to 29% when both signals carry information, that RRF falls below BM25 alone when vectors are weak, and that a convex combination loses less. Does that hold on real text with a real model? And do vectors kept by fragment (E255, E256) rank as well as a vector of the whole document? Notes: docs/research/search-engines.md (Bruch et al.; WordLlama; the judgments).
+- Change: none to the kernel. `examples/hybrid_real.rs` (with `examples/real_common/`) over E256's data:
+  - BM25 is Tantivy with English stemming (`en_stem`) on the README text; vectors are WordLlama's, searched exactly. Each gives its top 100, and the lists are fused by `vectors::rrf` (k 60) and `vectors::convex` (alpha 0.5, weight on BM25), as in E254.
+  - `whole` embeds each README whole; `mean` is the renormalized mean of its paragraphs' vectors, which a fragment cache already holds.
+  - Two tasks from the data's own structure (BEIR's judged sets could not be downloaded here):
+    - `known`: 1,000 projects' summaries as queries, each with its own README as the one relevant document; any paragraph holding the summary is removed from the README first.
+    - `topic`: 142 Trove topics (`Topic :: Scientific/Engineering :: Astronomy` becomes `Scientific Engineering Astronomy`) as queries, the 5 to 300 projects tagged with each relevant. Untagged projects may also be relevant, so these scores are lower bounds.
+  - Each way's mean per-query nDCG@10 difference from BM25 is printed with its standard error.
+- Result (13,055 READMEs; a 4-core cloud machine). nDCG@10, with recall@10 in brackets, and the difference from BM25 ± its standard error:
+
+  | Way | Known item (1,000 queries) | Topic (142 queries) |
+  |---|---|---|
+  | BM25 (Tantivy, stemmed) | 0.804 (0.86) | 0.124 (0.11) |
+  | Vectors, whole README | 0.516 (0.64), −0.288 ± 0.015 | 0.130 (0.12), +0.006 ± 0.016 |
+  | Vectors, mean of paragraphs | 0.513 (0.64), −0.291 ± 0.015 | 0.119 (0.12), −0.005 ± 0.016 |
+  | RRF k 60, whole | 0.703 (0.83), −0.101 ± 0.010 | 0.153 (0.14), +0.029 ± 0.012 |
+  | Convex 0.5, whole | 0.786 (0.89), −0.018 ± 0.007 | 0.157 (0.14), +0.033 ± 0.010 |
+  | RRF k 60, mean | 0.712 (0.83), −0.092 ± 0.010 | 0.154 (0.14), +0.030 ± 0.012 |
+  | Convex 0.5, mean | 0.789 (0.89), −0.015 ± 0.007 | 0.154 (0.14), +0.030 ± 0.010 |
+
+  - Recall@100 on known items: BM25 0.906, vectors 0.814, every fusion 0.938 to 0.942.
+  - Times: BM25 plus an exact scan of 13,055 vectors, 7.3 ms a query in memory; fusing two top-100 lists, 0.07 ms.
+  - E254's pattern holds on real data:
+    - Topic queries are short and name a subject the README may never name, and here BM25 and the vectors are about equally good (0.124 and 0.130). Fusion lifts nDCG@10 by 18 to 21% over the better one (+0.03, about three standard errors).
+    - For known items the summary shares words with its README, BM25 is strong and these vectors are weak (0.52). RRF then falls 13% below BM25 alone, as E254's weak-vector rows did. Convex loses only 2% on nDCG@10 and finds more of the items in its top 10 and top 100 than BM25 does.
+    - Convex is ahead of or level with RRF in every row; on topics the two are within a standard error.
+  - Vectors kept by paragraph rank as well as whole-README vectors here (0.513 against 0.516; 0.119 against 0.130, within noise). For a mean-pooled model like WordLlama that is close to expected; a transformer, which reads at most a few hundred tokens of a README, is not tested.
+- Not measured: a transformer embedder (the vectors here are weak; WordLlama's own MTEB retrieval score is about 60% of all-MiniLM-L6-v2's); human relevance judgments (BEIR); approximate indexes in the loop (E257 gives their recall); fusion inside ikam's own search view.
+- Trade-off: none new; fusion costs a second list and 0.07 ms.
+- Verdict: **measured; E254's findings hold on real text.** Fuse with a convex combination, not RRF: it gains where the signals are matched (+21% on topics) and costs little where vectors are weak (−2% on known items, with better recall), where RRF costs 13%. Fragment vectors can stand in for a document's vector with this model.
+- Run: `cargo run --release --features search-tantivy --example hybrid_real -- DIR` (DIR from E256's `prepare.py`).

@@ -114,6 +114,7 @@ These were read partly through `orx paper`, which fetches a paper's full text th
 5. **Bruch et al. on fusion.** Fusion beats either signal when both are informative; a convex combination holds up better than RRF when one is weak.
    - Change: E254's `rrf` and `convex`.
    - Status: **confirmed by E254 on synthetic data.**
+   - **Confirmed by E258 on real text** (PyPI READMEs, Tantivy BM25, WordLlama vectors, judgments from summaries and Trove topics). Where the signals were matched (topics), fusion lifted nDCG@10 by 18 to 21%; where vectors were weak (known items), RRF fell 13% below BM25 and convex only 2%.
 6. **ACORN and pgvector on filters.** Post-filtering loses recall as a filter tightens, filtering inside the graph keeps recall at growing cost, and an exact pre-filter is cheapest when the filter is tight.
    - Change: none (E254's harness).
    - Status: **confirmed by E254.**
