@@ -150,10 +150,11 @@ pub struct Repo<S: Store> {
     /// without reading every stored object first (E129). Off by default.
     /// On, it assumes this handle is the store's only writer while it is
     /// open (as `ikam serve` is): an encoding another process writes later
-    /// is not seen, and the copy it needs could be dropped. Off, every drop
-    /// at ingest reads the whole store.
+    /// is not seen, and the copy it needs could be dropped. Handles made
+    /// with `sibling` share the index (E262), so they count as one writer.
+    /// Off, every drop at ingest reads the whole store.
     pub needed_index: bool,
-    pub(crate) needed: std::sync::Mutex<Option<crate::dict::Needed>>,
+    pub(crate) needed: Arc<std::sync::Mutex<Option<crate::dict::Needed>>>,
     /// Where new content looks for repeats (E131). `None` (the default):
     /// every stored content, so the first write on a handle reads the whole
     /// store to build the matcher's seed index. `Some(roots)`: only those
@@ -500,14 +501,18 @@ impl<S: Store> Repo<S> {
 
     /// Another handle on the same store (one whose clones share it, such as
     /// `SharedStore`), for reads on another thread (E232). It shares the
-    /// ledger, so it reads what this handle derives, and copies the
-    /// dictionary and the options; it plans nothing, so it has no index.
+    /// ledger, so it reads what this handle derives, and the needed index
+    /// (E129, E262), so a sibling that writes keeps it current for both;
+    /// it copies the dictionary and the options; it has no seed index of
+    /// its own until it writes.
     pub fn sibling(&self) -> Repo<S>
     where
         S: Clone,
     {
         let mut r = Repo::new(self.store.clone());
         r.ledger = self.ledger.clone();
+        r.needed = self.needed.clone();
+        r.needed_index = self.needed_index;
         if let Some(d) = self.dict.get() {
             let _ = r.dict.set(d.clone());
         }
@@ -532,12 +537,12 @@ impl<S: Store> Repo<S> {
         self.index = None;
         *self.ledger.write().unwrap_or_else(|e| e.into_inner()) = None;
         self.dict = OnceLock::new();
-        *self.needed.get_mut().unwrap() = None;
+        *self.needed.lock().unwrap() = None;
     }
 
     /// Keep the needed set current after storing `encoded` (E129).
     pub(crate) fn note_needs(&mut self, encoded: &[u8]) {
-        if let Some(set) = self.needed.get_mut().unwrap().as_mut() {
+        if let Some(set) = self.needed.lock().unwrap().as_mut() {
             set.add(encoded);
         }
     }
