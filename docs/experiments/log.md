@@ -3499,3 +3499,152 @@ Gates on the branch (E229 to E233): every kernel test suite passes (release); cl
 - Trade-off: an incremental view's roots depend on its update history, so two stores with the same rows can hold different roots for it; rows, not roots, are the comparison.
 - Verdict: **kept** as an option (opt-in API). Incremental updates are 100 to 400 times faster than rebuilding at 100,000 rows, and a stored view reads about 1,000 times faster than one computed on read.
 - Run: `cargo run --release --example view_graph -- 100000 10 100 1000` (`TEMPLATES=1` keeps object templates on).
+
+### E243 shared-joins (joins kept up to date from shared indexes, after Differential Dataflow's arrangements)
+- Branch / parent: exp/243-shared-joins / main 9c4c708 (numbered E240 to E244 to stay clear of E229 to E232 on other branches)
+- Question: can two joins over one large table be kept up to date from a batch of changes, without recomputing them, by indexing the table by its join key once and sharing that index between the joins, as Differential Dataflow shares an arrangement between operators (from what is known of it; nothing was re-read for this entry)? What does sharing save over one index per join, and where does updating stop beating recomputing?
+- Change (opt-in; nothing arranges or joins unless a caller asks):
+  - `join` (src/join.rs): `Arrangement { name, table, key }` indexes a table of the database's `kv` view as a graph with one node `joinkey US rowkey` per row, pointing at the row's own bytes (no value is copied). `Join { name, left, right, combine }` keeps one node `joinkey US left US right` per matching pair. `Repo::joins_build`, `Repo::joins_update` (reads the `kv` diff, updates each arrangement once, then each join only at the join keys the changes touched, pairing a changed row with the other side's rows there), `Repo::join_rows`, and `Repo::join_recompute`, the reference.
+  - Tests (tests/join.rs): 40 random batches on three tables with three joins sharing two arrangements, one of them many-to-many; after every batch each join's rows equal a recompute and the arrangements equal a fresh build. The example checks separate arrangements the same way.
+- Result (`examples/shared_joins.rs`: table `a` of generated rows in 1,000 groups, tables `b` and `c` with one row per group, joins `a` with `b` and `a` with `c` on the group; batches of 80% changes to `a` and 10% each to `b` and `c`, where a change to `b` or `c` reaches every `a` row in its group; median of 5 batches; object templates off for derived data, E228's option; a 4-core cloud machine with other runs going, so times are rough). At 20,000 rows:
+
+  | Batch | Shared index | One index per join | Recompute both joins |
+  |---|---|---|---|
+  | 10 | 46 ms (1,907 reads) | 45 ms (1,959 reads) | 372 ms (50,262 reads) |
+  | 100 | 212 ms (7,940 reads) | 245 ms (8,339 reads) | 352 ms (50,449 reads) |
+  | 1,000 | 862 ms (36,837 reads) | 830 ms (37,886 reads) | 395 ms (50,395 reads) |
+
+  - Building the indexes and both joins takes 0.6 s at 20,000 rows and 2.9 s at 100,000.
+  - The two per-join indexes of `a` are the same graph as the shared one (content addressing stores one), so sharing saves no bytes, and only 3 to 5% of reads.
+  - After every batch both incremental ways equal the recompute.
+  - The 100,000-row run built in 2.9 s but had not finished its batches after 2 hours, mostly in the harness's own appends and checks between timed updates; it was stopped, so there are no 100,000-row update numbers.
+- Not measured: 100,000 rows and up, joins of more than two tables, joins whose output feeds E242's views, the Mac.
+- Trade-off: an update reads in proportion to the join rows its changes reach; a change on the one-row-per-group side reaches every row of its group, so at a batch of 1,000 here the update reads most of what a recompute reads and takes twice as long.
+- Verdict: **measured**. Updating beats recomputing about 8 times for 10 changes and 1.7 times for 100, and loses at 1,000. Sharing the index adds little here, because the store already keeps one copy of identical indexes. Not recommended to merge as is; a version that recomputes when a batch reaches more than a set share of join keys would be the next step.
+- Run: `cargo run --release --example shared_joins -- 20000 1000 10 100 1000` (`TEMPLATES=1` keeps object templates on).
+
+### E245 join-options (where a join update's time goes, and options for it)
+- Branch / parent: exp/245-join-options / exp/243-shared-joins c3b2914 (numbered after E240 to E244, which are on their own branches)
+- Question: E243's joins beat recomputing at 10 changes but lost at 1,000, and its 100,000-row run never finished. Where does an update's time go at large batches? What made 100,000 rows slow? Does switching to a recompute above a share of touched join keys keep the small-batch win? Notes: docs/research/incremental-views.md.
+- Reproduced first: E243's benchmark unchanged, on this Mac, gives exactly E243's reads.
+  - Reads at 10, 100 and 1,000 changes: 1,907, 7,940 and 36,837.
+  - Times: 18, 88 and 292 ms, against 172 to 176 ms recomputed.
+  - So on this Mac updating wins 9.5 times at 10 changes and 2 times at 100, and loses 1.7 times at 1,000.
+- Found by profiling with macOS `sample`:
+  - The 100,000-row stall is in the harness, not the update. `join_rows` reads each row with a fresh cache, and a join's values are one shared content, so each row decodes and hashes the whole content. The cost grows with rows times content size.
+  - At 1,000 changes about 65% of an update is graph edits writing new chunks. Most of that is the write planner's slice search, which decodes and checks older chunks to store each new one as slices of them.
+  - About 26% is per-key seeks (`at_key`) that decode the same arrangement chunks again for every touched key.
+- Change (all off by default; `joins_update`, `join_recompute` and `join_rows` behave as before):
+  - `JoinOpts` has four fields:
+    - `read_once`: each content is decoded once per call.
+    - `plain_writes`: derived chunks are stored plain, without the slice search, since they can be rebuilt.
+    - `memo`: the repository's read memo is kept for the whole update or recompute.
+    - `recompute_above`: a join is recomputed when a batch touches more than that share of the join keys it had when last computed. `JoinState.keys` records that count.
+  - Entry points: `joins_update_with`, `join_recompute_with` and `join_rows_with`.
+  - Tests (tests/join.rs): over 25 random rounds, with each option alone and the switch at shares 0, 0.5 and 2, every join's rows equal a recompute.
+- Result (`examples/join_switch.rs`):
+  - Setup: E243's tables and change mix, 1,000 groups, median of 5 batches per size, object templates off, each way on its own copy of the store.
+  - Machine: an Apple M3 Pro laptop (macOS). Each run went through OpenResearch (`orx`, local backend), one run at a time.
+  - "Bytes added" counts what the way stored over its build and all 30 batches.
+
+  | 20,000 rows | 10 | 100 | 1,000 | 3,000 | Bytes added |
+  |---|---|---|---|---|---|
+  | Update (E243) | 21 ms | 97 ms | 312 ms | 448 ms | 22.1 MB |
+  | `plain_writes` | 18 ms | 63 ms | 155 ms | 202 ms | 36.9 MB |
+  | `memo` | 17 ms | 70 ms | 193 ms | 246 ms | 22.1 MB |
+  | Both | 15 ms | 60 ms | 133 ms | 165 ms | 36.9 MB |
+  | Both + `recompute_above: 0.4` | 16 ms | 58 ms | 143 ms | 150 ms | 36.9 MB |
+  | Recompute (E243) | 160 ms | 158 ms | 165 ms | 168 ms | 28.0 MB |
+  | Recompute, both + `read_once` | 95 ms | 103 ms | 105 ms | 107 ms | 28.0 MB |
+
+  | 100,000 rows | 10 | 100 | 1,000 | 3,000 | Bytes added |
+  |---|---|---|---|---|---|
+  | Update (E243) | 54 ms | 149 ms | 788 ms | 1,234 ms | 46.9 MB |
+  | `plain_writes` | 48 ms | 113 ms | 457 ms | 675 ms | 99.3 MB |
+  | `memo` | 43 ms | 119 ms | 544 ms | 823 ms | 46.9 MB |
+  | Both | 40 ms | 103 ms | 428 ms | 630 ms | 99.3 MB |
+  | Both + `recompute_above: 0.4` | 41 ms | 104 ms | 661 ms | 733 ms | 106.6 MB |
+  | Recompute (E243) | 866 ms | 871 ms | 900 ms | 895 ms | 109.1 MB |
+  | Recompute, both + `read_once` | 519 ms | 528 ms | 554 ms | 563 ms | 109.1 MB |
+
+  - With `read_once` in the harness, 100,000 rows now run. The whole run, both sizes, took 3.5 minutes.
+  - Every way ends with the same rows.
+  - At 100,000 rows, E243's update beats recomputing up to 1,000 changes.
+  - Shares 0.1 and 0.2 trigger the switch at smaller batches, where it costs more: at 100,000 rows, 527 to 573 ms against 103 to 216 ms updated.
+- Not measured: durable stores, joins of more than two tables, alternating seeks in one ordered pass in place of `memo`.
+- Trade-off:
+  - `plain_writes` adds 1.7 to 2.1 times the bytes, because updated chunks are no longer stored as slices of the old ones. `memo` costs no bytes.
+  - The switch must still update the arrangements before it recomputes, so with the other two options on it saves time only at 3,000 changes on 20,000 rows (150 against 165 ms).
+- Verdict: **kept, all options off by default.**
+  - `read_once` fixes the 100,000-row stall.
+  - `memo` alone cuts updates by 19 to 45% at no byte cost; with `plain_writes` the cut is 26 to 63%, at more bytes.
+  - `recompute_above` keeps the small-batch numbers but is not recommended with the other options.
+  - The per-key seeks are the next target (E250 removes the diff's share of small updates).
+- Run: `cargo run --release --example join_switch -- 20000 1000 0.1,0.2,0.4 10 30 100 300 1000 3000`, and again with 100000.
+
+### E246 join-views (several views over one join: what sharing saves)
+- Branch / parent: exp/246-join-views / exp/245-join-options
+- Question: E243 found that sharing an index between two joins saved 3 to 5% of reads and no bytes. Does sharing pay off when several views read the same join, and is it the index or the join that should be shared? Hypothesis from Shared Arrangements (docs/research/incremental-views.md): sharing pays as more queries read the same indexed state.
+- Change: none in the kernel. `examples/join_views.rs` keeps k views (1, 2, 4, 8) over the join of table `a` (20,000 rows, 1,000 groups) with table `b` (one row per group) in three ways:
+  - `apart`: each view has its own arrangements and its own join.
+  - `shared arrangements`: one arrangement per table, and one join per view. Each view has its own combine function, so each is a distinct result.
+  - `shared join`: one join that every view reads, for views that read the same rows.
+  - Batches are 90% changes to `a` and 10% to `b`, median of 5. After the batches, every view's rows equal its join recomputed.
+- Result (an Apple M3 Pro laptop, through OpenResearch's local backend):
+
+  | E243's defaults | 1 view | 2 | 4 | 8 |
+  |---|---|---|---|---|
+  | 100 changes, apart | 69 ms | 108 ms | 199 ms | 355 ms |
+  | 100 changes, shared arrangements | 66 ms | 98 ms | 160 ms | 283 ms |
+  | 100 changes, shared join | 66 ms | 67 ms | 66 ms | 67 ms |
+  | 1,000 changes, apart | 181 ms | 309 ms | 560 ms | 1070 ms |
+  | 1,000 changes, shared arrangements | 180 ms | 290 ms | 506 ms | 952 ms |
+  | 1,000 changes, shared join | 180 ms | 180 ms | 181 ms | 180 ms |
+
+  | E245's `plain_writes` and `memo` | 1 view | 2 | 4 | 8 |
+  |---|---|---|---|---|
+  | 100 changes, apart | 45 ms | 69 ms | 123 ms | 217 ms |
+  | 100 changes, shared arrangements | 44 ms | 61 ms | 94 ms | 165 ms |
+  | 100 changes, shared join | 45 ms | 44 ms | 44 ms | 44 ms |
+  | 1,000 changes, apart | 89 ms | 140 ms | 245 ms | 455 ms |
+  | 1,000 changes, shared arrangements | 89 ms | 127 ms | 205 ms | 364 ms |
+  | 1,000 changes, shared join | 90 ms | 89 ms | 89 ms | 89 ms |
+
+  - At 8 views, sharing the arrangements saves 11 to 24% against keeping them apart.
+  - A shared join costs the same at 8 views as at 1, so it is 4.9 to 5.9 times cheaper than 8 views kept apart.
+  - Each extra view costs 55 to 70% of the first when kept apart, and 39 to 61% with shared arrangements. The first view also carries work every view shares, such as diffing the table.
+- Not measured: views that read a join through a further view (E242's view graph), durable stores, more than 8 views.
+- Trade-off: a shared join serves only views that need the same rows. Views that differ in what they combine can share only the arrangements.
+- Verdict: **measured.**
+  - Sharing an arrangement pays a little, growing with the number of views (11 to 24% at 8). That is why E243 saw almost nothing at 2.
+  - Sharing the join itself is what pays: the cost is flat in the number of views. Views over the same join should read one kept join, not keep one each.
+- Run: `cargo run --release --example join_views -- 20000 1000 100 1000`.
+
+### E250 pruned-diff-joins (E249's pruned diff on the joins line)
+- Branch / parent: exp/250-pruned-diff-joins / exp/246-join-views. The kernel change is E249's (exp/249-pruned-diff, on the search line), carried over unchanged.
+- Question: E245's updates at 10 changes cost 15 ms at 20,000 rows but 41 ms at 100,000, which means a fixed cost that grows with the table. E249 traced that cost to `graph_diff`, which lists every leaf of both graphs. Does skipping the subtrees both graphs share make small join updates independent of table size?
+- Change: E249's `Repo::prune_diff`, off by default: `graph_diff` walks both graphs a level at a time and drops chunk ids found on both frontiers. `tests/prune_diff.rs` checks that the changes are the same as a full diff's. `join_switch` gains an `update_fast_pruned` way.
+- Result (`examples/join_switch.rs` as E245: E243's tables and changes, median of 5, an Apple M3 Pro laptop, through OpenResearch's local backend; every way ends with the same rows):
+
+  | 20,000 rows | 10 | 30 | 100 | 300 | 1,000 |
+  |---|---|---|---|---|---|
+  | Update (E243) | 21.0 ms | 39.9 ms | 98.6 ms | 194 ms | 323 ms |
+  | E245's `plain_writes` + `memo` | 15.4 ms | 26.0 ms | 57.5 ms | 97.6 ms | 134 ms |
+  | Same + `prune_diff` | 9.5 ms | 19.8 ms | 52.7 ms | 96.6 ms | 133 ms |
+  | Recompute (E245, fastest) | 95.1 ms | 96.2 ms | 102 ms | 101 ms | 105 ms |
+
+  | 100,000 rows | 10 | 30 | 100 | 300 | 1,000 |
+  |---|---|---|---|---|---|
+  | Update (E243) | 52.9 ms | 73.6 ms | 151 ms | 345 ms | 781 ms |
+  | E245's `plain_writes` + `memo` | 41.4 ms | 55.0 ms | 103 ms | 216 ms | 437 ms |
+  | Same + `prune_diff` | 11.6 ms | 25.5 ms | 74.0 ms | 186 ms | 410 ms |
+  | Recompute (E245, fastest) | 517 ms | 523 ms | 529 ms | 538 ms | 550 ms |
+
+  - With `prune_diff`, a 10-change update reads 437 objects instead of 1,175 at 20,000 rows, and 668 instead of 4,151 at 100,000.
+  - At 100,000 rows a 10-change update is 11.6 ms, close to the 9.5 ms at 20,000.
+  - Against E243 as it was, a 10-change update at 100,000 rows is 4.6 times faster, and 45 times faster than the fastest recompute.
+  - At 1,000 changes the gain is small (437 to 410 ms), because there the diff is a small part of the work.
+- Not measured: durable stores, tables beyond 100,000 rows.
+- Trade-off: none found. The diff reads fewer objects, and gives the same changes.
+- Verdict: **kept (option off).** Small join updates no longer pay for the size of the table they read. Large batches are still bounded by the per-key seeks and writes of E245.
+- Run: `cargo run --release --example join_switch -- 20000 1000 0.4 10 30 100 300 1000`, and again with 100000.
