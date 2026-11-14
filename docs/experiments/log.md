@@ -3648,3 +3648,30 @@ Gates on the branch (E229 to E233): every kernel test suite passes (release); cl
 - Trade-off: none found. The diff reads fewer objects, and gives the same changes.
 - Verdict: **kept (option off).** Small join updates no longer pay for the size of the table they read. Large batches are still bounded by the per-key seeks and writes of E245.
 - Run: `cargo run --release --example join_switch -- 20000 1000 0.4 10 30 100 300 1000`, and again with 100000.
+
+### E265 branch-merge (merging a branch: files three-way by path, the database by its events since the fork)
+- Branch / parent: exp/265-branch-merge / main 6986d6e, rebased on 2b55018 (numbered from E260 to stay clear of E256 to E259 on other branches; E260 is the hot and cold baseline on exp/260-hot-cold-baseline)
+- Question: a branch in ikam is a ref, but nothing merges two of them, for files or for database mode's log. Can a merge cost in proportion to what changed since the fork rather than to the store, and find every key or path written on both sides? (Grounding: `graph_range` reads only the log chunks after a position, E119; the April Python design recorded a commit's base ref, result ref and delta hash, and its staging area promoted a closure atomically, `docs/ikam/IKAM_STAGING_AND_PROCESS_MODEL.md`.)
+- Change (opt-in, library only; nothing merges unless a caller does):
+  - `merge` (src/merge.rs): `Repo::branch` (create a ref at a commit), `Repo::merge_base` (both histories walked breadth-first in turn), `Repo::merge(into, from, message)` returning `Merged::{UpToDate, FastForward, Commit, Conflicts}`.
+  - Files: a three-way merge of the trees by path. A subtree with the same id on two sides is not read. A path changed on both sides to different entries is `Conflict::Path`.
+  - Database: the other side's events after the fork's log position are read (`db_events_after`, which checks both logs hold the fork's last event) and appended after this side's head with `db_append`, so a retry logged on both sides with the same bytes is kept once. A key written on both sides by different operations (a point, a subtree remove or a range remove overlapping) is `Conflict::Key`; an idempotency key logged with different bytes on each side is `Conflict::Idempotency`.
+  - Conflicts are reported and nothing is written; otherwise a commit with both heads as parents, and the ref moves by compare-and-swap.
+  - `Repo::db_commit` now builds its `db` entry with `db_entry`, shared with the merge (same objects as before).
+  - Tests (tests/merge.rs): disjoint changes merge and the views equal a rebuild; conflicts on a path, a key and an idempotency key write nothing; a subtree remove and a range remove clash with keys inside them; the same change on both sides is no conflict and a retry is logged once; fast-forward and up to date.
+- Result (`examples/branch_merge.rs`: N generated rows and N/10 generated files on `main`, a branch `side`, C changes on each side in commits of 100 (upserts, a file edit per ten, main on even files and side on odd), then `side` merged into `main`; MemStore with read counts; a 4-core cloud machine, nothing else running):
+
+  | Rows | Changes each side | Merge, `needed_index` on | Same events appended, no merge | Merge, defaults | Full rebuild of the merged log |
+  |---|---|---|---|---|---|
+  | 100,000 | 100 | 43 ms (855 reads) | 35 ms (454) | 76 ms (119k reads) | 0.74 s |
+  | 100,000 | 1,000 | 378 ms (6,409) | 400 ms (3,933) | 5.0 s (17.1M reads) | 0.76 s |
+  | 1,000,000 | 100 | 102 ms (1,356) | 73 ms (928) | 724 ms (2.35M reads) | 8.0 s |
+  | 1,000,000 | 1,000 | 528 ms (6,758) | 462 ms (4,393) | 9.0 s (33.3M reads) | 8.2 s |
+
+  - With 10% of side's keys also written by main, every planted key and no other was reported: 10 of 10 and 100 of 100, in 2.9 to 27 ms (379 to 2,329 reads), at both sizes, and the ref did not move.
+  - After every merge the views equal `db_rebuild` of the merged log, and the merged log holds N + 2C events.
+  - The merge's own cost is reading the events since the fork and the paths that changed; the rest is the append. With defaults, today's append can scan the whole store when it drops an object (E178's drop spike), so a merge costs what the same append costs, and at 1,000 changes it is slower than rebuilding. With `needed_index` (E129, an existing option) a merge of 1,000 changes on 1M rows is 16 times faster than a rebuild.
+- Not measured: E265's variant b (merging while one side's views lag): `db_append` refuses lagging views, so it waits for per-branch hot state (E264); 10M rows; FsStore and packs (times here are MemStore); criss-cross histories (the merge base may not be the best one); kept counts and view graphs on merged databases (rebuilt by their callers).
+- Verdict: **kept** as an option (opt-in API). A merge reads what changed since the fork and reports every planted conflict; its cost tracks the append path, so `needed_index` matters more for merges than the merge code does.
+- Run: `cargo run --release --example branch_merge -- 100000 1000000`; `cargo test --release --test merge`.
+- Gates on the branch: every kernel test suite passes (release, 228 tests after the rebase on 2b55018); clippy `-D warnings` and fmt clean; the bench, run before the rebase, gives the same byte and count fields as main 6986d6e run alongside it on the same machine (only times and peak memory differ), north 0.3096. The corpora built from git history (repo-history, repo-graph, structured, transcripts) were left out: their pinned commits are not in this repository's rewritten history, so this run used invoices, synthetic-history, generated, multiformat and the north corpora.

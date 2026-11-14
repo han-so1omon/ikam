@@ -26,6 +26,7 @@ pub mod join;
 mod library;
 mod markup;
 pub mod matcher;
+pub mod merge;
 mod object;
 mod pdftext;
 mod range;
