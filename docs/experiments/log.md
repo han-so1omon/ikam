@@ -3648,3 +3648,70 @@ Gates on the branch (E229 to E233): every kernel test suite passes (release); cl
 - Trade-off: none found. The diff reads fewer objects, and gives the same changes.
 - Verdict: **kept (option off).** Small join updates no longer pay for the size of the table they read. Large batches are still bounded by the per-key seeks and writes of E245.
 - Run: `cargo run --release --example join_switch -- 20000 1000 0.4 10 30 100 300 1000`, and again with 100000.
+
+### E260 hot-cold-baseline (where time goes in each layer, today)
+- Branch / parent: exp/260-hot-cold-baseline / main 6986d6e, rebased on 2b55018 (E260 to E267 are the hot and cold layers plan; E256 to E259 are on another branch)
+- Question: the older design notes split work into a hot layer (what a caller waits for: storing an edit, editing the tree, appending to the log, the commit that moves the ref) and a cold layer (work that may lag: repack, gc, fsck, bringing derived views up to date). Before changing either, how long does each take today, with the defaults and with today's opt-ins for the hot path (`FsStore::open_deferred`, E227; `Repo::plain_db_events`, E232; `Repo::needed_index`, E129)?
+- Change: none in the kernel. `examples/hot_cold.rs` measures both layers in one run, on FsStore in a temporary directory.
+  - W1 `files`: 200 generated files (half markdown notes of 40 lines, half CSV tables of 200 rows), then 1,000 edits of one line each, committed after every edit or every 50.
+  - W2 `db`: a generated table of N rows, then appends in batches of 1 (200 appends), 100 and 2,000 (2,000 appends), each batch committed; one incremental view (E242, a sum per id) updated after each batch or caught up once at the end, and checked against a full build and a rebuild of the log.
+  - Cold work after the session: repack, gc, fsck, disk bytes before and after. Repack runs at 20,000 rows or fewer (see the results).
+- Result (a 4-core cloud machine with nothing else running; one run each, so rough):
+
+  W1 files, 1,000 edits:
+
+  | Store | Commit every | Session | Edit p50 / p99 | Commit p50 | Repack | Disk before, after |
+  |---|---|---|---|---|---|---|
+  | default | 1 | 8.4 s | 6.1 / 47 ms | 0.8 ms | 68 s | 2.24 MB, 0.78 MB |
+  | default | 50 | 10.1 s | 8.0 / 45 ms | 1.6 ms | 29 s | 2.17 MB, 0.41 MB |
+  | deferred sync | 1 | 9.4 s | 6.9 / 56 ms | 2.2 ms | 71 s | 2.24 MB, 0.78 MB |
+  | deferred sync | 50 | 7.1 s | 4.8 / 43 ms | 14.2 ms | 29 s | 2.17 MB, 0.41 MB |
+
+  - Of an edit's time, the tree edit is about two thirds (4 ms p50) and storing the content about one fifth (1 to 2 ms); the commit is 1 to 2 ms, or 14 ms when deferred sync flushes 50 edits at once.
+  - The cold work is 3 to 9 times the session: repack takes 29 to 71 s for a store of about 2 MB and shrinks it 3 to 5 times; gc frees nothing (no edit leaves garbage); fsck takes 0.25 to 0.7 s.
+
+  W2 db, append p50 (and the session with views kept current after each batch, then caught up once at the end):
+
+  | Rows | Settings | Batch 1 | Batch 100 | Batch 2,000 |
+  |---|---|---|---|---|
+  | 10,000 | defaults | 20 ms (12.6 s, 8.5 s) | 527 ms (17.0 s, 15.0 s) | 12.9 s |
+  | 10,000 | opt-ins | 8.8 ms (7.4 s, 3.2 s) | 89 ms (3.5 s, 2.5 s) | 0.55 s |
+  | 100,000 | defaults | 20 ms (53 s, 15.5 s) | 8.3 s (171 s, 171 s) | 161 s |
+  | 100,000 | opt-ins | 10 ms (37 s, 4.0 s) | 174 ms (9.6 s, 4.2 s) | 1.4 s |
+
+  - With the defaults a batch's append grows with the store, not the batch: at 100,000 rows a batch of 100 takes 8.3 s and one of 2,000 takes 161 s. That is the drop path scanning the store for each dropped object (E265 saw the same); `needed_index` cuts it 48 to 115 times. Single appends p99: 672 ms with the defaults, 18 ms with the opt-ins.
+  - Keeping the view current after every batch is most of a session of small batches: 200 single appends at 100,000 rows take 37 s with the view updated each time (150 ms an update) and 4.0 s with it caught up once at the end (0.2 s for all 200). That is the case for a cold view layer (E261 to E264).
+  - Commits: 4 to 6 ms with the defaults; with deferred sync, 6 to 7 ms for one event and 290 ms for 2,000 (the flush moves into the commit).
+  - Cold, at 10,000 rows: repack 87 s for a 2.4 MB store (to 1.8 MB), gc 0.18 s, fsck 0.58 s. At 100,000 rows (a store of about 20 MB with the opt-ins): gc 1.5 s (437 objects freed), fsck 1.8 s; a repack with the defaults ran 12 minutes without finishing, its directory at 445 MB when stopped, so repack at that size is left out of the harness.
+  - A full build of the view takes 1 s at 10,000 rows and 12 to 15 s at 100,000.
+- Not measured: the Mac (the plan's Mac part: its disk, where sync costs differ most), the view pending edges (E148) and group commit (E177) under several writers (this harness has one), packs (E176), larger stores, repeated runs.
+- Trade-off: none (no kernel change).
+- Verdict: **reference**. The hot layer is dominated by two things that already have an answer or a plan: the default drop scan (`needed_index`, off by default) and views kept current on every append (catching up later is about 100 times cheaper per append). The cold layer's repack takes tens of seconds for a few megabytes and did not finish at 20 MB, so it cannot run in a session's path at all; a background or incremental repack is the cold layer's first need.
+- Run: `cargo run --release --example hot_cold -- files`, `-- db default 100000`, `-- db opt 100000`, `-- db 10000`.
+
+### E265 branch-merge (merging a branch: files three-way by path, the database by its events since the fork)
+- Branch / parent: exp/265-branch-merge / main 6986d6e, rebased on 2b55018 (numbered from E260 to stay clear of E256 to E259 on other branches; E260 is the hot and cold baseline on exp/260-hot-cold-baseline)
+- Question: a branch in ikam is a ref, but nothing merges two of them, for files or for database mode's log. Can a merge cost in proportion to what changed since the fork rather than to the store, and find every key or path written on both sides? (Grounding: `graph_range` reads only the log chunks after a position, E119; the April Python design recorded a commit's base ref, result ref and delta hash, and its staging area promoted a closure atomically, `docs/ikam/IKAM_STAGING_AND_PROCESS_MODEL.md`.)
+- Change (opt-in, library only; nothing merges unless a caller does):
+  - `merge` (src/merge.rs): `Repo::branch` (create a ref at a commit), `Repo::merge_base` (both histories walked breadth-first in turn), `Repo::merge(into, from, message)` returning `Merged::{UpToDate, FastForward, Commit, Conflicts}`.
+  - Files: a three-way merge of the trees by path. A subtree with the same id on two sides is not read. A path changed on both sides to different entries is `Conflict::Path`.
+  - Database: the other side's events after the fork's log position are read (`db_events_after`, which checks both logs hold the fork's last event) and appended after this side's head with `db_append`, so a retry logged on both sides with the same bytes is kept once. A key written on both sides by different operations (a point, a subtree remove or a range remove overlapping) is `Conflict::Key`; an idempotency key logged with different bytes on each side is `Conflict::Idempotency`.
+  - Conflicts are reported and nothing is written; otherwise a commit with both heads as parents, and the ref moves by compare-and-swap.
+  - `Repo::db_commit` now builds its `db` entry with `db_entry`, shared with the merge (same objects as before).
+  - Tests (tests/merge.rs): disjoint changes merge and the views equal a rebuild; conflicts on a path, a key and an idempotency key write nothing; a subtree remove and a range remove clash with keys inside them; the same change on both sides is no conflict and a retry is logged once; fast-forward and up to date.
+- Result (`examples/branch_merge.rs`: N generated rows and N/10 generated files on `main`, a branch `side`, C changes on each side in commits of 100 (upserts, a file edit per ten, main on even files and side on odd), then `side` merged into `main`; MemStore with read counts; a 4-core cloud machine, nothing else running):
+
+  | Rows | Changes each side | Merge, `needed_index` on | Same events appended, no merge | Merge, defaults | Full rebuild of the merged log |
+  |---|---|---|---|---|---|
+  | 100,000 | 100 | 43 ms (855 reads) | 35 ms (454) | 76 ms (119k reads) | 0.74 s |
+  | 100,000 | 1,000 | 378 ms (6,409) | 400 ms (3,933) | 5.0 s (17.1M reads) | 0.76 s |
+  | 1,000,000 | 100 | 102 ms (1,356) | 73 ms (928) | 724 ms (2.35M reads) | 8.0 s |
+  | 1,000,000 | 1,000 | 528 ms (6,758) | 462 ms (4,393) | 9.0 s (33.3M reads) | 8.2 s |
+
+  - With 10% of side's keys also written by main, every planted key and no other was reported: 10 of 10 and 100 of 100, in 2.9 to 27 ms (379 to 2,329 reads), at both sizes, and the ref did not move.
+  - After every merge the views equal `db_rebuild` of the merged log, and the merged log holds N + 2C events.
+  - The merge's own cost is reading the events since the fork and the paths that changed; the rest is the append. With defaults, today's append can scan the whole store when it drops an object (E178's drop spike), so a merge costs what the same append costs, and at 1,000 changes it is slower than rebuilding. With `needed_index` (E129, an existing option) a merge of 1,000 changes on 1M rows is 16 times faster than a rebuild.
+- Not measured: E265's variant b (merging while one side's views lag): `db_append` refuses lagging views, so it waits for per-branch hot state (E264); 10M rows; FsStore and packs (times here are MemStore); criss-cross histories (the merge base may not be the best one); kept counts and view graphs on merged databases (rebuilt by their callers).
+- Verdict: **kept** as an option (opt-in API). A merge reads what changed since the fork and reports every planted conflict; its cost tracks the append path, so `needed_index` matters more for merges than the merge code does.
+- Run: `cargo run --release --example branch_merge -- 100000 1000000`; `cargo test --release --test merge`.
+- Gates on the branch: every kernel test suite passes (release, 228 tests after the rebase on 2b55018); clippy `-D warnings` and fmt clean; the bench, run before the rebase, gives the same byte and count fields as main 6986d6e run alongside it on the same machine (only times and peak memory differ), north 0.3096. The corpora built from git history (repo-history, repo-graph, structured, transcripts) were left out: their pinned commits are not in this repository's rewritten history, so this run used invoices, synthetic-history, generated, multiformat and the north corpora.

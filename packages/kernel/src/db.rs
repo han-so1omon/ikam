@@ -814,6 +814,24 @@ impl<S: Store> Repo<S> {
         Ok(rebuilt)
     }
 
+    /// The events logged after position `at` (E265), read from the log's
+    /// chunks after it. Fails unless `db`'s log holds `base`'s event at
+    /// `at`, so both share the fork's history.
+    pub(crate) fn db_events_after(&self, db: &Db, base: &Db, at: u64) -> Result<Vec<Event>, Error> {
+        let label = seq_label(at);
+        if at > 0 && self.graph_node(&db.log, &label)? != self.graph_node(&base.log, &label)? {
+            return Err(Error::Decode("db logs do not share the fork's events"));
+        }
+        let mut out = Vec::new();
+        for n in self.graph_range(&db.log, &seq_label(at + 1), None, usize::MAX, false)? {
+            let Target::Content(a) = n.target else {
+                return Err(Error::Decode("db log"));
+            };
+            out.push(Event::decode(&self.read_content(&a.id())?)?.0);
+        }
+        Ok(out)
+    }
+
     /// Commit `db` to `name`, replacing the `db` entry of the ref's current
     /// tree and keeping every other entry.
     pub fn db_commit(&mut self, name: &str, db: &Db, message: &str) -> Result<Id, Error> {
@@ -825,6 +843,13 @@ impl<S: Store> Repo<S> {
             None => Vec::new(),
         };
         entries.retain(|e| e.name != "db");
+        entries.push(self.db_entry(db)?);
+        let tree = self.put(&Object::tree(entries)?)?;
+        self.commit(name, tree, message)
+    }
+
+    /// The tree entry `db` that holds `db`'s log and views.
+    pub(crate) fn db_entry(&mut self, db: &Db) -> Result<TreeEntry, Error> {
         let graph = |name: &str, id: Id| TreeEntry {
             name: name.into(),
             kind: Kind::Graph,
@@ -851,13 +876,11 @@ impl<S: Store> Repo<S> {
             id: views,
         };
         let dir = self.put(&Object::tree(vec![graph("log", db.log), views])?)?;
-        entries.push(TreeEntry {
+        Ok(TreeEntry {
             name: "db".into(),
             kind: Kind::Tree,
             id: dir,
-        });
-        let tree = self.put(&Object::tree(entries)?)?;
-        self.commit(name, tree, message)
+        })
     }
 
     fn commit_tree(&self, commit: &Id) -> Result<Id, Error> {
