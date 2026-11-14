@@ -177,9 +177,10 @@ impl<S: Store> Repo<S> {
         }
     }
 
-    /// Store derived bytes as plain content: a view can be rebuilt, so no
-    /// plan is searched for its values (the search reads stored contents).
-    fn put_derived(&mut self, bytes: &[u8]) -> Result<Id, Error> {
+    /// Store derived bytes as plain content: a view or a join can be
+    /// rebuilt, so no plan is searched for its values (the search reads
+    /// stored contents).
+    pub(crate) fn put_derived(&mut self, bytes: &[u8]) -> Result<Id, Error> {
         let id = Id::of_content(bytes);
         if !self.has_content(&id)? {
             let encoded = self.encode_plain(bytes);
