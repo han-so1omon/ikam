@@ -1690,7 +1690,7 @@ Newest last. Format and rules: `README.md`.
   - Hot stored sizes identical to E102 or smaller (generated -125 B, transcripts -553 B); `proxy_score` 3.8200 -> 3.8199, `read_score` 5.7268 -> 5.7266, `bytes_score` 5.7623 -> 5.7621.
   - Cost score **0.2646 / 0.2630 / 0.2594 / 0.2589** against main's 0.2504 / 0.2527 / 0.2414 / 0.2474 in runs alternated with it: about 4.5% higher, beyond its 2% spread. The rise is in measured time only. Its largest part is office (median 0.337 -> 0.418, from ingest). Office ingest executes the same work as on main: 10,039 M instructions on main, 10,037 M with E104 under callgrind. Wall time over the whole bench is lower (19.7 -> 19.6 s).
 - Verdict: **pending**. North improves beyond tolerance on every run. The cost score does not hold by the keep rule's letter, although every deterministic measure holds or improves and the slower runs execute the same instructions (most likely code layout). Kept on its branch until that call is made.
-- Follow-up (Nov 7, Eric's call: "it should be an option"): the short form is now `Repo::short_records`, **off by default**; reading accepts both forms whatever the setting, and repack's re-plan keeps it. `bench --short-records` measures with it on; `tests/exec.rs` asserts 102 B by default and 53 B with it on.
+- Follow-up (Nov 7, the owner's call: "it should be an option"): the short form is now `Repo::short_records`, **off by default**; reading accepts both forms whatever the setting, and repack's re-plan keeps it. `bench --short-records` measures with it on; `tests/exec.rs` asserts 102 B by default and 53 B with it on.
   - Off (two runs): every corpus byte-identical to main (all hot sizes, north/tables 135,551, multiformat 332,403, cases 391,496), north 0.3035, cost score 0.2484 / 0.2608. The second off run, with unrelated downloads running beside it, moved the cost score by 5% with identical bytes: the same size as the rise attributed to E104.
   - On (one run): north 0.2793 and every size as in E104's runs; cost score 0.2646.
   - Verdict: **kept**, as an option (a capability added while both scores hold by default). The trade-off and the other settings are mapped in `options.md`.
@@ -1770,7 +1770,7 @@ Newest last. Format and rules: `README.md`.
 
 ### E110 live-fs (the store as a filesystem you change while it runs)
 - Branch / parent: exp/110-live-fs / E109
-- Question (from Eric): can a corpus be used like a filesystem, with files added, changed, moved and deleted as it runs, searched and asked about, without a full repack per change? What does an edit cost, and does every file still read back exactly?
+- Question (from the owner): can a corpus be used like a filesystem, with files added, changed, moved and deleted as it runs, searched and asked about, without a full repack per change? What does an edit cost, and does every file still read back exactly?
 - Change:
   - `src/worktree.rs` (kernel): `Repo::edit_tree(root, edits)` applies put, mkdir, remove, rename and copy to a tree and rewrites only the trees on the changed paths; untouched subtrees keep their ids. A property test checks it against a model of the tree (200 random edit sequences; refused edits change nothing; a batch equals the same edits one at a time).
   - `src/container.rs` (kernel): `expand(bytes)`, the parts ingest expands a zip or a PDF into, for reading a binary file's text. After a repack a docx or pptx is often a concat of ranges of other files, so its derivation's arguments are not its members; text read from them was binary noise (100 MB of "text" from a 28.6 MB corpus).
@@ -1786,11 +1786,11 @@ Newest last. Format and rules: `README.md`.
   - The LLM step was checked only against a local stand-in for the API (request shape, key kept off the command line); no key was available here.
   - Bench (main and two runs of the branch, same machine): all corpora byte-identical, exact, fsck clean; north 0.3035 on all three; cost score 0.2493 on main, 0.2516 / 0.2434 on the branch (within its 2% spread). Nothing in ingest or repack changed; `edit_tree` and `expand` are new entry points.
 - Not done, next: an incremental repack (re-plan only content added since the last one: the drift above is all new content), a text index kept on disk (restart time), enforced WebDAV locks, a persistent store of dead properties if a client needs them.
-- Verdict: **kept** as a capability (both scores hold), on the branch until Eric says to merge.
+- Verdict: **kept** as a capability (both scores hold), on the branch until the owner says to merge.
 
 ### E111 live-host (running `ikam live` as a service another machine reaches)
 - Branch / parent: exp/111-live-host / E110
-- Question (from Eric's hosting plan): what does `ikam live` need to run on his Mac as a launchd service, reached from his other devices through Tailscale Serve, as a safe test that leaves the Mac's own files alone?
+- Question (from the owner's hosting plan): what does `ikam live` need to run on his Mac as a launchd service, reached from his other devices through Tailscale Serve, as a safe test that leaves the Mac's own files alone?
 - Change (CLI only; nothing in the kernel library):
   - `--allow-host NAME` (repeatable): requests naming NAME, with or without a port, pass the Host check as 127.0.0.1 and localhost do. The listener stays on 127.0.0.1; reaching it from elsewhere is the proxy's job.
   - `IKAM_AUTH=user:salt:hash` (from `ikam passwd USER`, password on stdin): every request, page, API and `/dav/` alike, needs that user and password over HTTP basic auth, else 401 with `WWW-Authenticate`. The hash is BLAKE3 (derive-key mode) over a 16-byte random salt and the password, compared in constant time.
@@ -1802,7 +1802,7 @@ Newest last. Format and rules: `README.md`.
   - Live bench (7 corpora without pandas, 400 edits): 0 mismatches, restart exact, fsck clean, edit p50 17 ms; the bench's own SIGTERM now stops the server cleanly. On an empty corpus folder: 0 mismatches, fsck clean (failed before the fix).
   - Bench: all corpora exact, fsck clean; north 0.3035 (unchanged); cost score 0.2510 (E110's runs 0.2434 to 0.2516). Nothing in ingest or repack changed.
 - Not done, next: a text index kept on disk (restart 24 s with pandas), a slow password hash if the settings file could ever be read by others.
-- Verdict: **kept** as a capability (both scores hold), on the branch until Eric says to merge.
+- Verdict: **kept** as a capability (both scores hold), on the branch until the owner says to merge.
 
 ### E112 markup-text-layer (an office XML part as its tags and its words, apart)
 - Branch / parent: exp/112-markup-text-layer / main at 9bfb18c (E111)
@@ -1827,12 +1827,12 @@ Newest last. Format and rules: `README.md`.
   - Real-world office files (`realworld`, single-type corpora): docx 563,619 -> 563,138 (-0.1%), pptx 2,930,435 -> 2,955,381 (+0.9%), sheets 243,778 -> 245,556 (+0.7%). With no other format holding the same words, the split only adds members.
   - Byte roles: cases docx body -14.1 KB and sheet cells -13.9 KB, text:code -11.9 KB (groups re-formed), skeleton and text members charged to office:zip (+19.0 KB, E101's sniff knows neither). multiformat docx body -15.3 KB but office:zip +18.1 KB, html +4.2 KB, md +1.3 KB: the docx text is cut into runs (one per line, words split by formatting), and 20 KB skeletons fill groups three at a time.
 - What it shows: words apart from tags help where the same facts sit in several types (cases: one graph now 4.9% smaller than per-type stores, was 0.6% larger), cost a little where a file type is alone, and lose on multiformat. A per-file choice between the layered and plain plans (priced after repack) would keep the cases gain without the multiformat and real-world losses; so would an E101 role for skeleton and text members.
-- Verdict: **kept as an option** (north improves beyond tolerance, cost score holds, office repack CPU rises; Eric's rule: trade-offs are settings). On its branch until Eric says to merge.
+- Verdict: **kept as an option** (north improves beyond tolerance, cost score holds, office repack CPU rises; the owner's rule: trade-offs are settings). On its branch until the owner says to merge.
 - Also found: on a shallow clone the bench's `repo-history` corpus is empty and `grep_queries` divides by zero (main too). A full or deeper clone runs.
 
 ### E113 finder-dav (why Finder stays on "Connecting", and a log that shows it)
 - Branch / parent: exp/113-finder-dav / main at baab468 (E112)
-- Question (Eric, Nov 8): on his Mac, Finder's Connect to Server at the Tailscale Serve name hangs on "Connecting" after the password, though the page opens in a browser and curl's PROPFIND gets 207; the log shows only startup lines, so nothing says whether Finder's requests arrive.
+- Question (the owner, Nov 8): on his Mac, Finder's Connect to Server at the Tailscale Serve name hangs on "Connecting" after the password, though the page opens in a browser and curl's PROPFIND gets 207; the log shows only startup lines, so nothing says whether Finder's requests arrive.
 - What macOS sends (Apple's webdavfs source, `mount.tproj/webdav_network.c` and `WebDAVPlugin/WebDAV_Mount.c`): the plugin probes the URL for a proxy, NetAuth asks for the password, then the mount sends OPTIONS (needs DAV class 1, or 2 for read-write) and PROPFIND Depth 0 for getlastmodified, getcontentlength, creationdate and resourcetype, and must find a collection. Then statfs asks for quota-available-bytes, quota-used-bytes, quota and quotaused, Finder looks up its metadata names (._., .DS_Store, .hidden, .metadata_never_index, Backups.backupdb, ...), lists with Depth 1, and writes AppleDouble files under LOCK. Basic auth is fine over https.
 - Replay: a Go reverse proxy shaped like Tailscale Serve (TLS in front, Host kept, X-Forwarded headers) in front of `ikam live` with IKAM_AUTH and --allow-host, over HTTP/1.1 and HTTP/2, with the WebDAVFS User-Agent: OPTIONS without a password 401 with the challenge, with it 200 (DAV: 1, 2); PROPFIND Depth 0 on /dav and /dav/, with Content-Length or chunked bodies, 207 with a collection and quota; the metadata names 404; Depth 1 207; LOCK on a new ._ file 201; PUT with Expect: 100-continue 201; MKCOL, MOVE, DELETE, UNLOCK as expected; no error or panic in the log. Nothing on the server side reproduces the hang, so the next fact has to come from the Mac.
 - Change (CLI only):
@@ -1840,12 +1840,12 @@ Newest last. Format and rules: `README.md`.
   - Every line `ikam live` writes (startup, watch, commit failures, stop, connection errors) starts with the UTC time, so a log tail over ssh shows which run a line came from.
 - Result: tests, clippy and fmt clean. Ingest, repack and the store are untouched (bench not rerun for that reason).
 - Next: run it on the Mac with `--log-requests` and retry Finder. No lines means Finder's requests never reach ikam (look on the client: `mount_webdav -i URL DIR` from Terminal, and `log show --last 5m --predicate 'process CONTAINS "webdav"'`); lines that stop at one request point at that request.
-- Verdict: **kept** as a capability (logging off by default); merged to main on Eric's yes (Nov 8).
+- Verdict: **kept** as a capability (logging off by default); merged to main on the owner's yes (Nov 8).
 
 
 ### E114 public-test (a copy anyone can read, and a self-test that publishes its result)
 - Branch / parent: exp/114-public-test / main at c3afdca (E113)
-- Question (Eric, Nov 8): put a test copy of ikam on Tailscale Funnel so Claude can watch it as it develops, without opening his own files: anyone may read, writes need a password, a test runner on the Mac uses that password and publishes what it finds.
+- Question (the owner, Nov 8): put a test copy of ikam on Tailscale Funnel so Claude can watch it as it develops, without opening his own files: anyone may read, writes need a password, a test runner on the Mac uses that password and publishes what it finds.
 - Gaps found in an open `ikam live`: request bodies read whole with no limit, no cap on the store, a thread per connection with no cap, header lines of any length, and repack/fsck/commit callable by anyone who can reach it when no password is set.
 - Change (CLI only; nothing changes without the new flags except the header caps):
   - `--public` (needs `IKAM_AUTH`): guests (no Authorization header) get GET, HEAD and OPTIONS anywhere and PROPFIND on `/dav`; every other method, and all API POSTs, get 401 with the challenge. A guest's `llm` parameter is dropped, so no Claude answer is spent for them. A wrong password is refused, reads included.
@@ -1857,7 +1857,7 @@ Newest last. Format and rules: `README.md`.
   - `realworld/selftest.py`: stdlib-only check of a running copy, under `/selftest/`: guest reads, 8 kinds of guest write refused, wrong password refused, no Claude answer for guests, 14 files (text, CSV, a Word file) read back byte for byte, search finds each by a word only it holds, ask's first source, an edit moves a word, rename/copy/delete/folder rename, commit; timings per kind. Writes `/dav/results/latest.json` and `history.jsonl` (last 200) with the password; never writes the password.
 - Result: unit tests (limits over a real socket, store cap, guest method table, byte sizes), clippy and fmt clean, 10 full test runs with no flake. Manual: guest writes 401, password writes 201, guest reads 200/207, unknown Host 403, 30 MB upload 413, store cap 507 after 20 x 100 KB. Self-test passes twice in a row (about 13 KB stored per run). Live bench (default flags, 8 corpora, 264 files, 400 edits): 0 mismatches, search 0 wrong, fsck clean, restart 3.5 s, watch lag p50 515 ms; ingest untouched.
 - Mac setup (dry run here with stand-ins for launchctl and plutil): a test-copy folder with its own store, a generated test password (mode 600), a LaunchAgent serving it on 127.0.0.1 using the private copy's auto-updated binary, and a second LaunchAgent that restarts the test copy when the private copy deploys a new build and runs the self-test (also every 6 hours). Funnel on 8443 only; the private copy keeps 443 on the tailnet.
-- Verdict: **kept** as options (all off by default); merged to main on Eric's yes (Nov 8).
+- Verdict: **kept** as options (all off by default); merged to main on the owner's yes (Nov 8).
 
 ### E115 robots (let web readers read the public test copy)
 - Branch / parent: exp/115-robots / main at 44b5730 (E114)
@@ -1865,7 +1865,7 @@ Newest last. Format and rules: `README.md`.
 - Change: `/robots.txt` (GET or HEAD, after the Host check, before the password check) answers `User-agent: *` with `Allow: /` on a `--public` copy and `Disallow: /` otherwise. Nothing else changes.
 - Result: unit test; manual: public copy 200 `Allow: /`, results still 200, PUT on /robots.txt 401; private copy 200 `Disallow: /`, everything else still 401, unknown Host 403. Tests, clippy and fmt clean.
 - Not settled here: if the reader looks for robots.txt on the default port (443, the private copy, not on Funnel), this does not help; that would need the test copy on its own name on 443.
-- Verdict: **kept**; merged to main on Eric's yes (Nov 9).
+- Verdict: **kept**; merged to main on the owner's yes (Nov 9).
 
 ### E116 live-gc (the test copy's store grows each run)
 - Branch / parent: exp/116-gc / main at 30d2042 (E115)
@@ -1874,7 +1874,7 @@ Newest last. Format and rules: `README.md`.
 - Change: `Live::gc` (commits pending edits, runs `Repo::gc`, re-measures the store for `--max-store`, re-stores the empty working tree when nothing is committed, as repack does); `POST /api/gc` (a write: password and `X-Ikam` header; guests get 401); option `--gc-every N` runs it after every N commits, off by default. `realworld/selftest.py` adds check 11, "gc frees space and keeps every file", and a guest refusal for `POST /api/gc`.
 - Result: unit tests (garbage freed by more than half and every committed version reads back; `--gc-every 2` shrinks the store on commits 2 and 4; gc of an empty store then edits). Eight self-test runs against a local `--public` copy: 11 of 11 checks each, gc deletes ~130 objects a run, the store grows about 2 KB a run (history) instead of ~5 KB. `ikam gc` takes 0.06 s on a 9 MB store of 1849 objects. Tests, clippy and fmt clean.
 - Not settled here: history is never dropped, so the test copy still grows about 2 KB a run (about 3 MB a year at four runs a day, well under its 1 GB cap).
-- Verdict: **kept**; merged to main on Eric's yes (Nov 9).
+- Verdict: **kept**; merged to main on the owner's yes (Nov 9).
 
 ### E117 bench-shallow (the full bench crashes on a shallow clone)
 - Branch / parent: exp/117-bench-shallow / main at 30d2042 (E115)
@@ -1882,52 +1882,52 @@ Newest last. Format and rules: `README.md`.
 - Cause: four corpora are built from this repository's own history at pinned commits (repo-history at 6cd6921; repo-graph, structured and transcripts at 0ca74e4). A shallow clone lacks those commits, `git rev-list` fails quietly, and repo-history comes out with no files. A partly deepened clone is worse: the commits exist with only part of their history, so a corpus comes out short and the run scores a different corpus without saying so.
 - Change: before any work, the bench counts each pinned commit's history (`git rev-list --count`, 9 and 38 commits) for the corpora selected, and if one is missing or short, prints which corpora, which commit and how much history it has, and `git fetch --unshallow`, then exits with status 2. Naming only other corpora still runs. `grep_queries` asserts it has files instead of dividing by zero.
 - Result: depth 1: fails at once naming all four corpora; depth 150: "commit 6cd6921 is missing; transcripts (commit 0ca74e4 has 21 of 38 commits of history)"; `md pdf` alone runs; after `git fetch --unshallow`, repo-history runs as before (exact, fsck clean). Measurement unchanged. Tests, clippy and fmt clean.
-- Verdict: **kept**; merged to main on Eric's yes (Nov 9).
+- Verdict: **kept**; merged to main on the owner's yes (Nov 9).
 
 
 ### E118 db-log-view (an event log and a last-write-wins view in the kernel)
 - Branch / parent: exp/db-log-view / main at 8d95f82 (E117)
-- Question (Eric, Nov 9): step 1 of the database roadmap: an append-only log in the kernel with idempotent appends and one last-write-wins view, built from today's objects, with no format change. Plan: `docs/plans/2026-11-09-db-log-view.md`.
+- Question (the owner, Nov 9): step 1 of the database roadmap: an append-only log in the kernel with idempotent appends and one last-write-wins view, built from today's objects, with no format change. Plan: `docs/plans/2026-11-09-db-log-view.md`.
 - Change (kernel only, new `src/db.rs`): events (key, upsert or remove with subtree, idempotency key) stored as content; the log is a `G` graph keyed by 20-digit sequence numbers; an `ids` view refuses a reused idempotency key with different bytes and skips an exact retry; a `kv` view folds by last write wins, each value a byte range of the event that wrote it. A commit holds them under `db/`, beside any files. New error `IdempotencyConflict`. Nothing else changes.
 - Result: `tests/db.rs`, 12 laws: the April fold tests (last write wins, remove whatever its idempotency key, independent keys, subtree remove, environment qualifiers), writes to distinct keys commute, exact read-back of values (empty, binary, 70 KB) and events, strict decoding, retries change no root, rebuilt views equal maintained ones every 50 of 300 random appends, older commits read their own version after gc, repack and fsck. All kernel tests pass; clippy and fmt clean.
   - Bench: all 14 corpora exact, fsck clean; north 0.3035 (unchanged); cost score 0.2389 (E110's runs 0.2434 to 0.2516; an append-cost test ran alongside at the start). Nothing in ingest or repack changed.
   - Append cost (ignored test `append_cost`): 1,000 single appends 6.2 s (8.5 ms each at the end); batches of 100, 0.21 s; 10,000 in batches of 1,000, 1.9 s (202 ms for the last batch). Every append rebuilds the three graphs, so cost grows with the database.
 - Not settled here: in-place prolly edits (so an append touches one path), whether a reused idempotency key with different bytes should be an error (April skipped it), and the ledger scan at open.
-- Verdict: **kept**; merged to main on Eric's yes (Nov 9).
+- Verdict: **kept**; merged to main on the owner's yes (Nov 9).
 
 ### E119 db-inplace (graph edits that touch only the chunks an edit falls in)
 - Branch / parent: exp/db-inplace / exp/db-log-view at e8ee290 (E118)
-- Question (Eric, Nov 9): every append rebuilt the whole view; build in-place edits, with each view's log position recorded.
+- Question (the owner, Nov 9): every append rebuilt the whole view; build in-place edits, with each view's log position recorded.
 - Change (kernel only; no format change): `graph_edit` re-cuts only the chunks edits fall in, until the content-defined cut falls back into step, level by level; `graph_nodes_in` (batch lookup), `graph_prefix`, `graph_last`; `db_append` uses them; `db_rebuild` is a separate full fold with `put_graph`; views record their log position (`ids.at`, `kv.at` files under `db/views`), and appends to views behind the log are refused. `put_graph` is refactored to share sizing and parent building, unchanged in output.
 - Result: 4 new graph laws (in-place root equals `put_graph` on graphs of height 0 to 2, chained random batches, appends at both ends from empty, emptying; one edit in 150,000 nodes writes only its path; label checks) and 2 new db laws (in-place views equal a full rebuild on a multi-chunk view with subtree removes across chunks; positions committed, defaulted and enforced). All kernel tests pass; clippy and fmt clean.
   - Bench: all 14 corpora exact, fsck clean; north 0.3035 (unchanged); cost score 0.2426 (E118 0.2389).
   - Append cost (`append_cost`, release, nothing else running): 1,000 single appends 6.3 s -> 3.1 s (last 9.5 -> 3.0 ms); batches of 100, 0.25 -> 0.20 s; 10,000 in batches of 1,000, 2.1 -> 1.8 s; 10,000 single appends 48 s, last 4.7 ms (not run before: about 10 minutes by extrapolation). Objects and bytes written unchanged.
   - Most of the remaining cost is the slice search when a new chunk is stored. Measured with it off (read weight 1.0, not committed): 1,000 single appends 0.9 s and 7.9 MB stored instead of 3.3 MB.
 - Not settled here: storing new chunks plain on the fast path and leaving slices to repack (an option to measure next); reading every chunk above the leaves per edit (fine below about a million keys); clash checks for label keys outside the rewritten chunks.
-- Verdict: **kept**; merged to main on Eric's yes (Nov 9).
+- Verdict: **kept**; merged to main on the owner's yes (Nov 9).
 
 ### E120 db-loose-ends (label clashes and path-only reads in in-place edits)
 - Branch / parent: exp/db-inplace / E119 at 05035da
-- Question (Eric, Nov 9): fix both loose ends from E119: label-key clashes outside the rewritten chunks, and every upper chunk read per edit.
+- Question (the owner, Nov 9): fix both loose ends from E119: label-key clashes outside the rewritten chunks, and every upper chunk read per edit.
 - Change (kernel only; no format change): `Keys::{Unique, Any}` with `put_graph_with` and `graph_edit_with`; the db's `ids` and `kv` views use `Keys::Any` (no edge points into them), the log keeps `Keys::Unique`. `graph_edit` walks from the root to the chunks edits fall in and right only until the cut falls back into step, instead of loading every upper level; output unchanged.
 - Result: a real 64-bit key collision (`ke32051949435c933`, `kb4a1e63c25ad68d4`, found in about 10 minutes on 4 cores) used in a graph test and a db test (the db test fails with the views on `Keys::Unique`); a read-count test (fails on E119's code). All 134 kernel tests pass; clippy and fmt clean.
   - Bench: all 14 corpora exact, fsck clean; north 0.3035 (unchanged); cost score 0.2434 (E119 0.2426, timing noise: no bench path calls graph_edit).
   - One edit: 1M keys 10 to 11 ms and about 310 reads -> 2.1 to 2.3 ms and 45 to 55; 10M keys 94 to 105 ms and about 2,700 reads -> 2.2 to 2.4 ms and 45 to 47 (one run 8.8 ms). Upper chunks read per edit: 131 and 1,321 -> 3.
   - Append cost unchanged at its sizes: 1,000 single appends 3.3 s (last 2.9 ms); 10,000, 48 s (last 5.7 ms).
 - Not settled here: `graph_edit` with `Keys::Unique` still checks only the chunks it rewrites (a key index for the log is an option past about 100M events); fsck does not check label keys; storing new chunks plain on the fast path.
-- Verdict: **kept**; merged to main on Eric's yes (Nov 9).
+- Verdict: **kept**; merged to main on the owner's yes (Nov 9).
 
 
 ### E121 results-no-cache (an old copy of the self-test results kept showing)
 - Branch / parent: exp/121-results-no-cache / main at a86be84
-- Question (Eric, Nov 9): a fetcher kept showing the 02:07 self-test results after the 6:00 run had replaced them; the server sent ETag and Last-Modified but no Cache-Control. Add the header.
+- Question (the owner, Nov 9): a fetcher kept showing the 02:07 self-test results after the 6:00 run had replaced them; the server sent ETag and Last-Modified but no Cache-Control. Add the header.
 - Change (CLI only): GET and HEAD under `/dav/results/` (the self-test's `latest.json` and `history.jsonl`, and the folder listing) send `Cache-Control: no-cache`, 304s included, so readers revalidate each time; ETag and Last-Modified stay, so an unchanged copy costs a 304. Other files are unchanged.
 - Result: a dav test (results revalidated on 200, 304, HEAD and the listing; `a.txt` and `resultsx.txt` without the header). All 135 kernel tests pass; clippy and fmt clean. No storage change, so the bench was not rerun.
-- Verdict: **kept**; merged to main on Eric's yes (Nov 9).
+- Verdict: **kept**; merged to main on the owner's yes (Nov 9).
 
 ### E122 store-bakeoff (chunk and ref store backends, measured on ikam's own workloads)
 - Branch / parent: exp/122-store-bakeoff / main at d14be74 (E121)
-- Question (Eric, Nov 9): run a measured comparison of chunk and ref store backends, each behind the `Store` trait as an option: plain files, packs, SQLite WAL, LMDB, an LSM store (RocksDB, fjall), and any other strong fit (redb). Measure object count, open time (small, 1M, 10M keys), write and read throughput, single appends, batch commits, ref swaps, size on disk and crash safety. Research note: `docs/research/store-backends.md` (git packs and reftable, Dolt, dbt, ext4 and ALICE, Apple's fsync, LFS, LSM, WiscKey, Bitcask, BlobDB, ZFS/Btrfs/APFS, lakeFS, SQLite, LMDB, redb, fjall, R2, VFS for Git, overlayfs, File Provider). OpenResearch (`orx`) could not be installed here (proxy 403); the README's git loop was followed.
+- Question (the owner, Nov 9): run a measured comparison of chunk and ref store backends, each behind the `Store` trait as an option: plain files, packs, SQLite WAL, LMDB, an LSM store (RocksDB, fjall), and any other strong fit (redb). Measure object count, open time (small, 1M, 10M keys), write and read throughput, single appends, batch commits, ref swaps, size on disk and crash safety. Research note: `docs/research/store-backends.md` (git packs and reftable, Dolt, dbt, ext4 and ALICE, Apple's fsync, LFS, LSM, WiscKey, Bitcask, BlobDB, ZFS/Btrfs/APFS, lakeFS, SQLite, LMDB, redb, fjall, R2, VFS for Git, overlayfs, File Provider). OpenResearch (`orx`) could not be installed here (proxy 403); the README's git loop was followed.
 - Change (kernel; no format change to anything existing): `src/backends.rs` with a `Kv` trait and a `KvStore` adapter (objects buffered and committed atomically with the ref move, the CAS checked inside the transaction where the engine has one) over SQLite (WAL, `synchronous` FULL or NORMAL; `fullfsync` on macOS for FULL), LMDB (heed), redb, fjall (with and without key/value separation) and RocksDB (with and without blobs), each behind a cargo feature (`stores` for all); and `PackStore`: append-only packs of `id | len | bytes | crc32` records, sealed at 512 MB with a git-style fanout index, the open pack's index checkpointed every 64 MB and on close, every record's CRC checked on read, sealed lookups by interpolation search, refs as files. `FsStore` ref updates now lock with an OS lock instead of the lock file's existence. Harness `examples/stores.rs` (phases `corpus`, `db`, `build`, `probe`, `crash`); tests `tests/backends.rs` (one contract and a repository round trip on every backend, torn tails, checkpoints, stale ref locks) and a sealed-lookup unit test.
 - Result (Linux VM, ext4, 4 cores; fsync here costs about 0.09 ms, so it is not the Mac's drive flush; other jobs ran alongside some phases):
   - The bench corpus `tests/fixtures/cases` (1,906 objects, 229 MB): write MB/s files 273, packs 769, SQLite 202, LMDB 172, redb 287, fjall 230 (330 separated), RocksDB 211; cold read MB/s files 827, packs 3,320, SQLite 1,052, LMDB 1,257, redb 557, fjall 462 (1,097 separated), RocksDB 609; open files 0.5 ms, SQLite 1 ms, LMDB 7 ms, fjall 39 ms, RocksDB 482 ms. redb took 338 MB for 229 MB.
@@ -1937,21 +1937,21 @@ Newest last. Format and rules: `README.md`.
   - Crash (SIGKILL after 150 to 1,650 ms of a child that writes a 50 to 250 KB file, appends 1 to 40 events and commits, 25 kills per backend, twice): no acknowledged commit lost, fsck clean and views rebuilt byte-identical after every kill, on every backend (500 kills). The first runs also found that `FsStore` wedged a ref after a kill between taking `refs/<name>.lock` and the rename: every later update was refused (22 of 25 children in the second run). With the OS lock, 25 of 25 children commit.
   - All kernel tests pass (`cargo test --release`, and `--features stores --test backends`). The bench was not rerun: no ingest, repack or read path changed, and `FsStore`'s lock change affects only who may move a ref.
 - Not measured here (needs the Mac): APFS and F_FULLFSYNC costs (66 drive flushes per commit on `FsStore` against 2 on packs is the number to price there), Finder over WebDAV, `clonefile`. Not built: a multi-pack index, a pack cleaner, per-pack Bloom filters for misses (a miss at 10M costs 130 us), an R2 backend (conditional PUT for refs, Range GET for packs).
-- Verdict: **kept** (packs and the engines as options, `FsStore` stays the default; the `FsStore` lock is a fix); on its branch until Eric says to merge.
+- Verdict: **kept** (packs and the engines as options, `FsStore` stays the default; the `FsStore` lock is a fix); on its branch until the owner says to merge.
 
 ### E123 repack-dict-corruption (a later ingest dropped a group's stored bytes)
 - Branch / parent: exp/123-repack-dict-corruption / main at d14be74 (E121)
-- Question (Eric, Nov 9): ingesting `packages/kernel/fixtures/multiformat`, `docs`, `packages/kernel/src` and then `tests/fixtures/cases` into one store, each under its own ref, failed the fourth ingest with "object ... does not match its id", and fsck then failed 149 objects; `tests/fixtures/cases` alone into a fresh store was clean. Suspected: repack's dictionary move.
+- Question (the owner, Nov 9): ingesting `packages/kernel/fixtures/multiformat`, `docs`, `packages/kernel/src` and then `tests/fixtures/cases` into one store, each under its own ref, failed the fourth ingest with "object ... does not match its id", and fsck then failed 149 objects; `tests/fixtures/cases` alone into a fresh store was clean. Suspected: repack's dictionary move.
 - Finding: not the dictionary. Every encoding in the failed store named the one dictionary (`7a6e7089`, still stored), and the fourth ingest failed in about 20 s, inside `snapshot`, before its repack. The 149 failures were the 49 members (`S 39f9173e8bf45ce8 ...`, docx XML parts from the multiformat ref) of one group whose stored bytes (`K`, 7,636 B) were gone, plus the 100 derivation records (59 `d`, 41 `D`) that read those members. A delete trace showed `apply_candidate` (from `container_candidate` unpacking a docx of the cases) deleting it. Cause: ingest indexes every stored content, groups included, so `new_template_candidate` anti-unified a new docx part with the group, recorded the group as a `fill` and dropped its stored bytes. Members read the group's stored encoding, never a derivation of it, so they were lost. `apply_candidate` kept the dictionary and "Q"/"M" contexts but not groups. Groups exist only after a repack, which is why one ingest into a fresh store was clean.
 - Change (kernel only; no format change): `apply_candidate` keeps a content's stored bytes while another stored encoding needs them (`Repo::is_needed`: any encoding whose `needs` names the id, as gc counts it: a dictionary, a group, or a "Q"/"M" context). It replaces the "Q"/"M"-only check (`is_related_base`, now used by tests only) and costs the same one store scan per drop.
 - Result: new test `tests/groups.rs` `ingest_never_drops_a_group_its_members_read` (40 small notes committed and repacked into a group, then a file shaped like the group under another ref; fsck must be clean, the group stored, every file exact, before and after a second repack): fails on main (the group is dropped and fsck is not clean), passes with the fix, 0.3 s. All kernel tests pass. The four-ingest repro now passes: every ingest prints fsck_failures=0 mismatched=0 (the fourth: 1,438 files, 233.7 MB in, 229.9 MB stored, repack applied) and the final `fsck` prints ok. Ingest and repack plans are otherwise unchanged. clippy and fmt clean.
   - Bench (`cargo run --release --example bench -- --json`, other jobs running): all corpora exact, fsck clean; north 0.3035 (unchanged); cost score 0.2391 (E120 0.2434; timing noise under load).
 - Not settled here: `new_template_candidate` still credits a group's stored bytes it will not drop, so it can choose a template over plain bytes on a false saving (correct, but larger until the next repack). Refusing groups there needs a check cheaper than a store scan per file.
-- Verdict: **kept**, on its branch until Eric says to merge.
+- Verdict: **kept**, on its branch until the owner says to merge.
 
 ### E124 section-reads (what a read of part of a file costs, by file type)
 - Branch / parent: exp/124-section-reads / main at d14be74 (E121)
-- Question (Eric, Nov 9: the most efficient format for I/O, query and permission, "including for targeting specific sections for specific actions relevant to the goals prompted by the user"): when a caller wants one section of a file (a 4 KiB byte range, one part of an Office file, one Markdown section), how many store objects and bytes does ikam fetch, against reading the whole file?
+- Question (the owner, Nov 9: the most efficient format for I/O, query and permission, "including for targeting specific sections for specific actions relevant to the goals prompted by the user"): when a caller wants one section of a file (a 4 KiB byte range, one part of an Office file, one Markdown section), how many store objects and bytes does ikam fetch, against reading the whole file?
 - Change: harness `examples/access.rs` (a counting wrapper over the store; phases `anatomy`, `e124`, then E125 to E127 below), run on the bench corpus `tests/fixtures/cases` (1,438 files, 1,906 objects, 229 MB stored). One fix found by it: `read_range` read a stored leaf to learn that it was stored, then read it again to rebuild the range, so a 4 KiB range of a 1 MB png fetched 2.2 MB. It now asks `store.has` (`src/range.rs`). Tried and dropped: storing range lengths on container plans; docx and pptx are rebuilt whole as containers, so it saved no reads.
 - Result (fetched bytes per byte the caller wanted, medians by type):
   - png (580 files, whole files are one object): whole 1.0; a 4 KiB range 546 before the fix, 273 after (the object is fetched once; ranges inside one object are not separately addressable).
@@ -1959,7 +1959,7 @@ Newest last. Format and rules: `README.md`.
   - Small text files (md, json, py, pdf, log) are members of group objects: 2 reads, and 8 to 140 fetched bytes per byte (md median 78). A Markdown section read alone (134 sections) fetched 1.945 MB against 1.961 MB for the files whole: sections save nothing while their file sits in a group.
   - jsonl (24 files) is chunked: 3 reads whole and for a range, 0.22 bytes per byte whole (compressed).
 - Gates: bench exact and fsck clean on every corpus; north 0.3035 (unchanged); cost score 0.2422 against 0.2391 on E123, a timing difference (the bench ran beside the per-tenant ingests and the 10M build; no ingest, repack or whole-file read path changed).
-- Verdict: **kept** (the `read_range` fix; the measurements feed the design doc); on its branch until Eric says to merge.
+- Verdict: **kept** (the `read_range` fix; the measurements feed the design doc); on its branch until the owner says to merge.
 
 ### E125 query-paths (point, path, range and neighbourhood queries)
 - Branch / parent: exp/124-section-reads / E124
@@ -2002,7 +2002,7 @@ Newest last. Format and rules: `README.md`.
   - Goal windows, fetched by plain reads / by one session / for the matched files whole: invoice 257 / 166 / 184 KB; churn 460 / 198 / 248; triage 93 / 66 / 66; safety 816 / 440 / 483; revenue 1,515 / 909 / 1,007; onboarding 207 / 146 / 158; Q3 542 / 385 / 462. In a session a goal's windows always cost no more than its files whole, and hand the model about 6 times fewer bytes.
   - 238 Office files: 18.9 MB fetched read one by one, the same with one session per file, 2.68 MB with one session for all (they share groups and dictionary blocks).
   - All kernel tests pass.
-- Verdict: **kept** (an option for callers that read several things in one request, such as the server's goal or search endpoints; plain reads are unchanged); on its branch until Eric says to merge.
+- Verdict: **kept** (an option for callers that read several things in one request, such as the server's goal or search endpoints; plain reads are unchanged); on its branch until the owner says to merge.
 
 ### E129 needed-index (dropping a superseded copy without reading the whole store)
 - Branch / parent: exp/129-needed-index / exp/123-repack-dict-corruption (E123)
@@ -2020,7 +2020,7 @@ Newest last. Format and rules: `README.md`.
     and the two stores hold byte-identical objects. Wall time 333.5 s on and
     339.5 s off; the cases ingest stores 229,892,773 bytes either way.
   - All kernel tests pass.
-- Verdict: **kept** (an option; recommended on for `ikam live`, which is the store's one writer); on its branch until Eric says to merge.
+- Verdict: **kept** (an option; recommended on for `ikam live`, which is the store's one writer); on its branch until the owner says to merge.
 
 ### E130 cold-handle (what the first read, write and lookup on a fresh handle read)
 - Branch / parent: exp/131-seed-scope / exp/129-needed-index (E129)
@@ -2032,7 +2032,7 @@ Newest last. Format and rules: `README.md`.
   - The first content write: the ledger (2,384 reads, 240 MB, 89 ms in memory), then the matcher's seed index (4,194 reads, 265 MB, 2.0 s). The second write: 4 reads, 0.5 ms.
   - A ledger cache, estimated outside the kernel: the store's 420 derivation records, length-prefixed in one file, are 159 KB and load in 0.1 ms (one read). That is 1,400 times fewer bytes than the scan, and one request instead of 1,906 on a remote store. The seed index cannot be cached the same way: about one anchor per 64 bytes of content, so near the size of the store.
   - Not measured: a cold disk on the Mac, and R2 latency per request (1,906 GETs per cold open; at $0.36 per million that is $0.0007, but the time is one round trip per object unless they are batched).
-- Verdict: **kept** (a measurement; no kernel change). A ledger cache file would be an on-disk addition, so it waits on Eric. Until then, long-lived handles (`ikam serve`, `ikam live`) pay the scan once per process.
+- Verdict: **kept** (a measurement; no kernel change). A ledger cache file would be an on-disk addition, so it waits on the owner. Until then, long-lived handles (`ikam serve`, `ikam live`) pay the scan once per process.
 
 ### E131 seed-scope (bound where new content looks for repeats)
 - Branch / parent: exp/131-seed-scope / exp/129-needed-index (E129)
@@ -2046,7 +2046,7 @@ Newest last. Format and rules: `README.md`.
   - A narrower scope stored fewer bytes, not more, in two of three cases: the matcher keeps 4 candidates per seed, and on the whole store those slots fill with other copies before the best source. Only the empty scope lost (1.09 MB against 2.9 KB).
   - Isolation is partial: identical content is one object whatever the scope (content addressing), and container members and groups are found by id, not by seeds. With the empty scope 92 and 141 derivation arguments still named content from before the handle. So the scope bounds near-match reuse; permission checks still belong at the file layer (E126).
   - All kernel tests pass.
-- Verdict: **kept** (an option; for `ikam live` and `serve`, scope a write to the folders it touches plus where its bytes came from, when the caller knows); on its branch until Eric says to merge.
+- Verdict: **kept** (an option; for `ikam live` and `serve`, scope a write to the folders it touches plus where its bytes came from, when the caller knows); on its branch until the owner says to merge.
 
 ### E132 short-search (one- and two-byte terms through the trigram index)
 - Branch / parent: exp/132-short-search / exp/131-seed-scope (E131)
@@ -2058,7 +2058,7 @@ Newest last. Format and rules: `README.md`.
   - One byte: "%" (83 files) 7.1 / 1.4 MB, 38.3 / 15.7 ms; "x" (230 files) 7.1 / 3.3 MB, 40.3 / 29.5 ms.
   - Unchanged paths for comparison: "invoice" (13) 0.44 MB, 6.2 ms; "Q3 revenue" (0) 0.26 MB, 4.6 ms.
   - Results equal the scan's for every query. All kernel tests pass.
-- Verdict: **kept** (no trade-off, so built in rather than an option); on its branch until Eric says to merge.
+- Verdict: **kept** (no trade-off, so built in rather than an option); on its branch until the owner says to merge.
 
 ### E133 goal-pipeline (one goal end to end, defaults against the recommended options)
 - Branch / parent: exp/133-goal-pipeline / exp/132-short-search, with exp/124-section-reads merged in for read sessions (E128)
@@ -2072,7 +2072,7 @@ Newest last. Format and rules: `README.md`.
   - What the recommended first goal still reads is two one-pass projections a fresh handle builds, the ledger (230 MB) and the needed index (234 MB), plus the scoped seed index (89 MB). The ledger cache in E130 would remove the first; the other two are once per handle.
   - The scope's price: 4% more bytes written on the first goal (251 against 241 KB). Without the view's chunks in scope, view updates stored 1.7 to 4 times more (404 and 308 KB).
   - fsck clean after every configuration. All kernel tests pass. Fixed bench: the same stored bytes; kernel op times within 5% of E132's (the cost ratio moved from 0.2655 to 0.3168 because the baseline's own ingest ran faster, 35.4 against 28.1 ms).
-- Verdict: **kept** (a measurement, and two fixes to the E131 option); on its branch until Eric says to merge.
+- Verdict: **kept** (a measurement, and two fixes to the E131 option); on its branch until the owner says to merge.
 
 ### E134 one-pass (a fresh handle's projections from one read of the store)
 - Branch / parent: exp/134-one-pass / exp/133-goal-pipeline (E133)
@@ -2084,7 +2084,7 @@ Newest last. Format and rules: `README.md`.
   - What the first goal still reads: the ledger's pass (230 MB) and the scoped seed index (89 MB).
   - Four-ingest safety check on frozen input, needed_index on and off: fsck_failures=0 and mismatched=0 on every ingest, fsck ok in both modes, objects identical.
   - All kernel tests pass. Fixed bench: every stored-bytes figure the same as E133's; timings within run-to-run noise (score 0.2433 to 0.2401).
-- Verdict: **kept**; on its branch until Eric says to merge.
+- Verdict: **kept**; on its branch until the owner says to merge.
 
 ### E135 head-reads (the projection pass reads each object's header, not its bytes)
 - Branch / parent: exp/135-head-reads / exp/134-one-pass (E134)
@@ -2098,12 +2098,12 @@ Newest last. Format and rules: `README.md`.
   - The second goal's view update wrote 75,465 bytes here, 75,501 in E134 and 75,467 in E133: that varies from run to run because the scoped seed index adds content in hash-set order (E131). E136 looks at it.
   - Four-ingest safety check on frozen input: fsck_failures=0 and mismatched=0 on every ingest, fsck ok, objects identical with needed_index on and off and identical to E134's store.
   - All kernel tests pass, plus `tests/heads.rs` (heads are prefixes of reads on both stores; a reopened `FsStore` finds the same derivations as the handle that wrote them).
-- Verdict: **kept**; on its branch until Eric says to merge.
+- Verdict: **kept**; on its branch until the owner says to merge.
 
 ### E136 seed-order (the same objects give the same encodings in every run and on every filesystem)
 - Branch / parent: exp/136-seed-order / exp/135-head-reads (E135)
 - Question: E133 to E135 each wrote a different number of bytes for the second goal's view update (75,467, 75,501 and 75,465) from the same store and the same edits. Where does the variation come from, and can it go?
-- Cause: the matcher keeps at most four candidate sources per seed, the first ones added, so the order the seed index is built in picks among equal sources. The scoped index (E131, E133) added a tree's content closure from a hash set, whose order changes from run to run. The whole-store index and every other pass over `FsStore::ids` follow directory order, which on ext4 depends on a per-filesystem hash seed and on APFS is sorted, so the same writes could store different encodings on Eric's Mac than here. Content ids never change; only which equal encoding is stored.
+- Cause: the matcher keeps at most four candidate sources per seed, the first ones added, so the order the seed index is built in picks among equal sources. The scoped index (E131, E133) added a tree's content closure from a hash set, whose order changes from run to run. The whole-store index and every other pass over `FsStore::ids` follow directory order, which on ext4 depends on a per-filesystem hash seed and on APFS is sorted, so the same writes could store different encodings on the owner's Mac than here. Content ids never change; only which equal encoding is stored.
 - Change (kernel; no format change): `FsStore::ids` and `ids_with_prefix` return ids sorted, as `MemStore` already does, and the seed index sorts its input and each closure it adds.
 - Result:
   - `examples/goal.rs` run twice: every stage writes the same bytes in both runs (second goal's view update 75,433 bytes in both).
@@ -2111,7 +2111,7 @@ Newest last. Format and rules: `README.md`.
   - Fixed bench: every stored-bytes figure the same as E134's; timings within noise (score 0.2401 to 0.2472).
   - Sorting costs one sort of the id list per listing, well under a millisecond for the 1,906 ids of the cases store (estimated, not timed separately).
   - All kernel tests pass, plus `tests/order.rs`: file-store listings come in id order (fails without the change), and the same writes store the same bytes in a file store as in a memory store (a guard; it also passed before).
-- Verdict: **kept**; on its branch until Eric says to merge.
+- Verdict: **kept**; on its branch until the owner says to merge.
 
 ### E137 file-scope (a goal's repeats looked for only in the files it touches)
 - Branch / parent: exp/137-file-scope / exp/136-seed-order (E136)
@@ -2123,7 +2123,7 @@ Newest last. Format and rules: `README.md`.
   - The edits here only change existing files, whose old versions are in the scope. A goal that writes new files from others it read (E131's folder copy) needs those sources in the scope too, so the rule is: what the goal reads and edits, not where it lives.
   - What the first goal now reads: search 0.73 MB, the model's windows 0.39 MB, edits 2.5 MB, view update 3.9 MB, the projections 0.25 MB.
   - No kernel change, so the safety check and the fixed bench are E136's.
-- Verdict: **kept** as the recommended scope (in `options.md`); on its branch until Eric says to merge.
+- Verdict: **kept** as the recommended scope (in `options.md`); on its branch until the owner says to merge.
 
 ### E138 read-memo (an edit reads each old chunk once)
 - Branch / parent: exp/138-view-update / exp/137-file-scope (E137)
@@ -2138,7 +2138,7 @@ Newest last. Format and rules: `README.md`.
   - Fixed bench (memo off, the default): every stored-bytes figure the same as E136's; score 0.2472 to 0.2399, timing noise.
   - `examples/goal.rs` also gains an `edit_reads` line (E139: what the first write of a goal reads) and `GOAL_FS=<dir>` to run on a file store.
   - All kernel tests pass, plus `tests/memo.rs`: a view and a tree edited with the memo on and off store identical objects with fewer reads on; nothing is kept once an edit returns.
-- Verdict: **kept**; on its branch until Eric says to merge.
+- Verdict: **kept**; on its branch until the owner says to merge.
 
 ### E139 file-store (the recommended setup end to end on files and on packs)
 - Branch / parent: exp/139-file-store / exp/138-view-update (E138), with exp/122-store-bakeoff merged in, so this one branch holds every experiment branch since E122.
@@ -2149,14 +2149,14 @@ Newest last. Format and rules: `README.md`.
   - Next goal: 3.3 MB; 421 ms on files, 186 ms on packs, 202 ms in memory.
   - On files the view update is most of the time (629 of 735 ms): it writes 425 objects for 214 links, and `FsStore` syncs each one. Packs sync twice per ref move whatever the count, so the same update takes 285 ms.
   - Same bytes written on every store (250,379 and 78,086); the fresh handle's lookup fetches 246 KB of heads on each.
-  - Here each object written costs `FsStore` about 0.9 ms (create, sync, rename: 629 against 237 ms in memory for 425 objects). On macOS, Rust's `sync_all` is a full flush to the drive (`F_FULLFSYNC`), usually milliseconds, so the gap between files and packs should be wider on Eric's Mac: to measure there.
+  - Here each object written costs `FsStore` about 0.9 ms (create, sync, rename: 629 against 237 ms in memory for 425 objects). On macOS, Rust's `sync_all` is a full flush to the drive (`F_FULLFSYNC`), usually milliseconds, so the gap between files and packs should be wider on the owner's Mac: to measure there.
   - The fixed bench on this branch: every byte count and the north score (0.3035) as on E138; cost score 0.2435 against 0.2399, from timings and repack peak memory only.
   - All kernel tests pass, plus `tests/backends.rs` (pack heads).
-- Verdict: **kept**; on its branch until Eric says to merge.
+- Verdict: **kept**; on its branch until the owner says to merge.
 
 ### E140 section-grants (what one goal may read and change, by byte range)
 - Branch / parent: exp/140-section-grants / exp/139-file-store (E139)
-- Question (Eric, Nov 9: permission "including for targeting specific sections for specific actions relevant to the goals prompted by the user"): E126 put permission checks at the file layer. Can a grant name sections of files instead, the lines a goal needs, for reading and for changing, and what does checking it cost?
+- Question (the owner, Nov 9: permission "including for targeting specific sections for specific actions relevant to the goals prompted by the user"): E126 put permission checks at the file layer. Can a grant name sections of files instead, the lines a goal needs, for reading and for changing, and what does checking it cost?
 - Change: `src/grant.rs`, a new API that stores nothing and changes no format. A `Grant` names, for one goal, file versions (path and content id) with read ranges and write ranges; `windows_around` builds the lines within two of each mention; `FileGrant::read` hands out only the granted ranges through range reads; `check_edit` finds what an edit changes in the old version (one region, aligned both ways for repeated bytes, else changed lines narrowed to their bytes) and allows it only when every region sits inside a write range and the old version is the granted one; `seal` and `verify` are a keyed BLAKE3 tag over a canonical encoding. Tests in `tests/grant.rs`; harness `examples/grants.rs` on the cases store, recommended setup, new handle.
 - Result (goals as in E133; a file-level grant, E126, names the same paths whole):
   - Exposure: "Q3" matches 27 files (347 KB); its grant is 33 sections, 16.7 KB (4.8%). "AI": 8 files (79.6 KB), 13 sections, 11.9 KB (15%).
@@ -2165,7 +2165,7 @@ Newest last. Format and rules: `README.md`.
   - What each grant allowed, over both goals (35 files): the goal's edit 35 of 35 under both; a line changed outside the windows, alone or with the goal's edit, 0 of 70 under the section grant against 70 of 70 under the file grant; an edit of a version the grant does not name 0 of 35 against 35 (a file grant names paths, not versions); a file not granted 0 under both.
   - All kernel tests pass.
   - The fixed bench on this branch: every byte count and the north score (0.3035) as on E139; cost score 0.2441 against 0.2435, from timings only.
-- Verdict: **kept**; on its branch until Eric says to merge. A server option: grants per goal, checked at the file layer as E126 says; the format is unchanged.
+- Verdict: **kept**; on its branch until the owner says to merge. A server option: grants per goal, checked at the file layer as E126 says; the format is unchanged.
 
 ### E141 replace-hints (a goal's scope names only its files; old chunks join the index as an edit reads them)
 - Branch / parent: exp/141-replace-hints / exp/140-section-grants (E140)
@@ -2178,7 +2178,7 @@ Newest last. Format and rules: `README.md`.
   - Time: about the same (on files 608 against 621 ms for the first goal, on packs 308 against 309 ms): what is left is the view update's syncs on files and its matching work.
   - All kernel tests pass.
   - The fixed bench on this branch: every byte count and the north score (0.3035) as on E140; cost score 0.2450 against 0.2441, from timings only (the bench does not set replace_hints).
-- Verdict: **kept**; on its branch until Eric says to merge. Recommended with a scope; the format is unchanged.
+- Verdict: **kept**; on its branch until the owner says to merge. Recommended with a scope; the format is unchanged.
 
 ### E142 session-search (a goal's search and its reads share one session)
 - Branch / parent: exp/142-session-search / exp/141-replace-hints (E141)
@@ -2192,7 +2192,7 @@ Newest last. Format and rules: `README.md`.
   - What is left: the view update (906 KB and 632 KB, mostly view chunks it reads to place new edges) and the edit (477 KB and 154 KB).
   - All kernel tests pass (164).
   - The fixed bench on this branch: every byte count and the north score (0.3035) as on E141; cost score 0.2280 against 0.2450, from timings only (the bench ran beside goal runs; it does not search through a session).
-- Verdict: **kept**; on its branch until Eric says to merge. A library API; nothing stored changes.
+- Verdict: **kept**; on its branch until the owner says to merge. A library API; nothing stored changes.
 
 ### E143 template-memo (a template candidate reuses the bytes the template search just read)
 - Branch / parent: exp/143-template-memo / exp/142-session-search (E142)
@@ -2207,7 +2207,7 @@ Newest last. Format and rules: `README.md`.
   - What is left of the view update: first reads of the similar chunks a new chunk is compared with (154 reads, 476 KB for Q3).
   - All kernel tests pass (165).
   - The fixed bench on this branch: every byte count and the north score (0.3035) as on E142; cost score 0.2427 against 0.2280, from timings only (the bench does not set read_memo).
-- Verdict: **kept**; on its branch until Eric says to merge. Part of `read_memo`; the format is unchanged.
+- Verdict: **kept**; on its branch until the owner says to merge. Part of `read_memo`; the format is unchanged.
 
 ### E144 object-templates (tree and view chunks planned only as slices)
 - Branch / parent: exp/144-object-templates / exp/143-template-memo (E143)
@@ -2222,7 +2222,7 @@ Newest last. Format and rules: `README.md`.
   - Configurations with it on read and write exactly as before. Not measured on the fixed bench's corpora, since the bench keeps the default.
   - All kernel tests pass (166).
   - The fixed bench on this branch: every byte count and the north score (0.3035) as on E143; cost score 0.2356 against 0.2427, from timings only (the bench keeps object_templates on).
-- Verdict: **kept**; on its branch until Eric says to merge. Recommended off for a service that edits trees and views; the format is unchanged.
+- Verdict: **kept**; on its branch until the owner says to merge. Recommended off for a service that edits trees and views; the format is unchanged.
 
 ### E145 write-batch (a goal's writes share one memo, handed the files it read)
 - Branch / parent: exp/145-write-batch / exp/144-object-templates (E144)
@@ -2236,7 +2236,7 @@ Newest last. Format and rules: `README.md`.
   - Left in the edit: one read per edited file for its stored length (a store call for an object's length would remove it, an API addition) and the tree edit's own reads.
   - All kernel tests pass (168).
   - The fixed bench on this branch: every byte count and the north score (0.3035) as on E144; cost score 0.2443 against 0.2356, from timings only (the bench does not run batches).
-- Verdict: **kept**; on its branch until Eric says to merge. Library API, used by a server's goal loop; nothing stored changes.
+- Verdict: **kept**; on its branch until the owner says to merge. Library API, used by a server's goal loop; nothing stored changes.
 
 ### E146 plain-object-chunks (tree and view chunks stored plain)
 - Question: after E145 the view update reads about 405 KB on E133's first goal, mostly old view chunks and the sources that derived chunks would be built from. Would storing tree and view chunks plain (no slice or template plans) read less?
@@ -2254,7 +2254,7 @@ Newest last. Format and rules: `README.md`.
   - Time: within run-to-run spread. Five interleaved runs on packs, first goal: E145 143 to 186 ms (median 150), E147 143 to 170 ms (median 157). On files 338 to 372 ms against 381 to 429 ms over two and three runs, all of it in the view update, whose reads and writes did not change.
   - All kernel tests pass (168). The HTTP limits test failed once while the full suite ran beside a goal run, and passed alone three times and in the next full run.
   - The fixed bench on this branch: every byte count and the north score (0.3035) as on E145; cost score 0.2387 against 0.2443, from timings only (the bench does not run batches).
-- Verdict: **kept**; on its branch until Eric says to merge. A store API addition with a default, so any backend works unchanged; nothing stored changes.
+- Verdict: **kept**; on its branch until the owner says to merge. A store API addition with a default, so any backend works unchanged; nothing stored changes.
 
 ### E148 pending-view (a view's new edges kept pending, folded every few goals)
 - Question: after E147 the view update is most of a goal: on E133's first goal it reads 405 KB (100 view chunks of about 3.6 KB and their path) to add 214 reverse edges, which land all over the view because the view is keyed by target id. Smaller view chunks first (measured with a temporary switch, not kept): 2-16 KB, 1-8 KB and 0.5-4 KB chunks read 374, 364 and 349 KB but write 81, 117 and 140 KB against 72 KB, grow the ledger's heads from 246 to 286, 351 and 456 KB, and take longer. Can the view be updated less often instead, log-structured?
@@ -2266,7 +2266,7 @@ Newest last. Format and rules: `README.md`.
   - Time, medians of three runs: on packs the first goal 150 to 37 ms, the next 112 to 26 ms, the fold 159 ms; on files 368 to 48 ms, 290 to 35 ms, the fold 434 ms.
   - All kernel tests pass (169).
   - The fixed bench on this branch: every byte count and the north score (0.3035) as on E147; cost score 0.2407 against 0.2387, from timings only (the bench does not keep views pending).
-- Verdict: **kept**; on its branch until Eric says to merge. Library API for a server, which keeps the pending edges in memory and folds every few goals or when idle. Pending edges are rebuilt from the objects written since the view's last fold, so nothing new has to be stored; recording which commit a view was folded at, so a restarted server knows where to start, would be a ref (an addition for Eric's yes).
+- Verdict: **kept**; on its branch until the owner says to merge. Library API for a server, which keeps the pending edges in memory and folds every few goals or when idle. Pending edges are rebuilt from the objects written since the view's last fold, so nothing new has to be stored; recording which commit a view was folded at, so a restarted server knows where to start, would be a ref (an addition for the owner's yes).
 
 ### E149 exact-short-search (patterns of up to three bytes from the postings alone)
 - Question: with the trigram index, E133's searches for "Q3" and "AI" still decode every candidate (655 KB and 351 KB with the index's 269 KB), though for patterns of one to three bytes a trigram's posting lists exactly the contents that hold it. Can such a search answer from the index alone?
@@ -2277,7 +2277,7 @@ Newest last. Format and rules: `README.md`.
   - Windows by range: the lines around each mention are 16.7 KB and 11.9 KB, but range reads of only those windows fetch the same 385 KB and 82 KB, because each file is one compressed object and a window is verified against the whole of it. A positional index alone would not help; windows need range-addressable stored files (E150).
   - All kernel tests pass (170).
   - The fixed bench on this branch: every byte count and the north score (0.3035) as on E148; cost score 0.2427 against 0.2407, from timings only (the bench does not set exact_short_search).
-- Verdict: **kept**; on its branch until Eric says to merge. Off by default because results then rest on the index (a corrupt index would give wrong answers that a scan would not); on, a "which files mention" query costs only the index, which a server holds in memory.
+- Verdict: **kept**; on its branch until the owner says to merge. Off by default because results then rest on the index (a corrupt index would give wrong answers that a scan would not); on, a "which files mention" query costs only the index, which a server holds in memory.
 
 ### E150 framed-files (window reads if stored files were seekable)
 - Question: E149 found that range reads of only the windows a goal needs fetch whole files: each file is one compressed object, verified against its id as a whole. What would window reads cost if each file were cut into independently compressed frames, each verifiable against the file's id with a BLAKE3 outboard (as Bao keeps), and what would the store grow by?
@@ -2286,7 +2286,7 @@ Newest last. Format and rules: `README.md`.
   - Text storage, whole-file zstd 401 KB: 1 KiB frames 980 KB plus 122 KB outboard; 4 KiB 564 KB plus 29 KB (+48%, +55% with outboard); 8 KiB 481 KB plus 14 KB; 16 KiB 437 KB plus 7 KB (+11%); 64 KiB 403 KB.
   - Window reads, Q3 (27 files, 16.7 KB of windows, 106 KB whole-file zstd): 1 KiB frames 34 KB, 4 KiB 51 KB, 8 KiB 72 KB, 16 KiB 102 KB. AI (8 files, 11.9 KB of windows, 15 KB whole): 12.7, 12.9, 12.2 and 15.3 KB.
   - So frames halve window reads only at 4 KiB or less, for half again the text storage; at 16 KiB they cost 11% and save 4%. For reference, the store as it is fetched 385 KB for Q3's 27 files (347 KB raw), because each file is read out of a 64 KiB group (E151).
-- Verdict: **measured**. Not worth a format addition for goals like these: windows are a large share of small files, and a goal that edits a file needs the whole file anyway. Worth it for large files read in sections (logs, long documents); there it would be a stored-format addition, for Eric's yes.
+- Verdict: **measured**. Not worth a format addition for goals like these: windows are a large share of small files, and a goal that edits a file needs the whole file anyway. Worth it for large files read in sections (logs, long documents); there it would be a stored-format addition, for the owner's yes.
 
 ### E151 group-size (smaller groups for goal reads)
 - Question: E150 found that the store fetches 385 KB to read Q3's 27 matched files (347 KB raw, 106 KB as whole-file zstd), because each small file is read out of a 64 KiB solid group and reading a member fetches its whole group. What do smaller groups cost and save?
@@ -2297,7 +2297,7 @@ Newest last. Format and rules: `README.md`.
   - The fixed bench at 16 KiB: north score 0.3035 to 0.3100, beyond its tolerance (stored bytes +0.1% on cases, +4.6% on multiformat, +1.8% on tables); cost score 0.2427 to 0.2341. As a default it fails the keep rule.
   - All kernel tests pass (171).
   - The fixed bench on this branch at the default size: every byte count and the north score (0.3035) as on E149; cost score 0.2406 against 0.2427, from timings only.
-- Verdict: **kept** as an option, off by default (64 KiB); on its branch until Eric says to merge. A server whose work is goals reading a few files of a large store can trade about 2% of stored bytes for half the bytes per file read. Stores packed at any size read the same; nothing in the stored format changes.
+- Verdict: **kept** as an option, off by default (64 KiB); on its branch until the owner says to merge. A server whose work is goals reading a few files of a large store can trade about 2% of stored bytes for half the bytes per file read. Stores packed at any size read the same; nothing in the stored format changes.
 
 ### E152 held-index (the search index held across goals)
 - Question: after E148 and E149 the next goal on a handle fetches 358 KB, and 269 KB of it is loading the search index again. What does a handle that keeps the decoded index between goals, as a server would, fetch?
@@ -2317,7 +2317,7 @@ Newest last. Format and rules: `README.md`.
 
 ### E153 fragment-cuts (how to cut content into fragments)
 - Branch / parent: exp/153-fragment-edits / E152 (main badc682)
-- Question: Eric (Nov 9) asked for experiments on fragments as the Python version had them (research note `docs/research/fragments-and-ir.md`). Which cut makes a good fragment: one that is shared across files and survives edits?
+- Question: the owner (Nov 9) asked for experiments on fragments as the Python version had them (research note `docs/research/fragments-and-ir.md`). Which cut makes a good fragment: one that is shared across files and survives edits?
 - Change: none in the kernel. `examples/fragments.rs` cuts the 534 md and text files of the cases (1,035,302 bytes) whole, by line, by paragraph block (ending after a run of blank lines, cut at a line past 16 KiB), by CDC at 256, 1,024, 4,096 and 16,384 bytes, and by line-aligned CDC. Per cutter: distinct fragments and their bytes, zstd 3 over the distinct fragments end to end, a stored-size proxy (that zstd plus 32 bytes per distinct fragment and 4 per reference), size distribution and fan-out.
 - Result:
   - Proxy bytes: whole 175,489 (dedup 1.11); lines 626K (dedup 1.95, but reference overhead); blocks 265,571 (dedup 1.24, median block 122 bytes); CDC 256 262K; CDC 1,024 197K; CDC 4,096 and 16,384 about as whole; line-aligned CDC like CDC.
@@ -2337,7 +2337,7 @@ Newest last. Format and rules: `README.md`.
 - Question: can one edit to a shared fragment reach every file that renders it without re-planning those files?
 - Change: `func.rs` adds the builtin `render/1`, which concatenates like `concat/1` but is a fact (not in `is_plan`), so repack keeps it; `range.rs` reads ranges of a render through its fragments. New `src/fragment.rs`: `blocks`, `put_fragmented` (fragments plus one render fact; a content of one fragment is stored as itself), `fragments_of`, `FragmentIndex` (which files render each fragment), `propagate`. `tests/fragment.rs`: blocks cover their input; after `propagate` every file that rendered the old fragment reads as before with it replaced, nothing else changes, the index follows the edit and fsck is clean; a render survives repack. `examples/propagate.rs` compares `scan-rewrite` (today: read every file, splice, `put_content`), `index-rewrite` (a side index finds the files) and `render`, on the 343 md files of the cases with natural fan-out and with a notice inserted into 1 to 256 copies.
 - Result: stored at rest after repack 69,332 bytes as plain files, 169,623 as renders (+145%). Read pass 17.2 ms plain, 24 to 25 ms as renders. Edits: every check and fsck pass; render writes fewer bytes than index-rewrite at fan-out 64 and above (E157 has the numbers).
-- Verdict: **kept** as an option on its branch, not a default: renders cost too much at rest (see E156, E157). `render/1` is a new builtin, a stored-format addition, so it waits on Eric's yes.
+- Verdict: **kept** as an option on its branch, not a default: renders cost too much at rest (see E156, E157). `render/1` is a new builtin, a stored-format addition, so it waits on the owner's yes.
 
 ### E156 render-short (renders with short records)
 - Branch / parent: exp/153-fragment-edits / E155
@@ -2357,7 +2357,7 @@ Newest last. Format and rules: `README.md`.
   - Fan-out 256: 85.6 KB against 115.3 KB; 85 ms against 117 ms.
   - Small fan-out: the same (about 0.9 to 1.7 ms). scan-rewrite takes 7 to 117 ms (7 ms even at fan-out 1, against 0.9 ms with an index).
   - Trees and records dominate the bytes written; the synthetic `fan/i/` layout inflates the tree bytes.
-- Verdict: **kept** as an option, off by default: a store whose work is edits that reach many files pays 24% at rest for 26 to 40% fewer bytes per edit and a faster edit at large fan-out. On its branch until Eric says to merge.
+- Verdict: **kept** as an option, off by default: a store whose work is edits that reach many files pays 24% at rest for 26 to 40% fewer bytes per edit and a faster edit at large fan-out. On its branch until the owner says to merge.
 
 ### E158 render-locality (does one paragraph change only its piece of each format?)
 - Branch / parent: exp/153-fragment-edits / E157
@@ -2543,7 +2543,7 @@ Newest last. Format and rules: `README.md`.
   - Cold read p50 36 to 42 us becomes 78 to 80 us (one more read, into the checkpoint, until the page cache holds it); warm read p50 the same (30 to 38 us). A missing id 0.2 to about 2.5 us.
   - Build of 1M: 2.5 to 4.4 s (each checkpoint is synced and rewritten whole).
   - Kills (with E172's ref log, `packs-fast`): 50 of 50 clean.
-- Verdict: **kept** as an option, off by default; on its branch until Eric says to merge. Worth turning on for a server that restarts often or opens many stores; a long-running server pays the slower cold reads instead.
+- Verdict: **kept** as an option, off by default; on its branch until the owner says to merge. Worth turning on for a server that restarts often or opens many stores; a long-running server pays the slower cold reads instead.
 
 ### E172 pack-ref-log (refs as records in the open pack: one flush a commit)
 - Question: a PackStore commit is two flushes and a rename: the pack's data, then the ref file (written, synced, renamed). On the Mac each flush is an F_FULLFSYNC, which is most of the 10.8 ms. Can the ref ride in the same flush as the objects it names?
@@ -2553,7 +2553,7 @@ Newest last. Format and rules: `README.md`.
   - Single commit mean 5.26 to 4.74 ms (on this disk a flush is about 40 us, so the time is mostly the harness's writes); ref swap p50 495 to 143 us, p99 1,356 to 310 us. RocksDB's is 160 us.
   - Kills: 50 of 50 clean, alone and with E171 (7,672 and 7,682 events), nothing acknowledged lost.
   - 1M objects: the same bytes on disk (+886 bytes), open as before (190 to 246 ms; 1.5 ms with E171), first ref 0.12 to 0.19 ms.
-- Verdict: **kept** as an option, off by default; on its branch until Eric says to merge. A stored-format addition (ref records and `refs.snap`), so turning it on for his stores needs his yes; a store written with it needs a kernel that knows the records. Expect it to halve a commit's flush time on the Mac; that is a Mac measurement.
+- Verdict: **kept** as an option, off by default; on its branch until the owner says to merge. A stored-format addition (ref records and `refs.snap`), so turning it on for his stores needs his yes; a store written with it needs a kernel that knows the records. Expect it to halve a commit's flush time on the Mac; that is a Mac measurement.
 
 ### E173 scale-10m (10M objects: packs, packs with E171 and E172, RocksDB, both hybrids)
 - Question: E122 measured 10M objects before E170 to E172. Do the new options and the hybrids hold up at 10M, and does lazy open still pay there?
@@ -2622,7 +2622,7 @@ Newest last. Format and rules: `README.md`.
 - Finding: an open that had to scan records after the last checkpoint (the process died before its next one) set `ckpt_at` to the end of the scan, as if those records were saved. So neither that handle's drop nor its next sync wrote a checkpoint until 64 MiB more had been appended, and a store killed again within each 64 MiB rescanned an ever longer tail on every open. This is on main too, in every PackStore mode; E174's commits were large enough to pass 64 MiB between kills, which hid it.
 - Change (kernel; no format change): `ckpt_at` starts where the saved checkpoint ends; an open that scanned 64 MiB or more syncs the pack and writes a checkpoint before returning. `tests/backends.rs` `pack_store_saves_a_scanned_tail` (fails before the change): 70 MiB written, the checkpoint removed as if the process had died, the next open saves one; with the defaults and with the lazy checkpoint and ref log.
 - Result: E177's kill test again (8 writers, 30 kills): reopen p50 460 to 35 ms, max 830 to 66 ms; 30 of 30 clean. crash-store at 100k: 10 of 10 clean.
-- Verdict: **kept** as a fix, on its branch until Eric says to merge. It changes no stored format; an open after a crash may now write one checkpoint.
+- Verdict: **kept** as a fix, on its branch until the owner says to merge. It changes no stored format; an open after a crash may now write one checkpoint.
 
 ### Gates for E174 to E179 (Nov 10)
 - On exp/179-ckpt-after-crash (E174 to E179 stacked on exp/173): 181 kernel tests pass, 187 with the store features; clippy `-D warnings` clean with and without them; the fixed bench matches main (badc682) in every byte count and the north score (0.3035), with only timing fields different. `cargo fmt` was run on the changed files (backends.rs was already off-format on exp/173).
@@ -2630,7 +2630,7 @@ Newest last. Format and rules: `README.md`.
 - `packages/kernel/scripts/mac-bakeoff.sh` gains `night2`, outside the default run, with `BRANCH=exp/178-repo-cost` or later: store-level kills at 1M, filters and the cleaner at 1M, writers alone and grouped at 1, 4 and 16 threads, group kills, and Repo commit cost at 10k and 100k.
 
 ### Merge of E170 to E179 into main (Nov 10)
-- On Eric's word ("Merge the appropriate changes"), exp/179-ckpt-after-crash (E170 to E179) merged onto main after the fragment merge (5a535de), with every option off by default: `PackOptions` `lazy_checkpoint`, `ref_log` and `filters` stay false, `compact` and `GroupCommit` run only when called, the hybrids build only with `store-rocksdb`, and FsStore stays the default store. The E179 fix (an open that scanned 64 MiB or more after a crash saves a checkpoint) applies to every PackStore. The log and registry kept both sides; the registry is in experiment order.
+- On the owner's word ("Merge the appropriate changes"), exp/179-ckpt-after-crash (E170 to E179) merged onto main after the fragment merge (5a535de), with every option off by default: `PackOptions` `lazy_checkpoint`, `ref_log` and `filters` stay false, `compact` and `GroupCommit` run only when called, the hybrids build only with `store-rocksdb`, and FsStore stays the default store. The E179 fix (an open that scanned 64 MiB or more after a crash saves a checkpoint) applies to every PackStore. The log and registry kept both sides; the registry is in experiment order.
 
 ### Mac night2 on main (b27e9bf, Nov 10, from the Mac session's report)
 - With full fsync on both, packs-fast commits in 4.9 ms against RocksDB's 5.9 ms; packs-fast opens 1M objects in 0.2 ms; 16 writers sharing a flush make 2,550 commits a second against 317 alone, p99 103 to 10 ms; every crash test clean.
@@ -2640,7 +2640,7 @@ Newest last. Format and rules: `README.md`.
 - Finding: `examples/stores.rs` `churn` kept its own list of pack names (packs, packs-fast, packs-fast-filter) and missed packs-filter, so the Mac night2 churn step for filtered packs panicked.
 - Change (harness only; kernel untouched): `pack_options(name)` maps every `packs*` name to its `PackOptions`, and `open` and `churn` both read it. The stores example now runs its own tests (`test = true`): every `packs*` name in `BACKENDS` has options, and build plus churn at 2,000 objects runs on all six. The churn test fails on the old list.
 - Gates: 187 kernel tests, 195 with the store features; clippy clean with and without them; fmt clean; the bench is unchanged (the kernel is unchanged).
-- Verdict: **kept** as a fix, on exp/185-churn-all-packs until Eric says to merge. The Mac reruns `churn packs-filter` at 1M once Remote Control is back.
+- Verdict: **kept** as a fix, on exp/185-churn-all-packs until the owner says to merge. The Mac reruns `churn packs-filter` at 1M once Remote Control is back.
 
 ### E186 stored-summaries (per-fragment summaries stored as derivations beside the fragments)
 - Branch / parent: exp/186-stored-summaries / main (a890aa6, E182 to E184)
@@ -2688,7 +2688,7 @@ Newest last. Format and rules: `README.md`.
 - Result:
   - E189's ledger load at 500 synthetic files: 142, 333, 1,069 and 4,251 ms (memory, native, stored, postings modes) to 11, 19, 36 and 93 ms. At 2,000 files: 39 to 257 ms.
   - Store level at 200,000 objects (`stores build` and `probe`, packs, two runs each): build 0.3 s, open 30 to 32 ms, point read p50 1.1 to 1.3 us, missing p50 0.1 us; main 0.3 s, 33 to 42 ms, 1.1 to 1.2 us and 0.1 us. A first version that made the open pack's index a BTreeMap was as fast on prefixes but opened in 58 to 67 ms with reads at 1.4 us, so it was replaced.
-- Verdict: **kept** as a fix, on its branch until Eric says to merge. No trade-off measured, so no option.
+- Verdict: **kept** as a fix, on its branch until the owner says to merge. No trade-off measured, so no option.
 - Gates: 188 kernel tests, 196 with the store features; clippy `-D warnings` clean with and without them; fmt clean; the fixed bench matches main (a890aa6) in every byte count and the north score (0.3035).
 
 ### E191 bucketed-postings (a word's list split by fragment id)
@@ -2703,11 +2703,11 @@ Newest last. Format and rules: `README.md`.
 - Run: `cargo run --release --example stored_summaries` (E186, E187, E191; about 80 s), `-- crash` (E188), `-- scale 500` and `-- scale 2000` (E189, E191).
 
 ### Merge of E186 to E191 into main (Nov 11)
-- On Eric's word ("Merge both"), exp/190-pack-prefix (E190) and then exp/186-stored-summaries (E186 to E191) merged onto main a890aa6. The E190 fix applies to every PackStore and changes no stored format. Stored summaries are an example (`examples/stored_summaries.rs`, `functions/summary.wasm`) and are off unless an application commits the view. The log and registry kept both sides, in experiment order.
+- On the owner's word ("Merge both"), exp/190-pack-prefix (E190) and then exp/186-stored-summaries (E186 to E191) merged onto main a890aa6. The E190 fix applies to every PackStore and changes no stored format. Stored summaries are an example (`examples/stored_summaries.rs`, `functions/summary.wasm`) and are off unless an application commits the view. The log and registry kept both sides, in experiment order.
 
 ### E192 ir-templates (cells and line templates: an opt-in IR codec)
 - Branch / parent: exp/192-ir-compression / E191 (main 17589ee, with E186 to E191 merged)
-- Question: Eric asked (Nov 11) how intermediate representations can find connections that aid dedup and compression. The kernel already templates bytes at repack (`template.rs`, E143, E144), and xz finds repeated text by itself. Does a format-aware IR (cells, and the skeleton around them, with each distinct line skeleton stored once) beat xz, gzip, zstd and the kernel on report-like files, and what else does it buy?
+- Question: the owner asked (Nov 11) how intermediate representations can find connections that aid dedup and compression. The kernel already templates bytes at repack (`template.rs`, E143, E144), and xz finds repeated text by itself. Does a format-aware IR (cells, and the skeleton around them, with each distinct line skeleton stored once) beat xz, gzip, zstd and the kernel on report-like files, and what else does it buy?
 - Grounding: E161 and E165 (a typed TableIR stores the three text formats in about half the bytes); LogShrink (`docs/research/kernel-direction.md` #15: a log line is a template plus variables, the variables stored by column); an earlier report-copy demo (30 synthetic reports: 0.52 of raw in the live store before repack, 0.16 after repack, gzip -9 0.14, xz -9 0.11). The demo's 52% was the unrepacked store, so the gap to xz is 1.45x, not 4x.
 - Change:
   - `src/ir.rs` (new, `pub mod ir`; nothing in put, repack or the bench calls it). Lexers: csv fields; json values (keys stay skeleton); md pipe-table cells; numbers in any other text. The skeleton is cut into lines at its newlines, and each distinct line skeleton is stored once. Cells go to token streams: the previous value again, a number as a delta, a string seen before by index, or a new string. Options (all off means templates with cells in file order): `columns`, `numbers`, `rows`, `siblings` (E193, E194). `decode` gives back every file byte-exact.
@@ -2770,7 +2770,7 @@ Newest last. Format and rules: `README.md`.
 
 ### E196 ir-benefits (what the IR buys beyond bytes)
 - Branch / parent: exp/192-ir-compression / E195
-- Question (Eric: "be creative when thinking about benefits as well"): what do the connections the IR exposes give besides size? Measured on reports-drift with columns, numbers and row keys.
+- Question (the owner: "be creative when thinking about benefits as well"): what do the connections the IR exposes give besides size? Measured on reports-drift with columns, numbers and row keys.
 - Result:
   - **Column query**: one link's dev rho over its 234 runs, from that link's stream alone (zstd -19 per stream): 0.08 ms reading 2,064 B (the stream and the compressed directory), against 0.46 ms scanning the 1.3 MB of text in memory and 3.8 ms from the xz archive (16,856 B, all of it decompressed). Answers equal.
   - **Aggregates**: every link's mean dev rho (24 links): 0.92 ms reading 3,288 B against 1.6 ms scanning the text; equal.
@@ -2783,7 +2783,7 @@ Newest last. Format and rules: `README.md`.
 - Real reports: `cargo run --release --example ir_compress dir:<folder>` runs the size table over any folder and prints only sizes and times.
 
 ### Merge of E192 to E196 into main (Nov 11)
-- On Eric's word ("Merge it"), exp/192-ir-compression merged onto main 17589ee as f46d252 (the merge tree is the branch tree). Every IR option is off: nothing in put, repack or the bench calls `ir`; it is a module an application or an experiment chooses.
+- On the owner's word ("Merge it"), exp/192-ir-compression merged onto main 17589ee as f46d252 (the merge tree is the branch tree). Every IR option is off: nothing in put, repack or the bench calls `ir`; it is a module an application or an experiment chooses.
 - Gates on the merge: 191 kernel tests pass; clippy `-D warnings` and fmt clean; the fixed bench gives the same 147 byte and count fields as main's last two runs (E186, E190) and north 0.3035.
 
 ### E197 ir-blocks (read one report without decoding every report)
@@ -3283,7 +3283,7 @@ Newest last. Format and rules: `README.md`.
 - Run: `cargo run --release --example ir_rawkey [corpus ...]` (about a minute).
 
 ### Merge of E197 to E225 into main (Nov 11)
-- On Eric's word ("Merge it"), the stacked branches exp/197-ir-blocks to exp/225-ir-raw-dict merged onto main a831e15 as one squashed commit, 1b72f35 (its tree is exp/225's tree). The build files committed by mistake on exp/206 are not in main's history. Every IR option is off, and nothing in put, repack or the bench calls `ir`, `put_ir` or `put_ir_blocks`.
+- On the owner's word ("Merge it"), the stacked branches exp/197-ir-blocks to exp/225-ir-raw-dict merged onto main a831e15 as one squashed commit, 1b72f35 (its tree is exp/225's tree). The build files committed by mistake on exp/206 are not in main's history. Every IR option is off, and nothing in put, repack or the bench calls `ir`, `put_ir` or `put_ir_blocks`.
 - Gates on the merge: every kernel test suite passes (release); clippy `-D warnings` and fmt clean; the bench gives the same byte and count fields as main's last run (only times and peak memory differ) and north 0.3035; `ir_parity` hashes are identical to E206's.
 
 ### E226 commit-cost (where a report copy's time goes, as `ikam live` stores it)
@@ -3328,7 +3328,7 @@ Newest last. Format and rules: `README.md`.
 Gates on the branch: every kernel test suite passes (release); clippy `-D warnings` and fmt clean; the bench gives the same byte and count fields as main 1c5efb9 run on the same machine (only times and peak memory differ), north 0.3035, cost score 0.2456 (main 0.2486, from timings).
 
 ### Merge of E226 to E228 into main (Nov 11)
-- On Eric's word ("Merge it"), exp/226-commit-cost (c0d333c) fast-forwarded onto main 1c5efb9. `FsStore::open` is unchanged and stays the default; `FsStore::open_deferred`, `ikam live --deferred-sync` and `ikam live --no-object-templates` are off unless asked for.
+- On the owner's word ("Merge it"), exp/226-commit-cost (c0d333c) fast-forwarded onto main 1c5efb9. `FsStore::open` is unchanged and stays the default; `FsStore::open_deferred`, `ikam live --deferred-sync` and `ikam live --no-object-templates` are off unless asked for.
 - Gates, run on c0d333c before the merge (main had not moved): every kernel test suite passes (release); clippy `-D warnings` and fmt clean; the bench gives the same byte and count fields as main 1c5efb9 on the same machine (only times and peak memory differ), north 0.3035.
 
 ### E230 mac-commit-cost (E226 to E228 on macOS, APFS)

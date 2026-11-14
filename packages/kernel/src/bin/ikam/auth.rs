@@ -225,7 +225,7 @@ mod tests {
 
     #[test]
     fn base64_decodes() {
-        assert_eq!(base64("ZXJpYzpodW50ZXIy").unwrap(), b"eric:hunter2");
+        assert_eq!(base64("YWxpY2U6aHVudGVyMg==").unwrap(), b"alice:hunter2");
         assert_eq!(base64("YQ==").unwrap(), b"a");
         assert_eq!(base64("YWI=").unwrap(), b"ab");
         assert!(base64("Y").is_none());
@@ -234,7 +234,7 @@ mod tests {
 
     #[test]
     fn password_check() {
-        let auth = Auth::parse(&Auth::line("eric", "hunter2:with colon").unwrap()).unwrap();
+        let auth = Auth::parse(&Auth::line("alice", "hunter2:with colon").unwrap()).unwrap();
         let enc = |s: &str| {
             const T: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
             let mut out = String::new();
@@ -255,15 +255,15 @@ mod tests {
         assert!(
             auth.check(&req(Some(&format!(
                 "Basic {}",
-                enc("eric:hunter2:with colon")
+                enc("alice:hunter2:with colon")
             ))))
             .is_none()
         );
         for bad in [
             None,
-            Some(format!("Basic {}", enc("eric:hunter3"))),
+            Some(format!("Basic {}", enc("alice:hunter3"))),
             Some(format!("Basic {}", enc("bob:hunter2:with colon"))),
-            Some(format!("Bearer {}", enc("eric:hunter2:with colon"))),
+            Some(format!("Bearer {}", enc("alice:hunter2:with colon"))),
             Some("Basic not-base64".into()),
         ] {
             let r = auth.check(&req(bad.as_deref())).expect("refused");
@@ -271,10 +271,10 @@ mod tests {
         }
         // A fresh salt each time.
         assert_ne!(
-            Auth::line("eric", "x").unwrap(),
-            Auth::line("eric", "x").unwrap()
+            Auth::line("alice", "x").unwrap(),
+            Auth::line("alice", "x").unwrap()
         );
-        assert!(Auth::parse("eric:zz:00").is_err());
+        assert!(Auth::parse("alice:zz:00").is_err());
         assert!(Auth::line("a:b", "x").is_err());
     }
 }

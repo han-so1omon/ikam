@@ -86,7 +86,7 @@ ikam --store S ask "which file says how to add a paragraph?" [--llm]
   user and password (HTTP basic auth, which Finder sends):
 
   ```sh
-  read -rs PW; printf '%s\n' "$PW" | ikam passwd eric   # prints IKAM_AUTH=eric:salt:hash
+  read -rs PW; printf '%s\n' "$PW" | ikam passwd alice   # prints IKAM_AUTH=alice:salt:hash
   IKAM_AUTH=... ikam --store S live --allow-host mac.example.ts.net
   ```
 

@@ -4,7 +4,7 @@
 
 ## Question
 
-Eric (Nov 11): how can abstractions (intermediate representations) find connections that aid dedup and compression, and what other benefits follow? The test case is a downstream app's run reports (markdown reports with a results table, one per research run), which the kernel stored at 0.16 of raw against xz -9's 0.11 in a report-copy demo on synthetic reports.
+The owner (Nov 11): how can abstractions (intermediate representations) find connections that aid dedup and compression, and what other benefits follow? The test case is a downstream app's run reports (markdown reports with a results table, one per research run), which the kernel stored at 0.16 of raw against xz -9's 0.11 in a report-copy demo on synthetic reports.
 
 ## Sources
 
