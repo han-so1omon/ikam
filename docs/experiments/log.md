@@ -3648,3 +3648,43 @@ Gates on the branch (E229 to E233): every kernel test suite passes (release); cl
 - Trade-off: none found. The diff reads fewer objects, and gives the same changes.
 - Verdict: **kept (option off).** Small join updates no longer pay for the size of the table they read. Large batches are still bounded by the per-key seeks and writes of E245.
 - Run: `cargo run --release --example join_switch -- 20000 1000 0.4 10 30 100 300 1000`, and again with 100000.
+
+### E260 hot-cold-baseline (where time goes in each layer, today)
+- Branch / parent: exp/260-hot-cold-baseline / main 6986d6e, rebased on 2b55018 (E260 to E267 are the hot and cold layers plan; E256 to E259 are on another branch)
+- Question: the older design notes split work into a hot layer (what a caller waits for: storing an edit, editing the tree, appending to the log, the commit that moves the ref) and a cold layer (work that may lag: repack, gc, fsck, bringing derived views up to date). Before changing either, how long does each take today, with the defaults and with today's opt-ins for the hot path (`FsStore::open_deferred`, E227; `Repo::plain_db_events`, E232; `Repo::needed_index`, E129)?
+- Change: none in the kernel. `examples/hot_cold.rs` measures both layers in one run, on FsStore in a temporary directory.
+  - W1 `files`: 200 generated files (half markdown notes of 40 lines, half CSV tables of 200 rows), then 1,000 edits of one line each, committed after every edit or every 50.
+  - W2 `db`: a generated table of N rows, then appends in batches of 1 (200 appends), 100 and 2,000 (2,000 appends), each batch committed; one incremental view (E242, a sum per id) updated after each batch or caught up once at the end, and checked against a full build and a rebuild of the log.
+  - Cold work after the session: repack, gc, fsck, disk bytes before and after. Repack runs at 20,000 rows or fewer (see the results).
+- Result (a 4-core cloud machine with nothing else running; one run each, so rough):
+
+  W1 files, 1,000 edits:
+
+  | Store | Commit every | Session | Edit p50 / p99 | Commit p50 | Repack | Disk before, after |
+  |---|---|---|---|---|---|---|
+  | default | 1 | 8.4 s | 6.1 / 47 ms | 0.8 ms | 68 s | 2.24 MB, 0.78 MB |
+  | default | 50 | 10.1 s | 8.0 / 45 ms | 1.6 ms | 29 s | 2.17 MB, 0.41 MB |
+  | deferred sync | 1 | 9.4 s | 6.9 / 56 ms | 2.2 ms | 71 s | 2.24 MB, 0.78 MB |
+  | deferred sync | 50 | 7.1 s | 4.8 / 43 ms | 14.2 ms | 29 s | 2.17 MB, 0.41 MB |
+
+  - Of an edit's time, the tree edit is about two thirds (4 ms p50) and storing the content about one fifth (1 to 2 ms); the commit is 1 to 2 ms, or 14 ms when deferred sync flushes 50 edits at once.
+  - The cold work is 3 to 9 times the session: repack takes 29 to 71 s for a store of about 2 MB and shrinks it 3 to 5 times; gc frees nothing (no edit leaves garbage); fsck takes 0.25 to 0.7 s.
+
+  W2 db, append p50 (and the session with views kept current after each batch, then caught up once at the end):
+
+  | Rows | Settings | Batch 1 | Batch 100 | Batch 2,000 |
+  |---|---|---|---|---|
+  | 10,000 | defaults | 20 ms (12.6 s, 8.5 s) | 527 ms (17.0 s, 15.0 s) | 12.9 s |
+  | 10,000 | opt-ins | 8.8 ms (7.4 s, 3.2 s) | 89 ms (3.5 s, 2.5 s) | 0.55 s |
+  | 100,000 | defaults | 20 ms (53 s, 15.5 s) | 8.3 s (171 s, 171 s) | 161 s |
+  | 100,000 | opt-ins | 10 ms (37 s, 4.0 s) | 174 ms (9.6 s, 4.2 s) | 1.4 s |
+
+  - With the defaults a batch's append grows with the store, not the batch: at 100,000 rows a batch of 100 takes 8.3 s and one of 2,000 takes 161 s. That is the drop path scanning the store for each dropped object (E265 saw the same); `needed_index` cuts it 48 to 115 times. Single appends p99: 672 ms with the defaults, 18 ms with the opt-ins.
+  - Keeping the view current after every batch is most of a session of small batches: 200 single appends at 100,000 rows take 37 s with the view updated each time (150 ms an update) and 4.0 s with it caught up once at the end (0.2 s for all 200). That is the case for a cold view layer (E261 to E264).
+  - Commits: 4 to 6 ms with the defaults; with deferred sync, 6 to 7 ms for one event and 290 ms for 2,000 (the flush moves into the commit).
+  - Cold, at 10,000 rows: repack 87 s for a 2.4 MB store (to 1.8 MB), gc 0.18 s, fsck 0.58 s. At 100,000 rows (a store of about 20 MB with the opt-ins): gc 1.5 s (437 objects freed), fsck 1.8 s; a repack with the defaults ran 12 minutes without finishing, its directory at 445 MB when stopped, so repack at that size is left out of the harness.
+  - A full build of the view takes 1 s at 10,000 rows and 12 to 15 s at 100,000.
+- Not measured: the Mac (the plan's Mac part: its disk, where sync costs differ most), the view pending edges (E148) and group commit (E177) under several writers (this harness has one), packs (E176), larger stores, repeated runs.
+- Trade-off: none (no kernel change).
+- Verdict: **reference**. The hot layer is dominated by two things that already have an answer or a plan: the default drop scan (`needed_index`, off by default) and views kept current on every append (catching up later is about 100 times cheaper per append). The cold layer's repack takes tens of seconds for a few megabytes and did not finish at 20 MB, so it cannot run in a session's path at all; a background or incremental repack is the cold layer's first need.
+- Run: `cargo run --release --example hot_cold -- files`, `-- db default 100000`, `-- db opt 100000`, `-- db 10000`.
