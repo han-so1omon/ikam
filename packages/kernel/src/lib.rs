@@ -12,6 +12,7 @@ pub mod colblock;
 mod container;
 mod db;
 mod dict;
+pub mod drafts;
 mod exec;
 mod fragment;
 pub mod func;
