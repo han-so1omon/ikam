@@ -3,12 +3,12 @@
 //!
 //! `cargo run --release --example ir_compress [corpus ...]`
 //!
-//! Corpora (the report ones are synthetic, deterministic, modelled on
-//! mercante-personal's lead-lag report renderer, `leadlag/cli.py render()`):
+//! Corpora (the report ones are synthetic and deterministic, shaped like the
+//! run reports a downstream research app renders):
 //! - `reports-drift`: 300 runs; numbers change only when a month of data
 //!   arrives (about every 20 runs), as rerunning a study on the same data does;
 //! - `reports-random`: 300 runs with every number redrawn each run (worst case);
-//! - `reports-30`: 30 random runs (the shape of the Mercante demo's test);
+//! - `reports-30`: 30 random runs (the shape of an earlier report-copy demo);
 //! - `exports`: 100 drift runs, each report's table also as csv and json;
 //! - `tables`: `fixtures/tables` csv, json and md (24 real workbooks);
 //! - `texts`: `fixtures/multiformat` md (24 prose texts, a control);

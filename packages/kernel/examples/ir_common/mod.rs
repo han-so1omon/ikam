@@ -347,8 +347,8 @@ pub fn fixture(dir: &str, exts: &[&str]) -> Files {
         .collect()
 }
 
-/// Every file directly in `dir`, by name (read only; for real reports, such
-/// as Mercante's `research/reports`). Only sizes and times are printed.
+/// Every file directly in `dir`, by name (read only; for a folder of real
+/// reports). Only sizes and times are printed.
 pub fn folder(dir: &Path) -> Files {
     let mut out: Files = std::fs::read_dir(dir)
         .unwrap()
