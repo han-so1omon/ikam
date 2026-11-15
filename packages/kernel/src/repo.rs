@@ -445,7 +445,12 @@ impl<S: Store> Repo<S> {
         for id in self.store.ids()? {
             // Both projections need only an encoding's header, except for
             // derivation records, which are read whole (E135).
-            let head = self.store.read_head(&id, crate::dict::HEAD_LEN)?;
+            // Deleted by another handle since the listing (E292).
+            let head = match self.store.read_head(&id, crate::dict::HEAD_LEN) {
+                Ok(head) => head,
+                Err(Error::NotFound(_)) => continue,
+                Err(e) => return Err(e),
+            };
             if let Some(set) = needed.as_mut() {
                 set.add(&head);
             }
@@ -455,7 +460,11 @@ impl<S: Store> Repo<S> {
             let encoded = if head.len() < crate::dict::HEAD_LEN {
                 head
             } else {
-                self.store.read(&id)?
+                match self.store.read(&id) {
+                    Ok(encoded) => encoded,
+                    Err(Error::NotFound(_)) => continue,
+                    Err(e) => return Err(e),
+                }
             };
             outputs.extend(self.derivation_output(&id, &encoded));
             records.push((id, encoded));

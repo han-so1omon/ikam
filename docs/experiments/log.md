@@ -4193,3 +4193,46 @@ Gates on the branch (E229 to E233): every kernel test suite passes (release); cl
 - Not measured: the Mac (the session there is closed); durable stores, as in E245.
 - Run: `cargo run --release --example join_switch -- 20000 1000 0.4 10 30 100 300 1000 3000`, and again with 100000 (7 minutes together here).
 - Gates on the branch: no code change.
+
+### E292 two-writers (two writers firing one net on one database)
+- Branch / parent: exp/292-two-writers / E291 (exp/291-join-options-ablation)
+- Question: E269 left concurrency open: two writers firing at once on one database. A night with two workers has two writers, each reading the head, firing on what it read and committing. What does each way of committing do with that, and which keeps the net's tokens right? (Source: E269's "Not measured": "concurrency (two writers firing at once on one database)".)
+- Hypothesis: `db_commit` builds on whatever the ref points at, so the second writer's commit replaces the first one's database and its firing is lost; a branch per writer plus `merge` (E265) catches it, since both sides write the same marking keys; a commit that names the head it read from refuses the second writer, and a retry keeps both.
+- Change:
+  - `Repo::db_commit_at(name, base, db, message)` (new, in `db.rs`): commits only if the ref still points at `base`, the commit `db` was read from, and returns `Error::RefConflict` otherwise. `db_commit` is unchanged.
+  - A race fixed, found by this experiment: with 8 writers as siblings on one SharedStore, a firing failed with `NotFound` now and then (in every run at 8 writers, never at 1 to 4). Writing content can drop a stored copy that a new derivation makes redundant, after `is_needed` checks that no other stored encoding needs it. That check lists the store's ids and then reads each one, and an object another handle deletes between the listing and the read failed the whole write. `is_needed` (`dict.rs`) and the ledger's build (`repo.rs`), which list and read the same way, now skip an object deleted since the listing. With the `dict.rs` part removed, the failure comes back in the first run.
+  - `examples/net_two_writers.rs`; a test, `commit_at_refuses_a_stale_database` (`tests/db.rs`).
+- Result, part 1 (two writers read one head, A starts candidate a, B starts b; the loop net, `cpu` holding 1 or 2):
+
+  | Way | cpu 1 (correct: a or b running, cpu 0) | cpu 2 (correct: a and b running, cpu 0) |
+  |---|---|---|
+  | `db_commit` both | b running, cpu 0; A's firing gone, replay equal | b running, cpu 1; A's firing gone, replay equal |
+  | a branch each, `merge`, plain marking | merged: a and b running, cpu 0; replay fails | merged: a and b running, cpu 1; replay fails |
+  | a branch each, `merge`, sum hash (E279) | refused: conflict on the hash key | refused: conflict on the hash key |
+  | `db_commit_at`, then a retry | B refused; B's retry finds start not enabled; a running | B refused; B's retry fires; a and b running, cpu 0 |
+
+  - `db_commit` loses a firing silently, and the head stays consistent, so nothing checks it.
+  - The plain merge is worse: both writers write the same count (`cpu` from 2 to 1, or removed from 1), the same operation on the same key, which merge reads as one write made twice. The merged marking runs two candidates on one cpu. Only replay notices.
+  - The sum hash makes the same merge conflict, because both sides write the hash key with different values.
+- Result, part 2 (W threads take 200 candidates through start, the work and finish, committing after every firing; cpu 2; each run stops after 20 s; MemStore). With 40 ms of work:
+
+  | Commit | W | Measured | Work runs | Starts lost | Most at once | Refused | Time |
+  |---|---|---|---|---|---|---|---|
+  | `db_commit` | 1 | 200 | 200 | 0 | 1 | 0 | 18.6 s |
+  | `db_commit` | 2 | 199 | 401 | 197 | 2 | 1 | stopped at 20 s |
+  | `db_commit` | 4 | 193 | 767 | 565 | 4 | 8 | stopped |
+  | `db_commit` | 8 | 119 | 946 | 821 | 8 | 8 | stopped |
+  | `db_commit_at` | 2 | 200 | 200 | 0 | 2 | 295 | 15.1 s |
+  | `db_commit_at` | 4 | 200 | 200 | 0 | 2 | 844 | 13.8 s |
+  | `db_commit_at` | 8 | 169 | 169 | 0 | 2 | 1,612 | stopped |
+  | one lock | 2 | 200 | 200 | 0 | 2 | 0 | 10.7 s |
+  | one lock | 4 | 200 | 200 | 0 | 1 | 0 | 12.9 s |
+  | one lock | 8 | 200 | 200 | 0 | 1 | 0 | 16.7 s |
+
+  - With `db_commit` and two writers or more, half or more of the work is lost and redone, up to 8 runs go at once on 2 cpus, and a candidate whose finish was lost stays running with nobody to finish it, so the night never ends. Replay is equal throughout: the head is one writer's consistent history.
+  - `db_commit_at` keeps every count right at every W. Refusals grow with W: at 8 writers each firing is refused about 10 times, and the run did not finish in 20 s.
+  - One lock held from reading the head to the commit (the work outside it) is right at every W and fastest at 2 writers. More writers spend the lock reading heads with nothing to start.
+  - With 2 ms of work (as in the first runs) nothing overlaps at all: one firing takes about 17 ms here, so the commit path, not the work, sets the pace (E293 follows that up).
+- Verdict: **kept** (`db_commit_at` is new and changes nothing else; the race fix is a fix, on this branch only). For a loop with more than one worker: one committer (a lock, or one thread that fires for the others) and the work in parallel; `db_commit_at` where writers cannot share a lock, such as two processes; never a plain merge of two branches that fired one net, unless the sum hash is on.
+- Not measured: FsStore and two processes (MemStore threads here); a merge that resolves two firings instead of refusing them; two more races found by reading `repo.rs`, not seen in a run: a ledger built while another handle records a derivation can miss it, and a handle that writes a record another handle already wrote does not add it to the ledger.
+- Run: `cargo run --release --example net_two_writers`, and `PART1=0 WORK_MS=40 cargo run --release --example net_two_writers` (5 minutes together here).
