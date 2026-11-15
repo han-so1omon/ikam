@@ -142,7 +142,9 @@ fn main() {
         steps += a.1;
     }
     println!("agreement: {nets} random nets, {steps} steps, every marking equal");
-    println!("places x transitions | interp ns/step | table ns/step | speedup");
+    println!(
+        "places x transitions | interp ns/step | table ns/step | speedup | incremental ns/step (E286) | over table"
+    );
     for (i, &(np, nt)) in [(10usize, 20usize), (100, 200), (1000, 2000)]
         .iter()
         .enumerate()
@@ -160,6 +162,16 @@ fn main() {
         let start = Instant::now();
         let tdone = table.walk(&mut m, tsteps, |n| (rng.next() % n as u64) as usize);
         let tns = start.elapsed().as_nanos() as f64 / tdone as f64;
-        println!("{np} x {nt} | {ins:.0} | {tns:.0} | {:.0}x", ins / tns);
+        let mut m2 = table.initial.clone();
+        let mut rng = Rng(1);
+        let start = Instant::now();
+        let idone2 = table.walk_incremental(&mut m2, tsteps, |n| (rng.next() % n as u64) as usize);
+        let incr = start.elapsed().as_nanos() as f64 / idone2 as f64;
+        assert_eq!((idone2, &m2), (tdone, &m), "incremental differs");
+        println!(
+            "{np} x {nt} | {ins:.0} | {tns:.0} | {:.0}x | {incr:.0} | {:.1}x",
+            ins / tns,
+            tns / incr
+        );
     }
 }

@@ -81,7 +81,7 @@ fn main() {
     let net = Net::parse(LOOP).unwrap();
     let seed = 0x0285_0285_0285_0285;
     println!(
-        "candidates | places x transitions | unfold+lower ms | interp ns/step | table ns/step | x"
+        "candidates | places x transitions | unfold+lower ms | interp ns/step | table ns/step | x | incremental ns/step (E286) | over table"
     );
     for k in [10usize, 100, 1000] {
         let colors: Vec<String> = (0..k).map(|i| format!("E{i:04}")).collect();
@@ -118,11 +118,18 @@ fn main() {
         let start = Instant::now();
         let done = t.walk(&mut tm, steps, |n| (r.next() % n as u64) as usize);
         let table_ns = start.elapsed().as_nanos() as f64 / done as f64;
+        let mut m2 = t.initial.clone();
+        let mut r = Rng(seed);
+        let start = Instant::now();
+        let done2 = t.walk_incremental(&mut m2, steps, |n| (r.next() % n as u64) as usize);
+        let incr_ns = start.elapsed().as_nanos() as f64 / done2 as f64;
+        assert_eq!((done2, &m2), (done, &tm), "incremental differs");
         println!(
-            "{k:>10} | {} x {} | {build_ms:.1} | {interp_ns:.0} | {table_ns:.0} | {:.0}",
+            "{k:>10} | {} x {} | {build_ms:.1} | {interp_ns:.0} | {table_ns:.0} | {:.0} | {incr_ns:.0} | {:.1}x",
             t.places.len(),
             t.transitions.len(),
-            interp_ns / table_ns
+            interp_ns / table_ns,
+            table_ns / incr_ns
         );
     }
 }

@@ -4035,3 +4035,26 @@ Gates on the branch (E229 to E233): every kernel test suite passes (release); cl
 - Not measured: guards on colors (none in the kernel yet); colors that are tuples; a net with many colored places per transition.
 - Run: `cargo run --release --example net_unfold`; `cargo test --release --lib net::`.
 - Gates on the branch: kernel lib tests pass (62, 1 ignored); clippy `-D warnings` and fmt clean.
+
+### E286 incremental-enabling (the table rechecks only what a firing touched)
+- Branch / parent: exp/286-incremental-enabling / E285 (exp/285-unfold-colors)
+- Question: E285 found the table's step grows with the transitions, because every step checks every transition. Does rechecking only the transitions that read a place the firing changed, with a log-time pick of the k-th enabled one, keep the same walk and remove that growth?
+- Hypothesis: the same firings (the enabled set and its order are the same), at a cost that follows the changed places' readers instead of the net's size, so the gain grows with the net. (Source: the loop design's "only transitions next to changed places are rechecked"; E285's verdict.)
+- Change: `Table::walk_incremental` in the opt-in `net` module: readers per place and changed places per transition computed once, a Fenwick tree over transition order for the count and the k-th pick, a stamp so each reader is rechecked once a step. One unit test (29 seeds on a small net with a dead transition and on the loop net unfolded to 30 colors: same steps and same marking as `walk`); `examples/net_unfold.rs` and `examples/net_table.rs` gain the column, asserting the same result as `walk`.
+- Result (`cargo run --release --example net_unfold`, `cargo run --release --example net_table`; ns per step):
+
+  | Net | Table (E278) | Incremental | Gain |
+  |---|---|---|---|
+  | loop net, 10 candidates (41 x 50) | 86 | 41 | 2.1x |
+  | loop net, 100 candidates (401 x 500) | 607 | 68 | 8.9x |
+  | loop net, 1,000 candidates (4,001 x 5,000) | 5,677 | 126 | 45x |
+  | random 10 x 20 | 77 | 67 | 1.1x |
+  | random 100 x 200 | 394 | 122 | 3.2x |
+  | random 1,000 x 2,000 | 2,865 | 173 | 17x |
+
+  - Every walk ended in the same marking after the same steps as `walk`.
+  - At 1,000 x 2,000 the incremental table (173 ns) is faster than E282's Cranelift code (1,543 ns) and E277's clang code (813 to 1,061 ns), with no compile: on large nets the algorithm matters more than the code generator. Compiling the incremental form would be the next comparison.
+- Verdict: **kept** as an option (opt-in API); the simulation path for nets of more than a few dozen transitions.
+- Not measured: an incremental mode compiled with Cranelift; nets where one place is read by most transitions (the loop's cpu slot is: each firing of start or finish rechecks every start, and the gain still holds at 45x).
+- Run: `cargo run --release --example net_unfold`; `cargo run --release --example net_table`; `cargo test --release --lib net::`.
+- Gates on the branch: kernel lib tests pass (63, 1 ignored); clippy `-D warnings` and fmt clean.

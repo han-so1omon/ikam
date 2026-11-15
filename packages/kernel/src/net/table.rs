@@ -20,6 +20,49 @@ pub struct Table {
     pub outputs: Vec<Vec<(usize, u64)>>,
 }
 
+/// Counts over transition indices, with the k-th set index in log time.
+struct Fenwick {
+    t: Vec<i64>,
+}
+
+impl Fenwick {
+    fn new(n: usize) -> Self {
+        Fenwick { t: vec![0; n + 1] }
+    }
+    fn add(&mut self, i: usize, d: i64) {
+        let mut i = i + 1;
+        while i < self.t.len() {
+            self.t[i] += d;
+            i += i & i.wrapping_neg();
+        }
+    }
+    fn total(&self) -> i64 {
+        let mut i = self.t.len() - 1;
+        let mut s = 0;
+        while i > 0 {
+            s += self.t[i];
+            i -= i & i.wrapping_neg();
+        }
+        s
+    }
+    /// The index of the k-th (from 0) set position.
+    fn kth(&self, k: usize) -> usize {
+        let n = self.t.len() - 1;
+        let mut pos = 0;
+        let mut rem = k as i64;
+        let mut step = n.next_power_of_two();
+        while step > 0 {
+            let next = pos + step;
+            if next <= n && self.t[next] <= rem {
+                pos = next;
+                rem -= self.t[next];
+            }
+            step >>= 1;
+        }
+        pos
+    }
+}
+
 impl Net {
     /// Lower a checked net with no colored places to a [`Table`].
     pub fn lower(&self) -> Result<Table, Error> {
@@ -156,6 +199,76 @@ impl Table {
         steps
     }
 
+    /// As [`walk`](Table::walk), with the same firings, but after each
+    /// firing rechecking only the transitions that read a place it changed
+    /// (E286), and picking the k-th enabled transition from a Fenwick tree
+    /// over transition order. A step costs the changed places' readers and
+    /// a log-time pick instead of a check of every transition.
+    pub fn walk_incremental(
+        &self,
+        m: &mut [u64],
+        steps: u64,
+        mut pick: impl FnMut(usize) -> usize,
+    ) -> u64 {
+        let nt = self.inputs.len();
+        // Readers of each place, and the places each transition changes.
+        let mut readers: Vec<Vec<usize>> = vec![Vec::new(); self.initial.len()];
+        for (t, ins) in self.inputs.iter().enumerate() {
+            for &(p, _) in ins {
+                if readers[p].last() != Some(&t) {
+                    readers[p].push(t);
+                }
+            }
+        }
+        let changes: Vec<Vec<usize>> = (0..nt)
+            .map(|t| {
+                let mut d = std::collections::BTreeMap::<usize, i128>::new();
+                for &(p, w) in &self.inputs[t] {
+                    *d.entry(p).or_default() -= w as i128;
+                }
+                for &(p, w) in &self.outputs[t] {
+                    *d.entry(p).or_default() += w as i128;
+                }
+                d.into_iter()
+                    .filter(|(_, x)| *x != 0)
+                    .map(|(p, _)| p)
+                    .collect()
+            })
+            .collect();
+        let mut on = vec![false; nt];
+        let mut tree = Fenwick::new(nt);
+        for (t, o) in on.iter_mut().enumerate() {
+            if self.is_enabled(m, t) {
+                *o = true;
+                tree.add(t, 1);
+            }
+        }
+        let mut stamp = vec![0u64; nt];
+        for step in 0..steps {
+            let count = tree.total();
+            if count == 0 {
+                return step;
+            }
+            let t = tree.kth(pick(count as usize));
+            self.fire(m, t);
+            let mark = step + 1;
+            for &p in &changes[t] {
+                for &r in &readers[p] {
+                    if stamp[r] == mark {
+                        continue;
+                    }
+                    stamp[r] = mark;
+                    let now = self.is_enabled(m, r);
+                    if now != on[r] {
+                        on[r] = now;
+                        tree.add(r, if now { 1 } else { -1 });
+                    }
+                }
+            }
+        }
+        steps
+    }
+
     /// The same counts as a [`Marking`] (anonymous tokens, no zeros).
     pub fn marking(&self, m: &[u64]) -> Marking {
         let mut out = Marking::new();
@@ -259,6 +372,41 @@ mod tests {
                 let (base, tok) = p.split_once('.').unwrap_or((p, crate::net::ANON));
                 let want = m.get(base).and_then(|x| x.get(tok)).copied().unwrap_or(0);
                 assert_eq!(tm[i], want, "place {p}");
+            }
+        }
+    }
+
+    #[test]
+    fn incremental_walk_takes_the_same_firings() {
+        let loop_net = crate::net::tests::loop_net();
+        let colors: Vec<String> = (0..30).map(|i| format!("E{i:02}")).collect();
+        let cs: Vec<&str> = colors.iter().map(String::as_str).collect();
+        let nets = [
+            Net::parse(
+                "net t 1\nplace a 3\nplace b\nplace c 1\n\
+                 transition ab pure: 2*a -> b\ntransition bc pure: b, c -> 2*c\n\
+                 transition ca pure: 2*c -> 3*a\ntransition dead pure: 9*b -> a\n",
+            )
+            .unwrap()
+            .lower()
+            .unwrap(),
+            loop_net.unfold(&cs).unwrap().lower().unwrap(),
+        ];
+        for t in &nets {
+            for seed in 1..30u64 {
+                let rng = |seed: u64| {
+                    let mut x = seed;
+                    move |n: usize| {
+                        x ^= x << 13;
+                        x ^= x >> 7;
+                        x ^= x << 17;
+                        (x % n as u64) as usize
+                    }
+                };
+                let (mut a, mut b) = (t.initial.clone(), t.initial.clone());
+                let da = t.walk(&mut a, 2_000, rng(seed));
+                let db = t.walk_incremental(&mut b, 2_000, rng(seed));
+                assert_eq!((da, &a), (db, &b), "seed {seed}");
             }
         }
     }
