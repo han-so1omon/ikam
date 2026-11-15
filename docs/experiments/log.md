@@ -4154,3 +4154,42 @@ Gates on the branch (E229 to E233): every kernel test suite passes (release); cl
 - Not measured: whether the follow-up fully answered the gap (E286's gap names two things, and E288 measured one); a backtest, since only 11 entries in the log have a Source naming an experiment.
 - Run: `cargo run --release --example loop_gaps`.
 - Gates on the branch: kernel lib tests as on E287 (63, 1 ignored); clippy `-D warnings` (all targets) and fmt clean.
+
+### E291 join-options-ablation (E245's join options, retested on today's code)
+- Branch / parent: exp/291-join-options-ablation / E290 (exp/290-source-arcs)
+- Question: the gap list marks E245's kept join options (`plain_writes`, `memo`, `recompute_above`) for an ablation: they were measured before E246 to E250 changed the join path (the pruned diff, E249) and before the faster-joins merge. Does each option still pay on today's code?
+- Hypothesis: the options still cut large batches by about E245's shares, the bytes are unchanged, and `recompute_above` still saves nothing once the other two are on; the small-batch win now comes from the pruned diff. (Source: the gap list's `stale/E245`, by registry.rs's ablate rule.)
+- Change: none. E245's command, unchanged, on this branch (the code of main c92a279 plus the opt-in net module). This is a cloud machine, not E245's Mac, so compare shares, not milliseconds; recomputing takes 2.3 to 2.6 times E245's time here.
+- Result (`cargo run --release --example join_switch -- N 1000 0.4 10 30 100 300 1000 3000`; median ms per batch; every way ended with the same rows at both sizes):
+
+  | 20,000 rows | 10 | 100 | 1,000 | 3,000 | Bytes added |
+  |---|---|---|---|---|---|
+  | Update | 40 | 231 | 871 | 1,209 | 22.1 MB |
+  | `plain_writes` | 42 | 140 | 383 | 502 | 36.9 MB |
+  | `memo` | 36 | 145 | 440 | 543 | 22.1 MB |
+  | Both | 37 | 127 | 304 | 371 | 36.9 MB |
+  | Both + pruned diff (E249) | 19 | 107 | 325 | 421 | 36.9 MB |
+  | Both + `recompute_above: 0.4` | 39 | 137 | 384 | 375 | 36.9 MB |
+  | Recompute | 373 | 393 | 429 | 442 | 28.0 MB |
+  | Recompute, both + `read_once` | 246 | 263 | 297 | 304 | 28.0 MB |
+
+  | 100,000 rows | 10 | 100 | 1,000 | 3,000 | Bytes added |
+  |---|---|---|---|---|---|
+  | Update | 115 | 353 | 1,864 | 3,178 | 46.9 MB |
+  | `plain_writes` | 141 | 303 | 1,128 | 1,581 | 99.3 MB |
+  | `memo` | 117 | 301 | 1,214 | 1,925 | 46.9 MB |
+  | Both | 119 | 275 | 1,169 | 1,599 | 99.3 MB |
+  | Both + pruned diff (E249) | 32 | 195 | 1,050 | 1,634 | 99.3 MB |
+  | Both + `recompute_above: 0.4` | 142 | 322 | 1,786 | 1,783 | 106.6 MB |
+  | Recompute | 2,386 | 2,278 | 2,277 | 2,245 | 109.1 MB |
+  | Recompute, both + `read_once` | 1,482 | 1,427 | 1,433 | 1,418 | 109.1 MB |
+
+  - Bytes are E245's to the byte at every way and size.
+  - From 100 changes up, `memo` alone cuts an update by 15 to 55 percent and both options by 22 to 69 percent, in line with E245 (19 to 45 and 26 to 63).
+  - At 10 and 30 changes the options no longer help: within a few percent at 20,000 rows, and up to 23 percent slower with `plain_writes` at 100,000. On E245's Mac `memo` cut 10 changes at 100,000 rows from 54 to 43 ms. The pruned diff is now what wins small batches: 72 percent less at 10 changes on 100,000 rows.
+  - `recompute_above: 0.4` again saves nothing with the other two on (1,783 against 1,599 ms at 3,000 changes on 100,000 rows), so the same advice holds.
+  - The 100,000-row run finished in 5.5 minutes: E245's stall fix (`read_once` in the harness) still holds.
+- Verdict: **kept** (E245's verdict stands, options off by default). For large batches, `memo` (no byte cost) and `plain_writes` (twice the bytes) still pay. For small batches, use the pruned diff and leave the other options off. Do not combine `recompute_above` with them.
+- Not measured: the Mac (the session there is closed); durable stores, as in E245.
+- Run: `cargo run --release --example join_switch -- 20000 1000 0.4 10 30 100 300 1000 3000`, and again with 100000 (7 minutes together here).
+- Gates on the branch: no code change.
