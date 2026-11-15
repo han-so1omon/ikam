@@ -3987,3 +3987,11 @@ Gates on the branch (E229 to E233): every kernel test suite passes (release); cl
 - Not measured: MLIR (no libraries here; Cranelift answers the same "fast compile, decent code" question from Rust); Cranelift's `opt_level=none`; colored nets; the enabling pass with branches (E277's shape) under Cranelift; macOS on Apple silicon (Cranelift supports aarch64).
 - Run: `cd packages/kernel/experiments/net-jit && cargo run --release` (needs clang).
 - Gates: clippy `-D warnings` and fmt clean on the crate; the kernel is unchanged.
+
+### E283 research-scan (one pass of the loop's reading step)
+- Branch / parent: exp/283-research-scan / E282 (exp/282-cranelift-mode)
+- Question: the loop's second step reads research by theme. One pass against the gaps tonight's experiments left: what do current sources say, and what should the queue take next?
+- Change: none in the kernel. `docs/research/scan-2026-11-15.md`: five themes (incremental hashing, compiling nets, durable execution and checkpoints, choosing the next experiment, keeping views current), the sources read for each in my own words, and what each means for IKAM.
+- Result: the sources agree with E276 (rank by dependencies and pilots, not keep rates), E281 (the smallest memoized unit sets a crash's cost) and E282 (fast back ends trade code quality for compile time); they name one gap in E279 worth running now (an LtHash mode for forgery resistance) and three for the queue (a pilot transition, dependency arcs in the gap list, colored nets in the table).
+- Verdict: **measured** (reading, no change). Taken up tonight: E284.
+- Not measured: whether a scan's proposals are taken up and kept more often than the gap list's (needs several nights).
