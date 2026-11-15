@@ -31,7 +31,10 @@
 //!
 //! Nothing in the default paths calls this module.
 
+mod table;
 mod text;
+
+pub use table::Table;
 
 use std::collections::BTreeMap;
 

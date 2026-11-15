@@ -3884,3 +3884,16 @@ Gates on the branch (E229 to E233): every kernel test suite passes (release); cl
 - Not measured: checkpoints inside long work; a cache keyed by inputs; outputs of megabytes (here under 100 bytes); MemStore.
 - Run: `cargo run --release --example net_outputs [-- N]`; `cargo test --release --lib net::`.
 - Gates on the branch: kernel lib tests pass (56, 1 ignored); clippy `-D warnings` and fmt clean.
+
+### E278 net-table (a net lowered to dense arrays, as an option)
+- Branch / parent: exp/278-net-table / E271 (exp/271-run-outputs)
+- Question: E277 found that for simulation (many steps in memory) a net lowered to arrays beats the interpreter by orders of magnitude with no compile step. As a kernel option, does it give the same markings as `Net::fire` on every net, and keep E277's speed?
+- Hypothesis: a `Table` (place indices, each transition's input thresholds and output additions) agrees with the interpreter step for step on random nets and matches E277's hand-written table within noise. (Source: E277.)
+- Change: `net::Table` and `Net::lower` in the opt-in `net` module (plain places only; a colored net is refused with a message to unfold colors first): `is_enabled`, `fire` in place, `enabled_into`, `walk` (a random walk with a caller's pick), `marking` (back to a `Marking`). One unit test against the interpreter; `examples/net_table.rs`.
+- Result (`cargo run --release --example net_table`):
+  - Agreement: 2,000 seeded random nets (3 to 42 places, conservative arcs as in E277), 300 steps each (600,000 in all): every marking equal to the interpreter's, and the same steps taken.
+  - Speed, ns per step: 10 x 20: interpreter 1,933, table 83 (23x); 100 x 200: 76,956 and 431 (179x); 1,000 x 2,000: 6,017,676 and 3,253 (1,850x). Within about 10% of E277's hand-written table (75, 372, 2,945).
+- Verdict: **kept** as an option (opt-in API). The simulation path for nets; the live loop keeps `net_fire`, whose cost is the append (E269).
+- Not measured: colored nets (unfolding); guards; a simulation the loop uses to plan (for example, how long a queue takes with one slot against two).
+- Run: `cargo run --release --example net_table`; `cargo test --release --lib net::`.
+- Gates on the branch: kernel lib tests pass; clippy `-D warnings` and fmt clean.
