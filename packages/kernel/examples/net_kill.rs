@@ -13,7 +13,8 @@
 //!
 //!   cargo run --release --example net_kill [-- N]
 //!   (W, KILL_MS, WORK_MS as env; DEFERRED=1 opens the store with
-//!   `open_deferred`; CLEAN=1 runs `clean_temporaries` (E302) at the end)
+//!   `open_deferred`; CLEAN=1 runs `clean_temporaries` (E302) at the end;
+//!   LEASE_MS puts back any candidate running longer than that, E303)
 
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
@@ -229,8 +230,45 @@ fn main() {
     let mut sup = open(&d);
     let (mut seq, mut requeued) = (0u64, 0usize);
     let mut ids: Vec<u64> = (1..=w).collect();
+    // E303: LEASE_MS > 0, a supervisor that cannot see deaths (workers on
+    // other machines): a candidate running longer than the lease is put
+    // back, whoever holds it.
+    let lease = Duration::from_millis(env("LEASE_MS", 0));
+    let mut seen: std::collections::HashMap<String, Instant> = Default::default();
+    let mut last_poll = Instant::now();
     while !kids.is_empty() && t0.elapsed() < Duration::from_secs(120) {
         std::thread::sleep(Duration::from_millis(5));
+        if !lease.is_zero() && last_poll.elapsed() >= Duration::from_millis(20) {
+            last_poll = Instant::now();
+            let head = sup.resolve(REF).unwrap();
+            let db = sup.db_at(&head).unwrap();
+            let running = tokens(&sup, &db, "running").unwrap();
+            seen.retain(|t, _| running.contains(t));
+            let now = Instant::now();
+            let mut late = Vec::new();
+            for t in running {
+                let since = *seen.entry(t.clone()).or_insert(now);
+                if now - since >= lease {
+                    late.push(t);
+                }
+            }
+            if !late.is_empty() {
+                let mut db = db;
+                for t in &late {
+                    seq += 1;
+                    db = sup
+                        .net_fire(&db, &net, "requeue", Some(t), &format!("rq{seq}"))
+                        .unwrap()
+                        .0;
+                }
+                if sup.db_commit_at(REF, head, &db, "lease").is_ok() {
+                    requeued += late.len();
+                    for t in &late {
+                        seen.remove(t);
+                    }
+                }
+            }
+        }
         let mut keep = Vec::new();
         for k in kids.iter_mut() {
             keep.push(!matches!(k.try_wait(), Ok(Some(_))));
@@ -318,6 +356,12 @@ fn main() {
         })
         .count();
     let fsck = repo.fsck().unwrap().len();
+    let starts = repo
+        .net_firings(&db, "loop")
+        .unwrap()
+        .iter()
+        .filter(|f| f.transition == "start")
+        .count();
     // E302: CLEAN=1 removes what dead workers left, once they are all gone.
     let cleaned = if std::env::var("CLEAN").as_deref() == Ok("1") {
         repo.store().clean_temporaries().unwrap()
@@ -336,7 +380,7 @@ fn main() {
         "{w} workers, {n} candidates, a kill every {kill_ms} ms{}: {kills} kills ({requeued} candidates requeued by the supervisor), {errors} errors; \
          first pass {first_ms} ms, {measured_first} measured, {} stranded in running; \
          after requeue {second_ms} ms: {} measured, replay {replay}, {unreadable} outputs wrong or unreadable, \
-         fsck {fsck}, {cleaned} temporary files removed, {leftovers} left",
+         fsck {fsck}, {cleaned} temporary files removed, {leftovers} left; {starts} starts for {n} candidates{}",
         match (std::env::var("DEFERRED").as_deref() == Ok("1"), supervise) {
             (true, true) => ", deferred, supervised",
             (true, false) => ", deferred",
@@ -345,6 +389,11 @@ fn main() {
         },
         stranded.len(),
         measured.len(),
+        if lease.is_zero() {
+            String::new()
+        } else {
+            format!(" (lease {} ms)", lease.as_millis())
+        },
     );
     let _ = std::fs::remove_dir_all(&dir);
 }

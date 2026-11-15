@@ -4482,3 +4482,28 @@ Gates on the branch (E229 to E233): every kernel test suite passes (release); cl
 - Verdict: **kept** (a new function, called only by whoever runs the workers; no change to what is stored). The supervisor of E301 can call it once its workers are gone, or after each death.
 - Not measured: stores shared across machines (it must not be used there); a supervisor calling it while workers run (safe by the process check, not exercised).
 - Run: as above, and `cargo test --release --test clean_temporaries`.
+
+### E303 run-leases (a time limit on running, for workers a supervisor cannot see)
+- Branch / parent: exp/303-run-leases / E302 (exp/302-clean-temporaries)
+- Question: E301's supervisor requeues a dead worker's runs because it sees the death. A worker on another machine dies unseen. Does a lease, putting back any candidate running longer than a time limit, keep the night going, and what does a wrong limit cost? (Source: E301's "Not measured": "workers on other machines ... need a lease".)
+- Hypothesis: a lease longer than the longest run recovers dead workers' runs at the cost of a few repeated starts; a lease shorter than a run requeues every run before it can finish.
+- Change: none to the kernel. `net_kill` gains `LEASE_MS`: the supervisor reads the head every 20 ms and requeues any candidate it has seen in `running` for longer than the lease, whoever holds it; it is not told of kills. Also reported: start firings for the N candidates (each extra start is a run done again).
+- Result (`WORK_MS=... KILL_MS=... LEASE_MS=... cargo run --release --example net_kill -- N`, 2 workers):
+
+  | Work per run | Kills | Lease | First pass | Starts for the candidates | Requeued |
+  |---|---|---|---|---|---|
+  | 40 ms | none | none, 60 ms, 200 ms, 2 s | 100 of 100 in 4.1 to 4.4 s | 100 for 100 | 0 |
+  | 40 ms | every 700 ms | 400 ms | 100 of 100 in 6.1 s | 105 for 100 | 5 |
+  | 200 ms | none | none | 60 of 60 in 7.9 s | 60 for 60 | 0 |
+  | 200 ms | none | 100 ms | 0 of 60 in 120 s | 1,172 for 60 | 1,112 |
+  | 200 ms | none | 300 ms | 60 of 60 in 7.8 s | 60 for 60 | 0 |
+  | 200 ms | every 1 s | none | 10 of 60, then stalled | 62 for 60 | 0 |
+  | 200 ms | every 1 s | 300 ms | 60 of 60 in 9.5 s | 67 for 60 | 7 |
+  | 200 ms | every 1 s | 1 s | 59 of 60 in 12.6 s (the last still within its lease) | 70 for 60 | 9 |
+
+  - A lease longer than a run recovers dead workers' runs without seeing the deaths: every candidate measured, at 5 to 10 extra starts for about one death per second.
+  - A lease shorter than a run is a livelock: every run is put back before it can finish, and nothing is measured. (A run's own finish is then refused because its candidate is no longer running, so nothing is wrong in the store, only no progress.) At 60 ms with 40 ms runs no run outlived the lease, so nothing happened.
+  - Replay, fsck and every output were right in every run.
+- Verdict: **kept** (example only). A lease is the recovery for unseen workers, and it must be longer than the longest run. Runs longer than any sensible lease need a heartbeat that renews it, for example E281's checkpoints, which a supervisor can read as a sign of life.
+- Not measured: a heartbeat renewing the lease; clocks that differ between machines (here one supervisor's clock times every lease).
+- Run: as above (about 8 minutes together).
