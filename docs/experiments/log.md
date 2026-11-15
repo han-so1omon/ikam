@@ -3820,6 +3820,45 @@ Gates on the branch (E229 to E233): every kernel test suite passes (release); cl
 - Run: `cargo run --release --example cold_pass -- [group] [nofull]`; `cargo run --release --example cold_pass -- kill 5000 30 [group]`; `cargo run --release --example cold_pass -- gccheck 100000 group`; `cargo run --release --example cold_pass -- repro 100000 group [nopass] [save=DIR]`, then `-- full DIR`; `cargo test --release --test coldpass`.
 - Gates on the branch: every kernel test suite passes (release, 247 tests); clippy `-D warnings` and fmt clean; the bench gives the same byte fields as main, north 0.3096 (corpora from git history left out, as for E265).
 
+### E310 repack-crash-safety (a full repack stopped after any of its writes leaves a clean store)
+- Branch / parent: exp/310-repack-crash-safety / exp/268-incremental-repack a279f89 (numbered E310 because E269 to E298 were taken by other work meanwhile)
+- Question: E268 found that the full repack's copy loop (`replan_store`) could replace entries durably before what their new encodings name is in place. Does a full repack stopped part way leave a store that reads the same and is fsck clean, and if not, what order makes it so?
+- Method: random kills first, as E268 did (`kill 3000 10 full`: ten full repacks of a 3,000-row store killed at a random time in the last fifth of their run, where the writes are). Then trace and replay (`crash N K [synced] [group]`): one full repack runs on a copy through a store that records every write, replace, delete, ref move and sync in order; for K points spread over that list (plus points where the kind of write changes, at most 3K in all), a fresh copy gets the writes up to the point on a deferred FsStore (with `synced`, one that places each write at once), its handle is lost without a drop, as in a crash, and it is reopened and checked: scan, `db_rebuild` and `fsck_deep` (every stored object, garbage included, decodes). A control replays every write and drops the handle as usual; it must be clean. The store is the kill store: N rows, a first cold pass (E268), then 1,000 upserts in batches of 100.
+- Before the fix (1,000 rows; the repack issues 3,043 writes: 332 new objects, 2,201 replacements, 508 deletes, 2 ref moves):
+  - Random kills found nothing: the repack plans for about 30 s and writes for well under a second at the end.
+  - Trace and replay: 1,109 of 1,126 stopping points failed their check, from the 126th write on, on the deferred store; the synced store failed too, so the order hurts, not only the deferral.
+- Causes, in the order they showed (each fix exposed the next; the last two only at 3,000 rows):
+  1. Replacements and new objects went out mixed, in id order: a content re-encoded against the new dictionary was replaced before the dictionary was written.
+  2. New objects went out before what they name (a group member before its group, a frame before its context, a derivation before its contents).
+  3. An old frame that the repack leaves as garbage, deleted only at the end, failed once its context was replaced by a group member or a frame (readers allow no chains).
+  4. Garbage derivations failed once the garbage contents they name were deleted first.
+  5. A kept content became a group member while a kept frame still to be rewritten read it as its context (37 of 78 points at 3,000 rows, synced).
+  6. gc, which the repack runs first and last, deleted garbage in id order: a garbage frame lost its context, and a garbage derivation lost the derivation that produced one of its arguments.
+- Change (not an option: the full repack's and gc's own correctness; the end state is the same):
+  - `replan_store` (src/repack.rs): new objects first, in rounds, each round writing those whose needs (`needs`, plus a tree or graph chunk's pointed content) are already stored, derivations last; then `sync`; then replacements and garbage deletes in rounds over the current store: an object becomes a member or a frame only once no stored frame reads it as a context, a frame is written only once its contexts are stored as neither, and garbage goes only once nothing stored names it. A round with nothing ready (a cycle, which a valid plan cannot hold) writes the rest in the old order.
+  - `Repo::delete_readers_first` (src/history.rs), used by gc and by `replan_store`: deletes a set so that no stored object in it names one already gone, by decoding (dictionary, group, context, pointed content) or as a derivation's function, argument or output, including an argument only another derivation in the set produces; objects before contents within a round.
+- Result after the fix:
+
+  | Run | Stopping points | Failing |
+  |---|---|---|
+  | 1,000 rows, deferred | 169 | 0 (was 1,109 of 1,126) |
+  | 1,000 rows after grouped passes, deferred | 165 | 0 |
+  | 3,000 rows, synced | 79 | 0 (was 37 of 78 with causes 1 to 4 fixed) |
+  | 3,000 rows, deferred | 79 | 0 |
+  | 3,000 rows, ten full repacks killed at random | 10 | 0 after the kill, 0 after a rerun |
+
+  - Tests (tests/repack_crash.rs, 2): every stopping point of a recorded full repack of a 400-row MemStore (first pass, five batches of 40 upserts), and every 75th of a 3,000-row one (ten batches of 100), each checked by scan and `fsck_deep`. On the parent's order the first fails at 790 of 915 points; with causes 1 to 5 fixed and gc unchanged the second fails at 3 of 74; with the fix both pass.
+  - The order costs no time that shows: the repack took 12.8 s at 1,000 rows and 31.7 s at 3,000 against 13.1 s and 31.4 s before; the bench's north corpora repack in 63.6 s of CPU against 60.4 s on the parent, within run-to-run spread on this machine.
+- Not covered: a crash inside a single write (FsStore writes each object through a temporary file and a rename); stores other than FsStore and MemStore; the incremental pass (E268's kill tests cover it); a grouped store at 100,000 rows.
+- Verdict: **kept** (a fix, no option). The gaps are on main too: the two tests, run on main without the first cold pass (which main lacks), fail at 763 of 910 and 67 of 74 stopping points.
+- Run: `cargo run --release --example cold_pass -- crash 1000 150 [synced] [group]`; `cargo run --release --example cold_pass -- crash 3000 60 [synced]`; `cargo run --release --example cold_pass -- kill 3000 10 full`; `cargo test --release --test repack_crash`.
+- Gates on the branch: every kernel test suite passes (release, 249 tests); clippy `-D warnings` and fmt clean; the bench gives the same byte fields as the parent, north 0.3096.
+- Follow-up after merging main (af24e4d, with E300's deferred deletes):
+  - E300 makes a deferred FsStore hold each delete until the next `sync` or ref move and then remove the files in id order. So a garbage frame deleted in one round could still be on disk when a later round replaced its context with a chained form: `crash 1000 150` on the deferred store failed at 4 of 169 points (after writes 2,862 to 2,874, each a replacement).
+  - Change: `Repo::delete_readers_first` syncs before the contents of each round and after each round, so each step of the deletes is durable before the next starts (12 syncs in a 1,000-row repack instead of 1).
+  - Result: 0 failing at every run: `crash 1000 150` (187 points), `crash 1000 150 group` (184), `crash 3000 60` deferred and synced (100 each), `kill 3000 10 full` (9 killed, 1 finished first). The repack took 16.7 s at 1,000 rows and 34.7 s at 3,000 while another build shared the machine, so these times are not comparable with the ones above.
+  - Test: `a_full_repack_with_deferred_deletes_stopped_after_any_write_reads_the_same` replays onto a MemStore that holds deletes until each sync or ref move and then applies them in reverse id order, at 1,000 rows, every 100th point and just before each sync or ref move. Without the change it fails at 1 of 35 points (after write 2,860); with it, it passes.
+
 ### E263 temperature-by-age (old content re-encoded at the archive read weight)
 - Branch / parent: exp/263-temperature / exp/268-incremental-repack a279f89 (its restricted recompress and `Store::sync`)
 - Question: the Python-era design tiered content hot, warm and cold by age. As read weights (E069: stored bytes worth one decoded byte), does planning new content at the heavy weight and re-encoding aged content at the archive weight get most of the archive's bytes while recent reads stay as fast as all-heavy? What does promotion cost when old content turns hot again?
