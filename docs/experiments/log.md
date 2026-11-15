@@ -3897,3 +3897,25 @@ Gates on the branch (E229 to E233): every kernel test suite passes (release); cl
 - Not measured: colored nets (unfolding); guards; a simulation the loop uses to plan (for example, how long a queue takes with one slot against two).
 - Run: `cargo run --release --example net_table`; `cargo test --release --lib net::`.
 - Gates on the branch: kernel lib tests pass; clippy `-D warnings` and fmt clean.
+
+### E279 marking-sum-hash (a firing's cost no longer grows with the tokens held, as an option)
+- Branch / parent: exp/279-marking-sum-hash / E278 (exp/278-net-table)
+- Question: E269 found a firing's cost grows with the tokens the net holds (8.6 to 33 ms as finished candidates pile up waiting on the owner), because a firing reads and hashes the whole marking for its record. Can the record's hashes be kept up to date from only the keys a firing touches?
+- Hypothesis: a sum hash (each `(place, token, count)` term hashed, the terms added lane by lane modulo 2^64) changes by subtracting the old terms of the touched keys and adding the new ones, so a firing reads only its arcs' keys and its cost stays flat as tokens pile up; replay recomputes the same hash and still catches a wrong record. (Source: E269's "Not measured"; additive set hashes as in LtHash and incremental multiset hashing.)
+- Change: in the opt-in `net` module, `net::sum_hash` and `Repo::net_init_sum` (as `net_init`, plus the running hash at `net/<name>/hash`; refused on a net already initialized without one). On such a database `net_fire` and `net_fire_output` read and write only the keys their arcs touch, update the stored hash in the same append, and record sum hashes as before and after; `net_replay` checks with the hash the database was set up with. Databases set up with `net_init` behave exactly as in E269. One unit test (retry, reused key, not enabled, replay, fold, stored hash equal to the marking's); `examples/net_sum_hash.rs`.
+- Result (`cargo run --release --example net_sum_hash`, 2,000 candidates never merged, 8,000 firings per run; fire p50 by quarter of the run, tokens held rising to 2,000):
+
+  | Store, hash | Q1 | Q2 | Q3 | Q4 | Whole run |
+  |---|---|---|---|---|---|
+  | mem, whole marking (default) | 14.0 ms | 25.0 | 36.2 | 49.2 | 251 s |
+  | mem, sum | 8.6 ms | 9.1 | 9.7 | 10.4 | 77 s |
+  | fs, whole marking (default) | 27.9 ms | 45.0 | 62.8 | 79.1 | 458 s |
+  | fs, sum | 19.5 ms | 21.2 | 22.3 | 23.9 | 192 s |
+
+  - With the sum hash the firing's cost stays nearly flat (up about 20% over the run, from the append's own growth with the log, not the hash), against 3.5x (mem) and 2.8x (fs) for the default; at 2,000 held a firing is 4.7x (mem) and 3.3x (fs) cheaper, and the whole run 3.3x and 2.4x faster.
+  - All four runs: replay equal to the stored marking, fold from scratch equal, all 2,000 waiting; fsck clean on fs; with the sum hash the stored hash equals the hash of the stored marking.
+  - This machine was slower than E269's (default Q1 14.0 ms on mem, E269 8.6 ms); compare within this table.
+- Verdict: **kept** as an option (opt-in, chosen when a net is set up). The sum hash detects damage and replay errors as E269's does, but unlike a hash over the whole marking it is not meant to resist someone choosing markings to collide (a 256-bit sum of hashes can be attacked by lattice methods; LtHash uses 1,024 lanes of 16 bits for that). The loop's own records need the former, so the sum suits it; a net whose records are shown to others as proof should keep the default.
+- Not measured: `net_enabled` and `net_marking` still read the whole marking (the scheduler's cost, separate from firing); the append's remaining growth with the log (E260's views); LtHash's larger state; nets with heavy arcs (cost grows with arcs, not tokens).
+- Run: `cargo run --release --example net_sum_hash [-- N]`; `cargo test --release --lib net::`.
+- Gates on the branch: kernel lib tests pass (58, 1 ignored); clippy `-D warnings` and fmt clean.

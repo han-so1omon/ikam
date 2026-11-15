@@ -280,6 +280,45 @@ pub fn marking_id(m: &Marking) -> Id {
     Id::of_content(&marking_bytes(m))
 }
 
+/// One `(place, token, count)` term of [`sum_hash`], as four lanes.
+fn term(place: &str, token: &str, count: u64) -> [u64; 4] {
+    let h = blake3::hash(format!("ikam net term\0{place}\0{token}\0{count}").as_bytes());
+    let b = h.as_bytes();
+    std::array::from_fn(|i| u64::from_le_bytes(b[i * 8..i * 8 + 8].try_into().unwrap()))
+}
+
+fn lanes(id: &Id) -> [u64; 4] {
+    let b = id.as_bytes();
+    std::array::from_fn(|i| u64::from_le_bytes(b[i * 8..i * 8 + 8].try_into().unwrap()))
+}
+
+fn from_lanes(l: [u64; 4]) -> Id {
+    let mut b = [0u8; 32];
+    for (i, x) in l.iter().enumerate() {
+        b[i * 8..i * 8 + 8].copy_from_slice(&x.to_le_bytes());
+    }
+    Id::from_bytes(b)
+}
+
+/// The marking's hash as a sum (E279): each `(place, token, count)` term
+/// hashed, the terms added lane by lane modulo 2^64. A firing changes it by
+/// subtracting the old terms of the keys it touches and adding the new
+/// ones, so it never needs the whole marking. It detects accidental damage
+/// and replay errors; unlike `marking_id` it is not meant to resist a
+/// forger choosing markings to collide.
+pub fn sum_hash(m: &Marking) -> Id {
+    let mut acc = [0u64; 4];
+    for (p, toks) in m {
+        for (t, c) in toks {
+            let x = term(p, t, *c);
+            for i in 0..4 {
+                acc[i] = acc[i].wrapping_add(x[i]);
+            }
+        }
+    }
+    from_lanes(acc)
+}
+
 fn prefix(net: &str) -> String {
     format!("net/{net}/")
 }
@@ -476,6 +515,38 @@ impl<S: Store> Repo<S> {
         self.db_append(db, &events)
     }
 
+    /// As `net_init`, and keep the marking's [`sum_hash`] at
+    /// `net/<name>/hash` (E279). Firings on such a database then read and
+    /// write only the keys their arcs touch, and their records carry sum
+    /// hashes, so a firing's cost no longer grows with the tokens held.
+    pub fn net_init_sum(&mut self, db: &Db, net: &Net) -> Result<Db, Error> {
+        let p = prefix(&net.name);
+        let key = format!("{p}hash");
+        if self.db_get(db, &key)?.is_some() {
+            return Ok(*db);
+        }
+        if self.db_get(db, &format!("{p}init"))?.is_some() {
+            return Err(invalid(
+                "net already initialized without a sum hash",
+                &net.name,
+            ));
+        }
+        let db = self.net_init(db, net)?;
+        let h = sum_hash(&net.initial_marking());
+        self.db_append(&db, &[Event::upsert(&key, h.to_string().as_bytes(), &key)])
+    }
+
+    fn sum_mode(&self, db: &Db, net: &str) -> Result<Option<Id>, Error> {
+        match self.db_get(db, &format!("{}hash", prefix(net)))? {
+            Some(v) => Ok(Some(
+                std::str::from_utf8(&v)
+                    .map_err(|_| Error::Decode("net hash"))?
+                    .parse()?,
+            )),
+            None => Ok(None),
+        }
+    }
+
     /// The net's current marking, read from `db`.
     pub fn net_marking(&self, db: &Db, net: &str) -> Result<Marking, Error> {
         let p = format!("{}m/", prefix(net));
@@ -611,6 +682,9 @@ impl<S: Store> Repo<S> {
         let t = net
             .transition(transition)
             .ok_or_else(|| invalid("transition", transition))?;
+        if let Some(h) = self.sum_mode(db, &net.name)? {
+            return self.fire_sum(db, net, t, token, key, output, h);
+        }
         let before = self.net_marking(db, &net.name)?;
         let after = net
             .fire(&before, t, token)
@@ -673,6 +747,107 @@ impl<S: Store> Repo<S> {
         Ok(Some((id, self.read_content(&id)?)))
     }
 
+    /// `fire_inner` on a database with a sum hash: reads and writes only
+    /// the keys `t`'s arcs touch.
+    #[allow(clippy::too_many_arguments)]
+    fn fire_sum(
+        &mut self,
+        db: &Db,
+        net: &Net,
+        t: &Transition,
+        token: Option<&str>,
+        key: &str,
+        output: Option<&[u8]>,
+        before: Id,
+    ) -> Result<(Db, Firing), Error> {
+        if net.binds_color(t) != token.is_some() {
+            return Err(Error::Exec(format!("transition {} is not enabled", t.name)));
+        }
+        let p = prefix(&net.name);
+        let rec_key = format!("{p}fire/{key}");
+        // Net change per (place, token) key: taken and added.
+        let mut delta: BTreeMap<(String, String), (u64, u64)> = BTreeMap::new();
+        let tok_for = |place: &str| {
+            if net.place(place).is_some_and(|p| p.colored) {
+                token.unwrap_or(ANON).to_string()
+            } else {
+                ANON.to_string()
+            }
+        };
+        for a in &t.inputs {
+            delta
+                .entry((a.place.clone(), tok_for(&a.place)))
+                .or_default()
+                .0 += a.weight as u64;
+        }
+        for a in &t.outputs {
+            delta
+                .entry((a.place.clone(), tok_for(&a.place)))
+                .or_default()
+                .1 += a.weight as u64;
+        }
+        let mut acc = lanes(&before);
+        let mut events = Vec::new();
+        for ((place, tok), (take, add)) in &delta {
+            let mk = format!("{p}m/{place}/{tok}");
+            let old: u64 = match self.db_get(db, &mk)? {
+                Some(v) => std::str::from_utf8(&v)
+                    .ok()
+                    .and_then(|s| s.parse().ok())
+                    .ok_or(Error::Decode("net marking"))?,
+                None => 0,
+            };
+            if old < *take {
+                return Err(Error::Exec(format!("transition {} is not enabled", t.name)));
+            }
+            let new = old - take + add;
+            if new == old {
+                continue;
+            }
+            if old > 0 {
+                let x = term(place, tok, old);
+                for i in 0..4 {
+                    acc[i] = acc[i].wrapping_sub(x[i]);
+                }
+            }
+            let idem = format!("{rec_key}/{place}/{tok}");
+            if new > 0 {
+                let x = term(place, tok, new);
+                for i in 0..4 {
+                    acc[i] = acc[i].wrapping_add(x[i]);
+                }
+                events.push(Event::upsert(&mk, new.to_string().as_bytes(), &idem));
+            } else {
+                events.push(Event::remove(&mk, false, &idem));
+            }
+        }
+        let after = from_lanes(acc);
+        let out_key = format!("{p}out/{key}");
+        let output = match output {
+            Some(o) => Some(self.put_content(o)?.id),
+            None => None,
+        };
+        let f = Firing {
+            key: key.into(),
+            transition: t.name.clone(),
+            token: token.map(String::from),
+            before,
+            after,
+            output,
+        };
+        let hk = format!("{p}hash");
+        events.push(Event::upsert(
+            &hk,
+            after.to_string().as_bytes(),
+            &format!("{rec_key}/hash"),
+        ));
+        if let Some(o) = &f.output {
+            events.push(Event::upsert(&out_key, o.to_string().as_bytes(), &out_key));
+        }
+        events.push(Event::upsert(&rec_key, &encode_record(&f), &rec_key));
+        Ok((self.db_append(db, &events)?, f))
+    }
+
     /// The firings recorded for `net`, in log order.
     pub fn net_firings(&self, db: &Db, net: &str) -> Result<Vec<Firing>, Error> {
         let p = format!("{}fire/", prefix(net));
@@ -691,18 +866,23 @@ impl<S: Store> Repo<S> {
     /// alone, checking each record's before and after hashes on the way.
     /// It must equal `net_marking`.
     pub fn net_replay(&self, db: &Db, net: &Net) -> Result<Marking, Error> {
+        let hash: fn(&Marking) -> Id = if self.sum_mode(db, &net.name)?.is_some() {
+            sum_hash
+        } else {
+            marking_id
+        };
         let mut m = net.initial_marking();
         for f in self.net_firings(db, &net.name)? {
             let t = net
                 .transition(&f.transition)
                 .ok_or_else(|| invalid("recorded transition", &f.transition))?;
-            if marking_id(&m) != f.before {
+            if hash(&m) != f.before {
                 return Err(Error::Decode("net replay: marking before differs"));
             }
             m = net
                 .fire(&m, t, f.token.as_deref())
                 .ok_or(Error::Decode("net replay: recorded firing not enabled"))?;
-            if marking_id(&m) != f.after {
+            if hash(&m) != f.after {
                 return Err(Error::Decode("net replay: marking after differs"));
             }
             if let Some(o) = &f.output {
@@ -858,6 +1038,49 @@ mod tests {
             r.net_marking(&db, "loop").unwrap()
         );
         assert_eq!(r.db_rebuild(&db.log).unwrap().kv, db.kv);
+    }
+
+    #[test]
+    fn sum_hash_follows_the_marking() {
+        let mut r = Repo::new(MemStore::default());
+        let net = loop_net();
+        let db = r.db_empty().unwrap();
+        let db = r.net_init_sum(&db, &net).unwrap();
+        assert_eq!(r.net_init_sum(&db, &net).unwrap(), db);
+        let mut db = db;
+        for i in 0..5 {
+            let tok = format!("E{i}");
+            for t in ["propose", "start", "finish", "ask"] {
+                db = r
+                    .net_fire(&db, &net, t, Some(&tok), &format!("{t}-{tok}"))
+                    .unwrap()
+                    .0;
+            }
+        }
+        // Not enabled, retry, reused key: as in the classic path.
+        assert!(r.net_fire(&db, &net, "start", Some("E9"), "x").is_err());
+        assert_eq!(
+            r.net_fire(&db, &net, "ask", Some("E0"), "ask-E0")
+                .unwrap()
+                .0,
+            db
+        );
+        assert!(matches!(
+            r.net_fire(&db, &net, "merge", Some("E1"), "ask-E0"),
+            Err(Error::IdempotencyConflict(_))
+        ));
+        let (db, _) = r
+            .net_fire(&db, &net, "merge", Some("E1"), "merge-E1")
+            .unwrap();
+        let m = r.net_marking(&db, "loop").unwrap();
+        assert_eq!(r.sum_mode(&db, "loop").unwrap(), Some(sum_hash(&m)));
+        assert_eq!(r.net_replay(&db, &net).unwrap(), m);
+        assert_eq!(r.db_rebuild(&db.log).unwrap().kv, db.kv);
+        // The sum hash is order-free and differs from marking_id.
+        assert_ne!(sum_hash(&m), marking_id(&m));
+        let plain = r.db_empty().unwrap();
+        let plain = r.net_init(&plain, &net).unwrap();
+        assert!(r.net_init_sum(&plain, &net).is_err());
     }
 
     #[test]
