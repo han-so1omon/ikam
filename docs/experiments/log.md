@@ -4293,3 +4293,30 @@ Gates on the branch (E229 to E233): every kernel test suite passes (release); cl
 - Not measured: how much of the 64 MB a night uses; FsStore; a shared cache's lock under many reader threads.
 - Run: as above (about 12 minutes together here).
 - Gates on the branch: fmt, clippy and the kernel's tests pass with the cache off (its default). With the default forced to 64 MB for a check, every test passes but three, and all three remove or damage stored files behind the repo's back after reading them, then expect the read to fail: `checked_raw_reads_check_their_crc`, `derivations_heal_a_corrupt_copy` and `derivation_cycles_are_errors`. That is the behaviour the verdict names; their fsck checks pass.
+
+### E295 tuned-writers (E292's writers with E293 and E294's options)
+- Branch / parent: exp/295-tuned-writers / E294 (exp/294-read-cache)
+- Question: in E292 a firing took about 17 ms, so with two writers the commit path set the pace and runs barely overlapped. With `read_weight` 1, a 64 MB read cache and the sum hash, do two workers now fill both cpus, and does `db_commit_at` finish at 8 writers?
+- Hypothesis: a firing drops to about 2 ms (E294), so with 40 ms of work two writers take about half the time of one, and refusals stop starving `db_commit_at`.
+- Change: `TUNED=1` in `examples/net_two_writers.rs` sets the three options for part 2. Nothing in the kernel.
+- Result (`PART1=0 TUNED=1 WORK_MS=40 cargo run --release --example net_two_writers`, and `WORK_MS=2`; 200 candidates, cpu 2, MemStore; time to the last finish, or stopped at 20 s):
+
+  | Commit | W | 40 ms work: time | Most at once | Refused | 2 ms work: time | E292 (untuned), 40 ms |
+  |---|---|---|---|---|---|---|
+  | `db_commit` | 1 | 9.1 s | 1 | 0 | 1.5 s | 18.6 s |
+  | `db_commit` | 2 | 5.1 s, 15 runs lost | 2 | 0 | stopped, 183 lost | stopped, 197 lost |
+  | `db_commit` | 8 | stopped, 1,175 lost | 8 | 35 | stopped, 1,290 lost | stopped, 821 lost |
+  | `db_commit_at` | 2 | 4.6 s | 2 | 8 | 1.3 s | 15.1 s |
+  | `db_commit_at` | 4 | 4.6 s | 2 | 430 | 1.2 s | 13.8 s |
+  | `db_commit_at` | 8 | 4.8 s | 2 | 1,188 | 1.7 s | stopped |
+  | one lock | 2 | 4.7 s | 2 | 0 | 1.0 s | 10.7 s |
+  | one lock | 4 | 4.7 s | 2 | 0 | 1.2 s | 12.9 s |
+  | one lock | 8 | 4.9 s | 2 | 0 | 1.4 s | 16.7 s |
+
+  - Tuned, two writers fill both cpus: 4.6 to 4.7 s against 9.1 s for one, close to the 4.0 s of work. Untuned, the best two-writer run took 10.7 s.
+  - `db_commit_at` now finishes at every W, 8 writers included; one lock needs no retries and is as fast.
+  - `db_commit` still loses work with two writers or more (15 runs at 2 writers with 40 ms of work, and every run stopped at 20 s with 2 ms of work), so faster firings make it no safer.
+  - Replay was equal in every run.
+- Verdict: **measured** (no kernel change). The loop runner's settings: `read_weight` 1, `read_cache` 64 MB, `net_init_sum`, one committer (a lock or `db_commit_at`), the work outside it.
+- Not measured: FsStore and processes; more cpus than 2; work that varies in length.
+- Run: as above (2 minutes together here).

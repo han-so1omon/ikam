@@ -22,7 +22,8 @@
 //! commits, time (each run stops after 20 s), and replay.
 //!
 //!   cargo run --release --example net_two_writers [-- N]
-//!   (PART1=0 skips part 1; WS=1,8 picks the thread counts)
+//!   (PART1=0 skips part 1; WS=1,8 picks the thread counts; TUNED=1 runs
+//!   part 2 with E293 and E294's options, as E295 does)
 
 use std::sync::Arc as Shared;
 use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
@@ -34,6 +35,12 @@ use ikam_kernel::{Db, Error, Id, MemStore, Repo, SharedStore};
 
 const REF: &str = "loop";
 const CPUS: u32 = 2;
+
+/// TUNED=1 (E295): `read_weight` 1, a 64 MB `read_cache` (E294) and the
+/// sum hash (E279), as E293 and E294 recommend for a loop runner.
+fn tuned() -> bool {
+    std::env::var("TUNED").as_deref() == Ok("1")
+}
 
 /// Milliseconds of work per candidate (WORK_MS, default 2).
 fn work_ms() -> u64 {
@@ -347,8 +354,13 @@ fn worker(
 
 fn part2(n: usize) {
     println!(
-        "Part 2: W threads take {n} candidates through start, {} ms of work and finish; cpu {CPUS}\n",
-        work_ms()
+        "Part 2: W threads take {n} candidates through start, {} ms of work and finish; cpu {CPUS}{}\n",
+        work_ms(),
+        if tuned() {
+            "; read_weight 1, read cache, sum hash"
+        } else {
+            ""
+        }
     );
     println!(
         "{:<13} {:>2} {:>9} {:>5} {:>5} {:>8} {:>8} {:>7} {:>9}  replay",
@@ -362,9 +374,17 @@ fn part2(n: usize) {
             .unwrap_or(vec![1, 2, 4, 8]);
         for &w in &ws {
             let mut repo = Repo::new(SharedStore::new(MemStore::default()));
+            if tuned() {
+                repo.read_weight = 1.0;
+                repo.read_cache = 64 << 20;
+            }
             {
                 let db = repo.db_empty().unwrap();
-                let mut db = repo.net_init(&db, &net).unwrap();
+                let mut db = if tuned() {
+                    repo.net_init_sum(&db, &net).unwrap()
+                } else {
+                    repo.net_init(&db, &net).unwrap()
+                };
                 for i in 0..n {
                     db = repo
                         .net_fire(
