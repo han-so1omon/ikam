@@ -728,3 +728,42 @@ fn kept_counts_equal_counts_from_scratch() {
     assert_eq!(back.counts, None);
     assert_eq!(repo.db_keep_counts(&back, 0).unwrap(), back);
 }
+
+/// E292: `db_commit` builds on whatever the ref points at, so a writer
+/// whose database was read before another commit replaces that commit's
+/// database; `db_commit_at` refuses instead, and a retry from the new head
+/// keeps both writes.
+#[test]
+fn commit_at_refuses_a_stale_database() {
+    let mut repo = Repo::new(MemStore::default());
+    let empty = repo.db_empty().unwrap();
+    let base = repo.db_append(&empty, &[up("k/0", "0", "i0")]).unwrap();
+    let head = repo.db_commit("main", &base, "base").unwrap();
+
+    let a = repo.db_append(&base, &[up("k/a", "a", "ia")]).unwrap();
+    let b = repo.db_append(&base, &[up("k/b", "b", "ib")]).unwrap();
+    repo.db_commit_at("main", head, &a, "A").unwrap();
+    assert!(matches!(
+        repo.db_commit_at("main", head, &b, "B"),
+        Err(Error::RefConflict(_))
+    ));
+    let head = repo.resolve("main").unwrap();
+    let now = repo.db_at(&head).unwrap();
+    let b = repo.db_append(&now, &[up("k/b", "b", "ib")]).unwrap();
+    repo.db_commit_at("main", head, &b, "B again").unwrap();
+    let db = repo.db_at(&repo.resolve("main").unwrap()).unwrap();
+    assert_eq!(repo.db_get(&db, "k/a").unwrap().as_deref(), Some(&b"a"[..]));
+    assert_eq!(repo.db_get(&db, "k/b").unwrap().as_deref(), Some(&b"b"[..]));
+
+    // The same two writes through db_commit: the first is lost.
+    let mut repo = Repo::new(MemStore::default());
+    let empty = repo.db_empty().unwrap();
+    let base = repo.db_append(&empty, &[up("k/0", "0", "i0")]).unwrap();
+    repo.db_commit("main", &base, "base").unwrap();
+    let a = repo.db_append(&base, &[up("k/a", "a", "ia")]).unwrap();
+    let b = repo.db_append(&base, &[up("k/b", "b", "ib")]).unwrap();
+    repo.db_commit("main", &a, "A").unwrap();
+    repo.db_commit("main", &b, "B").unwrap();
+    let db = repo.db_at(&repo.resolve("main").unwrap()).unwrap();
+    assert_eq!(repo.db_get(&db, "k/a").unwrap(), None);
+}
