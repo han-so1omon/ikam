@@ -3941,3 +3941,28 @@ Gates on the branch (E229 to E233): every kernel test suite passes (release); cl
 - Not measured: nets where most held tokens are not enabled (the pages then read the place to the end, as `net_enabled` does); an index of enabled firings kept with the marking; FsStore.
 - Run: `cargo run --release --example net_pick [-- MAX]`; `cargo test --release --lib net::`.
 - Gates on the branch: kernel lib tests pass (59, 1 ignored); clippy `-D warnings` and fmt clean.
+
+### E281 checkpoint-interval (how often a long run should save its progress)
+- Branch / parent: exp/281-checkpoint-interval / E280 (exp/280-enabled-limit)
+- Question: E271 found that recording a run's output before its firing saves no work after a crash; long work needs its own checkpoints. How often should a runner on the log save progress, and does the classic rule for it hold when each save is a database append and a commit?
+- Hypothesis: with checkpoint cost C and mean time between crashes M, the total time is lowest near Young's interval sqrt(2 C M) (Young 1974; Daly 2006 refines it for C not small against M), and no checkpointing loses most of the work when M is shorter than a run.
+- Change: `Repo::net_checkpoint(db, net, key, bytes)` and `Repo::net_resume(db, net, key)` in the opt-in `net` module (the progress as content, its id at `net/<name>/ckpt/<key>`, replaced by each save; saving the same bytes again changes nothing, so progress names its step). One unit test; `examples/net_checkpoint.rs`: 10 candidates through the loop net (sum hash, E279) on an FsStore, a commit to a ref after every append as in E271; each candidate's work is 160 steps of 5 ms (a hash chain, 800 ms); a checkpoint every K ms of work; crashes at seeded exponential times with mean M of wall time, checked at every step and before every append (drop memory, reopen, resume).
+- Result (`cargo run --release --example net_checkpoint`; one seed; C is the checkpoint's append and commit, p50 14 to 29 ms, rising with the log):
+
+  | Every | M = 500 ms: total | lost | M = 2,000 ms: total | lost |
+  |---|---|---|---|---|
+  | 5 ms | 106.2 s | 80 ms | 40.9 s | 30 ms |
+  | 20 ms | 18.9 s | 245 ms | 16.9 s | 65 ms |
+  | 40 ms | 14.9 s | 510 ms | 13.4 s | 115 ms |
+  | 80 ms | 12.7 s | 795 ms | 11.6 s | 210 ms |
+  | 160 ms | **11.4 s** | 1,115 ms | 10.6 s | 390 ms |
+  | 320 ms | 12.2 s | 2,180 ms | **10.3 s** | 795 ms |
+  | never | 35.2 s | 25,080 ms | 12.0 s | 2,655 ms |
+
+  - Young's interval with C about 20 ms: 141 ms for M = 500 ms (best measured 160 ms) and 283 ms for M = 2,000 ms (best 320 ms, 160 ms within 3%).
+  - Checkpointing too often costs more than never doing it (every 5 ms: 106 s and 41 s), since each save is an append and a commit.
+  - Every run: all 10 waiting on the owner, every finish output equal to the chain computed without crashes (`net_verify`), replay equal, fsck clean.
+- Verdict: **kept** as an option (opt-in API), and Young's rule **confirmed** on the log: a runner should save every sqrt(2 C M), with C measured on its store (about 20 ms here on FsStore with a commit per save) and M from its own crash record. For overnight runs on a machine that rarely crashes (M of hours), that means minutes between saves.
+- Not measured: more seeds (one seed per cell; the 160 and 320 ms cells at M = 2,000 are within noise); checkpoints of megabytes; a save without its own commit (the commit is part of C here); the growth of C with the log.
+- Run: `cargo run --release --example net_checkpoint [-- N]`; `cargo test --release --lib net::`.
+- Gates on the branch: kernel lib tests pass (60, 1 ignored); clippy `-D warnings` and fmt clean.

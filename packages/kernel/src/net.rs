@@ -940,6 +940,39 @@ impl<S: Store> Repo<S> {
         Ok((self.db_append(db, &events)?, f))
     }
 
+    /// Save `bytes` as the progress of the work that the firing under `key`
+    /// will finish (E281): the bytes as content, their id at
+    /// `net/<name>/ckpt/<key>`, replacing any earlier checkpoint. A runner
+    /// that crashes resumes from the last one with
+    /// [`net_resume`](Repo::net_resume) instead of from the start. Saving
+    /// bytes already saved once under `key` changes nothing, so progress
+    /// should name its step.
+    pub fn net_checkpoint(
+        &mut self,
+        db: &Db,
+        net: &str,
+        key: &str,
+        bytes: &[u8],
+    ) -> Result<Db, Error> {
+        let id = self.put_content(bytes)?.id;
+        let k = format!("{}ckpt/{key}", prefix(net));
+        let idem = format!("{k}/{id}");
+        self.db_append(db, &[Event::upsert(&k, id.to_string().as_bytes(), &idem)])
+    }
+
+    /// The last checkpoint saved under `key`, if any.
+    pub fn net_resume(&self, db: &Db, net: &str, key: &str) -> Result<Option<Vec<u8>>, Error> {
+        match self.db_get(db, &format!("{}ckpt/{key}", prefix(net)))? {
+            Some(v) => {
+                let id: Id = std::str::from_utf8(&v)
+                    .map_err(|_| Error::Decode("net checkpoint"))?
+                    .parse()?;
+                Ok(Some(self.read_content(&id)?))
+            }
+            None => Ok(None),
+        }
+    }
+
     /// The firings recorded for `net`, in log order.
     pub fn net_firings(&self, db: &Db, net: &str) -> Result<Vec<Firing>, Error> {
         let p = format!("{}fire/", prefix(net));
@@ -1222,6 +1255,28 @@ mod tests {
             .unwrap()
             .0;
         check(&r, &db);
+    }
+
+    #[test]
+    fn checkpoints_replace_and_resume() {
+        let mut r = Repo::new(MemStore::default());
+        let db = r.db_empty().unwrap();
+        assert_eq!(r.net_resume(&db, "loop", "finish-E1").unwrap(), None);
+        let db = r
+            .net_checkpoint(&db, "loop", "finish-E1", b"step 1")
+            .unwrap();
+        let again = r
+            .net_checkpoint(&db, "loop", "finish-E1", b"step 1")
+            .unwrap();
+        assert_eq!(again, db, "a retried checkpoint changes nothing");
+        let db = r
+            .net_checkpoint(&db, "loop", "finish-E1", b"step 2")
+            .unwrap();
+        assert_eq!(
+            r.net_resume(&db, "loop", "finish-E1").unwrap().as_deref(),
+            Some(&b"step 2"[..])
+        );
+        assert_eq!(r.net_resume(&db, "loop", "finish-E2").unwrap(), None);
     }
 
     #[test]
