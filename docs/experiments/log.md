@@ -4058,3 +4058,28 @@ Gates on the branch (E229 to E233): every kernel test suite passes (release); cl
 - Not measured: an incremental mode compiled with Cranelift; nets where one place is read by most transitions (the loop's cpu slot is: each firing of start or finish rechecks every start, and the gain still holds at 45x).
 - Run: `cargo run --release --example net_unfold`; `cargo run --release --example net_table`; `cargo test --release --lib net::`.
 - Gates on the branch: kernel lib tests pass (63, 1 ignored); clippy `-D warnings` and fmt clean.
+
+### E287 night-plan (planning a night away from the keyboard on the loop net, with times)
+- Branch / parent: exp/287-night-plan / E286 (exp/286-incremental-enabling)
+- Question: the loop is meant to run while the owner sleeps or is away. Given a ranked queue, some of whose candidates need the owner's decision first, which way of running the night finishes the most: the agent waiting on its own bench, or coding the next candidate while the cpu benches; strict rank order, or passing over what needs the owner; one cpu or two; and does coding ahead need a limit?
+- Hypothesis: strict order stalls at the first candidate that needs the owner; pipelining roughly doubles what finishes when bench and coding take similar time; with bench-heavy candidates an unbounded pipeline codes far ahead of the cpu and leaves work half-done at the end of the night, and a work-in-progress limit (a `slot` place, as on a kanban board) keeps the count while removing that waste. (Source: the loop design's "low-input planning" ask; E281's long-work model; Petri-net resource places.)
+- Change: none in the kernel. `examples/net_night_plan.rs`: a timed loop net (agent, cpu and slot places; `decide` is a human transition that never fires while the owner is away). Each step that takes time is a start transition, which takes its resources, and an end transition fired when the time is up; the simulation fires them on `Net::fire`. Durations are tonight's minutes between the commits of E279 to E286 (22.0, 9.4, 9.3, 7.2, 2.0, 12.9, 2.5, 2.8; 8.5 on average), resampled with a seeded x0.5 to x1.5 jitter for a queue of 150. The bench share was not recorded tonight, so it is swept (20, 50, 80 percent; the write-up 15 percent, coding the rest). The night is 8 hours; coding starts only when the candidate's estimate fits, and a bench or write-up that would run past the end is not started. The best plan's 822 firings are then replayed on an IKAM store (`net_fire` on a MemStore): the stored marking equals the simulation and `net_replay` equals the stored marking.
+- Result (`cargo run --release --example net_night_plan`; candidates finished in 8 hours, and those left half-done):
+
+  | Plan | No decisions, bench 20% | No decisions, bench 50% | No decisions, bench 80% | 25% need decisions, bench 50% |
+  |---|---|---|---|---|
+  | serial, strict order | 53 | 53 | 53 | 3 (stalled at the 4th) |
+  | serial, skip asks | 55 | 55 | 55 | 67 |
+  | pipelined, no limit | 71 | 117 (5 half-done) | 71 (79 half-done) | 112 |
+  | pipelined, 4 in flight | 71 | 104 (2) | 71 (3) | 112 |
+  | 2 cpus, 6 in flight | 71 | 122 | 141 (4) | 112 |
+
+  - Strict rank order is the worst plan whenever anything needs the owner: it stops at the first such candidate and the rest of the night is idle (3 finished). Skipping those keeps the agent busy all night.
+  - Pipelining is worth 1.3x to 2.1x over waiting on the bench; at 20 percent bench the agent is the bottleneck (100 percent busy) and a second cpu adds nothing.
+  - With bench-heavy work an unbounded pipeline leaves 79 candidates coded but never benched; 4 in flight finishes the same 71 with 3 left half-done, and the agent is free 75 percent of the night (time for research scans, which need no cpu). A second cpu is what raises the count there (141).
+  - With 25 percent needing decisions the queue's 112 others all finish under every pipelined plan; the 38 decisions wait for the morning.
+  - A limit of 2 in flight cost a fifth of the count at 50 percent bench (84 against 104 at 4; varied durations need some slack), so the slot count matters.
+- Verdict: **kept** as the night's planning rule (an example and a rule, no kernel change): skip what needs the owner, pipeline coding with benches, cap coding-ahead at about 4 per cpu, and add a cpu when the bench is the bottleneck. The 8-hour estimate also shows how much a queue should hold: about 70 to 120 candidates of tonight's size.
+- Not measured: tonight's real bench share (the run records commit times, not bench time; E281's checkpoints could record it); crashes and retries during the night (E281 measured those separately); a planner that reorders by expected value per minute instead of rank.
+- Run: `cargo run --release --example net_night_plan`.
+- Gates on the branch: kernel lib tests pass (63, 1 ignored); clippy `-D warnings` (all targets) and fmt clean.
