@@ -217,6 +217,14 @@ pub struct Repo<S: Store> {
     /// time; on, an append skips it, and a batch of similar rows may take
     /// more room.
     pub plain_db_events: bool,
+    /// Store every new content as it is (compressed, with the store
+    /// dictionary), without the slice, template or container search
+    /// (E261). Off by default. On, a write costs about what compressing it
+    /// costs; what the search would have shared is left to the cold pass
+    /// (`repack_incremental`, E268), which recompresses new contents, and to
+    /// a full repack, the only pass that finds slices and templates.
+    /// Plans a caller proposes (hints) are still tried.
+    pub plain_hot_writes: bool,
     pub(crate) writing_object: bool,
 }
 
@@ -268,6 +276,7 @@ impl<S: Store> Repo<S> {
             exact_short_search: false,
             object_templates: true,
             plain_db_events: false,
+            plain_hot_writes: false,
             writing_object: false,
             hints: Default::default(),
         }
@@ -521,6 +530,7 @@ impl<S: Store> Repo<S> {
         r.markup_layers = self.markup_layers;
         r.object_templates = self.object_templates;
         r.plain_db_events = self.plain_db_events;
+        r.plain_hot_writes = self.plain_hot_writes;
         r.exact_short_search = self.exact_short_search;
         r
     }

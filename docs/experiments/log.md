@@ -3819,3 +3819,31 @@ Gates on the branch (E229 to E233): every kernel test suite passes (release); cl
 - Verdict: **kept** as an option (opt-in API, grouping off by default). The cold work now follows the change: seconds where a full repack takes minutes or does not finish, with every file reading the same and killed passes leaving clean stores. The full repack stays for what only it finds (a new dictionary, templates across old and new files).
 - Run: `cargo run --release --example cold_pass -- [group] [nofull]`; `cargo run --release --example cold_pass -- kill 5000 30 [group]`; `cargo run --release --example cold_pass -- gccheck 100000 group`; `cargo run --release --example cold_pass -- repro 100000 group [nopass] [save=DIR]`, then `-- full DIR`; `cargo test --release --test coldpass`.
 - Gates on the branch: every kernel test suite passes (release, 247 tests); clippy `-D warnings` and fmt clean; the bench gives the same byte fields as main, north 0.3096 (corpora from git history left out, as for E265).
+
+### E261 plain-hot-writes (skip the storage-plan search on the hot path, leave it to the cold pass)
+- Branch / parent: exp/261-plain-hot-writes / exp/268-incremental-repack a279f89 (the cold pass it leans on)
+- Question: every new content goes through the storage-plan search (containers, slices, templates) before the write returns. If writes skip it and the cold pass plans later, how much faster is the hot path, and how much of the byte cost does one cold pass (E268) or a full repack take back? (Plan: E119's note, 1,000 single appends 3.1 to 0.9 s for 3.3 to 7.9 MB.)
+- Change (opt-in): `Repo::plain_hot_writes` (src/repo.rs, off by default; copied to siblings). With it on, `put_content_with` (src/ingest.rs) skips the container unpacking and the slice and template search, and stores the content compressed as it is; derivation hints are still tried. Nothing else changes: `plain_db_events` (E232) already stored database events plainly, so on a database what is skipped is the search for its own graph chunks.
+- Result (`examples/plain_writes.rs`; W1: 200 generated files, 1,000 one-line edits committed every 50; W2: a generated table, then 2,000 upserts in batches of 100 and 200 single upserts, each committed, with E260's opt-ins (deferred sync, `plain_db_events`, `needed_index`); FsStore; every store read back and `fsck_deep` clean after each step; a 4-core cloud machine; one run each):
+
+  | Workload | Measure | Planned at write | Plain hot writes |
+  |---|---|---|---|
+  | files | edit p50 / p95 | 2.5 / 15.3 ms | 1.7 / 2.8 ms |
+  | | stored after the session / after one pass / after a full repack | 2.17 / 2.09 MB / 410 KB | 4.98 / 4.18 MB / 388 KB |
+  | | read every file: session / pass / full repack | 127 / 206 / 128 ms | 17 / 32 / 346 ms |
+  | db 20,000 rows | batch of 100 p50, single upsert p50 | 111 ms, 13.0 ms | 50 ms, 5.8 ms |
+  | | stored after the session / after one pass / after a full repack | 6.25 / 5.17 / 4.37 MB | 13.6 / 6.95 / 11.9 MB |
+  | | read check: session / pass / full repack | 4.0 / 5.0 / 10.1 s | 1.3 / 2.7 / 4.5 s |
+  | | full repack time | 180 s | 92 s |
+  | db 100,000 rows | batch of 100 p50, single upsert p50 | 152 ms, 13.9 ms | 60 ms, 6.5 ms |
+  | | stored after the session / after one pass | 22.2 / 17.3 MB | 31.6 / 20.2 MB |
+  | | read check: session / pass | 17.5 / 29.0 s | 7.7 / 15.2 s |
+  | | cold pass time | 62 s | 66 s |
+
+  - The hot path is 2 to 2.5 times faster on databases and 1.5 times at the median on files, and the tail goes: file edits p95 15.3 to 2.8 ms, the slowest single upsert 27 to 10.5 ms at 100,000 rows. Reads are faster too until a full repack, since nothing stored is a slice or a frame.
+  - One cold pass takes back most of the database's extra bytes but not all: 17% more than planning at write at 100,000 rows (20.2 against 17.3 MB), 34% at 20,000. On files it takes back little (4.18 against 2.09 MB): the pass recompresses each content on its own or against one context and cannot rebuild an edit's slice of the file it came from, since contexts allow no chains. A full repack does rebuild them on files (388 KB, less than planned at write).
+  - A full repack does not take back the database's chunk sharing: 11.9 MB after it against 6.95 MB after the pass, 4.37 MB when planned at write. Stored bytes by encoding tag at 5,000 rows (`TAGS=1`) show where: graph chunk objects take 3.77 MB after the full repack with plain writes against 0.48 MB planned at write, and no derivation records are left (285 KB of them planned at write). So the full repack appears to build on what was recorded at write rather than search graph chunks from scratch (the plan's open question), and what plain writes skip there stays skipped. Not traced further.
+  - Loading the 100,000-row table took 21 s with plain writes against 11 s planned (one run; not looked into).
+- Not measured: a W1 session on its debounce; peak memory; 1M rows; macOS; plain writes with the background integrator (E262).
+- Verdict: **kept** as an option, off by default. It halves hot latency and cuts the tail, and one cold pass leaves databases within 17 to 34% of today's bytes; it is the wrong choice where a full repack is expected to restore sharing on databases, or for file stores that keep editing the same files.
+- Run: `cargo run --release --example plain_writes -- files db 20000 full`, `-- db 100000`; `TAGS=1 ... -- db 5000 full` for stored bytes by tag.
