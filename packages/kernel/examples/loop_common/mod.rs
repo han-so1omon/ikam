@@ -210,17 +210,58 @@ const NOT_MEASURED: [&str; 5] = [
     "not yet measured",
 ];
 
-/// Lines of an entry that name work left undone.
+/// Lines of an entry that name work left undone. Since E290: a table row
+/// is not one, and a phrase inside quotes, inside a `(Source: ...)` or
+/// after "does" or "did" ("the bench does not run batches") does not
+/// count, since those quote or describe instead of leaving work undone.
 pub fn undone_lines(entry: &str) -> Vec<String> {
     entry
         .lines()
         .map(str::trim)
+        .filter(|l| !l.starts_with('|'))
         .filter(|l| {
-            let low = l.to_lowercase();
-            NOT_MEASURED.iter().any(|p| low.contains(p))
+            let low = unquoted(&l.to_lowercase());
+            NOT_MEASURED.iter().any(|p| {
+                low.match_indices(p)
+                    .any(|(i, _)| !(low[..i].ends_with("does ") || low[..i].ends_with("did ")))
+            })
         })
         .map(|l| l.trim_start_matches("- ").to_string())
         .collect()
+}
+
+/// A line with its quoted spans and `(source: ...)` parentheticals blanked.
+fn unquoted(low: &str) -> String {
+    let mut out = String::with_capacity(low.len());
+    let mut rest = low;
+    loop {
+        let q = rest.find(['"', '\u{201c}']);
+        let s = rest.find("(source:");
+        let (start, close) = match (q, s) {
+            (Some(q), Some(s)) if s < q => (s, ")"),
+            (Some(q), _) => (
+                q,
+                if rest[q..].starts_with('"') {
+                    "\""
+                } else {
+                    "\u{201d}"
+                },
+            ),
+            (None, Some(s)) => (s, ")"),
+            (None, None) => {
+                out.push_str(rest);
+                return out;
+            }
+        };
+        out.push_str(&rest[..start]);
+        let open_len = rest[start..].chars().next().unwrap().len_utf8();
+        let after = &rest[start + open_len..];
+        match after.find(close) {
+            Some(e) => rest = &after[e + close.len()..],
+            None => return out,
+        }
+        out.push(' ');
+    }
 }
 
 /// Open hypotheses in the research notes: a `**Hn. Title.**` paragraph
@@ -381,4 +422,74 @@ pub fn json_str(s: &str) -> String {
     }
     o.push('"');
     o
+}
+
+/// Experiment ids named inside an entry's `(Source: ...)` parentheticals
+/// (E290): the entries it says it builds on.
+pub fn source_ids(entry: &str) -> BTreeSet<u32> {
+    let mut out = BTreeSet::new();
+    for part in entry.split("(Source:").skip(1) {
+        let inner = part.split(')').next().unwrap_or("");
+        out.extend(mentions(inner));
+    }
+    out
+}
+
+/// The Question and Hypothesis lines of an entry.
+fn ask_lines(entry: &str) -> String {
+    entry
+        .lines()
+        .filter(|l| l.starts_with("- Question:") || l.starts_with("- Hypothesis:"))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Experiment ids an entry's Question or Hypothesis names as the source of
+/// a gap it takes up: `E123's "Not measured"` (or "Not built", "Not
+/// tried"), the form the loop's entries use (E290).
+pub fn gap_citations(entry: &str) -> BTreeSet<u32> {
+    let asks = ask_lines(entry);
+    let mut out = BTreeSet::new();
+    for (i, _) in asks.match_indices("'s \"Not ") {
+        let head = &asks[..i];
+        let start = head.rfind('E').unwrap_or(i);
+        if let Some(id) = parse_id(&head[start..]) {
+            out.insert(id);
+        }
+    }
+    out
+}
+
+/// Not-measured gaps that a later entry follows up (E290). `strict` takes
+/// only [`gap_citations`]; otherwise any id in the entry's `(Source: ...)`.
+/// Of the cited experiment's not-measured lines, the one sharing the most
+/// content words (at least one) with the later entry's Question and
+/// Hypothesis is taken as the one followed. Gap label to the following
+/// entry.
+pub fn followups(
+    gaps: &[Gap],
+    entries: &BTreeMap<u32, String>,
+    strict: bool,
+) -> BTreeMap<String, u32> {
+    let mut out = BTreeMap::new();
+    for (&later, entry) in entries {
+        let asks = words(&ask_lines(entry));
+        let cited = if strict {
+            gap_citations(entry)
+        } else {
+            source_ids(entry)
+        };
+        for cited in cited.into_iter().filter(|&c| c < later) {
+            let best = gaps
+                .iter()
+                .filter(|g| g.source == Source::NotMeasured && g.from == Some(cited))
+                .map(|g| (words(&g.text).intersection(&asks).count(), g))
+                .filter(|(n, _)| *n > 0)
+                .max_by_key(|(n, g)| (*n, std::cmp::Reverse(g.label.clone())));
+            if let Some((_, g)) = best {
+                out.entry(g.label.clone()).or_insert(later);
+            }
+        }
+    }
+    out
 }

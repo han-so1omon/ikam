@@ -4132,3 +4132,25 @@ Gates on the branch (E229 to E233): every kernel test suite passes (release); cl
 - Not measured: other thresholds than 16; moving the compiled walk into the kernel behind an option (it would bring Cranelift into the kernel's build, which E282 kept out); MLIR (no MLIR toolchain here).
 - Run: `cargo run --release -- inc` in packages/kernel/experiments/net-jit (about 3 minutes, mostly clang).
 - Gates on the branch: no kernel change; the net-jit crate's clippy `-D warnings` and fmt clean; kernel lib tests as on E287 (63, 1 ignored).
+
+### E290 source-arcs (which gaps the loop has already followed up)
+- Branch / parent: exp/290-source-arcs / E289 (exp/289-hybrid-rechecks)
+- Question: E275's gap list keeps every "Not measured" line forever, and its test for a gap being taken up (a later entry cites the experiment and shares 3 content words) scored the same as its swap control. E276 said to order by dependencies instead. The loop's entries now name their source (`(Source: E286's "Not measured")`). Can the list tell which gaps a later entry followed up, and is the list itself clean?
+- Hypothesis: an entry that names a gap's experiment together with "Not measured" follows that gap; naming the experiment anywhere in its Source is looser and wrong more often. (Source: E275's verdict and E276's "order by dependencies".)
+- Change: none in the kernel. `examples/loop_common`: `source_ids` (ids in an entry's `(Source: ...)`), `gap_citations` (ids written as `E123's "Not measured"`, "Not built" or "Not tried" in the Question or Hypothesis), `followups(strict)` (of the cited experiment's not-measured lines, the one sharing the most content words with the later entry's Question and Hypothesis). `examples/loop_gaps.rs` prints both rules' pairs and the open count.
+- Found on the way: 12 of the list's 61 "not-measured" gaps were not gaps. They were table cells reading "(not measured)", Hypothesis and Verdict lines quoting another entry's "Not measured", and "the bench does not run batches". `undone_lines` now skips table rows, quoted spans, `(Source: ...)` parentheticals and "does" or "did" before the phrase. That leaves 49. By my reading of all 27 matched lines that do not start with the phrase, 13 are real gaps and all 13 stay. Two false ones remain (E119's "not run before", E133's "Setup, not measured").
+- Result (`cargo run --release --example loop_gaps`; pairs checked by reading each entry):
+
+  | Rule | Gaps marked followed | Right by reading |
+  |---|---|---|
+  | loose: the experiment named in the Source | 9 | 4 |
+  | strict: the gap's "Not measured" named | 5 | 5 |
+
+  - Strict pairs: E269's crash-between-work-and-firing gap by E271, E277's MLIR and native-modes gap by E282, E278's colored nets by E285, E279's whole-marking reads by E280, E286's compiled incremental mode by E288.
+  - The loose rule's misses come from entries that cite an experiment for its result, not for its gap (E284 builds on E283's proposals, E288 on E282's Cranelift mode).
+  - Tonight's run had 7 follow-ups by my reading. The strict rule finds 5. It misses E289, which cites E288's verdict rather than its "Not measured", and E278, which cites E277 without the phrase.
+  - With the cleaned list, E275's hindsight gives 13 percent of next experiments taking up a listed gap, against 14 percent for the swap control: the word test still carries nothing. 19 percent of listed gaps were taken up within 20 (15 before the cleanup).
+- Verdict: **kept** for the loop's tools (examples only, no kernel change). The strict rule is precise enough to mark gaps as followed up: 44 not-measured gaps stay open. It only works for entries that write their source that way, which the loop's entries now do, so it covers the loop's own work and not the older log. Writing `E123's "Not measured"` in the Source is now part of the entry format the loop follows.
+- Not measured: whether the follow-up fully answered the gap (E286's gap names two things, and E288 measured one); a backtest, since only 11 entries in the log have a Source naming an experiment.
+- Run: `cargo run --release --example loop_gaps`.
+- Gates on the branch: kernel lib tests as on E287 (63, 1 ignored); clippy `-D warnings` (all targets) and fmt clean.

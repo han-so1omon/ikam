@@ -159,6 +159,31 @@ fn main() {
         println!("  {}: {}", src.name(), list.join("; "));
     }
 
+    // E290: gaps a later entry follows up, by a cited source (loose) or
+    // by naming the gap's "Not measured" (strict).
+    let nm = gaps
+        .iter()
+        .filter(|g| g.source == Source::NotMeasured)
+        .count();
+    for strict in [false, true] {
+        let followed = followups(&gaps, &entries, strict);
+        println!(
+            "followed up ({}): {} of {nm} not-measured gaps; open: {}",
+            if strict {
+                "strict: names the gap's \"Not measured\""
+            } else {
+                "loose: names the experiment in its Source"
+            },
+            followed.len(),
+            nm - followed.len()
+        );
+        for (label, by) in &followed {
+            let g = gaps.iter().find(|g| &g.label == label).unwrap();
+            let text: String = g.text.chars().take(100).collect();
+            println!("  {label} <- E{by:03}: {text}");
+        }
+    }
+
     // Hindsight: would the list have pointed at what was run next?
     let max = entries.keys().copied().max().unwrap_or(0);
     let ran: Vec<u32> = entries.keys().copied().collect();
