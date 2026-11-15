@@ -91,14 +91,14 @@ impl<S: Store> Repo<S> {
         // A verified container fact (a re-plan's hint) is the plan unpacking
         // would find again, at the price of re-deflating every member at
         // each level it tries (E109: most of a re-plan of source archives).
-        if depth < MAX_UNPACK_DEPTH && !unpacked {
+        if depth < MAX_UNPACK_DEPTH && !unpacked && !self.plain_hot_writes {
             candidates.extend(self.container_candidate(bytes, depth)?);
         }
         // A slice or template plan rebuilds the whole content, so its read
         // work is at least its length: when that alone costs more than
         // storing it plain, the plan cannot win and is not searched for
         // (E092; the heavy read weight, every content).
-        if self.read_weight * (bytes.len() as f64) < plain.len() as f64 {
+        if !self.plain_hot_writes && self.read_weight * (bytes.len() as f64) < plain.len() as f64 {
             candidates.extend(self.slice_candidate(bytes)?);
             if self.object_templates || !self.writing_object {
                 candidates.extend(self.template_candidates(bytes)?);
