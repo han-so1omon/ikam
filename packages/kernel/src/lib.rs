@@ -17,6 +17,7 @@ pub mod drafts;
 mod exec;
 mod fragment;
 pub mod func;
+pub mod fusion;
 mod grant;
 mod graph;
 mod group;

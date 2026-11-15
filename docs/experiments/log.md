@@ -4813,3 +4813,22 @@ Gates on the branch (E229 to E233): every kernel test suite passes (release); cl
 - Verdict: **measured**, no new option. Together the kept options make the hot layer 2 to 24 times faster than today's opt-ins on these workloads and give a cold layer that runs at every size, for more bytes written and, against a full repack where one finishes, more bytes kept. All stay off by default.
 - Mac steps: `cargo run --release --example hot_cold -- files`, `-- db 20000`, `-- db 100000` on this branch, one at a time.
 - Run: `cargo run --release --example hot_cold -- [files|db] [default|opt|kept] [N...]`.
+
+### E312 fusion-default (convex fusion as the default hybrid ranking)
+- Branch / parent: exp/312-fusion-default / main
+- Question: which way of fusing a keyword list and a vector list should be ikam's default, and with what weight? The evidence is on unmerged branches: exp/258-real-hybrid and exp/259-fusion-tune (E258, E259: WordLlama vectors over OSI-licensed PyPI READMEs, judgments from the data's structure), and exp/304-beir-hybrid, exp/305-beir-fusion-tune and exp/306-transformer-vector-views (logged there as E304 to E306, numbers main uses for other entries: all-MiniLM-L6-v2 and bge-small-en-v1.5 on BEIR's NFCorpus, SciFact and FiQA with their human judgments, and on the PyPI set). Source: Bruch et al., 2022 (notes in docs/research/search-engines.md on exp/259-fusion-tune).
+- Change: `src/fusion.rs` (opt-in): `convex` (each list min-max normalized, `alpha * keyword + (1 - alpha) * vector`), `rrf`, and `hybrid`, the default, which is `convex` at `DEFAULT_ALPHA` 0.5. `STRONG_VECTORS_ALPHA` is 0.4. Nothing in the kernel calls them; tests in `tests/fusion.rs`.
+- Result (nDCG@10 on test queries; from the branches above, not rerun here):
+
+  | Embedder | Sets where fusion beats BM25 | Worst loss against each set's best weight, over five sets: 0.4 / 0.5 / 0.6 | Tuned convex against tuned RRF |
+  |---|---|---|---|
+  | all-MiniLM-L6-v2 | 5 of 5, by 2 to 6 standard errors | 0.042 / 0.016 / 0.053 | ahead or within 0.010 |
+  | bge-small-en-v1.5 | 5 of 5 | 0.010 / 0.032 / 0.066 | ahead or within 0.010 |
+  | WordLlama (static) | ties BM25 at best on known items; best weight 0.6 to 0.8 | | |
+
+  - The best weight follows the vectors' strength against BM25: it fell from 0.6 to 0.8 with a static model to 0.4 to 0.6 with MiniLM and 0.3 to 0.5 with bge-small. On FiQA, where vectors alone beat BM25 by 0.13 to 0.16, a weight of 0.6 falls below vectors alone.
+  - RRF's best k swings from 1 to 100 between sets and tasks; at its usual k of 60 it lost to BM25 on PyPI known items with MiniLM and with WordLlama.
+- Not measured: a weight chosen per query or per collection from unlabelled signals; embedders larger than bge-small.
+- Trade-off: none in cost (fusing two top-100 lists takes 0.03 to 0.04 ms). One weight is a compromise across collections.
+- Verdict: **kept**, opt-in. Convex is the default hybrid, at 0.5 for MiniLM-class embedders and 0.4 for bge-small-class ones; use 0.6 to 0.7 for a static model. Retune on a few hundred judged queries whenever the embedding model changes.
+- Run: `cargo test --test fusion`.
