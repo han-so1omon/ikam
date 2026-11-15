@@ -140,7 +140,12 @@ impl<S: Store> Repo<S> {
             && Some(old) != self.dictionary().map(|(id, _)| *id)
             && !self.is_needed(&old)?
         {
-            self.store.delete(&old)?;
+            // Another handle on the store may have dropped it first (E299):
+            // MemStore's delete of a missing id succeeds, FsStore's refuses.
+            match self.store.delete(&old) {
+                Ok(()) | Err(Error::NotFound(_)) => {}
+                Err(e) => return Err(e),
+            }
         }
         Ok(())
     }

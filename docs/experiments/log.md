@@ -3928,3 +3928,846 @@ Gates on the branch (E229 to E233): every kernel test suite passes (release); cl
 - Verdict: **measured**, no new option. Together the kept options make the hot layer 2 to 24 times faster than today's opt-ins on these workloads and give a cold layer that runs at every size, for more bytes written and, against a full repack where one finishes, more bytes kept. All stay off by default.
 - Mac steps: `cargo run --release --example hot_cold -- files`, `-- db 20000`, `-- db 100000` on this branch, one at a time.
 - Run: `cargo run --release --example hot_cold -- [files|db] [default|opt|kept] [N...]`.
+### E275 registry-gaps (the experiment loop's gap list, from the project's own records)
+- Branch / parent: exp/275-registry-gaps / main c92a279
+- Question: an experiment loop that runs with little input needs a queue of candidates. Do the project's records (registry, log, research notes) already hold one, and would a list built from them have pointed at what was run next? (Design: `docs/research/experiment-loop.md`.)
+- Hypothesis: four record types name work worth an experiment: stale registry verdicts (registry.rs's ablate and retest), "Not measured", "Not built", "Not tried" or "not run" lines in log entries, research hypotheses with status `open`, and experiment ids the log mentions ahead of the newest one with no entry or row. A list built at a cutoff from the log as it stood then should name a useful share of the next 20 experiments. (Source: measurement; the autoresearch family of loops keeps an append-only ledger as its queue.)
+- Change: none in the kernel. `examples/loop_gaps.rs` and `examples/loop_common/mod.rs` parse the three records, commit the list to a store as a versioned graph (ref `loop`, one node per gap with its line as content, edges to its source kind, its experiment and that experiment's mechanisms), read it back, check the count and fsck. Then the hindsight check: every 10 ids from E050, the list built from entries up to the cutoff (not-measured lines and planned ids; staleness and research notes are not time-sliced and are left out) against the next 20 entries. A gap counts as taken up when a later entry is the planned id, or cites the gap's experiment and shares at least 3 content words with the gap's line. A swap control reruns the word test with each line swapped for the next gap's (E051's swap test).
+- Result (`cargo run --release --example loop_gaps`, deterministic; on this branch, so the list includes this entry and `experiment-loop.md`):
+  - Gaps now: 95. 35 stale (registry.rs's ablate and retest lists), 37 not-measured lines, 14 open hypotheses (experiment-loop 4, graph-storage 2, kernel-direction 5, office-gap 2, tree-metadata 1), 9 planned ids within 30 of the newest (E249 and E256 to E259, recorded only on their branches; E261, E264, E267, the hot and cold plan's unrun entries; E276, next here). 22 touch a weighty mechanism.
+  - Hindsight over 21 cutoffs (E050 to E250): 8 of 14 planned ids were run within the next 20 experiments; most of the misses are ids recorded only on a branch, which the example does not read.
+  - Not-measured lines: 12% of later experiments took one up by the word test, and the swap control gives 13%. The test carries no information: either these lines are rarely taken up, or citing an entry and sharing words does not detect it. 15% of listed gaps (planned included) were taken up within 20.
+  - The store commits a new version only when the list changes; fsck clean.
+- Verdict: **measured** (a tool, no kernel change). The records hold a queue of about 100 candidates. An id named ahead of time is a strong signal; a "Not measured" line is a backlog that later work seldom visibly picks up, and this proxy cannot rank it. E276 ranks the list; a ranking should not lean on word overlap with not-measured lines.
+- Not measured: whether staleness and open hypotheses, as they stood at a cutoff, predict the next experiments (both need the records' git history at that commit); gaps recorded only on `exp/` branches (the example reads the checked-out branch).
+
+### E276 ranking-backtest (would the loop's ranking rule have ordered past experiments better?)
+- Branch / parent: exp/276-ranking-backtest / E275 (exp/275-registry-gaps)
+- Question: the loop design ranks candidates by value per hour, score = P(keep) x gain + 0.5 x info, over hours (`docs/research/experiment-loop.md`, H2). With only what the records hold ahead of time, does it order a queue better than the order experiments were actually run in, or than chance?
+- Hypothesis: a Beta(1, 1) posterior of P(keep) per mechanism, from the verdicts so far, plus a bonus for ids named ahead of time (E275: 8 of 14 run within 20), pushes the experiments that end not kept towards the end of a queue. (Source: the design; E275.)
+- Change: none in the kernel. `examples/loop_rank.rs` (reusing `examples/loop_common`). At each cutoff from E050, every 10 ids, the queue is the next 20 experiments that ended in a decision (kept against discarded, refuted, dropped, partial, not applicable, inconclusive; benchmarks and plain measurements left out). Rules, each using only records up to the cutoff: `actual` (run order), `score` (the rule, with gain and hours 1 since neither is recorded ahead of time), `p-keep` (the posterior alone), `planned` (planned ids first), `weighty` (WEIGHTY mechanisms first), `thompson` (one draw per experiment from its posterior, fixed seed), `random` (mean of 200 seeded shuffles). Metric: the mean position of the queue's not-kept experiments, as position / (n - 1) (0 first, 1 last; chance 0.5), and how many of the first 5 picks were kept.
+- Result (`cargo run --release --example loop_rank`, deterministic, two runs identical): 158 decided experiments, 131 kept (83%); 19 queues, 15 with at least one failure (about 27 failures in all; the windows overlap, so the queues are not independent).
+
+  | Rule | Failure position | Kept in the first 5 (of 95 picks) |
+  |---|---|---|
+  | actual | 0.350 | 72 |
+  | score | 0.400 | 79 |
+  | p-keep | 0.400 | 79 |
+  | planned | 0.350 | 72 |
+  | weighty | 0.442 | 77 |
+  | thompson | 0.470 | 79 |
+  | random | 0.500 | 81 |
+
+  - The run order put failures earlier than chance (0.35): riskier changes tended to be tried first.
+  - The rule beats the run order (0.40 against 0.35) but not chance; `p-keep` alone gives the same, so the planned bonus moves nothing (only 2 queues hold a planned id, and planned ids sit early in run order anyway).
+  - An earlier version that rounded each experiment's pooled counts did worse (0.31): the signal is weak enough that the rounding decided it.
+- Verdict: **refuted** for this rule. A mechanism's past keep rate does not predict whether its next experiment is kept; no rule tested beats a random order. The loop should not rank by P(keep). Order by dependencies (arcs), information (stale verdicts, open hypotheses, ids named ahead), the owner's theme boosts and cost once runs record their hours, with a seeded random tie-break. Also: running likely failures first is not bad in itself, since a refuted hypothesis is a result; this metric only asks whether keep rates can be predicted.
+- Not measured: gain and hours (not in the records ahead of time; the loop should record both per run so a later backtest can use them); per-objective keep rates (`weight_sensitive` verdicts across objective changes).
+
+### E269 petri-core (a Petri net of work states on the database log)
+- Branch / parent: exp/269-petri-core / E276 (exp/276-ranking-backtest)
+- Question: the kernel plan names scheduling as "Petri nets over derivations, for approvals, budgets and retries", and the Python-era engine (removed in a992b77) recorded each firing with the marking's hash before and after. Can a net live on the current kernel, stored as a graph object with its marking and firings in a database, so that replaying the recorded firings alone gives back the marking, retries are safe, and an owner's step is never taken by a scheduler? What does a firing cost? (Design: `docs/research/experiment-loop.md`, H4.)
+- Hypothesis: a net maps onto existing pieces without kernel changes outside a new module: places and transitions as graph nodes (arcs as edges), token counts as database keys, a firing as one `db_append` of the changed counts and a record keyed by the caller's idempotency key. Replay equals the stored marking for 10,000 firings; a firing costs about one append. (Source: the kernel plan; the graph-objects plan's note that a net fits a graph object; the Python-era `PetriNetEngine`.)
+- Change: new opt-in module `net` (library only; nothing in the default paths calls it). `Net`, `Place` (plain, with anonymous tokens, or colored, one named token per work item), `Transition` (input and output arcs with weights, a kind `pure`, `cmd`, `agent` or `human`, an optional capability name). `Net::check` (names unique, arcs to defined places, weights at least 1, colored places start empty, a human transition has no capability). `Repo::put_net` and `net_at` store and read the net as a graph; `net_init` writes the initial marking once; `net_marking`; `net_enabled(auto)` lists enabled transitions with the token each binds and, with `auto`, leaves out human ones; `net_fire` appends the changed counts and a firing record (transition, token, marking hashes before and after) under the key, returns the recorded firing on a retry with the same key, refuses a reused key for another firing (`IdempotencyConflict`) and a transition that is not enabled; `net_firings`; `net_replay` recomputes the marking from the records alone and checks each record's hashes. Three unit tests; `examples/net_core.rs`.
+- Result (`cargo run --release --example net_core`, 2,000 candidates through propose, start, finish, ask and the owner's merge, 10,000 firings; one cpu slot):
+  - MemStore: fire p50 8.6 ms, p99 20.6 ms. FsStore: p50 19.8 ms, p99 148 ms. Replay of 10,000 firings: 497 ms (mem), 679 ms (fs), equal to the stored marking both times; the database folds to the same views from scratch; fsck clean.
+  - A retry with the same key leaves the database unchanged; a reused key for another firing is refused; the scheduler's list never held `merge` (checked every 97 candidates).
+  - Fire cost grows with the log: p50 4.5 ms at 250 firings, 6.5 ms at 1,000, 8.6 ms at 10,000 with the marking kept small. Most of it is the append keeping views current (E260's finding).
+  - With the owner never merging, finished candidates pile up (2,001 tokens at the end) and fire p50 rises to 32.9 ms: a firing reads the whole marking to hash it.
+- Verdict: **kept** as an option (opt-in module, library only). The net core replays exactly and is safe to retry; at a few firings an hour, the cost does not matter. For a busier net, two costs to attack: hash the marking incrementally (or per place) instead of reading all of it, and use the background integrator (E262) or kept counts so firings do not pay for views.
+- Not measured: guards (the plan lowers them to interp.wasm later); a crash between a cmd transition's work and its firing (the firing is the commit point, so the work is redone; recording outputs is E271's question); several nets in one database; concurrency (two writers firing at once on one database).
+- Run: `cargo run --release --example net_core [-- N]`; `cargo test --release --lib net::`.
+- Gates on the branch: kernel lib tests pass (release, 52 and 1 ignored); clippy `-D warnings` and fmt clean.
+
+### E270 net-dsl (a text form for nets)
+- Branch / parent: exp/270-net-dsl / E269 (exp/269-petri-core)
+- Question: the old docs planned a DSL over the kernel (a workflow definition compiled to a Petri net, then lowered). Before any higher layer, can a net be written and reviewed as plain text that parses to a checked `Net`, prints back in one canonical form, and refuses malformed input with an error that names the line? (Design: `docs/research/experiment-loop.md`, H5.)
+- Hypothesis: a line-per-declaration grammar (`net`, `place`, `transition NAME KIND [CAPABILITY]: IN -> OUT`, weights as `2*place`, `#` comments) is enough for the loop's nets; print then parse is the identity on every valid net, and no input makes the parser panic. (Source: the Python-era `WorkflowDefinition` and `RichPetriWorkflow`, removed in a992b77, which kept places, transitions and arcs as the compiled form.)
+- Change: `net::text` inside the opt-in `net` module: `Net::parse` (checks each line as it goes, so an error names the line that broke a rule) and `Net::to_text` (canonical: the net line, places, then transitions in order, single spaces, no comments). Three unit tests (the loop net, weights, 14 malformed inputs each naming its line and cause); `examples/net_text.rs`.
+- Result (`cargo run --release --example net_text`, fixed seed, 10,000 random nets of 2 to 12 places and 1 to 12 transitions of every kind):
+  - Round trip: 10,000 of 10,000 equal after print and parse; the canonical text is a fixed point.
+  - One random edit per text (a character deleted, doubled or replaced from the grammar's own symbols, or two lines swapped): 7,035 refused, every error naming a line; 2,965 accepted, all passing `Net::check` and round-tripping; 0 panics. 1,976 of the accepted ones are a different net from the original (a changed weight, initial count or name): a one-character slip can still be a valid net, so a net file should be reviewed as a diff of its canonical text.
+  - Parse of the experiment-loop net (5 places, 5 transitions): 3.7 us.
+- Verdict: **kept** as an option (part of the opt-in `net` module). The text form is the net's IR level, the layer a workflow DSL would compile to; that higher layer (named stages, retries and approvals as sugar over places and arcs) is not built.
+- Not measured: guards and their lowering to interp.wasm (E277's question); a workflow layer above this; error positions finer than a line; nets of thousands of transitions.
+- Run: `cargo run --release --example net_text [-- N]`; `cargo test --release --lib net::`.
+- Gates on the branch: kernel lib tests pass; clippy `-D warnings` and fmt clean.
+
+### E277 execution-modes (interpreted, table, native and wasm steps for a net)
+- Branch / parent: exp/277-execution-modes / E270 (exp/270-net-dsl)
+- Question: would compiling a net (through MLIR, Cranelift, LLVM or to wasm) pay off, and where? Compare the cost of one step of the same net in several execution modes, with each mode's compile cost, against the cost of a recorded firing on the database (E269). (Design: `docs/research/experiment-loop.md`, H3.)
+- Hypothesis: for the live loop, a recorded firing (about 8.6 ms, mostly the append) dwarfs any step, so the mode does not matter; for simulation (many steps in memory, such as trying a schedule before running it) a lowered form beats the interpreter by orders of magnitude, and compiled native code adds a smaller factor that must repay its compile time. (Source: Fronc and Pommereau, SUMo 2011, whose compiled Petri net backends ran over 900x faster than SNAKES's interpretation; MLIR's and CIRCT Handshake's dataflow designs; the Rust options read for H3: melior wraps MLIR's C API and needs a matching system LLVM and MLIR, pliron is a pure-Rust MLIR-like framework, cranelift-jit calls itself experimental.)
+- Change: none in the kernel. `examples/net_modes.rs` runs one random walk (at each step list the enabled transitions in order, pick one with a shared xorshift generator, fire it) in four modes on seeded random place/transition nets (conservative arcs, weights 1 to 3, a cycle of single moves so the walk never deadlocks): `interp` (the `net` module's `Net::is_enabled` and `Net::fire` on string-keyed markings), `table` (lowered once to dense arrays of thresholds and deltas), `native` (the net emitted as specialized C, one enabling test and one firing per transition, built with clang -O2, LLVM 18, and loaded with dlopen), `wasm` (the same C built for wasm32 and run in wasmi, the kernel's deterministic interpreter, floats off). Every mode must end in the same marking after the same steps.
+- Result (`cargo run --release --example net_modes`, this cloud machine; markings equal in every mode at every size; ns per step, compile in ms):
+
+  | Net (places x transitions) | interp | table | native (compile) | wasm (compile) |
+  |---|---|---|---|---|
+  | 10 x 20 | 1,922 | 75 | 46 (96) | 109 (75) |
+  | 100 x 200 | 76,868 | 372 | 137 (245) | 734 (292) |
+  | 1,000 x 2,000 | 6,274,657 | 2,945 | 972 (4,229) | 18,503 (96,261) |
+
+  - The live loop is not bound by the step: at the loop net's size the interpreter's step is about 2 us, more than 4,000 times below a recorded firing (8.6 ms, E269).
+  - The interpreter scales badly: it looks places up by name and clones the marking on every firing. Lowering to the table is 26x faster at 10 places and over 2,000x at 1,000, with no compile step.
+  - Native code is 1.6x to 3x faster than the table; its compile repays itself only after about 3 million steps (10 x 20), 1 million (100 x 200) or 2 million (1,000 x 2,000).
+  - wasm in wasmi is slower than the table at 100 places and more (2x to 6x), and clang's wasm build of a large unrolled net took 96 s. Deterministic wasm fits small pure functions such as guards, not the whole step.
+- Verdict: **measured** (a comparison, no kernel change). Compilation does not matter for the live loop. For simulation the next step is the table lowering, as an option in the `net` module (and the same lookups by index would cut the interpreter's cost in `net_fire`); native compilation is worth trying only once a workload runs millions of steps; whole-net wasm is not worth it.
+- Not measured: MLIR itself (this machine has LLVM 18 but no MLIR libraries; clang -O2 stands in for the LLVM end of such a pipeline, and MLIR's gain would come from restructuring, such as vectorizing enabling tests over many colors, which a random walk does not exercise); Cranelift (would add a dependency; expected between table and native with faster compiles); colored nets (would unfold to one place per color); guards in wasm; macOS.
+- Run: `cargo run --release --example net_modes` (needs clang with the wasm32 target and lld).
+- Gates on the branch: clippy `-D warnings` and fmt clean; kernel lib tests pass.
+
+### E271 run-outputs (recording each run's output with its firing)
+- Branch / parent: exp/271-run-outputs / E277 (exp/277-execution-modes)
+- Question: E269 left open what happens when a loop runner crashes between a run's work and its firing: the firing is the commit point, so the work is redone. Does recording the work's output first avoid redoing it, and what does recording outputs cost and give? (Design: `docs/research/experiment-loop.md`; named in E269's "Not measured".)
+- Hypothesis: committing the output on its own before the firing lets a resumed runner find it and fire without rerunning the work, so crashes stop costing work; recording outputs also lets a later check recompute a run and catch work that is not deterministic.
+- Change: in the opt-in `net` module, `Firing.output` (the output's id; records without one keep E269's bytes), `Repo::net_fire_output` (the output as content, its id at `net/<name>/out/<key>` and in the record, all in the firing's one append; a retry with other bytes under the same key is refused), `net_output` and `net_verify` (recomputed bytes against the record); `net_replay` also checks that each named output is readable. One unit test; `examples/net_outputs.rs`: a stateless runner (it reads the marking to find each candidate's next step) takes 200 candidates through the loop net on an FsStore, committing to a ref after every append, with a seeded crash before any append (probability 0.15: drop everything in memory, reopen, resume from the ref). Work is a deterministic job that sleeps 20 ms. Three modes on the same seed: fire only (E269); output, then fire (the output appended and committed on its own first, the first design tried here); fire with output (`net_fire_output`).
+- Result (`cargo run --release --example net_outputs`):
+
+  | Mode | Crashes | Work runs | Redone | Finish firing p50 |
+  |---|---|---|---|---|
+  | fire only | 150 | 237 | 37 | 23.1 ms |
+  | output, then fire | 197 | 242 | 42 | 23.2 ms (plus an 11 ms output append) |
+  | fire with output | 150 | 237 | 37 | 28.7 ms |
+
+  - Committing the output first does not reduce redone work: the risky window (work done, nothing durable yet) is the same in both designs, it just ends at a different write; the extra append adds crash points and time (95 s against 66 s in all).
+  - Every mode ends with all 200 candidates waiting on the owner, replay equal to the marking when reopened cold, and fsck clean; with `net_fire_output` all 200 finish records name their output.
+  - `net_verify` recomputing every output: 200 of 200 match for the deterministic job; for a job whose output carries its run count, 200 of 200 differ.
+- Verdict: **kept** as an option (opt-in API) for what it gives: each firing names what the run produced, and a later pass can recompute runs to catch nondeterminism, for about 5.6 ms more per firing on FsStore. **Refuted** as a way to avoid redoing work: an extra durable write after the work leaves the same window. Long work needs its own checkpoints, or a cache keyed by its inputs (as content-addressed build tools do), to survive a crash.
+- Not measured: checkpoints inside long work; a cache keyed by inputs; outputs of megabytes (here under 100 bytes); MemStore.
+- Run: `cargo run --release --example net_outputs [-- N]`; `cargo test --release --lib net::`.
+- Gates on the branch: kernel lib tests pass (56, 1 ignored); clippy `-D warnings` and fmt clean.
+
+### E278 net-table (a net lowered to dense arrays, as an option)
+- Branch / parent: exp/278-net-table / E271 (exp/271-run-outputs)
+- Question: E277 found that for simulation (many steps in memory) a net lowered to arrays beats the interpreter by orders of magnitude with no compile step. As a kernel option, does it give the same markings as `Net::fire` on every net, and keep E277's speed?
+- Hypothesis: a `Table` (place indices, each transition's input thresholds and output additions) agrees with the interpreter step for step on random nets and matches E277's hand-written table within noise. (Source: E277.)
+- Change: `net::Table` and `Net::lower` in the opt-in `net` module (plain places only; a colored net is refused with a message to unfold colors first): `is_enabled`, `fire` in place, `enabled_into`, `walk` (a random walk with a caller's pick), `marking` (back to a `Marking`). One unit test against the interpreter; `examples/net_table.rs`.
+- Result (`cargo run --release --example net_table`):
+  - Agreement: 2,000 seeded random nets (3 to 42 places, conservative arcs as in E277), 300 steps each (600,000 in all): every marking equal to the interpreter's, and the same steps taken.
+  - Speed, ns per step: 10 x 20: interpreter 1,933, table 83 (23x); 100 x 200: 76,956 and 431 (179x); 1,000 x 2,000: 6,017,676 and 3,253 (1,850x). Within about 10% of E277's hand-written table (75, 372, 2,945).
+- Verdict: **kept** as an option (opt-in API). The simulation path for nets; the live loop keeps `net_fire`, whose cost is the append (E269).
+- Not measured: colored nets (unfolding); guards; a simulation the loop uses to plan (for example, how long a queue takes with one slot against two).
+- Run: `cargo run --release --example net_table`; `cargo test --release --lib net::`.
+- Gates on the branch: kernel lib tests pass; clippy `-D warnings` and fmt clean.
+
+### E279 marking-sum-hash (a firing's cost no longer grows with the tokens held, as an option)
+- Branch / parent: exp/279-marking-sum-hash / E278 (exp/278-net-table)
+- Question: E269 found a firing's cost grows with the tokens the net holds (8.6 to 33 ms as finished candidates pile up waiting on the owner), because a firing reads and hashes the whole marking for its record. Can the record's hashes be kept up to date from only the keys a firing touches?
+- Hypothesis: a sum hash (each `(place, token, count)` term hashed, the terms added lane by lane modulo 2^64) changes by subtracting the old terms of the touched keys and adding the new ones, so a firing reads only its arcs' keys and its cost stays flat as tokens pile up; replay recomputes the same hash and still catches a wrong record. (Source: E269's "Not measured"; additive set hashes as in LtHash and incremental multiset hashing.)
+- Change: in the opt-in `net` module, `net::sum_hash` and `Repo::net_init_sum` (as `net_init`, plus the running hash at `net/<name>/hash`; refused on a net already initialized without one). On such a database `net_fire` and `net_fire_output` read and write only the keys their arcs touch, update the stored hash in the same append, and record sum hashes as before and after; `net_replay` checks with the hash the database was set up with. Databases set up with `net_init` behave exactly as in E269. One unit test (retry, reused key, not enabled, replay, fold, stored hash equal to the marking's); `examples/net_sum_hash.rs`.
+- Result (`cargo run --release --example net_sum_hash`, 2,000 candidates never merged, 8,000 firings per run; fire p50 by quarter of the run, tokens held rising to 2,000):
+
+  | Store, hash | Q1 | Q2 | Q3 | Q4 | Whole run |
+  |---|---|---|---|---|---|
+  | mem, whole marking (default) | 14.0 ms | 25.0 | 36.2 | 49.2 | 251 s |
+  | mem, sum | 8.6 ms | 9.1 | 9.7 | 10.4 | 77 s |
+  | fs, whole marking (default) | 27.9 ms | 45.0 | 62.8 | 79.1 | 458 s |
+  | fs, sum | 19.5 ms | 21.2 | 22.3 | 23.9 | 192 s |
+
+  - With the sum hash the firing's cost stays nearly flat (up about 20% over the run, from the append's own growth with the log, not the hash), against 3.5x (mem) and 2.8x (fs) for the default; at 2,000 held a firing is 4.7x (mem) and 3.3x (fs) cheaper, and the whole run 3.3x and 2.4x faster.
+  - All four runs: replay equal to the stored marking, fold from scratch equal, all 2,000 waiting; fsck clean on fs; with the sum hash the stored hash equals the hash of the stored marking.
+  - This machine was slower than E269's (default Q1 14.0 ms on mem, E269 8.6 ms); compare within this table.
+- Verdict: **kept** as an option (opt-in, chosen when a net is set up). The sum hash detects damage and replay errors as E269's does, but unlike a hash over the whole marking it is not meant to resist someone choosing markings to collide (a 256-bit sum of hashes can be attacked by lattice methods; LtHash uses 1,024 lanes of 16 bits for that). The loop's own records need the former, so the sum suits it; a net whose records are shown to others as proof should keep the default.
+- Not measured: `net_enabled` and `net_marking` still read the whole marking (the scheduler's cost, separate from firing); the append's remaining growth with the log (E260's views); LtHash's larger state; nets with heavy arcs (cost grows with arcs, not tokens).
+- Run: `cargo run --release --example net_sum_hash [-- N]`; `cargo test --release --lib net::`.
+- Gates on the branch: kernel lib tests pass (58, 1 ignored); clippy `-D warnings` and fmt clean.
+
+### E280 enabled-limit (the scheduler reads only what its first answer needs, as an option)
+- Branch / parent: exp/280-enabled-limit / E279 (exp/279-marking-sum-hash)
+- Question: after E279 a firing no longer reads the whole marking, but the scheduler's question, `net_enabled`, still does, so a runner that asks "what can run next?" before each firing still pays for every token held. Can it ask for just the first few answers?
+- Hypothesis: checking plain inputs by key and reading a colored transition's first colored input place by prefix, in pages that double, gives the same first answers as `net_enabled` at a cost that follows the limit, not the tokens held. (Source: E279's "Not measured".)
+- Change: `Repo::net_enabled_limit(db, net, auto, limit)` in the opt-in `net` module: the first `limit` entries of `net_enabled`, in the same order. One unit test (equal to a prefix of `net_enabled` for limits 0 to 1,000, with and without `auto`, through a run with merges and a blocked cpu); `examples/net_pick.rs`.
+- Result (`cargo run --release --example net_pick`, sum-hash net on MemStore, one candidate queued, p50):
+
+  | Tokens held | `net_enabled` | `net_enabled_limit(1)` | Runner step (ask, fire), full | Runner step, limit 1 |
+  |---|---|---|---|---|
+  | 0 | 0.05 ms | 0.09 ms | 1.9 ms | 2.0 ms |
+  | 250 | 5.2 ms | 0.98 ms | 14.3 ms | 9.6 ms |
+  | 1,000 | 21.5 ms | 1.14 ms | 32.5 ms | 12.4 ms |
+  | 2,000 | 42.6 ms | 1.34 ms | 54.3 ms | 13.1 ms |
+  | 4,000 | 87.8 ms | 1.88 ms | 121.6 ms | 14.0 ms |
+
+  - The first answer was equal in every timed call; replay equal at the end with 4,001 waiting.
+  - With E279 and E280 together, a runner's step stays near 13 ms from 1,000 to 4,000 tokens held, against 32 to 122 ms with both defaults. The rest of the small growth is the database's own reads and append.
+- Verdict: **kept** as an option (opt-in API). The loop's runner should ask for one answer at a time.
+- Not measured: nets where most held tokens are not enabled (the pages then read the place to the end, as `net_enabled` does); an index of enabled firings kept with the marking; FsStore.
+- Run: `cargo run --release --example net_pick [-- MAX]`; `cargo test --release --lib net::`.
+- Gates on the branch: kernel lib tests pass (59, 1 ignored); clippy `-D warnings` and fmt clean.
+
+### E281 checkpoint-interval (how often a long run should save its progress)
+- Branch / parent: exp/281-checkpoint-interval / E280 (exp/280-enabled-limit)
+- Question: E271 found that recording a run's output before its firing saves no work after a crash; long work needs its own checkpoints. How often should a runner on the log save progress, and does the classic rule for it hold when each save is a database append and a commit?
+- Hypothesis: with checkpoint cost C and mean time between crashes M, the total time is lowest near Young's interval sqrt(2 C M) (Young 1974; Daly 2006 refines it for C not small against M), and no checkpointing loses most of the work when M is shorter than a run.
+- Change: `Repo::net_checkpoint(db, net, key, bytes)` and `Repo::net_resume(db, net, key)` in the opt-in `net` module (the progress as content, its id at `net/<name>/ckpt/<key>`, replaced by each save; saving the same bytes again changes nothing, so progress names its step). One unit test; `examples/net_checkpoint.rs`: 10 candidates through the loop net (sum hash, E279) on an FsStore, a commit to a ref after every append as in E271; each candidate's work is 160 steps of 5 ms (a hash chain, 800 ms); a checkpoint every K ms of work; crashes at seeded exponential times with mean M of wall time, checked at every step and before every append (drop memory, reopen, resume).
+- Result (`cargo run --release --example net_checkpoint`; one seed; C is the checkpoint's append and commit, p50 14 to 29 ms, rising with the log):
+
+  | Every | M = 500 ms: total | lost | M = 2,000 ms: total | lost |
+  |---|---|---|---|---|
+  | 5 ms | 106.2 s | 80 ms | 40.9 s | 30 ms |
+  | 20 ms | 18.9 s | 245 ms | 16.9 s | 65 ms |
+  | 40 ms | 14.9 s | 510 ms | 13.4 s | 115 ms |
+  | 80 ms | 12.7 s | 795 ms | 11.6 s | 210 ms |
+  | 160 ms | **11.4 s** | 1,115 ms | 10.6 s | 390 ms |
+  | 320 ms | 12.2 s | 2,180 ms | **10.3 s** | 795 ms |
+  | never | 35.2 s | 25,080 ms | 12.0 s | 2,655 ms |
+
+  - Young's interval with C about 20 ms: 141 ms for M = 500 ms (best measured 160 ms) and 283 ms for M = 2,000 ms (best 320 ms, 160 ms within 3%).
+  - Checkpointing too often costs more than never doing it (every 5 ms: 106 s and 41 s), since each save is an append and a commit.
+  - Every run: all 10 waiting on the owner, every finish output equal to the chain computed without crashes (`net_verify`), replay equal, fsck clean.
+- Verdict: **kept** as an option (opt-in API), and Young's rule **confirmed** on the log: a runner should save every sqrt(2 C M), with C measured on its store (about 20 ms here on FsStore with a commit per save) and M from its own crash record. For overnight runs on a machine that rarely crashes (M of hours), that means minutes between saves.
+- Not measured: more seeds (one seed per cell; the 160 and 320 ms cells at M = 2,000 are within noise); checkpoints of megabytes; a save without its own commit (the commit is part of C here); the growth of C with the log.
+- Run: `cargo run --release --example net_checkpoint [-- N]`; `cargo test --release --lib net::`.
+- Gates on the branch: kernel lib tests pass (60, 1 ignored); clippy `-D warnings` and fmt clean.
+
+### E282 cranelift-mode (a net's step compiled with Cranelift)
+- Branch / parent: exp/282-cranelift-mode / E281 (exp/281-checkpoint-interval)
+- Question: E277 measured interpreted, table, clang -O2 and wasm execution of a net's step and left Cranelift (and MLIR) unmeasured. Cranelift is the code generator behind wasmtime and a rustc backend, built for fast compiles. Where does it fall between the kernel's table (E278, no compile) and clang -O2 (fastest code, slow compiles)?
+- Hypothesis: Cranelift's code runs between the two and compiles orders of magnitude faster than clang, so it repays its compile after far fewer steps: the mode to use when a simulation is too long for the table and too short to wait for clang. (Source: E277's "Not measured"; Cranelift's design goal of fast compiles at some cost in code quality.)
+- Change: none in the kernel. A separate crate, `packages/kernel/experiments/net-jit` (so the kernel's builds and tests do not compile Cranelift 0.137.1): E277's seeded random conservative nets and random walk, in three modes checked to end in the same marking after the same steps: the kernel's `Table::walk`; one function per net built with cranelift-frontend (a branch-free enabling pass storing each transition's index at the next slot and advancing the count by its test, the generator, a jump table to one firing block per transition), compiled in memory with cranelift-jit at `opt_level=speed`; and the same structure emitted as C for clang -O2.
+- Result (`cargo run --release` in that crate; two runs, ns per step, compile ms, and steps after which the compile is repaid against the table):
+
+  | Net | Table | Cranelift | Cranelift compile | Repaid after | clang -O2 | clang compile | Repaid after |
+  |---|---|---|---|---|---|---|---|
+  | 10 x 20 | 80 to 84 | 28 to 29 | 1.4 to 1.5 ms | 27,000 | 22.5 to 22.9 | 85 to 254 ms | 1.4 to 4.4 million |
+  | 100 x 200 | 385 to 386 | 150 to 151 | 7.7 to 7.8 ms | 33,000 | 97 to 102 | 1.7 s | 6 million |
+  | 1,000 x 2,000 | 2,904 to 3,421 | 1,543 to 1,762 | 81 to 88 ms | 53,000 to 60,000 | 813 to 1,061 | 103 s | 44 to 49 million |
+
+  - Cranelift's code is 1.9x to 2.9x faster than the table and 1.2x to 1.9x slower than clang's; it compiles 60x to 1,200x faster than clang, so it repays itself after tens of thousands of steps against clang's millions.
+  - Every mode ends in the same marking after the same steps (asserted).
+  - clang took 103 s on the largest net here against 4.2 s in E277: the branch-free enabling pass is one long expression, which clang's optimizer handles far worse than E277's branches. Cranelift compiled the same shape in under 0.1 s.
+- Verdict: **measured** (a comparison, no kernel change). For simulation: the table up to tens of thousands of steps, Cranelift from there (a plan simulated for one night of the loop is in that range), clang only for runs of tens of millions of steps. For the live loop none of this matters: a recorded firing costs milliseconds (E269, E279). Adding Cranelift to the kernel would add about 60 crates to a dependency tree that is now small and pinned for reconstruction; keep it outside until a workload needs it.
+- Not measured: MLIR (no libraries here; Cranelift answers the same "fast compile, decent code" question from Rust); Cranelift's `opt_level=none`; colored nets; the enabling pass with branches (E277's shape) under Cranelift; macOS on Apple silicon (Cranelift supports aarch64).
+- Run: `cd packages/kernel/experiments/net-jit && cargo run --release` (needs clang).
+- Gates: clippy `-D warnings` and fmt clean on the crate; the kernel is unchanged.
+
+### E283 research-scan (one pass of the loop's reading step)
+- Branch / parent: exp/283-research-scan / E282 (exp/282-cranelift-mode)
+- Question: the loop's second step reads research by theme. One pass against the gaps tonight's experiments left: what do current sources say, and what should the queue take next?
+- Change: none in the kernel. `docs/research/scan-2026-11-15.md`: five themes (incremental hashing, compiling nets, durable execution and checkpoints, choosing the next experiment, keeping views current), the sources read for each in my own words, and what each means for IKAM.
+- Result: the sources agree with E276 (rank by dependencies and pilots, not keep rates), E281 (the smallest memoized unit sets a crash's cost) and E282 (fast back ends trade code quality for compile time); they name one gap in E279 worth running now (an LtHash mode for forgery resistance) and three for the queue (a pilot transition, dependency arcs in the gap list, colored nets in the table).
+- Verdict: **measured** (reading, no change). Taken up tonight: E284.
+- Not measured: whether a scan's proposals are taken up and kept more often than the gap list's (needs several nights).
+
+### E284 lthash-mode (a forgery-resistant running hash for the net, as an option)
+- Branch / parent: exp/284-lthash-mode / E283 (exp/283-research-scan)
+- Question: E279's sum hash (four 64-bit lanes) detects damage and replay errors but is not meant to resist someone choosing markings that collide; the research scan (E283) found LtHash, which updates the same way with 1,024 lanes of 16 bits and rests on a lattice problem. What does it cost a firing, the store and a replay?
+- Hypothesis: a firing costs the same as with the sum hash (a few 2 KB expansions per touched key), the store grows by about the 2 KB state each firing writes, and replay (which hashes the whole marking at every step) gets slower. (Source: E283; Facebook's LtHash post; Bellare and Micciancio's incremental hashing.)
+- Change: in the opt-in `net` module, `net::lt_hash` and `Repo::net_init_lthash` (the 2 KB state at `net/<name>/lthash`; each term is 2,048 bytes of BLAKE3's extendable output, added lane by lane modulo 2^16; records carry the BLAKE3 digest of the state). The sum and LtHash modes share one update path. One unit test; `examples/net_sum_hash.rs` runs all three modes and reports the FsStore's size.
+- Result (`cargo run --release --example net_sum_hash -- 1000`, 1,000 candidates never merged, 4,000 firings per run; fire p50 by quarter as tokens held rise to 1,000):
+
+  | Mode | mem fire p50 (Q1 to Q4) | fs fire p50 | fs store | replay (fs) |
+  |---|---|---|---|---|
+  | whole-marking hash (default) | 11.1 to 28.9 ms | 22.7 to 49.9 ms | 27.1 MB | 1.0 s |
+  | sum hash (E279) | 8.2 to 9.3 ms | 21.2 to 22.5 ms | 28.1 MB | 0.9 s |
+  | LtHash | 8.2 to 9.5 ms | 20.3 to 23.4 ms | 36.0 MB | 6.6 s |
+
+  - A firing costs the same with LtHash as with the sum hash, and both stay flat as tokens pile up.
+  - The store grows by about 2 KB a firing (36.0 against 28.1 MB, 4,000 firings), the state each firing writes.
+  - Replay is about 7x slower, since it recomputes the 2 KB hash of the whole marking at every step; an incremental replay would remove most of that.
+  - All runs: replay equal, the last record's hash equal to the hash of the stored marking, fsck clean.
+- Verdict: **kept** as an option (opt-in API). Use the sum hash for the loop's own records; use LtHash when the records are shown to someone else as evidence, paying about 2 KB a firing.
+- Not measured: an incremental replay; storing only the state's delta; ECMH (255-bit digests, needs an elliptic curve library).
+- Run: `cargo run --release --example net_sum_hash [-- N]`; `cargo test --release --lib net::`.
+- Gates on the branch: kernel lib tests pass (61, 1 ignored); clippy `-D warnings` and fmt clean.
+
+### E285 unfold-colors (colored nets in the table, by unfolding colors)
+- Branch / parent: exp/285-unfold-colors / E284 (exp/284-lthash-mode)
+- Question: E278's table refuses colored nets, and the loop's own net is colored (candidates are colors). Does unfolding colors into plain places and transitions give the interpreter's colored semantics, and what does it cost?
+- Hypothesis: one plain place per colored place and color, and one transition per binding transition and color, fire exactly as the colored net with that token bound, so the table's walk takes the same firings; the table keeps a 20x-plus lead, though its linear scan of every transition grows with the colors. (Source: the research scan's Neco note, E283; E278's "Not measured".)
+- Change: `Net::unfold(colors)` in the opt-in `net` module (`place.color`, `transition.color`; transitions that bind no color kept; colors must be distinct valid names; the result is checked). One unit test (39 seeded walks of 400 steps on the loop net with 12 colors: the same enabled list, the same firing names and the same counts as the colored interpreter); `examples/net_unfold.rs`.
+- Result (`cargo run --release --example net_unfold`; the same seeded walk on both, firings and counts asserted equal):
+
+  | Candidates | Unfolded places x transitions | Unfold and lower | Interpreter ns per step | Table ns per step | Table's lead |
+  |---|---|---|---|---|---|
+  | 10 | 41 x 50 | 0.1 ms | 1,998 | 83 | 24x |
+  | 100 | 401 x 500 | 0.8 ms | 12,524 | 627 | 20x |
+  | 1,000 | 4,001 x 5,000 | 41 ms | 95,880 | 5,392 | 18x |
+
+- Verdict: **kept** as an option (opt-in API). The loop's net can now be simulated on the table. Both modes grow with the colors because each step checks every transition; checking only the transitions next to the places a firing changed would cut that (next: E286).
+- Not measured: guards on colors (none in the kernel yet); colors that are tuples; a net with many colored places per transition.
+- Run: `cargo run --release --example net_unfold`; `cargo test --release --lib net::`.
+- Gates on the branch: kernel lib tests pass (62, 1 ignored); clippy `-D warnings` and fmt clean.
+
+### E286 incremental-enabling (the table rechecks only what a firing touched)
+- Branch / parent: exp/286-incremental-enabling / E285 (exp/285-unfold-colors)
+- Question: E285 found the table's step grows with the transitions, because every step checks every transition. Does rechecking only the transitions that read a place the firing changed, with a log-time pick of the k-th enabled one, keep the same walk and remove that growth?
+- Hypothesis: the same firings (the enabled set and its order are the same), at a cost that follows the changed places' readers instead of the net's size, so the gain grows with the net. (Source: the loop design's "only transitions next to changed places are rechecked"; E285's verdict.)
+- Change: `Table::walk_incremental` in the opt-in `net` module: readers per place and changed places per transition computed once, a Fenwick tree over transition order for the count and the k-th pick, a stamp so each reader is rechecked once a step. One unit test (29 seeds on a small net with a dead transition and on the loop net unfolded to 30 colors: same steps and same marking as `walk`); `examples/net_unfold.rs` and `examples/net_table.rs` gain the column, asserting the same result as `walk`.
+- Result (`cargo run --release --example net_unfold`, `cargo run --release --example net_table`; ns per step):
+
+  | Net | Table (E278) | Incremental | Gain |
+  |---|---|---|---|
+  | loop net, 10 candidates (41 x 50) | 86 | 41 | 2.1x |
+  | loop net, 100 candidates (401 x 500) | 607 | 68 | 8.9x |
+  | loop net, 1,000 candidates (4,001 x 5,000) | 5,677 | 126 | 45x |
+  | random 10 x 20 | 77 | 67 | 1.1x |
+  | random 100 x 200 | 394 | 122 | 3.2x |
+  | random 1,000 x 2,000 | 2,865 | 173 | 17x |
+
+  - Every walk ended in the same marking after the same steps as `walk`.
+  - At 1,000 x 2,000 the incremental table (173 ns) is faster than E282's Cranelift code (1,543 ns) and E277's clang code (813 to 1,061 ns), with no compile: on large nets the algorithm matters more than the code generator. Compiling the incremental form would be the next comparison.
+- Verdict: **kept** as an option (opt-in API); the simulation path for nets of more than a few dozen transitions.
+- Not measured: an incremental mode compiled with Cranelift; nets where one place is read by most transitions (the loop's cpu slot is: each firing of start or finish rechecks every start, and the gain still holds at 45x).
+- Run: `cargo run --release --example net_unfold`; `cargo run --release --example net_table`; `cargo test --release --lib net::`.
+- Gates on the branch: kernel lib tests pass (63, 1 ignored); clippy `-D warnings` and fmt clean.
+
+### E287 night-plan (planning a night away from the keyboard on the loop net, with times)
+- Branch / parent: exp/287-night-plan / E286 (exp/286-incremental-enabling)
+- Question: the loop is meant to run while the owner sleeps or is away. Given a ranked queue, some of whose candidates need the owner's decision first, which way of running the night finishes the most: the agent waiting on its own bench, or coding the next candidate while the cpu benches; strict rank order, or passing over what needs the owner; one cpu or two; and does coding ahead need a limit?
+- Hypothesis: strict order stalls at the first candidate that needs the owner; pipelining roughly doubles what finishes when bench and coding take similar time; with bench-heavy candidates an unbounded pipeline codes far ahead of the cpu and leaves work half-done at the end of the night, and a work-in-progress limit (a `slot` place, as on a kanban board) keeps the count while removing that waste. (Source: the loop design's "low-input planning" ask; E281's long-work model; Petri-net resource places.)
+- Change: none in the kernel. `examples/net_night_plan.rs`: a timed loop net (agent, cpu and slot places; `decide` is a human transition that never fires while the owner is away). Each step that takes time is a start transition, which takes its resources, and an end transition fired when the time is up; the simulation fires them on `Net::fire`. Durations are tonight's minutes between the commits of E279 to E286 (22.0, 9.4, 9.3, 7.2, 2.0, 12.9, 2.5, 2.8; 8.5 on average), resampled with a seeded x0.5 to x1.5 jitter for a queue of 150. The bench share was not recorded tonight, so it is swept (20, 50, 80 percent; the write-up 15 percent, coding the rest). The night is 8 hours; coding starts only when the candidate's estimate fits, and a bench or write-up that would run past the end is not started. The best plan's 822 firings are then replayed on an IKAM store (`net_fire` on a MemStore): the stored marking equals the simulation and `net_replay` equals the stored marking.
+- Result (`cargo run --release --example net_night_plan`; candidates finished in 8 hours, and those left half-done):
+
+  | Plan | No decisions, bench 20% | No decisions, bench 50% | No decisions, bench 80% | 25% need decisions, bench 50% |
+  |---|---|---|---|---|
+  | serial, strict order | 53 | 53 | 53 | 3 (stalled at the 4th) |
+  | serial, skip asks | 55 | 55 | 55 | 67 |
+  | pipelined, no limit | 71 | 117 (5 half-done) | 71 (79 half-done) | 112 |
+  | pipelined, 4 in flight | 71 | 104 (2) | 71 (3) | 112 |
+  | 2 cpus, 6 in flight | 71 | 122 | 141 (4) | 112 |
+
+  - Strict rank order is the worst plan whenever anything needs the owner: it stops at the first such candidate and the rest of the night is idle (3 finished). Skipping those keeps the agent busy all night.
+  - Pipelining is worth 1.3x to 2.1x over waiting on the bench; at 20 percent bench the agent is the bottleneck (100 percent busy) and a second cpu adds nothing.
+  - With bench-heavy work an unbounded pipeline leaves 79 candidates coded but never benched; 4 in flight finishes the same 71 with 3 left half-done, and the agent is free 75 percent of the night (time for research scans, which need no cpu). A second cpu is what raises the count there (141).
+  - With 25 percent needing decisions the queue's 112 others all finish under every pipelined plan; the 38 decisions wait for the morning.
+  - A limit of 2 in flight cost a fifth of the count at 50 percent bench (84 against 104 at 4; varied durations need some slack), so the slot count matters.
+- Verdict: **kept** as the night's planning rule (an example and a rule, no kernel change): skip what needs the owner, pipeline coding with benches, cap coding-ahead at about 4 per cpu, and add a cpu when the bench is the bottleneck. The 8-hour estimate also shows how much a queue should hold: about 70 to 120 candidates of tonight's size.
+- Not measured: tonight's real bench share (the run records commit times, not bench time; E281's checkpoints could record it); crashes and retries during the night (E281 measured those separately); a planner that reorders by expected value per minute instead of rank.
+- Run: `cargo run --release --example net_night_plan`.
+- Gates on the branch: kernel lib tests pass (63, 1 ignored); clippy `-D warnings` (all targets) and fmt clean.
+
+### E288 compiled-incremental (the incremental step compiled with Cranelift and clang)
+- Branch / parent: exp/288-compiled-incremental / E287 (exp/287-night-plan)
+- Question: E286 found that rechecking only what a firing touched beats every compiled form of the full scan on large nets, and named compiling the incremental form as the next comparison. Compiled, the readers to recheck after each transition are known at compile time; how much faster is that, what does it cost to compile, and where does it stop working?
+- Hypothesis: compiled straight-line rechecks with an enabled bitset (a popcount scan for the k-th pick) are 2x to 3x faster than the Rust incremental walk; the code grows with the rechecks summed over transitions, so a place read by many transitions (the loop net's cpu slot) makes it grow with the square of the candidates. (Source: E286's "Not measured"; E282's Cranelift mode; the MLIR question, "something similar for execution modes".)
+- Change: none in the kernel. `experiments/net-jit/src/inc.rs` (the separate crate): per transition, the places it changes and the distinct readers of those places; each firing block updates the places, recomputes each reader's test and flips its bit in an enabled bitset, keeping the count; the pick scans words by popcount, clears low bits to the k-th, then a jump table. The same in C for clang -O2. Run with `-- inc`. Every mode is asserted to end in the same marking after the same steps as `Table::walk` and `Table::walk_incremental`.
+- Result (`cargo run --release -- inc` in packages/kernel/experiments/net-jit; ns per step, compile ms in brackets):
+
+  | Net | Rechecks per transition | Table | Incremental (E286) | Cranelift incremental | clang -O2 incremental |
+  |---|---|---|---|---|---|
+  | random 10 x 20 | 8.2 | 80 | 67 | 28 (8) | 26 (238) |
+  | random 100 x 200 | 9.1 | 387 | 102 | 42 (103) | 40 (1,359) |
+  | random 1,000 x 2,000 | 9.2 | 3,016 | 168 | 68 (1,780) | 59 (22,526) |
+  | loop net, 10 candidates | 5.4 | 86 | 43 | 23 (12) | 22 (232) |
+  | loop net, 100 candidates | 41.4 | 557 | 58 | 44 (3,041) | 57 (27,567) |
+  | loop net, 1,000 candidates | 401.4 | 5,651 | 78 | not compiled | not compiled |
+
+  - Compiled, the incremental step is 1.9x to 2.9x faster than E286's Rust form, and 44x to 51x faster than the table on 1,000 x 2,000; Cranelift is within 20 percent of clang at a tenth of the compile time or less.
+  - Against the Rust incremental walk, Cranelift's compile repays after 0.2 M steps (10 x 20), 1.7 M (100 x 200), 18 M (1,000 x 2,000), 0.6 M (loop net, 10) and 210 M (loop net, 100).
+  - On the loop net the cpu slot is read by every `start`, so each `start` and `finish` rechecks every candidate's `start`: 2,007,000 unrolled rechecks at 1,000 candidates. The first run compiled them and the session ran out of memory; the run now skips any net over 1 M rechecks and reports the count.
+- Verdict: **measured**. For the loop's own nets (tens to hundreds of candidates, a thousand or so firings a night) the Rust incremental walk is the mode: nothing to compile and within 1.3x to 2x of the compiled code. Compiling pays only for long simulations of large nets with few readers per place (tens of millions of steps, as in a sweep of E287's plans). A hybrid would keep that gain on the loop net: unrolled rechecks for places with few readers, a loop over a reader table for hub places such as the cpu slot.
+- Not measured: the hybrid; MLIR itself (no MLIR toolchain in this environment; Cranelift and clang stand for a JIT and an ahead-of-time compiler); compiling colored nets without unfolding.
+- Run: `cargo run --release -- inc` in packages/kernel/experiments/net-jit (about 2 minutes, mostly clang).
+- Gates on the branch: no kernel change; the net-jit crate's clippy `-D warnings` and fmt clean; kernel lib tests as on E287 (63, 1 ignored).
+
+### E289 hybrid-rechecks (compiled rechecks unrolled for quiet places, a loop for busy ones)
+- Branch / parent: exp/289-hybrid-rechecks / E288 (exp/288-compiled-incremental)
+- Question: E288's compiled incremental step could not be built for the 1,000-candidate loop net (2,007,000 unrolled rechecks, because the cpu slot is read by every candidate's `start`), and took 2.8 s to compile at 100 candidates. Does unrolling only the readers of places with at most 16 readers, and calling a loop over a reader table for the rest, keep the compiled speed while bounding the code?
+- Hypothesis: the code then grows with the quiet places' readers only (linear in the candidates on the loop net), the compile drops by one to two orders of magnitude, and the step stays near E288's, since the busy places are changed by a minority of firings. (Source: E288's verdict.)
+- Change: none in the kernel. `experiments/net-jit/src/inc.rs`: a hub threshold; places with more readers are rechecked by `recheck_hub`, a loop over flat tables of readers and arcs (a Rust function called from the Cranelift code; a static C function for clang). The threshold is 16; `usize::MAX` is E288's form, run alongside. Every mode is asserted to end in the same marking after the same steps as `Table::walk` and `Table::walk_incremental`.
+- Result (`cargo run --release -- inc` in packages/kernel/experiments/net-jit; ns per step, compile ms in brackets):
+
+  | Net | Incremental (E286) | Cranelift, all unrolled (E288) | Cranelift hybrid | clang hybrid | Unrolled rechecks, hybrid |
+  |---|---|---|---|---|---|
+  | random 10 x 20 | 65 | 29 (8) | 28 (8) | 26 (177) | 163 |
+  | random 100 x 200 | 107 | 41 (96) | 41 (92) | 49 (1,470) | 1,826 |
+  | random 1,000 x 2,000 | 173 | 60 (1,741) | 58 (1,562) | 105 (20,521) | 18,322 |
+  | loop net, 10 candidates | 42 | 23 (15) | 22 (12) | 22 (220) | 270 |
+  | loop net, 100 candidates | 58 | 44 (2,821) | 39 (38) | 49 (3,287) | 800 |
+  | loop net, 1,000 candidates | 83 | not compiled (2,007,000 rechecks) | 53 (466) | 98 (10,905) | 8,000 |
+
+  - On the loop net the hybrid compiles 75 times faster at 100 candidates (38 ms against 2,821) at the same or better speed, and compiles at 1,000 candidates (466 ms, 8,000 unrolled rechecks), where it runs 1.6x faster than the Rust incremental walk.
+  - On random nets, which have no busy places at this threshold, the hybrid is E288's code (the same speed and compile).
+  - Cranelift's hybrid repays its compile against the Rust incremental walk after 2.0 M steps at 100 candidates and 15 M at 1,000.
+  - clang's numbers move between runs at the larger sizes (random 1,000 x 2,000, all unrolled: 96 ns in E288's first run, 59 in its second and 60 here; the hybrid's 105 is one run), so Cranelift is the steadier compiled mode here, besides compiling 10 to 40 times faster.
+- Verdict: **measured**; the hybrid is the compiled mode worth keeping in the separate crate. The order for the loop stays: the Rust incremental walk by default (nothing to compile), and the Cranelift hybrid for simulations of more than a few million steps, such as sweeping E287's plans over many queues.
+- Not measured: other thresholds than 16; moving the compiled walk into the kernel behind an option (it would bring Cranelift into the kernel's build, which E282 kept out); MLIR (no MLIR toolchain here).
+- Run: `cargo run --release -- inc` in packages/kernel/experiments/net-jit (about 3 minutes, mostly clang).
+- Gates on the branch: no kernel change; the net-jit crate's clippy `-D warnings` and fmt clean; kernel lib tests as on E287 (63, 1 ignored).
+
+### E290 source-arcs (which gaps the loop has already followed up)
+- Branch / parent: exp/290-source-arcs / E289 (exp/289-hybrid-rechecks)
+- Question: E275's gap list keeps every "Not measured" line forever, and its test for a gap being taken up (a later entry cites the experiment and shares 3 content words) scored the same as its swap control. E276 said to order by dependencies instead. The loop's entries now name their source (`(Source: E286's "Not measured")`). Can the list tell which gaps a later entry followed up, and is the list itself clean?
+- Hypothesis: an entry that names a gap's experiment together with "Not measured" follows that gap; naming the experiment anywhere in its Source is looser and wrong more often. (Source: E275's verdict and E276's "order by dependencies".)
+- Change: none in the kernel. `examples/loop_common`: `source_ids` (ids in an entry's `(Source: ...)`), `gap_citations` (ids written as `E123's "Not measured"`, "Not built" or "Not tried" in the Question or Hypothesis), `followups(strict)` (of the cited experiment's not-measured lines, the one sharing the most content words with the later entry's Question and Hypothesis). `examples/loop_gaps.rs` prints both rules' pairs and the open count.
+- Found on the way: 12 of the list's 61 "not-measured" gaps were not gaps. They were table cells reading "(not measured)", Hypothesis and Verdict lines quoting another entry's "Not measured", and "the bench does not run batches". `undone_lines` now skips table rows, quoted spans, `(Source: ...)` parentheticals and "does" or "did" before the phrase. That leaves 49. By my reading of all 27 matched lines that do not start with the phrase, 13 are real gaps and all 13 stay. Two false ones remain (E119's "not run before", E133's "Setup, not measured").
+- Result (`cargo run --release --example loop_gaps`; pairs checked by reading each entry):
+
+  | Rule | Gaps marked followed | Right by reading |
+  |---|---|---|
+  | loose: the experiment named in the Source | 9 | 4 |
+  | strict: the gap's "Not measured" named | 5 | 5 |
+
+  - Strict pairs: E269's crash-between-work-and-firing gap by E271, E277's MLIR and native-modes gap by E282, E278's colored nets by E285, E279's whole-marking reads by E280, E286's compiled incremental mode by E288.
+  - The loose rule's misses come from entries that cite an experiment for its result, not for its gap (E284 builds on E283's proposals, E288 on E282's Cranelift mode).
+  - Tonight's run had 7 follow-ups by my reading. The strict rule finds 5. It misses E289, which cites E288's verdict rather than its "Not measured", and E278, which cites E277 without the phrase.
+  - With the cleaned list, E275's hindsight gives 13 percent of next experiments taking up a listed gap, against 14 percent for the swap control: the word test still carries nothing. 19 percent of listed gaps were taken up within 20 (15 before the cleanup).
+- Verdict: **kept** for the loop's tools (examples only, no kernel change). The strict rule is precise enough to mark gaps as followed up: 44 not-measured gaps stay open. It only works for entries that write their source that way, which the loop's entries now do, so it covers the loop's own work and not the older log. Writing `E123's "Not measured"` in the Source is now part of the entry format the loop follows.
+- Not measured: whether the follow-up fully answered the gap (E286's gap names two things, and E288 measured one); a backtest, since only 11 entries in the log have a Source naming an experiment.
+- Run: `cargo run --release --example loop_gaps`.
+- Gates on the branch: kernel lib tests as on E287 (63, 1 ignored); clippy `-D warnings` (all targets) and fmt clean.
+
+### E291 join-options-ablation (E245's join options, retested on today's code)
+- Branch / parent: exp/291-join-options-ablation / E290 (exp/290-source-arcs)
+- Question: the gap list marks E245's kept join options (`plain_writes`, `memo`, `recompute_above`) for an ablation: they were measured before E246 to E250 changed the join path (the pruned diff, E249) and before the faster-joins merge. Does each option still pay on today's code?
+- Hypothesis: the options still cut large batches by about E245's shares, the bytes are unchanged, and `recompute_above` still saves nothing once the other two are on; the small-batch win now comes from the pruned diff. (Source: the gap list's `stale/E245`, by registry.rs's ablate rule.)
+- Change: none. E245's command, unchanged, on this branch (the code of main c92a279 plus the opt-in net module). This is a cloud machine, not E245's Mac, so compare shares, not milliseconds; recomputing takes 2.3 to 2.6 times E245's time here.
+- Result (`cargo run --release --example join_switch -- N 1000 0.4 10 30 100 300 1000 3000`; median ms per batch; every way ended with the same rows at both sizes):
+
+  | 20,000 rows | 10 | 100 | 1,000 | 3,000 | Bytes added |
+  |---|---|---|---|---|---|
+  | Update | 40 | 231 | 871 | 1,209 | 22.1 MB |
+  | `plain_writes` | 42 | 140 | 383 | 502 | 36.9 MB |
+  | `memo` | 36 | 145 | 440 | 543 | 22.1 MB |
+  | Both | 37 | 127 | 304 | 371 | 36.9 MB |
+  | Both + pruned diff (E249) | 19 | 107 | 325 | 421 | 36.9 MB |
+  | Both + `recompute_above: 0.4` | 39 | 137 | 384 | 375 | 36.9 MB |
+  | Recompute | 373 | 393 | 429 | 442 | 28.0 MB |
+  | Recompute, both + `read_once` | 246 | 263 | 297 | 304 | 28.0 MB |
+
+  | 100,000 rows | 10 | 100 | 1,000 | 3,000 | Bytes added |
+  |---|---|---|---|---|---|
+  | Update | 115 | 353 | 1,864 | 3,178 | 46.9 MB |
+  | `plain_writes` | 141 | 303 | 1,128 | 1,581 | 99.3 MB |
+  | `memo` | 117 | 301 | 1,214 | 1,925 | 46.9 MB |
+  | Both | 119 | 275 | 1,169 | 1,599 | 99.3 MB |
+  | Both + pruned diff (E249) | 32 | 195 | 1,050 | 1,634 | 99.3 MB |
+  | Both + `recompute_above: 0.4` | 142 | 322 | 1,786 | 1,783 | 106.6 MB |
+  | Recompute | 2,386 | 2,278 | 2,277 | 2,245 | 109.1 MB |
+  | Recompute, both + `read_once` | 1,482 | 1,427 | 1,433 | 1,418 | 109.1 MB |
+
+  - Bytes are E245's to the byte at every way and size.
+  - From 100 changes up, `memo` alone cuts an update by 15 to 55 percent and both options by 22 to 69 percent, in line with E245 (19 to 45 and 26 to 63).
+  - At 10 and 30 changes the options no longer help: within a few percent at 20,000 rows, and up to 23 percent slower with `plain_writes` at 100,000. On E245's Mac `memo` cut 10 changes at 100,000 rows from 54 to 43 ms. The pruned diff is now what wins small batches: 72 percent less at 10 changes on 100,000 rows.
+  - `recompute_above: 0.4` again saves nothing with the other two on (1,783 against 1,599 ms at 3,000 changes on 100,000 rows), so the same advice holds.
+  - The 100,000-row run finished in 5.5 minutes: E245's stall fix (`read_once` in the harness) still holds.
+- Verdict: **kept** (E245's verdict stands, options off by default). For large batches, `memo` (no byte cost) and `plain_writes` (twice the bytes) still pay. For small batches, use the pruned diff and leave the other options off. Do not combine `recompute_above` with them.
+- Not measured: the Mac (the session there is closed); durable stores, as in E245.
+- Run: `cargo run --release --example join_switch -- 20000 1000 0.4 10 30 100 300 1000 3000`, and again with 100000 (7 minutes together here).
+- Gates on the branch: no code change.
+
+### E292 two-writers (two writers firing one net on one database)
+- Branch / parent: exp/292-two-writers / E291 (exp/291-join-options-ablation)
+- Question: E269 left concurrency open: two writers firing at once on one database. A night with two workers has two writers, each reading the head, firing on what it read and committing. What does each way of committing do with that, and which keeps the net's tokens right? (Source: E269's "Not measured": "concurrency (two writers firing at once on one database)".)
+- Hypothesis: `db_commit` builds on whatever the ref points at, so the second writer's commit replaces the first one's database and its firing is lost; a branch per writer plus `merge` (E265) catches it, since both sides write the same marking keys; a commit that names the head it read from refuses the second writer, and a retry keeps both.
+- Change:
+  - `Repo::db_commit_at(name, base, db, message)` (new, in `db.rs`): commits only if the ref still points at `base`, the commit `db` was read from, and returns `Error::RefConflict` otherwise. `db_commit` is unchanged.
+  - A race fixed, found by this experiment: with 8 writers as siblings on one SharedStore, a firing failed with `NotFound` now and then (in every run at 8 writers, never at 1 to 4). Writing content can drop a stored copy that a new derivation makes redundant, after `is_needed` checks that no other stored encoding needs it. That check lists the store's ids and then reads each one, and an object another handle deletes between the listing and the read failed the whole write. `is_needed` (`dict.rs`) and the ledger's build (`repo.rs`), which list and read the same way, now skip an object deleted since the listing. With the `dict.rs` part removed, the failure comes back in the first run.
+  - `examples/net_two_writers.rs`; a test, `commit_at_refuses_a_stale_database` (`tests/db.rs`).
+- Result, part 1 (two writers read one head, A starts candidate a, B starts b; the loop net, `cpu` holding 1 or 2):
+
+  | Way | cpu 1 (correct: a or b running, cpu 0) | cpu 2 (correct: a and b running, cpu 0) |
+  |---|---|---|
+  | `db_commit` both | b running, cpu 0; A's firing gone, replay equal | b running, cpu 1; A's firing gone, replay equal |
+  | a branch each, `merge`, plain marking | merged: a and b running, cpu 0; replay fails | merged: a and b running, cpu 1; replay fails |
+  | a branch each, `merge`, sum hash (E279) | refused: conflict on the hash key | refused: conflict on the hash key |
+  | `db_commit_at`, then a retry | B refused; B's retry finds start not enabled; a running | B refused; B's retry fires; a and b running, cpu 0 |
+
+  - `db_commit` loses a firing silently, and the head stays consistent, so nothing checks it.
+  - The plain merge is worse: both writers write the same count (`cpu` from 2 to 1, or removed from 1), the same operation on the same key, which merge reads as one write made twice. The merged marking runs two candidates on one cpu. Only replay notices.
+  - The sum hash makes the same merge conflict, because both sides write the hash key with different values.
+- Result, part 2 (W threads take 200 candidates through start, the work and finish, committing after every firing; cpu 2; each run stops after 20 s; MemStore). With 40 ms of work:
+
+  | Commit | W | Measured | Work runs | Starts lost | Most at once | Refused | Time |
+  |---|---|---|---|---|---|---|---|
+  | `db_commit` | 1 | 200 | 200 | 0 | 1 | 0 | 18.6 s |
+  | `db_commit` | 2 | 199 | 401 | 197 | 2 | 1 | stopped at 20 s |
+  | `db_commit` | 4 | 193 | 767 | 565 | 4 | 8 | stopped |
+  | `db_commit` | 8 | 119 | 946 | 821 | 8 | 8 | stopped |
+  | `db_commit_at` | 2 | 200 | 200 | 0 | 2 | 295 | 15.1 s |
+  | `db_commit_at` | 4 | 200 | 200 | 0 | 2 | 844 | 13.8 s |
+  | `db_commit_at` | 8 | 169 | 169 | 0 | 2 | 1,612 | stopped |
+  | one lock | 2 | 200 | 200 | 0 | 2 | 0 | 10.7 s |
+  | one lock | 4 | 200 | 200 | 0 | 1 | 0 | 12.9 s |
+  | one lock | 8 | 200 | 200 | 0 | 1 | 0 | 16.7 s |
+
+  - With `db_commit` and two writers or more, half or more of the work is lost and redone, up to 8 runs go at once on 2 cpus, and a candidate whose finish was lost stays running with nobody to finish it, so the night never ends. Replay is equal throughout: the head is one writer's consistent history.
+  - `db_commit_at` keeps every count right at every W. Refusals grow with W: at 8 writers each firing is refused about 10 times, and the run did not finish in 20 s.
+  - One lock held from reading the head to the commit (the work outside it) is right at every W and fastest at 2 writers. More writers spend the lock reading heads with nothing to start.
+  - With 2 ms of work (as in the first runs) nothing overlaps at all: one firing takes about 17 ms here, so the commit path, not the work, sets the pace (E293 follows that up).
+- Verdict: **kept** (`db_commit_at` is new and changes nothing else; the race fix is a fix, on this branch only). For a loop with more than one worker: one committer (a lock, or one thread that fires for the others) and the work in parallel; `db_commit_at` where writers cannot share a lock, such as two processes; never a plain merge of two branches that fired one net, unless the sum hash is on.
+- Not measured: FsStore and two processes (MemStore threads here); a merge that resolves two firings instead of refusing them; two more races found by reading `repo.rs`, not seen in a run: a ledger built while another handle records a derivation can miss it, and a handle that writes a record another handle already wrote does not add it to the ledger.
+- Run: `cargo run --release --example net_two_writers`, and `PART1=0 WORK_MS=40 cargo run --release --example net_two_writers` (5 minutes together here).
+
+### E293 firing-cost (where one firing's time goes)
+- Branch / parent: exp/293-firing-cost / E292 (exp/292-two-writers)
+- Question: in E292 one firing of a commit-per-firing runner took about 17 ms on a MemStore, longer than most of the loop's own steps, so the commit path set the pace and runs did not overlap. Where does the time go, and what do the existing options (`read_weight`, the sum hash of E279) do to it? (Source: E292's part 2, "the commit path, not the work, sets the pace".)
+- Hypothesis: the time is in reads, not in the commit: the kernel stores most graph chunks as slices of earlier chunks to save bytes (`read_weight` 0.001), so every key read rebuilds its chunks. A higher `read_weight` stores them plainly and reads faster for more bytes; the sum hash saves the two whole-marking reads in `net_fire`.
+- Change: none to the kernel. `examples/net_firing_cost.rs` times each step of one writer taking N candidates through start and finish (head, marking, next firing, fire, commit), a thousand reads of one key, and the bytes written per firing.
+- Result (MemStore, one writer; ms per firing unless marked):
+
+  | N | `read_weight` | Hash | One key read | Firing | Head | Marking | Next | Fire | Commit | Bytes per firing |
+  |---|---|---|---|---|---|---|---|---|---|---|
+  | 200 | 0.001 (default) | plain | 464 µs | 29.4 | 0.15 | 4.19 | 11.27 | 13.70 | 0.13 | 7,643 |
+  | 200 | 0.1 | plain | 412 µs | 29.4 | 0.14 | 4.17 | 11.28 | 13.71 | 0.13 | 7,557 |
+  | 200 | 1 | plain | 46 µs | 10.0 | 0.12 | 3.12 | 1.67 | 4.97 | 0.12 | 17,140 |
+  | 200 | 10 | plain | 46 µs | 9.3 | 0.12 | 3.11 | 1.67 | 4.34 | 0.11 | 17,140 |
+  | 200 | 0.001 | sum | 414 µs | 26.2 | 0.17 | 4.31 | 11.17 | 10.42 | 0.12 | 7,647 |
+  | 200 | 1 | sum | 45 µs | 7.2 | 0.12 | 3.20 | 1.70 | 2.06 | 0.11 | 17,350 |
+  | 1,000 | 0.001 | plain | 442 µs | 70.8 | 0.23 | 21.93 | 13.63 | 34.78 | 0.24 | 9,132 |
+  | 1,000 | 1 | plain | 47 µs | 41.3 | 0.17 | 16.61 | 2.45 | 21.88 | 0.22 | 22,734 |
+  | 1,000 | 0.001 | sum | 476 µs | 48.7 | 0.23 | 21.65 | 13.34 | 13.35 | 0.13 | 9,373 |
+  | 1,000 | 1 | sum | 48 µs | 23.2 | 0.17 | 16.43 | 2.37 | 4.15 | 0.12 | 23,176 |
+
+  - The commit is a tenth of a millisecond. Reading is the cost: one key takes 0.4 to 0.5 ms by default, because its chunks are rebuilt from slices on every read.
+  - `read_weight` 1 makes a key read 10 times faster and a firing 3 to 4 times faster at 200 candidates, for 2.2 to 2.5 times the bytes per firing. Above 1 changes little.
+  - The sum hash cuts the fire step 2 to 5 times (it reads the changed keys, not the whole marking twice). With `read_weight` 1, a firing at 200 candidates takes 7.2 ms instead of 29.4.
+  - What is left at 1,000 candidates is the runner's own whole-marking read (16 ms) for its done check, which grows with the tokens; a count of the measured place would do.
+- Verdict: **measured** (no kernel change). For a loop runner, `read_weight` 1 and the sum hash are worth their bytes; the bytes are the default's trade, so both stay options. The reads are slow because nothing keeps a rebuilt chunk; E294 tries a read cache that keeps the default's bytes.
+- Not measured: FsStore (reads from disk add to every row); the kept counts of E233 for the done check; `read_weight` between 0.1 and 1.
+- Run: `cargo run --release --example net_firing_cost -- 200 1000` (14 minutes here).
+
+### E294 read-cache (keep rebuilt contents across reads)
+- Branch / parent: exp/294-read-cache / E293 (exp/293-firing-cost)
+- Question: E293 found a key read takes 0.45 ms by default because its graph chunks are rebuilt from slices on every read, and the faster `read_weight` costs 2.2 to 2.5 times the bytes. Can a cache of rebuilt contents give the fast reads at the default's bytes? (Source: E293's verdict.)
+- Hypothesis: a content's bytes never change for its id, so a kept copy is always right. A loop runner reads the same few chunks for every firing, so a cache of a few megabytes serves nearly every read, and writes store exactly the same bytes.
+- Change: `Repo::read_cache` (bytes; 0, the default, keeps nothing). `read_content`, and every read built on it, keeps each content it reads or rebuilds, after checking it against its id, and drops the oldest past the limit. Siblings share the cache; gc empties it, so content gc deleted is not served. A write's own checks and fsck never use it: they count decode work and test which stored copies a derivation depends on, and a kept copy would hide both (the first version served them too; it gave the same bytes in this benchmark, but a kept copy could let a write drop a stored copy that a kept content still depends on). `examples/net_firing_cost.rs` takes `CACHE=1` for these rows; `tests/read_cache.rs`.
+- Result (`CACHE=1 cargo run --release --example net_firing_cost -- 200`, then `-- 1000`; MemStore, one writer, 64 MB cache; ms per firing):
+
+  | N | `read_weight` | Hash | Cache | One key read | Firing | Marking | Next | Fire | Bytes per firing |
+  |---|---|---|---|---|---|---|---|---|---|
+  | 200 | 0.001 | plain | off | 499 µs | 29.3 | 4.19 | 11.23 | 13.65 | 7,643 |
+  | 200 | 0.001 | plain | on | 10 µs | 7.0 | 0.24 | 0.31 | 6.32 | 7,643 |
+  | 200 | 0.001 | sum | on | 10 µs | 7.5 | 0.25 | 0.32 | 6.80 | 7,647 |
+  | 200 | 1 | sum | off | 46 µs | 7.0 | 3.13 | 1.69 | 2.00 | 17,350 |
+  | 200 | 1 | sum | on | 10 µs | 2.4 | 0.21 | 0.29 | 1.76 | 17,350 |
+  | 1,000 | 0.001 | plain | off | 435 µs | 70.2 | 21.72 | 13.52 | 34.51 | 9,132 |
+  | 1,000 | 0.001 | plain | on | 12 µs | 12.1 | 1.21 | 0.75 | 9.84 | 9,132 |
+  | 1,000 | 0.001 | sum | on | 13 µs | 10.7 | 1.10 | 0.67 | 8.67 | 9,373 |
+  | 1,000 | 1 | sum | off | 62 µs | 23.1 | 16.44 | 2.35 | 4.07 | 23,176 |
+  | 1,000 | 1 | sum | on | 14 µs | 5.5 | 1.07 | 0.63 | 3.62 | 23,176 |
+
+  - At the default `read_weight`, the cache makes a key read 35 to 50 times faster and a firing 4 to 6 times faster, with the same bytes per firing to the byte.
+  - At 1,000 candidates it beats `read_weight` 1 without the cache (12.1 against 23.1 ms) at 40 percent of the bytes; at 200 they are even (7.0 ms each).
+  - Both together are fastest (2.4 and 5.5 ms), for the bytes `read_weight` 1 costs.
+  - What is left at the default weight is the write: each new chunk is matched against old ones for slices (6 to 10 ms), and those checks read the store.
+- Verdict: **kept** (an option, off by default). The trade is memory, up to the limit set, and one behaviour: a plain read of content kept before the store was damaged returns the kept bytes, which are right, where it would have returned an error; fsck still reports the damage. For the loop runner: 64 MB with the sum hash, and `read_weight` 1 as well when bytes do not matter.
+- Not measured: how much of the 64 MB a night uses; FsStore; a shared cache's lock under many reader threads.
+- Run: as above (about 12 minutes together here).
+- Gates on the branch: fmt, clippy and the kernel's tests pass with the cache off (its default). With the default forced to 64 MB for a check, every test passes but three, and all three remove or damage stored files behind the repo's back after reading them, then expect the read to fail: `checked_raw_reads_check_their_crc`, `derivations_heal_a_corrupt_copy` and `derivation_cycles_are_errors`. That is the behaviour the verdict names; their fsck checks pass.
+
+### E295 tuned-writers (E292's writers with E293 and E294's options)
+- Branch / parent: exp/295-tuned-writers / E294 (exp/294-read-cache)
+- Question: in E292 a firing took about 17 ms, so with two writers the commit path set the pace and runs barely overlapped. With `read_weight` 1, a 64 MB read cache and the sum hash, do two workers now fill both cpus, and does `db_commit_at` finish at 8 writers?
+- Hypothesis: a firing drops to about 2 ms (E294), so with 40 ms of work two writers take about half the time of one, and refusals stop starving `db_commit_at`.
+- Change: `TUNED=1` in `examples/net_two_writers.rs` sets the three options for part 2. Nothing in the kernel.
+- Result (`PART1=0 TUNED=1 WORK_MS=40 cargo run --release --example net_two_writers`, and `WORK_MS=2`; 200 candidates, cpu 2, MemStore; time to the last finish, or stopped at 20 s):
+
+  | Commit | W | 40 ms work: time | Most at once | Refused | 2 ms work: time | E292 (untuned), 40 ms |
+  |---|---|---|---|---|---|---|
+  | `db_commit` | 1 | 9.1 s | 1 | 0 | 1.5 s | 18.6 s |
+  | `db_commit` | 2 | 5.1 s, 15 runs lost | 2 | 0 | stopped, 183 lost | stopped, 197 lost |
+  | `db_commit` | 8 | stopped, 1,175 lost | 8 | 35 | stopped, 1,290 lost | stopped, 821 lost |
+  | `db_commit_at` | 2 | 4.6 s | 2 | 8 | 1.3 s | 15.1 s |
+  | `db_commit_at` | 4 | 4.6 s | 2 | 430 | 1.2 s | 13.8 s |
+  | `db_commit_at` | 8 | 4.8 s | 2 | 1,188 | 1.7 s | stopped |
+  | one lock | 2 | 4.7 s | 2 | 0 | 1.0 s | 10.7 s |
+  | one lock | 4 | 4.7 s | 2 | 0 | 1.2 s | 12.9 s |
+  | one lock | 8 | 4.9 s | 2 | 0 | 1.4 s | 16.7 s |
+
+  - Tuned, two writers fill both cpus: 4.6 to 4.7 s against 9.1 s for one, close to the 4.0 s of work. Untuned, the best two-writer run took 10.7 s.
+  - `db_commit_at` now finishes at every W, 8 writers included; one lock needs no retries and is as fast.
+  - `db_commit` still loses work with two writers or more (15 runs at 2 writers with 40 ms of work, and every run stopped at 20 s with 2 ms of work), so faster firings make it no safer.
+  - Replay was equal in every run.
+- Verdict: **measured** (no kernel change). The loop runner's settings: `read_weight` 1, `read_cache` 64 MB, `net_init_sum`, one committer (a lock or `db_commit_at`), the work outside it.
+- Not measured: FsStore and processes; more cpus than 2; work that varies in length.
+- Run: as above (2 minutes together here).
+
+### E296 ledger-races (the two races E292 found by reading)
+- Branch / parent: exp/296-ledger-races / E295 (exp/295-tuned-writers)
+- Question: E292 read two more races in `repo.rs` that no run had shown. Do they happen with several writers on one store, and does a change fix the one that does? (Source: E292's "Not measured": "two more races found by reading `repo.rs`, not seen in a run".)
+- Hypothesis:
+  - Race 1, a ledger build that lists the store while another handle records a derivation and so installs a ledger without it: it should not happen through `put_content`, which reads the ledger (`has_content`) before it writes, so the ledger is always built before any record. Only a reset (gc, repack) during other writes could reach it.
+  - Race 2, a handle writing a record that another handle wrote first does not add it to the shared ledger: with writers putting the same contents, a reader right after its own put sometimes finds the content neither stored nor in the ledger.
+- Change: `record` adds the derivation to the shared ledger whether or not this handle's write of the record was the first (`insert` keeps one copy). `examples/ledger_race.rs`: each trial makes a store of 400 blobs and a fresh handle with no ledger, then 8 siblings each put 40 near-copies of the blobs (stored as slices of them) and read each back at once; afterwards every content is read again through the shared ledger and through a fresh handle. `SAME=1` has every writer put the same contents.
+- Result (`SAME=1 cargo run --release --example ledger_race -- 200`, three runs each way; `-- 100` with different contents):
+
+  | Writers put | `record` | Trials | Stored as derivations | Reads failed right after the put | After the writers stopped | Through a fresh handle |
+  |---|---|---|---|---|---|---|
+  | the same contents | as on main | 3 x 200 | 13,514 to 14,473 per run | 4, 20 and 11 | 0 | 0 |
+  | the same contents | adds every time | 3 x 200 | 12,755 to 13,589 per run | 0, 0 and 0 | 0 | 0 |
+  | different contents | as on main | 110 | 35,200 | 0 | 0 | 0 |
+
+  - Race 2 happens: 35 failed reads in 600 trials, every one transient (the other handle added the record a moment later), and none once `record` always adds.
+  - Race 1 was not seen in 110 trials of different contents, as expected: every writer builds the ledger before its first record.
+- Verdict: **kept** (a fix, on this branch only; it changes no bytes and takes the ledger lock on every record instead of on new ones only). Race 1 is left as it is: reaching it needs a gc or repack during other writes, which nothing does concurrently yet.
+- Not measured: race 1 under a concurrent gc or repack; FsStore.
+- Run: as above (about 2 minutes here).
+
+### E297 hub-threshold (how many readers make a place a hub)
+- Branch / parent: exp/297-hub-threshold / E296 (exp/296-ledger-races)
+- Question: E289 rechecks places with over 16 readers by a loop over tables and unrolls the rest. Is 16 the right threshold? (Source: E289's "Not measured": "other thresholds than 16".)
+- Hypothesis: the loop net has a few very busy places (every candidate reads them) and many places read by one or two transitions, so any threshold between those two sizes should give the same code; on random nets, where no place is busy, a low threshold should cut compile time and cost step time.
+- Change: none to the kernel. `experiments/net-jit` gains `-- hub`: for each net and each threshold (1, 2, 4, 8, 16, 32, 64, 256, none), the unrolled rechecks, the Cranelift compile time and the best of three runs per step, each checked equal to the incremental walk of E286.
+- Result (`cargo run --release -- hub` in `experiments/net-jit`, ns per step):
+
+  | Net | Incremental, no compile | Threshold 1 | 4 | 8 | 16 | 64 | 256 | none |
+  |---|---|---|---|---|---|---|---|---|
+  | random 100 x 200 | 104 | 79 (14 ms) | 47 (65 ms) | 41 (94 ms) | 40 (96 ms) | 41 | 40 | 40 (97 ms) |
+  | random 1000 x 2000 | 170 | 122 (145 ms) | 69 (1.1 s) | 55 (1.8 s) | 55 (1.7 s) | 55 | 55 | 55 (1.7 s) |
+  | loop net, 100 candidates | 59 | 39 (44 ms) | 39 | 39 | 39 (39 ms) | 39 (39 ms) | 42 (4.2 s) | 43 (4.1 s) |
+  | loop net, 1000 candidates | 82 | 52 (0.5 s) | 51 | 52 | 52 (0.5 s) | 52 | 52 (0.5 s) | not compiled (2 million rechecks) |
+
+  - On the loop nets every threshold from 1 to 64 gives the same code: the busy places have hundreds of readers or more, the rest one or two. At 100 candidates the busy places have under 256 readers, so 256 unrolls them again and compiling takes 100 times longer for a slower step.
+  - On random nets no place has 8 readers, so 8 and up unroll everything; lower thresholds trade step time for compile time (threshold 1: 145 ms and 122 ns against 1.7 s and 55 ns at 1000 x 2000).
+- Verdict: **measured** (no change). 16 stays: it sits inside the wide flat range of the loop's own nets and leaves small-degree random nets fully unrolled. A threshold of 1 or 2 is the setting for a quick compile of a big net that will run few steps.
+- Not measured: nets whose busy places have 16 to 256 readers (the knee would move with them); clang at each threshold.
+- Run: as above (about 3 minutes here).
+
+### E298 writer-processes (worker processes on one store on disk)
+- Branch / parent: exp/298-writer-processes / E297 (exp/297-hub-threshold)
+- Question: E292 to E295 ran every writer as a thread sharing one handle's ledger on a MemStore. A loop runner more likely runs a process per worker on an FsStore, each with its own handle. Does that work? (Source: E295's "Not measured": "FsStore and processes".)
+- Hypothesis: the ref lock (E122) makes `db_commit_at` safe across processes, so the results should match E295's threads.
+- Change:
+  - `examples/net_processes.rs`: starts W copies of itself on one FsStore directory, each taking the loop net's 100 candidates through start, 40 ms of work and finish with `db_commit_at` or `db_commit`; the parent reads the head through a fresh handle (measured, runs, lost starts, refused commits, errors, replay, fsck). A worker that gets an error carries on with a fresh handle, up to 20 errors.
+  - New option `Repo::refresh_ledger` (off): when content is neither stored nor derivable, list the store once per read, read the derivation records this handle's ledger has not seen, and try again. The ledger keeps the ids it has looked at.
+  - `tests/refresh_ledger.rs`: two handles on one directory; without the option the second handle's derivation is NotFound for the first, with it the first reads it, and missing content is still NotFound.
+- Result (`cargo run --release --example net_processes -- 100`, cpu 2, 4 cores here):
+
+  | Settings | Commit | W | Measured | Errors | Refused commits | Time | Replay, fsck |
+  |---|---|---|---|---|---|---|---|
+  | defaults | `db_commit_at` | 1 | 100 | 0 | 0 | 11.7 to 12.1 s | equal, 0 |
+  | defaults | `db_commit_at` | 2 | 100 | 21 in every run (the second worker gives up) | 21 | 11.7 to 13.0 s | equal, 0 |
+  | defaults | `db_commit_at` | 4 | 100 | 3 workers fail | 0 | 12.3 s | equal, 0 |
+  | defaults, `refresh_ledger` | `db_commit_at` | 2 | 100 | 0 | 189 to 191 | 11.2 to 12.7 s | equal, 0 |
+  | defaults, `refresh_ledger` | `db_commit_at` | 4 | 100 | 0 | 484 | 12.8 s | equal, 0 |
+  | defaults, `refresh_ledger` | `db_commit` | 2 and 4 | 99 | 0 | 12 and 34 | 30 s, stopped (87 and 255 starts lost) | equal, 0 |
+  | E295's tuning | `db_commit_at` | 1 | 100 | 0 | 0 | 7.5 s | equal, 0 |
+  | E295's tuning | `db_commit_at` | 2 | 100 | 0 | 36 to 37 | 3.9 s | equal, 0 |
+  | E295's tuning, `refresh_ledger` | `db_commit_at` | 4 | 100 | 0 | 267 | 3.8 s | equal, 0 |
+
+  - With the defaults, a second process cannot read what the first commits: the first stores each new database partly as slices (derivations), and the second's ledger, built when it opened, never learns of them. Every read fails with NotFound until the handle is dropped, and a fresh handle fails again on the next commit. The result stays right (one worker does all the work), but the other workers are lost.
+  - `refresh_ledger` fixes the reads: no errors at 2 or 4 processes. At the default `read_weight` the extra workers still save no time: each firing costs about 40 ms on FsStore, so most commits are refused and redone.
+  - E295's tuning (`read_weight` 1, read cache, sum hash) avoids the problem without the option, because content is stored whole and no derivation is involved, and halves the time with 2 processes.
+  - `db_commit` still loses work across processes, as with threads.
+- Verdict: **kept** (`refresh_ledger`, off by default: it lists the store on a read of content that is really missing). For worker processes: E295's tuning and `db_commit_at`, or `refresh_ledger` where the default read weight is wanted. Turned on for the whole kernel suite, every test passes.
+- Not measured: the drop at ingest (`apply_candidate`) when another process records a derivation that needs the copy between the scan and the delete (found by reading; fsck found nothing in these runs); `needed_index` across processes (documented as single-writer); FsStore opened deferred.
+- Run: as above (about 4 minutes).
+
+### E299 ingest-processes (processes putting near-copies of the same contents)
+- Branch / parent: exp/299-ingest-processes / E298 (exp/298-writer-processes)
+- Question: E296 found and fixed a ledger race between threads sharing one handle. Processes share only the directory, and a put can drop a stored copy that it replaces with a derivation (a template fill). Do concurrent puts from several processes on one FsStore fail or lose content? (Source: E298's "Not measured": "the drop at ingest when another process records a derivation that needs the copy".)
+- Hypothesis: content is never lost, because a dropped copy stays derivable and the drop checks that no stored encoding needs it; puts may fail where two processes drop the same copy.
+- Change:
+  - `examples/ingest_processes.rs`: W copies of itself on one store seeded with 24 blobs; each puts 60 near-copies of blobs the others edit too (with `refresh_ledger`, E298) and reads each back; then a fresh handle reads every put and every seed, and fsck runs.
+  - `apply_candidate` treats a drop of a copy that is already gone as done. MemStore's delete of a missing id succeeds; FsStore's returned NotFound, so the second process to drop a copy failed its whole put (after recording its derivations).
+  - FsStore's temporary file for a write is now unique per write, not only per process. The new test found that two handles on one directory in one process (two threads) shared one name, so one renamed the other's half-written file into place under its own id: a Corrupt object.
+  - `tests/refresh_ledger.rs`: 4 handles on one directory on 4 threads putting near-copies at once, every put and seed read back through a fresh handle, fsck clean. It fails without either change.
+- Result (`cargo run --release --example ingest_processes -- 20`, and `W=8 ... -- 10`):
+
+  | Processes | Change | Puts | Stored as derivations | Put errors | Unreadable afterwards | fsck |
+  |---|---|---|---|---|---|---|
+  | 4 | as on E298 | 4,800 | 3,362 | 1,345 (28%), all "object not found" on the drop | 0 | 0 |
+  | 4 | drop of a missing copy is done | 4,800 | 4,702 to 4,707 | 0 | 0 | 0 |
+  | 8 | as on E298 | 4,800 | 3,133 | 1,336 | 0 | 0 |
+  | 8 | drop of a missing copy is done | 4,800 | 4,507 | 0 | 0 | 0 |
+
+  - Nothing was lost in any run: every put and every seed reads back through a fresh handle and fsck is clean, so the drop's own check held across processes.
+  - The failed puts were real failures for the caller: a loop runner would have seen 28% of its writes error out.
+  - The shared temporary name never happens across processes (each has its own id); it needs two FsStore handles in one process, which `SharedStore` (one handle, siblings) avoids.
+- Verdict: **kept** (two fixes, both unconditional: neither has a cost). The kernel suite passes.
+- Not measured: FsStore opened deferred (E227) across processes; a gc or repack during other writes.
+- Run: as above (about 3 minutes).
+
+### E300 deferred-drops (a crash with deferred syncing after a put that drops a copy)
+- Branch / parent: exp/300-deferred-drops / E299 (exp/299-ingest-processes)
+- Question: with `FsStore::open_deferred` (E227, used by the live server's deferred sync), E299's processes sometimes could not read their own puts back. Why, and does the same thing lose content after a crash? (Source: E299's "Not measured": "FsStore opened deferred across processes".)
+- Hypothesis: E227 makes new objects durable only at the next ref move, but a put that replaces a stored copy with a derivation (a template fill) deletes that copy at once. Until the move, the copy is gone from disk and what replaces it exists only as temporary files. Another process cannot read it meanwhile, and a crash before the move loses it.
+- Change:
+  - FsStore, deferred only: a delete of a stored object marks it as dropping. It reads as gone at once (`has`, `read`, `read_head`, `stored_len`, `ids` and `ids_with_prefix` leave it out), and its file is removed in `sync`, after the waiting objects are durable and renamed into place. Writing it again before then keeps the file.
+  - `tests/deferred_drop.rs`: a deferred handle puts 240 near-copies of 24 stored blobs (every blob's copy is dropped), then dies without syncing; a fresh handle must read every blob and fsck must be clean. A second test syncs and checks that the copies are removed and everything reads.
+  - `DEFERRED=1` for `ingest_processes` and `net_processes`.
+- Result:
+
+  | Case | Before | After |
+  |---|---|---|
+  | crash after 240 deferred puts (`tests/deferred_drop.rs`) | all 24 stored blobs lost | none lost, fsck clean |
+  | 4 deferred processes x 60 puts, 20 trials (`DEFERRED=1 ... ingest_processes -- 20`) | 12 reads of a process's own put failed | 0 failed; 0 unreadable afterwards; fsck 0 |
+  | loop net, 2 and 4 deferred processes (`DEFERRED=1 ... net_processes`) | no errors with `refresh_ledger` or the E295 tuning (11.1 to 10.8 s untuned; 6.4 to 3.2 s tuned) | unchanged |
+
+  - The loss needs only one process: any deferred put that picks a template fill over a stored copy, then a crash before the next commit. Without a crash nothing was lost, since the drop on sync made the copy derivable again.
+  - A gc on a deferred handle now frees its space at the next sync instead of at once.
+- Verdict: **kept** (a fix, deferred mode only; `open` is unchanged). The kernel suite passes.
+- Not measured: a crash in the middle of `sync` itself (between the renames and the removals: the removals come last, so it leaves extra copies, not missing ones); the hot and cold branches (E261 to E268), which also change `store.rs` and `ingest.rs` and will need merging with this.
+- Run: `cargo test --release --test deferred_drop`, and as above (about 2 minutes).
+
+### E301 killed-workers (worker processes killed in the middle of the loop)
+- Branch / parent: exp/301-killed-workers / E300 (exp/300-deferred-drops)
+- Question: on a night away, workers die (sleep, an out-of-memory kill). With E298 to E300's processes on one FsStore, does a SIGKILL at any moment leave the store and the net sound, and does the night go on? (Source: E281 measured checkpoints within one run, not a worker dying between firings; E298's processes never died.)
+- Hypothesis: the store stays sound (refs move by compare-and-swap, objects by rename), but a candidate a dead worker had started stays in `running` and keeps its cpu token, so after as many deaths as cpu tokens no candidate can start.
+- Change: none to the kernel. `examples/net_kill.rs`: W workers (as E298, with E295's tuning and `refresh_ledger`) take 100 candidates through start, 40 ms of work and finish with its output (`net_fire_output`, E271); every KILL_MS one worker is killed with SIGKILL and a new one started. The loop net gains `requeue: running -> queued, cpu`. With `REQUEUE=1`, a supervisor (the parent) requeues, after each death, every running candidate whose latest start was the dead worker's. At the end the parent requeues what is left, W new workers finish without kills, and every output is checked.
+- Result (`cargo run --release --example net_kill -- 100`; first pass stops at 120 s):
+
+  | Workers | A kill every | Supervisor | Deferred | Kills | Measured in the first pass | Left stranded | After requeue | Temporary files left |
+  |---|---|---|---|---|---|---|---|---|
+  | 2 | never | no | no | 0 | 100 in 4.7 s | 0 | 100 | 0 |
+  | 2 | 700 ms | no | no | 170 | 60, then stalled | 2 | 100 | 2 |
+  | 2 | 700 ms | no | yes | 170 | 39, then stalled | 2 | 100 | 0 |
+  | 4 | 200 ms | no | no | 590 | 5, then stalled | 2 | 100 | 2 |
+  | 2 | 700 ms | yes | no | 7 | 100 in 5.4 s (4 requeued) | 0 | 100 | 2 |
+  | 2 | 700 ms | yes | yes | 5 | 100 in 4.0 s (3 requeued) | 0 | 100 | 26 |
+  | 2 | 200 ms | yes | no | 593 | 100 (26 requeued) | 0 | 100 | 14 |
+  | 2 | 200 ms | yes | yes | 593 | 100 (17 requeued) | 0 | 100 | 110 |
+  | 4 | 200 ms | yes | no | 594 | 100 (4 requeued) | 0 | 100 | 10 |
+
+  - In every run the store and the net stayed sound: replay equal, fsck clean, every output right and readable, no errors.
+  - Without a supervisor the night stalls once two candidates are stranded (the net has 2 cpu tokens): 5 to 60 of 100 measured, and nothing more until someone requeues.
+  - With one, 100 of 100 are measured; at a kill every 200 ms the first pass ran to 120 s only because new workers were killed again before they could stop idle.
+  - Killed processes leave temporary files: `.tmp-*` from an interrupted write, and with `open_deferred` the `.pending-*` files of everything not yet synced (up to 110). They are never read, but nothing removes them.
+- Verdict: **kept** (example only; no kernel change). A loop runner needs a supervisor that requeues a dead worker's runs, with `requeue` in the loop net; E287's plan assumed workers never die.
+- Not measured: workers on other machines, where a supervisor cannot see a death and needs a lease (a time limit on `running`); cleaning up temporary files of dead processes (they would need a check that the process is gone).
+- Run: as above (about 12 minutes together).
+
+### E302 clean-temporaries (temporary files dead workers leave)
+- Branch / parent: exp/302-clean-temporaries / E301 (exp/301-killed-workers)
+- Question: E301's killed workers left up to 110 temporary files in `objects/` (`.tmp-*` from a cut-off write, `.pending-*` from a deferred store never synced). Nothing reads or removes them. Can they be removed safely? (Source: E301's "Not measured": "cleaning up temporary files of dead processes".)
+- Hypothesis: every temporary name carries its process id (E299 made `.tmp-` names unique per write as well), so a file whose process no longer exists can be removed: no live writer will rename it into place.
+- Change: `FsStore::clean_temporaries()`, called explicitly, never on its own: removes `.tmp-*` and `.pending-*` files in `objects/` whose process id is not this process and names no running process (signal 0; on systems other than Linux and Apple ones it removes nothing). It is for a store whose writers all run on this machine: a writer on another machine sharing the directory would look dead. A reused process id keeps its files, which is safe. `net_kill` gains `CLEAN=1`; `tests/clean_temporaries.rs` checks a dead process's files of both kinds and the old `.tmp-<pid>` name go, and a live process's, this process's and unparsable names stay.
+- Result (`REQUEUE=1 KILL_MS=... CLEAN=1 cargo run --release --example net_kill -- 100`):
+
+  | A kill every | Deferred | Kills | Removed | Left | Replay, fsck, outputs |
+  |---|---|---|---|---|---|
+  | 200 ms | yes | 595 | 44 | 0 | equal, 0, all right |
+  | 200 ms | no | 594 | 12 | 0 | equal, 0, all right |
+  | 700 ms | yes | 6 | 34 | 0 | equal, 0, all right |
+
+- Verdict: **kept** (a new function, called only by whoever runs the workers; no change to what is stored). The supervisor of E301 can call it once its workers are gone, or after each death.
+- Not measured: stores shared across machines (it must not be used there); a supervisor calling it while workers run (safe by the process check, not exercised).
+- Run: as above, and `cargo test --release --test clean_temporaries`.
+
+### E303 run-leases (a time limit on running, for workers a supervisor cannot see)
+- Branch / parent: exp/303-run-leases / E302 (exp/302-clean-temporaries)
+- Question: E301's supervisor requeues a dead worker's runs because it sees the death. A worker on another machine dies unseen. Does a lease, putting back any candidate running longer than a time limit, keep the night going, and what does a wrong limit cost? (Source: E301's "Not measured": "workers on other machines ... need a lease".)
+- Hypothesis: a lease longer than the longest run recovers dead workers' runs at the cost of a few repeated starts; a lease shorter than a run requeues every run before it can finish.
+- Change: none to the kernel. `net_kill` gains `LEASE_MS`: the supervisor reads the head every 20 ms and requeues any candidate it has seen in `running` for longer than the lease, whoever holds it; it is not told of kills. Also reported: start firings for the N candidates (each extra start is a run done again).
+- Result (`WORK_MS=... KILL_MS=... LEASE_MS=... cargo run --release --example net_kill -- N`, 2 workers):
+
+  | Work per run | Kills | Lease | First pass | Starts for the candidates | Requeued |
+  |---|---|---|---|---|---|
+  | 40 ms | none | none, 60 ms, 200 ms, 2 s | 100 of 100 in 4.1 to 4.4 s | 100 for 100 | 0 |
+  | 40 ms | every 700 ms | 400 ms | 100 of 100 in 6.1 s | 105 for 100 | 5 |
+  | 200 ms | none | none | 60 of 60 in 7.9 s | 60 for 60 | 0 |
+  | 200 ms | none | 100 ms | 0 of 60 in 120 s | 1,172 for 60 | 1,112 |
+  | 200 ms | none | 300 ms | 60 of 60 in 7.8 s | 60 for 60 | 0 |
+  | 200 ms | every 1 s | none | 10 of 60, then stalled | 62 for 60 | 0 |
+  | 200 ms | every 1 s | 300 ms | 60 of 60 in 9.5 s | 67 for 60 | 7 |
+  | 200 ms | every 1 s | 1 s | 59 of 60 in 12.6 s (the last still within its lease) | 70 for 60 | 9 |
+
+  - A lease longer than a run recovers dead workers' runs without seeing the deaths: every candidate measured, at 5 to 10 extra starts for about one death per second.
+  - A lease shorter than a run is a livelock: every run is put back before it can finish, and nothing is measured. (A run's own finish is then refused because its candidate is no longer running, so nothing is wrong in the store, only no progress.) At 60 ms with 40 ms runs no run outlived the lease, so nothing happened.
+  - Replay, fsck and every output were right in every run.
+- Verdict: **kept** (example only). A lease is the recovery for unseen workers, and it must be longer than the longest run. Runs longer than any sensible lease need a heartbeat that renews it, for example E281's checkpoints, which a supervisor can read as a sign of life.
+- Not measured: a heartbeat renewing the lease; clocks that differ between machines (here one supervisor's clock times every lease).
+- Run: as above (about 8 minutes together).
+
+### E304 lease-heartbeats (checkpoints that renew a run's lease)
+- Branch / parent: exp/304-lease-heartbeats / E303 (exp/303-run-leases)
+- Question: E303's lease must outlast the longest run, and a night has runs of minutes next to runs of seconds. Can a run's checkpoints (E281) renew its lease, so a short lease serves long runs? (Source: E303's "Not measured": "a heartbeat renewing the lease".)
+- Hypothesis: if the supervisor restarts a run's lease at each new checkpoint under its start's key, a 300 ms lease with a checkpoint every 100 ms never cuts a live 1 s run, and still recovers a dead worker's run within about 300 ms.
+- Change: none to the kernel. `net_kill` gains `HEARTBEAT_MS`: the work saves a checkpoint (`net_checkpoint`, the step number) under its start firing's key that often; the supervisor finds each running candidate's latest start and restarts its lease when that start's checkpoint changes. Two fixes to the example: the final requeue's keys no longer collide with the supervisor's, and workers still going at the time limit are stopped before the second pass (in E301 and E303 the runs that reached 120 s let their last workers run on into it; their first-pass figures stand, and their final checks were made after both passes).
+- Result (`WORK_MS=1000 ... cargo run --release --example net_kill -- 20`, 2 workers, 1 s per run):
+
+  | Kills | Lease | Heartbeat | First pass | Starts for 20 | Requeued |
+  |---|---|---|---|---|---|
+  | every 1.5 s | none | none | 3 of 20, then stalled | 22 | 0 |
+  | none | 300 ms | none | 1 of 20 in 120 s (livelock) | 257 | 235 |
+  | every 1.5 s | 300 ms | none | 1 of 20 in 120 s (livelock) | 285 | 265 |
+  | none | 300 ms | every 100 ms | 20 of 20 in 11.2 s | 20 | 0 |
+  | every 1.5 s | 300 ms | every 100 ms | 20 of 20 in 14.4 s | 28 | 8 |
+
+  - With heartbeats a lease three times shorter than a run never cut a live one, and dead workers' runs came back: every candidate measured with kills every 1.5 s.
+  - Without them the same lease livelocks, as in E303.
+  - Each heartbeat is a commit, so a run's checkpoints compete with other workers' firings for the ref (here 10 per run).
+  - Replay, fsck and every output right in every run.
+- Verdict: **kept** (example only). The loop runner's recovery: a lease a few heartbeats long, renewed by the run's checkpoints, with E301's requeue.
+- Not measured: heartbeats at scale (many workers' checkpoints contending for one ref; a separate ref per worker would avoid it); machines with differing clocks.
+- Run: as above (about 12 minutes together).
+
+### E305 refresh-cost (what `refresh_ledger` costs on a large store)
+- Branch / parent: exp/305-refresh-cost / E304 (exp/304-lease-heartbeats)
+- Question: E298's `refresh_ledger` lists the store on a read of content that is neither stored nor derivable. How much is that on a store the size of a real one, against the default? (Source: E298's verdict: "it lists the store on a read of content that is really missing".)
+- Hypothesis: the listing reads only directory entries, not objects, so a miss costs well under a millisecond per thousand objects, far less than building the ledger.
+- Change: none to the kernel. `examples/refresh_cost.rs`: FsStore stores of N small objects; times a read of stored content, the first miss (which builds the ledger), a later miss with the option off and on, and a read of content another handle derived after the ledger was built (on).
+- Result (`cargo run --release --example refresh_cost -- 1000 10000 50000 200000`, ms):
+
+  | Stored objects | Stored read | First miss (ledger build) | Later miss, off | Later miss, on | Another handle's derivation, on |
+  |---|---|---|---|---|---|
+  | 1,000 | 0.003 | 7.5 | 0.007 | 1.5 to 1.7 | 1.3 |
+  | 10,000 | 0.003 | 49 | 0.007 | 6.9 to 7.3 | 7.5 |
+  | 50,000 | 0.003 | 229 | 0.008 | 33 to 34 | 34 |
+  | 200,000 | 0.003 | 963 | 0.011 | 137 to 139 | 140 |
+
+  - With the option on, each miss costs about 0.7 µs per stored object (the listing), a seventh of building the ledger; off, a miss costs microseconds.
+  - Reading what another process derived costs the same listing once, then nothing.
+  - Reads of stored or known content are unchanged.
+- Verdict: **measured** (no change). Keep `refresh_ledger` off by default and on for worker processes sharing a store; a caller that probes for missing content in a loop should leave it off. A store large enough for 100 ms listings would want a list of new records to read instead (not built).
+- Not measured: stores on slower disks or network filesystems; APFS on the Mac.
+- Run: as above (about 1 minute).
+
+### E306 heartbeat-refs (heartbeats on a ref of each run's own)
+- Branch / parent: exp/306-heartbeat-refs / E305 (exp/305-refresh-cost)
+- Question: E304's heartbeats are commits to the loop's ref, so every run's checkpoints compete with every worker's firings. Does that slow the loop or cut live runs as workers grow, and does a ref per run avoid it? (Source: E304's "Not measured": "heartbeats at scale (many workers' checkpoints contending for one ref; a separate ref per worker would avoid it)".)
+- Hypothesis: with checkpoints on the loop's ref, refused commits grow with the workers until beats are missed and live runs are cut; a heartbeat that moves a ref of the run's own (`beat/<start key>`) never contends, so throughput stays near workers x runs per second.
+- Change: none to the kernel. `net_kill` gains `HEARTBEAT_REF=1` (each beat commits an empty tree to `beat/<start key>`; the supervisor renews a lease when that ref moves) and `CPUS` (the loop net's cpu tokens, so W workers run at once).
+- Result (`W=CPUS=... WORK_MS=1000 LEASE_MS=300 HEARTBEAT_MS=100 REQUEUE=1 cargo run --release --example net_kill -- 8W`, 1 s runs, 8 per worker; ideal first pass about 8 s):
+
+  | Workers | Kills | Beats on | First pass | Starts | Live runs cut |
+  |---|---|---|---|---|---|
+  | 2 | none | loop ref | 9.1 s | 16 for 16 | 0 |
+  | 2 | none | own ref | 9.0 s | 16 for 16 | 0 |
+  | 4 | none | loop ref | 9.4 s | 32 for 32 | 0 |
+  | 4 | none | own ref | 9.2 s | 32 for 32 | 0 |
+  | 8 | none | loop ref | 10.2 s | 64 for 64 | 0 |
+  | 8 | none | own ref | 9.3 s | 64 for 64 | 0 |
+  | 16 | none | loop ref | 33.9 s | 129 for 128 | 1 |
+  | 16 | none | own ref | 9.9 s | 128 for 128 | 0 |
+  | 16 | every 1.5 s | loop ref | 30.1 s | 135 for 128 | (7 requeued, 15 kills) |
+  | 16 | every 1.5 s | own ref | 11.1 s | 134 for 128 | (6 requeued, 7 kills) |
+
+  - Up to 8 workers the two are within a second. At 16 workers (160 beats a second) beats on the loop's ref made the night 3.4 times slower and cut one live run; on their own refs it stayed near the ideal.
+  - Kills were recovered either way: every candidate measured, replay, fsck and every output right in every run.
+- Verdict: **kept** (example only). Past a handful of workers, heartbeats belong on a ref of the run's own, not in the loop's database. The beat refs are never removed here; a runner would delete a run's ref at its finish.
+- Not measured: removing beat refs; many thousands of refs in one store; machines with differing clocks.
+- Run: as above (about 4 minutes together).
+
+### E307 beat-ref-scale (what a night of heartbeat refs costs the store)
+- Branch / parent: exp/307-beat-ref-scale / E306 (exp/306-heartbeat-refs)
+- Question: E306 leaves a `beat/<start key>` ref of about ten commits for every run, never removed. Over a night of thousands of runs, what do those refs cost the loop's own ref, listing, fsck and gc, and what does removing them at a run's finish cost? (Source: E306's "Not measured": "removing beat refs; many thousands of refs in one store".)
+- Hypothesis: FsStore keeps a file per ref, so resolving and moving the loop's ref do not grow with the beat refs; listing refs, fsck and gc grow linearly and gc keeps every beat commit alive; a delete per run costs about a millisecond.
+- Change: none to the kernel. `examples/ref_scale.rs`: FsStore stores with the loop's ref plus RUNS beat refs of BEATS (10) distinct commits each; times the beats, 1,000 resolves and 20 commits of the loop's ref, listing refs, fsck and gc; then deletes every beat ref, runs gc and the same reads again.
+- Result (`cargo run --release --example ref_scale -- 100 1000` and `-- 5000`):
+
+  | Runs (beat commits) | A beat | Resolve loop | Commit loop | List refs | fsck | gc | Delete the beat refs | gc after |
+  |---|---|---|---|---|---|---|---|---|
+  | 100 (1,000) | 2.3 ms | 1.3 us | 2.0 ms | 0.4 ms | 8 ms | 11 ms, 0 freed | 118 ms | 1.0 s, 1,000 freed |
+  | 1,000 (10,000) | 1.9 ms | 2.1 us | 1.7 ms | 5.5 ms | 113 ms | 163 ms, 0 freed | 1.2 s | 7.5 s, 10,000 freed |
+  | 5,000 (50,000) | 1.7 ms | 1.8 us | 1.8 ms | 28 ms | 436 ms | 580 ms, 0 freed | 2.2 s | 6.0 s, 50,000 freed |
+
+  - Resolving and moving the loop's ref do not change with the beat refs (1 to 2 us and about 2 ms at every size).
+  - Listing refs, fsck and gc grow with them, and gc frees nothing while they exist: every beat commit stays.
+  - Deleting a beat ref costs 0.4 to 1.2 ms, and gc then frees its commits. After the deletes, every read was back to its size with one ref.
+  - A beat itself costs about 2 ms (a commit and a synced ref file), so ten a second is about 2% of a run's time.
+  - fsck found nothing wrong at any size. Timings on this test machine's disk varied (the 1,000-run gc after the deletes was slower than the 5,000-run one).
+- Verdict: **measured** (no change). A loop runner should delete a run's beat ref when the run finishes, once, for about a millisecond; left in place, a night's refs cost nothing on the loop's hot path but keep every beat commit and slow listing, fsck and gc.
+- Not measured: APFS on the Mac; one directory of tens of thousands of ref files on other filesystems; gc's own per-object delete cost (it dominated the gc after the deletes).
+- Run: as above (about 2 minutes together).
+
+### E308 beat-ref-cleanup (a run's beat ref removed at its end)
+- Branch / parent: exp/308-beat-ref-cleanup / E307 (exp/307-beat-ref-scale)
+- Question: E307 says a runner should delete a run's beat ref when the run ends. Done by the worker at a finish, and by the supervisor when it puts a run back (a lease ran out, or its worker was seen to die), does every beat ref go, without slowing the loop or cutting live runs? (Source: E307's verdict.)
+- Hypothesis: with the deletes, no beat ref is left after a night with kills, and the first pass stays within E306's times.
+- Change: none to the kernel. `net_kill` gains `BEAT_CLEAN=1`: a worker removes `beat/<its start key>` after its finish commits or is refused; the supervisor removes the beat ref of each run it puts back on a lease, and every beat ref of a worker it saw die (`beat/w<n>-`). The run prints the beat refs left.
+- Result (`W=CPUS=16 WORK_MS=1000 LEASE_MS=300 HEARTBEAT_MS=100 HEARTBEAT_REF=1 REQUEUE=1 cargo run --release --example net_kill -- 128`):
+
+  | Kills | Cleanup | First pass | Starts for 128 | Beat refs left |
+  |---|---|---|---|---|
+  | none | off | 9.7 s | 128 | 128 |
+  | none | on | 9.9 s | 128 | 0 |
+  | every 1.5 s | off | 10.1 s | 133 | 132 |
+  | every 1.5 s | on | 11.1 s | 134 | 0 |
+
+  - Every beat ref went, including those of killed workers, and no live run was cut.
+  - Times stayed within E306's (9.9 to 11.1 s against an ideal of 8 s); the kill runs differ by one kill and one start.
+  - Replay, fsck and every output right in every run.
+- Verdict: **kept** (example only). With E301's requeue, E303's lease, E304's heartbeats, E306's per-run refs and this cleanup, the example is a complete recovery recipe for a loop runner with workers that die.
+- Not measured: a supervisor that itself dies; machines with differing clocks.
+- Run: as above (about 1 minute together).
