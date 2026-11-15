@@ -435,9 +435,68 @@ fn main_inc() {
     }
 }
 
+/// E297: the hybrid's threshold. For each net and each threshold, the
+/// Cranelift-compiled incremental step (E289): unrolled rechecks, compile
+/// time and ns per step, against the uncompiled incremental walk (E286).
+fn main_hub() {
+    let seed = 0x0123_4567_89AB_CDEF;
+    println!("net | incremental ns | threshold | unrolled rechecks | compile ms | ns per step");
+    let mut nets: Vec<(String, Net)> = Vec::new();
+    for (i, &(np, nt)) in [(100usize, 200usize), (1000, 2000)].iter().enumerate() {
+        nets.push((
+            format!("random {np} x {nt}"),
+            random_net(&mut Rng(0xA5A5_0001 + i as u64), np, nt),
+        ));
+    }
+    for c in [100usize, 1000] {
+        let names: Vec<String> = (0..c).map(|i| format!("c{i}")).collect();
+        let refs: Vec<&str> = names.iter().map(|s| s.as_str()).collect();
+        nets.push((
+            format!("loop net, {c} candidates"),
+            Net::parse(LOOP).unwrap().unfold(&refs).unwrap(),
+        ));
+    }
+    for (label, net) in &nets {
+        let t = net.lower().unwrap();
+        let steps = (200_000_000 / t.inputs.len() as u64).clamp(200_000, 5_000_000);
+        let mut im = t.initial.clone();
+        let mut rng = Rng(seed);
+        let start = Instant::now();
+        let idone = t.walk_incremental(&mut im, steps, |n| (rng.next() % n as u64) as usize);
+        let inc_ns = start.elapsed().as_nanos() as f64 / idone.max(1) as f64;
+        let hub = inc::Hub::new(&t);
+        for h in [1usize, 2, 4, 8, 16, 32, 64, 256, usize::MAX] {
+            let rechecks = inc::recheck_count(&t, h);
+            let name = if h == usize::MAX {
+                "none".to_string()
+            } else {
+                h.to_string()
+            };
+            if rechecks > 1_000_000 {
+                println!("{label} | {inc_ns:.1} | {name} | {rechecks} | not compiled | ");
+                continue;
+            }
+            // Best of three runs of the same compiled code.
+            let start = Instant::now();
+            let (_module, cf) = inc::compile_cranelift(&t, h);
+            let cl_ms = start.elapsed().as_secs_f64() * 1000.0;
+            let mut best = f64::MAX;
+            for _ in 0..3 {
+                let (cm, cdone, ns) = inc::run(cf, &t, &hub, steps, seed);
+                assert_eq!((&cm, cdone), (&im, idone), "compiled walk differs");
+                best = best.min(ns);
+            }
+            println!("{label} | {inc_ns:.1} | {name} | {rechecks} | {cl_ms:.0} | {best:.1}");
+        }
+    }
+}
+
 fn main() {
     if std::env::args().any(|a| a == "inc") {
         return main_inc();
+    }
+    if std::env::args().any(|a| a == "hub") {
+        return main_hub();
     }
     let dir = tempfile::tempdir().unwrap();
     let seed = 0x0123_4567_89AB_CDEF;

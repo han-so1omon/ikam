@@ -4341,3 +4341,23 @@ Gates on the branch (E229 to E233): every kernel test suite passes (release); cl
 - Verdict: **kept** (a fix, on this branch only; it changes no bytes and takes the ledger lock on every record instead of on new ones only). Race 1 is left as it is: reaching it needs a gc or repack during other writes, which nothing does concurrently yet.
 - Not measured: race 1 under a concurrent gc or repack; FsStore.
 - Run: as above (about 2 minutes here).
+
+### E297 hub-threshold (how many readers make a place a hub)
+- Branch / parent: exp/297-hub-threshold / E296 (exp/296-ledger-races)
+- Question: E289 rechecks places with over 16 readers by a loop over tables and unrolls the rest. Is 16 the right threshold? (Source: E289's "Not measured": "other thresholds than 16".)
+- Hypothesis: the loop net has a few very busy places (every candidate reads them) and many places read by one or two transitions, so any threshold between those two sizes should give the same code; on random nets, where no place is busy, a low threshold should cut compile time and cost step time.
+- Change: none to the kernel. `experiments/net-jit` gains `-- hub`: for each net and each threshold (1, 2, 4, 8, 16, 32, 64, 256, none), the unrolled rechecks, the Cranelift compile time and the best of three runs per step, each checked equal to the incremental walk of E286.
+- Result (`cargo run --release -- hub` in `experiments/net-jit`, ns per step):
+
+  | Net | Incremental, no compile | Threshold 1 | 4 | 8 | 16 | 64 | 256 | none |
+  |---|---|---|---|---|---|---|---|---|
+  | random 100 x 200 | 104 | 79 (14 ms) | 47 (65 ms) | 41 (94 ms) | 40 (96 ms) | 41 | 40 | 40 (97 ms) |
+  | random 1000 x 2000 | 170 | 122 (145 ms) | 69 (1.1 s) | 55 (1.8 s) | 55 (1.7 s) | 55 | 55 | 55 (1.7 s) |
+  | loop net, 100 candidates | 59 | 39 (44 ms) | 39 | 39 | 39 (39 ms) | 39 (39 ms) | 42 (4.2 s) | 43 (4.1 s) |
+  | loop net, 1000 candidates | 82 | 52 (0.5 s) | 51 | 52 | 52 (0.5 s) | 52 | 52 (0.5 s) | not compiled (2 million rechecks) |
+
+  - On the loop nets every threshold from 1 to 64 gives the same code: the busy places have hundreds of readers or more, the rest one or two. At 100 candidates the busy places have under 256 readers, so 256 unrolls them again and compiling takes 100 times longer for a slower step.
+  - On random nets no place has 8 readers, so 8 and up unroll everything; lower thresholds trade step time for compile time (threshold 1: 145 ms and 122 ns against 1.7 s and 55 ns at 1000 x 2000).
+- Verdict: **measured** (no change). 16 stays: it sits inside the wide flat range of the loop's own nets and leaves small-degree random nets fully unrolled. A threshold of 1 or 2 is the setting for a quick compile of a big net that will run few steps.
+- Not measured: nets whose busy places have 16 to 256 readers (the knee would move with them); clang at each threshold.
+- Run: as above (about 3 minutes here).
