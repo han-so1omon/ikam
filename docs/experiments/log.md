@@ -4781,3 +4781,35 @@ Gates on the branch (E229 to E233): every kernel test suite passes (release); cl
 - Verdict: **kept** (example only). With E301's requeue, E303's lease, E304's heartbeats, E306's per-run refs and this cleanup, the example is a complete recovery recipe for a loop runner with workers that die.
 - Not measured: a supervisor that itself dies; machines with differing clocks.
 - Run: as above (about 1 minute together).
+
+### E267 hot-cold-e2e (E260's two workloads with what E261 to E268 kept)
+- Branch / parent: exp/267-hot-cold-e2e / exp/268-incremental-repack a279f89, with exp/261-plain-hot-writes, exp/264-branch-hot-state and exp/263-temperature merged in (append-only doc conflicts kept both sides)
+- Question: with every option the hot and cold layers plan kept turned on together, how much faster is the hot layer than with today's opt-ins, what does the cold layer cost after a session, and how many bytes stay on disk, on E260's workloads?
+- Change: none in the kernel. `examples/hot_cold.rs` gets a third setting, `kept`: today's opt-ins (`FsStore::open_deferred`, E227; `plain_db_events`, E232; `needed_index`, E129) plus `plain_hot_writes` (E261); for the database, views kept by a background integrator (E262, `min_events` 50) through `hot::HotRefs` on `main` (E264) on a `SharedStore`; the cold work is `repack_incremental` (E268), gc and fsck at every size, in place of the full repack. For the database, one pass runs after the load so the pass after the session sees only the session. Every setting now reports `hot_p50`/`hot_p99`, what a caller waits for per batch: append, commit and, with views kept each batch, the view update (`kept`: the hand-over to the integrator). E263's temperature pass is left out: the harness writes at the kernel's default read weight, which is already about the archive weight.
+- Result (`cargo run --release --example hot_cold -- files`, `-- db 20000`, `-- db 100000`; a 4-core cloud machine, nothing else running; one run each; every case checks views against a full build and the database against a rebuild, and fsck after the cold work):
+
+  | Case | default | opt | kept |
+  |---|---|---|---|
+  | files, commit every edit: edit p50 / p99 | 7.5 / 42.7 ms | 5.5 / 39.8 ms | 2.9 / 4.4 ms |
+  | files, commit every 50: edit p50 / p99 | 7.2 / 36.6 ms | 3.7 / 32.1 ms | 1.3 / 11.4 ms |
+  | files, cold work (commit every edit / every 50) | full repack 55.8 / 23.9 s | 56.1 / 22.8 s | incremental pass 6.6 / 2.7 s |
+  | files, disk after the cold work (every edit / every 50) | 778 / 410 KB | 778 / 410 KB | 2,109 / 568 KB |
+  | files, hot bytes written (every 50) | 2.08 MB | 2.08 MB | 4.74 MB |
+  | db 100k, single appends: hot p50 / p99, views each batch | 158.9 / 728 ms | 156.6 / 203 ms | 6.6 / 15.0 ms, views 73 events behind at p50 |
+  | db 100k, single appends: hot p50, views once at end | 22.9 ms | 14.1 ms | (as above) |
+  | db 100k, batches of 100: hot p50 / p99, views each batch | 7,311 / 13,766 ms | 370 / 408 ms | 63 / 206 ms |
+  | db 100k, one batch of 2,000: hot, views each batch | 141 s | 2.14 s | 0.57 s |
+  | db 100k, views caught up after the session | 0.2 to 0.4 s | 0.1 to 0.5 s | 0.18 to 0.36 s (wait) |
+  | db 100k, cold work after the 2,000 batch | no repack (E260: unfinished after 12 min); gc 1.2 s, fsck 1.4 s | same | pass 7.0 s (4,008 new), gc 2.4 s, fsck 2.4 s; a one-time pass after the load 56 s |
+  | db 100k, disk after the cold work | 19.96 MB | 19.96 MB | 17.57 MB |
+  | db 20k, one batch of 2,000: hot; cold work | 24.6 s; full repack 125 s | 0.74 s; full repack 123 s | 0.39 s; pass 2.3 s (after a 11.7 s pass after the load) |
+  | db 20k, disk after the cold work | 3.37 MB | 3.37 MB | 3.87 MB |
+
+  - The hot layer: with everything kept, an edit on files waits 1.3 to 2.9 ms at the median and its slow tail mostly goes (p99 4.4 against 39.8 ms when committing each edit); a database append that keeps views current waits 6.6 ms for one event at 100,000 rows, against 157 ms with today's opt-ins updating views each time and 14 ms with them not current at all. Batches of 100 and 2,000 are 3 to 6 times faster than today's opt-ins with views kept each batch.
+  - The views stay close behind instead of current: 73 events at the median for single appends, and further for batches (800 events at p50 with batches of 100, when the session outruns the integrator's folds); catching up after the session took under 0.4 s in every case.
+  - The cold layer: the incremental pass is the first cold work that runs at 100,000 rows (7 s after a session of 2,000 events), and on files it takes an eighth of the full repack's time. A pass after the load, 56 s at 100,000 rows, is paid once.
+  - Bytes are the price. Plain hot writes write 2.3 to 4 times the bytes during the session (E261). After the cold work, a database that has had its passes is 12% smaller than today's at 100,000 rows (no full repack can run there) but 15% larger than a full repack at 20,000; files are 39% larger than a full repack when committing every 50 edits and 2.7 times larger when committing every edit (the pass encodes each version on its own; a full repack shares across them). A full repack stays the way to get the smallest store, where it can finish.
+- Not measured: macOS (Mac steps below); E263 with the heavy read weight in this harness (E263 measures it alone); E264's branches (one ref here); 1M rows; repeated runs.
+- Verdict: **measured**, no new option. Together the kept options make the hot layer 2 to 24 times faster than today's opt-ins on these workloads and give a cold layer that runs at every size, for more bytes written and, against a full repack where one finishes, more bytes kept. All stay off by default.
+- Mac steps: `cargo run --release --example hot_cold -- files`, `-- db 20000`, `-- db 100000` on this branch, one at a time.
+- Run: `cargo run --release --example hot_cold -- [files|db] [default|opt|kept] [N...]`.
