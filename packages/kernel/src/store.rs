@@ -226,6 +226,13 @@ pub struct FsStore {
     /// under their temporary names. Made durable and renamed into place
     /// before the next ref move (`sync`).
     pending: Option<BTreeMap<Id, PathBuf>>,
+    /// E300: with `open_deferred`, stored objects deleted since the last
+    /// ref move. They read as gone at once, but their files are removed
+    /// only after the waiting objects are durable (`sync`): a put that
+    /// replaces a stored copy with a derivation deletes the copy, and
+    /// removing it first lost the content when the process died before
+    /// the derivation was durable.
+    dropping: std::collections::BTreeSet<Id>,
 }
 
 impl FsStore {
@@ -236,6 +243,7 @@ impl FsStore {
         Ok(FsStore {
             root,
             pending: None,
+            dropping: Default::default(),
         })
     }
 
@@ -269,6 +277,22 @@ impl FsStore {
     /// systems each file gets a plain fsync and the ref's own sync, a full
     /// flush of the drive, makes them durable together.
     pub fn sync(&mut self) -> Result<(), Error> {
+        self.sync_pending()?;
+        // Only now, with what replaces them durable (E300).
+        while let Some(id) = self.dropping.pop_first() {
+            match fs::remove_file(self.path(&id)) {
+                Ok(()) => {}
+                Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+                Err(e) => {
+                    self.dropping.insert(id);
+                    return Err(e.into());
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn sync_pending(&mut self) -> Result<(), Error> {
         let Some(pending) = self.pending.as_mut() else {
             return Ok(());
         };
@@ -429,6 +453,10 @@ impl FsStore {
 
 impl Store for FsStore {
     fn write(&mut self, id: Id, encoded: &[u8]) -> Result<bool, Error> {
+        // Deleted since the last ref move: its file is still in place.
+        if self.dropping.remove(&id) {
+            return Ok(true);
+        }
         if self.has(&id) {
             return Ok(false);
         }
@@ -456,20 +484,30 @@ impl Store for FsStore {
         if let Some(tmp) = self.pending.as_mut().and_then(|p| p.remove(&id)) {
             let _ = fs::remove_file(tmp);
         }
+        self.dropping.remove(&id);
         write_atomic(&self.path(&id), encoded)
     }
 
     fn read(&self, id: &Id) -> Result<Vec<u8>, Error> {
+        if self.dropping.contains(id) {
+            return Err(Error::NotFound(*id));
+        }
         not_found_as(fs::read(self.located(id)), || Error::NotFound(*id))
     }
 
     fn stored_len(&self, id: &Id) -> Result<usize, Error> {
+        if self.dropping.contains(id) {
+            return Err(Error::NotFound(*id));
+        }
         not_found_as(fs::metadata(self.located(id)), || Error::NotFound(*id))
             .map(|m| m.len() as usize)
     }
 
     fn read_head(&self, id: &Id, n: usize) -> Result<Vec<u8>, Error> {
         use std::io::Read;
+        if self.dropping.contains(id) {
+            return Err(Error::NotFound(*id));
+        }
         let file = not_found_as(fs::File::open(self.located(id)), || Error::NotFound(*id))?;
         let mut out = Vec::with_capacity(n);
         file.take(n as u64).read_to_end(&mut out)?;
@@ -477,6 +515,9 @@ impl Store for FsStore {
     }
 
     fn has(&self, id: &Id) -> bool {
+        if self.dropping.contains(id) {
+            return false;
+        }
         self.pending.as_ref().is_some_and(|p| p.contains_key(id)) || self.path(id).exists()
     }
 
@@ -495,6 +536,7 @@ impl Store for FsStore {
         if let Some(pending) = &self.pending {
             out.extend(pending.keys());
         }
+        out.retain(|id| !self.dropping.contains(id));
         // Directory order depends on the filesystem (ext4 hashes names with a
         // per-filesystem seed, APFS sorts them). Callers that pick among
         // equal choices in id order then store the same encodings everywhere,
@@ -529,6 +571,7 @@ impl Store for FsStore {
                     .filter(|id| id.as_bytes().starts_with(prefix)),
             );
         }
+        out.retain(|id| !self.dropping.contains(id));
         out.sort_unstable(); // as `ids` (E136)
         Ok(out)
     }
@@ -536,6 +579,14 @@ impl Store for FsStore {
     fn delete(&mut self, id: &Id) -> Result<(), Error> {
         if let Some(tmp) = self.pending.as_mut().and_then(|p| p.remove(id)) {
             fs::remove_file(tmp)?;
+            return Ok(());
+        }
+        if self.pending.is_some() {
+            // Deferred (E300): gone now, removed at the next sync.
+            if self.dropping.contains(id) || !self.path(id).exists() {
+                return Err(Error::NotFound(*id));
+            }
+            self.dropping.insert(*id);
             return Ok(());
         }
         not_found_as(fs::remove_file(self.path(id)), || Error::NotFound(*id))

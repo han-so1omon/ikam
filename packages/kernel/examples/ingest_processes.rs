@@ -49,7 +49,13 @@ fn edit(trial: usize, w: usize, k: usize, base: usize) -> Vec<u8> {
 
 fn child(dir: &str, trial: usize, w: usize) {
     let (m, base) = (env("M", 60), env("BASE", 24));
-    let mut repo = Repo::new(FsStore::open(dir).unwrap());
+    // DEFERRED=1: objects made durable at the next ref move (E227, E300).
+    let store = if std::env::var("DEFERRED").as_deref() == Ok("1") {
+        FsStore::open_deferred(dir).unwrap()
+    } else {
+        FsStore::open(dir).unwrap()
+    };
+    let mut repo = Repo::new(store);
     repo.refresh_ledger = true;
     let (mut derived, mut fails, mut errors) = (0, 0, 0);
     for k in 0..m {

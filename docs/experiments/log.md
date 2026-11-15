@@ -4416,3 +4416,25 @@ Gates on the branch (E229 to E233): every kernel test suite passes (release); cl
 - Verdict: **kept** (two fixes, both unconditional: neither has a cost). The kernel suite passes.
 - Not measured: FsStore opened deferred (E227) across processes; a gc or repack during other writes.
 - Run: as above (about 3 minutes).
+
+### E300 deferred-drops (a crash with deferred syncing after a put that drops a copy)
+- Branch / parent: exp/300-deferred-drops / E299 (exp/299-ingest-processes)
+- Question: with `FsStore::open_deferred` (E227, used by the live server's deferred sync), E299's processes sometimes could not read their own puts back. Why, and does the same thing lose content after a crash? (Source: E299's "Not measured": "FsStore opened deferred across processes".)
+- Hypothesis: E227 makes new objects durable only at the next ref move, but a put that replaces a stored copy with a derivation (a template fill) deletes that copy at once. Until the move, the copy is gone from disk and what replaces it exists only as temporary files. Another process cannot read it meanwhile, and a crash before the move loses it.
+- Change:
+  - FsStore, deferred only: a delete of a stored object marks it as dropping. It reads as gone at once (`has`, `read`, `read_head`, `stored_len`, `ids` and `ids_with_prefix` leave it out), and its file is removed in `sync`, after the waiting objects are durable and renamed into place. Writing it again before then keeps the file.
+  - `tests/deferred_drop.rs`: a deferred handle puts 240 near-copies of 24 stored blobs (every blob's copy is dropped), then dies without syncing; a fresh handle must read every blob and fsck must be clean. A second test syncs and checks that the copies are removed and everything reads.
+  - `DEFERRED=1` for `ingest_processes` and `net_processes`.
+- Result:
+
+  | Case | Before | After |
+  |---|---|---|
+  | crash after 240 deferred puts (`tests/deferred_drop.rs`) | all 24 stored blobs lost | none lost, fsck clean |
+  | 4 deferred processes x 60 puts, 20 trials (`DEFERRED=1 ... ingest_processes -- 20`) | 12 reads of a process's own put failed | 0 failed; 0 unreadable afterwards; fsck 0 |
+  | loop net, 2 and 4 deferred processes (`DEFERRED=1 ... net_processes`) | no errors with `refresh_ledger` or the E295 tuning (11.1 to 10.8 s untuned; 6.4 to 3.2 s tuned) | unchanged |
+
+  - The loss needs only one process: any deferred put that picks a template fill over a stored copy, then a crash before the next commit. Without a crash nothing was lost, since the drop on sync made the copy derivable again.
+  - A gc on a deferred handle now frees its space at the next sync instead of at once.
+- Verdict: **kept** (a fix, deferred mode only; `open` is unchanged). The kernel suite passes.
+- Not measured: a crash in the middle of `sync` itself (between the renames and the removals: the removals come last, so it leaves extra copies, not missing ones); the hot and cold branches (E261 to E268), which also change `store.rs` and `ingest.rs` and will need merging with this.
+- Run: `cargo test --release --test deferred_drop`, and as above (about 2 minutes).

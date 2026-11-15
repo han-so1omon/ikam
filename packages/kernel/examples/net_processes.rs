@@ -52,7 +52,13 @@ transition finish pure: running -> measured, cpu
 }
 
 fn open(dir: &str) -> Repo<FsStore> {
-    let mut repo = Repo::new(FsStore::open(dir).unwrap());
+    // DEFERRED=1: objects made durable at the next ref move (E227, E300).
+    let store = if std::env::var("DEFERRED").as_deref() == Ok("1") {
+        FsStore::open_deferred(dir).unwrap()
+    } else {
+        FsStore::open(dir).unwrap()
+    };
+    let mut repo = Repo::new(store);
     repo.refresh_ledger = std::env::var("REFRESH").as_deref() == Ok("1");
     if tuned() {
         repo.read_weight = 1.0;
