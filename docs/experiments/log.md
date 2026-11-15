@@ -4599,3 +4599,24 @@ Gates on the branch (E229 to E233): every kernel test suite passes (release); cl
 - Verdict: **measured** (no change). A loop runner should delete a run's beat ref when the run finishes, once, for about a millisecond; left in place, a night's refs cost nothing on the loop's hot path but keep every beat commit and slow listing, fsck and gc.
 - Not measured: APFS on the Mac; one directory of tens of thousands of ref files on other filesystems; gc's own per-object delete cost (it dominated the gc after the deletes).
 - Run: as above (about 2 minutes together).
+
+### E308 beat-ref-cleanup (a run's beat ref removed at its end)
+- Branch / parent: exp/308-beat-ref-cleanup / E307 (exp/307-beat-ref-scale)
+- Question: E307 says a runner should delete a run's beat ref when the run ends. Done by the worker at a finish, and by the supervisor when it puts a run back (a lease ran out, or its worker was seen to die), does every beat ref go, without slowing the loop or cutting live runs? (Source: E307's verdict.)
+- Hypothesis: with the deletes, no beat ref is left after a night with kills, and the first pass stays within E306's times.
+- Change: none to the kernel. `net_kill` gains `BEAT_CLEAN=1`: a worker removes `beat/<its start key>` after its finish commits or is refused; the supervisor removes the beat ref of each run it puts back on a lease, and every beat ref of a worker it saw die (`beat/w<n>-`). The run prints the beat refs left.
+- Result (`W=CPUS=16 WORK_MS=1000 LEASE_MS=300 HEARTBEAT_MS=100 HEARTBEAT_REF=1 REQUEUE=1 cargo run --release --example net_kill -- 128`):
+
+  | Kills | Cleanup | First pass | Starts for 128 | Beat refs left |
+  |---|---|---|---|---|
+  | none | off | 9.7 s | 128 | 128 |
+  | none | on | 9.9 s | 128 | 0 |
+  | every 1.5 s | off | 10.1 s | 133 | 132 |
+  | every 1.5 s | on | 11.1 s | 134 | 0 |
+
+  - Every beat ref went, including those of killed workers, and no live run was cut.
+  - Times stayed within E306's (9.9 to 11.1 s against an ideal of 8 s); the kill runs differ by one kill and one start.
+  - Replay, fsck and every output right in every run.
+- Verdict: **kept** (example only). With E301's requeue, E303's lease, E304's heartbeats, E306's per-run refs and this cleanup, the example is a complete recovery recipe for a loop runner with workers that die.
+- Not measured: a supervisor that itself dies; machines with differing clocks.
+- Run: as above (about 1 minute together).

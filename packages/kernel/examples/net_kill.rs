@@ -16,13 +16,14 @@
 //!   `open_deferred`; CLEAN=1 runs `clean_temporaries` (E302) at the end;
 //!   LEASE_MS puts back any candidate running longer than that, E303;
 //!   HEARTBEAT_MS has the work checkpoint that often, renewing its lease, E304;
-//!   HEARTBEAT_REF=1 beats on a ref of the run's own instead, E306; CPUS)
+//!   HEARTBEAT_REF=1 beats on a ref of the run's own instead, E306; CPUS;
+//!   BEAT_CLEAN=1 removes a run's beat ref when it finishes or is put back, E308)
 
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
 use ikam_kernel::net::Net;
-use ikam_kernel::{Db, Error, FsStore, Id, Repo};
+use ikam_kernel::{Db, Error, FsStore, Id, Repo, Store};
 
 const REF: &str = "loop";
 
@@ -146,9 +147,11 @@ fn child(dir: &str, w: u64) {
                     &format!("fin-{tok}"),
                     &output(&tok),
                 ) else {
+                    delete_beats(dir, &format!("beat/w{w}-{k}"));
                     return Ok(true);
                 };
                 if repo.db_commit_at(REF, head, &db, "finish").is_ok() {
+                    delete_beats(dir, &format!("beat/w{w}-{k}"));
                     return Ok(true);
                 }
             }
@@ -205,6 +208,25 @@ fn requeue_dead(repo: &mut Repo<FsStore>, net: &Net, w: u64, seq: &mut u64) -> u
             return mine.len();
         }
     }
+}
+
+/// E308: BEAT_CLEAN=1, remove the beat refs whose names start with `prefix`
+/// (a finished run's, or every run of a dead worker's).
+fn delete_beats(dir: &str, prefix: &str) -> usize {
+    if std::env::var("BEAT_CLEAN").as_deref() != Ok("1") {
+        return 0;
+    }
+    let Ok(mut store) = FsStore::open(dir) else {
+        return 0;
+    };
+    let mut n = 0;
+    for (name, id) in store.refs().unwrap_or_default() {
+        let hit = name == prefix || (prefix.ends_with('-') && name.starts_with(prefix));
+        if hit && store.delete_ref(&name, id).is_ok() {
+            n += 1;
+        }
+    }
+    n
 }
 
 fn spawn(me: &std::path::Path, d: &str, w: u64) -> Child {
@@ -325,6 +347,9 @@ fn main() {
                     requeued += late.len();
                     for t in &late {
                         seen.remove(t);
+                        if let Some(key) = last_start.get(t) {
+                            delete_beats(&d, &format!("beat/{key}"));
+                        }
                     }
                 }
             }
@@ -358,6 +383,7 @@ fn main() {
                 let dead = ids.remove(i);
                 if supervise {
                     requeued += requeue_dead(&mut sup, &net, dead, &mut seq);
+                    delete_beats(&d, &format!("beat/w{dead}-"));
                 }
                 kills += 1;
                 next += 1;
@@ -461,5 +487,15 @@ fn main() {
             format!(" (lease {} ms)", lease.as_millis())
         },
     );
+    if std::env::var("HEARTBEAT_REF").as_deref() == Ok("1") {
+        let left = FsStore::open(&d)
+            .unwrap()
+            .refs()
+            .unwrap()
+            .iter()
+            .filter(|(n, _)| n.starts_with("beat/"))
+            .count();
+        println!("beat refs left: {left}");
+    }
     let _ = std::fs::remove_dir_all(&dir);
 }
