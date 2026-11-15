@@ -4264,3 +4264,32 @@ Gates on the branch (E229 to E233): every kernel test suite passes (release); cl
 - Verdict: **measured** (no kernel change). For a loop runner, `read_weight` 1 and the sum hash are worth their bytes; the bytes are the default's trade, so both stay options. The reads are slow because nothing keeps a rebuilt chunk; E294 tries a read cache that keeps the default's bytes.
 - Not measured: FsStore (reads from disk add to every row); the kept counts of E233 for the done check; `read_weight` between 0.1 and 1.
 - Run: `cargo run --release --example net_firing_cost -- 200 1000` (14 minutes here).
+
+### E294 read-cache (keep rebuilt contents across reads)
+- Branch / parent: exp/294-read-cache / E293 (exp/293-firing-cost)
+- Question: E293 found a key read takes 0.45 ms by default because its graph chunks are rebuilt from slices on every read, and the faster `read_weight` costs 2.2 to 2.5 times the bytes. Can a cache of rebuilt contents give the fast reads at the default's bytes? (Source: E293's verdict.)
+- Hypothesis: a content's bytes never change for its id, so a kept copy is always right. A loop runner reads the same few chunks for every firing, so a cache of a few megabytes serves nearly every read, and writes store exactly the same bytes.
+- Change: `Repo::read_cache` (bytes; 0, the default, keeps nothing). `read_content`, and every read built on it, keeps each content it reads or rebuilds, after checking it against its id, and drops the oldest past the limit. Siblings share the cache; gc empties it, so content gc deleted is not served. A write's own checks and fsck never use it: they count decode work and test which stored copies a derivation depends on, and a kept copy would hide both (the first version served them too; it gave the same bytes in this benchmark, but a kept copy could let a write drop a stored copy that a kept content still depends on). `examples/net_firing_cost.rs` takes `CACHE=1` for these rows; `tests/read_cache.rs`.
+- Result (`CACHE=1 cargo run --release --example net_firing_cost -- 200`, then `-- 1000`; MemStore, one writer, 64 MB cache; ms per firing):
+
+  | N | `read_weight` | Hash | Cache | One key read | Firing | Marking | Next | Fire | Bytes per firing |
+  |---|---|---|---|---|---|---|---|---|---|
+  | 200 | 0.001 | plain | off | 499 µs | 29.3 | 4.19 | 11.23 | 13.65 | 7,643 |
+  | 200 | 0.001 | plain | on | 10 µs | 7.0 | 0.24 | 0.31 | 6.32 | 7,643 |
+  | 200 | 0.001 | sum | on | 10 µs | 7.5 | 0.25 | 0.32 | 6.80 | 7,647 |
+  | 200 | 1 | sum | off | 46 µs | 7.0 | 3.13 | 1.69 | 2.00 | 17,350 |
+  | 200 | 1 | sum | on | 10 µs | 2.4 | 0.21 | 0.29 | 1.76 | 17,350 |
+  | 1,000 | 0.001 | plain | off | 435 µs | 70.2 | 21.72 | 13.52 | 34.51 | 9,132 |
+  | 1,000 | 0.001 | plain | on | 12 µs | 12.1 | 1.21 | 0.75 | 9.84 | 9,132 |
+  | 1,000 | 0.001 | sum | on | 13 µs | 10.7 | 1.10 | 0.67 | 8.67 | 9,373 |
+  | 1,000 | 1 | sum | off | 62 µs | 23.1 | 16.44 | 2.35 | 4.07 | 23,176 |
+  | 1,000 | 1 | sum | on | 14 µs | 5.5 | 1.07 | 0.63 | 3.62 | 23,176 |
+
+  - At the default `read_weight`, the cache makes a key read 35 to 50 times faster and a firing 4 to 6 times faster, with the same bytes per firing to the byte.
+  - At 1,000 candidates it beats `read_weight` 1 without the cache (12.1 against 23.1 ms) at 40 percent of the bytes; at 200 they are even (7.0 ms each).
+  - Both together are fastest (2.4 and 5.5 ms), for the bytes `read_weight` 1 costs.
+  - What is left at the default weight is the write: each new chunk is matched against old ones for slices (6 to 10 ms), and those checks read the store.
+- Verdict: **kept** (an option, off by default). The trade is memory, up to the limit set, and one behaviour: a plain read of content kept before the store was damaged returns the kept bytes, which are right, where it would have returned an error; fsck still reports the damage. For the loop runner: 64 MB with the sum hash, and `read_weight` 1 as well when bytes do not matter.
+- Not measured: how much of the 64 MB a night uses; FsStore; a shared cache's lock under many reader threads.
+- Run: as above (about 12 minutes together here).
+- Gates on the branch: fmt, clippy and the kernel's tests pass with the cache off (its default). With the default forced to 64 MB for a check, every test passes but three, and all three remove or damage stored files behind the repo's back after reading them, then expect the read to fail: `checked_raw_reads_check_their_crc`, `derivations_heal_a_corrupt_copy` and `derivation_cycles_are_errors`. That is the behaviour the verdict names; their fsck checks pass.

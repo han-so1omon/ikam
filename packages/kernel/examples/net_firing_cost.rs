@@ -9,6 +9,7 @@
 //! thousand `db_get`s of one key, and the bytes written per firing.
 //!
 //!   cargo run --release --example net_firing_cost [-- N...]
+//!   CACHE=1 cargo run --release --example net_firing_cost (E294's rows)
 
 use std::time::{Duration, Instant};
 
@@ -33,10 +34,11 @@ struct Row {
     bytes: f64,
 }
 
-fn run(n: usize, read_weight: f64, sum: bool) -> Row {
+fn run(n: usize, read_weight: f64, sum: bool, cache: usize) -> Row {
     let net = Net::parse(NET).unwrap();
     let mut repo = Repo::new(MemStore::default());
     repo.read_weight = read_weight;
+    repo.read_cache = cache;
     let db = repo.db_empty().unwrap();
     let mut db = if sum {
         repo.net_init_sum(&db, &net).unwrap()
@@ -98,6 +100,31 @@ fn run(n: usize, read_weight: f64, sum: bool) -> Row {
     }
 }
 
+/// (read_weight, sum hash, read_cache bytes). E293's rows by default;
+/// CACHE=1 runs E294's: the read cache (64 MB) against the same options.
+fn configs() -> Vec<(f64, bool, usize)> {
+    if std::env::var("CACHE").as_deref() == Ok("1") {
+        let c = 64 << 20;
+        return vec![
+            (0.001, false, 0),
+            (0.001, false, c),
+            (0.001, true, 0),
+            (0.001, true, c),
+            (1.0, true, 0),
+            (1.0, true, c),
+        ];
+    }
+    vec![
+        (0.001, false, 0),
+        (0.01, false, 0),
+        (0.1, false, 0),
+        (1.0, false, 0),
+        (10.0, false, 0),
+        (0.001, true, 0),
+        (1.0, true, 0),
+    ]
+}
+
 fn main() {
     let ns: Vec<usize> = std::env::args()
         .skip(1)
@@ -105,7 +132,7 @@ fn main() {
         .collect();
     let ns = if ns.is_empty() { vec![200, 1000] } else { ns };
     println!(
-        "{:>5} {:>6} {:<6} {:>8} {:>9} {:>7} {:>8} {:>7} {:>7} {:>7} {:>9}",
+        "{:>5} {:>6} {:<7} {:>8} {:>9} {:>7} {:>8} {:>7} {:>7} {:>7} {:>9}",
         "N",
         "weight",
         "hash",
@@ -119,21 +146,18 @@ fn main() {
         "bytes"
     );
     for &n in &ns {
-        for (w, sum) in [
-            (0.001, false),
-            (0.01, false),
-            (0.1, false),
-            (1.0, false),
-            (10.0, false),
-            (0.001, true),
-            (1.0, true),
-        ] {
-            let r = run(n, w, sum);
+        for (w, sum, cache) in configs() {
+            let r = run(n, w, sum, cache);
             println!(
-                "{:>5} {:>6} {:<6} {:>8.1} {:>9.1} {:>7.2} {:>8.2} {:>7.2} {:>7.2} {:>7.2} {:>9.0}",
+                "{:>5} {:>6} {:<7} {:>8.1} {:>9.1} {:>7.2} {:>8.2} {:>7.2} {:>7.2} {:>7.2} {:>9.0}",
                 n,
                 w,
-                if sum { "sum" } else { "plain" },
+                match (sum, cache > 0) {
+                    (false, false) => "plain",
+                    (true, false) => "sum",
+                    (false, true) => "plain+c",
+                    (true, true) => "sum+c",
+                },
                 r.get_us,
                 r.per_ms,
                 r.steps[0],

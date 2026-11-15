@@ -80,6 +80,10 @@ pub(crate) struct Cx {
     pub(crate) work: usize,
     /// Content lengths learned without rebuilding (E166).
     pub(crate) lens: HashMap<Id, u64>,
+    /// Serve contents from `read_cache` (E294). Only a plain read sets it:
+    /// a write's checks count decode work and test which stored copies a
+    /// derivation depends on, and a kept copy would hide both.
+    pub(crate) cached: bool,
 }
 
 impl Cx {
@@ -190,6 +194,18 @@ pub struct Repo<S: Store> {
     /// both. The same changes either way; off by default.
     pub prune_diff: bool,
     pub(crate) memo: std::sync::Mutex<Option<Memo>>,
+    /// Keep up to this many bytes of contents read, rebuilt ones included,
+    /// across reads (E294). 0, the default, keeps none. A content's bytes
+    /// never change for its id and are checked against it before they are
+    /// kept, so a kept copy is always right; it saves rebuilding a graph
+    /// chunk or a tree from slices on every read. Only `read_content` and
+    /// the reads built on it are served from it: a write's own checks and
+    /// fsck read the store, so writes store the same bytes either way and
+    /// fsck still sees damage. A plain read of content kept before the store
+    /// was damaged returns the kept, right bytes. Shared with siblings; gc
+    /// empties it.
+    pub read_cache: usize,
+    pub(crate) cache: Arc<std::sync::Mutex<Cache>>,
     /// With a `seed_scope`, add each old tree and graph chunk that a tree
     /// or view edit reads to the seed index before the edit writes its new
     /// chunks (E141). Off by default. A new chunk repeats the chunks it
@@ -236,6 +252,14 @@ pub(crate) struct Memo {
     bytes: usize,
 }
 
+/// Contents kept by `read_cache` (E294), dropped oldest first.
+#[derive(Default)]
+pub(crate) struct Cache {
+    map: HashMap<Id, Vec<u8>>,
+    order: std::collections::VecDeque<Id>,
+    bytes: usize,
+}
+
 /// Most bytes one edit's memo keeps; reads past it go to the store.
 pub(crate) const MEMO_LIMIT: usize = 64 << 20;
 
@@ -264,6 +288,8 @@ impl<S: Store> Repo<S> {
             read_memo: false,
             prune_diff: false,
             memo: Default::default(),
+            read_cache: 0,
+            cache: Default::default(),
             replace_hints: false,
             exact_short_search: false,
             object_templates: true,
@@ -526,6 +552,8 @@ impl<S: Store> Repo<S> {
             let _ = r.dict.set(d.clone());
         }
         r.read_weight = self.read_weight;
+        r.read_cache = self.read_cache;
+        r.cache = self.cache.clone();
         r.short_records = self.short_records;
         r.markup_layers = self.markup_layers;
         r.object_templates = self.object_templates;
@@ -547,6 +575,7 @@ impl<S: Store> Repo<S> {
         *self.ledger.write().unwrap_or_else(|e| e.into_inner()) = None;
         self.dict = OnceLock::new();
         *self.needed.lock().unwrap() = None;
+        *self.cache.lock().unwrap() = Cache::default();
     }
 
     /// Keep the needed set current after storing `encoded` (E129).
@@ -673,7 +702,13 @@ impl<S: Store> Repo<S> {
     }
 
     pub fn read_content(&self, id: &Id) -> Result<Vec<u8>, Error> {
-        self.rebuild(id, &mut Cx::default())
+        self.rebuild(
+            id,
+            &mut Cx {
+                cached: self.read_cache > 0,
+                ..Cx::default()
+            },
+        )
     }
 
     pub(crate) fn rebuild(&self, id: &Id, cx: &mut Cx) -> Result<Vec<u8>, Error> {
@@ -688,6 +723,11 @@ impl<S: Store> Repo<S> {
         if let Some(bytes) = self.memo_get(id) {
             return self.remember(id, bytes, cx);
         }
+        if cx.cached
+            && let Some(bytes) = self.cache.lock().unwrap().map.get(id).cloned()
+        {
+            return self.remember(id, bytes, cx);
+        }
         let mut err = Error::NotFound(*id);
         match self.store.read(id) {
             Ok(encoded) => match self.decode_plain(id, &encoded) {
@@ -695,6 +735,7 @@ impl<S: Store> Repo<S> {
                     if crate::dict::self_verified(&encoded) || Id::of_content(&bytes) == *id =>
                 {
                     self.memo_put(id, &bytes, encoded.len());
+                    self.cache_put(id, &bytes);
                     return self.remember(id, bytes, cx);
                 }
                 Ok(_) | Err(Error::Corrupt(_)) => err = Error::Corrupt(*id),
@@ -709,6 +750,7 @@ impl<S: Store> Repo<S> {
             match self.eval(&d.func, &d.args, cx) {
                 Ok(bytes) if Id::of_content(&bytes) == *id => {
                     cx.stack.pop();
+                    self.cache_put(id, &bytes);
                     return self.remember(id, bytes, cx);
                 }
                 Ok(_) => err = Error::Corrupt(*id),
@@ -718,6 +760,29 @@ impl<S: Store> Repo<S> {
         }
         cx.stack.pop();
         Err(err)
+    }
+
+    /// Keep checked content `bytes` of `id`, if `read_cache` is on.
+    fn cache_put(&self, id: &Id, bytes: &[u8]) {
+        let limit = self.read_cache;
+        if limit == 0 || bytes.len() > limit {
+            return;
+        }
+        let mut c = self.cache.lock().unwrap();
+        if c.map.contains_key(id) {
+            return;
+        }
+        while c.bytes + bytes.len() > limit {
+            let Some(old) = c.order.pop_front() else {
+                break;
+            };
+            if let Some(b) = c.map.remove(&old) {
+                c.bytes -= b.len();
+            }
+        }
+        c.bytes += bytes.len();
+        c.order.push_back(*id);
+        c.map.insert(*id, bytes.to_vec());
     }
 
     fn remember(&self, id: &Id, bytes: Vec<u8>, cx: &mut Cx) -> Result<Vec<u8>, Error> {
