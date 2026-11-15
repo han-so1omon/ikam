@@ -3841,3 +3841,25 @@ Gates on the branch (E229 to E233): every kernel test suite passes (release); cl
 - Not measured: guards and their lowering to interp.wasm (E277's question); a workflow layer above this; error positions finer than a line; nets of thousands of transitions.
 - Run: `cargo run --release --example net_text [-- N]`; `cargo test --release --lib net::`.
 - Gates on the branch: kernel lib tests pass; clippy `-D warnings` and fmt clean.
+
+### E277 execution-modes (interpreted, table, native and wasm steps for a net)
+- Branch / parent: exp/277-execution-modes / E270 (exp/270-net-dsl)
+- Question: would compiling a net (through MLIR, Cranelift, LLVM or to wasm) pay off, and where? Compare the cost of one step of the same net in several execution modes, with each mode's compile cost, against the cost of a recorded firing on the database (E269). (Design: `docs/research/experiment-loop.md`, H3.)
+- Hypothesis: for the live loop, a recorded firing (about 8.6 ms, mostly the append) dwarfs any step, so the mode does not matter; for simulation (many steps in memory, such as trying a schedule before running it) a lowered form beats the interpreter by orders of magnitude, and compiled native code adds a smaller factor that must repay its compile time. (Source: Fronc and Pommereau, SUMo 2011, whose compiled Petri net backends ran over 900x faster than SNAKES's interpretation; MLIR's and CIRCT Handshake's dataflow designs; the Rust options read for H3: melior wraps MLIR's C API and needs a matching system LLVM and MLIR, pliron is a pure-Rust MLIR-like framework, cranelift-jit calls itself experimental.)
+- Change: none in the kernel. `examples/net_modes.rs` runs one random walk (at each step list the enabled transitions in order, pick one with a shared xorshift generator, fire it) in four modes on seeded random place/transition nets (conservative arcs, weights 1 to 3, a cycle of single moves so the walk never deadlocks): `interp` (the `net` module's `Net::is_enabled` and `Net::fire` on string-keyed markings), `table` (lowered once to dense arrays of thresholds and deltas), `native` (the net emitted as specialized C, one enabling test and one firing per transition, built with clang -O2, LLVM 18, and loaded with dlopen), `wasm` (the same C built for wasm32 and run in wasmi, the kernel's deterministic interpreter, floats off). Every mode must end in the same marking after the same steps.
+- Result (`cargo run --release --example net_modes`, this cloud machine; markings equal in every mode at every size; ns per step, compile in ms):
+
+  | Net (places x transitions) | interp | table | native (compile) | wasm (compile) |
+  |---|---|---|---|---|
+  | 10 x 20 | 1,922 | 75 | 46 (96) | 109 (75) |
+  | 100 x 200 | 76,868 | 372 | 137 (245) | 734 (292) |
+  | 1,000 x 2,000 | 6,274,657 | 2,945 | 972 (4,229) | 18,503 (96,261) |
+
+  - The live loop is not bound by the step: at the loop net's size the interpreter's step is about 2 us, more than 4,000 times below a recorded firing (8.6 ms, E269).
+  - The interpreter scales badly: it looks places up by name and clones the marking on every firing. Lowering to the table is 26x faster at 10 places and over 2,000x at 1,000, with no compile step.
+  - Native code is 1.6x to 3x faster than the table; its compile repays itself only after about 3 million steps (10 x 20), 1 million (100 x 200) or 2 million (1,000 x 2,000).
+  - wasm in wasmi is slower than the table at 100 places and more (2x to 6x), and clang's wasm build of a large unrolled net took 96 s. Deterministic wasm fits small pure functions such as guards, not the whole step.
+- Verdict: **measured** (a comparison, no kernel change). Compilation does not matter for the live loop. For simulation the next step is the table lowering, as an option in the `net` module (and the same lookups by index would cut the interpreter's cost in `net_fire`); native compilation is worth trying only once a workload runs millions of steps; whole-net wasm is not worth it.
+- Not measured: MLIR itself (this machine has LLVM 18 but no MLIR libraries; clang -O2 stands in for the LLVM end of such a pipeline, and MLIR's gain would come from restructuring, such as vectorizing enabling tests over many colors, which a random walk does not exercise); Cranelift (would add a dependency; expected between table and native with faster compiles); colored nets (would unfold to one place per color); guards in wasm; macOS.
+- Run: `cargo run --release --example net_modes` (needs clang with the wasm32 target and lld).
+- Gates on the branch: clippy `-D warnings` and fmt clean; kernel lib tests pass.
