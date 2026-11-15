@@ -4465,3 +4465,20 @@ Gates on the branch (E229 to E233): every kernel test suite passes (release); cl
 - Verdict: **kept** (example only; no kernel change). A loop runner needs a supervisor that requeues a dead worker's runs, with `requeue` in the loop net; E287's plan assumed workers never die.
 - Not measured: workers on other machines, where a supervisor cannot see a death and needs a lease (a time limit on `running`); cleaning up temporary files of dead processes (they would need a check that the process is gone).
 - Run: as above (about 12 minutes together).
+
+### E302 clean-temporaries (temporary files dead workers leave)
+- Branch / parent: exp/302-clean-temporaries / E301 (exp/301-killed-workers)
+- Question: E301's killed workers left up to 110 temporary files in `objects/` (`.tmp-*` from a cut-off write, `.pending-*` from a deferred store never synced). Nothing reads or removes them. Can they be removed safely? (Source: E301's "Not measured": "cleaning up temporary files of dead processes".)
+- Hypothesis: every temporary name carries its process id (E299 made `.tmp-` names unique per write as well), so a file whose process no longer exists can be removed: no live writer will rename it into place.
+- Change: `FsStore::clean_temporaries()`, called explicitly, never on its own: removes `.tmp-*` and `.pending-*` files in `objects/` whose process id is not this process and names no running process (signal 0; on systems other than Linux and Apple ones it removes nothing). It is for a store whose writers all run on this machine: a writer on another machine sharing the directory would look dead. A reused process id keeps its files, which is safe. `net_kill` gains `CLEAN=1`; `tests/clean_temporaries.rs` checks a dead process's files of both kinds and the old `.tmp-<pid>` name go, and a live process's, this process's and unparsable names stay.
+- Result (`REQUEUE=1 KILL_MS=... CLEAN=1 cargo run --release --example net_kill -- 100`):
+
+  | A kill every | Deferred | Kills | Removed | Left | Replay, fsck, outputs |
+  |---|---|---|---|---|---|
+  | 200 ms | yes | 595 | 44 | 0 | equal, 0, all right |
+  | 200 ms | no | 594 | 12 | 0 | equal, 0, all right |
+  | 700 ms | yes | 6 | 34 | 0 | equal, 0, all right |
+
+- Verdict: **kept** (a new function, called only by whoever runs the workers; no change to what is stored). The supervisor of E301 can call it once its workers are gone, or after each death.
+- Not measured: stores shared across machines (it must not be used there); a supervisor calling it while workers run (safe by the process check, not exercised).
+- Run: as above, and `cargo test --release --test clean_temporaries`.

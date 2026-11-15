@@ -276,6 +276,47 @@ impl FsStore {
     /// (E227). Nothing to do for a store opened with `open`. On Apple
     /// systems each file gets a plain fsync and the ref's own sync, a full
     /// flush of the drive, makes them durable together.
+    /// Remove the temporary files that writer processes which have died
+    /// left in `objects/` (E302): `.tmp-*` from a write cut off before its
+    /// rename and, with `open_deferred`, `.pending-*` objects never synced.
+    /// Neither is ever read. A file is removed only if the process id in
+    /// its name is not this process and no process with that id runs, so
+    /// call it only on a store whose writers all run on this machine (and
+    /// in this process namespace): one on another machine looks dead. A
+    /// reused process id keeps its files, which is safe. Returns the number
+    /// removed; on systems other than Linux and Apple ones, removes nothing.
+    pub fn clean_temporaries(&self) -> Result<usize, Error> {
+        let mut removed = 0;
+        for dir in fs::read_dir(self.root.join("objects"))? {
+            let dir = dir?;
+            if !dir.file_type()?.is_dir() {
+                continue;
+            }
+            for file in fs::read_dir(dir.path())? {
+                let file = file?;
+                let name = file.file_name().to_string_lossy().into_owned();
+                let Some(rest) = name
+                    .strip_prefix(".tmp-")
+                    .or_else(|| name.strip_prefix(".pending-"))
+                else {
+                    continue;
+                };
+                let Ok(pid) = rest.split('-').next().unwrap_or("").parse::<u32>() else {
+                    continue;
+                };
+                if pid == std::process::id() || process_may_run(pid) {
+                    continue;
+                }
+                match fs::remove_file(file.path()) {
+                    Ok(()) => removed += 1,
+                    Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+                    Err(e) => return Err(e.into()),
+                }
+            }
+        }
+        Ok(removed)
+    }
+
     pub fn sync(&mut self) -> Result<(), Error> {
         self.sync_pending()?;
         // Only now, with what replaces them durable (E300).
@@ -350,6 +391,27 @@ impl Drop for FsStore {
     /// `open`: a later process may name them (`ikam put`, then a commit).
     fn drop(&mut self) {
         let _ = self.sync();
+    }
+}
+
+/// False only when no process with id `pid` exists (E302); true when it
+/// may, including when this system cannot tell.
+fn process_may_run(pid: u32) -> bool {
+    #[cfg(any(target_os = "linux", target_vendor = "apple"))]
+    {
+        let Ok(pid) = libc::pid_t::try_from(pid) else {
+            return true;
+        };
+        // SAFETY: signal 0 only checks that the process exists.
+        if unsafe { libc::kill(pid, 0) } == 0 {
+            return true;
+        }
+        io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH)
+    }
+    #[cfg(not(any(target_os = "linux", target_vendor = "apple")))]
+    {
+        let _ = pid;
+        true
     }
 }
 

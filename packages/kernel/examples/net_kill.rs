@@ -13,7 +13,7 @@
 //!
 //!   cargo run --release --example net_kill [-- N]
 //!   (W, KILL_MS, WORK_MS as env; DEFERRED=1 opens the store with
-//!   `open_deferred`)
+//!   `open_deferred`; CLEAN=1 runs `clean_temporaries` (E302) at the end)
 
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
@@ -318,6 +318,12 @@ fn main() {
         })
         .count();
     let fsck = repo.fsck().unwrap().len();
+    // E302: CLEAN=1 removes what dead workers left, once they are all gone.
+    let cleaned = if std::env::var("CLEAN").as_deref() == Ok("1") {
+        repo.store().clean_temporaries().unwrap()
+    } else {
+        0
+    };
     let mut leftovers = 0;
     for sub in std::fs::read_dir(dir.join("objects")).unwrap() {
         for f in std::fs::read_dir(sub.unwrap().path()).unwrap() {
@@ -330,7 +336,7 @@ fn main() {
         "{w} workers, {n} candidates, a kill every {kill_ms} ms{}: {kills} kills ({requeued} candidates requeued by the supervisor), {errors} errors; \
          first pass {first_ms} ms, {measured_first} measured, {} stranded in running; \
          after requeue {second_ms} ms: {} measured, replay {replay}, {unreadable} outputs wrong or unreadable, \
-         fsck {fsck}, {leftovers} temporary files left",
+         fsck {fsck}, {cleaned} temporary files removed, {leftovers} left",
         match (std::env::var("DEFERRED").as_deref() == Ok("1"), supervise) {
             (true, true) => ", deferred, supervised",
             (true, false) => ", deferred",
