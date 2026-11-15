@@ -4530,3 +4530,24 @@ Gates on the branch (E229 to E233): every kernel test suite passes (release); cl
 - Verdict: **kept** (example only). The loop runner's recovery: a lease a few heartbeats long, renewed by the run's checkpoints, with E301's requeue.
 - Not measured: heartbeats at scale (many workers' checkpoints contending for one ref; a separate ref per worker would avoid it); machines with differing clocks.
 - Run: as above (about 12 minutes together).
+
+### E305 refresh-cost (what `refresh_ledger` costs on a large store)
+- Branch / parent: exp/305-refresh-cost / E304 (exp/304-lease-heartbeats)
+- Question: E298's `refresh_ledger` lists the store on a read of content that is neither stored nor derivable. How much is that on a store the size of a real one, against the default? (Source: E298's verdict: "it lists the store on a read of content that is really missing".)
+- Hypothesis: the listing reads only directory entries, not objects, so a miss costs well under a millisecond per thousand objects, far less than building the ledger.
+- Change: none to the kernel. `examples/refresh_cost.rs`: FsStore stores of N small objects; times a read of stored content, the first miss (which builds the ledger), a later miss with the option off and on, and a read of content another handle derived after the ledger was built (on).
+- Result (`cargo run --release --example refresh_cost -- 1000 10000 50000 200000`, ms):
+
+  | Stored objects | Stored read | First miss (ledger build) | Later miss, off | Later miss, on | Another handle's derivation, on |
+  |---|---|---|---|---|---|
+  | 1,000 | 0.003 | 7.5 | 0.007 | 1.5 to 1.7 | 1.3 |
+  | 10,000 | 0.003 | 49 | 0.007 | 6.9 to 7.3 | 7.5 |
+  | 50,000 | 0.003 | 229 | 0.008 | 33 to 34 | 34 |
+  | 200,000 | 0.003 | 963 | 0.011 | 137 to 139 | 140 |
+
+  - With the option on, each miss costs about 0.7 µs per stored object (the listing), a seventh of building the ledger; off, a miss costs microseconds.
+  - Reading what another process derived costs the same listing once, then nothing.
+  - Reads of stored or known content are unchanged.
+- Verdict: **measured** (no change). Keep `refresh_ledger` off by default and on for worker processes sharing a store; a caller that probes for missing content in a loop should leave it off. A store large enough for 100 ms listings would want a list of new records to read instead (not built).
+- Not measured: stores on slower disks or network filesystems; APFS on the Mac.
+- Run: as above (about 1 minute).
