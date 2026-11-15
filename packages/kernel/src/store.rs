@@ -234,6 +234,13 @@ pub struct FsStore {
     /// under their temporary names. Made durable and renamed into place
     /// before the next ref move (`sync`).
     pending: Option<BTreeMap<Id, PathBuf>>,
+    /// E300: with `open_deferred`, stored objects deleted since the last
+    /// ref move. They read as gone at once, but their files are removed
+    /// only after the waiting objects are durable (`sync`): a put that
+    /// replaces a stored copy with a derivation deletes the copy, and
+    /// removing it first lost the content when the process died before
+    /// the derivation was durable.
+    dropping: std::collections::BTreeSet<Id>,
 }
 
 impl FsStore {
@@ -244,6 +251,7 @@ impl FsStore {
         Ok(FsStore {
             root,
             pending: None,
+            dropping: Default::default(),
         })
     }
 
@@ -276,7 +284,64 @@ impl FsStore {
     /// (E227). Nothing to do for a store opened with `open`. On Apple
     /// systems each file gets a plain fsync and the ref's own sync, a full
     /// flush of the drive, makes them durable together.
+    /// Remove the temporary files that writer processes which have died
+    /// left in `objects/` (E302): `.tmp-*` from a write cut off before its
+    /// rename and, with `open_deferred`, `.pending-*` objects never synced.
+    /// Neither is ever read. A file is removed only if the process id in
+    /// its name is not this process and no process with that id runs, so
+    /// call it only on a store whose writers all run on this machine (and
+    /// in this process namespace): one on another machine looks dead. A
+    /// reused process id keeps its files, which is safe. Returns the number
+    /// removed; on systems other than Linux and Apple ones, removes nothing.
+    pub fn clean_temporaries(&self) -> Result<usize, Error> {
+        let mut removed = 0;
+        for dir in fs::read_dir(self.root.join("objects"))? {
+            let dir = dir?;
+            if !dir.file_type()?.is_dir() {
+                continue;
+            }
+            for file in fs::read_dir(dir.path())? {
+                let file = file?;
+                let name = file.file_name().to_string_lossy().into_owned();
+                let Some(rest) = name
+                    .strip_prefix(".tmp-")
+                    .or_else(|| name.strip_prefix(".pending-"))
+                else {
+                    continue;
+                };
+                let Ok(pid) = rest.split('-').next().unwrap_or("").parse::<u32>() else {
+                    continue;
+                };
+                if pid == std::process::id() || process_may_run(pid) {
+                    continue;
+                }
+                match fs::remove_file(file.path()) {
+                    Ok(()) => removed += 1,
+                    Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+                    Err(e) => return Err(e.into()),
+                }
+            }
+        }
+        Ok(removed)
+    }
+
     pub fn sync(&mut self) -> Result<(), Error> {
+        self.sync_pending()?;
+        // Only now, with what replaces them durable (E300).
+        while let Some(id) = self.dropping.pop_first() {
+            match fs::remove_file(self.path(&id)) {
+                Ok(()) => {}
+                Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+                Err(e) => {
+                    self.dropping.insert(id);
+                    return Err(e.into());
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn sync_pending(&mut self) -> Result<(), Error> {
         let Some(pending) = self.pending.as_mut() else {
             return Ok(());
         };
@@ -337,6 +402,27 @@ impl Drop for FsStore {
     }
 }
 
+/// False only when no process with id `pid` exists (E302); true when it
+/// may, including when this system cannot tell.
+fn process_may_run(pid: u32) -> bool {
+    #[cfg(any(target_os = "linux", target_vendor = "apple"))]
+    {
+        let Ok(pid) = libc::pid_t::try_from(pid) else {
+            return true;
+        };
+        // SAFETY: signal 0 only checks that the process exists.
+        if unsafe { libc::kill(pid, 0) } == 0 {
+            return true;
+        }
+        io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH)
+    }
+    #[cfg(not(any(target_os = "linux", target_vendor = "apple")))]
+    {
+        let _ = pid;
+        true
+    }
+}
+
 /// Write a file's data to the drive: `sync_all`, except on Apple systems,
 /// where `sync_all` also flushes the drive's cache (F_FULLFSYNC) and a plain
 /// fsync is enough before a later full flush.
@@ -366,7 +452,12 @@ fn prefix_start(prefix: &[u8]) -> [u8; 32] {
 fn write_atomic(path: &std::path::Path, bytes: &[u8]) -> Result<(), Error> {
     let dir = path.parent().unwrap();
     fs::create_dir_all(dir)?;
-    let tmp = dir.join(format!(".tmp-{}", std::process::id()));
+    // Unique per process and write (E299): two handles on one directory
+    // in one process (two threads) once shared one name, so one renamed the
+    // other's half-written file into place under its own id.
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let tmp = dir.join(format!(".tmp-{}-{n}", std::process::id()));
     let mut file = fs::File::create(&tmp)?;
     file.write_all(bytes)?;
     file.sync_all()?;
@@ -435,6 +526,10 @@ impl Store for FsStore {
         FsStore::sync(self)
     }
     fn write(&mut self, id: Id, encoded: &[u8]) -> Result<bool, Error> {
+        // Deleted since the last ref move: its file is still in place.
+        if self.dropping.remove(&id) {
+            return Ok(true);
+        }
         if self.has(&id) {
             return Ok(false);
         }
@@ -462,20 +557,30 @@ impl Store for FsStore {
         if let Some(tmp) = self.pending.as_mut().and_then(|p| p.remove(&id)) {
             let _ = fs::remove_file(tmp);
         }
+        self.dropping.remove(&id);
         write_atomic(&self.path(&id), encoded)
     }
 
     fn read(&self, id: &Id) -> Result<Vec<u8>, Error> {
+        if self.dropping.contains(id) {
+            return Err(Error::NotFound(*id));
+        }
         not_found_as(fs::read(self.located(id)), || Error::NotFound(*id))
     }
 
     fn stored_len(&self, id: &Id) -> Result<usize, Error> {
+        if self.dropping.contains(id) {
+            return Err(Error::NotFound(*id));
+        }
         not_found_as(fs::metadata(self.located(id)), || Error::NotFound(*id))
             .map(|m| m.len() as usize)
     }
 
     fn read_head(&self, id: &Id, n: usize) -> Result<Vec<u8>, Error> {
         use std::io::Read;
+        if self.dropping.contains(id) {
+            return Err(Error::NotFound(*id));
+        }
         let file = not_found_as(fs::File::open(self.located(id)), || Error::NotFound(*id))?;
         let mut out = Vec::with_capacity(n);
         file.take(n as u64).read_to_end(&mut out)?;
@@ -483,6 +588,9 @@ impl Store for FsStore {
     }
 
     fn has(&self, id: &Id) -> bool {
+        if self.dropping.contains(id) {
+            return false;
+        }
         self.pending.as_ref().is_some_and(|p| p.contains_key(id)) || self.path(id).exists()
     }
 
@@ -501,6 +609,7 @@ impl Store for FsStore {
         if let Some(pending) = &self.pending {
             out.extend(pending.keys());
         }
+        out.retain(|id| !self.dropping.contains(id));
         // Directory order depends on the filesystem (ext4 hashes names with a
         // per-filesystem seed, APFS sorts them). Callers that pick among
         // equal choices in id order then store the same encodings everywhere,
@@ -535,6 +644,7 @@ impl Store for FsStore {
                     .filter(|id| id.as_bytes().starts_with(prefix)),
             );
         }
+        out.retain(|id| !self.dropping.contains(id));
         out.sort_unstable(); // as `ids` (E136)
         Ok(out)
     }
@@ -542,6 +652,14 @@ impl Store for FsStore {
     fn delete(&mut self, id: &Id) -> Result<(), Error> {
         if let Some(tmp) = self.pending.as_mut().and_then(|p| p.remove(id)) {
             fs::remove_file(tmp)?;
+            return Ok(());
+        }
+        if self.pending.is_some() {
+            // Deferred (E300): gone now, removed at the next sync.
+            if self.dropping.contains(id) || !self.path(id).exists() {
+                return Err(Error::NotFound(*id));
+            }
+            self.dropping.insert(*id);
             return Ok(());
         }
         not_found_as(fs::remove_file(self.path(id)), || Error::NotFound(*id))
