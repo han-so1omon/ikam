@@ -274,6 +274,7 @@ fn commit(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn worker(
     mut repo: Repo<SharedStore<MemStore>>,
     net: Shared<Net>,

@@ -4236,3 +4236,31 @@ Gates on the branch (E229 to E233): every kernel test suite passes (release); cl
 - Verdict: **kept** (`db_commit_at` is new and changes nothing else; the race fix is a fix, on this branch only). For a loop with more than one worker: one committer (a lock, or one thread that fires for the others) and the work in parallel; `db_commit_at` where writers cannot share a lock, such as two processes; never a plain merge of two branches that fired one net, unless the sum hash is on.
 - Not measured: FsStore and two processes (MemStore threads here); a merge that resolves two firings instead of refusing them; two more races found by reading `repo.rs`, not seen in a run: a ledger built while another handle records a derivation can miss it, and a handle that writes a record another handle already wrote does not add it to the ledger.
 - Run: `cargo run --release --example net_two_writers`, and `PART1=0 WORK_MS=40 cargo run --release --example net_two_writers` (5 minutes together here).
+
+### E293 firing-cost (where one firing's time goes)
+- Branch / parent: exp/293-firing-cost / E292 (exp/292-two-writers)
+- Question: in E292 one firing of a commit-per-firing runner took about 17 ms on a MemStore, longer than most of the loop's own steps, so the commit path set the pace and runs did not overlap. Where does the time go, and what do the existing options (`read_weight`, the sum hash of E279) do to it? (Source: E292's part 2, "the commit path, not the work, sets the pace".)
+- Hypothesis: the time is in reads, not in the commit: the kernel stores most graph chunks as slices of earlier chunks to save bytes (`read_weight` 0.001), so every key read rebuilds its chunks. A higher `read_weight` stores them plainly and reads faster for more bytes; the sum hash saves the two whole-marking reads in `net_fire`.
+- Change: none to the kernel. `examples/net_firing_cost.rs` times each step of one writer taking N candidates through start and finish (head, marking, next firing, fire, commit), a thousand reads of one key, and the bytes written per firing.
+- Result (MemStore, one writer; ms per firing unless marked):
+
+  | N | `read_weight` | Hash | One key read | Firing | Head | Marking | Next | Fire | Commit | Bytes per firing |
+  |---|---|---|---|---|---|---|---|---|---|---|
+  | 200 | 0.001 (default) | plain | 464 µs | 29.4 | 0.15 | 4.19 | 11.27 | 13.70 | 0.13 | 7,643 |
+  | 200 | 0.1 | plain | 412 µs | 29.4 | 0.14 | 4.17 | 11.28 | 13.71 | 0.13 | 7,557 |
+  | 200 | 1 | plain | 46 µs | 10.0 | 0.12 | 3.12 | 1.67 | 4.97 | 0.12 | 17,140 |
+  | 200 | 10 | plain | 46 µs | 9.3 | 0.12 | 3.11 | 1.67 | 4.34 | 0.11 | 17,140 |
+  | 200 | 0.001 | sum | 414 µs | 26.2 | 0.17 | 4.31 | 11.17 | 10.42 | 0.12 | 7,647 |
+  | 200 | 1 | sum | 45 µs | 7.2 | 0.12 | 3.20 | 1.70 | 2.06 | 0.11 | 17,350 |
+  | 1,000 | 0.001 | plain | 442 µs | 70.8 | 0.23 | 21.93 | 13.63 | 34.78 | 0.24 | 9,132 |
+  | 1,000 | 1 | plain | 47 µs | 41.3 | 0.17 | 16.61 | 2.45 | 21.88 | 0.22 | 22,734 |
+  | 1,000 | 0.001 | sum | 476 µs | 48.7 | 0.23 | 21.65 | 13.34 | 13.35 | 0.13 | 9,373 |
+  | 1,000 | 1 | sum | 48 µs | 23.2 | 0.17 | 16.43 | 2.37 | 4.15 | 0.12 | 23,176 |
+
+  - The commit is a tenth of a millisecond. Reading is the cost: one key takes 0.4 to 0.5 ms by default, because its chunks are rebuilt from slices on every read.
+  - `read_weight` 1 makes a key read 10 times faster and a firing 3 to 4 times faster at 200 candidates, for 2.2 to 2.5 times the bytes per firing. Above 1 changes little.
+  - The sum hash cuts the fire step 2 to 5 times (it reads the changed keys, not the whole marking twice). With `read_weight` 1, a firing at 200 candidates takes 7.2 ms instead of 29.4.
+  - What is left at 1,000 candidates is the runner's own whole-marking read (16 ms) for its done check, which grows with the tokens; a count of the measured place would do.
+- Verdict: **measured** (no kernel change). For a loop runner, `read_weight` 1 and the sum hash are worth their bytes; the bytes are the default's trade, so both stay options. The reads are slow because nothing keeps a rebuilt chunk; E294 tries a read cache that keeps the default's bytes.
+- Not measured: FsStore (reads from disk add to every row); the kept counts of E233 for the done check; `read_weight` between 0.1 and 1.
+- Run: `cargo run --release --example net_firing_cost -- 200 1000` (14 minutes here).
