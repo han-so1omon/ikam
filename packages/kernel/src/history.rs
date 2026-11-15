@@ -289,12 +289,21 @@ impl<S: Store> Repo<S> {
             }
             // Objects first: a derivation names contents it does not decode with.
             ready.sort_by_key(|&i| !object[i]);
+            let mut objects = true;
             for i in ready {
+                if objects && !object[i] {
+                    // A store may hold deletes until `sync` (E300's deferred
+                    // FsStore) and then apply them in any order, so each step
+                    // is made durable before the next one starts.
+                    self.store.sync()?;
+                    objects = false;
+                }
                 self.store.delete(&ids[i])?;
                 for &j in &reads[i] {
                     readers[j] -= 1;
                 }
             }
+            self.store.sync()?;
         }
         Ok(())
     }

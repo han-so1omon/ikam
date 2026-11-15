@@ -88,15 +88,34 @@ fn copy(src: &MemStore) -> MemStore {
     out
 }
 
-fn replay(store: &mut MemStore, ops: &[Op]) {
+/// Replays `ops` onto `store`. With `held`, deletes wait for the next
+/// sync and then go in reverse id order, as a store that defers its deletes
+/// may apply them (E300's deferred FsStore); a stop before that sync loses
+/// them, as a crash would.
+fn replay(store: &mut MemStore, ops: &[Op], held: bool) {
+    let mut waiting = Vec::new();
     for op in ops {
         match op {
             Op::Write(id, b) => {
                 store.write(*id, b).unwrap();
             }
             Op::Replace(id, b) => store.replace(*id, b).unwrap(),
+            Op::Delete(id) if held => waiting.push(*id),
             Op::Delete(id) => store.delete(id).unwrap(),
-            Op::SetRef(name, e, new) => store.set_ref(name, *e, *new).unwrap(),
+            Op::Sync if held => {
+                waiting.sort();
+                for id in waiting.drain(..).rev() {
+                    store.delete(&id).unwrap();
+                }
+            }
+            Op::SetRef(name, e, new) => {
+                // A ref move syncs first (E227).
+                waiting.sort();
+                for id in waiting.drain(..).rev() {
+                    store.delete(&id).unwrap();
+                }
+                store.set_ref(name, *e, *new).unwrap()
+            }
             Op::DeleteRef(name, e) => store.delete_ref(name, *e).unwrap(),
             Op::Sync => store.sync().unwrap(),
         }
@@ -144,7 +163,7 @@ fn store(rows: u64, batches: u64, batch: u64) -> (MemStore, Db, Vec<(String, Vec
 /// Stops a recorded full repack of `store(rows, batches, batch)` after
 /// every `step`-th write (and after the last) and returns the stopping
 /// points whose store does not scan the same or is not fsck clean.
-fn unclean(rows: u64, batches: u64, batch: u64, step: usize) -> (Vec<usize>, usize) {
+fn unclean(rows: u64, batches: u64, batch: u64, step: usize, held: bool) -> (Vec<usize>, usize) {
     let (base, db, scan) = store(rows, batches, batch);
     let mut repo = Repo::new(Recorder {
         inner: copy(&base),
@@ -158,12 +177,17 @@ fn unclean(rows: u64, batches: u64, batch: u64, step: usize) -> (Vec<usize>, usi
     let ops = std::mem::take(&mut *repo.store().ops.lock().unwrap());
     assert!(ops.len() > 100, "{} writes", ops.len());
     let points: Vec<usize> = (0..=ops.len())
-        .filter(|k| k % step == 0 || *k == ops.len())
+        .filter(|&k| {
+            // With held deletes, a stop just before a sync or a ref move loses the most.
+            k % step == 0
+                || k == ops.len()
+                || (held && matches!(ops.get(k), Some(Op::Sync | Op::SetRef(..))))
+        })
         .collect();
     let bad = (points.iter())
         .filter(|&&k| {
             let mut store = copy(&base);
-            replay(&mut store, &ops[..k]);
+            replay(&mut store, &ops[..k], held);
             let repo = Repo::new(store);
             !(repo.db_scan(&db).ok().as_ref() == Some(&scan)
                 && repo.fsck_deep().map(|b| b.is_empty()).unwrap_or(false))
@@ -175,7 +199,7 @@ fn unclean(rows: u64, batches: u64, batch: u64, step: usize) -> (Vec<usize>, usi
 
 #[test]
 fn a_full_repack_stopped_after_any_write_reads_the_same() {
-    let (bad, points) = unclean(400, 5, 40, 1);
+    let (bad, points) = unclean(400, 5, 40, 1, false);
     assert!(
         bad.is_empty(),
         "{} of {points} stopping points unclean, first after {}",
@@ -188,7 +212,21 @@ fn a_full_repack_stopped_after_any_write_reads_the_same() {
 /// still read as a context by a frame it has yet to rewrite.
 #[test]
 fn a_larger_full_repack_stopped_part_way_reads_the_same() {
-    let (bad, points) = unclean(3000, 10, 100, 75);
+    let (bad, points) = unclean(3000, 10, 100, 75, false);
+    assert!(
+        bad.is_empty(),
+        "{} of {points} stopping points unclean, first after {}",
+        bad.len(),
+        bad[0]
+    );
+}
+
+/// The same with deletes held until each sync and then applied in any
+/// order, stopped every 100th write and just before each sync: every step
+/// of the repack's deletes is made durable before the next one starts.
+#[test]
+fn a_full_repack_with_deferred_deletes_stopped_after_any_write_reads_the_same() {
+    let (bad, points) = unclean(1000, 10, 100, 100, true);
     assert!(
         bad.is_empty(),
         "{} of {points} stopping points unclean, first after {}",

@@ -3853,6 +3853,12 @@ Gates on the branch (E229 to E233): every kernel test suite passes (release); cl
 - Verdict: **kept** (a fix, no option). The gaps are on main too: the two tests, run on main without the first cold pass (which main lacks), fail at 763 of 910 and 67 of 74 stopping points.
 - Run: `cargo run --release --example cold_pass -- crash 1000 150 [synced] [group]`; `cargo run --release --example cold_pass -- crash 3000 60 [synced]`; `cargo run --release --example cold_pass -- kill 3000 10 full`; `cargo test --release --test repack_crash`.
 - Gates on the branch: every kernel test suite passes (release, 249 tests); clippy `-D warnings` and fmt clean; the bench gives the same byte fields as the parent, north 0.3096.
+- Follow-up after merging main (af24e4d, with E300's deferred deletes):
+  - E300 makes a deferred FsStore hold each delete until the next `sync` or ref move and then remove the files in id order. So a garbage frame deleted in one round could still be on disk when a later round replaced its context with a chained form: `crash 1000 150` on the deferred store failed at 4 of 169 points (after writes 2,862 to 2,874, each a replacement).
+  - Change: `Repo::delete_readers_first` syncs before the contents of each round and after each round, so each step of the deletes is durable before the next starts (12 syncs in a 1,000-row repack instead of 1).
+  - Result: 0 failing at every run: `crash 1000 150` (187 points), `crash 1000 150 group` (184), `crash 3000 60` deferred and synced (100 each), `kill 3000 10 full` (9 killed, 1 finished first). The repack took 16.7 s at 1,000 rows and 34.7 s at 3,000 while another build shared the machine, so these times are not comparable with the ones above.
+  - Test: `a_full_repack_with_deferred_deletes_stopped_after_any_write_reads_the_same` replays onto a MemStore that holds deletes until each sync or ref move and then applies them in reverse id order, at 1,000 rows, every 100th point and just before each sync or ref move. Without the change it fails at 1 of 35 points (after write 2,860); with it, it passes.
+
 ### E275 registry-gaps (the experiment loop's gap list, from the project's own records)
 - Branch / parent: exp/275-registry-gaps / main c92a279
 - Question: an experiment loop that runs with little input needs a queue of candidates. Do the project's records (registry, log, research notes) already hold one, and would a list built from them have pointed at what was run next? (Design: `docs/research/experiment-loop.md`.)
