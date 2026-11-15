@@ -4083,3 +4083,27 @@ Gates on the branch (E229 to E233): every kernel test suite passes (release); cl
 - Not measured: tonight's real bench share (the run records commit times, not bench time; E281's checkpoints could record it); crashes and retries during the night (E281 measured those separately); a planner that reorders by expected value per minute instead of rank.
 - Run: `cargo run --release --example net_night_plan`.
 - Gates on the branch: kernel lib tests pass (63, 1 ignored); clippy `-D warnings` (all targets) and fmt clean.
+
+### E288 compiled-incremental (the incremental step compiled with Cranelift and clang)
+- Branch / parent: exp/288-compiled-incremental / E287 (exp/287-night-plan)
+- Question: E286 found that rechecking only what a firing touched beats every compiled form of the full scan on large nets, and named compiling the incremental form as the next comparison. Compiled, the readers to recheck after each transition are known at compile time; how much faster is that, what does it cost to compile, and where does it stop working?
+- Hypothesis: compiled straight-line rechecks with an enabled bitset (a popcount scan for the k-th pick) are 2x to 3x faster than the Rust incremental walk; the code grows with the rechecks summed over transitions, so a place read by many transitions (the loop net's cpu slot) makes it grow with the square of the candidates. (Source: E286's "Not measured"; E282's Cranelift mode; the MLIR question, "something similar for execution modes".)
+- Change: none in the kernel. `experiments/net-jit/src/inc.rs` (the separate crate): per transition, the places it changes and the distinct readers of those places; each firing block updates the places, recomputes each reader's test and flips its bit in an enabled bitset, keeping the count; the pick scans words by popcount, clears low bits to the k-th, then a jump table. The same in C for clang -O2. Run with `-- inc`. Every mode is asserted to end in the same marking after the same steps as `Table::walk` and `Table::walk_incremental`.
+- Result (`cargo run --release -- inc` in packages/kernel/experiments/net-jit; ns per step, compile ms in brackets):
+
+  | Net | Rechecks per transition | Table | Incremental (E286) | Cranelift incremental | clang -O2 incremental |
+  |---|---|---|---|---|---|
+  | random 10 x 20 | 8.2 | 80 | 67 | 28 (8) | 26 (238) |
+  | random 100 x 200 | 9.1 | 387 | 102 | 42 (103) | 40 (1,359) |
+  | random 1,000 x 2,000 | 9.2 | 3,016 | 168 | 68 (1,780) | 59 (22,526) |
+  | loop net, 10 candidates | 5.4 | 86 | 43 | 23 (12) | 22 (232) |
+  | loop net, 100 candidates | 41.4 | 557 | 58 | 44 (3,041) | 57 (27,567) |
+  | loop net, 1,000 candidates | 401.4 | 5,651 | 78 | not compiled | not compiled |
+
+  - Compiled, the incremental step is 1.9x to 2.9x faster than E286's Rust form, and 44x to 51x faster than the table on 1,000 x 2,000; Cranelift is within 20 percent of clang at a tenth of the compile time or less.
+  - Against the Rust incremental walk, Cranelift's compile repays after 0.2 M steps (10 x 20), 1.7 M (100 x 200), 18 M (1,000 x 2,000), 0.6 M (loop net, 10) and 210 M (loop net, 100).
+  - On the loop net the cpu slot is read by every `start`, so each `start` and `finish` rechecks every candidate's `start`: 2,007,000 unrolled rechecks at 1,000 candidates. The first run compiled them and the session ran out of memory; the run now skips any net over 1 M rechecks and reports the count.
+- Verdict: **measured**. For the loop's own nets (tens to hundreds of candidates, a thousand or so firings a night) the Rust incremental walk is the mode: nothing to compile and within 1.3x to 2x of the compiled code. Compiling pays only for long simulations of large nets with few readers per place (tens of millions of steps, as in a sweep of E287's plans). A hybrid would keep that gain on the loop net: unrolled rechecks for places with few readers, a loop over a reader table for hub places such as the cpu slot.
+- Not measured: the hybrid; MLIR itself (no MLIR toolchain in this environment; Cranelift and clang stand for a JIT and an ahead-of-time compiler); compiling colored nets without unfolding.
+- Run: `cargo run --release -- inc` in packages/kernel/experiments/net-jit (about 2 minutes, mostly clang).
+- Gates on the branch: no kernel change; the net-jit crate's clippy `-D warnings` and fmt clean; kernel lib tests as on E287 (63, 1 ignored).

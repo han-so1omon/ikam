@@ -19,6 +19,11 @@
 //! against the table.
 //!
 //!   cargo run --release   (in packages/kernel/experiments/net-jit)
+//!
+//! With `-- inc`, E288 instead: the incremental step compiled (see
+//! `inc.rs`).
+
+mod inc;
 
 use std::ffi::CString;
 use std::fmt::Write as _;
@@ -331,7 +336,95 @@ fn run(f: Walk, t: &Table, steps: u64, seed: u64) -> (Vec<u64>, u64, f64) {
     )
 }
 
+const LOOP: &str = "\
+net loop 1
+place cpu 1
+place queued colored
+place running colored
+place measured colored
+place waiting colored
+transition propose agent propose: -> queued
+transition start cmd bench: queued, cpu -> running
+transition finish pure: running -> measured, cpu
+transition ask pure: measured -> waiting
+transition merge human: waiting ->
+";
+
+/// E288: table, incremental (E286), and the incremental step compiled with
+/// Cranelift and with clang -O2, on random nets and the loop net unfolded.
+fn main_inc() {
+    let dir = tempfile::tempdir().unwrap();
+    let seed = 0x0123_4567_89AB_CDEF;
+    println!(
+        "net | places x transitions | rechecks per firing | table ns | incremental ns | cranelift inc ns (compile ms) | clang inc ns (compile ms)"
+    );
+    let mut nets: Vec<(String, Net)> = Vec::new();
+    for (i, &(np, nt)) in [(10usize, 20usize), (100, 200), (1000, 2000)]
+        .iter()
+        .enumerate()
+    {
+        nets.push((
+            format!("random {np} x {nt}"),
+            random_net(&mut Rng(0xA5A5_0000 + i as u64), np, nt),
+        ));
+    }
+    for c in [10usize, 100, 1000] {
+        let names: Vec<String> = (0..c).map(|i| format!("c{i}")).collect();
+        let refs: Vec<&str> = names.iter().map(|s| s.as_str()).collect();
+        let net = Net::parse(LOOP).unwrap().unfold(&refs).unwrap();
+        nets.push((format!("loop net, {c} candidates"), net));
+    }
+    for (i, (label, net)) in nets.iter().enumerate() {
+        net.check().unwrap();
+        let t = net.lower().unwrap();
+        let nt = t.inputs.len();
+        let steps = (200_000_000 / nt as u64).clamp(200_000, 5_000_000);
+        let per = inc::recheck_count(&t) as f64 / nt as f64;
+
+        let mut tm = t.initial.clone();
+        let mut rng = Rng(seed);
+        let start = Instant::now();
+        let tdone = t.walk(&mut tm, steps, |n| (rng.next() % n as u64) as usize);
+        let table_ns = start.elapsed().as_nanos() as f64 / tdone.max(1) as f64;
+
+        let mut im = t.initial.clone();
+        let mut rng = Rng(seed);
+        let start = Instant::now();
+        let idone = t.walk_incremental(&mut im, steps, |n| (rng.next() % n as u64) as usize);
+        let inc_ns = start.elapsed().as_nanos() as f64 / idone.max(1) as f64;
+        assert_eq!((&im, idone), (&tm, tdone), "incremental differs");
+
+        let rechecks = inc::recheck_count(&t);
+        if rechecks > 1_000_000 {
+            // Unrolled, the rechecks alone would be this many enabling
+            // tests in the code; the first try ran out of memory here.
+            println!(
+                "{label} | {} x {nt} | {per:.1} | {table_ns:.1} | {inc_ns:.1} | not compiled: {rechecks} unrolled rechecks | not compiled",
+                t.initial.len()
+            );
+            continue;
+        }
+        let start = Instant::now();
+        let (_module, cf) = inc::compile_cranelift(&t);
+        let cl_ms = start.elapsed().as_secs_f64() * 1000.0;
+        let (cm, cdone, cl_ns) = inc::run(cf, &t, steps, seed);
+        assert_eq!((&cm, cdone), (&tm, tdone), "cranelift inc differs");
+
+        let (nf, cc_ms) = inc::clang_native(dir.path(), i, &t);
+        let (nm, ndone, cc_ns) = inc::run(nf, &t, steps, seed);
+        assert_eq!((&nm, ndone), (&tm, tdone), "clang inc differs");
+
+        println!(
+            "{label} | {} x {nt} | {per:.1} | {table_ns:.1} | {inc_ns:.1} | {cl_ns:.1} ({cl_ms:.1}) | {cc_ns:.1} ({cc_ms:.0})",
+            t.initial.len()
+        );
+    }
+}
+
 fn main() {
+    if std::env::args().any(|a| a == "inc") {
+        return main_inc();
+    }
     let dir = tempfile::tempdir().unwrap();
     let seed = 0x0123_4567_89AB_CDEF;
     println!("net | mode | ns per step | compile ms | repays after (steps, vs table)");
