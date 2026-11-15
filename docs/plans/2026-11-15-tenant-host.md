@@ -28,9 +28,10 @@ outside this repository. Nothing here is built yet.
   can learn from sizes or the `X-Ikam-Cost` header whether another holds the
   same bytes.
 - **Project host (`ikam host --config FILE`):** serves one or many projects.
-  Every route of `live` and `db serve` sits under `/p/<project>/`, or a host
-  name maps to a project. A project the caller may not see answers exactly
-  like one that does not exist.
+  A host name maps to a project (built in E313: the names in the config and
+  `NAME.localhost`; a path prefix such as `/p/<project>/` was dropped, since
+  the pages and WebDAV answers of `live` use absolute links). A project the
+  caller may not see answers exactly like one that does not exist.
 - **Roles per project:** owner, write, read, each from `ikam passwd` lines.
   Owners issue tokens for a ref or path prefix with an expiry, sealed with the
   project's key.

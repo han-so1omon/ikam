@@ -5356,3 +5356,21 @@ Gates on the branch (E229 to E233): every kernel test suite passes (release); cl
 - Not measured: vector and hybrid search through a share (the vector index covers the whole store; a scoped index is left for later).
 - Verdict: **kept**, as part of E315, for keyword search.
 - Run: `cargo test --test share`.
+
+### E313 project-host (several separate projects in one process)
+- Branch / parent: exp/313-project-host / exp/315-scoped-shares
+- Question: can one `ikam` process serve several projects, each its own store with its own users and limits, at little cost per request?
+- Change: `ikam host --config FILE [PORT]` (`src/bin/ikam/host.rs`). The config declares projects (`project NAME STORE_DIR [REF]`), the host names each answers to (`host NAME HOSTNAME`, plus `NAME.localhost`), users with a role (`user NAME read|write|owner LINE`, lines from `ikam passwd`) and per-project `max-store` and `max-body`. Each project is opened as `ikam live` opens one and served by the same page and WebDAV handlers. Routing is by Host name only: `live`'s pages and WebDAV answers use absolute links, so a path prefix would break them. Roles: read (GET, HEAD, PROPFIND), write (also edits and commits), owner (also repack, gc, fsck and shares). Share routes put E315 to E318 behind HTTP: the source owner issues, lists, revokes and accepts proposals at `/shares/...`; the receiving project reads, searches, proposes and merges at `/from/SOURCE/SHARE/...`, merging only as the receiver's owner; every refusal of a share answers 404. Each project's share key is made on first use in `STORE/share.key` (mode 0600). `--public` and a `public` line are refused. `Share::decode` and `Repo::share_named` (kernel) read a logged share back.
+- Result (in process, release build, a 13-byte cached file read through WebDAV, 20,000 requests, three rounds): 2.45 to 3.85 us called directly, 3.74 to 4.95 us through the host, so routing, the role check and three password checks add about 1.1 to 1.4 us a request; one password check is 0.21 to 0.30 us. A run over real HTTP on 127.0.0.1 with curl: two projects, writes, a share, a scoped read, a refused read outside the scope, a merge and a clean stop on SIGTERM all behave as in the tests.
+- Not measured: memory per project, start time with 5 and 50 projects, latency over the network, the one heavy-job queue across projects (not built: repack, gc and fsck of one project hold only that project's lock).
+- Verdict: **kept**, as a new command; `ikam live` and `ikam db serve` are unchanged.
+- Run: `cargo test --release --bin ikam host::tests::overhead -- --ignored --nocapture`.
+
+### E314 project-separation (no path between projects without a share)
+- Branch / parent: exp/313-project-host / exp/315-scoped-shares
+- Question: through the host, can a user of one project read, list, search or write another project's data without a share?
+- Result: `cargo test --bin ikam host::`, all pass. A project's user gets 401 on every other project, the same answer as no password or a wrong one; an unknown host name and no Host header get 404 with the same body; listings and search in one project show nothing of another. A read user cannot write, a writer cannot run maintenance or manage shares, and a project's body limit holds for it alone. Through a share: reads inside the scope succeed, while a private folder, a sibling folder, the folder itself, `..` and percent-encoded `..` paths, another project's request, the source's own users, a missing, revoked or expired share, and merging or proposing through a read-only share all answer 404; only the receiver's owner merges, only the source's owner accepts a proposal, and a merge leaves out what the scope does not cover. A project whose lock was poisoned by a panic answers 500 while the others keep reading and writing. The config refuses two projects on one store, a host name used twice (configured or `NAME.localhost`), a project without an owner, and public projects.
+- Fix found here: a share path with an empty, `.` or `..` segment raised a store error (a 500 through the host) instead of `Outside`; `Share::covers_path` now refuses it.
+- Not measured: a request rate limit per project (not built); spoofed `X-Forwarded-*` headers (the host reads none).
+- Verdict: **kept**, as part of E313.
+- Run: `cargo test --bin ikam host::`.

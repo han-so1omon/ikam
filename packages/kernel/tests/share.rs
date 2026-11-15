@@ -520,3 +520,47 @@ fn only_path_and_records_scopes_merge() {
     );
     assert!(b.resolve("main").is_err());
 }
+
+#[test]
+fn shares_decode_from_the_log() {
+    let (mut a, c) = source();
+    let id = a.put_content(b"x").unwrap().id;
+    let scopes = [
+        Scope::Path("pub".into()),
+        Scope::Section {
+            path: "pub/one.md".into(),
+            id,
+            ranges: vec![1..3, 5..9],
+        },
+        Scope::Fragments(vec![id, c]),
+        Scope::Records {
+            start: "a".into(),
+            end: None,
+        },
+        Scope::Records {
+            start: "a".into(),
+            end: Some("b".into()),
+        },
+        Scope::Graph {
+            path: "g".into(),
+            prefix: "x/".into(),
+        },
+    ];
+    for (i, scope) in scopes.into_iter().enumerate() {
+        let s = share(
+            &format!("s{i}"),
+            c,
+            scope,
+            [Right::Read, Right::Propose, Right::Merge][i % 3],
+        );
+        assert_eq!(Share::decode(&s.encode()), Some(s.clone()));
+        a.share_issue(&s, &KEY).unwrap();
+        assert_eq!(a.share_named(&s.name).unwrap(), Some(s));
+    }
+    let bytes = share("t", c, Scope::Path("p".into()), Right::Read).encode();
+    for n in 0..bytes.len() {
+        assert_eq!(Share::decode(&bytes[..n]), None);
+    }
+    assert_eq!(Share::decode(&[bytes.as_slice(), b"x"].concat()), None);
+    assert_eq!(a.share_named("missing").unwrap(), None);
+}

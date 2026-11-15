@@ -149,17 +149,111 @@ impl Share {
         out
     }
 
+    /// The share `encode` wrote; none for anything else.
+    pub fn decode(bytes: &[u8]) -> Option<Share> {
+        let mut r = Reader(bytes.strip_prefix(&TAG[..])?);
+        let name = r.text()?;
+        let from = r.text()?;
+        let to = r.text()?;
+        let commit = r.id()?;
+        let right = match r.byte()? {
+            0 => Right::Read,
+            1 => Right::Propose,
+            2 => Right::Merge,
+            _ => return None,
+        };
+        let expires = r.u64()?;
+        let scope = match r.byte()? {
+            0 => Scope::Path(r.text()?),
+            1 => {
+                let path = r.text()?;
+                let id = r.id()?;
+                let n = r.u64()?;
+                let mut ranges = Vec::new();
+                for _ in 0..n {
+                    ranges.push(r.u64()?..r.u64()?);
+                }
+                Scope::Section { path, id, ranges }
+            }
+            2 => {
+                let n = r.u64()?;
+                let mut ids = Vec::new();
+                for _ in 0..n {
+                    ids.push(r.id()?);
+                }
+                Scope::Fragments(ids)
+            }
+            3 => {
+                let start = r.text()?;
+                let end = match r.byte()? {
+                    0 => None,
+                    1 => Some(r.text()?),
+                    _ => return None,
+                };
+                Scope::Records { start, end }
+            }
+            4 => Scope::Graph {
+                path: r.text()?,
+                prefix: r.text()?,
+            },
+            _ => return None,
+        };
+        let share = Share {
+            name,
+            from,
+            to,
+            commit,
+            scope,
+            right,
+            expires,
+        };
+        (r.0.is_empty() && share.encode() == bytes).then_some(share)
+    }
+
     pub fn seal(&self, key: &[u8; 32]) -> [u8; 32] {
         *blake3::keyed_hash(key, &self.encode()).as_bytes()
     }
 
     /// Whether the file at `path` is inside a `Path` or `Section` scope.
     pub fn covers_path(&self, path: &str) -> bool {
+        if path
+            .split('/')
+            .any(|part| part.is_empty() || part == "." || part == "..")
+        {
+            return false;
+        }
         match &self.scope {
             Scope::Path(p) => under(path, p),
             Scope::Section { path: p, .. } => p == path,
             _ => false,
         }
+    }
+}
+
+struct Reader<'a>(&'a [u8]);
+
+impl Reader<'_> {
+    fn take(&mut self, n: usize) -> Option<&[u8]> {
+        if self.0.len() < n {
+            return None;
+        }
+        let (a, b) = self.0.split_at(n);
+        self.0 = b;
+        Some(a)
+    }
+    fn byte(&mut self) -> Option<u8> {
+        Some(self.take(1)?[0])
+    }
+    fn u64(&mut self) -> Option<u64> {
+        Some(u64::from_le_bytes(self.take(8)?.try_into().ok()?))
+    }
+    fn id(&mut self) -> Option<Id> {
+        let b: [u8; 32] = self.take(32)?.try_into().ok()?;
+        Some(Id::from_bytes(b))
+    }
+    fn text(&mut self) -> Option<String> {
+        let n = usize::try_from(self.u64()?).ok()?;
+        String::from_utf8(self.take(n)?.to_vec()).ok()
     }
 }
 
@@ -213,6 +307,14 @@ impl<S: Store> Repo<S> {
     pub fn shares(&mut self) -> Result<Vec<(String, Vec<u8>)>, Error> {
         let db = self.shares_db()?;
         self.db_prefix(&db, "share/", usize::MAX, false)
+    }
+
+    /// The logged share named `name`, if it has not been revoked.
+    pub fn share_named(&mut self, name: &str) -> Result<Option<Share>, Error> {
+        let db = self.shares_db()?;
+        Ok(self
+            .db_get(&db, &key_of(name))?
+            .and_then(|b| Share::decode(&b)))
     }
 
     /// Whether `share` (with `tag`) lets project `to` use `right` at `now`.
