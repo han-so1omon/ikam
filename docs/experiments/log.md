@@ -3966,3 +3966,24 @@ Gates on the branch (E229 to E233): every kernel test suite passes (release); cl
 - Not measured: more seeds (one seed per cell; the 160 and 320 ms cells at M = 2,000 are within noise); checkpoints of megabytes; a save without its own commit (the commit is part of C here); the growth of C with the log.
 - Run: `cargo run --release --example net_checkpoint [-- N]`; `cargo test --release --lib net::`.
 - Gates on the branch: kernel lib tests pass (60, 1 ignored); clippy `-D warnings` and fmt clean.
+
+### E282 cranelift-mode (a net's step compiled with Cranelift)
+- Branch / parent: exp/282-cranelift-mode / E281 (exp/281-checkpoint-interval)
+- Question: E277 measured interpreted, table, clang -O2 and wasm execution of a net's step and left Cranelift (and MLIR) unmeasured. Cranelift is the code generator behind wasmtime and a rustc backend, built for fast compiles. Where does it fall between the kernel's table (E278, no compile) and clang -O2 (fastest code, slow compiles)?
+- Hypothesis: Cranelift's code runs between the two and compiles orders of magnitude faster than clang, so it repays its compile after far fewer steps: the mode to use when a simulation is too long for the table and too short to wait for clang. (Source: E277's "Not measured"; Cranelift's design goal of fast compiles at some cost in code quality.)
+- Change: none in the kernel. A separate crate, `packages/kernel/experiments/net-jit` (so the kernel's builds and tests do not compile Cranelift 0.137.1): E277's seeded random conservative nets and random walk, in three modes checked to end in the same marking after the same steps: the kernel's `Table::walk`; one function per net built with cranelift-frontend (a branch-free enabling pass storing each transition's index at the next slot and advancing the count by its test, the generator, a jump table to one firing block per transition), compiled in memory with cranelift-jit at `opt_level=speed`; and the same structure emitted as C for clang -O2.
+- Result (`cargo run --release` in that crate; two runs, ns per step, compile ms, and steps after which the compile is repaid against the table):
+
+  | Net | Table | Cranelift | Cranelift compile | Repaid after | clang -O2 | clang compile | Repaid after |
+  |---|---|---|---|---|---|---|---|
+  | 10 x 20 | 80 to 84 | 28 to 29 | 1.4 to 1.5 ms | 27,000 | 22.5 to 22.9 | 85 to 254 ms | 1.4 to 4.4 million |
+  | 100 x 200 | 385 to 386 | 150 to 151 | 7.7 to 7.8 ms | 33,000 | 97 to 102 | 1.7 s | 6 million |
+  | 1,000 x 2,000 | 2,904 to 3,421 | 1,543 to 1,762 | 81 to 88 ms | 53,000 to 60,000 | 813 to 1,061 | 103 s | 44 to 49 million |
+
+  - Cranelift's code is 1.9x to 2.9x faster than the table and 1.2x to 1.9x slower than clang's; it compiles 60x to 1,200x faster than clang, so it repays itself after tens of thousands of steps against clang's millions.
+  - Every mode ends in the same marking after the same steps (asserted).
+  - clang took 103 s on the largest net here against 4.2 s in E277: the branch-free enabling pass is one long expression, which clang's optimizer handles far worse than E277's branches. Cranelift compiled the same shape in under 0.1 s.
+- Verdict: **measured** (a comparison, no kernel change). For simulation: the table up to tens of thousands of steps, Cranelift from there (a plan simulated for one night of the loop is in that range), clang only for runs of tens of millions of steps. For the live loop none of this matters: a recorded firing costs milliseconds (E269, E279). Adding Cranelift to the kernel would add about 60 crates to a dependency tree that is now small and pinned for reconstruction; keep it outside until a workload needs it.
+- Not measured: MLIR (no libraries here; Cranelift answers the same "fast compile, decent code" question from Rust); Cranelift's `opt_level=none`; colored nets; the enabling pass with branches (E277's shape) under Cranelift; macOS on Apple silicon (Cranelift supports aarch64).
+- Run: `cd packages/kernel/experiments/net-jit && cargo run --release` (needs clang).
+- Gates: clippy `-D warnings` and fmt clean on the crate; the kernel is unchanged.
