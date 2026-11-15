@@ -1,0 +1,501 @@
+//! E301: worker processes killed in the middle of the loop.
+//!
+//! A night's workers die: the laptop sleeps, a run is killed for memory.
+//! This runs W worker processes (as E298) over the loop net's N candidates
+//! on one FsStore and, every KILL_MS (env, default 700), kills one at random
+//! with SIGKILL and starts a new one in its place. When no candidate is left
+//! queued, the candidates a killed worker had started are still in
+//! `running`, with nobody to finish them: the parent counts them, puts them
+//! back with a `requeue` transition (running -> queued, cpu), and lets W
+//! new workers finish without kills. Reported: kills, candidates stranded,
+//! measured at the end, replay, fsck, every candidate's content readable,
+//! and temporary files left behind.
+//!
+//!   cargo run --release --example net_kill [-- N]
+//!   (W, KILL_MS, WORK_MS as env; DEFERRED=1 opens the store with
+//!   `open_deferred`; CLEAN=1 runs `clean_temporaries` (E302) at the end;
+//!   LEASE_MS puts back any candidate running longer than that, E303;
+//!   HEARTBEAT_MS has the work checkpoint that often, renewing its lease, E304;
+//!   HEARTBEAT_REF=1 beats on a ref of the run's own instead, E306; CPUS;
+//!   BEAT_CLEAN=1 removes a run's beat ref when it finishes or is put back, E308)
+
+use std::process::{Child, Command, Stdio};
+use std::time::{Duration, Instant};
+
+use ikam_kernel::net::Net;
+use ikam_kernel::{Db, Error, FsStore, Id, Repo, Store};
+
+const REF: &str = "loop";
+
+fn env(name: &str, default: u64) -> u64 {
+    std::env::var(name)
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(default)
+}
+
+fn loop_net() -> Net {
+    Net::parse(&format!(
+        "\
+net loop 1
+place cpu {}
+place queued colored
+place running colored
+place measured colored
+transition propose agent propose: -> queued
+transition start cmd bench: queued, cpu -> running
+transition finish pure: running -> measured, cpu
+transition requeue pure: running -> queued, cpu
+",
+        env("CPUS", 2)
+    ))
+    .unwrap()
+}
+
+fn open(dir: &str) -> Repo<FsStore> {
+    let store = if std::env::var("DEFERRED").as_deref() == Ok("1") {
+        FsStore::open_deferred(dir).unwrap()
+    } else {
+        FsStore::open(dir).unwrap()
+    };
+    let mut repo = Repo::new(store);
+    repo.refresh_ledger = true;
+    repo.read_weight = 1.0;
+    repo.read_cache = 64 << 20;
+    repo
+}
+
+fn tokens(repo: &Repo<FsStore>, db: &Db, place: &str) -> Result<Vec<String>, Error> {
+    Ok(repo
+        .net_marking(db, "loop")?
+        .get(place)
+        .map(|m| m.keys().cloned().collect())
+        .unwrap_or_default())
+}
+
+/// The bytes a candidate's run produces: what the finish firing records.
+fn output(tok: &str) -> Vec<u8> {
+    format!("result of {tok}\n").repeat(200).into_bytes()
+}
+
+fn child(dir: &str, w: u64) {
+    let net = loop_net();
+    let mut repo = open(dir);
+    let work = Duration::from_millis(env("WORK_MS", 40));
+    let mut k = 0u64;
+    let mut idle = 0;
+    loop {
+        let r: Result<bool, Error> = (|| {
+            let head = repo.resolve(REF)?;
+            let db = repo.db_at(&head)?;
+            let queued = tokens(&repo, &db, "queued")?;
+            let Some(tok) = queued
+                .get((w as usize * 7 + k as usize) % queued.len().max(1))
+                .cloned()
+            else {
+                return Ok(false);
+            };
+            k += 1;
+            let db = match repo.net_fire(&db, &net, "start", Some(&tok), &format!("w{w}-{k}")) {
+                Ok((db, _)) => db,
+                Err(_) => return Ok(true), // no cpu free
+            };
+            if repo.db_commit_at(REF, head, &db, "start").is_err() {
+                return Ok(true);
+            }
+            // E304: HEARTBEAT_MS > 0, the work saves a checkpoint (E281)
+            // under its start's key that often, as a sign of life.
+            let beat = Duration::from_millis(env("HEARTBEAT_MS", 0));
+            if beat.is_zero() {
+                std::thread::sleep(work);
+            } else {
+                let started = Instant::now();
+                let mut step = 0;
+                while started.elapsed() < work {
+                    std::thread::sleep(beat.min(work.saturating_sub(started.elapsed())));
+                    step += 1;
+                    // E306: HEARTBEAT_REF=1, a ref of the run's own instead
+                    // of a checkpoint in the loop's database.
+                    if std::env::var("HEARTBEAT_REF").as_deref() == Ok("1") {
+                        let tree = repo.put(&ikam_kernel::Object::tree(vec![])?)?;
+                        repo.commit(&format!("beat/w{w}-{k}"), tree, &format!("step {step}"))?;
+                        continue;
+                    }
+                    for _ in 0..5 {
+                        let head = repo.resolve(REF)?;
+                        let db = repo.db_at(&head)?;
+                        let db = repo.net_checkpoint(
+                            &db,
+                            "loop",
+                            &format!("w{w}-{k}"),
+                            format!("step {step}").as_bytes(),
+                        )?;
+                        if repo.db_commit_at(REF, head, &db, "beat").is_ok() {
+                            break;
+                        }
+                    }
+                }
+            }
+            loop {
+                let head = repo.resolve(REF)?;
+                let db = repo.db_at(&head)?;
+                let Ok((db, _)) = repo.net_fire_output(
+                    &db,
+                    &net,
+                    "finish",
+                    Some(&tok),
+                    &format!("fin-{tok}"),
+                    &output(&tok),
+                ) else {
+                    delete_beats(dir, &format!("beat/w{w}-{k}"));
+                    return Ok(true);
+                };
+                if repo.db_commit_at(REF, head, &db, "finish").is_ok() {
+                    delete_beats(dir, &format!("beat/w{w}-{k}"));
+                    return Ok(true);
+                }
+            }
+        })();
+        match r {
+            Ok(true) => idle = 0,
+            Ok(false) => {
+                idle += 1;
+                if idle > 50 {
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            Err(e) => {
+                eprintln!("error {e}");
+                repo = open(dir);
+            }
+        }
+    }
+}
+
+/// REQUEUE=1: what a supervisor does when it sees worker `w` die: put back
+/// every candidate whose latest start was `w`'s and that is still running.
+fn requeue_dead(repo: &mut Repo<FsStore>, net: &Net, w: u64, seq: &mut u64) -> usize {
+    loop {
+        let head = repo.resolve(REF).unwrap();
+        let db = repo.db_at(&head).unwrap();
+        let running = tokens(repo, &db, "running").unwrap();
+        let mut last = std::collections::HashMap::new();
+        for f in repo.net_firings(&db, "loop").unwrap() {
+            if f.transition == "start"
+                && let Some(t) = f.token
+            {
+                last.insert(t, f.key);
+            }
+        }
+        let prefix = format!("w{w}-");
+        let mine: Vec<&String> = running
+            .iter()
+            .filter(|t| last.get(*t).is_some_and(|k| k.starts_with(&prefix)))
+            .collect();
+        if mine.is_empty() {
+            return 0;
+        }
+        let mut db = db;
+        for tok in &mine {
+            *seq += 1;
+            db = repo
+                .net_fire(&db, net, "requeue", Some(tok), &format!("rq{seq}"))
+                .unwrap()
+                .0;
+        }
+        if repo.db_commit_at(REF, head, &db, "requeue").is_ok() {
+            return mine.len();
+        }
+    }
+}
+
+/// E308: BEAT_CLEAN=1, remove the beat refs whose names start with `prefix`
+/// (a finished run's, or every run of a dead worker's).
+fn delete_beats(dir: &str, prefix: &str) -> usize {
+    if std::env::var("BEAT_CLEAN").as_deref() != Ok("1") {
+        return 0;
+    }
+    let Ok(mut store) = FsStore::open(dir) else {
+        return 0;
+    };
+    let mut n = 0;
+    for (name, id) in store.refs().unwrap_or_default() {
+        let hit = name == prefix || (prefix.ends_with('-') && name.starts_with(prefix));
+        if hit && store.delete_ref(&name, id).is_ok() {
+            n += 1;
+        }
+    }
+    n
+}
+
+fn spawn(me: &std::path::Path, d: &str, w: u64) -> Child {
+    Command::new(me)
+        .env("E301_CHILD", format!("{d}|{w}"))
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap()
+}
+
+fn main() {
+    if let Ok(spec) = std::env::var("E301_CHILD") {
+        let (d, w) = spec.split_once('|').unwrap();
+        child(d, w.parse().unwrap());
+        return;
+    }
+    let n: usize = std::env::args()
+        .nth(1)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(100);
+    let (w, kill_ms) = (env("W", 2), env("KILL_MS", 700));
+    let net = loop_net();
+    let me = std::env::current_exe().unwrap();
+    let dir = std::env::temp_dir().join(format!("ikam-e301-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let d = dir.to_str().unwrap().to_string();
+    {
+        let mut repo = open(&d);
+        let db = repo.db_empty().unwrap();
+        let mut db = repo.net_init_sum(&db, &net).unwrap();
+        for i in 0..n {
+            db = repo
+                .net_fire(
+                    &db,
+                    &net,
+                    "propose",
+                    Some(&format!("c{i:03}")),
+                    &format!("p{i}"),
+                )
+                .unwrap()
+                .0;
+        }
+        repo.db_commit(REF, &db, "proposed").unwrap();
+    }
+    let t0 = Instant::now();
+    let mut next = 0u64;
+    let mut kids: Vec<Child> = (0..w)
+        .map(|_| {
+            next += 1;
+            spawn(&me, &d, next)
+        })
+        .collect();
+    let (mut kills, mut errors) = (0, 0);
+    let mut rng = 0x9E37_79B9_7F4A_7C15u64;
+    let mut last_kill = Instant::now();
+    let supervise = std::env::var("REQUEUE").as_deref() == Ok("1");
+    let mut sup = open(&d);
+    let (mut seq, mut requeued) = (0u64, 0usize);
+    let mut ids: Vec<u64> = (1..=w).collect();
+    // E303: LEASE_MS > 0, a supervisor that cannot see deaths (workers on
+    // other machines): a candidate running longer than the lease is put
+    // back, whoever holds it.
+    let lease = Duration::from_millis(env("LEASE_MS", 0));
+    let mut seen: std::collections::HashMap<String, (Instant, Option<Vec<u8>>)> =
+        Default::default();
+    let mut last_poll = Instant::now();
+    while !kids.is_empty() && t0.elapsed() < Duration::from_secs(120) {
+        std::thread::sleep(Duration::from_millis(5));
+        if !lease.is_zero() && last_poll.elapsed() >= Duration::from_millis(20) {
+            last_poll = Instant::now();
+            let head = sup.resolve(REF).unwrap();
+            let db = sup.db_at(&head).unwrap();
+            let running = tokens(&sup, &db, "running").unwrap();
+            seen.retain(|t, _| running.contains(t));
+            let now = Instant::now();
+            let mut late = Vec::new();
+            // E304: a run's lease restarts at each new checkpoint of its start.
+            let beats = env("HEARTBEAT_MS", 0) > 0;
+            let mut last_start = std::collections::HashMap::new();
+            if beats {
+                for f in sup.net_firings(&db, "loop").unwrap() {
+                    if f.transition == "start"
+                        && let Some(t) = f.token
+                    {
+                        last_start.insert(t, f.key);
+                    }
+                }
+            }
+            for t in running {
+                let progress = last_start.get(&t).and_then(|key| {
+                    if std::env::var("HEARTBEAT_REF").as_deref() == Ok("1") {
+                        sup.resolve(&format!("beat/{key}"))
+                            .ok()
+                            .map(|id| id.to_hex().into_bytes())
+                    } else {
+                        sup.net_resume(&db, "loop", key).ok().flatten()
+                    }
+                });
+                let entry = seen.entry(t.clone()).or_insert((now, progress.clone()));
+                if entry.1 != progress {
+                    *entry = (now, progress);
+                }
+                if now - entry.0 >= lease {
+                    late.push(t);
+                }
+            }
+            if !late.is_empty() {
+                let mut db = db;
+                for t in &late {
+                    seq += 1;
+                    db = sup
+                        .net_fire(&db, &net, "requeue", Some(t), &format!("rq{seq}"))
+                        .unwrap()
+                        .0;
+                }
+                if sup.db_commit_at(REF, head, &db, "lease").is_ok() {
+                    requeued += late.len();
+                    for t in &late {
+                        seen.remove(t);
+                        if let Some(key) = last_start.get(t) {
+                            delete_beats(&d, &format!("beat/{key}"));
+                        }
+                    }
+                }
+            }
+        }
+        let mut keep = Vec::new();
+        for k in kids.iter_mut() {
+            keep.push(!matches!(k.try_wait(), Ok(Some(_))));
+        }
+        let mut it = keep.iter();
+        ids.retain(|_| *it.next().unwrap());
+        kids.retain_mut(|k| match k.try_wait() {
+            Ok(Some(_)) => {
+                let mut s = String::new();
+                use std::io::Read;
+                let _ = k.stderr.take().map(|mut e| e.read_to_string(&mut s));
+                errors += s.lines().filter(|l| l.starts_with("error")).count();
+                false
+            }
+            _ => true,
+        });
+        if last_kill.elapsed() >= Duration::from_millis(kill_ms) && !kids.is_empty() {
+            last_kill = Instant::now();
+            rng ^= rng << 13;
+            rng ^= rng >> 7;
+            rng ^= rng << 17;
+            let i = (rng % kids.len() as u64) as usize;
+            if kids[i].try_wait().ok().flatten().is_none() {
+                let mut gone = kids.remove(i);
+                let _ = gone.kill();
+                let _ = gone.wait();
+                let dead = ids.remove(i);
+                if supervise {
+                    requeued += requeue_dead(&mut sup, &net, dead, &mut seq);
+                    delete_beats(&d, &format!("beat/w{dead}-"));
+                }
+                kills += 1;
+                next += 1;
+                kids.push(spawn(&me, &d, next));
+                ids.push(next);
+            }
+        }
+    }
+    // Workers still going at the time limit are stopped, so the second
+    // pass runs alone.
+    for mut k in kids {
+        let _ = k.kill();
+        let _ = k.wait();
+    }
+    let first_ms = t0.elapsed().as_millis();
+    drop(sup);
+    let mut repo = open(&d);
+    let head = repo.resolve(REF).unwrap();
+    let db = repo.db_at(&head).unwrap();
+    let stranded = tokens(&repo, &db, "running").unwrap();
+    let measured_first = tokens(&repo, &db, "measured").unwrap().len();
+    let mut db = db;
+    for (i, tok) in stranded.iter().enumerate() {
+        db = repo
+            .net_fire(&db, &net, "requeue", Some(tok), &format!("end-rq{i}"))
+            .unwrap()
+            .0;
+    }
+    repo.db_commit_at(REF, head, &db, "requeue").unwrap();
+    drop(repo);
+    let t1 = Instant::now();
+    let kids: Vec<Child> = (0..w)
+        .map(|_| {
+            next += 1;
+            spawn(&me, &d, next)
+        })
+        .collect();
+    for k in kids {
+        let out = k.wait_with_output().unwrap();
+        errors += String::from_utf8_lossy(&out.stderr)
+            .lines()
+            .filter(|l| l.starts_with("error"))
+            .count();
+    }
+    let second_ms = t1.elapsed().as_millis();
+    let mut repo = open(&d);
+    let db = repo.db_at(&repo.resolve(REF).unwrap()).unwrap();
+    let measured = tokens(&repo, &db, "measured").unwrap();
+    let replay = match repo.net_replay(&db, &net) {
+        Ok(m) if m == repo.net_marking(&db, "loop").unwrap() => "equal".to_string(),
+        Ok(_) => "differs".into(),
+        Err(e) => format!("fails ({e})"),
+    };
+    let unreadable = measured
+        .iter()
+        .filter(|tok| {
+            repo.net_output(&db, "loop", &format!("fin-{tok}"))
+                .ok()
+                .flatten()
+                .map(|(id, bytes)| id != Id::of_content(&output(tok)) || bytes != output(tok))
+                .unwrap_or(true)
+        })
+        .count();
+    let fsck = repo.fsck().unwrap().len();
+    let starts = repo
+        .net_firings(&db, "loop")
+        .unwrap()
+        .iter()
+        .filter(|f| f.transition == "start")
+        .count();
+    // E302: CLEAN=1 removes what dead workers left, once they are all gone.
+    let cleaned = if std::env::var("CLEAN").as_deref() == Ok("1") {
+        repo.store().clean_temporaries().unwrap()
+    } else {
+        0
+    };
+    let mut leftovers = 0;
+    for sub in std::fs::read_dir(dir.join("objects")).unwrap() {
+        for f in std::fs::read_dir(sub.unwrap().path()).unwrap() {
+            if f.unwrap().file_name().to_string_lossy().starts_with('.') {
+                leftovers += 1;
+            }
+        }
+    }
+    println!(
+        "{w} workers, {n} candidates, a kill every {kill_ms} ms{}: {kills} kills ({requeued} candidates requeued by the supervisor), {errors} errors; \
+         first pass {first_ms} ms, {measured_first} measured, {} stranded in running; \
+         after requeue {second_ms} ms: {} measured, replay {replay}, {unreadable} outputs wrong or unreadable, \
+         fsck {fsck}, {cleaned} temporary files removed, {leftovers} left; {starts} starts for {n} candidates{}",
+        match (std::env::var("DEFERRED").as_deref() == Ok("1"), supervise) {
+            (true, true) => ", deferred, supervised",
+            (true, false) => ", deferred",
+            (false, true) => ", supervised",
+            _ => "",
+        },
+        stranded.len(),
+        measured.len(),
+        if lease.is_zero() {
+            String::new()
+        } else {
+            format!(" (lease {} ms)", lease.as_millis())
+        },
+    );
+    if std::env::var("HEARTBEAT_REF").as_deref() == Ok("1") {
+        let left = FsStore::open(&d)
+            .unwrap()
+            .refs()
+            .unwrap()
+            .iter()
+            .filter(|(n, _)| n.starts_with("beat/"))
+            .count();
+        println!("beat refs left: {left}");
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
