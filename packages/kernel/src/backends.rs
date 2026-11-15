@@ -151,6 +151,9 @@ fn parse_id(key: &[u8]) -> Option<Id> {
 }
 
 impl<K: Kv> Store for KvStore<K> {
+    fn sync(&mut self) -> Result<(), Error> {
+        KvStore::sync(self)
+    }
     fn write(&mut self, id: Id, encoded: &[u8]) -> Result<bool, Error> {
         if self.has(&id) {
             return Ok(false);
@@ -1990,6 +1993,9 @@ impl Drop for PackStore {
 }
 
 impl Store for PackStore {
+    fn sync(&mut self) -> Result<(), Error> {
+        PackStore::sync(self)
+    }
     fn write(&mut self, id: Id, encoded: &[u8]) -> Result<bool, Error> {
         if self.has(&id) {
             return Ok(false);
@@ -2230,6 +2236,9 @@ pub mod hybrid {
     }
 
     impl Store for RefsHybrid {
+        fn sync(&mut self) -> Result<(), Error> {
+            self.packs.sync()
+        }
         fn write(&mut self, id: Id, encoded: &[u8]) -> Result<bool, Error> {
             self.packs.write(id, encoded)
         }
@@ -2472,6 +2481,9 @@ pub mod hybrid {
     }
 
     impl Store for IndexHybrid {
+        fn sync(&mut self) -> Result<(), Error> {
+            IndexHybrid::sync(self)
+        }
         fn write(&mut self, id: Id, encoded: &[u8]) -> Result<bool, Error> {
             if self.has(&id) {
                 return Ok(false);

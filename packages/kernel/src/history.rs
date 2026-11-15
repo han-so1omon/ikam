@@ -98,10 +98,20 @@ impl<S: Store> Repo<S> {
     /// Ids reachable from refs: tree/commit objects, the file content ids
     /// those trees name, and the content trees are stored as.
     pub(crate) fn reachable(&self) -> Result<(HashSet<Id>, Vec<Id>), Error> {
+        let refs = self.store.refs()?.into_iter().map(|(_, id)| id).collect();
+        self.reachable_from(refs, &HashSet::new())
+    }
+
+    /// `reachable` from `roots`, not descending into objects in `skip`
+    /// (E268: what changed since an earlier walk).
+    pub(crate) fn reachable_from(
+        &self,
+        mut stack: Vec<Id>,
+        skip: &HashSet<Id>,
+    ) -> Result<(HashSet<Id>, Vec<Id>), Error> {
         let (mut objects, mut files) = (HashSet::new(), Vec::new());
-        let mut stack: Vec<Id> = self.store.refs()?.into_iter().map(|(_, id)| id).collect();
         while let Some(id) = stack.pop() {
-            if !objects.insert(id) {
+            if skip.contains(&id) || !objects.insert(id) {
                 continue;
             }
             // A tree stored as content keeps that content live.
@@ -171,21 +181,34 @@ impl<S: Store> Repo<S> {
         let (mut objects, files) = self.reachable()?;
         let (content, records) = self.closure(files, |_| true)?;
         objects.extend(records);
-        // Dictionaries and groups that live stored encodings need: every
-        // object their id prefix may name.
+        // Dictionaries, groups and contexts that live stored encodings need:
+        // every object their id prefix may name, and what those need in
+        // turn (a group may be stored against a context, E268).
         let mut dicts: Vec<Vec<u8>> = Vec::new();
-        for id in content.iter().chain(&objects) {
-            if let Ok(encoded) = self.store.read(id) {
-                for prefix in needs(&encoded) {
-                    if !dicts.iter().any(|d| d == prefix) {
-                        dicts.push(prefix.to_vec());
+        let mut scan: Vec<Id> = content.iter().chain(&objects).copied().collect();
+        let all = self.store.ids()?;
+        while !scan.is_empty() {
+            let mut found = false;
+            for id in scan.drain(..) {
+                if let Ok(encoded) = self.store.read(&id) {
+                    for prefix in needs(&encoded) {
+                        if !dicts.iter().any(|d| d == prefix) {
+                            dicts.push(prefix.to_vec());
+                            found = true;
+                        }
                     }
                 }
             }
-        }
-        for id in self.store.ids()? {
-            if dicts.iter().any(|d| names(d, &id)) {
-                objects.insert(id);
+            if !found {
+                break;
+            }
+            for id in &all {
+                if dicts.iter().any(|d| names(d, id))
+                    && objects.insert(*id)
+                    && !content.contains(id)
+                {
+                    scan.push(*id);
+                }
             }
         }
         let mut deleted = 0;

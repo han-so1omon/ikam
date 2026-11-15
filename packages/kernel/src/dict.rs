@@ -189,7 +189,7 @@ impl Needed {
         }
     }
 
-    fn names(&self, id: &Id) -> bool {
+    pub(crate) fn names(&self, id: &Id) -> bool {
         let id = id.as_bytes();
         self.by_len
             .iter()
