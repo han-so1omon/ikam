@@ -883,7 +883,7 @@ impl<S: Store> Repo<S> {
         })
     }
 
-    fn commit_tree(&self, commit: &Id) -> Result<Id, Error> {
+    pub(crate) fn commit_tree(&self, commit: &Id) -> Result<Id, Error> {
         match self.get(commit)? {
             Object::Commit(c) => Ok(c.tree),
             _ => Err(Error::WrongKind(*commit)),
