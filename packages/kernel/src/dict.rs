@@ -683,12 +683,21 @@ impl<S: Store> Repo<S> {
     /// stored bytes themselves, never a derivation of them (E123: a group
     /// dropped for a `fill` that rebuilds it lost every member).
     pub(crate) fn is_needed(&self, id: &Id) -> Result<bool, Error> {
+        // Another handle on the store may delete an object between the
+        // listing and its read (E292); a deleted object needs nothing.
+        let read = |other: &Id| match self.store.read(other) {
+            Ok(stored) => Ok(Some(stored)),
+            Err(Error::NotFound(_)) => Ok(None),
+            Err(e) => Err(e),
+        };
         if self.needed_index {
             let mut slot = self.needed.lock().unwrap();
             if slot.is_none() {
                 let mut set = Needed::default();
                 for other in self.store.ids()? {
-                    set.add(&self.store.read(&other)?);
+                    if let Some(stored) = read(&other)? {
+                        set.add(&stored);
+                    }
                 }
                 *slot = Some(set);
             }
@@ -696,9 +705,8 @@ impl<S: Store> Repo<S> {
         }
         for other in self.store.ids()? {
             if other != *id
-                && needs(&self.store.read(&other)?)
-                    .iter()
-                    .any(|p| names(p, id))
+                && let Some(stored) = read(&other)?
+                && needs(&stored).iter().any(|p| names(p, id))
             {
                 return Ok(true);
             }

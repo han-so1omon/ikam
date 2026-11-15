@@ -57,6 +57,9 @@ impl std::ops::Deref for LedgerRef<'_> {
 pub(crate) struct Ledger {
     pub(crate) by_output: BTreeMap<Id, Vec<Derivation>>,
     pub(crate) by_key: HashMap<Id, Id>,
+    /// Every stored id this ledger has looked at, so `refresh_ledger`
+    /// (E298) reads only objects written since (by another process).
+    pub(crate) seen: std::collections::HashSet<Id>,
 }
 
 impl Ledger {
@@ -80,6 +83,12 @@ pub(crate) struct Cx {
     pub(crate) work: usize,
     /// Content lengths learned without rebuilding (E166).
     pub(crate) lens: HashMap<Id, u64>,
+    /// Serve contents from `read_cache` (E294). Only a plain read sets it:
+    /// a write's checks count decode work and test which stored copies a
+    /// derivation depends on, and a kept copy would hide both.
+    pub(crate) cached: bool,
+    /// The ledger was refreshed once for this read (E298).
+    pub(crate) refreshed: bool,
 }
 
 impl Cx {
@@ -190,6 +199,28 @@ pub struct Repo<S: Store> {
     /// both. The same changes either way; off by default.
     pub prune_diff: bool,
     pub(crate) memo: std::sync::Mutex<Option<Memo>>,
+    /// Keep up to this many bytes of contents read, rebuilt ones included,
+    /// across reads (E294). 0, the default, keeps none. A content's bytes
+    /// never change for its id and are checked against it before they are
+    /// kept, so a kept copy is always right; it saves rebuilding a graph
+    /// chunk or a tree from slices on every read. Only `read_content` and
+    /// the reads built on it are served from it: a write's own checks and
+    /// fsck read the store, so writes store the same bytes either way and
+    /// fsck still sees damage. A plain read of content kept before the store
+    /// was damaged returns the kept, right bytes. Shared with siblings; gc
+    /// empties it.
+    pub read_cache: usize,
+    pub(crate) cache: Arc<std::sync::Mutex<Cache>>,
+    /// When content is neither stored nor derivable, look once for
+    /// derivation records written since the ledger was built, then try
+    /// again (E298). Off by default. The ledger is built once per handle
+    /// (and shared by siblings), so a handle never sees what another
+    /// process records later, and reading a database that process committed
+    /// fails with NotFound for as long as the handle lives. On, such a miss
+    /// lists the store and reads only the objects this ledger has not seen,
+    /// at most once per read; a read of content that really is missing pays
+    /// that listing.
+    pub refresh_ledger: bool,
     /// With a `seed_scope`, add each old tree and graph chunk that a tree
     /// or view edit reads to the seed index before the edit writes its new
     /// chunks (E141). Off by default. A new chunk repeats the chunks it
@@ -236,6 +267,14 @@ pub(crate) struct Memo {
     bytes: usize,
 }
 
+/// Contents kept by `read_cache` (E294), dropped oldest first.
+#[derive(Default)]
+pub(crate) struct Cache {
+    map: HashMap<Id, Vec<u8>>,
+    order: std::collections::VecDeque<Id>,
+    bytes: usize,
+}
+
 /// Most bytes one edit's memo keeps; reads past it go to the store.
 pub(crate) const MEMO_LIMIT: usize = 64 << 20;
 
@@ -264,6 +303,9 @@ impl<S: Store> Repo<S> {
             read_memo: false,
             prune_diff: false,
             memo: Default::default(),
+            read_cache: 0,
+            refresh_ledger: false,
+            cache: Default::default(),
             replace_hints: false,
             exact_short_search: false,
             object_templates: true,
@@ -442,10 +484,17 @@ impl<S: Store> Repo<S> {
         // (E134), so a fresh handle reads the store once, not twice.
         let mut needed = (self.needed_index && self.needed.lock().unwrap().is_none())
             .then(crate::dict::Needed::default);
-        for id in self.store.ids()? {
+        let listed = self.store.ids()?;
+        ledger.seen = listed.iter().copied().collect();
+        for id in listed {
             // Both projections need only an encoding's header, except for
             // derivation records, which are read whole (E135).
-            let head = self.store.read_head(&id, crate::dict::HEAD_LEN)?;
+            // Deleted by another handle since the listing (E292).
+            let head = match self.store.read_head(&id, crate::dict::HEAD_LEN) {
+                Ok(head) => head,
+                Err(Error::NotFound(_)) => continue,
+                Err(e) => return Err(e),
+            };
             if let Some(set) = needed.as_mut() {
                 set.add(&head);
             }
@@ -455,7 +504,11 @@ impl<S: Store> Repo<S> {
             let encoded = if head.len() < crate::dict::HEAD_LEN {
                 head
             } else {
-                self.store.read(&id)?
+                match self.store.read(&id) {
+                    Ok(encoded) => encoded,
+                    Err(Error::NotFound(_)) => continue,
+                    Err(e) => return Err(e),
+                }
             };
             outputs.extend(self.derivation_output(&id, &encoded));
             records.push((id, encoded));
@@ -499,6 +552,72 @@ impl<S: Store> Repo<S> {
         ))
     }
 
+    /// Read the derivation records stored since the ledger was built or
+    /// last refreshed, by another process (E298). True if any was added.
+    pub(crate) fn ledger_refresh(&self) -> Result<bool, Error> {
+        let seen = self.ledger()?.seen.clone();
+        let mut records = Vec::new();
+        let mut outputs = std::collections::BTreeSet::new();
+        let mut new_ids = Vec::new();
+        for id in self.store.ids()? {
+            if seen.contains(&id) {
+                continue;
+            }
+            new_ids.push(id);
+            let encoded = match self.store.read(&id) {
+                Ok(encoded) => encoded,
+                Err(Error::NotFound(_)) => continue,
+                Err(e) => return Err(e),
+            };
+            if object_tag(&encoded) != Some(b'D') {
+                continue;
+            }
+            outputs.extend(self.derivation_output(&id, &encoded));
+            records.push((id, encoded));
+        }
+        let known: std::collections::BTreeSet<Id> = {
+            let l = self.ledger()?;
+            l.by_output
+                .keys()
+                .copied()
+                .chain(outputs.iter().copied())
+                .collect()
+        };
+        let resolve = |prefix: &[u8]| -> Result<Vec<Id>, Error> {
+            let mut out = self.store.ids_with_prefix(prefix)?;
+            let start =
+                Id::from_bytes(std::array::from_fn(|i| prefix.get(i).copied().unwrap_or(0)));
+            for id in known
+                .range(start..)
+                .take_while(|id| id.as_bytes().starts_with(prefix))
+            {
+                if !out.contains(id) {
+                    out.push(*id);
+                }
+            }
+            Ok(out)
+        };
+        let mut found = Vec::new();
+        for (id, stored) in records {
+            let encoded = self.decode_object_with(&id, stored, &resolve)?;
+            if Id::of(&encoded) == id
+                && let Object::Derivation(d) = Object::decode(&encoded)?
+            {
+                found.push(d);
+            }
+        }
+        let mut slot = self.ledger.write().unwrap_or_else(|e| e.into_inner());
+        let Some(ledger) = slot.as_mut() else {
+            return Ok(false);
+        };
+        ledger.seen.extend(new_ids);
+        let added = !found.is_empty();
+        for d in found {
+            ledger.insert(d);
+        }
+        Ok(added)
+    }
+
     /// Another handle on the same store (one whose clones share it, such as
     /// `SharedStore`), for reads on another thread (E232). It shares the
     /// ledger, so it reads what this handle derives, and the needed index
@@ -517,6 +636,9 @@ impl<S: Store> Repo<S> {
             let _ = r.dict.set(d.clone());
         }
         r.read_weight = self.read_weight;
+        r.read_cache = self.read_cache;
+        r.refresh_ledger = self.refresh_ledger;
+        r.cache = self.cache.clone();
         r.short_records = self.short_records;
         r.markup_layers = self.markup_layers;
         r.object_templates = self.object_templates;
@@ -538,6 +660,7 @@ impl<S: Store> Repo<S> {
         *self.ledger.write().unwrap_or_else(|e| e.into_inner()) = None;
         self.dict = OnceLock::new();
         *self.needed.lock().unwrap() = None;
+        *self.cache.lock().unwrap() = Cache::default();
     }
 
     /// Keep the needed set current after storing `encoded` (E129).
@@ -627,12 +750,15 @@ impl<S: Store> Repo<S> {
     pub(crate) fn record(&mut self, d: Derivation) -> Result<Id, Error> {
         let encoded = Object::Derivation(d.clone()).encode();
         let id = Id::of(&encoded);
-        if self.write(id, &encoded)?
-            && let Some(ledger) = self
-                .ledger
-                .write()
-                .unwrap_or_else(|e| e.into_inner())
-                .as_mut()
+        // Added even when another handle on the store wrote the same record
+        // first (E296): it may not have added it to the shared ledger yet,
+        // and this handle reads the output next. `insert` keeps one copy.
+        self.write(id, &encoded)?;
+        if let Some(ledger) = self
+            .ledger
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_mut()
         {
             ledger.insert(d);
         }
@@ -664,7 +790,13 @@ impl<S: Store> Repo<S> {
     }
 
     pub fn read_content(&self, id: &Id) -> Result<Vec<u8>, Error> {
-        self.rebuild(id, &mut Cx::default())
+        self.rebuild(
+            id,
+            &mut Cx {
+                cached: self.read_cache > 0,
+                ..Cx::default()
+            },
+        )
     }
 
     pub(crate) fn rebuild(&self, id: &Id, cx: &mut Cx) -> Result<Vec<u8>, Error> {
@@ -679,6 +811,11 @@ impl<S: Store> Repo<S> {
         if let Some(bytes) = self.memo_get(id) {
             return self.remember(id, bytes, cx);
         }
+        if cx.cached
+            && let Some(bytes) = self.cache.lock().unwrap().map.get(id).cloned()
+        {
+            return self.remember(id, bytes, cx);
+        }
         let mut err = Error::NotFound(*id);
         match self.store.read(id) {
             Ok(encoded) => match self.decode_plain(id, &encoded) {
@@ -686,6 +823,7 @@ impl<S: Store> Repo<S> {
                     if crate::dict::self_verified(&encoded) || Id::of_content(&bytes) == *id =>
                 {
                     self.memo_put(id, &bytes, encoded.len());
+                    self.cache_put(id, &bytes);
                     return self.remember(id, bytes, cx);
                 }
                 Ok(_) | Err(Error::Corrupt(_)) => err = Error::Corrupt(*id),
@@ -694,12 +832,27 @@ impl<S: Store> Repo<S> {
             Err(Error::NotFound(_)) => {}
             Err(e) => return Err(e),
         }
-        let derivations = self.derivations(id)?;
+        let mut derivations = self.derivations(id)?;
+        if derivations.is_empty()
+            && matches!(err, Error::NotFound(_))
+            && self.refresh_ledger
+            && !cx.refreshed
+        {
+            cx.refreshed = true;
+            if self.ledger_refresh()? {
+                // Another process may also have stored it since.
+                if self.store.has(id) {
+                    return self.rebuild(id, cx);
+                }
+                derivations = self.derivations(id)?;
+            }
+        }
         cx.stack.push(*id);
         for d in derivations {
             match self.eval(&d.func, &d.args, cx) {
                 Ok(bytes) if Id::of_content(&bytes) == *id => {
                     cx.stack.pop();
+                    self.cache_put(id, &bytes);
                     return self.remember(id, bytes, cx);
                 }
                 Ok(_) => err = Error::Corrupt(*id),
@@ -709,6 +862,29 @@ impl<S: Store> Repo<S> {
         }
         cx.stack.pop();
         Err(err)
+    }
+
+    /// Keep checked content `bytes` of `id`, if `read_cache` is on.
+    fn cache_put(&self, id: &Id, bytes: &[u8]) {
+        let limit = self.read_cache;
+        if limit == 0 || bytes.len() > limit {
+            return;
+        }
+        let mut c = self.cache.lock().unwrap();
+        if c.map.contains_key(id) {
+            return;
+        }
+        while c.bytes + bytes.len() > limit {
+            let Some(old) = c.order.pop_front() else {
+                break;
+            };
+            if let Some(b) = c.map.remove(&old) {
+                c.bytes -= b.len();
+            }
+        }
+        c.bytes += bytes.len();
+        c.order.push_back(*id);
+        c.map.insert(*id, bytes.to_vec());
     }
 
     fn remember(&self, id: &Id, bytes: Vec<u8>, cx: &mut Cx) -> Result<Vec<u8>, Error> {
