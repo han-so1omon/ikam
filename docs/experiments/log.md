@@ -5364,7 +5364,7 @@ Gates on the branch (E229 to E233): every kernel test suite passes (release); cl
 - Result (in process, release build, a 13-byte cached file read through WebDAV, 20,000 requests, three rounds): 2.45 to 3.85 us called directly, 3.74 to 4.95 us through the host, so routing, the role check and three password checks add about 1.1 to 1.4 us a request; one password check is 0.21 to 0.30 us. A run over real HTTP on 127.0.0.1 with curl: two projects, writes, a share, a scoped read, a refused read outside the scope, a merge and a clean stop on SIGTERM all behave as in the tests.
 - Not measured: memory per project, start time with 5 and 50 projects, latency over the network, the one heavy-job queue across projects (not built: repack, gc and fsck of one project hold only that project's lock).
 - Verdict: **kept**, as a new command; `ikam live` and `ikam db serve` are unchanged.
-- Run: `cargo test --release --bin ikam host::tests::overhead -- --ignored --nocapture`.
+- Run: `cargo test --release --bin ikam host::tests::overhead -- --ignored --nocapture`; on a real machine, `ROOT=/path/to/new-folder bash packages/kernel/scripts/e313-host-demo.sh` (build, tests, 22 checks over HTTP on 127.0.0.1, timing; removes ROOT at the end; 22 of 22 on Linux, p50 0.4 ms).
 
 ### E314 project-separation (no path between projects without a share)
 - Branch / parent: exp/313-project-host / exp/315-scoped-shares
