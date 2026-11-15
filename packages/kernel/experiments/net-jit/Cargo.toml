@@ -19,5 +19,10 @@ cranelift-native = "=0.137.1"
 libc = "=0.2.189"
 tempfile = "3.27.0"
 
+# E311: the MLIR mode. Off by default; it adds no dependency, only a
+# subcommand that runs MLIR's and LLVM's tools (MLIR_BIN or PATH).
+[features]
+mlir = []
+
 [profile.release]
 debug = false
