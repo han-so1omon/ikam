@@ -9,6 +9,7 @@ pub mod backends;
 mod claims;
 mod codec;
 pub mod colblock;
+mod coldpass;
 mod container;
 mod db;
 mod dict;
@@ -42,6 +43,7 @@ pub mod views;
 mod wasm;
 pub mod worktree;
 
+pub use coldpass::{COLD_PASS_REF, ColdPass, ColdPassOpts};
 pub use container::expand;
 pub use db::{Counts, Db, Event, Op, prefix_end};
 pub use dict::decode_cost;

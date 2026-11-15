@@ -46,6 +46,11 @@ pub trait Store {
         let _ = (name, expected);
         Err(Error::Exec("this store cannot delete refs".into()))
     }
+    /// Make every object written so far durable without moving a ref
+    /// (E268). A store that writes at once has nothing to do.
+    fn sync(&mut self) -> Result<(), Error> {
+        Ok(())
+    }
 }
 
 /// A store several `Repo`s share (E232): each call takes a lock for that
@@ -77,6 +82,9 @@ impl<S: Store> SharedStore<S> {
 }
 
 impl<S: Store> Store for SharedStore<S> {
+    fn sync(&mut self) -> Result<(), Error> {
+        self.w().sync()
+    }
     fn write(&mut self, id: Id, encoded: &[u8]) -> Result<bool, Error> {
         self.w().write(id, encoded)
     }
@@ -423,6 +431,9 @@ impl FsStore {
 }
 
 impl Store for FsStore {
+    fn sync(&mut self) -> Result<(), Error> {
+        FsStore::sync(self)
+    }
     fn write(&mut self, id: Id, encoded: &[u8]) -> Result<bool, Error> {
         if self.has(&id) {
             return Ok(false);

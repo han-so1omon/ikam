@@ -424,11 +424,27 @@ impl<S: Store + Sync> Repo<S> {
     /// kept pays for the slow level. Decoded content is checked against its
     /// id first.
     pub(crate) fn recompress(&mut self, roots: &[Id]) -> Result<(), Error> {
+        self.recompress_only(roots, None, &HashSet::new())
+    }
+
+    /// `recompress`, of the ids in `only` when given (E268), with only
+    /// those contents as candidate contexts; ids in `keep` may be contexts
+    /// but keep their encoding.
+    pub(crate) fn recompress_only(
+        &mut self,
+        roots: &[Id],
+        only: Option<&HashSet<Id>>,
+        keep: &HashSet<Id>,
+    ) -> Result<(), Error> {
         self.level = STORE_LEVEL;
         let dict = self.dictionary().map(|(id, _)| *id);
         let model = self.read_model(roots)?;
-        let bases = self.related_bases(dict)?;
-        let ids = self.store.ids()?;
+        let bases = self.related_bases(dict, only)?;
+        let mut ids = self.store.ids()?;
+        if let Some(only) = only {
+            ids.retain(|id| only.contains(id));
+        }
+        ids.retain(|id| !keep.contains(id));
         let mut cheapest = self.cheapest_encodings(&ids, dict, &model)?;
         let (mut used, mut related) = (HashSet::new(), HashSet::new());
         for id in ids {
@@ -648,9 +664,12 @@ impl<S: Store + Sync> Repo<S> {
 
     /// Contents stored plainly (not the dictionary) of at least
     /// `RELATED_MIN` bytes: the candidate contexts of "Q" encodings.
-    fn related_bases(&self, dict: Option<Id>) -> Result<Bases, Error> {
+    fn related_bases(&self, dict: Option<Id>, only: Option<&HashSet<Id>>) -> Result<Bases, Error> {
         let mut bases = Bases::default();
         for id in self.store.ids()? {
+            if only.is_some_and(|o| !o.contains(&id)) {
+                continue;
+            }
             let stored = self.store.read(&id)?;
             if !matches!(stored[0], b'B' | b'W' | b'Z' | b'Y') || Some(id) == dict {
                 continue;

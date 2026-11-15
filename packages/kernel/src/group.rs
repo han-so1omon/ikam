@@ -248,9 +248,17 @@ impl<S: Store> Repo<S> {
     /// written only if it and its member entries are smaller than the
     /// members' current encodings.
     pub(crate) fn group_small(&mut self) -> Result<(), Error> {
+        self.group_small_only(None)
+    }
+
+    /// `group_small` over the contents in `only` when given (E268).
+    pub(crate) fn group_small_only(&mut self, only: Option<&HashSet<Id>>) -> Result<(), Error> {
         let dict = self.dictionary().map(|(id, _)| *id);
         let mut items: Vec<(Vec<u8>, Id, usize)> = Vec::new();
         for id in self.store.ids()? {
+            if only.is_some_and(|o| !o.contains(&id)) {
+                continue;
+            }
             let stored = self.store.read(&id)?;
             if matches!(stored.first(), Some(b'B' | b'W' | b'Z' | b'Y')) && Some(id) != dict {
                 let bytes = self.decode_plain(&id, &stored)?;
@@ -290,9 +298,17 @@ impl<S: Store> Repo<S> {
                 best = (saved, plans);
             }
         }
-        for p in best.1 {
+        for p in &best.1 {
             self.store.write(p.group, &p.encoded)?;
             self.note_needs(&p.encoded);
+        }
+        // A member entry is durable once replaced: its group must be durable
+        // first, or a crash on a store with deferred writes loses the
+        // member (E268).
+        if !best.1.is_empty() {
+            self.store.sync()?;
+        }
+        for p in best.1 {
             for (id, entry) in p.entries {
                 self.store.replace(id, &entry)?;
                 self.note_needs(&entry);
@@ -460,5 +476,62 @@ mod tests {
             .sum::<usize>()
             + repo.store().read(&group).unwrap().len();
         assert!(after < before, "{after} >= {before}");
+    }
+
+    /// A group stored against a context only it needs: gc keeps the context
+    /// too, so the members stay readable (E268: a full repack of a store the
+    /// grouped cold pass left lost such contexts in its final gc).
+    #[test]
+    fn gc_keeps_what_a_group_needs() {
+        use crate::dict::{STORE_LEVEL, zstd_frame};
+        let mut repo = Repo::new(MemStore::default());
+        let docs: Vec<Vec<u8>> = (0..40)
+            .map(|i| {
+                format!(
+                    "# Note {i}\n\nShared boilerplate for every note, item {}.\n",
+                    i * 7
+                )
+                .into_bytes()
+            })
+            .collect();
+        let entries: Vec<TreeEntry> = docs
+            .iter()
+            .enumerate()
+            .map(|(i, d)| TreeEntry {
+                name: format!("n{i:02}.md"),
+                kind: Kind::File,
+                id: repo.put_content(d).unwrap().id,
+            })
+            .collect();
+        let tree = repo.put(&Object::tree(entries).unwrap()).unwrap();
+        repo.commit("main", tree, "").unwrap();
+        repo.group_small().unwrap();
+        let entry = repo.store().read(&Id::of_content(&docs[0])).unwrap();
+        assert_eq!(entry[0], b'S');
+        let group = repo
+            .store()
+            .ids_with_prefix(&entry[1..1 + GROUP_REF_LEN])
+            .unwrap()[0];
+        let bytes = repo
+            .decode_plain(&group, &repo.store().read(&group).unwrap())
+            .unwrap();
+        // A context no ref reaches: an earlier version of the group's bytes.
+        let context = [&bytes[..bytes.len() / 2], b"an older tail"].concat();
+        let c = Id::of_content(&context);
+        repo.store
+            .write(c, &[&b"B"[..], &context].concat())
+            .unwrap();
+        let z = zstd_frame(&bytes, &context, STORE_LEVEL).unwrap();
+        repo.store
+            .replace(group, &[&b"Q"[..], c.as_bytes(), &z].concat())
+            .unwrap();
+        for d in &docs {
+            assert_eq!(&repo.read_content(&Id::of_content(d)).unwrap(), d);
+        }
+        repo.gc().unwrap();
+        assert!(repo.store().has(&c), "gc keeps the group's context");
+        for d in &docs {
+            assert_eq!(&repo.read_content(&Id::of_content(d)).unwrap(), d);
+        }
     }
 }
