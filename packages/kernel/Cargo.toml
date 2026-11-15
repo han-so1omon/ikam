@@ -54,6 +54,14 @@ path = "src/bin/ikam/main.rs"
 [profile.dev.package."*"]
 opt-level = 2
 
+# E321: wasmi picks its tail-call dispatch at opt-level 2 or 3, where each
+# instruction handler jumps to the next. Its debug assertions keep LLVM from
+# turning those calls into jumps, so in a dev build every executed instruction
+# adds a stack frame and an interpreter program overflows any stack. Release
+# builds already run wasmi without them.
+[profile.dev.package.wasmi]
+debug-assertions = false
+
 [[example]]
 name = "stores"
 required-features = ["stores"]

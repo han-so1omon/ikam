@@ -4832,3 +4832,15 @@ Gates on the branch (E229 to E233): every kernel test suite passes (release); cl
 - Trade-off: none in cost (fusing two top-100 lists takes 0.03 to 0.04 ms). One weight is a compromise across collections.
 - Verdict: **kept**, opt-in. Convex is the default hybrid, at 0.5 for MiniLM-class embedders and 0.4 for bge-small-class ones; use 0.6 to 0.7 for a static model. Retune on a few hundred judged queries whenever the embedding model changes.
 - Run: `cargo test --test fusion`.
+
+
+### E321 wasmi-dev-stack (an interpreter program overflows the stack in a dev build)
+- Branch / parent: exp/321-wasmi-dev-stack / main at 17fa3a6 (E312)
+- Question: `cargo test --test exec` (dev profile) aborts in `interpreter_programs_reconstruct_exactly_and_price_their_fuel` with "has overflowed its stack", also with `RUST_MIN_STACK` at 16 MB. `cargo test --release` passes. Is it a recent merge, and what grows the stack?
+- Cause: wasmi 2.0's `auto-dispatch` picks its tail-call dispatch whenever wasmi is built at opt-level 2 or 3 (its `build.rs`); each instruction handler ends by calling the next one and relies on LLVM to turn that call into a jump. The dev profile builds dependencies at opt-level 2 (E069) but keeps debug assertions on, and with wasmi's debug assertions the calls stay calls: a debugger shows about 33,700 nested handler frames when the stack runs out, one per executed instruction, so any long enough program overflows any stack. Turning debug assertions off for every dependency passes; for `wasmi` alone passes; for `wasmi_ir` alone fails; debuginfo off fails. Which assertion blocks the jump is inferred, not traced: with debug assertions wasmi's `unreachable_unchecked!` becomes a formatted `unreachable!`, which takes the address of locals in each handler.
+- Not a recent merge: the same failure on af24e4d, before PRs 11 to 18. The opt-level override and wasmi's features date from E069. Test runs in this log use `--release`, which is why it did not show.
+- Change: `[profile.dev.package.wasmi] debug-assertions = false` in `packages/kernel/Cargo.toml`. Build setting only; release builds and the kernel's own debug assertions are unchanged.
+- Result: the test passes in a dev build. Full `cargo test` passes in dev and in release, 291 tests each.
+- Trade-off: dev builds lose wasmi's internal assertions, which release builds never had. A wasmi bug that only an assertion would catch now shows in neither.
+- Verdict: **kept** (fix).
+- Run: `cargo test --test exec` and `cargo test --release`.
