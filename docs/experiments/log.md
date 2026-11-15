@@ -4577,3 +4577,25 @@ Gates on the branch (E229 to E233): every kernel test suite passes (release); cl
 - Verdict: **kept** (example only). Past a handful of workers, heartbeats belong on a ref of the run's own, not in the loop's database. The beat refs are never removed here; a runner would delete a run's ref at its finish.
 - Not measured: removing beat refs; many thousands of refs in one store; machines with differing clocks.
 - Run: as above (about 4 minutes together).
+
+### E307 beat-ref-scale (what a night of heartbeat refs costs the store)
+- Branch / parent: exp/307-beat-ref-scale / E306 (exp/306-heartbeat-refs)
+- Question: E306 leaves a `beat/<start key>` ref of about ten commits for every run, never removed. Over a night of thousands of runs, what do those refs cost the loop's own ref, listing, fsck and gc, and what does removing them at a run's finish cost? (Source: E306's "Not measured": "removing beat refs; many thousands of refs in one store".)
+- Hypothesis: FsStore keeps a file per ref, so resolving and moving the loop's ref do not grow with the beat refs; listing refs, fsck and gc grow linearly and gc keeps every beat commit alive; a delete per run costs about a millisecond.
+- Change: none to the kernel. `examples/ref_scale.rs`: FsStore stores with the loop's ref plus RUNS beat refs of BEATS (10) distinct commits each; times the beats, 1,000 resolves and 20 commits of the loop's ref, listing refs, fsck and gc; then deletes every beat ref, runs gc and the same reads again.
+- Result (`cargo run --release --example ref_scale -- 100 1000` and `-- 5000`):
+
+  | Runs (beat commits) | A beat | Resolve loop | Commit loop | List refs | fsck | gc | Delete the beat refs | gc after |
+  |---|---|---|---|---|---|---|---|---|
+  | 100 (1,000) | 2.3 ms | 1.3 us | 2.0 ms | 0.4 ms | 8 ms | 11 ms, 0 freed | 118 ms | 1.0 s, 1,000 freed |
+  | 1,000 (10,000) | 1.9 ms | 2.1 us | 1.7 ms | 5.5 ms | 113 ms | 163 ms, 0 freed | 1.2 s | 7.5 s, 10,000 freed |
+  | 5,000 (50,000) | 1.7 ms | 1.8 us | 1.8 ms | 28 ms | 436 ms | 580 ms, 0 freed | 2.2 s | 6.0 s, 50,000 freed |
+
+  - Resolving and moving the loop's ref do not change with the beat refs (1 to 2 us and about 2 ms at every size).
+  - Listing refs, fsck and gc grow with them, and gc frees nothing while they exist: every beat commit stays.
+  - Deleting a beat ref costs 0.4 to 1.2 ms, and gc then frees its commits. After the deletes, every read was back to its size with one ref.
+  - A beat itself costs about 2 ms (a commit and a synced ref file), so ten a second is about 2% of a run's time.
+  - fsck found nothing wrong at any size. Timings on this test machine's disk varied (the 1,000-run gc after the deletes was slower than the 5,000-run one).
+- Verdict: **measured** (no change). A loop runner should delete a run's beat ref when the run finishes, once, for about a millisecond; left in place, a night's refs cost nothing on the loop's hot path but keep every beat commit and slow listing, fsck and gc.
+- Not measured: APFS on the Mac; one directory of tens of thousands of ref files on other filesystems; gc's own per-object delete cost (it dominated the gc after the deletes).
+- Run: as above (about 2 minutes together).
