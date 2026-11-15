@@ -4507,3 +4507,26 @@ Gates on the branch (E229 to E233): every kernel test suite passes (release); cl
 - Verdict: **kept** (example only). A lease is the recovery for unseen workers, and it must be longer than the longest run. Runs longer than any sensible lease need a heartbeat that renews it, for example E281's checkpoints, which a supervisor can read as a sign of life.
 - Not measured: a heartbeat renewing the lease; clocks that differ between machines (here one supervisor's clock times every lease).
 - Run: as above (about 8 minutes together).
+
+### E304 lease-heartbeats (checkpoints that renew a run's lease)
+- Branch / parent: exp/304-lease-heartbeats / E303 (exp/303-run-leases)
+- Question: E303's lease must outlast the longest run, and a night has runs of minutes next to runs of seconds. Can a run's checkpoints (E281) renew its lease, so a short lease serves long runs? (Source: E303's "Not measured": "a heartbeat renewing the lease".)
+- Hypothesis: if the supervisor restarts a run's lease at each new checkpoint under its start's key, a 300 ms lease with a checkpoint every 100 ms never cuts a live 1 s run, and still recovers a dead worker's run within about 300 ms.
+- Change: none to the kernel. `net_kill` gains `HEARTBEAT_MS`: the work saves a checkpoint (`net_checkpoint`, the step number) under its start firing's key that often; the supervisor finds each running candidate's latest start and restarts its lease when that start's checkpoint changes. Two fixes to the example: the final requeue's keys no longer collide with the supervisor's, and workers still going at the time limit are stopped before the second pass (in E301 and E303 the runs that reached 120 s let their last workers run on into it; their first-pass figures stand, and their final checks were made after both passes).
+- Result (`WORK_MS=1000 ... cargo run --release --example net_kill -- 20`, 2 workers, 1 s per run):
+
+  | Kills | Lease | Heartbeat | First pass | Starts for 20 | Requeued |
+  |---|---|---|---|---|---|
+  | every 1.5 s | none | none | 3 of 20, then stalled | 22 | 0 |
+  | none | 300 ms | none | 1 of 20 in 120 s (livelock) | 257 | 235 |
+  | every 1.5 s | 300 ms | none | 1 of 20 in 120 s (livelock) | 285 | 265 |
+  | none | 300 ms | every 100 ms | 20 of 20 in 11.2 s | 20 | 0 |
+  | every 1.5 s | 300 ms | every 100 ms | 20 of 20 in 14.4 s | 28 | 8 |
+
+  - With heartbeats a lease three times shorter than a run never cut a live one, and dead workers' runs came back: every candidate measured with kills every 1.5 s.
+  - Without them the same lease livelocks, as in E303.
+  - Each heartbeat is a commit, so a run's checkpoints compete with other workers' firings for the ref (here 10 per run).
+  - Replay, fsck and every output right in every run.
+- Verdict: **kept** (example only). The loop runner's recovery: a lease a few heartbeats long, renewed by the run's checkpoints, with E301's requeue.
+- Not measured: heartbeats at scale (many workers' checkpoints contending for one ref; a separate ref per worker would avoid it); machines with differing clocks.
+- Run: as above (about 12 minutes together).

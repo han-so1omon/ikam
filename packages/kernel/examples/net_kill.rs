@@ -14,7 +14,8 @@
 //!   cargo run --release --example net_kill [-- N]
 //!   (W, KILL_MS, WORK_MS as env; DEFERRED=1 opens the store with
 //!   `open_deferred`; CLEAN=1 runs `clean_temporaries` (E302) at the end;
-//!   LEASE_MS puts back any candidate running longer than that, E303)
+//!   LEASE_MS puts back any candidate running longer than that, E303;
+//!   HEARTBEAT_MS has the work checkpoint that often, renewing its lease, E304)
 
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
@@ -99,7 +100,32 @@ fn child(dir: &str, w: u64) {
             if repo.db_commit_at(REF, head, &db, "start").is_err() {
                 return Ok(true);
             }
-            std::thread::sleep(work);
+            // E304: HEARTBEAT_MS > 0, the work saves a checkpoint (E281)
+            // under its start's key that often, as a sign of life.
+            let beat = Duration::from_millis(env("HEARTBEAT_MS", 0));
+            if beat.is_zero() {
+                std::thread::sleep(work);
+            } else {
+                let started = Instant::now();
+                let mut step = 0;
+                while started.elapsed() < work {
+                    std::thread::sleep(beat.min(work.saturating_sub(started.elapsed())));
+                    step += 1;
+                    for _ in 0..5 {
+                        let head = repo.resolve(REF)?;
+                        let db = repo.db_at(&head)?;
+                        let db = repo.net_checkpoint(
+                            &db,
+                            "loop",
+                            &format!("w{w}-{k}"),
+                            format!("step {step}").as_bytes(),
+                        )?;
+                        if repo.db_commit_at(REF, head, &db, "beat").is_ok() {
+                            break;
+                        }
+                    }
+                }
+            }
             loop {
                 let head = repo.resolve(REF)?;
                 let db = repo.db_at(&head)?;
@@ -234,7 +260,8 @@ fn main() {
     // other machines): a candidate running longer than the lease is put
     // back, whoever holds it.
     let lease = Duration::from_millis(env("LEASE_MS", 0));
-    let mut seen: std::collections::HashMap<String, Instant> = Default::default();
+    let mut seen: std::collections::HashMap<String, (Instant, Option<Vec<u8>>)> =
+        Default::default();
     let mut last_poll = Instant::now();
     while !kids.is_empty() && t0.elapsed() < Duration::from_secs(120) {
         std::thread::sleep(Duration::from_millis(5));
@@ -246,9 +273,27 @@ fn main() {
             seen.retain(|t, _| running.contains(t));
             let now = Instant::now();
             let mut late = Vec::new();
+            // E304: a run's lease restarts at each new checkpoint of its start.
+            let beats = env("HEARTBEAT_MS", 0) > 0;
+            let mut last_start = std::collections::HashMap::new();
+            if beats {
+                for f in sup.net_firings(&db, "loop").unwrap() {
+                    if f.transition == "start"
+                        && let Some(t) = f.token
+                    {
+                        last_start.insert(t, f.key);
+                    }
+                }
+            }
             for t in running {
-                let since = *seen.entry(t.clone()).or_insert(now);
-                if now - since >= lease {
+                let progress = last_start
+                    .get(&t)
+                    .and_then(|key| sup.net_resume(&db, "loop", key).ok().flatten());
+                let entry = seen.entry(t.clone()).or_insert((now, progress.clone()));
+                if entry.1 != progress {
+                    *entry = (now, progress);
+                }
+                if now - entry.0 >= lease {
                     late.push(t);
                 }
             }
@@ -306,6 +351,12 @@ fn main() {
             }
         }
     }
+    // Workers still going at the time limit are stopped, so the second
+    // pass runs alone.
+    for mut k in kids {
+        let _ = k.kill();
+        let _ = k.wait();
+    }
     let first_ms = t0.elapsed().as_millis();
     drop(sup);
     let mut repo = open(&d);
@@ -316,7 +367,7 @@ fn main() {
     let mut db = db;
     for (i, tok) in stranded.iter().enumerate() {
         db = repo
-            .net_fire(&db, &net, "requeue", Some(tok), &format!("rq{i}"))
+            .net_fire(&db, &net, "requeue", Some(tok), &format!("end-rq{i}"))
             .unwrap()
             .0;
     }
