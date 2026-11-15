@@ -848,6 +848,38 @@ impl<S: Store> Repo<S> {
         self.commit(name, tree, message)
     }
 
+    /// Commit `db` to `name` only if the ref still points at `base`, the
+    /// commit `db` was read from (E292, opt-in). `db_commit` builds on
+    /// whatever the ref points at now, so a writer whose `db` was read
+    /// before another writer committed replaces that writer's database
+    /// silently; this refuses with `Error::RefConflict` instead, writing
+    /// no ref, and the caller reads the new head and tries again.
+    pub fn db_commit_at(
+        &mut self,
+        name: &str,
+        base: Id,
+        db: &Db,
+        message: &str,
+    ) -> Result<Id, Error> {
+        if self.store.get_ref(name)? != Some(base) {
+            return Err(Error::RefConflict(name.into()));
+        }
+        let mut entries = match self.get(&self.commit_tree(&base)?)? {
+            Object::Tree(entries) => entries,
+            _ => return Err(Error::WrongKind(base)),
+        };
+        entries.retain(|e| e.name != "db");
+        entries.push(self.db_entry(db)?);
+        let tree = self.put(&Object::tree(entries)?)?;
+        let id = self.put(&Object::Commit(crate::Commit {
+            tree,
+            parents: vec![base],
+            message: message.into(),
+        }))?;
+        self.store.set_ref(name, Some(base), id)?;
+        Ok(id)
+    }
+
     /// The tree entry `db` that holds `db`'s log and views.
     pub(crate) fn db_entry(&mut self, db: &Db) -> Result<TreeEntry, Error> {
         let graph = |name: &str, id: Id| TreeEntry {

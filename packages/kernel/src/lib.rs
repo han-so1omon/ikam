@@ -30,6 +30,7 @@ mod library;
 mod markup;
 pub mod matcher;
 pub mod merge;
+pub mod net;
 mod object;
 mod pdftext;
 mod range;
