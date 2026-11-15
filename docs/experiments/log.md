@@ -3919,3 +3919,25 @@ Gates on the branch (E229 to E233): every kernel test suite passes (release); cl
 - Not measured: `net_enabled` and `net_marking` still read the whole marking (the scheduler's cost, separate from firing); the append's remaining growth with the log (E260's views); LtHash's larger state; nets with heavy arcs (cost grows with arcs, not tokens).
 - Run: `cargo run --release --example net_sum_hash [-- N]`; `cargo test --release --lib net::`.
 - Gates on the branch: kernel lib tests pass (58, 1 ignored); clippy `-D warnings` and fmt clean.
+
+### E280 enabled-limit (the scheduler reads only what its first answer needs, as an option)
+- Branch / parent: exp/280-enabled-limit / E279 (exp/279-marking-sum-hash)
+- Question: after E279 a firing no longer reads the whole marking, but the scheduler's question, `net_enabled`, still does, so a runner that asks "what can run next?" before each firing still pays for every token held. Can it ask for just the first few answers?
+- Hypothesis: checking plain inputs by key and reading a colored transition's first colored input place by prefix, in pages that double, gives the same first answers as `net_enabled` at a cost that follows the limit, not the tokens held. (Source: E279's "Not measured".)
+- Change: `Repo::net_enabled_limit(db, net, auto, limit)` in the opt-in `net` module: the first `limit` entries of `net_enabled`, in the same order. One unit test (equal to a prefix of `net_enabled` for limits 0 to 1,000, with and without `auto`, through a run with merges and a blocked cpu); `examples/net_pick.rs`.
+- Result (`cargo run --release --example net_pick`, sum-hash net on MemStore, one candidate queued, p50):
+
+  | Tokens held | `net_enabled` | `net_enabled_limit(1)` | Runner step (ask, fire), full | Runner step, limit 1 |
+  |---|---|---|---|---|
+  | 0 | 0.05 ms | 0.09 ms | 1.9 ms | 2.0 ms |
+  | 250 | 5.2 ms | 0.98 ms | 14.3 ms | 9.6 ms |
+  | 1,000 | 21.5 ms | 1.14 ms | 32.5 ms | 12.4 ms |
+  | 2,000 | 42.6 ms | 1.34 ms | 54.3 ms | 13.1 ms |
+  | 4,000 | 87.8 ms | 1.88 ms | 121.6 ms | 14.0 ms |
+
+  - The first answer was equal in every timed call; replay equal at the end with 4,001 waiting.
+  - With E279 and E280 together, a runner's step stays near 13 ms from 1,000 to 4,000 tokens held, against 32 to 122 ms with both defaults. The rest of the small growth is the database's own reads and append.
+- Verdict: **kept** as an option (opt-in API). The loop's runner should ask for one answer at a time.
+- Not measured: nets where most held tokens are not enabled (the pages then read the place to the end, as `net_enabled` does); an index of enabled firings kept with the marking; FsStore.
+- Run: `cargo run --release --example net_pick [-- MAX]`; `cargo test --release --lib net::`.
+- Gates on the branch: kernel lib tests pass (59, 1 ignored); clippy `-D warnings` and fmt clean.

@@ -600,6 +600,98 @@ impl<S: Store> Repo<S> {
         Ok(out)
     }
 
+    /// The first `limit` entries of [`net_enabled`](Repo::net_enabled), in
+    /// the same order, reading only what it needs (E280): plain inputs by
+    /// key, and a colored transition's first colored input place by prefix,
+    /// in pages that double until `limit` are found or the place is read to
+    /// the end. Its cost follows `limit` and the net, not the tokens held,
+    /// unless most held tokens are not enabled.
+    pub fn net_enabled_limit(
+        &self,
+        db: &Db,
+        net: &Net,
+        auto: bool,
+        limit: usize,
+    ) -> Result<Vec<(String, Option<String>)>, Error> {
+        let p = prefix(&net.name);
+        let count = |key: &str| -> Result<u64, Error> {
+            match self.db_get(db, key)? {
+                Some(v) => std::str::from_utf8(&v)
+                    .ok()
+                    .and_then(|s| s.parse().ok())
+                    .ok_or(Error::Decode("net marking")),
+                None => Ok(0),
+            }
+        };
+        let colored = |place: &str| net.place(place).is_some_and(|pl| pl.colored);
+        let mut out = Vec::new();
+        for t in &net.transitions {
+            if out.len() >= limit {
+                break;
+            }
+            if auto && t.kind == Kind::Human {
+                continue;
+            }
+            // Arcs on plain places, summed by place.
+            let mut plain: BTreeMap<&str, u64> = BTreeMap::new();
+            let mut col: BTreeMap<&str, u64> = BTreeMap::new();
+            for a in &t.inputs {
+                let e = if colored(&a.place) {
+                    &mut col
+                } else {
+                    &mut plain
+                };
+                *e.entry(a.place.as_str()).or_default() += a.weight as u64;
+            }
+            let mut ok = true;
+            for (place, w) in &plain {
+                if count(&format!("{p}m/{place}/{ANON}"))? < *w {
+                    ok = false;
+                    break;
+                }
+            }
+            if !ok {
+                continue;
+            }
+            if !net.binds_color(t) {
+                out.push((t.name.clone(), None));
+                continue;
+            }
+            let Some(first) = t.inputs.iter().find(|a| colored(&a.place)) else {
+                continue;
+            };
+            let pre = format!("{p}m/{}/", first.place);
+            let mut page = (limit - out.len()).max(8);
+            let mut seen = 0;
+            loop {
+                let rows = self.db_prefix(db, &pre, page, false)?;
+                let done = rows.len() < page;
+                for (key, _) in rows.iter().skip(seen) {
+                    let tok = &key[pre.len()..];
+                    let mut all = true;
+                    for (place, w) in &col {
+                        if count(&format!("{p}m/{place}/{tok}"))? < *w {
+                            all = false;
+                            break;
+                        }
+                    }
+                    if all {
+                        out.push((t.name.clone(), Some(tok.to_string())));
+                        if out.len() >= limit {
+                            return Ok(out);
+                        }
+                    }
+                }
+                seen = rows.len();
+                if done {
+                    break;
+                }
+                page *= 2;
+            }
+        }
+        Ok(out)
+    }
+
     /// Fire `transition` with `token` bound, as one append: the changed
     /// counts and the firing record under `key`. A retry with the same key
     /// returns the recorded firing and changes nothing; a key already used
@@ -1081,6 +1173,55 @@ mod tests {
         let plain = r.db_empty().unwrap();
         let plain = r.net_init(&plain, &net).unwrap();
         assert!(r.net_init_sum(&plain, &net).is_err());
+    }
+
+    #[test]
+    fn enabled_limit_is_a_prefix_of_enabled() {
+        let mut r = Repo::new(MemStore::default());
+        let net = loop_net();
+        let db = r.db_empty().unwrap();
+        let mut db = r.net_init(&db, &net).unwrap();
+        let check = |r: &Repo<MemStore>, db: &Db| {
+            for auto in [false, true] {
+                let all = r.net_enabled(db, &net, auto).unwrap();
+                for k in [0, 1, 2, 5, 40, 1000] {
+                    let some = r.net_enabled_limit(db, &net, auto, k).unwrap();
+                    assert_eq!(some, all[..k.min(all.len())], "limit {k}, auto {auto}");
+                }
+            }
+        };
+        check(&r, &db);
+        for i in 0..30 {
+            let tok = format!("E{i:02}");
+            for t in ["propose", "start", "finish", "ask"] {
+                db = r
+                    .net_fire(&db, &net, t, Some(&tok), &format!("{t}-{tok}"))
+                    .unwrap()
+                    .0;
+                if i % 7 == 0 {
+                    check(&r, &db);
+                }
+            }
+            if i % 3 == 0 {
+                db = r
+                    .net_fire(&db, &net, "merge", Some(&tok), &format!("merge-{tok}"))
+                    .unwrap()
+                    .0;
+            }
+        }
+        // Some queued, one running: start is blocked on the cpu.
+        for i in 30..45 {
+            let tok = format!("E{i:02}");
+            db = r
+                .net_fire(&db, &net, "propose", Some(&tok), &format!("propose-{tok}"))
+                .unwrap()
+                .0;
+        }
+        db = r
+            .net_fire(&db, &net, "start", Some("E31"), "start-E31")
+            .unwrap()
+            .0;
+        check(&r, &db);
     }
 
     #[test]
