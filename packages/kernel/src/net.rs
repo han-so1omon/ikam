@@ -31,6 +31,8 @@
 //!
 //! Nothing in the default paths calls this module.
 
+mod text;
+
 use std::collections::BTreeMap;
 
 use crate::db::{Db, Event};

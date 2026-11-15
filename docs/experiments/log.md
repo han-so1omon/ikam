@@ -3827,3 +3827,17 @@ Gates on the branch (E229 to E233): every kernel test suite passes (release); cl
 - Not measured: guards (the plan lowers them to interp.wasm later); a crash between a cmd transition's work and its firing (the firing is the commit point, so the work is redone; recording outputs is E271's question); several nets in one database; concurrency (two writers firing at once on one database).
 - Run: `cargo run --release --example net_core [-- N]`; `cargo test --release --lib net::`.
 - Gates on the branch: kernel lib tests pass (release, 52 and 1 ignored); clippy `-D warnings` and fmt clean.
+
+### E270 net-dsl (a text form for nets)
+- Branch / parent: exp/270-net-dsl / E269 (exp/269-petri-core)
+- Question: the old docs planned a DSL over the kernel (a workflow definition compiled to a Petri net, then lowered). Before any higher layer, can a net be written and reviewed as plain text that parses to a checked `Net`, prints back in one canonical form, and refuses malformed input with an error that names the line? (Design: `docs/research/experiment-loop.md`, H5.)
+- Hypothesis: a line-per-declaration grammar (`net`, `place`, `transition NAME KIND [CAPABILITY]: IN -> OUT`, weights as `2*place`, `#` comments) is enough for the loop's nets; print then parse is the identity on every valid net, and no input makes the parser panic. (Source: the Python-era `WorkflowDefinition` and `RichPetriWorkflow`, removed in a992b77, which kept places, transitions and arcs as the compiled form.)
+- Change: `net::text` inside the opt-in `net` module: `Net::parse` (checks each line as it goes, so an error names the line that broke a rule) and `Net::to_text` (canonical: the net line, places, then transitions in order, single spaces, no comments). Three unit tests (the loop net, weights, 14 malformed inputs each naming its line and cause); `examples/net_text.rs`.
+- Result (`cargo run --release --example net_text`, fixed seed, 10,000 random nets of 2 to 12 places and 1 to 12 transitions of every kind):
+  - Round trip: 10,000 of 10,000 equal after print and parse; the canonical text is a fixed point.
+  - One random edit per text (a character deleted, doubled or replaced from the grammar's own symbols, or two lines swapped): 7,035 refused, every error naming a line; 2,965 accepted, all passing `Net::check` and round-tripping; 0 panics. 1,976 of the accepted ones are a different net from the original (a changed weight, initial count or name): a one-character slip can still be a valid net, so a net file should be reviewed as a diff of its canonical text.
+  - Parse of the experiment-loop net (5 places, 5 transitions): 3.7 us.
+- Verdict: **kept** as an option (part of the opt-in `net` module). The text form is the net's IR level, the layer a workflow DSL would compile to; that higher layer (named stages, retries and approvals as sugar over places and arcs) is not built.
+- Not measured: guards and their lowering to interp.wasm (E277's question); a workflow layer above this; error positions finer than a line; nets of thousands of transitions.
+- Run: `cargo run --release --example net_text [-- N]`; `cargo test --release --lib net::`.
+- Gates on the branch: kernel lib tests pass; clippy `-D warnings` and fmt clean.
