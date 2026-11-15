@@ -1,9 +1,13 @@
-# One ikam service for several tenants, kept apart
+# Separate ikam projects, shared by scope
 
-The owner, Nov 15: plan how several services can use the same ikam service,
-with isolation. This note is the generic design for the kernel's server side.
-Which services are tenants, and where the service runs, are deployment
-choices kept outside this repository. Nothing here is built yet.
+The owner, Nov 15: several services should use ikam with isolation. Revised
+the same day, in the owner's words: projects "separate by default but able to
+have scope access for granular data fragments and mergable on specific scope
+when authorized. Else graphs are completely separate."
+
+This note is the generic design for the kernel and its server. Which
+services are projects, and where they run, are deployment choices kept
+outside this repository. Nothing here is built yet.
 
 ## Where it starts
 
@@ -11,60 +15,96 @@ choices kept outside this repository. Nothing here is built yet.
   `--max-body`, `--max-store`, `--max-conns`, `--public` and `--llm`.
 - `ikam db serve` (E229) serves one store's databases (`db/NAME` refs) with a
   write user and a read user (`IKAM_READ_AUTH`).
-- A deployment that wants several private stores runs one process per store,
-  each with its own password and port. That is strong isolation, but every
-  process holds its own index and cache, and each needs its own supervisor,
-  port and backup job.
-- Section grants (E140) already seal a scoped permission with a keyed hash.
+- Section grants (E140) seal byte ranges of file versions with a keyed hash;
+  fragment grants (E155) do the same for one fragment within a path.
+- `Repo::merge` (E265) merges branches of one store: files three-way by path,
+  database events since the fork, conflicts reported and never resolved.
+- Nothing crosses stores today.
 
-## What it is
+## Separate by default
 
-`ikam host --config FILE`: one process serving many **tenants**.
+- **Project = one store folder:** its own objects, refs, ledger, index and
+  graphs. No object is shared or deduplicated across projects, so no project
+  can learn from sizes or the `X-Ikam-Cost` header whether another holds the
+  same bytes.
+- **Project host (`ikam host --config FILE`):** serves one or many projects.
+  Every route of `live` and `db serve` sits under `/p/<project>/`, or a host
+  name maps to a project. A project the caller may not see answers exactly
+  like one that does not exist.
+- **Roles per project:** owner, write, read, each from `ikam passwd` lines.
+  Owners issue tokens for a ref or path prefix with an expiry, sealed with the
+  project's key.
+- **Limits per project** (body, store size, connections, request rate), and
+  one queue that runs heavy jobs (repack, gc, fsck, reindex, ask) one at a
+  time across projects.
+- **Fault isolation:** a request runs under `catch_unwind`; a panic or failed
+  fsck marks that project degraded and the rest serve on. Stores open on
+  first use and close when idle.
+- **Settings per project**, each off unless set. `--public` is refused in the
+  host: a no-password copy stays its own process and never takes part in a
+  share.
+- One process per project stays supported; isolation never rests on the
+  process boundary alone.
 
-- **Tenant = one store folder.** Its own objects, refs, ledger, index and
-  settings. No object is shared between tenants by default.
-- **Routing.** Every route of `live` and `db serve` under `/t/<tenant>/`
-  (`/t/<tenant>/dav/...`, `/t/<tenant>/api/...`, `/t/<tenant>/db/NAME/...`),
-  or a host name mapped to a tenant in the config. An unknown tenant answers
-  404 whether or not it exists elsewhere.
-- **Roles per tenant:** owner (repack, gc, fsck, settings), write, read. Each
-  is one or more `ikam passwd` lines in the config.
-- **Scoped tokens:** issued by an owner for a ref prefix and/or path prefix,
-  a role and an expiry, sealed with a per-tenant key the way grants are.
-  Loop workers get `exp/` and `beat/` only; a review page gets read.
-- **Limits per tenant:** body size, store size, connections, requests per
-  second. Heavy jobs (repack, gc, fsck, reindex, ask) from every tenant go
-  through one queue that runs one at a time.
-- **Failure isolation:** a request runs under `catch_unwind`; a panic or a
-  failed fsck marks that tenant degraded (503 for it) and the rest serve on.
-  Stores open on first use and close after an idle time.
-- **Settings per tenant:** deferred sync, packs, hot/cold, fusion, `--llm`,
-  each as today and off unless set. `--public` is refused in host mode: a
-  no-password copy stays its own process.
-- **Config file:** readable only by its owner; holds tenants, folders,
-  passwd lines, token keys and limits. Never in the repository.
+## Scopes
 
-## Choices made here (options for later)
+A scope names exactly what a project exposes, at one of five grains:
 
-- **Shared object pool** (off): tenants marked as one trust group share one
-  object store, so near-copies across them are stored once (the north
-  star). Off by default because a shared store leaks: `X-Ikam-Cost`
-  new_bytes tells a writer whether another tenant already holds the bytes.
-  With the pool on, that header is withheld.
-- **Path vs host routing:** both; path is what a single private name needs,
-  host names suit a proxy in front.
-- **One process vs one per tenant:** one process is the new option; one
-  process per store stays supported.
+| Grain | What | Builds on |
+|---|---|---|
+| fragment | fragment ids, or the fragments rendered under a path | `FragmentGrant` (E155) |
+| section | byte ranges of one file version | `Grant` (E140) |
+| path | the files under a prefix | trees |
+| records | a key prefix or range in one database | `db_range`, `db_prefix` (E229) |
+| graph | the nodes under a prefix in one graph | `graph_prefix`, `graph_range` |
 
-## What else the server needs (from the HTTP gaps still open)
+A scope is pinned to a commit by default; following a ref is an option.
+
+## Shares
+
+A share is `(source project, scope, receiving project, right, expiry)`, with
+right one of:
+
+- **read:** the receiver may read the scope through the host;
+- **propose:** the receiver may write edits inside the scope, which land as a
+  branch in the source project (write ranges as in grants);
+- **merge:** the receiver may take the scope into its own graph (below).
+
+A share is sealed with the source project's key and recorded as an event in
+the source project's own log (`shares` database), so it is listed, audited,
+backed up and revoked there. A read through a share returns only the scoped
+bytes and never a storage object: a group, dictionary or delta object can
+hold bytes of several files (E126), so checks stay at the file, fragment,
+record and node layer. Anything outside the scope answers as if it did not
+exist.
+
+Search and ask run over a project's own graph. With a read share they may
+also run over the shared scope; every hit is marked with its source project
+and none comes from outside the scope.
+
+## Scoped merge
+
+- A merge copies the scope's content into the receiving project's store as
+  one commit, with provenance: source project, scope and source commit. The
+  graphs stay separate; the receiver deduplicates only within itself.
+- It needs a share with the merge right **and** an authorization of that
+  merge by the owner (per merge by default; standing authorization per pair
+  of projects and scope is an option).
+- A later merge of the same scope is incremental: three-way against the last
+  merged source commit, as `Repo::merge` does within one store. A change on
+  both sides is a conflict, reported, nothing written.
+- Revoking a share stops reads, proposals and future merges at once. Content
+  already merged stays, because it is a copy.
+
+## What else the server needs (HTTP gaps still open)
 
 1. Read at a commit: `GET .../dav/<path>?rev=<commit>`, `.../api/log?path=`.
 2. Commit with a message and author, answering the commit id.
 3. Write to a named ref, per request.
 4. `live` and `db` routes in one process.
-5. Net routes (fire, lease, beat, journal) so a worker can use a tenant over
+5. Net routes (fire, lease, beat, journal) so a worker can use a project over
    HTTP instead of opening a store folder.
-6. A snapshot hook per tenant (flush, then a consistent copy) for backups.
+6. A snapshot hook per project (flush, then a consistent copy) for backups.
 
 ## Experiments to prove it
 
@@ -73,14 +113,16 @@ when each starts.
 
 | Id | Question | Measure |
 |---|---|---|
-| E313 | What does one host cost against one process per store? | p50/p99 per route, memory per idle and busy tenant, start time, 5 and 50 tenants |
-| E314 | Can a tenant reach another's data? | cross-tenant paths, `..` and encoded paths, Host spoofing, expired or out-of-scope tokens, read role writing: all refused |
-| E315 | Does one tenant slow another? | tenant A ingest, repack and a large db import; tenant B p99 with and without the job queue |
-| E316 | Does one tenant's failure stay its own? | panic and damaged objects in A; B keeps serving; A recovers on restart |
-| E317 | What does the shared pool save, and is the leak closed? | bytes vs separate stores on pairs of corpora; cost-header oracle shown, then gone with the header withheld |
-| E318 | Are limits enforced per tenant? | 413, 507 and 429 at the set sizes and rates, other tenants unaffected |
-| E319 | What does firing over HTTP cost? | net firing remote vs in-process (E293), with leases and beats (E303, E304) |
-| E320 | Can a tenant be backed up while it serves? | snapshot time, byte-exact restore, write latency during it |
+| E313 | What does one host cost against one process per project? | p50/p99 per route, memory per idle and busy project, start time, 5 and 50 projects |
+| E314 | Can a project reach another's data without a share? | cross-project paths, `..` and encoded paths, Host spoofing, expired or out-of-scope tokens, read role writing: all refused; hidden and missing projects answer alike |
+| E315 | Can a share be stretched past its scope? | one byte past a section, a stale version, a fragment outside the scope, a key past the prefix, a node outside the graph prefix: all refused; cost per scoped read |
+| E316 | Does a scoped merge copy exactly and merge again cleanly? | byte-exact copy with provenance, incremental re-merge, conflicts reported, proposal branches |
+| E317 | Do revoke and expiry take effect at once? | reads, proposals and merges refused from the next request; merged copies read back and pass fsck |
+| E318 | Can search through a share leak? | no hit outside the scope, with near-identical text just outside it |
+| E319 | Does one project slow or break another? | import, repack and damage in A; B's p99 and uptime, with and without the job queue |
+| E320 | Are limits enforced per project? | 413, 507 and 429 at the set sizes and rates, other projects unaffected |
+| E321 | What does firing over HTTP cost? | net firing remote vs in-process (E293), with leases and beats (E303, E304) |
+| E322 | Can a project be backed up while it serves? | snapshot time, byte-exact restore, write latency during it |
 
 Gates as for every experiment: byte-exact reads, search equal to a scan,
-clean fsck, in every tenant.
+clean fsck, in every project.
