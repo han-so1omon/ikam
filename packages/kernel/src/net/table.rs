@@ -46,6 +46,75 @@ impl Net {
     }
 }
 
+impl Net {
+    /// The same net with each colored place split into one plain place per
+    /// color (`place.color`) and each transition that binds a color copied
+    /// once per color (`transition.color`), in the order given (E285).
+    /// Firing `t` with token `c` here is firing `t.c` there, so the result
+    /// lowers to a [`Table`]. Transitions that bind no color are kept as
+    /// they are. Colors must be valid names and distinct.
+    pub fn unfold(&self, colors: &[&str]) -> Result<Net, Error> {
+        self.check()?;
+        let mut seen = std::collections::BTreeSet::new();
+        for c in colors {
+            if !super::valid_name(c) || !seen.insert(*c) {
+                return Err(Error::InvalidName(format!("color {c}")));
+            }
+        }
+        let colored = |p: &str| self.place(p).is_some_and(|pl| pl.colored);
+        let mut places = Vec::new();
+        for p in &self.places {
+            if p.colored {
+                for c in colors {
+                    places.push(super::Place {
+                        name: format!("{}.{c}", p.name),
+                        colored: false,
+                        initial: 0,
+                    });
+                }
+            } else {
+                places.push(p.clone());
+            }
+        }
+        let mut transitions = Vec::new();
+        for t in &self.transitions {
+            if !self.binds_color(t) {
+                transitions.push(t.clone());
+                continue;
+            }
+            for c in colors {
+                let map = |arcs: &[super::Arc]| {
+                    arcs.iter()
+                        .map(|a| super::Arc {
+                            place: if colored(&a.place) {
+                                format!("{}.{c}", a.place)
+                            } else {
+                                a.place.clone()
+                            },
+                            weight: a.weight,
+                        })
+                        .collect()
+                };
+                transitions.push(super::Transition {
+                    name: format!("{}.{c}", t.name),
+                    inputs: map(&t.inputs),
+                    outputs: map(&t.outputs),
+                    kind: t.kind,
+                    capability: t.capability.clone(),
+                });
+            }
+        }
+        let out = Net {
+            name: self.name.clone(),
+            version: self.version,
+            places,
+            transitions,
+        };
+        out.check()?;
+        Ok(out)
+    }
+}
+
 impl Table {
     pub fn is_enabled(&self, m: &[u64], t: usize) -> bool {
         self.inputs[t].iter().all(|&(p, w)| m[p] >= w)
@@ -137,5 +206,60 @@ mod tests {
                 .lower()
                 .is_err()
         );
+    }
+
+    #[test]
+    fn unfolded_table_agrees_with_colored_interpreter() {
+        let net = crate::net::tests::loop_net();
+        let colors: Vec<String> = (0..12).map(|i| format!("E{i:02}")).collect();
+        let cs: Vec<&str> = colors.iter().map(String::as_str).collect();
+        let t = net.unfold(&cs).unwrap().lower().unwrap();
+        assert!(net.unfold(&["a", "a"]).is_err());
+        for seed in 1..40u64 {
+            let mut x = seed;
+            let mut next = move || {
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                x
+            };
+            let mut m = net.initial_marking();
+            let mut tm = t.initial.clone();
+            let mut en = Vec::new();
+            for _ in 0..400 {
+                let mut list = Vec::new();
+                for tr in &net.transitions {
+                    if net.binds_color(tr) {
+                        for c in &cs {
+                            if net.is_enabled(&m, tr, Some(c)) {
+                                list.push((tr, Some(*c)));
+                            }
+                        }
+                    } else if net.is_enabled(&m, tr, None) {
+                        list.push((tr, None));
+                    }
+                }
+                t.enabled_into(&tm, &mut en);
+                assert_eq!(list.len(), en.len());
+                if list.is_empty() {
+                    break;
+                }
+                let k = (next() % list.len() as u64) as usize;
+                let (tr, c) = list[k];
+                m = net.fire(&m, tr, c).unwrap();
+                assert!(t.fire(&mut tm, en[k]));
+                let name = match c {
+                    Some(c) => format!("{}.{c}", tr.name),
+                    None => tr.name.clone(),
+                };
+                assert_eq!(t.transitions[en[k]], name);
+            }
+            // Same counts, place by place.
+            for (i, p) in t.places.iter().enumerate() {
+                let (base, tok) = p.split_once('.').unwrap_or((p, crate::net::ANON));
+                let want = m.get(base).and_then(|x| x.get(tok)).copied().unwrap_or(0);
+                assert_eq!(tm[i], want, "place {p}");
+            }
+        }
     }
 }

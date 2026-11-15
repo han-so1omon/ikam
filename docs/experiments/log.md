@@ -4017,3 +4017,21 @@ Gates on the branch (E229 to E233): every kernel test suite passes (release); cl
 - Not measured: an incremental replay; storing only the state's delta; ECMH (255-bit digests, needs an elliptic curve library).
 - Run: `cargo run --release --example net_sum_hash [-- N]`; `cargo test --release --lib net::`.
 - Gates on the branch: kernel lib tests pass (61, 1 ignored); clippy `-D warnings` and fmt clean.
+
+### E285 unfold-colors (colored nets in the table, by unfolding colors)
+- Branch / parent: exp/285-unfold-colors / E284 (exp/284-lthash-mode)
+- Question: E278's table refuses colored nets, and the loop's own net is colored (candidates are colors). Does unfolding colors into plain places and transitions give the interpreter's colored semantics, and what does it cost?
+- Hypothesis: one plain place per colored place and color, and one transition per binding transition and color, fire exactly as the colored net with that token bound, so the table's walk takes the same firings; the table keeps a 20x-plus lead, though its linear scan of every transition grows with the colors. (Source: the research scan's Neco note, E283; E278's "Not measured".)
+- Change: `Net::unfold(colors)` in the opt-in `net` module (`place.color`, `transition.color`; transitions that bind no color kept; colors must be distinct valid names; the result is checked). One unit test (39 seeded walks of 400 steps on the loop net with 12 colors: the same enabled list, the same firing names and the same counts as the colored interpreter); `examples/net_unfold.rs`.
+- Result (`cargo run --release --example net_unfold`; the same seeded walk on both, firings and counts asserted equal):
+
+  | Candidates | Unfolded places x transitions | Unfold and lower | Interpreter ns per step | Table ns per step | Table's lead |
+  |---|---|---|---|---|---|
+  | 10 | 41 x 50 | 0.1 ms | 1,998 | 83 | 24x |
+  | 100 | 401 x 500 | 0.8 ms | 12,524 | 627 | 20x |
+  | 1,000 | 4,001 x 5,000 | 41 ms | 95,880 | 5,392 | 18x |
+
+- Verdict: **kept** as an option (opt-in API). The loop's net can now be simulated on the table. Both modes grow with the colors because each step checks every transition; checking only the transitions next to the places a firing changed would cut that (next: E286).
+- Not measured: guards on colors (none in the kernel yet); colors that are tuples; a net with many colored places per transition.
+- Run: `cargo run --release --example net_unfold`; `cargo test --release --lib net::`.
+- Gates on the branch: kernel lib tests pass (62, 1 ignored); clippy `-D warnings` and fmt clean.
