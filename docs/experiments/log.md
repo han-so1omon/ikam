@@ -3863,3 +3863,24 @@ Gates on the branch (E229 to E233): every kernel test suite passes (release); cl
 - Not measured: MLIR itself (this machine has LLVM 18 but no MLIR libraries; clang -O2 stands in for the LLVM end of such a pipeline, and MLIR's gain would come from restructuring, such as vectorizing enabling tests over many colors, which a random walk does not exercise); Cranelift (would add a dependency; expected between table and native with faster compiles); colored nets (would unfold to one place per color); guards in wasm; macOS.
 - Run: `cargo run --release --example net_modes` (needs clang with the wasm32 target and lld).
 - Gates on the branch: clippy `-D warnings` and fmt clean; kernel lib tests pass.
+
+### E271 run-outputs (recording each run's output with its firing)
+- Branch / parent: exp/271-run-outputs / E277 (exp/277-execution-modes)
+- Question: E269 left open what happens when a loop runner crashes between a run's work and its firing: the firing is the commit point, so the work is redone. Does recording the work's output first avoid redoing it, and what does recording outputs cost and give? (Design: `docs/research/experiment-loop.md`; named in E269's "Not measured".)
+- Hypothesis: committing the output on its own before the firing lets a resumed runner find it and fire without rerunning the work, so crashes stop costing work; recording outputs also lets a later check recompute a run and catch work that is not deterministic.
+- Change: in the opt-in `net` module, `Firing.output` (the output's id; records without one keep E269's bytes), `Repo::net_fire_output` (the output as content, its id at `net/<name>/out/<key>` and in the record, all in the firing's one append; a retry with other bytes under the same key is refused), `net_output` and `net_verify` (recomputed bytes against the record); `net_replay` also checks that each named output is readable. One unit test; `examples/net_outputs.rs`: a stateless runner (it reads the marking to find each candidate's next step) takes 200 candidates through the loop net on an FsStore, committing to a ref after every append, with a seeded crash before any append (probability 0.15: drop everything in memory, reopen, resume from the ref). Work is a deterministic job that sleeps 20 ms. Three modes on the same seed: fire only (E269); output, then fire (the output appended and committed on its own first, the first design tried here); fire with output (`net_fire_output`).
+- Result (`cargo run --release --example net_outputs`):
+
+  | Mode | Crashes | Work runs | Redone | Finish firing p50 |
+  |---|---|---|---|---|
+  | fire only | 150 | 237 | 37 | 23.1 ms |
+  | output, then fire | 197 | 242 | 42 | 23.2 ms (plus an 11 ms output append) |
+  | fire with output | 150 | 237 | 37 | 28.7 ms |
+
+  - Committing the output first does not reduce redone work: the risky window (work done, nothing durable yet) is the same in both designs, it just ends at a different write; the extra append adds crash points and time (95 s against 66 s in all).
+  - Every mode ends with all 200 candidates waiting on the owner, replay equal to the marking when reopened cold, and fsck clean; with `net_fire_output` all 200 finish records name their output.
+  - `net_verify` recomputing every output: 200 of 200 match for the deterministic job; for a job whose output carries its run count, 200 of 200 differ.
+- Verdict: **kept** as an option (opt-in API) for what it gives: each firing names what the run produced, and a later pass can recompute runs to catch nondeterminism, for about 5.6 ms more per firing on FsStore. **Refuted** as a way to avoid redoing work: an extra durable write after the work leaves the same window. Long work needs its own checkpoints, or a cache keyed by its inputs (as content-addressed build tools do), to survive a crash.
+- Not measured: checkpoints inside long work; a cache keyed by inputs; outputs of megabytes (here under 100 bytes); MemStore.
+- Run: `cargo run --release --example net_outputs [-- N]`; `cargo test --release --lib net::`.
+- Gates on the branch: kernel lib tests pass (56, 1 ignored); clippy `-D warnings` and fmt clean.

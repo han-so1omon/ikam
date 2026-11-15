@@ -121,6 +121,9 @@ pub struct Firing {
     pub token: Option<String>,
     pub before: Id,
     pub after: Id,
+    /// The work's output, when the firing was made with `net_fire_output`
+    /// (E271).
+    pub output: Option<Id>,
 }
 
 fn valid_name(s: &str) -> bool {
@@ -302,21 +305,26 @@ fn parse_arcs(s: &str) -> Result<Vec<Arc>, Error> {
 }
 
 fn encode_record(f: &Firing) -> Vec<u8> {
-    format!(
+    let mut s = format!(
         "{}\n{}\n{}\n{}\n",
         f.transition,
         f.token.as_deref().unwrap_or(""),
         f.before,
         f.after
-    )
-    .into_bytes()
+    );
+    // A fifth line only when there is an output, so records without one
+    // keep E269's bytes.
+    if let Some(o) = &f.output {
+        s += &format!("{o}\n");
+    }
+    s.into_bytes()
 }
 
 fn decode_record(key: &str, bytes: &[u8]) -> Result<Firing, Error> {
     let s = std::str::from_utf8(bytes).map_err(|_| Error::Decode("net firing"))?;
     let l: Vec<&str> = s.lines().collect();
     let id = |s: &str| s.parse::<Id>();
-    if l.len() != 4 {
+    if l.len() != 4 && l.len() != 5 {
         return Err(Error::Decode("net firing"));
     }
     Ok(Firing {
@@ -325,6 +333,7 @@ fn decode_record(key: &str, bytes: &[u8]) -> Result<Firing, Error> {
         token: (!l[1].is_empty()).then(|| l[1].to_string()),
         before: id(l[2])?,
         after: id(l[3])?,
+        output: l.get(4).map(|o| id(o)).transpose()?,
     })
 }
 
@@ -531,6 +540,50 @@ impl<S: Store> Repo<S> {
         token: Option<&str>,
         key: &str,
     ) -> Result<(Db, Firing), Error> {
+        self.fire_inner(db, net, transition, token, key, None)
+    }
+
+    /// Fire as `net_fire`, recording the work's output in the same append
+    /// (E271): the bytes as content, their id at `net/<name>/out/<key>`
+    /// and in the firing record. A retry with the same key and the same
+    /// bytes changes nothing; the same key with other bytes is refused
+    /// (`Error::IdempotencyConflict`), which is how a rerun of work that is
+    /// not deterministic shows up. See also `net_verify`.
+    pub fn net_fire_output(
+        &mut self,
+        db: &Db,
+        net: &Net,
+        transition: &str,
+        token: Option<&str>,
+        key: &str,
+        output: &[u8],
+    ) -> Result<(Db, Firing), Error> {
+        self.fire_inner(db, net, transition, token, key, Some(output))
+    }
+
+    /// Whether `output` (the work recomputed) matches what the firing under
+    /// `key` recorded. None when nothing was recorded under `key`.
+    pub fn net_verify(
+        &self,
+        db: &Db,
+        net: &str,
+        key: &str,
+        output: &[u8],
+    ) -> Result<Option<bool>, Error> {
+        Ok(self
+            .net_output(db, net, key)?
+            .map(|(id, _)| id == Id::of_content(output)))
+    }
+
+    fn fire_inner(
+        &mut self,
+        db: &Db,
+        net: &Net,
+        transition: &str,
+        token: Option<&str>,
+        key: &str,
+        output: Option<&[u8]>,
+    ) -> Result<(Db, Firing), Error> {
         if !valid_name(key) {
             return Err(invalid("firing key", key));
         }
@@ -543,7 +596,11 @@ impl<S: Store> Repo<S> {
         let rec_key = format!("{p}fire/{key}");
         if let Some(bytes) = self.db_get(db, &rec_key)? {
             let f = decode_record(key, &bytes)?;
-            if f.transition != transition || f.token.as_deref() != token {
+            let same_output = match output {
+                None => true,
+                Some(o) => f.output == Some(Id::of_content(o)),
+            };
+            if f.transition != transition || f.token.as_deref() != token || !same_output {
                 return Err(Error::IdempotencyConflict(rec_key));
             }
             return Ok((*db, f));
@@ -555,12 +612,18 @@ impl<S: Store> Repo<S> {
         let after = net
             .fire(&before, t, token)
             .ok_or_else(|| Error::Exec(format!("transition {transition} is not enabled")))?;
+        let out_key = format!("{p}out/{key}");
+        let output = match output {
+            Some(o) => Some(self.put_content(o)?.id),
+            None => None,
+        };
         let f = Firing {
             key: key.into(),
             transition: transition.into(),
             token: token.map(String::from),
             before: marking_id(&before),
             after: marking_id(&after),
+            output,
         };
         let mut events = Vec::new();
         let places: std::collections::BTreeSet<&String> =
@@ -584,8 +647,27 @@ impl<S: Store> Repo<S> {
                 }
             }
         }
+        if let Some(o) = &f.output {
+            events.push(Event::upsert(&out_key, o.to_string().as_bytes(), &out_key));
+        }
         events.push(Event::upsert(&rec_key, &encode_record(&f), &rec_key));
         Ok((self.db_append(db, &events)?, f))
+    }
+
+    /// The output recorded under `key`, if any: its id and bytes.
+    pub fn net_output(
+        &self,
+        db: &Db,
+        net: &str,
+        key: &str,
+    ) -> Result<Option<(Id, Vec<u8>)>, Error> {
+        let Some(v) = self.db_get(db, &format!("{}out/{key}", prefix(net)))? else {
+            return Ok(None);
+        };
+        let id: Id = std::str::from_utf8(&v)
+            .map_err(|_| Error::Decode("net output"))?
+            .parse()?;
+        Ok(Some((id, self.read_content(&id)?)))
     }
 
     /// The firings recorded for `net`, in log order.
@@ -619,6 +701,9 @@ impl<S: Store> Repo<S> {
                 .ok_or(Error::Decode("net replay: recorded firing not enabled"))?;
             if marking_id(&m) != f.after {
                 return Err(Error::Decode("net replay: marking after differs"));
+            }
+            if let Some(o) = &f.output {
+                self.read_content(o)?;
             }
         }
         Ok(m)
@@ -726,6 +811,49 @@ mod tests {
         assert_eq!(count(&m, "waiting", "E1"), 1);
         assert_eq!(r.net_firings(&db, "loop").unwrap().len(), 5);
         // The database folds to the same views from scratch.
+        assert_eq!(r.db_rebuild(&db.log).unwrap().kv, db.kv);
+    }
+
+    #[test]
+    fn records_outputs_once() {
+        let mut r = Repo::new(MemStore::default());
+        let net = loop_net();
+        let db = r.db_empty().unwrap();
+        let db = r.net_init(&db, &net).unwrap();
+        let (db, _) = r.net_fire(&db, &net, "propose", Some("E1"), "p1").unwrap();
+        let (db, _) = r.net_fire(&db, &net, "start", Some("E1"), "s1").unwrap();
+        assert!(r.net_output(&db, "loop", "f1").unwrap().is_none());
+        let (db, f) = r
+            .net_fire_output(&db, &net, "finish", Some("E1"), "f1", b"cost 0.31")
+            .unwrap();
+        assert_eq!(f.output, Some(Id::of_content(b"cost 0.31")));
+        // A retry with the same bytes: no change. Other bytes: refused.
+        let again = r.net_fire_output(&db, &net, "finish", Some("E1"), "f1", b"cost 0.31");
+        assert_eq!(again.unwrap().0, db);
+        assert!(matches!(
+            r.net_fire_output(&db, &net, "finish", Some("E1"), "f1", b"cost 0.30"),
+            Err(Error::IdempotencyConflict(_))
+        ));
+        assert_eq!(
+            r.net_output(&db, "loop", "f1").unwrap().unwrap().1,
+            b"cost 0.31"
+        );
+        assert_eq!(
+            r.net_verify(&db, "loop", "f1", b"cost 0.31").unwrap(),
+            Some(true)
+        );
+        assert_eq!(
+            r.net_verify(&db, "loop", "f1", b"cost 0.30").unwrap(),
+            Some(false)
+        );
+        assert_eq!(r.net_verify(&db, "loop", "s1", b"x").unwrap(), None);
+        let fs = r.net_firings(&db, "loop").unwrap();
+        assert_eq!(fs.last().unwrap().output, f.output);
+        assert_eq!(fs[0].output, None);
+        assert_eq!(
+            r.net_replay(&db, &net).unwrap(),
+            r.net_marking(&db, "loop").unwrap()
+        );
         assert_eq!(r.db_rebuild(&db.log).unwrap().kv, db.kv);
     }
 
