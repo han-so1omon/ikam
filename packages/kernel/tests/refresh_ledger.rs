@@ -64,3 +64,55 @@ fn a_missing_content_is_still_not_found() {
     let missing = ikam_kernel::Id::of_content(b"never stored");
     assert!(matches!(r.read_content(&missing), Err(Error::NotFound(_))));
 }
+
+/// E299: two handles on one directory (as two processes would be), each on
+/// its own thread, putting near-copies of the same contents at once. A put
+/// may replace a stored copy with a derivation and drop it; the other
+/// handle may decide the same and find the copy already gone, which is not
+/// an error.
+#[test]
+fn a_copy_another_handle_dropped_first_is_not_an_error() {
+    for trial in 0..4u64 {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().to_path_buf();
+        {
+            let mut seed = Repo::new(FsStore::open(&path).unwrap());
+            for i in 0..12 {
+                seed.put_content(&blob(i)).unwrap();
+            }
+        }
+        let edit = move |w: usize, k: usize| {
+            let mut bytes = blob(((k as u64) + trial) % 12);
+            bytes[64 * (w + 1)] ^= 0x5A;
+            bytes[2048 + k] ^= 0xA5;
+            bytes.extend_from_slice(format!("t{trial} w{w} k{k}").as_bytes());
+            bytes
+        };
+        let hs: Vec<_> = (0..4)
+            .map(|w| {
+                let path = path.clone();
+                std::thread::spawn(move || {
+                    let mut r = Repo::new(FsStore::open(&path).unwrap());
+                    r.refresh_ledger = true;
+                    for k in 0..30 {
+                        let bytes = edit(w, k);
+                        let id = r.put_content(&bytes).unwrap().id;
+                        assert_eq!(r.read_content(&id).unwrap(), bytes);
+                    }
+                })
+            })
+            .collect();
+        for h in hs {
+            h.join().unwrap();
+        }
+        let fresh = Repo::new(FsStore::open(&path).unwrap());
+        for w in 0..4 {
+            for k in 0..30 {
+                let bytes = edit(w, k);
+                let id = ikam_kernel::Id::of_content(&bytes);
+                assert_eq!(fresh.read_content(&id).unwrap(), bytes);
+            }
+        }
+        assert!(fresh.fsck().unwrap().is_empty());
+    }
+}

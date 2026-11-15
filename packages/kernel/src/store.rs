@@ -358,7 +358,12 @@ fn prefix_start(prefix: &[u8]) -> [u8; 32] {
 fn write_atomic(path: &std::path::Path, bytes: &[u8]) -> Result<(), Error> {
     let dir = path.parent().unwrap();
     fs::create_dir_all(dir)?;
-    let tmp = dir.join(format!(".tmp-{}", std::process::id()));
+    // Unique per process and write (E299): two handles on one directory
+    // in one process (two threads) once shared one name, so one renamed the
+    // other's half-written file into place under its own id.
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let tmp = dir.join(format!(".tmp-{}-{n}", std::process::id()));
     let mut file = fs::File::create(&tmp)?;
     file.write_all(bytes)?;
     file.sync_all()?;

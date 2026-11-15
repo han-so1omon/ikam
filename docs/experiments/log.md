@@ -4391,3 +4391,28 @@ Gates on the branch (E229 to E233): every kernel test suite passes (release); cl
 - Verdict: **kept** (`refresh_ledger`, off by default: it lists the store on a read of content that is really missing). For worker processes: E295's tuning and `db_commit_at`, or `refresh_ledger` where the default read weight is wanted. Turned on for the whole kernel suite, every test passes.
 - Not measured: the drop at ingest (`apply_candidate`) when another process records a derivation that needs the copy between the scan and the delete (found by reading; fsck found nothing in these runs); `needed_index` across processes (documented as single-writer); FsStore opened deferred.
 - Run: as above (about 4 minutes).
+
+### E299 ingest-processes (processes putting near-copies of the same contents)
+- Branch / parent: exp/299-ingest-processes / E298 (exp/298-writer-processes)
+- Question: E296 found and fixed a ledger race between threads sharing one handle. Processes share only the directory, and a put can drop a stored copy that it replaces with a derivation (a template fill). Do concurrent puts from several processes on one FsStore fail or lose content? (Source: E298's "Not measured": "the drop at ingest when another process records a derivation that needs the copy".)
+- Hypothesis: content is never lost, because a dropped copy stays derivable and the drop checks that no stored encoding needs it; puts may fail where two processes drop the same copy.
+- Change:
+  - `examples/ingest_processes.rs`: W copies of itself on one store seeded with 24 blobs; each puts 60 near-copies of blobs the others edit too (with `refresh_ledger`, E298) and reads each back; then a fresh handle reads every put and every seed, and fsck runs.
+  - `apply_candidate` treats a drop of a copy that is already gone as done. MemStore's delete of a missing id succeeds; FsStore's returned NotFound, so the second process to drop a copy failed its whole put (after recording its derivations).
+  - FsStore's temporary file for a write is now unique per write, not only per process. The new test found that two handles on one directory in one process (two threads) shared one name, so one renamed the other's half-written file into place under its own id: a Corrupt object.
+  - `tests/refresh_ledger.rs`: 4 handles on one directory on 4 threads putting near-copies at once, every put and seed read back through a fresh handle, fsck clean. It fails without either change.
+- Result (`cargo run --release --example ingest_processes -- 20`, and `W=8 ... -- 10`):
+
+  | Processes | Change | Puts | Stored as derivations | Put errors | Unreadable afterwards | fsck |
+  |---|---|---|---|---|---|---|
+  | 4 | as on E298 | 4,800 | 3,362 | 1,345 (28%), all "object not found" on the drop | 0 | 0 |
+  | 4 | drop of a missing copy is done | 4,800 | 4,702 to 4,707 | 0 | 0 | 0 |
+  | 8 | as on E298 | 4,800 | 3,133 | 1,336 | 0 | 0 |
+  | 8 | drop of a missing copy is done | 4,800 | 4,507 | 0 | 0 | 0 |
+
+  - Nothing was lost in any run: every put and every seed reads back through a fresh handle and fsck is clean, so the drop's own check held across processes.
+  - The failed puts were real failures for the caller: a loop runner would have seen 28% of its writes error out.
+  - The shared temporary name never happens across processes (each has its own id); it needs two FsStore handles in one process, which `SharedStore` (one handle, siblings) avoids.
+- Verdict: **kept** (two fixes, both unconditional: neither has a cost). The kernel suite passes.
+- Not measured: FsStore opened deferred (E227) across processes; a gc or repack during other writes.
+- Run: as above (about 3 minutes).
