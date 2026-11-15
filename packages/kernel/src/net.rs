@@ -319,6 +319,100 @@ pub fn sum_hash(m: &Marking) -> Id {
     from_lanes(acc)
 }
 
+const LT_LANES: usize = 1024;
+
+/// One term of [`lt_hash`]: 1,024 lanes of 16 bits from BLAKE3's
+/// extendable output.
+fn lt_term(place: &str, token: &str, count: u64) -> Vec<u16> {
+    let mut h = blake3::Hasher::new();
+    h.update(format!("ikam net lt term\0{place}\0{token}\0{count}").as_bytes());
+    let mut b = vec![0u8; LT_LANES * 2];
+    h.finalize_xof().fill(&mut b);
+    b.chunks(2)
+        .map(|c| u16::from_le_bytes([c[0], c[1]]))
+        .collect()
+}
+
+fn lt_digest(state: &[u16]) -> Id {
+    let mut h = blake3::Hasher::new();
+    h.update(b"ikam net lthash\0");
+    for x in state {
+        h.update(&x.to_le_bytes());
+    }
+    Id::from_bytes(*h.finalize().as_bytes())
+}
+
+/// The marking's hash in the LtHash construction (E284): each term
+/// expanded to 1,024 lanes of 16 bits and the terms added lane by lane
+/// modulo 2^16; the record carries the BLAKE3 digest of that 2 KB state.
+/// It updates as [`sum_hash`] does, and its collision resistance rests on
+/// a lattice problem (Bellare and Micciancio's construction, as Facebook's
+/// LtHash parameters it) rather than on nobody looking for collisions.
+pub fn lt_hash(m: &Marking) -> Id {
+    let mut acc = Acc::Lt(vec![0; LT_LANES]);
+    for (p, toks) in m {
+        for (t, c) in toks {
+            acc.add(p, t, *c);
+        }
+    }
+    acc.digest()
+}
+
+/// A running marking hash kept beside the marking.
+enum Acc {
+    Sum([u64; 4]),
+    Lt(Vec<u16>),
+}
+
+impl Acc {
+    fn add(&mut self, place: &str, tok: &str, c: u64) {
+        match self {
+            Acc::Sum(a) => {
+                let x = term(place, tok, c);
+                for i in 0..4 {
+                    a[i] = a[i].wrapping_add(x[i]);
+                }
+            }
+            Acc::Lt(a) => {
+                for (y, x) in a.iter_mut().zip(lt_term(place, tok, c)) {
+                    *y = y.wrapping_add(x);
+                }
+            }
+        }
+    }
+
+    fn sub(&mut self, place: &str, tok: &str, c: u64) {
+        match self {
+            Acc::Sum(a) => {
+                let x = term(place, tok, c);
+                for i in 0..4 {
+                    a[i] = a[i].wrapping_sub(x[i]);
+                }
+            }
+            Acc::Lt(a) => {
+                for (y, x) in a.iter_mut().zip(lt_term(place, tok, c)) {
+                    *y = y.wrapping_sub(x);
+                }
+            }
+        }
+    }
+
+    fn digest(&self) -> Id {
+        match self {
+            Acc::Sum(a) => from_lanes(*a),
+            Acc::Lt(a) => lt_digest(a),
+        }
+    }
+
+    /// What is stored at the hash key.
+    fn encode(&self) -> Vec<u8> {
+        match self {
+            Acc::Sum(a) => from_lanes(*a).to_string().into_bytes(),
+            Acc::Lt(a) => a.iter().flat_map(|x| x.to_le_bytes()).collect(),
+        }
+    }
+}
+
 fn prefix(net: &str) -> String {
     format!("net/{net}/")
 }
@@ -536,15 +630,56 @@ impl<S: Store> Repo<S> {
         self.db_append(&db, &[Event::upsert(&key, h.to_string().as_bytes(), &key)])
     }
 
-    fn sum_mode(&self, db: &Db, net: &str) -> Result<Option<Id>, Error> {
-        match self.db_get(db, &format!("{}hash", prefix(net)))? {
-            Some(v) => Ok(Some(
-                std::str::from_utf8(&v)
-                    .map_err(|_| Error::Decode("net hash"))?
-                    .parse()?,
-            )),
-            None => Ok(None),
+    /// As [`net_init_sum`](Repo::net_init_sum) with the [`lt_hash`]
+    /// construction (E284): its 2 KB state at `net/<name>/lthash`, records
+    /// carrying its digest. Refused on a net set up any other way.
+    pub fn net_init_lthash(&mut self, db: &Db, net: &Net) -> Result<Db, Error> {
+        let p = prefix(&net.name);
+        let key = format!("{p}lthash");
+        if self.db_get(db, &key)?.is_some() {
+            return Ok(*db);
         }
+        if self.db_get(db, &format!("{p}init"))?.is_some() {
+            return Err(invalid(
+                "net already initialized without an lthash",
+                &net.name,
+            ));
+        }
+        let db = self.net_init(db, net)?;
+        let mut acc = Acc::Lt(vec![0; LT_LANES]);
+        for (pl, toks) in net.initial_marking() {
+            for (t, c) in toks {
+                acc.add(&pl, &t, c);
+            }
+        }
+        self.db_append(&db, &[Event::upsert(&key, &acc.encode(), &key)])
+    }
+
+    /// The running hash a net was set up with, if any.
+    fn hash_state(&self, db: &Db, net: &str) -> Result<Option<Acc>, Error> {
+        let p = prefix(net);
+        if let Some(v) = self.db_get(db, &format!("{p}hash"))? {
+            let id: Id = std::str::from_utf8(&v)
+                .map_err(|_| Error::Decode("net hash"))?
+                .parse()?;
+            return Ok(Some(Acc::Sum(lanes(&id))));
+        }
+        if let Some(v) = self.db_get(db, &format!("{p}lthash"))? {
+            if v.len() != LT_LANES * 2 {
+                return Err(Error::Decode("net lthash"));
+            }
+            return Ok(Some(Acc::Lt(
+                v.chunks(2)
+                    .map(|c| u16::from_le_bytes([c[0], c[1]]))
+                    .collect(),
+            )));
+        }
+        Ok(None)
+    }
+
+    #[cfg(test)]
+    fn sum_mode(&self, db: &Db, net: &str) -> Result<Option<Id>, Error> {
+        Ok(self.hash_state(db, net)?.map(|a| a.digest()))
     }
 
     /// The net's current marking, read from `db`.
@@ -774,7 +909,7 @@ impl<S: Store> Repo<S> {
         let t = net
             .transition(transition)
             .ok_or_else(|| invalid("transition", transition))?;
-        if let Some(h) = self.sum_mode(db, &net.name)? {
+        if let Some(h) = self.hash_state(db, &net.name)? {
             return self.fire_sum(db, net, t, token, key, output, h);
         }
         let before = self.net_marking(db, &net.name)?;
@@ -850,8 +985,9 @@ impl<S: Store> Repo<S> {
         token: Option<&str>,
         key: &str,
         output: Option<&[u8]>,
-        before: Id,
+        mut acc: Acc,
     ) -> Result<(Db, Firing), Error> {
+        let before = acc.digest();
         if net.binds_color(t) != token.is_some() {
             return Err(Error::Exec(format!("transition {} is not enabled", t.name)));
         }
@@ -878,7 +1014,6 @@ impl<S: Store> Repo<S> {
                 .or_default()
                 .1 += a.weight as u64;
         }
-        let mut acc = lanes(&before);
         let mut events = Vec::new();
         for ((place, tok), (take, add)) in &delta {
             let mk = format!("{p}m/{place}/{tok}");
@@ -897,23 +1032,17 @@ impl<S: Store> Repo<S> {
                 continue;
             }
             if old > 0 {
-                let x = term(place, tok, old);
-                for i in 0..4 {
-                    acc[i] = acc[i].wrapping_sub(x[i]);
-                }
+                acc.sub(place, tok, old);
             }
             let idem = format!("{rec_key}/{place}/{tok}");
             if new > 0 {
-                let x = term(place, tok, new);
-                for i in 0..4 {
-                    acc[i] = acc[i].wrapping_add(x[i]);
-                }
+                acc.add(place, tok, new);
                 events.push(Event::upsert(&mk, new.to_string().as_bytes(), &idem));
             } else {
                 events.push(Event::remove(&mk, false, &idem));
             }
         }
-        let after = from_lanes(acc);
+        let after = acc.digest();
         let out_key = format!("{p}out/{key}");
         let output = match output {
             Some(o) => Some(self.put_content(o)?.id),
@@ -927,10 +1056,13 @@ impl<S: Store> Repo<S> {
             after,
             output,
         };
-        let hk = format!("{p}hash");
+        let hk = match acc {
+            Acc::Sum(_) => format!("{p}hash"),
+            Acc::Lt(_) => format!("{p}lthash"),
+        };
         events.push(Event::upsert(
             &hk,
-            after.to_string().as_bytes(),
+            &acc.encode(),
             &format!("{rec_key}/hash"),
         ));
         if let Some(o) = &f.output {
@@ -991,10 +1123,10 @@ impl<S: Store> Repo<S> {
     /// alone, checking each record's before and after hashes on the way.
     /// It must equal `net_marking`.
     pub fn net_replay(&self, db: &Db, net: &Net) -> Result<Marking, Error> {
-        let hash: fn(&Marking) -> Id = if self.sum_mode(db, &net.name)?.is_some() {
-            sum_hash
-        } else {
-            marking_id
+        let hash: fn(&Marking) -> Id = match self.hash_state(db, &net.name)? {
+            Some(Acc::Sum(_)) => sum_hash,
+            Some(Acc::Lt(_)) => lt_hash,
+            None => marking_id,
         };
         let mut m = net.initial_marking();
         for f in self.net_firings(db, &net.name)? {
@@ -1277,6 +1409,40 @@ mod tests {
             Some(&b"step 2"[..])
         );
         assert_eq!(r.net_resume(&db, "loop", "finish-E2").unwrap(), None);
+    }
+
+    #[test]
+    fn lthash_follows_the_marking() {
+        let mut r = Repo::new(MemStore::default());
+        let net = loop_net();
+        let db = r.db_empty().unwrap();
+        let mut db = r.net_init_lthash(&db, &net).unwrap();
+        for i in 0..5 {
+            let tok = format!("E{i}");
+            for t in ["propose", "start", "finish", "ask"] {
+                db = r
+                    .net_fire(&db, &net, t, Some(&tok), &format!("{t}-{tok}"))
+                    .unwrap()
+                    .0;
+            }
+        }
+        assert_eq!(
+            r.net_fire(&db, &net, "ask", Some("E0"), "ask-E0")
+                .unwrap()
+                .0,
+            db
+        );
+        let (db, _) = r
+            .net_fire(&db, &net, "merge", Some("E1"), "merge-E1")
+            .unwrap();
+        let m = r.net_marking(&db, "loop").unwrap();
+        assert_eq!(r.sum_mode(&db, "loop").unwrap(), Some(lt_hash(&m)));
+        assert_eq!(r.net_replay(&db, &net).unwrap(), m);
+        assert_eq!(r.db_rebuild(&db.log).unwrap().kv, db.kv);
+        assert_ne!(lt_hash(&m), sum_hash(&m));
+        let sum = r.db_empty().unwrap();
+        let sum = r.net_init_sum(&sum, &net).unwrap();
+        assert!(r.net_init_lthash(&sum, &net).is_err());
     }
 
     #[test]

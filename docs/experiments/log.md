@@ -3995,3 +3995,25 @@ Gates on the branch (E229 to E233): every kernel test suite passes (release); cl
 - Result: the sources agree with E276 (rank by dependencies and pilots, not keep rates), E281 (the smallest memoized unit sets a crash's cost) and E282 (fast back ends trade code quality for compile time); they name one gap in E279 worth running now (an LtHash mode for forgery resistance) and three for the queue (a pilot transition, dependency arcs in the gap list, colored nets in the table).
 - Verdict: **measured** (reading, no change). Taken up tonight: E284.
 - Not measured: whether a scan's proposals are taken up and kept more often than the gap list's (needs several nights).
+
+### E284 lthash-mode (a forgery-resistant running hash for the net, as an option)
+- Branch / parent: exp/284-lthash-mode / E283 (exp/283-research-scan)
+- Question: E279's sum hash (four 64-bit lanes) detects damage and replay errors but is not meant to resist someone choosing markings that collide; the research scan (E283) found LtHash, which updates the same way with 1,024 lanes of 16 bits and rests on a lattice problem. What does it cost a firing, the store and a replay?
+- Hypothesis: a firing costs the same as with the sum hash (a few 2 KB expansions per touched key), the store grows by about the 2 KB state each firing writes, and replay (which hashes the whole marking at every step) gets slower. (Source: E283; Facebook's LtHash post; Bellare and Micciancio's incremental hashing.)
+- Change: in the opt-in `net` module, `net::lt_hash` and `Repo::net_init_lthash` (the 2 KB state at `net/<name>/lthash`; each term is 2,048 bytes of BLAKE3's extendable output, added lane by lane modulo 2^16; records carry the BLAKE3 digest of the state). The sum and LtHash modes share one update path. One unit test; `examples/net_sum_hash.rs` runs all three modes and reports the FsStore's size.
+- Result (`cargo run --release --example net_sum_hash -- 1000`, 1,000 candidates never merged, 4,000 firings per run; fire p50 by quarter as tokens held rise to 1,000):
+
+  | Mode | mem fire p50 (Q1 to Q4) | fs fire p50 | fs store | replay (fs) |
+  |---|---|---|---|---|
+  | whole-marking hash (default) | 11.1 to 28.9 ms | 22.7 to 49.9 ms | 27.1 MB | 1.0 s |
+  | sum hash (E279) | 8.2 to 9.3 ms | 21.2 to 22.5 ms | 28.1 MB | 0.9 s |
+  | LtHash | 8.2 to 9.5 ms | 20.3 to 23.4 ms | 36.0 MB | 6.6 s |
+
+  - A firing costs the same with LtHash as with the sum hash, and both stay flat as tokens pile up.
+  - The store grows by about 2 KB a firing (36.0 against 28.1 MB, 4,000 firings), the state each firing writes.
+  - Replay is about 7x slower, since it recomputes the 2 KB hash of the whole marking at every step; an incremental replay would remove most of that.
+  - All runs: replay equal, the last record's hash equal to the hash of the stored marking, fsck clean.
+- Verdict: **kept** as an option (opt-in API). Use the sum hash for the loop's own records; use LtHash when the records are shown to someone else as evidence, paying about 2 KB a firing.
+- Not measured: an incremental replay; storing only the state's delta; ECMH (255-bit digests, needs an elliptic curve library).
+- Run: `cargo run --release --example net_sum_hash [-- N]`; `cargo test --release --lib net::`.
+- Gates on the branch: kernel lib tests pass (61, 1 ignored); clippy `-D warnings` and fmt clean.
