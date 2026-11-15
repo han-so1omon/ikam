@@ -254,9 +254,9 @@ fn main() {
             rng ^= rng << 17;
             let i = (rng % kids.len() as u64) as usize;
             if kids[i].try_wait().ok().flatten().is_none() {
-                let _ = kids[i].kill();
-                let _ = kids[i].wait();
-                kids.remove(i);
+                let mut gone = kids.remove(i);
+                let _ = gone.kill();
+                let _ = gone.wait();
                 let dead = ids.remove(i);
                 if supervise {
                     requeued += requeue_dead(&mut sup, &net, dead, &mut seq);
