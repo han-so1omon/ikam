@@ -57,6 +57,9 @@ impl std::ops::Deref for LedgerRef<'_> {
 pub(crate) struct Ledger {
     pub(crate) by_output: BTreeMap<Id, Vec<Derivation>>,
     pub(crate) by_key: HashMap<Id, Id>,
+    /// Every stored id this ledger has looked at, so `refresh_ledger`
+    /// (E298) reads only objects written since (by another process).
+    pub(crate) seen: std::collections::HashSet<Id>,
 }
 
 impl Ledger {
@@ -84,6 +87,8 @@ pub(crate) struct Cx {
     /// a write's checks count decode work and test which stored copies a
     /// derivation depends on, and a kept copy would hide both.
     pub(crate) cached: bool,
+    /// The ledger was refreshed once for this read (E298).
+    pub(crate) refreshed: bool,
 }
 
 impl Cx {
@@ -206,6 +211,16 @@ pub struct Repo<S: Store> {
     /// empties it.
     pub read_cache: usize,
     pub(crate) cache: Arc<std::sync::Mutex<Cache>>,
+    /// When content is neither stored nor derivable, look once for
+    /// derivation records written since the ledger was built, then try
+    /// again (E298). Off by default. The ledger is built once per handle
+    /// (and shared by siblings), so a handle never sees what another
+    /// process records later, and reading a database that process committed
+    /// fails with NotFound for as long as the handle lives. On, such a miss
+    /// lists the store and reads only the objects this ledger has not seen,
+    /// at most once per read; a read of content that really is missing pays
+    /// that listing.
+    pub refresh_ledger: bool,
     /// With a `seed_scope`, add each old tree and graph chunk that a tree
     /// or view edit reads to the seed index before the edit writes its new
     /// chunks (E141). Off by default. A new chunk repeats the chunks it
@@ -289,6 +304,7 @@ impl<S: Store> Repo<S> {
             prune_diff: false,
             memo: Default::default(),
             read_cache: 0,
+            refresh_ledger: false,
             cache: Default::default(),
             replace_hints: false,
             exact_short_search: false,
@@ -468,7 +484,9 @@ impl<S: Store> Repo<S> {
         // (E134), so a fresh handle reads the store once, not twice.
         let mut needed = (self.needed_index && self.needed.lock().unwrap().is_none())
             .then(crate::dict::Needed::default);
-        for id in self.store.ids()? {
+        let listed = self.store.ids()?;
+        ledger.seen = listed.iter().copied().collect();
+        for id in listed {
             // Both projections need only an encoding's header, except for
             // derivation records, which are read whole (E135).
             // Deleted by another handle since the listing (E292).
@@ -534,6 +552,72 @@ impl<S: Store> Repo<S> {
         ))
     }
 
+    /// Read the derivation records stored since the ledger was built or
+    /// last refreshed, by another process (E298). True if any was added.
+    pub(crate) fn ledger_refresh(&self) -> Result<bool, Error> {
+        let seen = self.ledger()?.seen.clone();
+        let mut records = Vec::new();
+        let mut outputs = std::collections::BTreeSet::new();
+        let mut new_ids = Vec::new();
+        for id in self.store.ids()? {
+            if seen.contains(&id) {
+                continue;
+            }
+            new_ids.push(id);
+            let encoded = match self.store.read(&id) {
+                Ok(encoded) => encoded,
+                Err(Error::NotFound(_)) => continue,
+                Err(e) => return Err(e),
+            };
+            if object_tag(&encoded) != Some(b'D') {
+                continue;
+            }
+            outputs.extend(self.derivation_output(&id, &encoded));
+            records.push((id, encoded));
+        }
+        let known: std::collections::BTreeSet<Id> = {
+            let l = self.ledger()?;
+            l.by_output
+                .keys()
+                .copied()
+                .chain(outputs.iter().copied())
+                .collect()
+        };
+        let resolve = |prefix: &[u8]| -> Result<Vec<Id>, Error> {
+            let mut out = self.store.ids_with_prefix(prefix)?;
+            let start =
+                Id::from_bytes(std::array::from_fn(|i| prefix.get(i).copied().unwrap_or(0)));
+            for id in known
+                .range(start..)
+                .take_while(|id| id.as_bytes().starts_with(prefix))
+            {
+                if !out.contains(id) {
+                    out.push(*id);
+                }
+            }
+            Ok(out)
+        };
+        let mut found = Vec::new();
+        for (id, stored) in records {
+            let encoded = self.decode_object_with(&id, stored, &resolve)?;
+            if Id::of(&encoded) == id
+                && let Object::Derivation(d) = Object::decode(&encoded)?
+            {
+                found.push(d);
+            }
+        }
+        let mut slot = self.ledger.write().unwrap_or_else(|e| e.into_inner());
+        let Some(ledger) = slot.as_mut() else {
+            return Ok(false);
+        };
+        ledger.seen.extend(new_ids);
+        let added = !found.is_empty();
+        for d in found {
+            ledger.insert(d);
+        }
+        Ok(added)
+    }
+
     /// Another handle on the same store (one whose clones share it, such as
     /// `SharedStore`), for reads on another thread (E232). It shares the
     /// ledger, so it reads what this handle derives, and the needed index
@@ -553,6 +637,7 @@ impl<S: Store> Repo<S> {
         }
         r.read_weight = self.read_weight;
         r.read_cache = self.read_cache;
+        r.refresh_ledger = self.refresh_ledger;
         r.cache = self.cache.clone();
         r.short_records = self.short_records;
         r.markup_layers = self.markup_layers;
@@ -747,7 +832,21 @@ impl<S: Store> Repo<S> {
             Err(Error::NotFound(_)) => {}
             Err(e) => return Err(e),
         }
-        let derivations = self.derivations(id)?;
+        let mut derivations = self.derivations(id)?;
+        if derivations.is_empty()
+            && matches!(err, Error::NotFound(_))
+            && self.refresh_ledger
+            && !cx.refreshed
+        {
+            cx.refreshed = true;
+            if self.ledger_refresh()? {
+                // Another process may also have stored it since.
+                if self.store.has(id) {
+                    return self.rebuild(id, cx);
+                }
+                derivations = self.derivations(id)?;
+            }
+        }
         cx.stack.push(*id);
         for d in derivations {
             match self.eval(&d.func, &d.args, cx) {

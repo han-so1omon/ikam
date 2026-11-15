@@ -4361,3 +4361,33 @@ Gates on the branch (E229 to E233): every kernel test suite passes (release); cl
 - Verdict: **measured** (no change). 16 stays: it sits inside the wide flat range of the loop's own nets and leaves small-degree random nets fully unrolled. A threshold of 1 or 2 is the setting for a quick compile of a big net that will run few steps.
 - Not measured: nets whose busy places have 16 to 256 readers (the knee would move with them); clang at each threshold.
 - Run: as above (about 3 minutes here).
+
+### E298 writer-processes (worker processes on one store on disk)
+- Branch / parent: exp/298-writer-processes / E297 (exp/297-hub-threshold)
+- Question: E292 to E295 ran every writer as a thread sharing one handle's ledger on a MemStore. A loop runner more likely runs a process per worker on an FsStore, each with its own handle. Does that work? (Source: E295's "Not measured": "FsStore and processes".)
+- Hypothesis: the ref lock (E122) makes `db_commit_at` safe across processes, so the results should match E295's threads.
+- Change:
+  - `examples/net_processes.rs`: starts W copies of itself on one FsStore directory, each taking the loop net's 100 candidates through start, 40 ms of work and finish with `db_commit_at` or `db_commit`; the parent reads the head through a fresh handle (measured, runs, lost starts, refused commits, errors, replay, fsck). A worker that gets an error carries on with a fresh handle, up to 20 errors.
+  - New option `Repo::refresh_ledger` (off): when content is neither stored nor derivable, list the store once per read, read the derivation records this handle's ledger has not seen, and try again. The ledger keeps the ids it has looked at.
+  - `tests/refresh_ledger.rs`: two handles on one directory; without the option the second handle's derivation is NotFound for the first, with it the first reads it, and missing content is still NotFound.
+- Result (`cargo run --release --example net_processes -- 100`, cpu 2, 4 cores here):
+
+  | Settings | Commit | W | Measured | Errors | Refused commits | Time | Replay, fsck |
+  |---|---|---|---|---|---|---|---|
+  | defaults | `db_commit_at` | 1 | 100 | 0 | 0 | 11.7 to 12.1 s | equal, 0 |
+  | defaults | `db_commit_at` | 2 | 100 | 21 in every run (the second worker gives up) | 21 | 11.7 to 13.0 s | equal, 0 |
+  | defaults | `db_commit_at` | 4 | 100 | 3 workers fail | 0 | 12.3 s | equal, 0 |
+  | defaults, `refresh_ledger` | `db_commit_at` | 2 | 100 | 0 | 189 to 191 | 11.2 to 12.7 s | equal, 0 |
+  | defaults, `refresh_ledger` | `db_commit_at` | 4 | 100 | 0 | 484 | 12.8 s | equal, 0 |
+  | defaults, `refresh_ledger` | `db_commit` | 2 and 4 | 99 | 0 | 12 and 34 | 30 s, stopped (87 and 255 starts lost) | equal, 0 |
+  | E295's tuning | `db_commit_at` | 1 | 100 | 0 | 0 | 7.5 s | equal, 0 |
+  | E295's tuning | `db_commit_at` | 2 | 100 | 0 | 36 to 37 | 3.9 s | equal, 0 |
+  | E295's tuning, `refresh_ledger` | `db_commit_at` | 4 | 100 | 0 | 267 | 3.8 s | equal, 0 |
+
+  - With the defaults, a second process cannot read what the first commits: the first stores each new database partly as slices (derivations), and the second's ledger, built when it opened, never learns of them. Every read fails with NotFound until the handle is dropped, and a fresh handle fails again on the next commit. The result stays right (one worker does all the work), but the other workers are lost.
+  - `refresh_ledger` fixes the reads: no errors at 2 or 4 processes. At the default `read_weight` the extra workers still save no time: each firing costs about 40 ms on FsStore, so most commits are refused and redone.
+  - E295's tuning (`read_weight` 1, read cache, sum hash) avoids the problem without the option, because content is stored whole and no derivation is involved, and halves the time with 2 processes.
+  - `db_commit` still loses work across processes, as with threads.
+- Verdict: **kept** (`refresh_ledger`, off by default: it lists the store on a read of content that is really missing). For worker processes: E295's tuning and `db_commit_at`, or `refresh_ledger` where the default read weight is wanted. Turned on for the whole kernel suite, every test passes.
+- Not measured: the drop at ingest (`apply_candidate`) when another process records a derivation that needs the copy between the scan and the delete (found by reading; fsck found nothing in these runs); `needed_index` across processes (documented as single-writer); FsStore opened deferred.
+- Run: as above (about 4 minutes).
