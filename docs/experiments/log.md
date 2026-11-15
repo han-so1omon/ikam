@@ -4832,3 +4832,37 @@ Gates on the branch (E229 to E233): every kernel test suite passes (release); cl
 - Trade-off: none in cost (fusing two top-100 lists takes 0.03 to 0.04 ms). One weight is a compromise across collections.
 - Verdict: **kept**, opt-in. Convex is the default hybrid, at 0.5 for MiniLM-class embedders and 0.4 for bge-small-class ones; use 0.6 to 0.7 for a static model. Retune on a few hundred judged queries whenever the embedding model changes.
 - Run: `cargo test --test fusion`.
+
+### E315 share-scope-escape (scoped shares between separate projects)
+- Branch / parent: exp/315-scoped-shares / exp/313-tenant-host (the plan in `docs/plans/2026-11-15-tenant-host.md`)
+- Question: can one project give another read access to a scope of its data (a folder, a byte range of one file version, listed fragments, a key range of its database, or a label prefix of one graph) without the other ever reading a byte outside it?
+- Change: `src/share.rs` (new, nothing else calls it). A `Share` names its source and receiving projects, the source commit it is pinned to, a `Scope`, a `Right` (read, propose or merge) and an expiry. It is sealed with the source's key (keyed blake3, as E140's grants) and logged in the source's own `shares` database ref. `share_check` refuses a bad seal, another receiver, an expired share, one not in the log or replaced since, and a missing right. `share_files`, `share_read`, `share_fragment`, `share_records` and `share_nodes` return only what the scope covers, at the pinned commit. The caller checks before it reads; a host would call `share_check` on every request.
+- Result: `tests/share.rs`, all pass. Refused: a sibling folder with the same prefix (`pubx/` against `pub/`), `..` in a path, the folder itself, a missing file; a range one byte past either end of a section, an empty range, a whole-file read of a section, and a section grant for another version of the file; a fragment not listed; keys and records outside the range; graph nodes outside the prefix; a forged scope under a valid tag. A share pinned to a commit still reads that commit after the source moves on.
+- Not measured: time per check and read (E313 with the host); encoded paths over HTTP (E314, E321).
+- Verdict: **kept**, opt-in. Nothing in the kernel or binary uses it yet.
+- Run: `cargo test --test share`.
+
+### E316 share-scoped-merge (merging a scope into another project's store)
+- Branch / parent: exp/315-scoped-shares / exp/313-tenant-host
+- Question: can a project merge a shared scope into its own store, so the copy is its own, and merge again later three-way against the last merge?
+- Change: `import_share` in `src/share.rs`. With the merge right, it copies the scope's bytes into the receiver's store on the ref `import/<from>/<share>` (one commit per merge, its message naming the source commit) and calls `Repo::merge` (E265) into the receiver's branch. Folder scopes replace the folder's files with the source's; database key ranges append the difference against the last merge (removes, then upserts). A proposal (`share_propose`, propose right) goes the other way: a branch `proposals/<share>` in the source, from the pinned commit; a section proposal may change bytes only inside its ranges (E140's `check_edit`).
+- Result: the copy is byte-exact and leaves the receiver's own files alone; a second merge brings the source's edits, adds and removes; both sides changing one imported file is a conflict and the branch stays put; key ranges merge incrementally (a removed key goes, a new one comes); fsck is clean on the receiver. Section, fragment and graph scopes refuse to merge (`NotMergeable`): a byte range is not a file, and graph nodes point at objects in the source's store.
+- Not measured: large scopes; who approves a merge (left to the caller; the plan has the owner approve each one).
+- Verdict: **kept**, opt-in, for folder and key-range scopes.
+- Run: `cargo test --test share`.
+
+### E317 share-revoke-expire
+- Branch / parent: exp/315-scoped-shares / exp/313-tenant-host
+- Question: does revoking, replacing or expiring a share stop it at once, and what happens to data already merged?
+- Result: revoking removes the share from the source's log, and the next check refuses it, with its seal still valid. Issuing another share under the same name retires the old one. A share fails its check from its expiry time on. Data merged before a revoke stays in the receiver's store, since it is a copy there.
+- Verdict: **kept**, as part of E315.
+- Run: `cargo test --test share`.
+
+### E318 share-scoped-search
+- Branch / parent: exp/315-scoped-shares / exp/313-tenant-host
+- Question: does a search through a share find only text inside the scope, when near-identical text sits just outside it?
+- Change: `share_search` searches only the scope's bytes: the folder's files, the granted ranges of a section, or the records in range.
+- Result: a word found in the shared folder is not found in a sibling folder or a private folder holding the same word; a word just outside a section's range is not found; keys outside a record range are not searched.
+- Not measured: vector and hybrid search through a share (the vector index covers the whole store; a scoped index is left for later).
+- Verdict: **kept**, as part of E315, for keyword search.
+- Run: `cargo test --test share`.

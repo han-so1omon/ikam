@@ -39,6 +39,7 @@ mod range;
 mod repack;
 mod repo;
 mod search;
+pub mod share;
 pub mod snapshot;
 mod store;
 pub mod temperature;
