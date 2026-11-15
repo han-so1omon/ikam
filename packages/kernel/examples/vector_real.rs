@@ -92,10 +92,18 @@ fn main() {
         .map(|(i, v)| (format!("v/{i:08}"), v))
         .collect();
     let n = all.len();
-    let queries: Vec<Vec<f32>> = real_common::queries(dir)
+    // Known-item queries where the set has them (PyPI), else the test
+    // queries (BEIR sets).
+    let qs = real_common::queries(dir);
+    let task = if qs.iter().any(|q| q.task == "known") {
+        "known".to_string()
+    } else {
+        qs[0].task.clone()
+    };
+    let queries: Vec<Vec<f32>> = qs
         .iter()
         .zip(real_common::vectors(&format!("{dir}/queries.f32"), dim))
-        .filter(|(q, _)| q.task == "known")
+        .filter(|(q, _)| q.task == task && (task == "known" || q.split == "test"))
         .map(|(_, v)| v)
         .take(300)
         .collect();

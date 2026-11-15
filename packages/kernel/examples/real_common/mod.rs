@@ -5,7 +5,7 @@
 
 #![allow(dead_code)]
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
 
 use ikam_kernel::vectors::dot;
@@ -17,6 +17,9 @@ pub struct Query {
     pub qid: String,
     pub split: String,
     pub relevant: HashSet<String>,
+    /// Graded judgments (BEIR's qrels): key to gain. A key written without
+    /// `=grade` has gain 1, so binary sets score as before.
+    pub grades: HashMap<String, f64>,
     pub text: String,
 }
 
@@ -68,11 +71,19 @@ pub fn queries(dir: &str) -> Vec<Query> {
         .lines()
         .map(|l| {
             let f: Vec<&str> = l.splitn(5, '\t').collect();
+            let grades: HashMap<String, f64> = f[3]
+                .split(',')
+                .map(|r| match r.rsplit_once('=') {
+                    Some((k, g)) if g.parse::<f64>().is_ok() => (k.to_string(), g.parse().unwrap()),
+                    _ => (r.to_string(), 1.0),
+                })
+                .collect();
             Query {
                 task: f[0].into(),
                 qid: f[1].into(),
                 split: f[2].into(),
-                relevant: f[3].split(',').map(String::from).collect(),
+                relevant: grades.keys().cloned().collect(),
+                grades,
                 text: f[4].into(),
             }
         })
@@ -112,6 +123,40 @@ pub struct Quality {
     pub recall10: f64,
     pub recall100: f64,
     pub mrr10: f64,
+}
+
+/// The tasks in `queries`, in order of first appearance.
+pub fn tasks(queries: &[Query]) -> Vec<String> {
+    let mut out: Vec<String> = vec![];
+    for q in queries {
+        if !out.contains(&q.task) {
+            out.push(q.task.clone());
+        }
+    }
+    out
+}
+
+/// As `quality`, with nDCG@10 from the query's graded gains (linear gain,
+/// as BEIR's evaluation computes it). Equal to `quality` for binary sets.
+pub fn quality_of(ranked: &[String], q: &Query) -> Quality {
+    let mut out = quality(ranked, &q.relevant);
+    let gain = |i: usize| 1.0 / (i as f64 + 2.0).log2();
+    let dcg: f64 = ranked
+        .iter()
+        .take(10)
+        .enumerate()
+        .map(|(i, k)| q.grades.get(k).copied().unwrap_or(0.0) * gain(i))
+        .sum();
+    let mut g: Vec<f64> = q.grades.values().copied().collect();
+    g.sort_by(|a, b| b.total_cmp(a));
+    let ideal: f64 = g
+        .iter()
+        .take(10)
+        .enumerate()
+        .map(|(i, x)| x * gain(i))
+        .sum();
+    out.ndcg10 = dcg / ideal;
+    out
 }
 
 pub fn quality(ranked: &[String], rel: &HashSet<String>) -> Quality {

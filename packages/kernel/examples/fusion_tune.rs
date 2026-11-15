@@ -13,7 +13,7 @@
 mod real_common;
 
 use ikam_kernel::vectors::{convex, rrf};
-use real_common::{Lists, Query, keys, mean, quality};
+use real_common::{Lists, Query, keys, mean, quality_of};
 
 #[derive(Clone, Copy)]
 enum Fuse {
@@ -34,7 +34,7 @@ fn score(qs: &[Query], l: &Lists, task: &str, split: &str, f: Fuse) -> f64 {
         .iter()
         .enumerate()
         .filter(|(_, q)| q.task == task && q.split == split)
-        .map(|(i, q)| quality(&ranked(l, i, f), &q.relevant))
+        .map(|(i, q)| quality_of(&ranked(l, i, f), q))
         .collect();
     mean(&v).ndcg10
 }
@@ -68,7 +68,8 @@ fn main() {
     );
     let convexes: Vec<Fuse> = (0..=10).map(|i| Fuse::Convex(i as f32 / 10.0)).collect();
     let rrfs: Vec<Fuse> = [1.0, 10.0, 30.0, 60.0, 100.0].map(Fuse::Rrf).to_vec();
-    for task in ["known", "topic"] {
+    let tasks = real_common::tasks(&qs);
+    for task in &tasks {
         for f in convexes.iter().chain(&rrfs) {
             let way = if matches!(f, Fuse::Convex(_)) {
                 "convex"
@@ -83,7 +84,22 @@ fn main() {
             );
         }
     }
-    for (task, other) in [("known", "topic"), ("topic", "known")] {
+    // With one task (a BEIR set), "other" is the task itself; carry-over
+    // across sets is `real_text/carry.py` over the sweep lines.
+    let pairs: Vec<(&str, &str)> = if tasks.len() == 1 {
+        vec![(&tasks[0], &tasks[0])]
+    } else {
+        tasks
+            .iter()
+            .flat_map(|a| {
+                tasks
+                    .iter()
+                    .filter(move |b| *b != a)
+                    .map(move |b| (a.as_str(), b.as_str()))
+            })
+            .collect()
+    };
+    for (task, other) in pairs {
         for (way, opts, default) in [
             ("convex", &convexes, Fuse::Convex(0.5)),
             ("rrf", &rrfs, Fuse::Rrf(60.0)),

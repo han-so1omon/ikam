@@ -1,7 +1,7 @@
 """E256-E259: turn a sample of PyPI project pages into a real-text search
 benchmark for the vector and hybrid examples.
 
-    python3 prepare.py IN.jsonl OUT_DIR
+    python3 prepare.py IN.jsonl OUT_DIR [MODEL]
 
 IN.jsonl has one project a line, from PyPI's JSON API (`fetch.py`): name,
 summary, description (the README), classifiers and up to six earlier
@@ -9,11 +9,11 @@ releases' descriptions. Only projects with an OSI-approved license
 classifier are kept. Nothing from the data is committed; OUT_DIR is
 scratch.
 
-The model is WordLlama (`wordllama` on PyPI, config l2_supercat, 256
-dimensions): a static embedding model, token embeddings taken from
-Llama 2 and trained for sentence similarity, mean pooled. Its weights and
-tokenizer ship inside the wheel; `WORDLLAMA_DIR` must point at a folder
-holding them as `weights/` and `tokenizer/` (see the experiment log).
+MODEL is one of `embedders.MODELS` (default `wordllama`, E256 to E259:
+WordLlama l2_supercat, 256 dimensions, a static model whose weights ship
+in its wheel, `WORDLLAMA_DIR` pointing at them; E304 adds the transformers
+`minilm` and `bge-small`). Queries are embedded as queries (bge-small adds
+its retrieval instruction), everything else as documents.
 
 Writes (little-endian f32, one unit vector a row):
 - docs.tsv       key, then the README's paragraphs joined by 0x1e
@@ -28,9 +28,11 @@ Writes (little-endian f32, one unit vector a row):
 import hashlib, json, os, random, re, sys, time
 
 import numpy as np
-from wordllama import WordLlama
+
+import embedders
 
 SRC, OUT = sys.argv[1], sys.argv[2]
+MODEL = embedders.load(sys.argv[3] if len(sys.argv) > 3 else "wordllama")
 RS = "\x1e"
 os.makedirs(OUT, exist_ok=True)
 
@@ -48,8 +50,7 @@ def paragraphs(desc, drop=None):
     return out[:300]
 
 
-def unit(m):
-    return m / np.maximum(np.linalg.norm(m, axis=1, keepdims=True), 1e-9)
+unit = embedders.unit
 
 
 projects = [json.loads(l) for l in open(SRC)]
@@ -64,19 +65,7 @@ for p in projects:
 docs.sort(key=lambda d: d[0])
 print("docs", len(docs))
 
-wl = WordLlama.load(cache_dir=os.environ["WORDLLAMA_DIR"], disable_download=True)
-
-
-DIM = len(wl.embed(["warm up"], norm=False)[0])
-
-
-def emb(texts):
-    # Batches pad to their longest text, so embed in length order.
-    order = sorted(range(len(texts)), key=lambda i: len(texts[i]))
-    out = np.zeros((len(texts), DIM), dtype=np.float32)
-    if texts:
-        out[order] = unit(np.asarray(wl.embed([texts[i] for i in order], norm=False), dtype=np.float32))
-    return out
+emb = MODEL.docs
 
 
 frag_list = sorted({x for _, _, ps in docs for x in ps})
@@ -86,7 +75,7 @@ batch_s = time.perf_counter() - t
 sample = random.Random(1).sample(frag_list, min(2000, len(frag_list)))
 t = time.perf_counter()
 for s in sample:
-    wl.embed([s], norm=False)
+    MODEL.one(s)
 single_s = (time.perf_counter() - t) / len(sample)
 fidx = {s: i for i, s in enumerate(frag_list)}
 
@@ -118,7 +107,7 @@ for c, keys in sorted(topics.items()):
     if 5 <= len(keys) <= 300:
         text = norm(re.sub(r"[:/]+", " ", c[len("Topic :: "):]))
         qs.append(("topic", "t/" + hashlib.sha1(c.encode()).hexdigest()[:10], keys, text))
-qv = emb([q[3] for q in qs])
+qv = MODEL.queries([q[3] for q in qs])
 with open(f"{OUT}/queries.tsv", "w") as f:
     for i, (task, qid, rel, text) in enumerate(qs):
         split = "dev" if random.Random(qid).random() < 0.5 else "test"
@@ -134,7 +123,7 @@ with open(f"{OUT}/hist.tsv", "w") as f:
                 f.write(f"{key}\t{i}\t{RS.join(paragraphs(v['description']))}\n")
 
 json.dump({
-    "model": "wordllama l2_supercat 256",
+    "model": MODEL.name,
     "dim": int(fv.shape[1]),
     "fragments": len(frag_list),
     "batch_us_per_fragment": batch_s / len(frag_list) * 1e6,

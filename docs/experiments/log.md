@@ -3749,3 +3749,34 @@ Gates on the branch: every kernel test suite passes (release); clippy `-D warnin
 - Trade-off: none in cost. One fixed weight is a compromise across kinds of query.
 - Verdict: **measured.** Bruch et al.'s findings mostly hold: tuned convex beats tuned RRF on known items (0.805 against 0.767), RRF is ahead on topics by 0.005 to 0.009, within noise for 81 queries, and RRF's best k swings from 1 to 100 with the task. For ikam with these vectors, a convex alpha of 0.6 on BM25 is a safe single default (within 0.004 of the best on both tasks). Retune it on a few hundred judged queries whenever the embedding model changes.
 - Run: `cargo run --release --features search-tantivy --example fusion_tune -- DIR` (DIR from E256's `prepare.py`).
+
+### E304 beir-hybrid (E258's hybrid ranking with transformer embedders and BEIR's human judgments)
+- Branch / parent: exp/304-beir-hybrid / exp/259-fusion-tune
+- Question: E258 and E259 ran with WordLlama, a static model whose vectors were weak on known items, and with judgments taken from the data's own structure. With a transformer embedder, and on BEIR's human-judged sets, do vectors beat BM25, does fusion still help, and does convex still lose less than RRF? Notes: docs/research/search-engines.md (Bruch et al.).
+- Change: none to the kernel. The harness:
+  - `examples/real_text/embedders.py` gives `prepare.py` a model switch: `wordllama` (as before), `minilm` (sentence-transformers all-MiniLM-L6-v2, 384 dimensions, reads 256 tokens) and `bge-small` (BAAI bge-small-en-v1.5, 384 dimensions, reads 512 tokens, queries prefixed with its retrieval instruction). Installed with pip; the transformers run on the GPU (MPS).
+  - `examples/real_text/beir.py` writes a BEIR set (downloaded by hand, outside the repository) as the files `prepare.py` writes: title plus text embedded whole; the title and paragraphs as fragments; test qrels as split `test`; dev qrels, or train where there is none (SciFact), as split `dev` (at most 1,000 queries).
+  - `real_common` reads graded judgments (`key=grade`) and computes nDCG@10 with linear gains, as BEIR's evaluation does; binary sets score as before. The harnesses take their tasks from the queries file. `hybrid_real` takes an optional split (BEIR: `test`) and adds convex 0.6.
+  - Sets: NFCorpus (3,633 docs, 323 test queries, graded), SciFact (5,183 docs, 300 test queries), FiQA (57,638 docs, 648 test queries). PyPI: E256's method fetched afresh, 13,119 READMEs, 1,000 known-item and 144 topic queries (all queries, as E258).
+  - Recall@100 is hits over min(relevant, 100), as in E258.
+- Result (nDCG@10; difference from BM25 ± its paired standard error; an Apple M3 Pro laptop):
+
+  | Set | BM25 | WordLlama vectors | MiniLM vectors | bge-small vectors | MiniLM RRF 60 | MiniLM convex 0.5 | bge RRF 60 | bge convex 0.5 |
+  |---|---|---|---|---|---|---|---|---|
+  | NFCorpus | 0.315 | 0.246 | 0.317, +0.002 ± 0.012 | 0.344, +0.029 ± 0.011 | 0.349, +0.034 ± 0.007 | 0.346, +0.031 ± 0.009 | 0.360, +0.045 ± 0.008 | 0.358, +0.043 ± 0.009 |
+  | SciFact | 0.685 | 0.513 | 0.645, −0.040 ± 0.018 | 0.713, +0.028 ± 0.017 | 0.710, +0.025 ± 0.011 | 0.725, +0.040 ± 0.010 | 0.723, +0.038 ± 0.011 | 0.733, +0.048 ± 0.010 |
+  | FiQA | 0.240 | 0.170 | 0.369, +0.129 ± 0.013 | 0.404, +0.163 ± 0.012 | 0.363, +0.123 ± 0.008 | 0.383, +0.143 ± 0.008 | 0.356, +0.116 ± 0.007 | 0.382, +0.142 ± 0.008 |
+  | PyPI known | 0.789 | 0.515 | 0.668, −0.121 ± 0.015 | 0.758, −0.031 ± 0.013 | 0.745, −0.044 ± 0.010 | 0.810, +0.021 ± 0.008 | 0.809, +0.021 ± 0.008 | 0.846, +0.058 ± 0.008 |
+  | PyPI topic | 0.124 | 0.130 | 0.170, +0.046 ± 0.016 | 0.146, +0.022 ± 0.015 | 0.183, +0.059 ± 0.011 | 0.180, +0.055 ± 0.010 | 0.190, +0.066 ± 0.011 | 0.178, +0.053 ± 0.010 |
+
+  - Recall@100: BM25 0.259 / 0.910 / 0.531 / 0.910 / 0.205 (NFCorpus, SciFact, FiQA, known, topic); bge-small convex 0.5 0.329 / 0.970 / 0.687 / 0.953 / 0.259; MiniLM convex 0.5 0.333 / 0.953 / 0.702 / 0.955 / 0.273.
+  - The vector-only numbers match BEIR's published ones for these models (MiniLM SciFact 0.645; bge-small about 0.72, 0.34 and 0.40), so the loader and graded nDCG agree with BEIR's evaluation. Tantivy's BM25 (one field, stemmed) is within 0.02 of BEIR's BM25 baseline (0.325, 0.665, 0.236).
+  - With either transformer, fusion beats BM25 on every set, by 2 to 6 standard errors. Convex 0.5 is ahead of RRF 60 on SciFact, FiQA and known items (by 0.010 to 0.065) and within 0.012 on NFCorpus and topics.
+  - Where vectors are much stronger than BM25 (FiQA), fusion at 0.5 loses to vectors alone with bge-small (0.382 against 0.404); E305 finds the weight that fixes it.
+  - WordLlama, rerun on the same sample and sets, is below BM25 everywhere except topics, and its fusions at best tie BM25, as E258 found.
+  - Fragment-mean vectors: within 0.01 of whole-document vectors on BEIR (one or two paragraphs a document), but 0.07 below whole for MiniLM on known items (0.597 against 0.668): a transformer's vector of a whole README is better than the mean of its paragraphs, unlike WordLlama's.
+  - Cost: MiniLM 0.8 ms a paragraph batched (5.6 ms a single call), bge-small 1.8 ms (7.1 ms); WordLlama 0.03 ms (0.06 ms), all on this laptop, transformers on its GPU. BM25 plus an exact scan of 57,638 vectors (384 dimensions): 15.5 ms a query; fusing two top-100 lists 0.03 to 0.04 ms.
+- Not measured: larger embedders; bge-small's or MiniLM's truncation of long READMEs (256 and 512 tokens) against chunking; per-query weights.
+- Trade-off: a transformer costs 30 to 70 times WordLlama's time a paragraph, which makes E255's cache matter (E256: updates embed 5 to 7 times fewer paragraphs).
+- Verdict: **measured; with a transformer embedder, hybrid search beats BM25 on all five sets.** Convex is ahead of or level with RRF everywhere. bge-small is the stronger model (vectors alone beat BM25 on four of five sets).
+- Run: `python3 examples/real_text/beir.py BEIR_DIR DIR minilm` (or `prepare.py PROJECTS.jsonl DIR minilm`), then `cargo run --release --features search-tantivy --example hybrid_real -- DIR test` (PyPI: no split).

@@ -22,10 +22,12 @@ mod real_common;
 use std::time::Instant;
 
 use ikam_kernel::vectors::{convex, rrf};
-use real_common::{Quality, keys, mean, quality};
+use real_common::{Quality, keys, mean, quality_of};
 
 fn main() {
     let dir = std::env::args().nth(1).unwrap();
+    // Optional: score only one split (BEIR sets: `test`).
+    let split = std::env::args().nth(2);
     let dim = real_common::dim(&dir);
     let docs = real_common::docs(&dir);
     let queries = real_common::queries(&dir);
@@ -44,7 +46,7 @@ fn main() {
         &queries,
         &qv,
     );
-    let ways: [&str; 7] = [
+    let ways: [&str; 8] = [
         "bm25",
         "vec_whole",
         "vec_mean",
@@ -52,12 +54,17 @@ fn main() {
         "convex_0.5_whole",
         "rrf_k60_mean",
         "convex_0.5_mean",
+        "convex_0.6_whole",
     ];
-    for task in ["known", "topic"] {
+    for task in real_common::tasks(&queries) {
         let mut acc: Vec<Vec<Quality>> = vec![vec![]; ways.len()];
         let mut fuse_ms = 0.0;
         let mut m = 0;
-        for (i, q) in queries.iter().enumerate().filter(|(_, q)| q.task == task) {
+        for (i, q) in queries
+            .iter()
+            .enumerate()
+            .filter(|(_, q)| q.task == task && split.as_ref().is_none_or(|s| &q.split == s))
+        {
             let (b, vw) = &whole[i];
             let vm = &meanv[i].1;
             let t = Instant::now();
@@ -69,10 +76,11 @@ fn main() {
                 keys(&convex(b, vw, 0.5)),
                 keys(&rrf(&[keys(b), keys(vm)], 60.0)),
                 keys(&convex(b, vm, 0.5)),
+                keys(&convex(b, vw, 0.6)),
             ];
-            fuse_ms += t.elapsed().as_secs_f64() * 1e3 / 4.0;
+            fuse_ms += t.elapsed().as_secs_f64() * 1e3 / 5.0;
             for (w, r) in ranked.iter().enumerate() {
-                acc[w].push(quality(r, &q.relevant));
+                acc[w].push(quality_of(r, q));
             }
             m += 1;
         }
