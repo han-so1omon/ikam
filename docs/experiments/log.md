@@ -4438,3 +4438,30 @@ Gates on the branch (E229 to E233): every kernel test suite passes (release); cl
 - Verdict: **kept** (a fix, deferred mode only; `open` is unchanged). The kernel suite passes.
 - Not measured: a crash in the middle of `sync` itself (between the renames and the removals: the removals come last, so it leaves extra copies, not missing ones); the hot and cold branches (E261 to E268), which also change `store.rs` and `ingest.rs` and will need merging with this.
 - Run: `cargo test --release --test deferred_drop`, and as above (about 2 minutes).
+
+### E301 killed-workers (worker processes killed in the middle of the loop)
+- Branch / parent: exp/301-killed-workers / E300 (exp/300-deferred-drops)
+- Question: on a night away, workers die (sleep, an out-of-memory kill). With E298 to E300's processes on one FsStore, does a SIGKILL at any moment leave the store and the net sound, and does the night go on? (Source: E281 measured checkpoints within one run, not a worker dying between firings; E298's processes never died.)
+- Hypothesis: the store stays sound (refs move by compare-and-swap, objects by rename), but a candidate a dead worker had started stays in `running` and keeps its cpu token, so after as many deaths as cpu tokens no candidate can start.
+- Change: none to the kernel. `examples/net_kill.rs`: W workers (as E298, with E295's tuning and `refresh_ledger`) take 100 candidates through start, 40 ms of work and finish with its output (`net_fire_output`, E271); every KILL_MS one worker is killed with SIGKILL and a new one started. The loop net gains `requeue: running -> queued, cpu`. With `REQUEUE=1`, a supervisor (the parent) requeues, after each death, every running candidate whose latest start was the dead worker's. At the end the parent requeues what is left, W new workers finish without kills, and every output is checked.
+- Result (`cargo run --release --example net_kill -- 100`; first pass stops at 120 s):
+
+  | Workers | A kill every | Supervisor | Deferred | Kills | Measured in the first pass | Left stranded | After requeue | Temporary files left |
+  |---|---|---|---|---|---|---|---|---|
+  | 2 | never | no | no | 0 | 100 in 4.7 s | 0 | 100 | 0 |
+  | 2 | 700 ms | no | no | 170 | 60, then stalled | 2 | 100 | 2 |
+  | 2 | 700 ms | no | yes | 170 | 39, then stalled | 2 | 100 | 0 |
+  | 4 | 200 ms | no | no | 590 | 5, then stalled | 2 | 100 | 2 |
+  | 2 | 700 ms | yes | no | 7 | 100 in 5.4 s (4 requeued) | 0 | 100 | 2 |
+  | 2 | 700 ms | yes | yes | 5 | 100 in 4.0 s (3 requeued) | 0 | 100 | 26 |
+  | 2 | 200 ms | yes | no | 593 | 100 (26 requeued) | 0 | 100 | 14 |
+  | 2 | 200 ms | yes | yes | 593 | 100 (17 requeued) | 0 | 100 | 110 |
+  | 4 | 200 ms | yes | no | 594 | 100 (4 requeued) | 0 | 100 | 10 |
+
+  - In every run the store and the net stayed sound: replay equal, fsck clean, every output right and readable, no errors.
+  - Without a supervisor the night stalls once two candidates are stranded (the net has 2 cpu tokens): 5 to 60 of 100 measured, and nothing more until someone requeues.
+  - With one, 100 of 100 are measured; at a kill every 200 ms the first pass ran to 120 s only because new workers were killed again before they could stop idle.
+  - Killed processes leave temporary files: `.tmp-*` from an interrupted write, and with `open_deferred` the `.pending-*` files of everything not yet synced (up to 110). They are never read, but nothing removes them.
+- Verdict: **kept** (example only; no kernel change). A loop runner needs a supervisor that requeues a dead worker's runs, with `requeue` in the loop net; E287's plan assumed workers never die.
+- Not measured: workers on other machines, where a supervisor cannot see a death and needs a lease (a time limit on `running`); cleaning up temporary files of dead processes (they would need a check that the process is gone).
+- Run: as above (about 12 minutes together).
