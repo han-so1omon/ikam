@@ -665,12 +665,15 @@ impl<S: Store> Repo<S> {
     pub(crate) fn record(&mut self, d: Derivation) -> Result<Id, Error> {
         let encoded = Object::Derivation(d.clone()).encode();
         let id = Id::of(&encoded);
-        if self.write(id, &encoded)?
-            && let Some(ledger) = self
-                .ledger
-                .write()
-                .unwrap_or_else(|e| e.into_inner())
-                .as_mut()
+        // Added even when another handle on the store wrote the same record
+        // first (E296): it may not have added it to the shared ledger yet,
+        // and this handle reads the output next. `insert` keeps one copy.
+        self.write(id, &encoded)?;
+        if let Some(ledger) = self
+            .ledger
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_mut()
         {
             ledger.insert(d);
         }

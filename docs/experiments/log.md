@@ -4320,3 +4320,24 @@ Gates on the branch (E229 to E233): every kernel test suite passes (release); cl
 - Verdict: **measured** (no kernel change). The loop runner's settings: `read_weight` 1, `read_cache` 64 MB, `net_init_sum`, one committer (a lock or `db_commit_at`), the work outside it.
 - Not measured: FsStore and processes; more cpus than 2; work that varies in length.
 - Run: as above (2 minutes together here).
+
+### E296 ledger-races (the two races E292 found by reading)
+- Branch / parent: exp/296-ledger-races / E295 (exp/295-tuned-writers)
+- Question: E292 read two more races in `repo.rs` that no run had shown. Do they happen with several writers on one store, and does a change fix the one that does? (Source: E292's "Not measured": "two more races found by reading `repo.rs`, not seen in a run".)
+- Hypothesis:
+  - Race 1, a ledger build that lists the store while another handle records a derivation and so installs a ledger without it: it should not happen through `put_content`, which reads the ledger (`has_content`) before it writes, so the ledger is always built before any record. Only a reset (gc, repack) during other writes could reach it.
+  - Race 2, a handle writing a record that another handle wrote first does not add it to the shared ledger: with writers putting the same contents, a reader right after its own put sometimes finds the content neither stored nor in the ledger.
+- Change: `record` adds the derivation to the shared ledger whether or not this handle's write of the record was the first (`insert` keeps one copy). `examples/ledger_race.rs`: each trial makes a store of 400 blobs and a fresh handle with no ledger, then 8 siblings each put 40 near-copies of the blobs (stored as slices of them) and read each back at once; afterwards every content is read again through the shared ledger and through a fresh handle. `SAME=1` has every writer put the same contents.
+- Result (`SAME=1 cargo run --release --example ledger_race -- 200`, three runs each way; `-- 100` with different contents):
+
+  | Writers put | `record` | Trials | Stored as derivations | Reads failed right after the put | After the writers stopped | Through a fresh handle |
+  |---|---|---|---|---|---|---|
+  | the same contents | as on main | 3 x 200 | 13,514 to 14,473 per run | 4, 20 and 11 | 0 | 0 |
+  | the same contents | adds every time | 3 x 200 | 12,755 to 13,589 per run | 0, 0 and 0 | 0 | 0 |
+  | different contents | as on main | 110 | 35,200 | 0 | 0 | 0 |
+
+  - Race 2 happens: 35 failed reads in 600 trials, every one transient (the other handle added the record a moment later), and none once `record` always adds.
+  - Race 1 was not seen in 110 trials of different contents, as expected: every writer builds the ledger before its first record.
+- Verdict: **kept** (a fix, on this branch only; it changes no bytes and takes the ledger lock on every record instead of on new ones only). Race 1 is left as it is: reaching it needs a gc or repack during other writes, which nothing does concurrently yet.
+- Not measured: race 1 under a concurrent gc or repack; FsStore.
+- Run: as above (about 2 minutes here).
