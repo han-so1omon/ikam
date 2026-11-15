@@ -3780,3 +3780,33 @@ Gates on the branch: every kernel test suite passes (release); clippy `-D warnin
 - Trade-off: a transformer costs 30 to 70 times WordLlama's time a paragraph, which makes E255's cache matter (E256: updates embed 5 to 7 times fewer paragraphs).
 - Verdict: **measured; with a transformer embedder, hybrid search beats BM25 on all five sets.** Convex is ahead of or level with RRF everywhere. bge-small is the stronger model (vectors alone beat BM25 on four of five sets).
 - Run: `python3 examples/real_text/beir.py BEIR_DIR DIR minilm` (or `prepare.py PROJECTS.jsonl DIR minilm`), then `cargo run --release --features search-tantivy --example hybrid_real -- DIR test` (PyPI: no split).
+
+### E305 beir-fusion-tune (E259's fusion tuning with transformer vectors, on BEIR, and across datasets)
+- Branch / parent: exp/305-beir-fusion-tune / exp/304-beir-hybrid
+- Question: E259 found convex alpha 0.6 (weight on BM25) within 0.004 of the best on both PyPI tasks with WordLlama, and guessed that stronger vectors would move the best alpha toward them. With MiniLM and bge-small, on three BEIR sets and PyPI: what alpha and RRF k are best, does alpha 0.6 hold, and does a setting tuned on one dataset carry to another?
+- Change: none to the kernel. `fusion_tune` as E259 (alpha 0 to 1 by 0.1; k 1, 10, 30, 60, 100; best on `dev` scored on `test`), over E304's data. `examples/real_text/carry.py` takes each set's sweep and scores every set's test with every other set's dev-best setting. PyPI's dev and test are E259's hash halves; BEIR's are its own dev (train for SciFact) and test qrels.
+- Result (nDCG@10 on test; an Apple M3 Pro laptop):
+
+  | Model, set | BM25 | Vectors | Convex 0.5 | Convex 0.6 | Convex, tuned on dev | RRF 60 | RRF, tuned on dev |
+  |---|---|---|---|---|---|---|---|
+  | MiniLM, NFCorpus | 0.315 | 0.317 | 0.346 | 0.342 | 0.345 (0.4) | 0.349 | 0.352 (k 10) |
+  | MiniLM, SciFact | 0.685 | 0.645 | 0.725 | 0.717 | 0.725 (0.5) | 0.710 | 0.715 (k 1) |
+  | MiniLM, FiQA | 0.240 | 0.369 | 0.383 | 0.346 | 0.399 (0.4) | 0.363 | 0.379 (k 10) |
+  | MiniLM, PyPI known | 0.791 | 0.668 | 0.810 | 0.824 | 0.824 (0.6) | 0.745 | 0.813 (k 1) |
+  | MiniLM, PyPI topic | 0.121 | 0.175 | 0.181 | 0.164 | 0.188 (0.4) | 0.174 | 0.170 (k 10) |
+  | bge-small, NFCorpus | 0.315 | 0.344 | 0.358 | 0.350 | 0.358 (0.3) | 0.360 | 0.366 (k 10) |
+  | bge-small, SciFact | 0.685 | 0.713 | 0.733 | 0.727 | 0.734 (0.4) | 0.723 | 0.732 (k 1) |
+  | bge-small, FiQA | 0.240 | 0.404 | 0.382 | 0.348 | 0.414 (0.3) | 0.356 | 0.381 (k 1) |
+  | bge-small, PyPI known | 0.791 | 0.759 | 0.847 | 0.847 | 0.847 (0.5) | 0.806 | 0.842 (k 1) |
+  | bge-small, PyPI topic | 0.121 | 0.151 | 0.179 | 0.175 | 0.178 (0.4) | 0.187 | 0.188 (k 100) |
+  | WordLlama, NFCorpus / SciFact / FiQA | 0.315 / 0.685 / 0.240 | 0.246 / 0.513 / 0.170 | 0.305 / 0.676 / 0.241 | 0.314 / 0.694 / 0.255 | 0.313 (0.7) / 0.691 (0.8) / 0.255 (0.6) | 0.308 / 0.635 / 0.230 | 0.310 / 0.667 / 0.238 |
+
+  - PyPI rows are the test halves (528 known-item and 81 topic queries, by E259's hash split over the new sample), so their BM25 and vectors are `fusion_tune`'s alpha 1 and 0. BEIR rows' BM25 is `hybrid_real`'s (E304), because `fusion_tune`'s alpha 1 is not quite BM25: min-max scaling gives a list's last hit 0, so a query whose BM25 returns one document ties it with the vector-only ones; on NFCorpus alpha 1 scores 0.296 against BM25's 0.315.
+  - **The best alpha moved toward the vectors, as E259 guessed.** With WordLlama it is 0.6 to 0.8 on every set but PyPI topics (dev best 0.3, test best 0.5). With MiniLM it is 0.4 to 0.6, with bge-small 0.3 to 0.5. On FiQA, where vectors beat BM25 by 0.13 to 0.16, alpha 0.6 costs 0.053 (MiniLM) and 0.066 (bge-small) against the best, and falls below vectors alone.
+  - Worst loss against each set's best alpha on test, over the five sets: MiniLM 0.042 at 0.4, 0.016 at 0.5, 0.053 at 0.6; bge-small 0.010 at 0.4, 0.032 at 0.5, 0.066 at 0.6.
+  - **Carry-over across datasets:** a convex alpha tuned on one set's dev and used on another's test lands within 0.02 of that set's own best in most pairs. The exceptions are pairs that cross FiQA (best 0.3 to 0.4) and the PyPI tasks (known items 0.5 to 0.6): losses up to 0.053 (MiniLM, known items' 0.6 used on FiQA). RRF's best k swings from 1 to 100 between sets and tasks, as in E259; the dev-best k is 1 or 10 in nine of ten transformer rows and beats k 60 on test in nine.
+  - Tuned convex is ahead of tuned RRF on seven of ten transformer rows and behind by up to 0.010 on the other three (NFCorpus both, bge-small topics).
+- Not measured: alpha chosen per query or per collection from unlabelled signals (for instance which list's scores are more spread); larger models.
+- Trade-off: none in cost. One weight is a compromise across collections; its error grows with the gap between the two signals.
+- Verdict: **measured; 0.6 does not hold with transformer vectors.** Make convex the default hybrid, with alpha 0.4 for bge-small-class models (within 0.010 of the best on all five sets) and 0.5 for MiniLM (within 0.016); keep 0.6 to 0.7 only for a static model like WordLlama. Retune when the model changes: the best alpha follows the vectors' strength against BM25.
+- Run: `cargo run --release --features search-tantivy --example fusion_tune -- DIR` for each of E304's DIRs, then `python3 examples/real_text/carry.py pypi=P.jsonl scifact=S.jsonl nfcorpus=N.jsonl fiqa=F.jsonl`.
