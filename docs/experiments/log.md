@@ -4107,3 +4107,28 @@ Gates on the branch (E229 to E233): every kernel test suite passes (release); cl
 - Not measured: the hybrid; MLIR itself (no MLIR toolchain in this environment; Cranelift and clang stand for a JIT and an ahead-of-time compiler); compiling colored nets without unfolding.
 - Run: `cargo run --release -- inc` in packages/kernel/experiments/net-jit (about 2 minutes, mostly clang).
 - Gates on the branch: no kernel change; the net-jit crate's clippy `-D warnings` and fmt clean; kernel lib tests as on E287 (63, 1 ignored).
+
+### E289 hybrid-rechecks (compiled rechecks unrolled for quiet places, a loop for busy ones)
+- Branch / parent: exp/289-hybrid-rechecks / E288 (exp/288-compiled-incremental)
+- Question: E288's compiled incremental step could not be built for the 1,000-candidate loop net (2,007,000 unrolled rechecks, because the cpu slot is read by every candidate's `start`), and took 2.8 s to compile at 100 candidates. Does unrolling only the readers of places with at most 16 readers, and calling a loop over a reader table for the rest, keep the compiled speed while bounding the code?
+- Hypothesis: the code then grows with the quiet places' readers only (linear in the candidates on the loop net), the compile drops by one to two orders of magnitude, and the step stays near E288's, since the busy places are changed by a minority of firings. (Source: E288's verdict.)
+- Change: none in the kernel. `experiments/net-jit/src/inc.rs`: a hub threshold; places with more readers are rechecked by `recheck_hub`, a loop over flat tables of readers and arcs (a Rust function called from the Cranelift code; a static C function for clang). The threshold is 16; `usize::MAX` is E288's form, run alongside. Every mode is asserted to end in the same marking after the same steps as `Table::walk` and `Table::walk_incremental`.
+- Result (`cargo run --release -- inc` in packages/kernel/experiments/net-jit; ns per step, compile ms in brackets):
+
+  | Net | Incremental (E286) | Cranelift, all unrolled (E288) | Cranelift hybrid | clang hybrid | Unrolled rechecks, hybrid |
+  |---|---|---|---|---|---|
+  | random 10 x 20 | 65 | 29 (8) | 28 (8) | 26 (177) | 163 |
+  | random 100 x 200 | 107 | 41 (96) | 41 (92) | 49 (1,470) | 1,826 |
+  | random 1,000 x 2,000 | 173 | 60 (1,741) | 58 (1,562) | 105 (20,521) | 18,322 |
+  | loop net, 10 candidates | 42 | 23 (15) | 22 (12) | 22 (220) | 270 |
+  | loop net, 100 candidates | 58 | 44 (2,821) | 39 (38) | 49 (3,287) | 800 |
+  | loop net, 1,000 candidates | 83 | not compiled (2,007,000 rechecks) | 53 (466) | 98 (10,905) | 8,000 |
+
+  - On the loop net the hybrid compiles 75 times faster at 100 candidates (38 ms against 2,821) at the same or better speed, and compiles at 1,000 candidates (466 ms, 8,000 unrolled rechecks), where it runs 1.6x faster than the Rust incremental walk.
+  - On random nets, which have no busy places at this threshold, the hybrid is E288's code (the same speed and compile).
+  - Cranelift's hybrid repays its compile against the Rust incremental walk after 2.0 M steps at 100 candidates and 15 M at 1,000.
+  - clang's numbers move between runs at the larger sizes (random 1,000 x 2,000, all unrolled: 96 ns in E288's first run, 59 in its second and 60 here; the hybrid's 105 is one run), so Cranelift is the steadier compiled mode here, besides compiling 10 to 40 times faster.
+- Verdict: **measured**; the hybrid is the compiled mode worth keeping in the separate crate. The order for the loop stays: the Rust incremental walk by default (nothing to compile), and the Cranelift hybrid for simulations of more than a few million steps, such as sweeping E287's plans over many queues.
+- Not measured: other thresholds than 16; moving the compiled walk into the kernel behind an option (it would bring Cranelift into the kernel's build, which E282 kept out); MLIR (no MLIR toolchain here).
+- Run: `cargo run --release -- inc` in packages/kernel/experiments/net-jit (about 3 minutes, mostly clang).
+- Gates on the branch: no kernel change; the net-jit crate's clippy `-D warnings` and fmt clean; kernel lib tests as on E287 (63, 1 ignored).

@@ -350,13 +350,16 @@ transition ask pure: measured -> waiting
 transition merge human: waiting ->
 ";
 
+/// E289: places with more readers than this are rechecked by a loop.
+const HUB: usize = 16;
+
 /// E288: table, incremental (E286), and the incremental step compiled with
 /// Cranelift and with clang -O2, on random nets and the loop net unfolded.
 fn main_inc() {
     let dir = tempfile::tempdir().unwrap();
     let seed = 0x0123_4567_89AB_CDEF;
     println!(
-        "net | places x transitions | rechecks per firing | table ns | incremental ns | cranelift inc ns (compile ms) | clang inc ns (compile ms)"
+        "net | places x transitions | rechecks per transition | table ns | incremental ns | cranelift inc ns (compile ms) | clang inc ns (compile ms) | hybrid cranelift ns (compile ms) | hybrid clang ns (compile ms) | hybrid unrolled rechecks"
     );
     let mut nets: Vec<(String, Net)> = Vec::new();
     for (i, &(np, nt)) in [(10usize, 20usize), (100, 200), (1000, 2000)]
@@ -379,7 +382,7 @@ fn main_inc() {
         let t = net.lower().unwrap();
         let nt = t.inputs.len();
         let steps = (200_000_000 / nt as u64).clamp(200_000, 5_000_000);
-        let per = inc::recheck_count(&t) as f64 / nt as f64;
+        let per = inc::recheck_count(&t, usize::MAX) as f64 / nt as f64;
 
         let mut tm = t.initial.clone();
         let mut rng = Rng(seed);
@@ -394,29 +397,40 @@ fn main_inc() {
         let inc_ns = start.elapsed().as_nanos() as f64 / idone.max(1) as f64;
         assert_eq!((&im, idone), (&tm, tdone), "incremental differs");
 
-        let rechecks = inc::recheck_count(&t);
-        if rechecks > 1_000_000 {
-            // Unrolled, the rechecks alone would be this many enabling
-            // tests in the code; the first try ran out of memory here.
-            println!(
-                "{label} | {} x {nt} | {per:.1} | {table_ns:.1} | {inc_ns:.1} | not compiled: {rechecks} unrolled rechecks | not compiled",
-                t.initial.len()
-            );
-            continue;
+        let hub = inc::Hub::new(&t);
+        let mut cols = Vec::new();
+        for h in [usize::MAX, HUB] {
+            let rechecks = inc::recheck_count(&t, h);
+            if rechecks > 1_000_000 {
+                // Unrolled, the rechecks alone would be this many enabling
+                // tests in the code; the first try ran out of memory here.
+                cols.push(format!(
+                    "not compiled: {rechecks} unrolled rechecks | not compiled"
+                ));
+                continue;
+            }
+            let start = Instant::now();
+            let (_module, cf) = inc::compile_cranelift(&t, h);
+            let cl_ms = start.elapsed().as_secs_f64() * 1000.0;
+            let (cm, cdone, cl_ns) = inc::run(cf, &t, &hub, steps, seed);
+            assert_eq!((&cm, cdone), (&tm, tdone), "cranelift inc differs");
+
+            let (nf, cc_ms) = inc::clang_native(dir.path(), i, &t, h);
+            let (nm, ndone, cc_ns) = inc::run(nf, &t, &hub, steps, seed);
+            assert_eq!((&nm, ndone), (&tm, tdone), "clang inc differs");
+            let tail = if h == HUB {
+                format!(" | {rechecks} unrolled")
+            } else {
+                String::new()
+            };
+            cols.push(format!(
+                "{cl_ns:.1} ({cl_ms:.1}) | {cc_ns:.1} ({cc_ms:.0}){tail}"
+            ));
         }
-        let start = Instant::now();
-        let (_module, cf) = inc::compile_cranelift(&t);
-        let cl_ms = start.elapsed().as_secs_f64() * 1000.0;
-        let (cm, cdone, cl_ns) = inc::run(cf, &t, steps, seed);
-        assert_eq!((&cm, cdone), (&tm, tdone), "cranelift inc differs");
-
-        let (nf, cc_ms) = inc::clang_native(dir.path(), i, &t);
-        let (nm, ndone, cc_ns) = inc::run(nf, &t, steps, seed);
-        assert_eq!((&nm, ndone), (&tm, tdone), "clang inc differs");
-
         println!(
-            "{label} | {} x {nt} | {per:.1} | {table_ns:.1} | {inc_ns:.1} | {cl_ns:.1} ({cl_ms:.1}) | {cc_ns:.1} ({cc_ms:.0})",
-            t.initial.len()
+            "{label} | {} x {nt} | {per:.1} | {table_ns:.1} | {inc_ns:.1} | {}",
+            t.initial.len(),
+            cols.join(" | ")
         );
     }
 }
