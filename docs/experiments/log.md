@@ -3810,3 +3810,28 @@ Gates on the branch: every kernel test suite passes (release); clippy `-D warnin
 - Trade-off: none in cost. One weight is a compromise across collections; its error grows with the gap between the two signals.
 - Verdict: **measured; 0.6 does not hold with transformer vectors.** Make convex the default hybrid, with alpha 0.4 for bge-small-class models (within 0.010 of the best on all five sets) and 0.5 for MiniLM (within 0.016); keep 0.6 to 0.7 only for a static model like WordLlama. Retune when the model changes: the best alpha follows the vectors' strength against BM25.
 - Run: `cargo run --release --features search-tantivy --example fusion_tune -- DIR` for each of E304's DIRs, then `python3 examples/real_text/carry.py pypi=P.jsonl scifact=S.jsonl nfcorpus=N.jsonl fiqa=F.jsonl`.
+
+### E306 transformer-vector-views (E257's vector views on transformer vectors)
+- Branch / parent: exp/306-transformer-vector-views / exp/305-beir-fusion-tune
+- Question: E257 measured flat int8, IVF and HNSW on 256-dimension WordLlama vectors: HNSW needed ef 128 for 0.94 recall at 100,000 paragraphs. Do transformer vectors (384 dimensions, a different geometry) need more or less? Does drift cost them recall?
+- Change: none to the kernel. `vector_real` as E257, over E304's PyPI data: an even sample of 100,000 of the 442,916 distinct paragraphs, queried by 300 known-item summaries (embedded as queries); two of 20 k-means regions held out (7.8% of rows for MiniLM, 7.2% for bge-small) and fed in batches after the build.
+- Result (recall@10 against exact search; an Apple M3 Pro laptop; HNSW builds on one thread):
+
+  | Way | MiniLM: query, recall, after drift | bge-small: query, recall, after drift | Update of 10 / 1,000 rows (MiniLM) |
+  |---|---|---|---|
+  | Exact, every row read from ikam | 4,096 ms, 1.000 | 4,109 ms, 1.000 | |
+  | Flat int8, best 40 rescored | 99 ms, 1.000, 1.000 | 103 ms, 1.000, 1.000 | 1.6 / 33 ms |
+  | IVF, 8 probed (303 lists) | 51 ms, 0.687, 0.698 | 59 ms, 0.677, 0.680 | 4.5 / 205 ms |
+  | IVF, 32 probed | 56 ms, 0.873, 0.883 | 67 ms, 0.860, 0.866 | 4.6 / 205 ms |
+  | HNSW, ef 64 | 0.59 ms, 0.934, 0.943 | 0.59 ms, 0.876, 0.890 | 9.4 / 983 ms |
+  | HNSW, ef 128 | 1.04 ms, 0.959, 0.964 | 1.05 ms, 0.930, 0.934 | |
+
+  - Builds: HNSW 65 s (MiniLM) and 69 s (bge-small) for about 92,000 rows; flat int8 views 2.6 s, IVF views 15 s after k-means of 5.4 to 5.6 s. Stored: 21.8 and 21.3 MB (flat), 22.6 and 22.1 MB (IVF), against E257's 15.9 and 16.6 MB at 256 dimensions.
+  - HNSW at ef 128 recalls 0.96 (MiniLM) and 0.93 (bge-small), against E257's 0.94 with WordLlama. bge-small's vectors are harder than MiniLM's for every approximate way (0.88 at ef 64).
+  - Flat int8 with rescoring stays exact, at about 100 ms a query at 100,000 rows (E257 128 ms on the cloud machine).
+  - Drift again cost no recall: every way is within 0.015 of its recall before the held-out regions arrived, slightly up for most.
+  - Exact search reading every row from ikam takes 4.1 s, against E257's 9.5 s on the cloud machine.
+- Not measured: ef above 128; M other than 16; HNSW on several threads; FiQA-sized document sets (57,638) as views.
+- Trade-off: as E257.
+- Verdict: **measured; E257's advice holds for transformer vectors.** HNSW at ef 128 recalls 0.93 to 0.96 at about 1 ms; for bge-small-class vectors, ef 128 is the floor, not a margin. Flat int8 stays exact and fine to about 10,000 rows. IVF needs more than 32 probes on these vectors.
+- Run: `cargo run --release --features vectors-hnsw --example vector_real -- DIR frags 100000` (DIR from `prepare.py ... minilm` or `bge-small`).
