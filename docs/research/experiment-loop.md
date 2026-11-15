@@ -20,7 +20,7 @@ The question: can the loop in `docs/experiments/README.md` (question, read, hypo
 - **H1. The records hold the queue.** Stale verdicts, "Not measured" lines, open hypotheses and ids mentioned ahead of time list the candidates. Status: confirmed in part by E275 (85 gaps; 8 of 10 ids named ahead of time were run within 20 experiments; matching "Not measured" lines by citation and shared words scores the same as its swap control).
 - **H2. A value-per-hour score ranks them better than the order they were run in.** score = P(keep) x gain + 0.5 x info, over hours, with P(keep) a Beta prior per mechanism from the registry. Status: refuted by E276 (failures' mean queue position 0.40 against 0.50 for a random order and 0.35 for the run order; mechanism keep rates do not predict verdicts). Rank by dependencies, information, the owner's theme boosts and, once runs record them, gain and hours, with a seeded random tie-break.
 - **H3. Execution modes for nets.** The same checked net run interpreted, compiled to the stack machine already stored as `functions/interp.wasm`, compiled through Cranelift, or lowered through MLIR (from Rust, the melior bindings), compared on firing cost, compile cost, determinism on replay and dependencies added. Status: `open` (E277; read MLIR's dialect and pass design and the Rust options first).
-- **H4. The net core replays exactly.** Status: `open` (E269).
+- **H4. The net core replays exactly.** Status: confirmed by E269 (10,000 firings replay to the stored marking; retries safe; fire p50 8.6 ms in memory, growing with the log and the tokens held).
 - **H5. The text form round-trips and refuses malformed nets.** Status: `open` (E270).
 
 ## Unknowns
