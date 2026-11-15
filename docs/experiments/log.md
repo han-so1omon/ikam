@@ -3820,6 +3820,33 @@ Gates on the branch (E229 to E233): every kernel test suite passes (release); cl
 - Run: `cargo run --release --example cold_pass -- [group] [nofull]`; `cargo run --release --example cold_pass -- kill 5000 30 [group]`; `cargo run --release --example cold_pass -- gccheck 100000 group`; `cargo run --release --example cold_pass -- repro 100000 group [nopass] [save=DIR]`, then `-- full DIR`; `cargo test --release --test coldpass`.
 - Gates on the branch: every kernel test suite passes (release, 247 tests); clippy `-D warnings` and fmt clean; the bench gives the same byte fields as main, north 0.3096 (corpora from git history left out, as for E265).
 
+### E264 branch-hot-state (each ref keeps its own hot state)
+- Branch / parent: exp/264-branch-hot-state / exp/268-incremental-repack a279f89 (its cold pass; E262's integrator and E265's merge are on main)
+- Question: if a ref keeps its own hot state (its newest database and its views, caught up by its own integrator), does a branch cost one ref to create, are edits on it as fast as on main, does one cold pass serve every ref because content addressing shares their objects, and can a merge run while either side's views lag (E265's variant b) and still give a merge with current views' database and view rows?
+- Change (opt-in, library only): `hot::HotRefs` (src/hot.rs). `open(name)` takes the ref's database from its commit and starts an E262 integrator from views given or built; `fork(from, to)` creates the ref at `from`'s head and starts an integrator from `from`'s newest view state, however far it lags, copying and rebuilding nothing; `append(name, events)` appends, commits to that ref and hands its integrator the database; `merge(into, from)` runs `Repo::merge` (E265) without waiting for views and hands `into`'s integrator the merged database (to merge with current views, `wait` on both first); `wait`, `lag`, `views`, `close`, `names`. The cold pass stays shared: `repack_incremental` (E268) walks every ref at once and skips what it planned before. No change to merge itself: it reads logs and trees only, so views lagging never blocked it; what E265 left open was handing the merged database to views that lag.
+  - Tests (tests/hot.rs, 6): a fork writes no object and shares the source's database, head and views; each ref's views equal a full build at its own database, and its committed database is its hot one; a merge while views lag gives the database and view rows a merge after both sides caught up gives; planted conflicts are reported while views lag and nothing moves; a fast-forward hands over the database; one cold pass and gc after branching keep every ref scanning and rebuilding the same, fsck clean.
+- Result (`examples/branch_hot.rs`; a generated table of 100,000 rows with E260's per-id sum view (incremental), FsStore with deferred sync (E227), `plain_db_events` (E232), `needed_index` (E129), shared with the integrators (`SharedStore`), integrators folding once views lag 50 events (E262's `min_events` 50); one cold pass after the load (52 s, 14.8 MB) so later passes see only the change; each case on a copy of that store; W3: `side` forked from `main`, 500 single upserts on each side in turn, each committed to its own ref, main on even rows and side on odd ones; a 4-core cloud machine, nothing else running; one run):
+
+  | Step | Result |
+  |---|---|
+  | 20 forks of `main` | p50 0.38 ms, slowest 621 ms; 0 objects and 0 bytes written; a branch building its own views would pay 19.5 s first |
+  | W3 hot latency (append, commit, hand-over), main / side | p50 13.3 / 13.3 ms, p99 23.1 / 24.0 ms (lagging run); 18.0 / 17.6, 28.8 / 27.6 ms (current run); the same 1,000 upserts on one ref: p50 16.6, p99 31.1 ms |
+  | views behind, per side | p50 37, p99 63 events |
+  | merge while views lag (variant b), 100 events behind in all | merge 352 ms; `main`'s views current 400 ms later |
+  | merge after both caught up (variant a) | wait 192 ms, merge 332 ms, views current 290 ms later |
+  | variants a and b | same merged database, same view rows; both equal a full build |
+  | stored, branched session merged / the same events on one ref | 20.93 / 21.28 MB; after a pass 20.84 / 21.19 MB |
+  | cold pass after the branch session and merge (45,162 new) / after a second branch's 500 upserts (22,485 new) / after the one-ref session (45,060 new) | 12.3 / 9.0 / 13.6 s |
+  | planted conflicts (48 of side's upserts on rows main wrote), merged while views lag | 48 found, none missed, none false, 33 ms; `main` did not move |
+
+  - A branch costs a ref: no object is written and the views are shared as they stand, where a branch with views of its own would rebuild them for 19.5 s at this size. Edits on a branch cost what edits on `main` cost (within 1 ms at the median in each run; the two runs differ by 5 ms, which the one-ref control sits between).
+  - Content addressing shares the two sides fully: the branched and merged store is 1.6% smaller than the same upserts on one ref, and each cold pass handles only its own new objects, at the same cost per object for the second branch as for the first.
+  - Merging while views lag (variant b) works with no change to the merge: the merge reads logs and trees only. It gives the merge commit 172 ms sooner than waiting first (352 against 524 ms) and current views about as soon (752 against 814 ms); the database and view rows are the same.
+  - The slowest fork (621 ms) and the slowest upsert on the second branch (2.2 s, in both runs) came once each; the second is the first append after the ref was reopened following a cold pass, which builds the writer's indexes (as E262's warm-up append does). Not traced further.
+- Not measured: hot state kept across restarts (it lives in memory, as E262's); pending view edges (E148) and deferred objects per ref, which the plan also named (the database and views were enough for this harness); gc while integrators run (not allowed, as in E262); file trees on branches (E265 covers their merge); 1M rows; macOS.
+- Verdict: **kept** as an option (opt-in library). Hot state per ref costs nothing to fork, edits run at `main`'s speed, branches share every object and one cold pass serves all refs; merges need not wait for views.
+- Run: `cargo run --release --example branch_hot -- [N]`; `cargo test --release --test hot`.
+
 ### E261 plain-hot-writes (skip the storage-plan search on the hot path, leave it to the cold pass)
 - Branch / parent: exp/261-plain-hot-writes / exp/268-incremental-repack a279f89 (the cold pass it leans on)
 - Question: every new content goes through the storage-plan search (containers, slices, templates) before the write returns. If writes skip it and the cold pass plans later, how much faster is the hot path, and how much of the byte cost does one cold pass (E268) or a full repack take back? (Plan: E119's note, 1,000 single appends 3.1 to 0.9 s for 3.3 to 7.9 MB.)
@@ -3847,6 +3874,7 @@ Gates on the branch (E229 to E233): every kernel test suite passes (release); cl
 - Not measured: a W1 session on its debounce; peak memory; 1M rows; macOS; plain writes with the background integrator (E262).
 - Verdict: **kept** as an option, off by default. It halves hot latency and cuts the tail, and one cold pass leaves databases within 17 to 34% of today's bytes; it is the wrong choice where a full repack is expected to restore sharing on databases, or for file stores that keep editing the same files.
 - Run: `cargo run --release --example plain_writes -- files db 20000 full`, `-- db 100000`; `TAGS=1 ... -- db 5000 full` for stored bytes by tag.
+
 ### E275 registry-gaps (the experiment loop's gap list, from the project's own records)
 - Branch / parent: exp/275-registry-gaps / main c92a279
 - Question: an experiment loop that runs with little input needs a queue of candidates. Do the project's records (registry, log, research notes) already hold one, and would a list built from them have pointed at what was run next? (Design: `docs/research/experiment-loop.md`.)
