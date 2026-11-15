@@ -15,7 +15,8 @@
 //!   (W, KILL_MS, WORK_MS as env; DEFERRED=1 opens the store with
 //!   `open_deferred`; CLEAN=1 runs `clean_temporaries` (E302) at the end;
 //!   LEASE_MS puts back any candidate running longer than that, E303;
-//!   HEARTBEAT_MS has the work checkpoint that often, renewing its lease, E304)
+//!   HEARTBEAT_MS has the work checkpoint that often, renewing its lease, E304;
+//!   HEARTBEAT_REF=1 beats on a ref of the run's own instead, E306; CPUS)
 
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
@@ -33,10 +34,10 @@ fn env(name: &str, default: u64) -> u64 {
 }
 
 fn loop_net() -> Net {
-    Net::parse(
+    Net::parse(&format!(
         "\
 net loop 1
-place cpu 2
+place cpu {}
 place queued colored
 place running colored
 place measured colored
@@ -45,7 +46,8 @@ transition start cmd bench: queued, cpu -> running
 transition finish pure: running -> measured, cpu
 transition requeue pure: running -> queued, cpu
 ",
-    )
+        env("CPUS", 2)
+    ))
     .unwrap()
 }
 
@@ -111,6 +113,13 @@ fn child(dir: &str, w: u64) {
                 while started.elapsed() < work {
                     std::thread::sleep(beat.min(work.saturating_sub(started.elapsed())));
                     step += 1;
+                    // E306: HEARTBEAT_REF=1, a ref of the run's own instead
+                    // of a checkpoint in the loop's database.
+                    if std::env::var("HEARTBEAT_REF").as_deref() == Ok("1") {
+                        let tree = repo.put(&ikam_kernel::Object::tree(vec![])?)?;
+                        repo.commit(&format!("beat/w{w}-{k}"), tree, &format!("step {step}"))?;
+                        continue;
+                    }
                     for _ in 0..5 {
                         let head = repo.resolve(REF)?;
                         let db = repo.db_at(&head)?;
@@ -286,9 +295,15 @@ fn main() {
                 }
             }
             for t in running {
-                let progress = last_start
-                    .get(&t)
-                    .and_then(|key| sup.net_resume(&db, "loop", key).ok().flatten());
+                let progress = last_start.get(&t).and_then(|key| {
+                    if std::env::var("HEARTBEAT_REF").as_deref() == Ok("1") {
+                        sup.resolve(&format!("beat/{key}"))
+                            .ok()
+                            .map(|id| id.to_hex().into_bytes())
+                    } else {
+                        sup.net_resume(&db, "loop", key).ok().flatten()
+                    }
+                });
                 let entry = seen.entry(t.clone()).or_insert((now, progress.clone()));
                 if entry.1 != progress {
                     *entry = (now, progress);

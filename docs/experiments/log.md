@@ -4551,3 +4551,29 @@ Gates on the branch (E229 to E233): every kernel test suite passes (release); cl
 - Verdict: **measured** (no change). Keep `refresh_ledger` off by default and on for worker processes sharing a store; a caller that probes for missing content in a loop should leave it off. A store large enough for 100 ms listings would want a list of new records to read instead (not built).
 - Not measured: stores on slower disks or network filesystems; APFS on the Mac.
 - Run: as above (about 1 minute).
+
+### E306 heartbeat-refs (heartbeats on a ref of each run's own)
+- Branch / parent: exp/306-heartbeat-refs / E305 (exp/305-refresh-cost)
+- Question: E304's heartbeats are commits to the loop's ref, so every run's checkpoints compete with every worker's firings. Does that slow the loop or cut live runs as workers grow, and does a ref per run avoid it? (Source: E304's "Not measured": "heartbeats at scale (many workers' checkpoints contending for one ref; a separate ref per worker would avoid it)".)
+- Hypothesis: with checkpoints on the loop's ref, refused commits grow with the workers until beats are missed and live runs are cut; a heartbeat that moves a ref of the run's own (`beat/<start key>`) never contends, so throughput stays near workers x runs per second.
+- Change: none to the kernel. `net_kill` gains `HEARTBEAT_REF=1` (each beat commits an empty tree to `beat/<start key>`; the supervisor renews a lease when that ref moves) and `CPUS` (the loop net's cpu tokens, so W workers run at once).
+- Result (`W=CPUS=... WORK_MS=1000 LEASE_MS=300 HEARTBEAT_MS=100 REQUEUE=1 cargo run --release --example net_kill -- 8W`, 1 s runs, 8 per worker; ideal first pass about 8 s):
+
+  | Workers | Kills | Beats on | First pass | Starts | Live runs cut |
+  |---|---|---|---|---|---|
+  | 2 | none | loop ref | 9.1 s | 16 for 16 | 0 |
+  | 2 | none | own ref | 9.0 s | 16 for 16 | 0 |
+  | 4 | none | loop ref | 9.4 s | 32 for 32 | 0 |
+  | 4 | none | own ref | 9.2 s | 32 for 32 | 0 |
+  | 8 | none | loop ref | 10.2 s | 64 for 64 | 0 |
+  | 8 | none | own ref | 9.3 s | 64 for 64 | 0 |
+  | 16 | none | loop ref | 33.9 s | 129 for 128 | 1 |
+  | 16 | none | own ref | 9.9 s | 128 for 128 | 0 |
+  | 16 | every 1.5 s | loop ref | 30.1 s | 135 for 128 | (7 requeued, 15 kills) |
+  | 16 | every 1.5 s | own ref | 11.1 s | 134 for 128 | (6 requeued, 7 kills) |
+
+  - Up to 8 workers the two are within a second. At 16 workers (160 beats a second) beats on the loop's ref made the night 3.4 times slower and cut one live run; on their own refs it stayed near the ideal.
+  - Kills were recovered either way: every candidate measured, replay, fsck and every output right in every run.
+- Verdict: **kept** (example only). Past a handful of workers, heartbeats belong on a ref of the run's own, not in the loop's database. The beat refs are never removed here; a runner would delete a run's ref at its finish.
+- Not measured: removing beat refs; many thousands of refs in one store; machines with differing clocks.
+- Run: as above (about 4 minutes together).
