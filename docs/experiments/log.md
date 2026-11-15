@@ -3789,3 +3789,26 @@ Gates on the branch (E229 to E233): every kernel test suite passes (release); cl
   - The store commits a new version only when the list changes; fsck clean.
 - Verdict: **measured** (a tool, no kernel change). The records hold a queue of about 100 candidates. An id named ahead of time is a strong signal; a "Not measured" line is a backlog that later work seldom visibly picks up, and this proxy cannot rank it. E276 ranks the list; a ranking should not lean on word overlap with not-measured lines.
 - Not measured: whether staleness and open hypotheses, as they stood at a cutoff, predict the next experiments (both need the records' git history at that commit); gaps recorded only on `exp/` branches (the example reads the checked-out branch).
+
+### E276 ranking-backtest (would the loop's ranking rule have ordered past experiments better?)
+- Branch / parent: exp/276-ranking-backtest / E275 (exp/275-registry-gaps)
+- Question: the loop design ranks candidates by value per hour, score = P(keep) x gain + 0.5 x info, over hours (`docs/research/experiment-loop.md`, H2). With only what the records hold ahead of time, does it order a queue better than the order experiments were actually run in, or than chance?
+- Hypothesis: a Beta(1, 1) posterior of P(keep) per mechanism, from the verdicts so far, plus a bonus for ids named ahead of time (E275: 8 of 14 run within 20), pushes the experiments that end not kept towards the end of a queue. (Source: the design; E275.)
+- Change: none in the kernel. `examples/loop_rank.rs` (reusing `examples/loop_common`). At each cutoff from E050, every 10 ids, the queue is the next 20 experiments that ended in a decision (kept against discarded, refuted, dropped, partial, not applicable, inconclusive; benchmarks and plain measurements left out). Rules, each using only records up to the cutoff: `actual` (run order), `score` (the rule, with gain and hours 1 since neither is recorded ahead of time), `p-keep` (the posterior alone), `planned` (planned ids first), `weighty` (WEIGHTY mechanisms first), `thompson` (one draw per experiment from its posterior, fixed seed), `random` (mean of 200 seeded shuffles). Metric: the mean position of the queue's not-kept experiments, as position / (n - 1) (0 first, 1 last; chance 0.5), and how many of the first 5 picks were kept.
+- Result (`cargo run --release --example loop_rank`, deterministic, two runs identical): 158 decided experiments, 131 kept (83%); 19 queues, 15 with at least one failure (about 27 failures in all; the windows overlap, so the queues are not independent).
+
+  | Rule | Failure position | Kept in the first 5 (of 95 picks) |
+  |---|---|---|
+  | actual | 0.350 | 72 |
+  | score | 0.400 | 79 |
+  | p-keep | 0.400 | 79 |
+  | planned | 0.350 | 72 |
+  | weighty | 0.442 | 77 |
+  | thompson | 0.470 | 79 |
+  | random | 0.500 | 81 |
+
+  - The run order put failures earlier than chance (0.35): riskier changes tended to be tried first.
+  - The rule beats the run order (0.40 against 0.35) but not chance; `p-keep` alone gives the same, so the planned bonus moves nothing (only 2 queues hold a planned id, and planned ids sit early in run order anyway).
+  - An earlier version that rounded each experiment's pooled counts did worse (0.31): the signal is weak enough that the rounding decided it.
+- Verdict: **refuted** for this rule. A mechanism's past keep rate does not predict whether its next experiment is kept; no rule tested beats a random order. The loop should not rank by P(keep). Order by dependencies (arcs), information (stale verdicts, open hypotheses, ids named ahead), the owner's theme boosts and cost once runs record their hours, with a seeded random tie-break. Also: running likely failures first is not bad in itself, since a refuted hypothesis is a result; this metric only asks whether keep rates can be predicted.
+- Not measured: gain and hours (not in the records ahead of time; the loop should record both per run so a later backtest can use them); per-objective keep rates (`weight_sensitive` verdicts across objective changes).
