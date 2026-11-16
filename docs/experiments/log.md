@@ -5100,3 +5100,26 @@ Gates on the branch (E229 to E233): every kernel test suite passes (release); cl
 - Verdict: **kept as an option.** For vectors like these, above about 20,000 rows, the graph is the index to use: 0.93 to 0.96 recall in about 1 ms at a few hundred thousand rows, where the IVF needs 6 to 16 ms for less. Below that, scan (E331). Suggested setting: m 16, ef_build 100, lanes on, threads as the machine has; search with ef 80 to 160, or ef 80 when fused with BM25 (E326: fusion hides most of the misses).
 - Not measured: the graph fused with BM25 on the judged queries; a graph over int8 codes (E253) to halve memory; deletes past 10% of rows; an Apple silicon run.
 - Run: `cargo run --release --example hnsw_graph -- DIR`, `-- DIR 100000`, `THREADS=4 MS=16 ... -- DIR 376619` (DIR from `prepare.py`).
+
+### E333 hybrid-graph (the best ranking with graph indexes, end to end)
+- Branch / parent: exp/333-hybrid-graph / exp/332-hnsw (E332)
+- Question: E330's best ranking (BM25 fused at convex 0.6 with the mean of a README's best-paragraph score and its whole-README score) scored both vector lists exactly: 63 ms a query over 376,619 paragraphs. With both lists from E332's graphs, does the ranking hold, and what does a query cost end to end?
+- Hypothesis: it holds within noise at a modest beam, since fusion hides most vector misses (E326) and the graph finds 0.9 of the exact top 10 paragraphs at ef 80 (E332); a query costs about 5 to 10 ms, most of it BM25 and the rescore.
+- Change: none in the kernel. `examples/hybrid_graph.rs`: the rows of E330 (text for BM25, one vector a README under `w/`, one a paragraph under `f/`) in one database; a graph over each (m 16, ef_build 100, lanes, 4 threads); a query searches BM25 (top 100), the README graph (top 100) and the paragraph graph (top `p` paragraphs, beam `p`), and rescores the union of their READMEs exactly as E330's best+whole, then fuses. Against the same computed by exact scans.
+- Result (nDCG@10, mean and standard error; 1,130 queries; a 4-core cloud Xeon):
+
+  | Vectors | Known items dev / test, convex 0.6 | Topics dev / test, convex 0.5 | Top 10 vs exact | Query end to end |
+  |---|---|---|---|---|
+  | BM25 alone | 0.796 / 0.802 | 0.128 / 0.106 | | 4.5 ms |
+  | Exact scans (E330) | 0.825 / 0.836 (0.016 / 0.015) | 0.136 / 0.136 | 1.000 | 4.5 + 63 ms |
+  | Graphs, README ef 80, 100 paragraphs | 0.825 / 0.835 | 0.136 / 0.134 | 0.975 | 8.7 ms |
+  | Graphs, README ef 80, 200 paragraphs | 0.824 / 0.837 | 0.137 / 0.134 | 0.985 | 12.0 ms |
+  | Graphs, README ef 160, 400 paragraphs | 0.824 / 0.836 | 0.136 / 0.133 | 0.995 | 20.1 ms |
+
+  - The ranking holds: every graph setting is within 0.002 of exact on known items and 0.003 on topics, far inside one standard error. Alone, the graph lists lose 0.02 at the smallest beam (0.697 against 0.719 on dev), which fusion hides, as in E326.
+  - End to end the smallest setting takes 8.7 ms against 68 ms with exact scans, 8 times faster. BM25 is about half of it (4.5 ms here against 2.2 ms in E324, likely because this process holds the 376,619 vectors three times: in the store, in the graph and in the example's own copy; not checked), the rescore of a few hundred READMEs' paragraphs most of the rest.
+  - Graph builds: 2.4 s for 11,384 READMEs, 105 s for the paragraphs, on 4 threads.
+- Trade-off: none beyond E332's memory: the rescore reads every paragraph vector of each candidate README, so the vectors stay in memory (here as the example's own copy).
+- Verdict: **measured.** The recommended semantic search for READMEs like these is BM25 fused at convex 0.6 with best paragraph plus whole, both lists from graphs at the smallest setting (README ef 80, 100 paragraphs): known items 0.83 (BM25 0.80), topics kept, about 9 ms a query at 376,619 paragraphs on this machine.
+- Not measured: the rescore from the graph's own vectors (it holds them; the example keeps a second copy); a transformer embedder (E306's vectors) in the same pipeline; an Apple silicon run.
+- Run: `cargo run --release --example hybrid_graph -- DIR` (DIR from `prepare.py`).

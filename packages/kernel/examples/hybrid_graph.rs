@@ -1,0 +1,307 @@
+//! E333: the best ranking measured so far (E330: BM25 fused with a
+//! README's best paragraph and its whole vector) with both vector lists
+//! from graph indexes (E332) instead of exact scans, and its time a
+//! query end to end: BM25, two graph searches, the rescore and fusion.
+//!
+//! `cargo run --release --example hybrid_graph -- DIR`
+//!
+//! DIR is what `prepare.py` writes (see `hybrid_kernel` and
+//! `fragment_vectors`). Nothing from it is committed. `THREADS=n` builds
+//! the graphs on n threads (default 4).
+
+use std::collections::{BTreeSet, HashMap};
+use std::time::Instant;
+
+use ikam_kernel::fusion::convex;
+use ikam_kernel::hnsw::HnswIndex;
+use ikam_kernel::vectors::{dot_lanes, from_f32s, to_f32s};
+use ikam_kernel::{Event, MemStore, Repo};
+
+/// A ranked list of keys.
+type Ranked = Vec<(String, f32)>;
+/// Task, split, relevant keys, text, vector.
+type Query = (String, String, BTreeSet<String>, String, Vec<f32>);
+
+fn read_f32s(path: &str, dim: usize) -> Vec<Vec<f32>> {
+    to_f32s(&std::fs::read(path).unwrap())
+        .chunks_exact(dim)
+        .map(<[f32]>::to_vec)
+        .collect()
+}
+
+fn ms(t: Instant) -> f64 {
+    t.elapsed().as_secs_f64() * 1e3
+}
+
+fn ndcg10(ranked: &[(String, f32)], rel: &BTreeSet<String>) -> f64 {
+    let dcg: f64 = ranked
+        .iter()
+        .take(10)
+        .enumerate()
+        .filter(|(_, r)| rel.contains(&r.0))
+        .map(|(i, _)| 1.0 / ((i + 2) as f64).log2())
+        .sum();
+    let ideal: f64 = (0..rel.len().min(10))
+        .map(|i| 1.0 / ((i + 2) as f64).log2())
+        .sum();
+    dcg / ideal
+}
+
+fn top(mut v: Ranked, k: usize) -> Ranked {
+    v.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    v.truncate(k);
+    v
+}
+
+/// Best paragraph plus whole (E330): over the documents in `cands`, the
+/// mean of the whole README's score and its best paragraph's.
+fn both(
+    cands: &BTreeSet<usize>,
+    q: &[f32],
+    frags_of: &[Vec<usize>],
+    fvec: &[Vec<f32>],
+    whole: &[Vec<f32>],
+    keys: &[String],
+) -> Ranked {
+    let scored = cands
+        .iter()
+        .map(|&d| {
+            let b = frags_of[d]
+                .iter()
+                .map(|&f| dot_lanes(q, &fvec[f]))
+                .fold(f32::MIN, f32::max);
+            (keys[d].clone(), 0.5 * b + 0.5 * dot_lanes(q, &whole[d]))
+        })
+        .collect();
+    top(scored, 100)
+}
+
+fn main() {
+    let dir = std::env::args().nth(1).expect("DIR");
+    let threads: usize = std::env::var("THREADS")
+        .ok()
+        .and_then(|t| t.parse().ok())
+        .unwrap_or(4);
+    let docs: Vec<(String, Vec<String>)> = std::fs::read_to_string(format!("{dir}/docs.tsv"))
+        .unwrap()
+        .lines()
+        .map(|l| {
+            let (k, t) = l.split_once('\t').unwrap();
+            (k.to_string(), t.split('\u{1e}').map(String::from).collect())
+        })
+        .collect();
+    let keys: Vec<String> = docs.iter().map(|d| d.0.clone()).collect();
+    let pos: HashMap<&str, usize> = keys
+        .iter()
+        .enumerate()
+        .map(|(i, k)| (k.as_str(), i))
+        .collect();
+    let raw = std::fs::read(format!("{dir}/doc_whole.f32")).unwrap();
+    let dim = raw.len() / 4 / docs.len();
+    let whole = read_f32s(&format!("{dir}/doc_whole.f32"), dim);
+    let frag_text: Vec<String> = std::fs::read_to_string(format!("{dir}/frags.tsv"))
+        .unwrap()
+        .lines()
+        .map(String::from)
+        .collect();
+    let fvec = read_f32s(&format!("{dir}/frags.f32"), dim);
+    let index: HashMap<&str, usize> = frag_text
+        .iter()
+        .enumerate()
+        .map(|(i, t)| (t.as_str(), i))
+        .collect();
+    let mut owner: Vec<Vec<usize>> = vec![Vec::new(); fvec.len()];
+    for (d, (_, paras)) in docs.iter().enumerate() {
+        for p in paras {
+            if let Some(&f) = index.get(p.as_str()) {
+                if owner[f].last() != Some(&d) {
+                    owner[f].push(d);
+                }
+            }
+        }
+    }
+    let mut frags_of: Vec<Vec<usize>> = vec![Vec::new(); docs.len()];
+    for (f, ds) in owner.iter().enumerate() {
+        for &d in ds {
+            frags_of[d].push(f);
+        }
+    }
+    let qvec = read_f32s(&format!("{dir}/queries.f32"), dim);
+    let queries: Vec<Query> = std::fs::read_to_string(format!("{dir}/queries.tsv"))
+        .unwrap()
+        .lines()
+        .zip(qvec)
+        .map(|(l, v)| {
+            let f: Vec<&str> = l.splitn(5, '\t').collect();
+            (
+                f[0].into(),
+                f[2].into(),
+                f[3].split(',').map(String::from).collect(),
+                f[4].into(),
+                v,
+            )
+        })
+        .collect();
+    let mut repo = Repo::new(MemStore::default());
+    let empty = repo.db_empty().unwrap();
+    let mut events: Vec<Event> = docs
+        .iter()
+        .map(|(k, p)| Event::upsert(&format!("t/{k}"), p.join("\n").as_bytes(), &format!("t{k}")))
+        .collect();
+    events.extend(
+        whole
+            .iter()
+            .zip(&keys)
+            .map(|(v, k)| Event::upsert(&format!("w/{k}"), &from_f32s(v), &format!("w{k}"))),
+    );
+    events.extend(
+        fvec.iter()
+            .enumerate()
+            .map(|(i, v)| Event::upsert(&format!("f/{i:07}"), &from_f32s(v), &format!("f{i}"))),
+    );
+    let db = repo.db_append(&empty, &events).unwrap();
+    drop(events);
+    let bid = repo.bm25_build(&db, "t/").unwrap();
+    let bm25 = repo.bm25_load(&bid).unwrap();
+    let graph = |repo: &mut Repo<MemStore>, prefix: &str| {
+        let t = Instant::now();
+        let (_, g) = repo
+            .hnsw_build(
+                &db,
+                prefix,
+                HnswIndex::new(dim, 16, 100)
+                    .with_lanes(true)
+                    .with_threads(threads),
+            )
+            .unwrap();
+        (g, ms(t))
+    };
+    let (mut gw, gw_ms) = graph(&mut repo, "w/");
+    let (mut gf, gf_ms) = graph(&mut repo, "f/");
+    println!(
+        "{{\"docs\":{},\"paragraphs\":{},\"queries\":{},\"threads\":{threads},\"graph_docs_build_ms\":{gw_ms:.0},\"graph_paragraphs_build_ms\":{gf_ms:.0}}}",
+        docs.len(),
+        fvec.len(),
+        queries.len()
+    );
+    // Settings: (whole ef, paragraphs returned, paragraph ef).
+    let settings = [(80, 100, 100), (80, 200, 200), (160, 400, 400)];
+    let nq = queries.len() as f64;
+    let mut lists: Vec<HashMap<String, Ranked>> = vec![HashMap::new(); queries.len()];
+    let (mut t_bm25, mut t_exact) = (0.0, 0.0);
+    for (i, (_, _, _, text, q)) in queries.iter().enumerate() {
+        let t = Instant::now();
+        let kw: Ranked = bm25
+            .search(text, 100)
+            .into_iter()
+            .map(|(k, s)| (k.trim_start_matches("t/").to_string(), s))
+            .collect();
+        t_bm25 += ms(t);
+        // Reference: both lists exactly (E330's best+whole).
+        let t = Instant::now();
+        let w = top(
+            whole
+                .iter()
+                .zip(&keys)
+                .map(|(v, k)| (k.clone(), dot_lanes(q, v)))
+                .collect(),
+            100,
+        );
+        let mut all: Vec<(usize, f32)> = fvec
+            .iter()
+            .enumerate()
+            .map(|(i, v)| (i, dot_lanes(q, v)))
+            .collect();
+        all.select_nth_unstable_by(2000, |a, b| b.1.total_cmp(&a.1));
+        all.truncate(2000);
+        let mut cands: BTreeSet<usize> = w.iter().map(|(k, _)| pos[k.as_str()]).collect();
+        let mut best: HashMap<usize, f32> = HashMap::new();
+        for &(f, s) in &all {
+            for &d in &owner[f] {
+                let e = best.entry(d).or_insert(f32::MIN);
+                *e = e.max(s);
+            }
+        }
+        let best = top(
+            best.into_iter()
+                .map(|(d, s)| (keys[d].clone(), s))
+                .collect(),
+            100,
+        );
+        cands.extend(best.iter().map(|(k, _)| pos[k.as_str()]));
+        let exact = both(&cands, q, &frags_of, &fvec, &whole, &keys);
+        t_exact += ms(t);
+        lists[i].insert("exact".into(), exact);
+        lists[i].insert("bm25".into(), kw);
+    }
+    println!(
+        "{{\"bm25_ms\":{:.3},\"exact_vectors_ms\":{:.3}}}",
+        t_bm25 / nq,
+        t_exact / nq
+    );
+    let mut names = vec!["exact".to_string()];
+    for &(wef, pk, pef) in &settings {
+        let name = format!("graph-w{wef}-p{pk}");
+        let (mut t_all, mut recall) = (0.0, 0.0);
+        for (i, (_, _, _, text, q)) in queries.iter().enumerate() {
+            let t = Instant::now();
+            let kw: Ranked = bm25
+                .search(text, 100)
+                .into_iter()
+                .map(|(k, s)| (k.trim_start_matches("t/").to_string(), s))
+                .collect();
+            let mut cands: BTreeSet<usize> = gw
+                .search(q, 100, wef)
+                .into_iter()
+                .map(|(k, _)| pos[&k[2..]])
+                .collect();
+            for (k, _) in gf.search(q, pk, pef) {
+                let f: usize = k[2..].parse().unwrap();
+                cands.extend(&owner[f]);
+            }
+            let v = both(&cands, q, &frags_of, &fvec, &whole, &keys);
+            let _ = convex(&kw, &v, 0.6);
+            t_all += ms(t);
+            let e: BTreeSet<&String> = lists[i]["exact"].iter().take(10).map(|x| &x.0).collect();
+            recall += v.iter().take(10).filter(|x| e.contains(&x.0)).count() as f64 / 10.0;
+            lists[i].insert(name.clone(), v);
+        }
+        println!(
+            "{{\"setting\":\"{name}\",\"paragraph_ef\":{pef},\"end_to_end_ms\":{:.3},\"recall10_vs_exact\":{:.3}}}",
+            t_all / nq,
+            recall / nq
+        );
+        names.push(name);
+    }
+    for task in ["known", "topic"] {
+        for split in ["dev", "test"] {
+            let idx: Vec<usize> = (0..queries.len())
+                .filter(|&i| queries[i].0 == task && queries[i].1 == split)
+                .collect();
+            let stat = |f: &dyn Fn(usize) -> Ranked| {
+                let s: Vec<f64> = idx.iter().map(|&i| ndcg10(&f(i), &queries[i].2)).collect();
+                let m = s.iter().sum::<f64>() / s.len() as f64;
+                let sd = (s.iter().map(|x| (x - m).powi(2)).sum::<f64>() / s.len() as f64).sqrt();
+                format!("[{m:.4},{:.4}]", sd / (s.len() as f64).sqrt())
+            };
+            println!(
+                "{{\"task\":\"{task}\",\"split\":\"{split}\",\"queries\":{},\"bm25\":{}}}",
+                idx.len(),
+                stat(&|i| lists[i]["bm25"].clone())
+            );
+            for s in &names {
+                let mut row = format!(
+                    "{{\"task\":\"{task}\",\"split\":\"{split}\",\"vectors\":\"{s}\",\"alone\":{}",
+                    stat(&|i| lists[i][s].clone())
+                );
+                for a in [0.5f32, 0.6, 0.7] {
+                    row += &format!(
+                        ",\"convex-{a}\":{}",
+                        stat(&|i| convex(&lists[i]["bm25"], &lists[i][s], a))
+                    );
+                }
+                println!("{row}}}");
+            }
+        }
+    }
+}
