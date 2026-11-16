@@ -519,6 +519,49 @@ impl HnswIndex {
         }
     }
 
+    /// `score_at` for each of `nodes`, in order, into `out` (cleared
+    /// first): the same scores, with each node's row asked of memory a few
+    /// nodes before it is scored, so the reads overlap (E340: 4 nodes ahead
+    /// for codes, 8 for f32 vectors, the best of those measured).
+    pub fn score_many(&self, q: &[f32], nodes: &[u32], out: &mut Vec<Option<f32>>) {
+        let ahead = if self.codes.is_some() { 4 } else { 8 };
+        out.clear();
+        for (j, &n) in nodes.iter().enumerate() {
+            if let Some(&m) = nodes.get(j + ahead) {
+                self.prefetch(m);
+            }
+            out.push(self.score_at(q, n));
+        }
+    }
+
+    /// Ask for node `i`'s row (vector or code) to be brought into cache.
+    /// A hint only: it changes no result. Nothing for a node out of range.
+    #[inline]
+    fn prefetch(&self, i: u32) {
+        #[cfg(target_arch = "x86_64")]
+        {
+            use std::arch::x86_64::{_MM_HINT_T0, _mm_prefetch};
+            let i = i as usize;
+            if i >= self.removed.len() {
+                return;
+            }
+            let row: &[u8] = match &self.codes {
+                Some(c) => &c[i * self.dim..][..self.dim],
+                None => {
+                    let v = &self.vecs[i * self.dim..][..self.dim];
+                    // Safety: the f32s' own bytes, same length in bytes.
+                    unsafe { std::slice::from_raw_parts(v.as_ptr().cast(), v.len() * 4) }
+                }
+            };
+            for off in (0..row.len()).step_by(64) {
+                // Safety: `off` is inside `row`; a prefetch reads nothing.
+                unsafe { _mm_prefetch::<_MM_HINT_T0>(row.as_ptr().add(off).cast()) };
+            }
+        }
+        #[cfg(not(target_arch = "x86_64"))]
+        let _ = i;
+    }
+
     /// Leave `key` out of results; it stays a waypoint. False if absent.
     pub fn remove(&mut self, key: &str) -> bool {
         match self.pos.remove(key) {

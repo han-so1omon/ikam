@@ -114,6 +114,32 @@ fn both_at(
     keys: &[String],
     nodes: (&[Option<u32>], &[Option<u32>]),
 ) -> Ranked {
+    // E340: `MANY=1` scores every candidate's paragraphs in one
+    // `score_many`, which reads ahead; the same scores.
+    if std::env::var("MANY").as_deref() == Ok("1") {
+        let (mut list, mut ends) = (Vec::new(), Vec::new());
+        for &d in cands {
+            list.extend(frags_of[d].iter().filter_map(|&f| nodes.0[f]));
+            ends.push(list.len());
+        }
+        let mut out = Vec::new();
+        gf.score_many(q, &list, &mut out);
+        let mut start = 0;
+        let scored = cands
+            .iter()
+            .zip(ends)
+            .map(|(&d, end)| {
+                let b = out[start..end]
+                    .iter()
+                    .flatten()
+                    .fold(f32::MIN, |a, &x| a.max(x));
+                start = end;
+                let w = nodes.1[d].and_then(|n| gw.score_at(q, n)).unwrap_or(0.0);
+                (keys[d].clone(), 0.5 * b + 0.5 * w)
+            })
+            .collect();
+        return top(scored, 100);
+    }
     let scored = cands
         .iter()
         .map(|&d| {
@@ -135,6 +161,7 @@ fn main() {
         .and_then(|t| t.parse().ok())
         .unwrap_or(4);
     let codes = std::env::var("CODES").as_deref() == Ok("1");
+    let hot = std::env::var("HOT").as_deref() == Ok("1");
     let docs: Vec<(String, Vec<String>)> = std::fs::read_to_string(format!("{dir}/docs.tsv"))
         .unwrap()
         .lines()
@@ -336,14 +363,30 @@ fn main() {
                 }
             }
             phase[2] += ms(s);
-            let s = Instant::now();
+            let mut s = Instant::now();
             scored.0 += cands.len();
             if at < 2 {
                 scored.1 += cands.iter().map(|&d| frags_of[d].len()).sum::<usize>();
             }
             let v = match at {
                 0 => both_kept(&cands, q, &frags_of, &gf, &gw, &keys, (&fkeys, &wkeys)),
-                1 => both_at(&cands, q, &frags_of, &gf, &gw, &keys, (&fnodes, &wnodes)),
+                1 => {
+                    // E340: `HOT=1` scores once untimed first, so the timed
+                    // pass finds the rows in cache: what memory costs.
+                    if hot {
+                        std::hint::black_box(both_at(
+                            &cands,
+                            q,
+                            &frags_of,
+                            &gf,
+                            &gw,
+                            &keys,
+                            (&fnodes, &wnodes),
+                        ));
+                        s = Instant::now();
+                    }
+                    both_at(&cands, q, &frags_of, &gf, &gw, &keys, (&fnodes, &wnodes))
+                }
                 _ => top(
                     cands
                         .iter()

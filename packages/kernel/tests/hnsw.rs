@@ -253,3 +253,35 @@ fn score_at_a_position_matches_score_by_key() {
         assert_eq!(g.score_at(&q, u32::MAX), None);
     }
 }
+
+/// E340: `score_many` gives `score_at` for each node, in order, also for
+/// removed nodes, nodes out of range and repeated nodes, with lanes on or off.
+#[test]
+fn score_many_matches_score_at() {
+    let mut rng = Lcg(9);
+    for (codes, lanes) in [(false, false), (false, true), (true, false), (true, true)] {
+        let mut g = HnswIndex::new(DIM, 8, 32)
+            .with_codes(codes)
+            .with_lanes(lanes);
+        let rows: Vec<(String, Vec<f32>)> = (0..200)
+            .map(|i| {
+                (
+                    format!("r/{i:04}"),
+                    unit((0..DIM).map(|_| rng.gauss()).collect()),
+                )
+            })
+            .collect();
+        g.extend(rows);
+        assert!(g.remove("r/0003"));
+        let q = unit((0..DIM).map(|_| rng.gauss()).collect());
+        let mut nodes: Vec<u32> = (0..250).rev().collect();
+        nodes.extend([5, 5, u32::MAX, 3, 0]);
+        let mut out = vec![Some(1.0)];
+        g.score_many(&q, &nodes, &mut out);
+        let want: Vec<Option<f32>> = nodes.iter().map(|&n| g.score_at(&q, n)).collect();
+        assert_eq!(out, want);
+        assert_eq!(out[nodes.len() - 2], None);
+        g.score_many(&q, &[], &mut out);
+        assert!(out.is_empty());
+    }
+}
