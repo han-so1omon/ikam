@@ -194,9 +194,17 @@ fn main() {
         "{{\"form\":\"live\",\"merge_rows\":{merge_rows},\"update_ms\":{update_ms:.1},\"update_mb\":{:.3},\"query_ms\":{query_ms:.3},\"same_top10_as_index\":{same},\"merge_ms\":{merge_ms:.0}}}",
         update_bytes as f64 / 1e6
     );
-    // Updates in a row, 1% each, until the delta passes 5% and merges.
-    let (mut live, mut at, mut series) = (live2, next2, Vec::new());
-    for round in 0..6 {
+    // From the merged view, 1% updates in a row until the delta passes 5%
+    // and merges.
+    let (mut live, mut at, mut series) = (
+        Bm25Live {
+            merge_rows,
+            ..merged
+        },
+        next2,
+        Vec::new(),
+    );
+    for round in 0..7 {
         let edits: Vec<Event> = (0..(n / 100).max(1))
             .map(|j| {
                 let i = rng.next() as usize % n;
@@ -222,4 +230,12 @@ fn main() {
         "{{\"form\":\"live\",\"updates_in_a_row\":[{}]}}",
         series.join(",")
     );
+    // The live view after them ranks as a view built at the same rows.
+    let blank = repo.bm25_view_empty().unwrap();
+    let fresh = repo.bm25_view_update(&blank, &empty, &at, "t/").unwrap();
+    for q in queries.iter().take(50) {
+        let a = repo.bm25_live_search(&live, q, 10).unwrap();
+        let b = repo.bm25_view_search(&fresh, q, 10).unwrap();
+        assert_eq!(same_as(&a, &b), 1, "{q}");
+    }
 }

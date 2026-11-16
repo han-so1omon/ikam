@@ -4993,3 +4993,34 @@ Gates on the branch (E229 to E233): every kernel test suite passes (release); cl
 - Verdict: **measured.** The kernel alone gives the hybrid ranking E259 measured with Tantivy (0.82 against 0.805 on known items). For vectors like these, probe at least 60% of an IVF's lists, or probe them all below about 10,000 rows, where it costs 1.5 ms; a lower probe count is only safe with a keyword weight of 0.7 or more.
 - Not measured: a transformer embedder in this path (model downloads are blocked on this machine; E306 measured MiniLM and bge-small outside it); stemming; collections over 100,000 rows.
 - Run: `cargo run --release --example hybrid_kernel -- DIR` (DIR from `prepare.py` on exp/259-fusion-tune; not committed).
+
+### E329 bm25-view (BM25 kept up by edits as a view of the database)
+- Branch / parent: exp/329-bm25-view / exp/326-hybrid-kernel (E326)
+- Question: E324's index is built whole, so every database update costs a rebuild (3.9 s at 11,384 READMEs). ikam's rows change all the time. Can BM25 be a view that an update edits, as `vectors` and `views` are, at a cost that follows the rows changed, with the same scores?
+- Hypothesis: one graph node per term (its postings as content) and a stats node make a view whose update reads and rewrites only the terms of the changed rows, and whose query reads only its own terms. Common terms appear in most rows, so a 1% update still rewrites their long lists. Keeping the changes in a small second graph and folding it in now and then, as Lucene's segments do, makes an update cost follow the rows changed. (Source: Lucene's segment merging, as summarized in docs/research/search-engines.md on exp/259-fusion-tune; E325's lists graph.)
+- Change (opt-in): in `src/bm25.rs`:
+  - `Bm25View` and `Repo::bm25_view_update(&view, &old, &new, prefix)`: nodes `t US term` (postings `{ key tf dl }` sorted by key) and `s` (rows, total length); the update reads the `kv` diff and edits only the touched terms. The same rows give the same root however the view got there. `bm25_view_search` reads its terms' lists in place.
+  - `Bm25Live` (`bm25_live_build`, `bm25_live_update`, `bm25_live_search`): a base view at `base_db` and a delta graph holding the changed rows' postings, a mark for each changed row (`k US key`, removed rows included) and the stats of the whole. An update edits the delta; past `merge_rows` marked rows the base is updated from `base_db` and the delta emptied. A query drops marked rows from the base lists and adds the delta's, so document frequencies and lengths are those of the current rows.
+  - `tests/bm25.rs`: over six rounds of rows added, changed and removed (and rows outside the prefix), the view and two live views (one merging every 25 rows, one never) score as the formula computed row by row, and the kept view equals one built at the end.
+  - `examples/bm25_view.rs`: E324's index, the view and the live view on the same rows, a 1% update (rows given other rows' text), a forced merge, then 1% updates in a row until a merge.
+  - Tried and dropped: one node per posting (`p US term US key US tf,dl`, no content), so an update rewrites only the tree chunks around changed postings. On the synthetic rows it built in 11.9 s, updated in 11.4 s (no better than its rebuild) and queried in 26.7 ms: each changed row's 100 or more terms land in different chunks, so 1% of the rows touched about 40% of them.
+- Result (a 4-core cloud Xeon; `needed_index` on, E325; mean ms a query, top 10):
+
+  | | Synthetic: 20,000 rows of 50 to 300 Zipf words, 3-word queries | Real: E326's 11,384 READMEs, 1,130 summary and topic queries |
+  |---|---|---|
+  | Index (E324): build, size, load, query | 2.1 s, 3.6 MB, 56 ms, 3.95 ms | 3.7 s, 5.2 MB, 118 ms, 2.18 ms |
+  | View: build, size | 5.1 s, 14.6 MB | 16.5 s, 43.0 MB |
+  | View: update of 1% (written), rebuild | 2.57 s (11.7 MB), 3.94 s | 5.51 s (31.9 MB), 6.52 s |
+  | View: query | 3.52 ms | 6.9 ms (15.2 ms on the copy written first) |
+  | Live: update of 1% (written) | 0.30 s (0.49 MB) | 0.42 s (0.71 MB) |
+  | Live: query, with a 1% delta | 4.35 ms | 17.1 ms |
+  | Live: 1% updates in a row from a merged view; the sixth passes 5% and merges | 0.33, 0.58, 0.79, 0.87, 0.93 s, merge 4.04 s | 0.31, 0.52, 0.89, 0.87, 1.14 s, merge 7.78 s |
+
+  - Every view and live query returns the index's top 10 (200 of 200 and 1,130 of 1,130); sizes are bytes the store wrote.
+  - A view's update costs 65% (synthetic) to 85% (real) of its rebuild, as the hypothesis expected for common terms. The live view's first update costs 8 to 12% of the view's; over six updates with one merge it costs 1.3 s (synthetic) to 1.9 s (real) a 1% update, against the view's 2.6 s and 5.5 s. After them it ranks as a view built at the same rows (the example checks it).
+  - Real queries (a project's whole summary) read many common terms' lists: 6.9 ms against the loaded index's 2.2 ms. Reading those lists was 12 ms of the live query's 17 ms; its base is the copy written first. Why the store reads the first-written copy of the same lists at 15 ms and later copies at 7 ms was not found (inferred: how the store encoded each content).
+  - Before reading lists in place, the view's real-text query took 24.8 ms (decoding each list into a map).
+- Trade-off: against E324's index, a view needs no load and no rebuild, but is 4 to 8x larger in the store and its queries are up to 3x slower on long queries over common terms (on par on short ones). The live view makes updates cheap but merges take one rebuild's time now and then, and its queries are slower again while the delta holds rows.
+- Verdict: **kept**, both opt-in. `Bm25Live` for rows that change often; `Bm25View` where updates are rare and queries short; E324's loaded index where queries dominate.
+- Not measured: merging in the background while queries use the old base; a delta folded by term rather than whole; the store encoding behind the 7 to 15 ms spread; stemming.
+- Run: `cargo test --release --test bm25`; `cargo run --release --example bm25_view` (synthetic) and `-- DIR` (E326's data).
