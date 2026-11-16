@@ -4909,6 +4909,7 @@ Gates on the branch (E229 to E233): every kernel test suite passes (release); cl
 - Verdict: **kept**, opt-in. BM25 in the kernel ranks as well as the Tantivy configuration that E258 and E259 measured, with no dependency, so hybrid ranking can run without the `search-tantivy` feature.
 - Not measured: stemming; BM25 over fragments rather than whole rows; collections over 100,000 rows.
 - Run: `cargo test --release --test bm25`; `cargo run --release --example hybrid_kernel -- DIR` (exp/326-hybrid-kernel; DIR from `prepare.py`, not committed).
+
 ### E325 ivf-loaded (a vector index loaded once for repeated queries)
 - Branch / parent: exp/325-ivf-loaded / exp/324-bm25 (E324; E323 below it)
 - Question: E323 found every IVF query costs about 9 ms at 20,000 rows whatever it probes. Where does it go, and what does loading the index once buy?
@@ -4928,8 +4929,8 @@ Gates on the branch (E229 to E233): every kernel test suite passes (release); cl
   - Results are the same rows in each form (the test checks it); recall@10 at nprobe 4 is 0.988 at 100,000 (0.870 at rescore 10).
   - Without kept vectors, the rescore's row reads cost about 60 us a row (6.8 ms for 100 at 20,000).
   - Memory: codes are `dim` bytes a row (25.6 MB at 100,000 x 256); kept vectors add 4 x `dim` (102 MB).
-  - Seen on the way, not part of this hypothesis: `ivf_update` of 1% of the rows took 0.51 s at 20,000 and 11.3 s at 100,000, against a build of 1.7 s and 13.3 s. An update that touches scattered rows rewrites most of the lists graph's chunks.
+  - Seen on the way, not part of this hypothesis: `ivf_update` of 1% of the rows took 0.51 s at 20,000 and 11.3 s at 100,000, against a build of 1.7 s and 13.3 s. Cause, found afterwards with a debugger's stack samples: nearly all of it is the store checking, for each superseded copy the update drops, whether anything still needs it (`is_needed` scanning the store), because `needed_index` (E129) is off by default. With `repo.needed_index = true` the same update takes 1.47 s at 100,000, against a build of 13.8 s (mostly assigning rows to their nearest list). Any caller that updates vector views should turn the index on.
 - Trade-off: a loaded index is a snapshot: after a database update the caller loads again (150 ms at 100,000 without vectors). Kept vectors trade 4 bytes a dimension a row of memory and a 17x longer load for a further 2 to 6x.
 - Verdict: **kept** as an option. Load once for any caller that queries more than a few times; keep vectors where memory allows.
-- Next: why a 1% update costs most of a build (graph edits or the chunk writes' planning), and E326's real-text measurement.
+- Next: E326's real-text measurement.
 - Run: `cargo test --release --test vectors`; `cargo run --release --example vector_ivf -- 20000 256` and `-- 100000 256`.
