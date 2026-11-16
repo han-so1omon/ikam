@@ -113,27 +113,61 @@ impl Bm25 {
     /// The `k` best rows for `query`, best first, ties by key.
     pub fn search(&self, query: &str, k: usize) -> Vec<(String, f32)> {
         let n = self.rows.len() as f32;
-        let mut score: HashMap<u32, f32> = HashMap::new();
         let mut seen = std::collections::HashSet::new();
-        for t in terms(query) {
-            let Some(list) = self.postings.get(&t).filter(|_| seen.insert(t.clone())) else {
-                continue;
-            };
+        let lists: Vec<&Vec<(u32, u32)>> = terms(query)
+            .filter_map(|t| self.postings.get(&t).filter(|_| seen.insert(t.clone())))
+            .collect();
+        // E338: sums in a dense array when the query touches enough rows,
+        // else in a map; in the same order either way (so the same floats),
+        // and only the best `k` rows' keys copied.
+        let touched: usize = lists.iter().map(|l| l.len()).sum();
+        if touched * 16 >= self.rows.len() {
+            let mut score = vec![0f32; self.rows.len()];
+            let hit = self.sum(&lists, n, &mut score);
+            self.best(hit, k, |r| score[r as usize])
+        } else {
+            let mut score: HashMap<u32, f32> = HashMap::new();
+            let hit = self.sum(&lists, n, &mut score);
+            self.best(hit, k, |r| score[&r])
+        }
+    }
+
+    /// Add each list's terms into `slot`, as `search` always has; the rows
+    /// touched, in first-touch order.
+    fn sum(&self, lists: &[&Vec<(u32, u32)>], n: f32, score: &mut impl Sums) -> Vec<u32> {
+        let mut hit = Vec::new();
+        for list in lists {
             let df = list.len() as f32;
             let idf = (1.0 + (n - df + 0.5) / (df + 0.5)).ln();
-            for &(row, tf) in list {
+            for &(row, tf) in list.iter() {
                 let (tf, dl) = (tf as f32, self.lens[row as usize] as f32);
                 let norm = K1 * (1.0 - B + B * dl / self.avg.max(1.0));
-                *score.entry(row).or_default() += idf * tf * (K1 + 1.0) / (tf + norm);
+                let s = score.slot(row);
+                // Every term adds more than 0 (idf > 0, tf >= 1).
+                if *s == 0.0 {
+                    hit.push(row);
+                }
+                *s += idf * tf * (K1 + 1.0) / (tf + norm);
             }
         }
-        let mut out: Vec<(String, f32)> = score
-            .into_iter()
-            .map(|(r, s)| (self.rows[r as usize].clone(), s))
-            .collect();
-        out.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
-        out.truncate(k);
-        out
+        hit
+    }
+
+    /// The `k` best of `hit` by `score`, best first, ties by key.
+    fn best(&self, mut hit: Vec<u32>, k: usize, score: impl Fn(u32) -> f32) -> Vec<(String, f32)> {
+        let order = |a: &u32, b: &u32| {
+            score(*b)
+                .total_cmp(&score(*a))
+                .then_with(|| self.rows[*a as usize].cmp(&self.rows[*b as usize]))
+        };
+        if hit.len() > k && k > 0 {
+            hit.select_nth_unstable_by(k - 1, order);
+        }
+        hit.truncate(k);
+        hit.sort_by(order);
+        hit.into_iter()
+            .map(|r| (self.rows[r as usize].clone(), score(r)))
+            .collect()
     }
 
     pub fn len(&self) -> usize {
@@ -533,5 +567,85 @@ impl<S: Store> Repo<S> {
             }
         }
         Ok(ranked(score, k))
+    }
+}
+
+/// Where `search` adds up a row's score: a dense array or a map.
+trait Sums {
+    fn slot(&mut self, row: u32) -> &mut f32;
+}
+
+impl Sums for Vec<f32> {
+    fn slot(&mut self, row: u32) -> &mut f32 {
+        &mut self[row as usize]
+    }
+}
+
+impl Sums for HashMap<u32, f32> {
+    fn slot(&mut self, row: u32) -> &mut f32 {
+        self.entry(row).or_default()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// E338: both ways of adding up give the same rows and the same score
+    /// bits, for small and large `k`.
+    #[test]
+    fn dense_and_map_sums_agree() {
+        let mut seed = 7u64;
+        let mut next = || {
+            seed = seed
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            seed >> 33
+        };
+        let (mut rows, mut lens) = (Vec::new(), Vec::new());
+        let mut postings: HashMap<String, Vec<(u32, u32)>> = HashMap::new();
+        for r in 0..500u32 {
+            rows.push(format!("r{:03}", next() % 1000));
+            let mut len = 0;
+            for t in 0..20u64 {
+                if next() % 3 == 0 {
+                    let tf = 1 + (next() % 4) as u32;
+                    len += tf;
+                    postings.entry(format!("t{t}")).or_default().push((r, tf));
+                }
+            }
+            lens.push(len);
+        }
+        let avg = lens.iter().map(|&l| l as f32).sum::<f32>() / rows.len() as f32;
+        let bm = Bm25 {
+            rows,
+            lens,
+            avg,
+            postings,
+        };
+        let n = bm.rows.len() as f32;
+        for query in ["t1", "t2 t3 t2", "t0 t5 t9 t13 t19"] {
+            let mut seen = std::collections::HashSet::new();
+            let lists: Vec<&Vec<(u32, u32)>> = terms(query)
+                .filter_map(|t| bm.postings.get(&t).filter(|_| seen.insert(t.clone())))
+                .collect();
+            for k in [0, 1, 10, 100, 1000] {
+                let mut dense = vec![0f32; bm.rows.len()];
+                let hit = bm.sum(&lists, n, &mut dense);
+                let a = bm.best(hit, k, |r| dense[r as usize]);
+                let mut map: HashMap<u32, f32> = HashMap::new();
+                let hit = bm.sum(&lists, n, &mut map);
+                let b = bm.best(hit, k, |r| map[&r]);
+                let bits = |v: &[(String, f32)]| -> Vec<(String, u32)> {
+                    v.iter().map(|(s, f)| (s.clone(), f.to_bits())).collect()
+                };
+                assert_eq!(bits(&a), bits(&b), "{query} k={k}");
+                assert_eq!(a, bm.search(query, k), "{query} k={k}");
+                assert!(
+                    a.windows(2)
+                        .all(|w| w[0].1 > w[1].1 || (w[0].1 == w[1].1 && w[0].0 <= w[1].0))
+                );
+            }
+        }
     }
 }

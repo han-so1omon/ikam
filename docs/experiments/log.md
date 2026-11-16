@@ -5225,3 +5225,14 @@ Gates on the branch (E229 to E233): every kernel test suite passes (release); cl
 - Verdict: **kept** (`position`, `score_at`; no option needed). The full search with compact graphs answers in about 6 ms at E333's setting with the same ranking, and in 3.5 ms with `-hits` if a little ranking can go. BM25 (about 2 ms) is now the largest step.
 - Not measured: BM25's own query cost; `-hits` with f32 vectors; an Apple silicon run.
 - Run: `THREADS=4 cargo run --release --example hybrid_graph -- DIR` (and `CODES=1`).
+
+### E338 bm25-query (BM25's top k without a map and a full sort)
+- Branch / parent: exp/338-bm25-query / exp/337-hybrid-phases (E337)
+- Question: E337 left BM25 (about 2 ms) as the largest step of the full hybrid search. What does a BM25 query cost on its own, and can it be cut without changing a single result?
+- Hypothesis: most of it is the shape of `search`, not the scoring: a map from row to score, a copy of every matched row's key, and a sort of all of them, for a query that wants 10 or 100. (Source: E337's "not measured".)
+- Change: `Bm25::search` adds up scores in a dense array of the index's rows when the query's postings touch at least a sixteenth of them, else in a map as before, in the same order either way (so the same floats); it then picks the best `k` row numbers (`select_nth_unstable`), sorts only those (score, then key, as before) and copies only their keys. Test `dense_and_map_sums_agree`: both ways give the same rows and score bits as `search`, for k from 0 to more than every row. `examples/bm25_query.rs` writes every result's key and score bits, so two builds can be compared.
+- Result (11,384 READMEs, 1,130 queries, E326's set; best of 5; a 4-core cloud Xeon): k=10 1.62 to 0.15-0.16 ms a query, k=100 1.94 to 0.13-0.18 ms. All 1,130 queries' top 100 are byte for byte the same before and after (keys and score bits).
+- Trade-off: none; the dense array is one f32 a row of the index for the query's length, taken only when the query touches enough rows that a map would be as large.
+- Verdict: **kept, not an option** (same results, about 10x faster).
+- Not measured: an index of millions of rows; an Apple silicon run.
+- Run: `cargo run --release --example bm25_query -- DIR OUT` (DIR from `prepare.py`), and `cmp` two OUTs.
