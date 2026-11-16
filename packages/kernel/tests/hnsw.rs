@@ -220,3 +220,36 @@ fn graph_of_codes_rescored_finds_neighbours_through_storage_and_updates() {
         assert_eq!(loaded.search(q, 10, 64), index.search(q, 10, 64));
     }
 }
+
+/// E337: scoring by position gives `score`'s numbers, and a position goes
+/// stale (None) once its key is inserted again or removed.
+#[test]
+fn score_at_a_position_matches_score_by_key() {
+    let mut rng = Lcg(5);
+    for codes in [false, true] {
+        let mut g = HnswIndex::new(DIM, 8, 32).with_codes(codes);
+        let rows: Vec<(String, Vec<f32>)> = (0..300)
+            .map(|i| {
+                (
+                    format!("r/{i:04}"),
+                    unit((0..DIM).map(|_| rng.gauss()).collect()),
+                )
+            })
+            .collect();
+        g.extend(rows.clone());
+        let q = unit((0..DIM).map(|_| rng.gauss()).collect());
+        for (k, _) in &rows {
+            let n = g.position(k).unwrap();
+            assert_eq!(g.score_at(&q, n), g.score(&q, k));
+        }
+        let old = g.position("r/0007").unwrap();
+        g.insert("r/0007".into(), &rows[8].1);
+        assert_eq!(g.score_at(&q, old), None);
+        let new = g.position("r/0007").unwrap();
+        assert_eq!(g.score_at(&q, new), g.score(&q, "r/0007"));
+        assert!(g.remove("r/0007"));
+        assert_eq!(g.score_at(&q, new), None);
+        assert_eq!(g.position("r/0007"), None);
+        assert_eq!(g.score_at(&q, u32::MAX), None);
+    }
+}

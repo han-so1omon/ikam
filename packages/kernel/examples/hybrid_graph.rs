@@ -103,6 +103,31 @@ fn both_kept(
     top(scored, 100)
 }
 
+/// `both_kept` with each row's graph node found once beforehand (E337),
+/// so a query scores by position instead of looking each key up.
+fn both_at(
+    cands: &BTreeSet<usize>,
+    q: &[f32],
+    frags_of: &[Vec<usize>],
+    gf: &HnswIndex,
+    gw: &HnswIndex,
+    keys: &[String],
+    nodes: (&[Option<u32>], &[Option<u32>]),
+) -> Ranked {
+    let scored = cands
+        .iter()
+        .map(|&d| {
+            let b = frags_of[d]
+                .iter()
+                .filter_map(|&f| gf.score_at(q, nodes.0[f]?))
+                .fold(f32::MIN, f32::max);
+            let w = nodes.1[d].and_then(|n| gw.score_at(q, n)).unwrap_or(0.0);
+            (keys[d].clone(), 0.5 * b + 0.5 * w)
+        })
+        .collect();
+    top(scored, 100)
+}
+
 fn main() {
     let dir = std::env::args().nth(1).expect("DIR");
     let threads: usize = std::env::var("THREADS")
@@ -271,10 +296,18 @@ fn main() {
     // Row keys of each paragraph and README, made once.
     let fkeys: Vec<String> = (0..fvec.len()).map(|f| format!("f/{f:07}")).collect();
     let wkeys: Vec<String> = keys.iter().map(|k| format!("w/{k}")).collect();
+    let fnodes: Vec<Option<u32>> = fkeys.iter().map(|k| gf.position(k)).collect();
+    let wnodes: Vec<Option<u32>> = wkeys.iter().map(|k| gw.position(k)).collect();
     let mut names = vec!["exact".to_string()];
-    for &(wef, pk, pef) in &settings {
-        let name = format!("graph-w{wef}-p{pk}");
+    for (&(wef, pk, pef), at) in settings.iter().flat_map(|s| [(s, 0), (s, 1), (s, 2)]) {
+        // 0 by key (E334), 1 by position, 2 by position with each
+        // document's best paragraph taken from the paragraphs the graph
+        // returned (a document with none gets the lowest of them).
+        let name = format!("graph-w{wef}-p{pk}{}", ["", "-at", "-hits"][at]);
         let (mut t_all, mut recall) = (0.0, 0.0);
+        // E337: time of each step, and candidates scored.
+        let mut phase = [0.0f64; 5];
+        let mut scored = (0usize, 0usize);
         for (i, (_, _, _, text, q)) in queries.iter().enumerate() {
             let t = Instant::now();
             let kw: Ranked = bm25
@@ -282,17 +315,51 @@ fn main() {
                 .into_iter()
                 .map(|(k, s)| (k.trim_start_matches("t/").to_string(), s))
                 .collect();
+            phase[0] += ms(t);
+            let s = Instant::now();
             let mut cands: BTreeSet<usize> = gw
                 .search(q, 100, wef)
                 .into_iter()
                 .map(|(k, _)| pos[&k[2..]])
                 .collect();
-            for (k, _) in gf.search(q, pk, pef) {
+            phase[1] += ms(s);
+            let s = Instant::now();
+            let mut hits: HashMap<usize, f32> = HashMap::new();
+            let mut floor = f32::MAX;
+            for (k, sc) in gf.search(q, pk, pef) {
                 let f: usize = k[2..].parse().unwrap();
                 cands.extend(&owner[f]);
+                floor = floor.min(sc);
+                for &d in &owner[f] {
+                    let e = hits.entry(d).or_insert(f32::MIN);
+                    *e = e.max(sc);
+                }
             }
-            let v = both_kept(&cands, q, &frags_of, &gf, &gw, &keys, (&fkeys, &wkeys));
+            phase[2] += ms(s);
+            let s = Instant::now();
+            scored.0 += cands.len();
+            if at < 2 {
+                scored.1 += cands.iter().map(|&d| frags_of[d].len()).sum::<usize>();
+            }
+            let v = match at {
+                0 => both_kept(&cands, q, &frags_of, &gf, &gw, &keys, (&fkeys, &wkeys)),
+                1 => both_at(&cands, q, &frags_of, &gf, &gw, &keys, (&fnodes, &wnodes)),
+                _ => top(
+                    cands
+                        .iter()
+                        .map(|&d| {
+                            let b = hits.get(&d).copied().unwrap_or(floor);
+                            let w = wnodes[d].and_then(|n| gw.score_at(q, n)).unwrap_or(0.0);
+                            (keys[d].clone(), 0.5 * b + 0.5 * w)
+                        })
+                        .collect(),
+                    100,
+                ),
+            };
+            phase[3] += ms(s);
+            let s = Instant::now();
             let _ = convex(&kw, &v, 0.6);
+            phase[4] += ms(s);
             t_all += ms(t);
             let e: BTreeSet<&String> = lists[i]["exact"].iter().take(10).map(|x| &x.0).collect();
             recall += v.iter().take(10).filter(|x| e.contains(&x.0)).count() as f64 / 10.0;
@@ -302,6 +369,16 @@ fn main() {
             "{{\"setting\":\"{name}\",\"paragraph_ef\":{pef},\"end_to_end_ms\":{:.3},\"recall10_vs_exact\":{:.3}}}",
             t_all / nq,
             recall / nq
+        );
+        println!(
+            "{{\"setting\":\"{name}\",\"ms\":{{\"bm25\":{:.3},\"docs_graph\":{:.3},\"paragraphs_graph\":{:.3},\"score_candidates\":{:.3},\"fuse\":{:.3}}},\"candidates\":{:.0},\"paragraphs_scored\":{:.0}}}",
+            phase[0] / nq,
+            phase[1] / nq,
+            phase[2] / nq,
+            phase[3] / nq,
+            phase[4] / nq,
+            scored.0 as f64 / nq,
+            scored.1 as f64 / nq
         );
         names.push(name);
     }
