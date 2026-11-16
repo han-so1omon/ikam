@@ -4877,3 +4877,16 @@ Gates on the branch (E229 to E233): every kernel test suite passes (release); cl
 - Not measured: the four history corpora (they need the old history, for example on a clone that kept it); the cost noise of a quiet machine; pilots as a ranking signal rather than a gate (the paper's use); real candidates in place of tunables.
 - Run: `python3 -I experiments/pilot-runs/drive.py` (about 3.5 hours here), then `python3 -I experiments/pilot-runs/analyze.py`; `cargo run --release --example net_night_plan`.
 - Gates on the branch: `cargo test --release` passes (291 tests); clippy `-D warnings` (all targets) and fmt clean; the privacy scan is clean.
+
+### E323 vector-views (the IVF vector view and the embedding cache on main's line)
+- Branch / parent: exp/323-vector-views / main at d80ba03 (E322)
+- Question: main has hybrid fusion (E312) but nothing to produce its vector list. The IVF view (E253) and the embedding cache (E255) live only on branches whose history does not share a root with main (exp/253 to exp/259 and the transformer reruns on exp/306-transformer-vector-views), so they cannot merge. Do they port to today's kernel unchanged, and what does a query cost?
+- Change (opt-in, nothing in the kernel calls them): `src/vectors.rs` (the IVF view: spherical k-means centroids, rows assigned to their nearest list, int8 codes packed in one content, search probing `nprobe` lists and rescoring the best `rescore` with the exact vectors from the database) and `src/embeds.rs` (the embedding cache keyed by model and fragment content id, and its row view), from exp/306-transformer-vector-views. Two edits: they use main's `put_derived` and `node_value` (now `pub(crate)`) in place of the branch's own copies, and the branch's `rrf` and `convex` are dropped since `src/fusion.rs` has them. `tests/vectors.rs` and `tests/embeds.rs` come over unchanged but for the fusion test, which `tests/fusion.rs` covers. `examples/vector_ivf.rs`: clustered unit vectors (64 topics) as rows, build, a 1% update, recall@10 against an exact scan.
+- Result (`cargo run --release --example vector_ivf -- 20000 256`, one 4-core cloud machine):
+  - Train (k-means, 141 lists, 8 rounds) 1.0 s, build 1.8 s, a 200-row update 0.49 s.
+  - recall@10 at rescore 100: nprobe 1 0.762, 2 0.954, 4 to 64 1.000. Query 11.9 ms at nprobe 1, 12.8 ms at 4, 29.9 ms at 64.
+  - At nprobe 4: rescore 10 gives recall 0.896 in 9.2 ms, 30 gives 1.000 in 9.7 ms, 100 14.2 ms, 300 22.4 ms.
+  - A query never costs less than about 9 ms here, whatever it probes: inferred from the code, not profiled, each query reads the centroids content and the whole code pack (20,000 x 256 bytes, one content per build) to score a few lists' codes. Synthetic clusters are easier than real text, so the recall figures are an upper bound; E325 measures real text.
+- Trade-off: none for callers who do not use it. Two modules and two tests added.
+- Verdict: **kept** (port, opt-in). The view and the cache work on main's line as they did on their own branch; the per-query floor is the next thing to fix.
+- Run: `cargo test --release --test vectors --test embeds`; `cargo run --release --example vector_ivf -- 20000 256`.
