@@ -80,7 +80,20 @@ fn code_dot(q: &[f32], code: &[u8]) -> f32 {
 /// `code_dot` with 16 independent sums added at the end (E327). The
 /// compiler may vectorize it, since the order of the additions is written
 /// out; the result can differ from `code_dot` in the last bits.
+///
+/// E339: on x86-64 with AVX2 the same loop runs compiled for AVX2 (wider
+/// registers, no fused multiply-add), so the result is the same bits.
 pub fn code_dot_lanes(q: &[f32], code: &[u8]) -> f32 {
+    #[cfg(target_arch = "x86_64")]
+    if std::arch::is_x86_feature_detected!("avx2") {
+        // Safety: AVX2 is present, checked just above.
+        return unsafe { avx2::code_dot_lanes(q, code) };
+    }
+    code_dot_lanes_body(q, code)
+}
+
+#[inline(always)]
+fn code_dot_lanes_body(q: &[f32], code: &[u8]) -> f32 {
     let mut acc = [0f32; 16];
     let (qs, cs) = (q.chunks_exact(16), code.chunks_exact(16));
     let tail: f32 = qs
@@ -97,8 +110,19 @@ pub fn code_dot_lanes(q: &[f32], code: &[u8]) -> f32 {
     acc.iter().sum::<f32>() + tail
 }
 
-/// `dot` with 16 independent sums (E327).
+/// `dot` with 16 independent sums (E327); with AVX2 as `code_dot_lanes`
+/// (E339), the same bits.
 pub fn dot_lanes(a: &[f32], b: &[f32]) -> f32 {
+    #[cfg(target_arch = "x86_64")]
+    if std::arch::is_x86_feature_detected!("avx2") {
+        // Safety: AVX2 is present, checked just above.
+        return unsafe { avx2::dot_lanes(a, b) };
+    }
+    dot_lanes_body(a, b)
+}
+
+#[inline(always)]
+fn dot_lanes_body(a: &[f32], b: &[f32]) -> f32 {
     let mut acc = [0f32; 16];
     let (xs, ys) = (a.chunks_exact(16), b.chunks_exact(16));
     let tail: f32 = xs
@@ -113,6 +137,21 @@ pub fn dot_lanes(a: &[f32], b: &[f32]) -> f32 {
         }
     }
     acc.iter().sum::<f32>() + tail
+}
+
+/// The lanes loops compiled for AVX2 only (not FMA: Rust never fuses a
+/// multiply and an add on its own, so each lane rounds as the portable loop).
+#[cfg(target_arch = "x86_64")]
+mod avx2 {
+    #[target_feature(enable = "avx2")]
+    pub(super) unsafe fn code_dot_lanes(q: &[f32], code: &[u8]) -> f32 {
+        super::code_dot_lanes_body(q, code)
+    }
+
+    #[target_feature(enable = "avx2")]
+    pub(super) unsafe fn dot_lanes(a: &[f32], b: &[f32]) -> f32 {
+        super::dot_lanes_body(a, b)
+    }
 }
 
 fn nearest(cents: &[f32], dim: usize, v: &[f32]) -> usize {
@@ -405,5 +444,48 @@ impl<S: Store> Repo<S> {
 
     pub fn ivf_load(&self, ivf: &Ivf, db: &Db) -> Result<IvfIndex, Error> {
         self.ivf_load_with(ivf, db, false)
+    }
+}
+
+#[cfg(test)]
+mod lanes_tests {
+    use super::*;
+
+    /// E339: the dispatched lanes loops give the bits of the portable ones,
+    /// for every length up to 300 (tails included) and extreme values.
+    #[test]
+    fn dispatched_lanes_match_portable_bits() {
+        let mut seed = 11u64;
+        let mut next = || {
+            seed = seed
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (seed >> 33) as u32
+        };
+        for len in 0..300 {
+            for round in 0..4 {
+                let f = |x: u32| match round {
+                    0 => (x % 2001) as f32 / 1000.0 - 1.0,
+                    1 => {
+                        f32::from_bits(x.rotate_left(7) & 0x7f7f_ffff)
+                            * if x & 1 == 0 { 1.0 } else { -1.0 }
+                    }
+                    _ => ((x % 2001) as f32 - 1000.0) * 1e-30,
+                };
+                let a: Vec<f32> = (0..len).map(|_| f(next())).collect();
+                let b: Vec<f32> = (0..len).map(|_| f(next())).collect();
+                let c: Vec<u8> = (0..len).map(|_| next() as u8).collect();
+                assert_eq!(
+                    dot_lanes(&a, &b).to_bits(),
+                    dot_lanes_body(&a, &b).to_bits(),
+                    "dot len {len} round {round}"
+                );
+                assert_eq!(
+                    code_dot_lanes(&a, &c).to_bits(),
+                    code_dot_lanes_body(&a, &c).to_bits(),
+                    "code len {len} round {round}"
+                );
+            }
+        }
     }
 }
