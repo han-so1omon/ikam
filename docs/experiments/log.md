@@ -4844,3 +4844,36 @@ Gates on the branch (E229 to E233): every kernel test suite passes (release); cl
 - Trade-off: dev builds lose wasmi's internal assertions, which release builds never had. A wasmi bug that only an assertion would catch now shows in neither.
 - Verdict: **kept** (fix).
 - Run: `cargo test --test exec` and `cargo test --release`.
+
+### E322 pilot-runs (a short bench before the full one: does its sign predict the full run's?)
+- Branch / parent: exp/322-pilot-runs / main at eecfe12 (E321)
+- Question: the second item of E283's queue. The loop could run a short pilot of the fixed bench before the full one, and stop a candidate the pilot says is worse. Does a pilot's sign predict the full run's verdict, what does it cost, and what does it buy a night of the loop (E287)?
+- Hypothesis: one corpus run alone predicts the sign of the score it belongs to well enough to stop most failing candidates early, without stopping ones the full runs keep. (Source: research preference models, arXiv 2608.13940, as read in E283: short pilot runs raised an agent's choice of what to run from 65-69% to 79-84% accuracy.)
+- Change: none in the kernel.
+  - `experiments/pilot-runs/drive.py`: 18 candidates, each one constant of a tunable the README names changed on its own: `STORE_LEVEL` 15 and 22, `MEASURE_LEVEL` 1 and 6, `STAR_CANDIDATES` 16 and 256, `GAP_DIFF` 256 and 4096, `DICT_SHORTLIST` 3, `MIN_MATCH` 48 and 192, the matcher's `MAX_CANDIDATES` 16, `GROUP_SIZE` 32 KiB, the group `SHORTLIST` 2, ingest `NEIGHBORS` 1, search `MAX_CHUNK` 4096, graph `MIN_CHUNK` 2048, the bench's `ARCHIVE_READS` 8. Each is built in release, run through the full command twice, then each corpus alone once as its pilot. The base gets two rounds (three full runs and two pilots per corpus each). One 4-core cloud machine with nothing else running.
+  - `experiments/pilot-runs/analyze.py`: each candidate's verdict by the keep rule against the pooled base runs; each pilot's change against the base pilots' median; signs (better, flat, worse); gates that stop a candidate when its pilot is worse than a threshold.
+  - `examples/net_night_plan.rs`: two plans with a pilot transition before the full bench (`4 in flight, pilot`, `2 cpus, 6, pilot`), fed with the numbers below. E287's plans, queue and numbers are unchanged.
+- Bench limit: four corpora (repo-history, repo-graph, structured, transcripts) are built from pinned commits that are not in the rewritten history, as for E265 and E266. "Full" here is the other seven cost corpora and the three north corpora, named on the command line. Base: cost 0.2433 (median of 5), north 0.3096.
+- Result (`python3 -I experiments/pilot-runs/analyze.py --exclude base/full2`):
+  - Noise: the base cost score over 5 runs is 0.2323 to 0.2499, up to 4.5% from its median (the README's spread is 2%). A sixth base run, 0.2743, overlapped a build of another example and is excluded. A cost corpus alone moves 9% (synthetic-history) to 25% (invoices) between runs of the same code. The north lines are deterministic.
+  - Full verdicts: 3 kept (`GAP_DIFF` 256 and 4096, `MIN_MATCH` 48: north -0.7% to -1.0%, cost within noise), 10 worse with the cost tolerance at this machine's 4.6% (12 at 2%), 5 hold. These are labels for scoring the pilots, not proposals: they were measured without the four history corpora, on a noisy machine. The three kept ones are candidates for experiments of their own.
+  - Signs: a cost corpus alone matches the cost score's sign on 11 to 15 of 18, no better than always guessing flat (12 of 18 at 2%, 14 at 4.6%). north/cases and north/multiformat match the north score's sign on 12 of 18 (always flat: 8); north/tables on 8.
+  - Gates (time saved against two full runs per candidate, 378 s, as the keep rule needs):
+
+  | Pilot | Time | Stop above | Stops | Worse caught (of 10) | Kept stopped (of 3) | Bench time saved |
+  |---|---|---|---|---|---|---|
+  | north/multiformat | 30 s | 0.5% | 9 | 7 | 1 | 42% |
+  | north/multiformat | 30 s | 1% | 8 | 7 | 0 | 36% |
+  | north/multiformat | 30 s | 2% | 7 | 6 | 0 | 31% |
+  | north/tables | 17 s | 0.5% | 6 | 3 | 2 | 29% |
+  | north/tables | 17 s | 1% | 2 | 2 | 0 | 6% |
+  | north/cases | 37 s | 0.5% | 2 | 2 | 0 | 1% |
+  | all three north corpora (the north score) | 85 s | 0.5% | 6 | 6 | 0 | 11% |
+  | md, at its own noise (17%) | 4.5 s | 17% | 4 | 1 | 0 | 21% |
+
+  - The north pilot misses the three candidates that are worse in cost only (`DICT_SHORTLIST` 3, `STAR_CANDIDATES` 256, `STORE_LEVEL` 22; north/multiformat 0.0%, 0.0%, -0.2%). Its one stop that was not worse was `MAX_CANDIDATES` 16 (hold). Three of md's four stops are holds: noise.
+  - Night plan (`cargo run --release --example net_night_plan`; the pilot at 30/378 of the bench, stopping 8 of 18, none wrongly): with the bench at 80% of each candidate, 4 in flight finishes 105 instead of 71 (44 of them answered at the pilot) and 2 cpus 150 instead of 141. With the bench at 20% or 50%, where the agent is the bottleneck, it gains nothing (100 instead of 104 at 50% with no decisions). With 25% needing the owner, 112 either way. Both pilot nights replay equal on an IKAM store.
+- Verdict: **kept as an option, off by default** (a measurement and two plans in an example; no kernel change). A pilot on one north corpus costs 8% of the two full runs and its result is deterministic, so it can stop north regressions early. A pilot on one cost corpus is noise on this machine and should stop nothing. Off by default because the sample is 18 candidates with 3 kept, so one wrong stop is a third of the keeps; the 1% threshold was chosen on the same 18 (0.5% stopped a keep); it never sees a regression in cost alone; and it pays only when the bench, not the agent, is the night's bottleneck, which E287 left unmeasured. For a bench-heavy night: north/multiformat, stop above 1%, and record each pilot beside its full run so the rule can be checked on real candidates.
+- Not measured: the four history corpora (they need the old history, for example on a clone that kept it); the cost noise of a quiet machine; pilots as a ranking signal rather than a gate (the paper's use); real candidates in place of tunables.
+- Run: `python3 -I experiments/pilot-runs/drive.py` (about 3.5 hours here), then `python3 -I experiments/pilot-runs/analyze.py`; `cargo run --release --example net_night_plan`.
+- Gates on the branch: `cargo test --release` passes (291 tests); clippy `-D warnings` (all targets) and fmt clean; the privacy scan is clean.
