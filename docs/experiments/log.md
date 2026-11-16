@@ -5048,3 +5048,26 @@ Gates on the branch (E229 to E233): every kernel test suite passes (release); cl
 - Verdict: **measured.** For finding a document by part of its content, score it by its best paragraph and its whole vector together: alone that gains 0.19 on known items and keeps topics, and fused with BM25 it is the best ranking measured here (0.836 on known-item test queries). Not a kernel option yet: a kernel version would be a vector view over fragments with documents scored at query time, worth building once a stronger embedder shows whether the gain holds.
 - Not measured: a transformer embedder (MiniLM or bge-small read at most a few hundred tokens, so their whole-README vector is a first-paragraph vector, inferred; model downloads are blocked here); weights other than the even mean of best paragraph and whole; the top k paragraphs instead of the best one.
 - Run: `cargo run --release --example fragment_vectors -- DIR` (DIR from `prepare.py`; not committed).
+
+### E331 ivf-routing (why the IVF needs so many lists on real vectors)
+- Branch / parent: exp/331-ivf-routing / exp/330-fragment-vectors (E330)
+- Question: on WordLlama vectors the IVF needs 64 of 106 lists for recall@10 0.99 (E326) and 128 of 613 for 0.93 (E330), where synthetic clusters needed 4 (E323). Is it the training (the kernel's callers use 20 sample rows a list and 8 rounds), or the vectors' geometry? Static models' vectors share a large common direction; does routing on mean-centred vectors help?
+- Hypothesis: both. Longer training on a larger sample evens the lists and raises recall at a fixed probe count. Centring the vectors before training and routing (scores still exact on the original vectors) spreads them over the sphere and raises recall per row scanned. (Source: E257, E326; the anisotropy of static and contextual embeddings, Ethayarajh, 2019, and mean-centring as a fix, Mu and Viswanath's "all-but-the-top", 2018.)
+- Change: none in the kernel. `examples/ivf_routing.rs`: in memory, outside the store, the kernel's `kmeans` and nearest-centroid rule; for each training setting, the share of each query's exact top 10 that lies in the lists it probes (the most any rescore can reach) and the rows those lists hold. Rows: E326's 11,384 README vectors (106 lists) and an even sample of 100,000 of E330's paragraph vectors (316 lists); the 1,130 E326 queries.
+- Result (share of the true top 10 in the probed lists, rows scanned in brackets; a 4-core cloud Xeon):
+
+  | Training | READMEs: 8 lists | 16 | 64 | Paragraphs: 8 lists | 16 | 64 | Train (READMEs / paragraphs) |
+  |---|---|---|---|---|---|---|---|
+  | 20 rows a list, 8 rounds (as now) | 0.670 (1,236) | 0.809 (2,444) | 0.987 (8,677) | 0.698 (3,790) | 0.764 (7,132) | 0.891 (25,659) | 0.6 s / 5.3 s |
+  | 100 rows a list, 20 rounds | 0.703 (1,013) | 0.828 (2,031) | 0.986 (7,822) | 0.748 (3,187) | 0.807 (6,154) | 0.909 (22,904) | 6.9 s / 59 s |
+  | Centred, 20 rows, 8 rounds | 0.527 (777) | 0.669 (1,568) | 0.944 (6,579) | 0.688 (2,791) | 0.747 (5,184) | 0.867 (18,981) | 0.6 s / 4.8 s |
+  | Centred, 100 rows, 20 rounds | 0.569 (751) | 0.713 (1,576) | 0.957 (6,722) | 0.734 (2,635) | 0.785 (5,040) | 0.887 (19,056) | 6.9 s / 60 s |
+
+  - The routing reproduces the kernel's IVF: 0.670 at 8 lists over READMEs, as E326 measured through the store.
+  - The geometry: READMEs sit at a mean cosine of 0.61 to their common mean (paragraphs 0.28), and the largest list holds 6.3 times the mean (paragraphs 9.1). Queries land in the large lists: at 64 of 106 lists the IVF scans 76% of the READMEs, so at this size it saves little over scanning them all.
+  - Longer training evens the lists (largest 3.8 and 5.4 times the mean) and gains up to 0.06 at a fixed probe count (0.02 to 0.06, except at 64 READMEs lists, where both reach 0.99) while scanning 10 to 18% fewer rows, for about 11 times the training time.
+  - Centring scans fewer rows a list but finds less: over READMEs it loses at every probe count, and over paragraphs it matches uncentred training at the same rows scanned (0.785 at 5,040 rows against about 0.78 interpolated). The hypothesis's second part does not hold.
+- Trade-off: training is a caller's choice (`kmeans(sample, k, iters)`), nothing to change in the kernel; 100 rows a list and 20 rounds cost a minute at 100,000 rows, once per index.
+- Verdict: **measured.** Train IVF centroids on about 100 rows a list for about 20 rounds for vectors like these; do not centre. With a static embedder the lists stay uneven and queries fall in the big ones, so below about 20,000 rows scan everything (E326: 1.5 ms at 11,384), and above it expect to probe 10 to 20% of the lists for recall 0.8 to 0.9. A graph index (HNSW, E257: 0.94 at ef 128 on 100,000 paragraphs) is the next thing to try for this case, not more IVF tuning.
+- Not measured: k-means++ seeding; more lists than sqrt(N); a transformer embedder's geometry.
+- Run: `cargo run --release --example ivf_routing -- DIR` and `-- DIR 100000` (DIR from `prepare.py`).
