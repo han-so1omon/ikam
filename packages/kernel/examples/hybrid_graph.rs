@@ -113,10 +113,10 @@ fn main() {
     let mut owner: Vec<Vec<usize>> = vec![Vec::new(); fvec.len()];
     for (d, (_, paras)) in docs.iter().enumerate() {
         for p in paras {
-            if let Some(&f) = index.get(p.as_str()) {
-                if owner[f].last() != Some(&d) {
-                    owner[f].push(d);
-                }
+            if let Some(&f) = index.get(p.as_str())
+                && owner[f].last() != Some(&d)
+            {
+                owner[f].push(d);
             }
         }
     }
