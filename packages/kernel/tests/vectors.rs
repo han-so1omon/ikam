@@ -76,8 +76,11 @@ fn ivf_view_is_exact_when_probing_all_and_updates_like_a_build() {
         let got = repo.ivf_search(&ivf, &db, &q, 5, 8, 1000).unwrap();
         // E325: the loaded index returns the same rows, with and without
         // vectors kept, also when it probes and rescores fewer.
-        for keep in [false, true] {
-            let loaded = repo.ivf_load_with(&ivf, &db, keep).unwrap();
+        for (keep, lanes) in [(false, false), (true, false), (false, true), (true, true)] {
+            let loaded = repo
+                .ivf_load_with(&ivf, &db, keep)
+                .unwrap()
+                .with_lanes(lanes);
             let l = loaded.search(&repo, &db, &q, 5, 8, 1000).unwrap();
             assert_eq!(
                 l.iter().map(|g| &g.0).collect::<Vec<_>>(),
