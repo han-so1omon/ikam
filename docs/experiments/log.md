@@ -5184,3 +5184,18 @@ Gates on the branch (E229 to E233): every kernel test suite passes (release); cl
 - Verdict: **kept, not an option** (no trade-off). Reading a row by key is about 3 times faster without the read cache and about 3 times with it. Every read of graph chunks and compressed contents gains; nothing else changes.
 - Not measured: an on-disk store (`FsStore`), where the file read adds its own cost; reuse of compression contexts on write (next: about a fifth of the write time at 20,000 rows was setting up a compressor); an Apple silicon run.
 - Run: `cargo run --release --example point_reads -- 100000` (`CACHE=0` or `CACHE=1` for one pass); `IVF=0 CODES=1 RESCORE=50 THREADS=4 MS=16 cargo run --release --example hnsw_graph -- DIR 100000`.
+
+### E336 write-ctx (one zstd compressor per thread for what ingest writes)
+- Branch / parent: exp/336-write-ctx / exp/335-point-reads (E335)
+- Question: E335's profile of building 20,000 rows put about a fifth of the append in zstd compression, most of it setting up a compressor for every frame. Does keeping one compressor per thread speed up writes, and does it write the same bytes?
+- Hypothesis: yes, for the many small frames an append writes (graph chunks, values); the frames are the same, since zstd starts each frame afresh. (Source: E335; E336's own profile at 20,000 rows.)
+- Change: `zstd_frame` at `MEASURE_LEVEL` (3, what ingest writes) without a dictionary takes a kept compressor from the thread, and puts it back after (a frame inside a frame gets its own). Other levels (repack's 19) and dictionaries still make one per frame: a level-19 context can hold tens of MB. Test `kept_framer_writes_what_a_new_one_writes`: 200 frames of 0 to 1 MB, in mixed order, are byte for byte those of a new compressor and decode back. `point_reads` also prints what a kept context holds.
+- Result (a 4-core cloud Xeon; two runs each, before / after):
+  - `db_append_cost 10 2000` (20,000 row events in memory): 5.0 to 5.3 s before, 2.8 to 3.6 s after; stored 5.8 MB both.
+  - `db_write_path` (a pack store on disk holding a database, one-row appends as `ikam db serve` writes them): the append p50 2.6 to 3.0 ms before, 1.4 to 2.0 ms after; with the commit, p50 3.9 to 4.4 ms before, 2.4 to 3.4 ms after (p95 5.6 to 6.1, 3.3 to 4.6); store 68.3 MB both.
+  - `point_reads 100000` (100,000 rows of 1 KB in one append): 7.2 to 7.3 s before, 4.7 to 5.3 s after.
+  - A kept level-3 compressor holds about 530 KB after a 32 KB frame (`CCtx::sizeof`); E335's kept decompressor about 94 KB.
+- Trade-off: about 0.5 MB kept by each thread that writes (more after larger frames, until zstd shrinks an oversized context); the same bytes are stored.
+- Verdict: **kept, not an option**: writes are 30 to 45% faster for half a megabyte a writing thread. If that memory matters on some host, it is one line to make it an option.
+- Not measured: repack at level 19 with a kept context (bigger, and runs rarely); dictionary frames; an Apple silicon run.
+- Run: `cargo run --release --example db_append_cost -- 10 2000`; `cargo run --release --example db_write_path -- DIR` (DIR must not exist); `CACHE=0 cargo run --release --example point_reads -- 100000`.

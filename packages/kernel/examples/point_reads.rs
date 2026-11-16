@@ -192,6 +192,22 @@ fn main() {
             report(&tag("graph_nodes_in x50"), cache, probe.len(), t);
         }
     }
+    // What a kept zstd context holds after a chunk-sized frame (E335, E336).
+    let sample: Vec<u8> = (0..8192u32).flat_map(|i| (i % 251).to_be_bytes()).collect();
+    let mut cctx = zstd::zstd_safe::CCtx::create();
+    cctx.set_parameter(zstd::zstd_safe::CParameter::CompressionLevel(3))
+        .unwrap();
+    let mut frame = Vec::with_capacity(sample.len() + 1024);
+    cctx.compress2(&mut frame, &sample).unwrap();
+    let mut dctx = zstd::zstd_safe::DCtx::create();
+    let mut back = Vec::with_capacity(sample.len());
+    dctx.decompress(&mut back, &frame).unwrap();
+    assert_eq!(back, sample);
+    println!(
+        "{{\"zstd_kept_bytes\":{{\"compress_level3\":{},\"decompress\":{}}}}}",
+        cctx.sizeof(),
+        dctx.sizeof()
+    );
     // Hashing: what verifying those bytes costs, per KB.
     for size in [1024usize, 4096, 16384, 65536] {
         let buf = vec![7u8; size];
