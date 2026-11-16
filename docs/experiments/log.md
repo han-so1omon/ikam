@@ -5024,3 +5024,27 @@ Gates on the branch (E229 to E233): every kernel test suite passes (release); cl
 - Verdict: **kept**, both opt-in. `Bm25Live` for rows that change often; `Bm25View` where updates are rare and queries short; E324's loaded index where queries dominate.
 - Not measured: merging in the background while queries use the old base; a delta folded by term rather than whole; the store encoding behind the 7 to 15 ms spread; stemming.
 - Run: `cargo test --release --test bm25`; `cargo run --release --example bm25_view` (synthetic) and `-- DIR` (E326's data).
+
+### E330 fragment-vectors (a README found by its best paragraph)
+- Branch / parent: exp/330-fragment-vectors / exp/329-bm25-view (E329)
+- Question: E258 found one vector of a whole README and the mean of its paragraphs' vectors rank alike, both weak on known items (0.52 against BM25's 0.80). The embedding cache (E255, E323) already holds a vector a paragraph. Does scoring a document by its best paragraph find it better, alone and fused with BM25, and can the loaded IVF (E325) serve 33 times as many rows?
+- Hypothesis: a static model averages a long README into a vector near the collection's centre, so a query that paraphrases one part of it matches that part's paragraph far better than the whole. Known items gain; topic queries, which name what a whole project is about, gain less or lose. (Source: E258's whole-against-mean result; scoring a document by its best passage, as in max-passage retrieval and ColBERT's late interaction, Khattab and Zaharia, 2020.)
+- Change: none in the kernel. `examples/fragment_vectors.rs` over E326's data: every distinct paragraph (376,619) is a row `f/N` with its WordLlama vector, BM25 over the READMEs' text, an IVF over `f/` (613 lists, vectors kept, lanes on). Per query, documents ranked by: the whole README's vector, the mean of its paragraphs (E258), its best paragraph (the top 2,000 paragraphs over all rows, exactly or through the IVF at 16 to 128 lists, each document scored by the best of its own among them), and the mean of best paragraph and whole README (`best+whole`, over the two lists' top 100s). Each alone and fused with BM25 by convex.
+- Result (nDCG@10, dev / test; standard errors about 0.015 to 0.020 on known items, 0.011 to 0.020 on topics; a 4-core cloud Xeon):
+
+  | Vectors | Alone, known item | Convex 0.6, known item | Alone, topic | Convex 0.5, topic |
+  |---|---|---|---|---|
+  | (BM25 alone) | 0.796 / 0.802 | | 0.128 / 0.106 | |
+  | Whole README | 0.528 / 0.535 | 0.816 / 0.818 | 0.122 / 0.107 | 0.147 / 0.129 |
+  | Mean of paragraphs | 0.543 / 0.540 | 0.820 / 0.825 | 0.109 / 0.117 | 0.141 / 0.146 |
+  | Best paragraph | 0.687 / 0.694 | 0.829 / 0.833 | 0.060 / 0.067 | 0.100 / 0.101 |
+  | Best paragraph and whole, mean | 0.719 / 0.732 | 0.825 / 0.836 | 0.111 / 0.111 | 0.136 / 0.136 |
+  | Best paragraph, IVF at 64 of 613 lists | 0.655 / 0.649 | 0.824 / 0.827 | 0.060 / 0.063 | 0.099 / 0.099 |
+
+  - Alone, a document's best paragraph finds known items 0.16 better than its whole vector (about eight standard errors), and with the whole vector added 0.19 to 0.20 better. Fused with BM25 the gain shrinks to 0.01 to 0.02 (about one standard error): BM25 already finds most known items.
+  - On topics the best paragraph alone halves the score (0.06 against 0.12) and drags fusion down by 0.03 to 0.05: a topic matches what a project is about, which one paragraph rarely says. Adding the whole vector back keeps topics within a standard error of the whole vector alone.
+  - Costs: exact best paragraph 66 ms a query (376,619 rows scored). The IVF: build 108 s, load 10 to 11 s, about 480 MB in memory with vectors kept (inferred from the row sizes); document recall@10 against exact 0.80, 0.85, 0.89 and 0.93 at 16, 32, 64 and 128 lists, 7.3, 8.6, 12.0 and 19.9 ms a query. Rows took 36 to 38 s to append.
+- Trade-off: 33 times as many vectors to embed, store and index (the cache holds them already where fragments are embedded); queries 5 to 10 times slower than over whole READMEs. Best paragraph alone is worse for broad queries, so it should not replace the whole vector.
+- Verdict: **measured.** For finding a document by part of its content, score it by its best paragraph and its whole vector together: alone that gains 0.19 on known items and keeps topics, and fused with BM25 it is the best ranking measured here (0.836 on known-item test queries). Not a kernel option yet: a kernel version would be a vector view over fragments with documents scored at query time, worth building once a stronger embedder shows whether the gain holds.
+- Not measured: a transformer embedder (MiniLM or bge-small read at most a few hundred tokens, so their whole-README vector is a first-paragraph vector, inferred; model downloads are blocked here); weights other than the even mean of best paragraph and whole; the top k paragraphs instead of the best one.
+- Run: `cargo run --release --example fragment_vectors -- DIR` (DIR from `prepare.py`; not committed).
