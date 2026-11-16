@@ -74,6 +74,22 @@ fn ivf_view_is_exact_when_probing_all_and_updates_like_a_build() {
         want.sort_by(|a, b| b.1.total_cmp(&a.1));
         want.truncate(5);
         let got = repo.ivf_search(&ivf, &db, &q, 5, 8, 1000).unwrap();
+        // E325: the loaded index returns the same rows, with and without
+        // vectors kept, also when it probes and rescores fewer.
+        for keep in [false, true] {
+            let loaded = repo.ivf_load_with(&ivf, &db, keep).unwrap();
+            let l = loaded.search(&repo, &db, &q, 5, 8, 1000).unwrap();
+            assert_eq!(
+                l.iter().map(|g| &g.0).collect::<Vec<_>>(),
+                got.iter().map(|g| &g.0).collect::<Vec<_>>()
+            );
+            let few = repo.ivf_search(&ivf, &db, &q, 5, 2, 20).unwrap();
+            let lf = loaded.search(&repo, &db, &q, 5, 2, 20).unwrap();
+            assert_eq!(
+                lf.iter().map(|g| &g.0).collect::<Vec<_>>(),
+                few.iter().map(|g| &g.0).collect::<Vec<_>>()
+            );
+        }
         assert_eq!(
             got.iter().map(|g| &g.0).collect::<Vec<_>>(),
             want.iter().map(|w| &w.0).collect::<Vec<_>>(),

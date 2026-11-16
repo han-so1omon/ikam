@@ -4909,3 +4909,27 @@ Gates on the branch (E229 to E233): every kernel test suite passes (release); cl
 - Verdict: **kept**, opt-in. BM25 in the kernel ranks as well as the Tantivy configuration that E258 and E259 measured, with no dependency, so hybrid ranking can run without the `search-tantivy` feature.
 - Not measured: stemming; BM25 over fragments rather than whole rows; collections over 100,000 rows.
 - Run: `cargo test --release --test bm25`; `cargo run --release --example hybrid_kernel -- DIR` (exp/326-hybrid-kernel; DIR from `prepare.py`, not committed).
+### E325 ivf-loaded (a vector index loaded once for repeated queries)
+- Branch / parent: exp/325-ivf-loaded / exp/324-bm25 (E324; E323 below it)
+- Question: E323 found every IVF query costs about 9 ms at 20,000 rows whatever it probes. Where does it go, and what does loading the index once buy?
+- Hypothesis: the floor is reading the whole code pack and the centroids on every query (E323, from the code). A loaded index (centroids, each list's rows and codes in memory) leaves only the rescore's row reads; keeping the rows' exact vectors in memory too leaves nothing to read. (Source: E323's floor; the same split as `SearchIndex`, which is loaded once and queried many times.)
+- Change (opt-in): `vectors::IvfIndex`, from `Repo::ivf_load(&ivf, &db)` or `ivf_load_with(&ivf, &db, true)` (exact vectors kept). `IvfIndex::search` returns what `ivf_search` returns. `tests/vectors.rs` checks both forms against `ivf_search` after every round of updates, at full and at small probe and rescore. `examples/vector_ivf.rs` adds the loaded queries.
+- Result (`cargo run --release --example vector_ivf -- ROWS 256`, clustered synthetic unit vectors, 50 queries, mean ms a query):
+
+  | Rows | Form | Load | nprobe 4, rescore 10 | nprobe 4, rescore 100 | nprobe 64, rescore 100 |
+  |---|---|---|---|---|---|
+  | 20,000 | view (`ivf_search`) | none | 8.5 | 14.0 | 28.5 |
+  | 20,000 | loaded | 26 ms | 1.12 | 6.8 | 7.8 |
+  | 20,000 | loaded, vectors kept | 483 ms | 0.42 | 0.51 | 2.0 |
+  | 100,000 | view | none | 36.1 | 39.7 | 82.4 |
+  | 100,000 | loaded | 150 ms | 2.2 | 7.4 | 11.9 |
+  | 100,000 | loaded, vectors kept | 2.5 s | 1.55 | 1.25 | 4.8 |
+
+  - Results are the same rows in each form (the test checks it); recall@10 at nprobe 4 is 0.988 at 100,000 (0.870 at rescore 10).
+  - Without kept vectors, the rescore's row reads cost about 60 us a row (6.8 ms for 100 at 20,000).
+  - Memory: codes are `dim` bytes a row (25.6 MB at 100,000 x 256); kept vectors add 4 x `dim` (102 MB).
+  - Seen on the way, not part of this hypothesis: `ivf_update` of 1% of the rows took 0.51 s at 20,000 and 11.3 s at 100,000, against a build of 1.7 s and 13.3 s. An update that touches scattered rows rewrites most of the lists graph's chunks.
+- Trade-off: a loaded index is a snapshot: after a database update the caller loads again (150 ms at 100,000 without vectors). Kept vectors trade 4 bytes a dimension a row of memory and a 17x longer load for a further 2 to 6x.
+- Verdict: **kept** as an option. Load once for any caller that queries more than a few times; keep vectors where memory allows.
+- Next: why a 1% update costs most of a build (graph edits or the chunk writes' planning), and E326's real-text measurement.
+- Run: `cargo test --release --test vectors`; `cargo run --release --example vector_ivf -- 20000 256` and `-- 100000 256`.
