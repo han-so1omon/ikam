@@ -301,23 +301,58 @@ pub(crate) fn unzstd_prefix(frame: &[u8], dict: &[u8], limit: usize) -> Option<V
     unzstd_prefix_with(frame, Dict::Raw(dict), limit)
 }
 
+thread_local! {
+    /// A decompression context kept between reads on this thread (E335):
+    /// creating one per read cost more than decoding a small chunk.
+    static DCTX: std::cell::Cell<Option<zstd::zstd_safe::DCtx<'static>>> =
+        const { std::cell::Cell::new(None) };
+}
+
 pub(crate) fn unzstd_prefix_with(frame: &[u8], dict: Dict, limit: usize) -> Option<Vec<u8>> {
-    use zstd::zstd_safe::{DCtx, DParameter, FrameFormat, InBuffer, OutBuffer};
-    let mut ctx = DCtx::create();
-    ctx.set_parameter(DParameter::Format(FrameFormat::Magicless))
-        .ok()?;
+    use zstd::zstd_safe::{DCtx, DParameter, FrameFormat, ResetDirective};
+    let magicless = DParameter::Format(FrameFormat::Magicless);
     match dict {
-        Dict::Raw([]) => {}
-        Dict::Raw(raw) => drop(ctx.load_dictionary(raw).ok()?),
-        Dict::Prepared(ddict) => drop(ctx.ref_ddict(ddict).ok()?),
+        Dict::Prepared(ddict) => {
+            let mut ctx = DCtx::create();
+            ctx.set_parameter(magicless).ok()?;
+            ctx.ref_ddict(ddict).ok()?;
+            unzstd_stream(&mut ctx, frame, limit)
+        }
+        Dict::Raw(raw) => {
+            // Taken out while in use, so a read inside a read gets its own.
+            let mut ctx = DCTX.take().unwrap_or_else(DCtx::create);
+            // Clears the last read's state and dictionary.
+            ctx.reset(ResetDirective::SessionAndParameters).ok()?;
+            ctx.set_parameter(magicless).ok()?;
+            if !raw.is_empty() {
+                ctx.load_dictionary(raw).ok()?;
+            }
+            let out = unzstd_stream(&mut ctx, frame, limit);
+            DCTX.set(Some(ctx));
+            out
+        }
     }
-    // Stream until the frame ends or `limit` bytes are out.
-    let (mut out, mut input, mut chunk) = (Vec::new(), InBuffer::around(frame), [0u8; 1 << 16]);
+}
+
+fn unzstd_stream(
+    ctx: &mut zstd::zstd_safe::DCtx<'_>,
+    frame: &[u8],
+    limit: usize,
+) -> Option<Vec<u8>> {
+    use zstd::zstd_safe::{InBuffer, OutBuffer};
+    // Stream until the frame ends or `limit` bytes are out, straight into
+    // `out`'s spare room (E335: zeroing a 64 KB step buffer on every read
+    // cost more than decompressing a small chunk).
+    let mut input = InBuffer::around(frame);
+    let mut out: Vec<u8> = Vec::with_capacity((frame.len() * 4).clamp(256, 1 << 16));
     while out.len() < limit {
-        let mut buf = OutBuffer::around(&mut chunk[..]);
+        if out.capacity() - out.len() < 256 {
+            out.reserve(out.capacity().min(1 << 20));
+        }
+        let pos = out.len();
+        let mut buf = OutBuffer::around_pos(&mut out, pos);
         let left = ctx.decompress_stream(&mut buf, &mut input).ok()?;
-        let n = buf.pos();
-        out.extend_from_slice(&chunk[..n]);
+        let n = buf.pos() - pos;
         if left == 0 {
             break; // the frame is complete
         }
