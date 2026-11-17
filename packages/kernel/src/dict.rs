@@ -207,7 +207,22 @@ pub(crate) fn names(prefix: &[u8], id: &Id) -> bool {
 /// fields would only repeat what is known (up to ~10 B per stored object).
 /// `dict` empty means no dictionary.
 pub(crate) fn zstd_frame(bytes: &[u8], dict: &[u8], level: i32) -> Option<Vec<u8>> {
-    framer_at(dict, level)?.compress(bytes).ok()
+    if !dict.is_empty() || level != MEASURE_LEVEL {
+        return framer_at(dict, level)?.compress(bytes).ok();
+    }
+    // E336: what ingest writes reuses one compressor per thread; setting
+    // one up cost more than compressing a small chunk. Taken out while in
+    // use, so a frame inside a frame gets its own.
+    let mut c = FRAMER.take().or_else(|| framer_at(&[], level))?;
+    let out = c.compress(bytes).ok();
+    FRAMER.set(Some(c));
+    out
+}
+
+thread_local! {
+    /// `zstd_frame`'s compressor at `MEASURE_LEVEL` without a dictionary.
+    static FRAMER: std::cell::Cell<Option<zstd::bulk::Compressor<'static>>> =
+        const { std::cell::Cell::new(None) };
 }
 
 /// zstd level for estimates (growing groups, scoring dictionaries, comparing
@@ -812,6 +827,29 @@ impl<S: Store> Repo<S> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// E336: frames from the kept compressor are byte for byte the frames
+    /// of a new one, in any order of sizes, and decode back.
+    #[test]
+    fn kept_framer_writes_what_a_new_one_writes() {
+        let mut seed = 11u64;
+        for round in 0..200usize {
+            seed = seed
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            let len = [0, 1, 300, 4096, 70_000, 1 << 20][round % 6] + (seed >> 50) as usize;
+            let bytes: Vec<u8> = (0..len)
+                .map(|i| ((i as u64 * (seed | 1)) >> 7) as u8 % 37)
+                .collect();
+            let fresh = framer_at(&[], MEASURE_LEVEL)
+                .unwrap()
+                .compress(&bytes)
+                .unwrap();
+            let kept = zstd_frame(&bytes, &[], MEASURE_LEVEL).unwrap();
+            assert_eq!(kept, fresh, "round {round}, {len} bytes");
+            assert_eq!(unzstd_frame(&kept, &[]).unwrap(), bytes);
+        }
+    }
 
     /// Above `slow_codec_max`, brotli is not tried (E109).
     #[test]
