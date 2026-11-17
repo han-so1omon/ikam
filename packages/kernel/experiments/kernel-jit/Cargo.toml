@@ -1,0 +1,24 @@
+# E341: compiled modes for the kernel's data-parallel loops (one query
+# scored against many rows, and k-means assignment, a matrix product),
+# where compiling could pay more than in a net's step (E311). A separate
+# crate so the kernel's own builds and tests do not compile Cranelift.
+[package]
+name = "kernel-jit"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[workspace]
+
+[dependencies]
+ikam-kernel = { path = "../.." }
+cranelift-codegen = "=0.137.1"
+cranelift-frontend = "=0.137.1"
+cranelift-jit = "=0.137.1"
+cranelift-module = "=0.137.1"
+cranelift-native = "=0.137.1"
+libc = "=0.2.189"
+tempfile = "3.27.0"
+
+[profile.release]
+debug = false

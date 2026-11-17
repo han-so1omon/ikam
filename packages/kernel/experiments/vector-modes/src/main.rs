@@ -264,7 +264,13 @@ fn build(
     let lib = |name: &str, fast: bool| {
         let so = dir.join(name);
         let mut cmd = Command::new("clang");
-        cmd.args(["-O3", "-march=native", "-shared", "-fPIC", "-o"])
+        // E341: Apple's clang names the host CPU with -mcpu on arm64.
+        let cpu = if cfg!(target_arch = "x86_64") {
+            "-march=native"
+        } else {
+            "-mcpu=native"
+        };
+        cmd.args(["-O3", cpu, "-shared", "-fPIC", "-o"])
             .arg(&so)
             .arg(&c);
         if fast {
