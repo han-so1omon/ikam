@@ -839,7 +839,7 @@ mod tests {
                 .wrapping_add(1442695040888963407);
             let len = [0, 1, 300, 4096, 70_000, 1 << 20][round % 6] + (seed >> 50) as usize;
             let bytes: Vec<u8> = (0..len)
-                .map(|i| ((i as u64 * (seed | 1)) >> 7) as u8 % 37)
+                .map(|i| (((i as u64).wrapping_mul(seed | 1)) >> 7) as u8 % 37)
                 .collect();
             let fresh = framer_at(&[], MEASURE_LEVEL)
                 .unwrap()
