@@ -7,7 +7,9 @@
 //!
 //! DIR is what `prepare.py` writes (see `hybrid_kernel` and
 //! `fragment_vectors`). Nothing from it is committed. `THREADS=n` builds
-//! the graphs on n threads (default 4).
+//! the graphs on n threads (default 4); `CODES=1` keeps int8 codes in
+//! them (E334). The graph settings score candidates from the graphs'
+//! own rows; the exact reference from the example's copy.
 
 use std::collections::{BTreeSet, HashMap};
 use std::time::Instant;
@@ -76,12 +78,38 @@ fn both(
     top(scored, 100)
 }
 
+/// `both` with each score as a graph keeps it (E334: from codes, with
+/// `CODES=1`), so no second copy of the vectors is needed.
+fn both_kept(
+    cands: &BTreeSet<usize>,
+    q: &[f32],
+    frags_of: &[Vec<usize>],
+    gf: &HnswIndex,
+    gw: &HnswIndex,
+    keys: &[String],
+    names: (&[String], &[String]),
+) -> Ranked {
+    let scored = cands
+        .iter()
+        .map(|&d| {
+            let b = frags_of[d]
+                .iter()
+                .filter_map(|&f| gf.score(q, &names.0[f]))
+                .fold(f32::MIN, f32::max);
+            let w = gw.score(q, &names.1[d]).unwrap_or(0.0);
+            (keys[d].clone(), 0.5 * b + 0.5 * w)
+        })
+        .collect();
+    top(scored, 100)
+}
+
 fn main() {
     let dir = std::env::args().nth(1).expect("DIR");
     let threads: usize = std::env::var("THREADS")
         .ok()
         .and_then(|t| t.parse().ok())
         .unwrap_or(4);
+    let codes = std::env::var("CODES").as_deref() == Ok("1");
     let docs: Vec<(String, Vec<String>)> = std::fs::read_to_string(format!("{dir}/docs.tsv"))
         .unwrap()
         .lines()
@@ -171,7 +199,8 @@ fn main() {
                 prefix,
                 HnswIndex::new(dim, 16, 100)
                     .with_lanes(true)
-                    .with_threads(threads),
+                    .with_threads(threads)
+                    .with_codes(codes),
             )
             .unwrap();
         (g, ms(t))
@@ -179,7 +208,7 @@ fn main() {
     let (mut gw, gw_ms) = graph(&mut repo, "w/");
     let (mut gf, gf_ms) = graph(&mut repo, "f/");
     println!(
-        "{{\"docs\":{},\"paragraphs\":{},\"queries\":{},\"threads\":{threads},\"graph_docs_build_ms\":{gw_ms:.0},\"graph_paragraphs_build_ms\":{gf_ms:.0}}}",
+        "{{\"docs\":{},\"paragraphs\":{},\"queries\":{},\"threads\":{threads},\"codes\":{codes},\"graph_docs_build_ms\":{gw_ms:.0},\"graph_paragraphs_build_ms\":{gf_ms:.0}}}",
         docs.len(),
         fvec.len(),
         queries.len()
@@ -239,6 +268,9 @@ fn main() {
         t_bm25 / nq,
         t_exact / nq
     );
+    // Row keys of each paragraph and README, made once.
+    let fkeys: Vec<String> = (0..fvec.len()).map(|f| format!("f/{f:07}")).collect();
+    let wkeys: Vec<String> = keys.iter().map(|k| format!("w/{k}")).collect();
     let mut names = vec!["exact".to_string()];
     for &(wef, pk, pef) in &settings {
         let name = format!("graph-w{wef}-p{pk}");
@@ -259,7 +291,7 @@ fn main() {
                 let f: usize = k[2..].parse().unwrap();
                 cands.extend(&owner[f]);
             }
-            let v = both(&cands, q, &frags_of, &fvec, &whole, &keys);
+            let v = both_kept(&cands, q, &frags_of, &gf, &gw, &keys, (&fkeys, &wkeys));
             let _ = convex(&kw, &v, 0.6);
             t_all += ms(t);
             let e: BTreeSet<&String> = lists[i]["exact"].iter().take(10).map(|x| &x.0).collect();

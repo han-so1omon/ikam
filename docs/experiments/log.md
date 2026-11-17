@@ -5123,3 +5123,39 @@ Gates on the branch (E229 to E233): every kernel test suite passes (release); cl
 - Verdict: **measured.** The recommended semantic search for READMEs like these is BM25 fused at convex 0.6 with best paragraph plus whole, both lists from graphs at the smallest setting (README ef 80, 100 paragraphs): known items 0.83 (BM25 0.80), topics kept, about 9 ms a query at 376,619 paragraphs on this machine.
 - Not measured: the rescore from the graph's own vectors (it holds them; the example keeps a second copy); a transformer embedder (E306's vectors) in the same pipeline; an Apple silicon run.
 - Run: `cargo run --release --example hybrid_graph -- DIR` (DIR from `prepare.py`).
+
+### E334 hnsw-codes (a graph index that keeps int8 codes, a quarter of the memory)
+- Branch / parent: exp/334-hnsw-codes / exp/333-hybrid-graph (E333)
+- Question: E332's loaded graph keeps every row's f32 vector: 386 MB at 376,619 paragraphs of 256 dimensions, for a service that runs on the owner's own machine. With each row kept as E253's int8 code instead (96 MB), how much recall is lost, does a rescore of the best rows from the store win it back and at what cost, and does E333's full ranking hold?
+- Hypothesis: the walk reaches the same nodes (codes keep the order of near neighbours well), the final order loses a little where scores lie within quantization error, a rescore of the best 50 restores it, and fusion with BM25 hides the rest.
+- Change: `src/hnsw.rs`, both opt-in:
+  - `HnswIndex::with_codes(true)` (off by default; set on an empty index): rows kept as int8 codes; a query scores codes against the f32 query, links are chosen by code-to-code dot products (exact in i32). The stored graph records which kind it is; a removed row keeps its code there.
+  - `Repo::hnsw_search_rescored(index, db, q, k, ef, rescore)`: the best `rescore` rows rescored with their exact vectors read from the database; `HnswIndex::score(q, key)`: a row's score as the index keeps it.
+  - `tests/hnsw.rs`: a graph of codes, built on 2 threads, rescored: exact scores, recall above 0.95, stored and loaded the same, recall above 0.93 after upserts and removals.
+  - `examples/hnsw_graph.rs` gains `CODES=1`, `RESCORE=n` (0: none), `IVF=0` and `READ_CACHE=bytes`; `examples/hybrid_graph.rs` gains `CODES=1` and scores candidates from the graphs' own rows instead of a second copy.
+- Result (recall@10 against an exact scan, m 16, lanes, 4 threads; a 4-core cloud Xeon):
+
+  | Rows | Kept | ef 80: recall, ms | ef 160 | ef 320 | Build |
+  |---|---|---|---|---|---|
+  | 100,000 | vectors (E332) | 0.930, 0.45 | 0.962, 0.76 | 0.979, 1.34 | 25 s |
+  | 100,000 | codes | 0.908, 0.30 | 0.938, 0.55 | 0.953, 1.03 | 29 s |
+  | 100,000 | codes, best 50 rescored from the store | 0.930, 4.6 | 0.963, 5.4 | 0.980, 5.2 | |
+  | 376,619 | vectors (E332) | 0.902, 0.56 | 0.934, 1.03 | 0.962, 1.83 | 110 s |
+  | 376,619 | codes | 0.875, 0.50 | 0.908, 0.87 | 0.933, 1.67 | 133 s |
+
+  - The walk with codes scores exactly as many vectors as with f32 vectors (1,489 at ef 80) and the rescore gives back the same recall, within 0.001, so codes lose only in the final order: 0.02 to 0.03 of recall at every beam.
+  - The rescore costs about 85 µs a row read from the store (50 rows, 4.3 ms); with E294's read cache it is 36 µs (2.1 ms at ef 80), but the cache then holds the vectors codes were meant to drop. Reading a row by key from this store is the cost to look at next, not the graph.
+  - E333's full ranking with both graphs keeping codes, candidates scored from the codes (11,384 READMEs, 376,619 paragraphs; nDCG@10):
+
+    | Vectors | Known items dev / test, convex 0.6 | Topics dev / test, convex 0.5 | Top 10 vs exact |
+    |---|---|---|---|
+    | Exact scans (E330) | 0.825 / 0.836 | 0.136 / 0.136 | 1.000 |
+    | Graphs with vectors, README ef 80, 100 paragraphs | 0.825 / 0.835 | 0.136 / 0.134 | 0.975 |
+    | Graphs with codes, same setting | 0.823 / 0.836 | 0.134 / 0.133 | 0.952 |
+
+    Within 0.003 of exact everywhere, inside one standard error (0.015 known, 0.019 topics). End to end 13 to 14 ms for both kinds here, against E333's 8.7 ms: scoring candidates by key through the index's map likely costs those 5 ms (string hashing for a few thousand paragraphs a query; not profiled), a cost of the example's lookup, not of codes.
+  - Memory at 376,619 rows: 96 MB of codes against 386 MB of vectors, plus the links either way.
+- Trade-off: 0.02 to 0.03 recall alone, nothing measurable fused; builds 15 to 20% slower (likely the code-to-code products, written without lanes); `with_codes` must be set before rows are added.
+- Verdict: **kept as an option.** For E333's search on a machine where memory matters, keep both graphs as codes and do not rescore: the fused ranking is unchanged and the vectors take a quarter of the memory. Rescore from the store only for vector search alone, and only once reading a row costs less (next: where a point read's 40 to 80 µs go).
+- Not measured: codes of 4 bits or product quantization; `score` by position instead of by key; an Apple silicon run.
+- Run: `IVF=0 CODES=1 RESCORE=0 THREADS=4 MS=16 cargo run --release --example hnsw_graph -- DIR 100000` (and `RESCORE=50`, `READ_CACHE=536870912`, `376619`); `CODES=1 cargo run --release --example hybrid_graph -- DIR`.

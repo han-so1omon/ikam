@@ -18,11 +18,12 @@
 //!
 //! Opt-in: nothing in the kernel builds a graph unless a caller asks.
 
+use std::borrow::Cow;
 use std::cmp::Ordering;
 use std::cmp::Reverse;
 use std::collections::{BTreeSet, BinaryHeap, HashMap};
 
-use crate::vectors::{dot, dot_lanes, to_f32s};
+use crate::vectors::{code_dot_lanes, dot, dot_lanes, quantize, to_f32s};
 use crate::{Db, Error, Id, Repo, Store};
 
 /// A stored graph: `links` is the content `HnswIndex::encode` wrote for
@@ -42,6 +43,8 @@ pub struct HnswIndex {
     ef_build: usize,
     keys: Vec<String>,
     vecs: Vec<f32>,
+    /// E334: int8 codes instead of `vecs` (`with_codes`).
+    codes: Option<Vec<u8>>,
     /// Per node, per level from 0, the linked nodes.
     links: Vec<Vec<Vec<u32>>>,
     removed: Vec<bool>,
@@ -94,6 +97,21 @@ impl Ord for Near {
     }
 }
 
+fn code_dot(q: &[f32], code: &[u8]) -> f32 {
+    q.iter()
+        .zip(code)
+        .map(|(x, &c)| x * f32::from(c as i8))
+        .sum()
+}
+
+/// Dot product of two int8 codes, exact in i32.
+fn codes_dot(a: &[u8], b: &[u8]) -> i32 {
+    a.iter()
+        .zip(b)
+        .map(|(&x, &y)| i32::from(x as i8) * i32::from(y as i8))
+        .sum()
+}
+
 fn splitmix(mut x: u64) -> u64 {
     x = x.wrapping_add(0x9e37_79b9_7f4a_7c15);
     x = (x ^ (x >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
@@ -117,6 +135,7 @@ impl HnswIndex {
             ef_build: ef_build.max(1),
             keys: Vec::new(),
             vecs: Vec::new(),
+            codes: None,
             links: Vec::new(),
             removed: Vec::new(),
             pos: HashMap::new(),
@@ -144,6 +163,16 @@ impl HnswIndex {
         self
     }
 
+    /// Keep each row as an int8 code (E253's scalar quantization, a
+    /// quarter of the memory) instead of its f32 vector; scores are then
+    /// approximate, and `Repo::hnsw_search_rescored` rescores the best
+    /// from the database (E334, off by default). Set on an empty index.
+    pub fn with_codes(mut self, on: bool) -> Self {
+        assert!(self.is_empty(), "hnsw: with_codes on a filled index");
+        self.codes = on.then(Vec::new);
+        self
+    }
+
     pub fn len(&self) -> usize {
         self.keys.len()
     }
@@ -164,8 +193,53 @@ impl HnswIndex {
         }
     }
 
+    fn code(&self, i: u32) -> &[u8] {
+        let c = self.codes.as_deref().unwrap_or(&[]);
+        &c[i as usize * self.dim..][..self.dim]
+    }
+
+    /// Node `i`'s vector, decoded from its code in code mode.
+    fn node_q(&self, i: u32) -> Cow<'_, [f32]> {
+        match &self.codes {
+            None => Cow::Borrowed(self.vec(i)),
+            Some(_) => Cow::Owned(
+                self.code(i)
+                    .iter()
+                    .map(|&c| f32::from(c as i8) / 127.0)
+                    .collect(),
+            ),
+        }
+    }
+
     fn sim(&self, q: &[f32], i: u32) -> f32 {
-        self.pair(q, self.vec(i))
+        match &self.codes {
+            None => self.pair(q, self.vec(i)),
+            Some(_) if self.lanes => code_dot_lanes(q, self.code(i)) / 127.0,
+            Some(_) => code_dot(q, self.code(i)) / 127.0,
+        }
+    }
+
+    /// Similarity of two nodes.
+    fn sim_nodes(&self, a: u32, b: u32) -> f32 {
+        match &self.codes {
+            None => self.pair(self.vec(a), self.vec(b)),
+            Some(_) => codes_dot(self.code(a), self.code(b)) as f32 / (127.0 * 127.0),
+        }
+    }
+
+    fn push_row(&mut self, v: &[f32]) {
+        match &mut self.codes {
+            None => self.vecs.extend_from_slice(v),
+            Some(c) => c.extend(quantize(v)),
+        }
+    }
+
+    fn set_row(&mut self, i: usize, v: &[f32]) {
+        let dim = self.dim;
+        match &mut self.codes {
+            None => self.vecs[i * dim..][..dim].copy_from_slice(v),
+            Some(c) => c[i * dim..][..dim].copy_from_slice(&quantize(v)),
+        }
     }
 
     fn top(&self) -> usize {
@@ -233,8 +307,7 @@ impl HnswIndex {
             if out.len() >= keep {
                 break;
             }
-            let v = self.vec(c.1);
-            if out.iter().all(|&r| self.pair(v, self.vec(r)) < c.0) {
+            if out.iter().all(|&r| self.sim_nodes(c.1, r) < c.0) {
                 out.push(c.1);
             } else {
                 pruned.push(c.1);
@@ -261,7 +334,7 @@ impl HnswIndex {
         let top = level_of(i, self.m);
         self.pos.insert(key.clone(), i as u32);
         self.keys.push(key);
-        self.vecs.extend_from_slice(v);
+        self.push_row(v);
         self.links.push(vec![Vec::new(); top + 1]);
         self.removed.push(false);
         top
@@ -277,7 +350,8 @@ impl HnswIndex {
         top: usize,
         extra: &dyn Fn(usize) -> Vec<Near>,
     ) -> Vec<Vec<u32>> {
-        let q = self.vec(i);
+        let q = self.node_q(i);
+        let q = &*q;
         let mut out = vec![Vec::new(); top + 1];
         let Some(e) = self.entry else {
             for (level, links) in out.iter_mut().enumerate() {
@@ -320,10 +394,9 @@ impl HnswIndex {
                 let list = &mut self.links[n as usize][level];
                 list.push(i);
                 if list.len() > max {
-                    let nv = self.vec(n);
                     let mut cands: Vec<Near> = self.links[n as usize][level]
                         .iter()
-                        .map(|&o| Near(self.pair(nv, self.vec(o)), o))
+                        .map(|&o| Near(self.sim_nodes(n, o), o))
                         .collect();
                     cands.sort_by(|a, b| b.cmp(a));
                     self.links[n as usize][level] = self.select(&cands, max);
@@ -337,10 +410,9 @@ impl HnswIndex {
                 }
             }
             if self.links[i as usize][level].len() > max {
-                let iv = self.vec(i);
                 let mut cands: Vec<Near> = self.links[i as usize][level]
                     .iter()
-                    .map(|&o| Near(self.pair(iv, self.vec(o)), o))
+                    .map(|&o| Near(self.sim_nodes(i, o), o))
                     .collect();
                 cands.sort_by(|a, b| b.cmp(a));
                 self.links[i as usize][level] = self.select(&cands, max);
@@ -397,7 +469,8 @@ impl HnswIndex {
                             let mut visit = Visit::default();
                             part.iter()
                                 .map(|&i| {
-                                    let q = this.vec(i);
+                                    let q = this.node_q(i);
+                                    let q = &*q;
                                     let extra = |level: usize| -> Vec<Near> {
                                         ids.iter()
                                             .filter(|&&j| {
@@ -422,6 +495,12 @@ impl HnswIndex {
                 self.link(i, plan);
             }
         }
+    }
+
+    /// `key`'s score for `q` as the index keeps its row: exact with
+    /// vectors, approximate with codes. None if absent or removed.
+    pub fn score(&self, q: &[f32], key: &str) -> Option<f32> {
+        self.pos.get(key).map(|&i| self.sim(q, i))
     }
 
     /// Leave `key` out of results; it stays a waypoint. False if absent.
@@ -470,6 +549,7 @@ impl HnswIndex {
     pub fn encode(&self) -> Vec<u8> {
         let mut out = Vec::new();
         put_varint(&mut out, self.m as u64);
+        put_varint(&mut out, u64::from(self.codes.is_some()));
         put_varint(&mut out, self.entry.map_or(0, |e| u64::from(e) + 1));
         for (i, node) in self.links.iter().enumerate() {
             let key = self.keys[i].as_bytes();
@@ -478,7 +558,10 @@ impl HnswIndex {
             let removed = self.removed[i];
             put_varint(&mut out, (node.len() as u64) << 1 | u64::from(removed));
             if removed {
-                out.extend(self.vec(i as u32).iter().flat_map(|x| x.to_le_bytes()));
+                match &self.codes {
+                    None => out.extend(self.vec(i as u32).iter().flat_map(|x| x.to_le_bytes())),
+                    Some(_) => out.extend_from_slice(self.code(i as u32)),
+                }
             }
             for level in node {
                 put_varint(&mut out, level.len() as u64);
@@ -554,8 +637,10 @@ impl<S: Store> Repo<S> {
         let b = self.read_content(&h.links)?;
         let mut at = 0;
         let m = get_varint(&b, &mut at)? as usize;
+        let codes = get_varint(&b, &mut at)? == 1;
         let entry = get_varint(&b, &mut at)?;
-        let mut index = HnswIndex::new(h.dim, m, 100);
+        let mut index = HnswIndex::new(h.dim, m, 100).with_codes(codes);
+        let width = if codes { h.dim } else { 4 * h.dim };
         index.entry = entry.checked_sub(1).map(|e| e as u32);
         let mut want = BTreeSet::new();
         for i in 0..h.rows {
@@ -566,13 +651,17 @@ impl<S: Store> Repo<S> {
             let head = get_varint(&b, &mut at)?;
             let removed = head & 1 == 1;
             if removed {
-                let v = b
-                    .get(at..at + 4 * h.dim)
-                    .ok_or(Error::Decode("hnsw vector"))?;
-                index.vecs.extend(to_f32s(v));
-                at += 4 * h.dim;
+                let v = b.get(at..at + width).ok_or(Error::Decode("hnsw vector"))?;
+                match &mut index.codes {
+                    None => index.vecs.extend(to_f32s(v)),
+                    Some(c) => c.extend_from_slice(v),
+                }
+                at += width;
             } else {
-                index.vecs.extend(std::iter::repeat_n(0.0, h.dim));
+                match &mut index.codes {
+                    None => index.vecs.extend(std::iter::repeat_n(0.0, h.dim)),
+                    Some(c) => c.extend(std::iter::repeat_n(0, h.dim)),
+                }
                 want.insert(key.clone());
                 index.pos.insert(key.clone(), i as u32);
             }
@@ -609,9 +698,36 @@ impl<S: Store> Repo<S> {
                 return Err(Error::Decode("hnsw dim"));
             }
             let i = index.pos[&n.label] as usize;
-            index.vecs[i * h.dim..][..h.dim].copy_from_slice(&v);
+            index.set_row(i, &v);
         }
         Ok(index)
+    }
+
+    /// `index.search` for the best `rescore` (at least `k`), then those
+    /// rows scored with their exact vectors from `db` and the best `k`
+    /// returned: for an index of codes (E334), exact scores and order.
+    pub fn hnsw_search_rescored(
+        &self,
+        index: &mut HnswIndex,
+        db: &Db,
+        q: &[f32],
+        k: usize,
+        ef: usize,
+        rescore: usize,
+    ) -> Result<Vec<(String, f32)>, Error> {
+        let keep: BTreeSet<String> = index
+            .search(q, rescore.max(k), ef.max(rescore))
+            .into_iter()
+            .map(|r| r.0)
+            .collect();
+        let mut out: Vec<(String, f32)> = self
+            .graph_nodes_in(&db.kv, &keep)?
+            .iter()
+            .map(|n| Ok((n.label.clone(), dot(q, &to_f32s(&self.node_value(n)?)))))
+            .collect::<Result<_, Error>>()?;
+        out.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+        out.truncate(k);
+        Ok(out)
     }
 
     /// Bring a loaded `index`, kept at `old`, up to `new`: rows in the

@@ -151,3 +151,72 @@ fn threaded_build_is_deterministic_and_finds_neighbours() {
     let r = hit as f64 / (10 * queries.len()) as f64;
     assert!(r > 0.95, "recall {r}");
 }
+
+#[test]
+fn graph_of_codes_rescored_finds_neighbours_through_storage_and_updates() {
+    let mut rng = Lcg(23);
+    let topics: Vec<Vec<f32>> = (0..12)
+        .map(|_| unit((0..DIM).map(|_| rng.gauss()).collect()))
+        .collect();
+    let point = |rng: &mut Lcg| {
+        let t = &topics[(rng.next() % 12) as usize];
+        unit(t.iter().map(|x| x + 0.3 * rng.gauss()).collect())
+    };
+    let mut rows: BTreeMap<String, Vec<f32>> = (0..3000)
+        .map(|i| (format!("v/{i:05}"), point(&mut rng)))
+        .collect();
+    let mut repo = Repo::new(MemStore::default());
+    let empty = repo.db_empty().unwrap();
+    let events: Vec<Event> = rows
+        .iter()
+        .map(|(k, v)| Event::upsert(k, &from_f32s(v), &format!("s{k}")))
+        .collect();
+    let db = repo.db_append(&empty, &events).unwrap();
+    let (h, mut index) = repo
+        .hnsw_build(
+            &db,
+            "v/",
+            HnswIndex::new(DIM, 8, 64).with_codes(true).with_threads(2),
+        )
+        .unwrap();
+    let queries: Vec<Vec<f32>> = (0..40).map(|_| point(&mut rng)).collect();
+    let check =
+        |repo: &Repo<MemStore>, index: &mut HnswIndex, db, rows: &BTreeMap<String, Vec<f32>>| {
+            let mut hit = 0;
+            for q in &queries {
+                let want = exact(rows, q, 10);
+                let got = repo.hnsw_search_rescored(index, db, q, 10, 64, 40).unwrap();
+                for (k, s) in &got {
+                    assert!((dot(q, &rows[k]) - s).abs() < 1e-5, "scores are exact");
+                }
+                hit += got.iter().filter(|g| want.contains(&g.0)).count();
+            }
+            hit as f64 / (10 * queries.len()) as f64
+        };
+    let r = check(&repo, &mut index, &db, &rows);
+    assert!(r > 0.95, "recall {r}");
+    let mut loaded = repo.hnsw_load(&h, &db).unwrap();
+    for q in &queries {
+        assert_eq!(loaded.search(q, 10, 64), index.search(q, 10, 64));
+    }
+    let mut edits = Vec::new();
+    for j in 0..200 {
+        let key = format!("v/{:05}", rng.next() % 3300);
+        if j % 4 == 0 && rows.remove(&key).is_some() {
+            edits.push(Event::remove(&key, false, &format!("d{j}")));
+        } else {
+            let v = point(&mut rng);
+            edits.push(Event::upsert(&key, &from_f32s(&v), &format!("u{j}")));
+            rows.insert(key, v);
+        }
+    }
+    let next = repo.db_append(&db, &edits).unwrap();
+    repo.hnsw_update(&mut index, &db, &next, "v/").unwrap();
+    let r = check(&repo, &mut index, &next, &rows);
+    assert!(r > 0.93, "recall after updates {r}");
+    let h2 = repo.hnsw_save(&index).unwrap();
+    let mut loaded = repo.hnsw_load(&h2, &next).unwrap();
+    for q in &queries {
+        assert_eq!(loaded.search(q, 10, 64), index.search(q, 10, 64));
+    }
+}

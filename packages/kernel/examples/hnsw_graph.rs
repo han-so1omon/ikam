@@ -82,6 +82,12 @@ fn main() {
             / nq
     };
     let mut repo = Repo::new(MemStore::default());
+    // READ_CACHE=bytes: keep checked contents across reads (E294), for the
+    // rescore's reads from the store.
+    repo.read_cache = std::env::var("READ_CACHE")
+        .ok()
+        .and_then(|t| t.parse().ok())
+        .unwrap_or(0);
     let empty = repo.db_empty().unwrap();
     let events: Vec<Event> = keys
         .iter()
@@ -93,37 +99,41 @@ fn main() {
         "{{\"rows\":{n},\"dim\":{dim},\"queries\":{}}}",
         queries.len()
     );
-    // Baseline: the loaded IVF with vectors kept and lanes (E325, E327).
-    let nlist = (n as f64).sqrt() as usize;
-    let t = Instant::now();
-    let sample: Vec<Vec<f32>> = vecs
-        .iter()
-        .step_by((n / (nlist * 20)).max(1))
-        .cloned()
-        .collect();
-    let ivf = repo
-        .ivf_build(&db, "v/", &kmeans(&sample, nlist, 8), dim)
-        .unwrap();
-    let ivf_build_ms = ms(t);
-    let index = repo
-        .ivf_load_with(&ivf, &db, true)
-        .unwrap()
-        .with_lanes(true);
-    for p in [8, 16, 32, 64, 128] {
-        if p > nlist {
-            break;
-        }
+    // Baseline: the loaded IVF with vectors kept and lanes (E325, E327);
+    // IVF=0 leaves it out.
+    let ivf = (std::env::var("IVF").as_deref() != Ok("0")).then(|| {
+        let nlist = (n as f64).sqrt() as usize;
         let t = Instant::now();
-        let got: Vec<_> = queries
+        let sample: Vec<Vec<f32>> = vecs
             .iter()
-            .map(|q| index.search(&repo, &db, q, 10, p, 100).unwrap())
+            .step_by((n / (nlist * 20)).max(1))
+            .cloned()
             .collect();
-        println!(
-            "{{\"index\":\"ivf\",\"nlist\":{nlist},\"build_ms\":{ivf_build_ms:.0},\"nprobe\":{p},\"recall10\":{:.3},\"query_ms\":{:.3}}}",
-            recall(&got),
-            ms(t) / nq
-        );
-    }
+        let ivf = repo
+            .ivf_build(&db, "v/", &kmeans(&sample, nlist, 8), dim)
+            .unwrap();
+        let ivf_build_ms = ms(t);
+        let index = repo
+            .ivf_load_with(&ivf, &db, true)
+            .unwrap()
+            .with_lanes(true);
+        for p in [8, 16, 32, 64, 128] {
+            if p > nlist {
+                break;
+            }
+            let t = Instant::now();
+            let got: Vec<_> = queries
+                .iter()
+                .map(|q| index.search(&repo, &db, q, 10, p, 100).unwrap())
+                .collect();
+            println!(
+                "{{\"index\":\"ivf\",\"nlist\":{nlist},\"build_ms\":{ivf_build_ms:.0},\"nprobe\":{p},\"recall10\":{:.3},\"query_ms\":{:.3}}}",
+                recall(&got),
+                ms(t) / nq
+            );
+        }
+        ivf
+    });
     // The exact scan, for scale.
     let t = Instant::now();
     for q in &queries {
@@ -141,6 +151,13 @@ fn main() {
         .ok()
         .map(|m| m.split(',').filter_map(|x| x.parse().ok()).collect())
         .unwrap_or(vec![8, 16, 24]);
+    // CODES=1: keep int8 codes, not vectors (E334); queries rescore the
+    // best RESCORE (default 50; 0: none, the codes' scores) from the store.
+    let codes = std::env::var("CODES").as_deref() == Ok("1");
+    let rescore: usize = std::env::var("RESCORE")
+        .ok()
+        .and_then(|t| t.parse().ok())
+        .unwrap_or(50);
     for m in ms_list {
         let t = Instant::now();
         let (h, built) = repo
@@ -149,7 +166,8 @@ fn main() {
                 "v/",
                 HnswIndex::new(dim, m, 100)
                     .with_threads(threads)
-                    .with_lanes(true),
+                    .with_lanes(true)
+                    .with_codes(codes),
             )
             .unwrap();
         let build_ms = ms(t);
@@ -163,13 +181,18 @@ fn main() {
             let got: Vec<_> = queries
                 .iter()
                 .map(|q| {
-                    let r = g.search(q, 10, ef);
+                    let r = if codes && rescore > 0 {
+                        repo.hnsw_search_rescored(&mut g, &db, q, 10, ef, rescore)
+                            .unwrap()
+                    } else {
+                        g.search(q, 10, ef)
+                    };
                     scored += g.scored;
                     r
                 })
                 .collect();
             println!(
-                "{{\"index\":\"hnsw\",\"threads\":{threads},\"m\":{m},\"build_ms\":{build_ms:.0},\"graph_mb\":{:.2},\"load_ms\":{load_ms:.0},\"ef\":{ef},\"recall10\":{:.3},\"query_ms\":{:.3},\"scored\":{:.0}}}",
+                "{{\"index\":\"hnsw\",\"codes\":{codes},\"threads\":{threads},\"m\":{m},\"build_ms\":{build_ms:.0},\"graph_mb\":{:.2},\"load_ms\":{load_ms:.0},\"ef\":{ef},\"recall10\":{:.3},\"query_ms\":{:.3},\"scored\":{:.0}}}",
                 bytes as f64 / 1e6,
                 recall(&got),
                 ms(t) / nq,
@@ -195,7 +218,9 @@ fn main() {
         let h2 = repo.hnsw_save(&g).unwrap();
         let save_ms = ms(t);
         let t = Instant::now();
-        let ivf2 = repo.ivf_update(&ivf, &db, &next, "v/").unwrap();
+        if let Some(ivf) = &ivf {
+            repo.ivf_update(ivf, &db, &next, "v/").unwrap();
+        }
         let ivf_update_ms = ms(t);
         let mut now = vecs.clone();
         for j in 0..n / 100 {
@@ -213,7 +238,17 @@ fn main() {
                 s.into_iter().take(10).map(|x| x.1).collect()
             })
             .collect();
-        let got: Vec<_> = queries.iter().map(|q| g.search(q, 10, 80)).collect();
+        let got: Vec<_> = queries
+            .iter()
+            .map(|q| {
+                if codes && rescore > 0 {
+                    repo.hnsw_search_rescored(&mut g, &next, q, 10, 80, rescore)
+                        .unwrap()
+                } else {
+                    g.search(q, 10, 80)
+                }
+            })
+            .collect();
         let r2 = got
             .iter()
             .zip(&truth2)
@@ -224,7 +259,6 @@ fn main() {
         let same = queries
             .iter()
             .all(|q| reloaded.search(q, 10, 80) == g.search(q, 10, 80));
-        let _ = ivf2;
         println!(
             "{{\"update_rows\":{},\"hnsw_update_ms\":{update_ms:.0},\"hnsw_save_ms\":{save_ms:.0},\"ivf_update_ms\":{ivf_update_ms:.0},\"recall10_after_ef80\":{r2:.3},\"reload_same\":{same}}}",
             n / 100
