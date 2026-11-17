@@ -15,6 +15,7 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
+use crate::object::{Found, graph_scan};
 use crate::{Error, Graph, Id, Node, Object, Repo, Store, node_key};
 
 /// A node that differs between two graphs: `(label, before, after)`.
@@ -125,10 +126,16 @@ impl<S: Store> Repo<S> {
     }
 
     fn graph_chunk(&self, id: &Id) -> Result<Graph, Error> {
-        match self.get(id)? {
-            Object::Graph(g) => Ok(g),
-            _ => Err(Error::WrongKind(*id)),
+        graph_decode(id, &self.graph_encoded(id)?)
+    }
+
+    /// A chunk's checked encoding, as `get` reads it.
+    fn graph_encoded(&self, id: &Id) -> Result<Vec<u8>, Error> {
+        let encoded = self.read_object(id)?;
+        if Id::of(&encoded) != *id {
+            return Err(Error::Corrupt(*id));
         }
+        Ok(encoded)
     }
 
     /// Leaves under `a` and under `b`, less the subtrees both share (E249):
@@ -215,18 +222,25 @@ impl<S: Store> Repo<S> {
     pub fn graph_node(&self, root: &Id, label: &str) -> Result<Option<Node>, Error> {
         let mut id = *root;
         loop {
-            match self.graph_chunk(&id)? {
-                Graph::Nodes(nodes) => return Ok(nodes.into_iter().find(|n| n.label == label)),
-                Graph::Children(_, children) => {
-                    match children
-                        .iter()
-                        .rev()
-                        .find(|(first, _)| first.as_str() <= label)
-                    {
-                        Some((_, child)) => id = *child,
-                        None => return Ok(None),
+            // E335: scan each chunk for the one node or child it needs.
+            let encoded = self.graph_encoded(&id)?;
+            match graph_scan(&encoded, &|l| l == label, label)? {
+                Some(Found::Nodes(mut nodes)) => return Ok(nodes.pop()),
+                Some(Found::Child(Some(child))) => id = child,
+                Some(Found::Child(None)) => return Ok(None),
+                None => match graph_decode(&id, &encoded)? {
+                    Graph::Nodes(nodes) => return Ok(nodes.into_iter().find(|n| n.label == label)),
+                    Graph::Children(_, children) => {
+                        match children
+                            .iter()
+                            .rev()
+                            .find(|(first, _)| first.as_str() <= label)
+                        {
+                            Some((_, child)) => id = *child,
+                            None => return Ok(None),
+                        }
                     }
-                }
+                },
             }
         }
     }
@@ -247,7 +261,15 @@ impl<S: Store> Repo<S> {
         labels: &BTreeSet<String>,
         out: &mut Vec<Node>,
     ) -> Result<(), Error> {
-        match self.graph_chunk(id)? {
+        let encoded = self.graph_encoded(id)?;
+        // E335: a leaf builds only the nodes asked for.
+        if let [b'G', 0x80, ..] = encoded.as_slice()
+            && let Some(Found::Nodes(nodes)) = graph_scan(&encoded, &|l| labels.contains(l), "")?
+        {
+            out.extend(nodes);
+            return Ok(());
+        }
+        match graph_decode(id, &encoded)? {
             Graph::Nodes(nodes) => {
                 out.extend(nodes.into_iter().filter(|n| labels.contains(&n.label)))
             }
@@ -908,5 +930,13 @@ impl<S: Store> Repo<S> {
             return self.put_graph(Vec::new());
         }
         self.put_parents(out, 1)
+    }
+}
+
+/// A graph chunk from its checked encoding, as `get` decodes it.
+fn graph_decode(id: &Id, encoded: &[u8]) -> Result<Graph, Error> {
+    match Object::decode(encoded)? {
+        Object::Graph(g) => Ok(g),
+        _ => Err(Error::WrongKind(*id)),
     }
 }

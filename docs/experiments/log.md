@@ -5159,3 +5159,28 @@ Gates on the branch (E229 to E233): every kernel test suite passes (release); cl
 - Verdict: **kept as an option.** For E333's search on a machine where memory matters, keep both graphs as codes and do not rescore: the fused ranking is unchanged and the vectors take a quarter of the memory. Rescore from the store only for vector search alone, and only once reading a row costs less (next: where a point read's 40 to 80 µs go).
 - Not measured: codes of 4 bits or product quantization; `score` by position instead of by key; an Apple silicon run.
 - Run: `IVF=0 CODES=1 RESCORE=0 THREADS=4 MS=16 cargo run --release --example hnsw_graph -- DIR 100000` (and `RESCORE=50`, `READ_CACHE=536870912`, `376619`); `CODES=1 cargo run --release --example hybrid_graph -- DIR`.
+
+### E335 point-reads (where reading one row by key goes, and three fixes)
+- Branch / parent: exp/335-point-reads / exp/334-hnsw-codes (E334)
+- Question: E334 found that reading one row by key from an in-memory store costs 40 to 85 µs, so rescoring 50 candidates from the store costs more than the graph search. Where does that time go, and what of it can go without changing what a read checks or returns?
+- Hypothesis: the store's own read is a small part; most is decoding: the prolly chunks on the way down (hash, decompress, decode) and the value's content. (Source: E334; E294's read cache took about half off.)
+- Change:
+  - `examples/point_reads.rs`: a store that counts the reads, bytes and time of the store underneath (a `MemStore`), 100,000 rows of 1 KB values, 2,000 random keys read by `graph_node`, `db_get` and `graph_nodes_in` in batches of 50, without and with the read cache; and BLAKE3 at 1 to 64 KB. Profiled with callgrind at 20,000 rows.
+  - The profile: decoding whole graph chunks (every node's label and edges built as strings and vectors, then dropped, to keep one; about 73 nodes a chunk here) was the largest part; then a new zstd decompression context for every read (about 94 KB of state, set up each time) and a 64 KB step buffer zeroed for every read; then the hash that checks each chunk (about a fifth of a chunk read). The store's own read is under a tenth.
+  - Three fixes, none with a trade-off, so none is an option: `object::graph_scan` reads a chunk's encoding for a lookup, building only the nodes asked for or following one child, with the same checks and the same error for the same bytes (`graph_node`, and the leaves of `graph_nodes_in`; chunks from before E045 still decode as before). `unzstd_prefix_with` keeps one decompression context per thread (reset before each read; a context with a prepared dictionary is still made per read) and decompresses straight into its output.
+  - Test: `graph_scan_answers_as_decode`: on a leaf and an inner chunk, and on every one-bit change and every cut of their encodings, the scan keeps the same nodes, follows the same child and fails with the same error as decoding the whole chunk.
+- Result (µs a row, 100,000 rows, a 4-core cloud Xeon):
+
+  | Read | Before | After | With read cache, before | With read cache, after |
+  |---|---|---|---|---|
+  | `graph_node` | 98 | 40 | 59 | 18 |
+  | `db_get` (the node, then its value) | 114 | 32 | 61 | 19 |
+  | `graph_nodes_in`, 50 keys a batch | 74 | 27 | 37 | 20 |
+
+  - Each fix alone: the zeroed buffer about 10% of `db_get`; the scan took `graph_node` from 98 to 60 µs and with the cache from 58 to 18; the reused context the rest (60 to 40, and `db_get` 83 to 32). Hashing stays: BLAKE3 costs about 1 µs a KB at these sizes.
+  - E334's graph of codes, the best 50 rescored from the store (100,000 paragraphs, ef 80): 4.6 ms a query before, 2.0 ms after, recall 0.930 both; loading the graph with its vectors 2.4 s before, 1.1 s after. Rescoring now costs about 33 µs a row, so with codes and a rescore the graph answers at the recall of full vectors in about 2 ms without keeping the vectors in memory.
+  - E333's end to end (both graphs, f32 vectors): 13.9 ms, as in E334 (14.2 ms): that example's time is not in reads from the store.
+- Trade-off: none found: the same bytes read, checked and returned; one decompression context kept per thread that reads (94 KB after a chunk-sized read, from `DCtx::sizeof`).
+- Verdict: **kept, not an option** (no trade-off). Reading a row by key is about 3 times faster without the read cache and about 3 times with it. Every read of graph chunks and compressed contents gains; nothing else changes.
+- Not measured: an on-disk store (`FsStore`), where the file read adds its own cost; reuse of compression contexts on write (next: about a fifth of the write time at 20,000 rows was setting up a compressor); an Apple silicon run.
+- Run: `cargo run --release --example point_reads -- 100000` (`CACHE=0` or `CACHE=1` for one pass); `IVF=0 CODES=1 RESCORE=50 THREADS=4 MS=16 cargo run --release --example hnsw_graph -- DIR 100000`.
