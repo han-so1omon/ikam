@@ -5257,3 +5257,29 @@ Gates on the branch (E229 to E233): every kernel test suite passes (release); cl
 - Verdict: **kept, not an option**. The loop's gain end to end is about 20 to 25%, not E327's 3x, likely because scoring a paragraph waits on reading its vector (inferred, not profiled).
 - Not measured: Apple silicon, where NEON is always present and the portable lanes loop should already be vectorized, so E339 changes nothing there; AVX-512.
 - Run: `THREADS=4 cargo run --release --example hybrid_graph -- DIR` (and `CODES=1`), before and after.
+
+### E340 score-prefetch (candidates' paragraphs scored in one pass, rows read ahead)
+- Branch / parent: exp/340-score-prefetch / exp/339-lanes-avx2 (E339)
+- Question: after E339, scoring the candidates' paragraphs is still most of the full hybrid search, at about 250 ns a paragraph with f32 vectors and 230 ns with codes, where E327's loop alone takes about 20 ns a code. Is that time spent waiting on memory, and does asking for rows a few nodes ahead cut it?
+- Hypothesis: yes: a graph built by 4 threads leaves one document's paragraphs at scattered nodes, so each row is a read from memory, and reads can overlap if asked for early. (Source: E339's "not measured".)
+- Change:
+  - `HnswIndex::score_many(q, nodes, out)`: `score_at` for each node, in order, with the row of the node some places ahead asked of memory first (`_mm_prefetch`, x86-64 only; elsewhere none). 4 nodes ahead for codes and 8 for f32 vectors, the best of 4 and 8 measured below. Test `score_many_matches_score_at`: the same answers as `score_at`, removed, repeated and out-of-range nodes included, codes and lanes on and off.
+  - `examples/hybrid_graph.rs`: `MANY=1` scores all candidates' paragraphs in one `score_many` call and takes each document's best from its slice; `HOT=1` scores once untimed before the timed pass (rows in cache).
+  - Registry: a duplicate E325 row (left by a rebase since E327) removed.
+- Result (`hybrid_graph`, by position, 11,384 READMEs, 376,619 paragraphs, 1,130 queries; ms a query for scoring the candidates, at 80 / 100, 80 / 200 and 160 / 400; a 4-core cloud Xeon; one run each, runs vary by about 0.2 ms):
+
+  | Way of scoring | f32 | codes |
+  |---|---|---|
+  | One document at a time (E339) | 2.68, 4.25, 6.56 | 2.37, 3.25, 4.91 |
+  | The same, rows already in cache (`HOT=1`) | 2.51, 3.80, 6.05 | |
+  | One pass, no read-ahead | 1.94, 2.88, 4.28 | 1.86, 2.55, 4.44 |
+  | One pass, 4 nodes ahead | 1.85, 2.99, 4.73 | **0.71, 1.02, 1.72** |
+  | One pass, 8 nodes ahead | **1.55, 2.47, 3.76** | 0.88, 1.03, 2.09 |
+
+  - End to end at 80 / 100: f32 3.98 to 2.73 ms, codes 3.54 to 1.63 ms; at 160 / 400: f32 9.6 to 6.5, codes 7.3 to 3.9.
+  - Every recall and nDCG line is the same in all of these runs, f32 and codes.
+- Reading: the hypothesis was half right. With rows in cache the old loop is barely faster (2.51 against 2.68), so it was not mostly waiting on memory; one pass over a flat list (less work a paragraph in the example's loop, inferred) gives most of the f32 gain, and reading 8 ahead 15 to 20% more. For codes (256 bytes a row) reading 4 ahead is the larger part: 1.86 to 0.71 ms.
+- Trade-off: none (same scores); `score_many` is a new call, `score_at` is unchanged.
+- Verdict: **kept** (`score_many`; no option needed). The best full hybrid search measured (best paragraph plus whole README fused with BM25, E330) now answers in about 1.6 ms with codes and 2.7 ms with f32 vectors, against 68 ms with exact scans (E333).
+- Not measured: other distances ahead (only 4 and 8); Apple silicon, where there is no prefetch here yet (Rust's is unstable on aarch64), so only the one-pass gain applies.
+- Run: `MANY=1 THREADS=4 cargo run --release --example hybrid_graph -- DIR` (and `CODES=1`, `HOT=1`); for "no read-ahead" and "4 ahead" the distance in `score_many` changed by hand.
