@@ -164,7 +164,7 @@ fn run_check<'a>(
 }
 
 impl<S: Store> Repo<S> {
-    fn node_value(&self, n: &Node) -> Result<Vec<u8>, Error> {
+    pub(crate) fn node_value(&self, n: &Node) -> Result<Vec<u8>, Error> {
         match &n.target {
             Target::Content(Arg::Whole(id)) => self.read_content(id),
             Target::Content(Arg::Range { id, start, len }) => {
