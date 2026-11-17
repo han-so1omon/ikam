@@ -4934,3 +4934,34 @@ Gates on the branch (E229 to E233): every kernel test suite passes (release); cl
 - Verdict: **kept** as an option. Load once for any caller that queries more than a few times; keep vectors where memory allows.
 - Next: E326's real-text measurement.
 - Run: `cargo test --release --test vectors`; `cargo run --release --example vector_ivf -- 20000 256` and `-- 100000 256`.
+
+### E327 vector-modes (execution modes for scoring a list's codes, MLIR included)
+- Branch / parent: exp/327-vector-modes / exp/325-ivf-loaded (E325)
+- Question: E277, E282 and E311 compared execution modes for a net's step, a scalar loop where E311's hypothesis expected MLIR to add nothing. An IVF query's inner loop (score `n` int8 codes against a query, E323 and E325) is the opposite case: data parallel, the shape MLIR's vector dialect is for. Which modes are fastest, does MLIR beat clang or Rust here, and what should the kernel do?
+- Hypothesis: the kernel's loop (`code_dot`: one running f32 sum) does not vectorize, because float addition is not associative and the compiler keeps the order. Any mode that reorders the sum (independent lanes in Rust, `-ffast-math` in C, explicit vector lanes in MLIR) runs several times faster, and they end within noise of each other, MLIR included, since they reach the same LLVM back end. An int8 query (exact i32 sums) is faster again and loses a few of the f32 query's top 100. (Source: E311's hypothesis on where MLIR could pay; the LLVM and MLIR vector dialect documentation; Jégou et al.'s scalar quantization as used in E253.)
+- Change:
+  - `experiments/vector-modes` (separate crate, own workspace, no kernel dependency): 4,096 codes (1 MB, the size of a few probed lists) and 100,000 (25.6 MB), `d` 256, random unit vectors quantized as in `vectors::quantize`. f32 query: `rust` (the kernel's loop), `rust-lanes` (16 sums), `clang` and `clang-fast` (the same loop in C, `-O3 -march=native`, without and with `-ffast-math`), `mlir+llc` and `mlir+opt` (the loop in the vector dialect, 16 lanes and a `vector.reduction` at the end, lowered with mlir-opt to the llvm dialect, `mlir-translate`, then `llc -O3 -mcpu=native` with or without `opt -O3` first, loaded with dlopen). int8 query: `rust-i8`, `avx2-i8` (`std::arch`: widen to i16, `madd`), `clang-i8`, `mlir-i8+llc`, `mlir-i8+opt`; the program asserts every int8 mode returns the same i32 scores. Fastest of 5 runs of at least 300 ms. MLIR and LLVM 18.1.3 from Ubuntu's `mlir-18-tools`. Rust built twice: default target (x86-64 baseline, as the kernel builds) and `-C target-cpu=native`.
+  - Kernel (opt-in): `vectors::code_dot_lanes` and `dot_lanes`, and `IvfIndex::with_lanes(true)`, which scores codes, centroids and kept vectors with 16 independent sums. `tests/vectors.rs` checks the loaded index with lanes returns the same rows as `ivf_search` after every update round.
+- Result (ns a code, one 4-core cloud Xeon with AVX2 and AVX-512; `cargo run --release` in `experiments/vector-modes` with `MLIR_BIN=/usr/lib/llvm-18/bin`):
+
+  | Mode | f32 query, 4,096 | f32 query, 100,000 | int8 query, 4,096 | int8 query, 100,000 |
+  |---|---|---|---|---|
+  | Rust as written (kernel today) | 138.8 | 126.3 | 56.2 | 70.2 |
+  | Rust, 16 lanes | 56.9 | 60.2 | | |
+  | Rust as written, target-cpu=native | 134.1 | 129.9 | 16.0 | 17.7 |
+  | Rust, 16 lanes, target-cpu=native | 21.5 | 19.4 | | |
+  | clang -O3 -march=native | 265.6 | 260.8 | 14.5 | 18.7 |
+  | clang, -ffast-math | 15.4 | 18.6 | | |
+  | MLIR vector dialect + llc | 20.1 | 27.9 | 17.6 | 23.0 |
+  | MLIR vector dialect + opt + llc | 19.9 | 22.0 | 10.2 | 16.3 |
+  | AVX2 intrinsics (Rust) | | | 8.9 | 16.8 |
+
+  - Every f32 mode returns the f32 query's same top 100 (largest difference from the kernel's loop 2.3e-5). The int8 query keeps 94 to 95 of the f32 query's top 100; the rescore with exact vectors (E325) restores the order of what it keeps.
+  - MLIR compiles the two kernels in 30 ms (mlir-opt) + 20 ms (translate) + 81 ms (opt -O3) + 27 ms (llc); clang takes 93 to 554 ms for the C file.
+  - In memory (100,000 codes), the fast modes meet at 14 to 16 GB/s, the machine's memory bandwidth for one core (inferred: in cache at 4,096 they spread to 9 to 20 ns).
+  - In the kernel (`examples/vector_ivf`, 100,000 x 256, loaded with vectors kept): `with_lanes(true)` takes nprobe 4 from 0.41 to 0.27 ms and nprobe 64 from 3.99 to 2.86 ms, same recall; the rest of a query (sorting, row keys) does not change.
+- Answer on MLIR: here MLIR does what it is for, but so do two lines of Rust. Its vector dialect matched clang with `-ffast-math` and Rust with lanes within about 30%, and with `opt -O3` matched hand-written AVX2 on the int8 query in memory. It adds nothing over writing the lanes out, which is what the kernel can do without a tool chain. MLIR would matter for code generated at run time over many shapes (dimensions, code widths, fused filters), which ikam does not have yet.
+- Trade-off: lanes change float rounding (last bits), so ties can order differently; off by default for that reason. An int8 query is faster again but changes which rows reach the rescore; not added to the kernel. The kernel's baseline x86-64 build gets about a third of what `target-cpu=native` gets.
+- Verdict: **measured** (modes) and **kept** as an option (`with_lanes`, off).
+- Not measured: AVX-512 VNNI (`vpdpbusd`, present on this machine); Apple silicon (NEON, and the laptop's MLIR from E311); a fused filter or several queries at once, where MLIR's affine and linalg dialects could pay.
+- Run: `MLIR_BIN=/usr/lib/llvm-18/bin cargo run --release` in `packages/kernel/experiments/vector-modes` (add `RUSTFLAGS="-C target-cpu=native"` for the native rows); `cargo run --release --example vector_ivf -- 100000 256`.

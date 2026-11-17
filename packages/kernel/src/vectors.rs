@@ -23,6 +23,9 @@ const US: char = '\u{1f}';
 /// Candidates scored by code, and the code packs read so far.
 type Scored = (Vec<(f32, String)>, BTreeMap<Id, Vec<u8>>);
 
+type CodeDot = fn(&[f32], &[u8]) -> f32;
+type Dot = fn(&[f32], &[f32]) -> f32;
+
 /// An IVF loaded once (E325): centroids, each list's rows and their codes
 /// in memory, so a query reads only the rows it rescores. With `vectors`
 /// (`ivf_load_with(.., true)`) the rows' exact vectors are kept too and a
@@ -33,6 +36,8 @@ pub struct IvfIndex {
     /// Per list: row keys, and their codes back to back.
     lists: Vec<(Vec<String>, Vec<u8>)>,
     vectors: Option<BTreeMap<String, Vec<f32>>>,
+    /// E327: score codes and centroids with 16 independent sums.
+    lanes: bool,
 }
 
 /// An IVF view: `centroids` is a content of `nlist * dim` f32s.
@@ -70,6 +75,44 @@ fn code_dot(q: &[f32], code: &[u8]) -> f32 {
         .zip(code)
         .map(|(x, &c)| x * f32::from(c as i8))
         .sum()
+}
+
+/// `code_dot` with 16 independent sums added at the end (E327). The
+/// compiler may vectorize it, since the order of the additions is written
+/// out; the result can differ from `code_dot` in the last bits.
+pub fn code_dot_lanes(q: &[f32], code: &[u8]) -> f32 {
+    let mut acc = [0f32; 16];
+    let (qs, cs) = (q.chunks_exact(16), code.chunks_exact(16));
+    let tail: f32 = qs
+        .remainder()
+        .iter()
+        .zip(cs.remainder())
+        .map(|(x, &c)| x * f32::from(c as i8))
+        .sum();
+    for (q, c) in qs.zip(cs) {
+        for l in 0..16 {
+            acc[l] += q[l] * f32::from(c[l] as i8);
+        }
+    }
+    acc.iter().sum::<f32>() + tail
+}
+
+/// `dot` with 16 independent sums (E327).
+pub fn dot_lanes(a: &[f32], b: &[f32]) -> f32 {
+    let mut acc = [0f32; 16];
+    let (xs, ys) = (a.chunks_exact(16), b.chunks_exact(16));
+    let tail: f32 = xs
+        .remainder()
+        .iter()
+        .zip(ys.remainder())
+        .map(|(x, y)| x * y)
+        .sum();
+    for (x, y) in xs.zip(ys) {
+        for l in 0..16 {
+            acc[l] += x[l] * y[l];
+        }
+    }
+    acc.iter().sum::<f32>() + tail
 }
 
 fn nearest(cents: &[f32], dim: usize, v: &[f32]) -> usize {
@@ -251,17 +294,30 @@ impl<S: Store> Repo<S> {
 }
 
 impl IvfIndex {
+    /// Score with 16 independent sums (E327, off by default): the same
+    /// rows unless two scores tie within float rounding.
+    pub fn with_lanes(mut self, on: bool) -> Self {
+        self.lanes = on;
+        self
+    }
+
     fn probe(&self, q: &[f32], nprobe: usize, rescore: usize) -> Vec<String> {
         let dim = self.dim;
+        let (cdot, vdot): (CodeDot, Dot) = if self.lanes {
+            (code_dot_lanes, dot_lanes)
+        } else {
+            (code_dot, dot)
+        };
+        let cent: Vec<f32> = (0..self.lists.len())
+            .map(|c| vdot(&self.cents[c * dim..][..dim], q))
+            .collect();
         let mut order: Vec<usize> = (0..self.lists.len()).collect();
-        order.sort_by(|&a, &b| {
-            dot(&self.cents[b * dim..][..dim], q).total_cmp(&dot(&self.cents[a * dim..][..dim], q))
-        });
+        order.sort_by(|&a, &b| cent[b].total_cmp(&cent[a]));
         let mut scored: Vec<(f32, &String)> = Vec::new();
         for &c in order.iter().take(nprobe) {
             let (rows, codes) = &self.lists[c];
             for (row, code) in rows.iter().zip(codes.chunks_exact(dim)) {
-                scored.push((code_dot(q, code), row));
+                scored.push((cdot(q, code), row));
             }
         }
         scored.sort_by(|a, b| b.0.total_cmp(&a.0));
@@ -343,6 +399,7 @@ impl<S: Store> Repo<S> {
             cents,
             lists,
             vectors,
+            lanes: false,
         })
     }
 

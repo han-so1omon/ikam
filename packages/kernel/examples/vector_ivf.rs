@@ -121,9 +121,12 @@ fn main() {
     }
     // E325: the same queries on the loaded index, rows read from the
     // database or kept in memory.
-    for keep in [false, true] {
+    for (keep, lanes) in [(false, false), (true, false), (true, true)] {
         let t = Instant::now();
-        let loaded = repo.ivf_load_with(&ivf2, &next, keep).unwrap();
+        let loaded = repo
+            .ivf_load_with(&ivf2, &next, keep)
+            .unwrap()
+            .with_lanes(lanes);
         let load_ms = t.elapsed().as_secs_f64() * 1e3;
         for (nprobe, rescore) in [(1, 100), (4, 10), (4, 30), (4, 100), (16, 100), (64, 100)] {
             if nprobe > nlist {
@@ -136,7 +139,7 @@ fn main() {
             }
             let ms = t.elapsed().as_secs_f64() * 1e3 / queries.len() as f64;
             println!(
-                "{{\"loaded\":true,\"vectors_kept\":{keep},\"load_ms\":{load_ms:.0},\"nprobe\":{nprobe},\"rescore\":{rescore},\"recall10\":{:.3},\"query_ms\":{ms:.3}}}",
+                "{{\"loaded\":true,\"vectors_kept\":{keep},\"lanes\":{lanes},\"load_ms\":{load_ms:.0},\"nprobe\":{nprobe},\"rescore\":{rescore},\"recall10\":{:.3},\"query_ms\":{ms:.3}}}",
                 hit as f64 / (10 * queries.len()) as f64
             );
         }
