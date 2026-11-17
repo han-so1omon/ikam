@@ -207,7 +207,22 @@ pub(crate) fn names(prefix: &[u8], id: &Id) -> bool {
 /// fields would only repeat what is known (up to ~10 B per stored object).
 /// `dict` empty means no dictionary.
 pub(crate) fn zstd_frame(bytes: &[u8], dict: &[u8], level: i32) -> Option<Vec<u8>> {
-    framer_at(dict, level)?.compress(bytes).ok()
+    if !dict.is_empty() || level != MEASURE_LEVEL {
+        return framer_at(dict, level)?.compress(bytes).ok();
+    }
+    // E336: what ingest writes reuses one compressor per thread; setting
+    // one up cost more than compressing a small chunk. Taken out while in
+    // use, so a frame inside a frame gets its own.
+    let mut c = FRAMER.take().or_else(|| framer_at(&[], level))?;
+    let out = c.compress(bytes).ok();
+    FRAMER.set(Some(c));
+    out
+}
+
+thread_local! {
+    /// `zstd_frame`'s compressor at `MEASURE_LEVEL` without a dictionary.
+    static FRAMER: std::cell::Cell<Option<zstd::bulk::Compressor<'static>>> =
+        const { std::cell::Cell::new(None) };
 }
 
 /// zstd level for estimates (growing groups, scoring dictionaries, comparing
@@ -301,23 +316,58 @@ pub(crate) fn unzstd_prefix(frame: &[u8], dict: &[u8], limit: usize) -> Option<V
     unzstd_prefix_with(frame, Dict::Raw(dict), limit)
 }
 
+thread_local! {
+    /// A decompression context kept between reads on this thread (E335):
+    /// creating one per read cost more than decoding a small chunk.
+    static DCTX: std::cell::Cell<Option<zstd::zstd_safe::DCtx<'static>>> =
+        const { std::cell::Cell::new(None) };
+}
+
 pub(crate) fn unzstd_prefix_with(frame: &[u8], dict: Dict, limit: usize) -> Option<Vec<u8>> {
-    use zstd::zstd_safe::{DCtx, DParameter, FrameFormat, InBuffer, OutBuffer};
-    let mut ctx = DCtx::create();
-    ctx.set_parameter(DParameter::Format(FrameFormat::Magicless))
-        .ok()?;
+    use zstd::zstd_safe::{DCtx, DParameter, FrameFormat, ResetDirective};
+    let magicless = DParameter::Format(FrameFormat::Magicless);
     match dict {
-        Dict::Raw([]) => {}
-        Dict::Raw(raw) => drop(ctx.load_dictionary(raw).ok()?),
-        Dict::Prepared(ddict) => drop(ctx.ref_ddict(ddict).ok()?),
+        Dict::Prepared(ddict) => {
+            let mut ctx = DCtx::create();
+            ctx.set_parameter(magicless).ok()?;
+            ctx.ref_ddict(ddict).ok()?;
+            unzstd_stream(&mut ctx, frame, limit)
+        }
+        Dict::Raw(raw) => {
+            // Taken out while in use, so a read inside a read gets its own.
+            let mut ctx = DCTX.take().unwrap_or_else(DCtx::create);
+            // Clears the last read's state and dictionary.
+            ctx.reset(ResetDirective::SessionAndParameters).ok()?;
+            ctx.set_parameter(magicless).ok()?;
+            if !raw.is_empty() {
+                ctx.load_dictionary(raw).ok()?;
+            }
+            let out = unzstd_stream(&mut ctx, frame, limit);
+            DCTX.set(Some(ctx));
+            out
+        }
     }
-    // Stream until the frame ends or `limit` bytes are out.
-    let (mut out, mut input, mut chunk) = (Vec::new(), InBuffer::around(frame), [0u8; 1 << 16]);
+}
+
+fn unzstd_stream(
+    ctx: &mut zstd::zstd_safe::DCtx<'_>,
+    frame: &[u8],
+    limit: usize,
+) -> Option<Vec<u8>> {
+    use zstd::zstd_safe::{InBuffer, OutBuffer};
+    // Stream until the frame ends or `limit` bytes are out, straight into
+    // `out`'s spare room (E335: zeroing a 64 KB step buffer on every read
+    // cost more than decompressing a small chunk).
+    let mut input = InBuffer::around(frame);
+    let mut out: Vec<u8> = Vec::with_capacity((frame.len() * 4).clamp(256, 1 << 16));
     while out.len() < limit {
-        let mut buf = OutBuffer::around(&mut chunk[..]);
+        if out.capacity() - out.len() < 256 {
+            out.reserve(out.capacity().min(1 << 20));
+        }
+        let pos = out.len();
+        let mut buf = OutBuffer::around_pos(&mut out, pos);
         let left = ctx.decompress_stream(&mut buf, &mut input).ok()?;
-        let n = buf.pos();
-        out.extend_from_slice(&chunk[..n]);
+        let n = buf.pos() - pos;
         if left == 0 {
             break; // the frame is complete
         }
@@ -777,6 +827,29 @@ impl<S: Store> Repo<S> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// E336: frames from the kept compressor are byte for byte the frames
+    /// of a new one, in any order of sizes, and decode back.
+    #[test]
+    fn kept_framer_writes_what_a_new_one_writes() {
+        let mut seed = 11u64;
+        for round in 0..200usize {
+            seed = seed
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            let len = [0, 1, 300, 4096, 70_000, 1 << 20][round % 6] + (seed >> 50) as usize;
+            let bytes: Vec<u8> = (0..len)
+                .map(|i| ((i as u64 * (seed | 1)) >> 7) as u8 % 37)
+                .collect();
+            let fresh = framer_at(&[], MEASURE_LEVEL)
+                .unwrap()
+                .compress(&bytes)
+                .unwrap();
+            let kept = zstd_frame(&bytes, &[], MEASURE_LEVEL).unwrap();
+            assert_eq!(kept, fresh, "round {round}, {len} bytes");
+            assert_eq!(unzstd_frame(&kept, &[]).unwrap(), bytes);
+        }
+    }
 
     /// Above `slow_codec_max`, brotli is not tried (E109).
     #[test]

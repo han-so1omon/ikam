@@ -4916,3 +4916,409 @@ Gates on the branch (E229 to E233): every kernel test suite passes (release); cl
 - Not measured: the four history corpora (they need the old history, for example on a clone that kept it); the cost noise of a quiet machine; pilots as a ranking signal rather than a gate (the paper's use); real candidates in place of tunables.
 - Run: `python3 -I experiments/pilot-runs/drive.py` (about 3.5 hours here), then `python3 -I experiments/pilot-runs/analyze.py`; `cargo run --release --example net_night_plan`.
 - Gates on the branch: `cargo test --release` passes (291 tests); clippy `-D warnings` (all targets) and fmt clean; the privacy scan is clean.
+
+### E323 vector-views (the IVF vector view and the embedding cache on main's line)
+- Branch / parent: exp/323-vector-views / main at d80ba03 (E322)
+- Question: main has hybrid fusion (E312) but nothing to produce its vector list. The IVF view (E253) and the embedding cache (E255) live only on branches whose history does not share a root with main (exp/253 to exp/259 and the transformer reruns on exp/306-transformer-vector-views), so they cannot merge. Do they port to today's kernel unchanged, and what does a query cost?
+- Change (opt-in, nothing in the kernel calls them): `src/vectors.rs` (the IVF view: spherical k-means centroids, rows assigned to their nearest list, int8 codes packed in one content, search probing `nprobe` lists and rescoring the best `rescore` with the exact vectors from the database) and `src/embeds.rs` (the embedding cache keyed by model and fragment content id, and its row view), from exp/306-transformer-vector-views. Two edits: they use main's `put_derived` and `node_value` (now `pub(crate)`) in place of the branch's own copies, and the branch's `rrf` and `convex` are dropped since `src/fusion.rs` has them. `tests/vectors.rs` and `tests/embeds.rs` come over unchanged but for the fusion test, which `tests/fusion.rs` covers. `examples/vector_ivf.rs`: clustered unit vectors (64 topics) as rows, build, a 1% update, recall@10 against an exact scan.
+- Result (`cargo run --release --example vector_ivf -- 20000 256`, one 4-core cloud machine):
+  - Train (k-means, 141 lists, 8 rounds) 1.0 s, build 1.8 s, a 200-row update 0.49 s.
+  - recall@10 at rescore 100: nprobe 1 0.762, 2 0.954, 4 to 64 1.000. Query 11.9 ms at nprobe 1, 12.8 ms at 4, 29.9 ms at 64.
+  - At nprobe 4: rescore 10 gives recall 0.896 in 9.2 ms, 30 gives 1.000 in 9.7 ms, 100 14.2 ms, 300 22.4 ms.
+  - A query never costs less than about 9 ms here, whatever it probes: inferred from the code, not profiled, each query reads the centroids content and the whole code pack (20,000 x 256 bytes, one content per build) to score a few lists' codes. Synthetic clusters are easier than real text, so the recall figures are an upper bound; E325 measures real text.
+- Trade-off: none for callers who do not use it. Two modules and two tests added.
+- Verdict: **kept** (port, opt-in). The view and the cache work on main's line as they did on their own branch; the per-query floor is the next thing to fix.
+- Run: `cargo test --release --test vectors --test embeds`; `cargo run --release --example vector_ivf -- 20000 256`.
+
+### E324 bm25 (ranked keyword search in the kernel)
+- Branch / parent: exp/324-bm25 / exp/323-vector-views (E323)
+- Question: ikam's hybrid ranking (`fusion`, E312) fuses a keyword list with a vector list, but the kernel has no ranked keyword list: E258 and E259 used Tantivy behind a feature, and `search` answers which contents hold a pattern, not how well. Can a small BM25 over database rows, with no dependency, rank as well as Tantivy did on E258's task, and what does it cost?
+- Hypothesis: Okapi BM25 with Lucene's idf and Anserini's defaults (k1 0.9, b 0.4) over lowercased alphanumeric terms, without stemming, comes within a standard error of E258's Tantivy (stemmed) on known items and topics, and a query over about 10,000 documents takes a few milliseconds. (Source: Robertson and Zaragoza, 2009; Anserini's BM25 defaults; E258's numbers.)
+- Change (opt-in): `src/bm25.rs`: `terms`, `Repo::bm25_build(&db, prefix)` (one content: row keys and lengths, then each term's postings as varint row deltas and frequencies), `bm25_load`, `Bm25::search(query, k)` (ties by key). `tests/bm25.rs`: scores equal the formula computed row by row over 300 random rows (rows outside the prefix ignored, case folded, the stored index read back), and a small ranking case. Nothing in the kernel calls it.
+- Result (E326's data: 11,384 OSI-licensed PyPI READMEs, 61 MB of text, sampled from PyPI's JSON API with E256's `fetch.py` and `prepare.py`; E258's two tasks; a 4-core cloud Xeon; `cargo run --release --example hybrid_kernel -- DIR` on exp/326-hybrid-kernel):
+
+  | | Known item, dev / test (495 / 505 queries) | Topic, dev / test (58 / 72) |
+  |---|---|---|
+  | Kernel BM25, unstemmed | 0.796 / 0.802 (± 0.016) | 0.128 / 0.106 (± 0.017) |
+  | E258: Tantivy, stemmed (13,055 READMEs, another sample) | 0.804 (all 1,000) | 0.124 (all 142) |
+
+  - nDCG@10 with standard errors. The two samples differ, so the rows are comparable in size, not query for query.
+  - Build 3.9 s for 11,384 rows; index 8.7 MB (5.2 MB as stored); load 106 to 146 ms; a query 2.2 ms (mean of 1,130 queries, top 100).
+- Trade-off: the index is built whole, so any database update needs a rebuild (3.9 s here); E329 keeps one up by edits. No stemming or stop words: the stemmed engine scored the same here, but other text may want stemming. A loaded index lives in memory (about its stored size).
+- Verdict: **kept**, opt-in. BM25 in the kernel ranks as well as the Tantivy configuration that E258 and E259 measured, with no dependency, so hybrid ranking can run without the `search-tantivy` feature.
+- Not measured: stemming; BM25 over fragments rather than whole rows; collections over 100,000 rows.
+- Run: `cargo test --release --test bm25`; `cargo run --release --example hybrid_kernel -- DIR` (exp/326-hybrid-kernel; DIR from `prepare.py`, not committed).
+
+### E325 ivf-loaded (a vector index loaded once for repeated queries)
+- Branch / parent: exp/325-ivf-loaded / exp/324-bm25 (E324; E323 below it)
+- Question: E323 found every IVF query costs about 9 ms at 20,000 rows whatever it probes. Where does it go, and what does loading the index once buy?
+- Hypothesis: the floor is reading the whole code pack and the centroids on every query (E323, from the code). A loaded index (centroids, each list's rows and codes in memory) leaves only the rescore's row reads; keeping the rows' exact vectors in memory too leaves nothing to read. (Source: E323's floor; the same split as `SearchIndex`, which is loaded once and queried many times.)
+- Change (opt-in): `vectors::IvfIndex`, from `Repo::ivf_load(&ivf, &db)` or `ivf_load_with(&ivf, &db, true)` (exact vectors kept). `IvfIndex::search` returns what `ivf_search` returns. `tests/vectors.rs` checks both forms against `ivf_search` after every round of updates, at full and at small probe and rescore. `examples/vector_ivf.rs` adds the loaded queries.
+- Result (`cargo run --release --example vector_ivf -- ROWS 256`, clustered synthetic unit vectors, 50 queries, mean ms a query):
+
+  | Rows | Form | Load | nprobe 4, rescore 10 | nprobe 4, rescore 100 | nprobe 64, rescore 100 |
+  |---|---|---|---|---|---|
+  | 20,000 | view (`ivf_search`) | none | 8.5 | 14.0 | 28.5 |
+  | 20,000 | loaded | 26 ms | 1.12 | 6.8 | 7.8 |
+  | 20,000 | loaded, vectors kept | 483 ms | 0.42 | 0.51 | 2.0 |
+  | 100,000 | view | none | 36.1 | 39.7 | 82.4 |
+  | 100,000 | loaded | 150 ms | 2.2 | 7.4 | 11.9 |
+  | 100,000 | loaded, vectors kept | 2.5 s | 1.55 | 1.25 | 4.8 |
+
+  - Results are the same rows in each form (the test checks it); recall@10 at nprobe 4 is 0.988 at 100,000 (0.870 at rescore 10).
+  - Without kept vectors, the rescore's row reads cost about 60 us a row (6.8 ms for 100 at 20,000).
+  - Memory: codes are `dim` bytes a row (25.6 MB at 100,000 x 256); kept vectors add 4 x `dim` (102 MB).
+  - Seen on the way, not part of this hypothesis: `ivf_update` of 1% of the rows took 0.51 s at 20,000 and 11.3 s at 100,000, against a build of 1.7 s and 13.3 s. Cause, found afterwards with a debugger's stack samples: nearly all of it is the store checking, for each superseded copy the update drops, whether anything still needs it (`is_needed` scanning the store), because `needed_index` (E129) is off by default. With `repo.needed_index = true` the same update takes 1.47 s at 100,000, against a build of 13.8 s (mostly assigning rows to their nearest list). Any caller that updates vector views should turn the index on.
+- Trade-off: a loaded index is a snapshot: after a database update the caller loads again (150 ms at 100,000 without vectors). Kept vectors trade 4 bytes a dimension a row of memory and a 17x longer load for a further 2 to 6x.
+- Verdict: **kept** as an option. Load once for any caller that queries more than a few times; keep vectors where memory allows.
+- Next: E326's real-text measurement.
+- Run: `cargo test --release --test vectors`; `cargo run --release --example vector_ivf -- 20000 256` and `-- 100000 256`.
+
+### E327 vector-modes (execution modes for scoring a list's codes, MLIR included)
+- Branch / parent: exp/327-vector-modes / exp/325-ivf-loaded (E325)
+- Question: E277, E282 and E311 compared execution modes for a net's step, a scalar loop where E311's hypothesis expected MLIR to add nothing. An IVF query's inner loop (score `n` int8 codes against a query, E323 and E325) is the opposite case: data parallel, the shape MLIR's vector dialect is for. Which modes are fastest, does MLIR beat clang or Rust here, and what should the kernel do?
+- Hypothesis: the kernel's loop (`code_dot`: one running f32 sum) does not vectorize, because float addition is not associative and the compiler keeps the order. Any mode that reorders the sum (independent lanes in Rust, `-ffast-math` in C, explicit vector lanes in MLIR) runs several times faster, and they end within noise of each other, MLIR included, since they reach the same LLVM back end. An int8 query (exact i32 sums) is faster again and loses a few of the f32 query's top 100. (Source: E311's hypothesis on where MLIR could pay; the LLVM and MLIR vector dialect documentation; Jégou et al.'s scalar quantization as used in E253.)
+- Change:
+  - `experiments/vector-modes` (separate crate, own workspace, no kernel dependency): 4,096 codes (1 MB, the size of a few probed lists) and 100,000 (25.6 MB), `d` 256, random unit vectors quantized as in `vectors::quantize`. f32 query: `rust` (the kernel's loop), `rust-lanes` (16 sums), `clang` and `clang-fast` (the same loop in C, `-O3 -march=native`, without and with `-ffast-math`), `mlir+llc` and `mlir+opt` (the loop in the vector dialect, 16 lanes and a `vector.reduction` at the end, lowered with mlir-opt to the llvm dialect, `mlir-translate`, then `llc -O3 -mcpu=native` with or without `opt -O3` first, loaded with dlopen). int8 query: `rust-i8`, `avx2-i8` (`std::arch`: widen to i16, `madd`), `clang-i8`, `mlir-i8+llc`, `mlir-i8+opt`; the program asserts every int8 mode returns the same i32 scores. Fastest of 5 runs of at least 300 ms. MLIR and LLVM 18.1.3 from Ubuntu's `mlir-18-tools`. Rust built twice: default target (x86-64 baseline, as the kernel builds) and `-C target-cpu=native`.
+  - Kernel (opt-in): `vectors::code_dot_lanes` and `dot_lanes`, and `IvfIndex::with_lanes(true)`, which scores codes, centroids and kept vectors with 16 independent sums. `tests/vectors.rs` checks the loaded index with lanes returns the same rows as `ivf_search` after every update round.
+- Result (ns a code, one 4-core cloud Xeon with AVX2 and AVX-512; `cargo run --release` in `experiments/vector-modes` with `MLIR_BIN=/usr/lib/llvm-18/bin`):
+
+  | Mode | f32 query, 4,096 | f32 query, 100,000 | int8 query, 4,096 | int8 query, 100,000 |
+  |---|---|---|---|---|
+  | Rust as written (kernel today) | 138.8 | 126.3 | 56.2 | 70.2 |
+  | Rust, 16 lanes | 56.9 | 60.2 | | |
+  | Rust as written, target-cpu=native | 134.1 | 129.9 | 16.0 | 17.7 |
+  | Rust, 16 lanes, target-cpu=native | 21.5 | 19.4 | | |
+  | clang -O3 -march=native | 265.6 | 260.8 | 14.5 | 18.7 |
+  | clang, -ffast-math | 15.4 | 18.6 | | |
+  | MLIR vector dialect + llc | 20.1 | 27.9 | 17.6 | 23.0 |
+  | MLIR vector dialect + opt + llc | 19.9 | 22.0 | 10.2 | 16.3 |
+  | AVX2 intrinsics (Rust) | | | 8.9 | 16.8 |
+
+  - Every f32 mode returns the f32 query's same top 100 (largest difference from the kernel's loop 2.3e-5). The int8 query keeps 94 to 95 of the f32 query's top 100; the rescore with exact vectors (E325) restores the order of what it keeps.
+  - MLIR compiles the two kernels in 30 ms (mlir-opt) + 20 ms (translate) + 81 ms (opt -O3) + 27 ms (llc); clang takes 93 to 554 ms for the C file.
+  - In memory (100,000 codes), the fast modes meet at 14 to 16 GB/s, the machine's memory bandwidth for one core (inferred: in cache at 4,096 they spread to 9 to 20 ns).
+  - In the kernel (`examples/vector_ivf`, 100,000 x 256, loaded with vectors kept): `with_lanes(true)` takes nprobe 4 from 0.41 to 0.27 ms and nprobe 64 from 3.99 to 2.86 ms, same recall; the rest of a query (sorting, row keys) does not change.
+- Answer on MLIR: here MLIR does what it is for, but so do two lines of Rust. Its vector dialect matched clang with `-ffast-math` and Rust with lanes within about 30%, and with `opt -O3` matched hand-written AVX2 on the int8 query in memory. It adds nothing over writing the lanes out, which is what the kernel can do without a tool chain. MLIR would matter for code generated at run time over many shapes (dimensions, code widths, fused filters), which ikam does not have yet.
+- Trade-off: lanes change float rounding (last bits), so ties can order differently; off by default for that reason. An int8 query is faster again but changes which rows reach the rescore; not added to the kernel. The kernel's baseline x86-64 build gets about a third of what `target-cpu=native` gets.
+- Verdict: **measured** (modes) and **kept** as an option (`with_lanes`, off).
+- Not measured: AVX-512 VNNI (`vpdpbusd`, present on this machine); Apple silicon (NEON, and the laptop's MLIR from E311); a fused filter or several queries at once, where MLIR's affine and linalg dialects could pay.
+- Run: `MLIR_BIN=/usr/lib/llvm-18/bin cargo run --release` in `packages/kernel/experiments/vector-modes` (add `RUSTFLAGS="-C target-cpu=native"` for the native rows); `cargo run --release --example vector_ivf -- 100000 256`.
+
+### E326 hybrid-kernel (keyword, vector and fused ranking all in the kernel, on real text)
+- Branch / parent: exp/326-hybrid-kernel / exp/327-vector-modes (E327; E325, E324 and E323 below it)
+- Question: E258 and E259 measured hybrid ranking with Tantivy and an exact vector scan outside the kernel's views. With the kernel's own BM25 (E324), its loaded IVF (E325, vectors kept, lanes from E327) and `fusion` (E312), how good is the whole path on real text, and how many lists must the IVF probe before its misses stop costing ranking quality?
+- Hypothesis: fused with BM25 by convex at E312's weight for a static model (0.6 to 0.7), the kernel path scores as E259's did (known items about 0.80, topics about 0.14). The IVF needs many probes on these vectors (E257: recall@10 0.69 at 8 of 109 lists, 0.93 at 32), and fusion hides part of its misses, because a missed row is often still in BM25's list. (Source: E257, E258, E259, E312.)
+- Change: none in the kernel. `examples/hybrid_kernel.rs`: rows `t/KEY` (text) and `v/KEY` (WordLlama vector of the whole README), BM25 over `t/`, an IVF over `v/` (sqrt(N) lists, k-means on a sample of 20 rows a list, 8 rounds) loaded with vectors kept and lanes on. Per query: BM25's top 100, the exact top 100, and the IVF's top 100 at 4 to all lists probed (best 200 rescored); each vector list alone, with RRF k 60 and with convex 0.5 to 0.8. Queries split in halves by a hash of their id.
+- Result (11,384 OSI-licensed PyPI READMEs and 1,130 queries from `prepare.py` on a fresh sample of PyPI's JSON API; WordLlama l2_supercat, 256 dimensions; a 4-core cloud Xeon). nDCG@10, dev / test:
+
+  | Ranking | Known item (495 / 505) | Topic (58 / 72) |
+  |---|---|---|
+  | BM25 (E324) | 0.796 / 0.802 | 0.128 / 0.106 |
+  | Vectors, exact | 0.528 / 0.535 | 0.122 / 0.107 |
+  | RRF k 60, exact vectors | 0.726 / 0.721 | 0.153 / 0.139 |
+  | Convex 0.6, exact vectors | 0.816 / 0.818 | 0.143 / 0.128 |
+  | Convex 0.7, exact vectors | 0.815 / 0.820 | 0.151 / 0.121 |
+  | Convex 0.7, IVF at 8 lists | 0.798 / 0.812 | 0.143 / 0.119 |
+  | Convex 0.5, IVF at 8 lists | 0.681 / 0.702 | 0.147 / 0.121 |
+  | Convex 0.7, IVF at 64 lists | 0.812 / 0.819 | 0.148 / 0.122 |
+
+  - Standard errors are about 0.016 on known items and 0.015 to 0.020 on topics.
+  - IVF (106 lists) recall@10 against exact, and ms a query: 4 lists 0.525 (0.40), 8 lists 0.670 (0.28), 16 lists 0.809 (0.39), 32 lists 0.916 (0.66), 64 lists 0.987 (1.13), all 1.000 (1.45). The 4-list time above the 8-list one is inferred to be the first search of each query paying cold caches.
+  - BM25 2.2 ms a query, fusion 0.06 ms; build: rows 8.7 s, BM25 3.9 s, IVF 1.5 s.
+  - As E259 found: convex at 0.6 to 0.7 is the best single weight on known items, about one standard error above BM25 alone (+0.016 to +0.020), and RRF falls below BM25 there by 0.07 to 0.08. On topics RRF k 60 leads by 0.025 to 0.033 over BM25, within two standard errors on sets this small.
+  - Fusion hides the index's misses at a high keyword weight: at 0.7 the 8-list IVF is within 0.02 of exact vectors on known items, but at 0.5 it is 0.08 to 0.11 below exact vectors at the same weight, because the vector list then decides more of the top 10.
+- Trade-off: none new. Probing 64 lists costs 1.13 ms against 0.28 ms for 8, all of it inside one query's total of about 3.4 ms.
+- Verdict: **measured.** The kernel alone gives the hybrid ranking E259 measured with Tantivy (0.82 against 0.805 on known items). For vectors like these, probe at least 60% of an IVF's lists, or probe them all below about 10,000 rows, where it costs 1.5 ms; a lower probe count is only safe with a keyword weight of 0.7 or more.
+- Not measured: a transformer embedder in this path (model downloads are blocked on this machine; E306 measured MiniLM and bge-small outside it); stemming; collections over 100,000 rows.
+- Run: `cargo run --release --example hybrid_kernel -- DIR` (DIR from `prepare.py` on exp/259-fusion-tune; not committed).
+
+### E329 bm25-view (BM25 kept up by edits as a view of the database)
+- Branch / parent: exp/329-bm25-view / exp/326-hybrid-kernel (E326)
+- Question: E324's index is built whole, so every database update costs a rebuild (3.9 s at 11,384 READMEs). ikam's rows change all the time. Can BM25 be a view that an update edits, as `vectors` and `views` are, at a cost that follows the rows changed, with the same scores?
+- Hypothesis: one graph node per term (its postings as content) and a stats node make a view whose update reads and rewrites only the terms of the changed rows, and whose query reads only its own terms. Common terms appear in most rows, so a 1% update still rewrites their long lists. Keeping the changes in a small second graph and folding it in now and then, as Lucene's segments do, makes an update cost follow the rows changed. (Source: Lucene's segment merging, as summarized in docs/research/search-engines.md on exp/259-fusion-tune; E325's lists graph.)
+- Change (opt-in): in `src/bm25.rs`:
+  - `Bm25View` and `Repo::bm25_view_update(&view, &old, &new, prefix)`: nodes `t US term` (postings `{ key tf dl }` sorted by key) and `s` (rows, total length); the update reads the `kv` diff and edits only the touched terms. The same rows give the same root however the view got there. `bm25_view_search` reads its terms' lists in place.
+  - `Bm25Live` (`bm25_live_build`, `bm25_live_update`, `bm25_live_search`): a base view at `base_db` and a delta graph holding the changed rows' postings, a mark for each changed row (`k US key`, removed rows included) and the stats of the whole. An update edits the delta; past `merge_rows` marked rows the base is updated from `base_db` and the delta emptied. A query drops marked rows from the base lists and adds the delta's, so document frequencies and lengths are those of the current rows.
+  - `tests/bm25.rs`: over six rounds of rows added, changed and removed (and rows outside the prefix), the view and two live views (one merging every 25 rows, one never) score as the formula computed row by row, and the kept view equals one built at the end.
+  - `examples/bm25_view.rs`: E324's index, the view and the live view on the same rows, a 1% update (rows given other rows' text), a forced merge, then 1% updates in a row until a merge.
+  - Tried and dropped: one node per posting (`p US term US key US tf,dl`, no content), so an update rewrites only the tree chunks around changed postings. On the synthetic rows it built in 11.9 s, updated in 11.4 s (no better than its rebuild) and queried in 26.7 ms: each changed row's 100 or more terms land in different chunks, so 1% of the rows touched about 40% of them.
+- Result (a 4-core cloud Xeon; `needed_index` on, E325; mean ms a query, top 10):
+
+  | | Synthetic: 20,000 rows of 50 to 300 Zipf words, 3-word queries | Real: E326's 11,384 READMEs, 1,130 summary and topic queries |
+  |---|---|---|
+  | Index (E324): build, size, load, query | 2.1 s, 3.6 MB, 56 ms, 3.95 ms | 3.7 s, 5.2 MB, 118 ms, 2.18 ms |
+  | View: build, size | 5.1 s, 14.6 MB | 16.5 s, 43.0 MB |
+  | View: update of 1% (written), rebuild | 2.57 s (11.7 MB), 3.94 s | 5.51 s (31.9 MB), 6.52 s |
+  | View: query | 3.52 ms | 6.9 ms (15.2 ms on the copy written first) |
+  | Live: update of 1% (written) | 0.30 s (0.49 MB) | 0.42 s (0.71 MB) |
+  | Live: query, with a 1% delta | 4.35 ms | 17.1 ms |
+  | Live: 1% updates in a row from a merged view; the sixth passes 5% and merges | 0.33, 0.58, 0.79, 0.87, 0.93 s, merge 4.04 s | 0.31, 0.52, 0.89, 0.87, 1.14 s, merge 7.78 s |
+
+  - Every view and live query returns the index's top 10 (200 of 200 and 1,130 of 1,130); sizes are bytes the store wrote.
+  - A view's update costs 65% (synthetic) to 85% (real) of its rebuild, as the hypothesis expected for common terms. The live view's first update costs 8 to 12% of the view's; over six updates with one merge it costs 1.3 s (synthetic) to 1.9 s (real) a 1% update, against the view's 2.6 s and 5.5 s. After them it ranks as a view built at the same rows (the example checks it).
+  - Real queries (a project's whole summary) read many common terms' lists: 6.9 ms against the loaded index's 2.2 ms. Reading those lists was 12 ms of the live query's 17 ms; its base is the copy written first. Why the store reads the first-written copy of the same lists at 15 ms and later copies at 7 ms was not found (inferred: how the store encoded each content).
+  - Before reading lists in place, the view's real-text query took 24.8 ms (decoding each list into a map).
+- Trade-off: against E324's index, a view needs no load and no rebuild, but is 4 to 8x larger in the store and its queries are up to 3x slower on long queries over common terms (on par on short ones). The live view makes updates cheap but merges take one rebuild's time now and then, and its queries are slower again while the delta holds rows.
+- Verdict: **kept**, both opt-in. `Bm25Live` for rows that change often; `Bm25View` where updates are rare and queries short; E324's loaded index where queries dominate.
+- Not measured: merging in the background while queries use the old base; a delta folded by term rather than whole; the store encoding behind the 7 to 15 ms spread; stemming.
+- Run: `cargo test --release --test bm25`; `cargo run --release --example bm25_view` (synthetic) and `-- DIR` (E326's data).
+
+### E330 fragment-vectors (a README found by its best paragraph)
+- Branch / parent: exp/330-fragment-vectors / exp/329-bm25-view (E329)
+- Question: E258 found one vector of a whole README and the mean of its paragraphs' vectors rank alike, both weak on known items (0.52 against BM25's 0.80). The embedding cache (E255, E323) already holds a vector a paragraph. Does scoring a document by its best paragraph find it better, alone and fused with BM25, and can the loaded IVF (E325) serve 33 times as many rows?
+- Hypothesis: a static model averages a long README into a vector near the collection's centre, so a query that paraphrases one part of it matches that part's paragraph far better than the whole. Known items gain; topic queries, which name what a whole project is about, gain less or lose. (Source: E258's whole-against-mean result; scoring a document by its best passage, as in max-passage retrieval and ColBERT's late interaction, Khattab and Zaharia, 2020.)
+- Change: none in the kernel. `examples/fragment_vectors.rs` over E326's data: every distinct paragraph (376,619) is a row `f/N` with its WordLlama vector, BM25 over the READMEs' text, an IVF over `f/` (613 lists, vectors kept, lanes on). Per query, documents ranked by: the whole README's vector, the mean of its paragraphs (E258), its best paragraph (the top 2,000 paragraphs over all rows, exactly or through the IVF at 16 to 128 lists, each document scored by the best of its own among them), and the mean of best paragraph and whole README (`best+whole`, over the two lists' top 100s). Each alone and fused with BM25 by convex.
+- Result (nDCG@10, dev / test; standard errors about 0.015 to 0.020 on known items, 0.011 to 0.020 on topics; a 4-core cloud Xeon):
+
+  | Vectors | Alone, known item | Convex 0.6, known item | Alone, topic | Convex 0.5, topic |
+  |---|---|---|---|---|
+  | (BM25 alone) | 0.796 / 0.802 | | 0.128 / 0.106 | |
+  | Whole README | 0.528 / 0.535 | 0.816 / 0.818 | 0.122 / 0.107 | 0.147 / 0.129 |
+  | Mean of paragraphs | 0.543 / 0.540 | 0.820 / 0.825 | 0.109 / 0.117 | 0.141 / 0.146 |
+  | Best paragraph | 0.687 / 0.694 | 0.829 / 0.833 | 0.060 / 0.067 | 0.100 / 0.101 |
+  | Best paragraph and whole, mean | 0.719 / 0.732 | 0.825 / 0.836 | 0.111 / 0.111 | 0.136 / 0.136 |
+  | Best paragraph, IVF at 64 of 613 lists | 0.655 / 0.649 | 0.824 / 0.827 | 0.060 / 0.063 | 0.099 / 0.099 |
+
+  - Alone, a document's best paragraph finds known items 0.16 better than its whole vector (about eight standard errors), and with the whole vector added 0.19 to 0.20 better. Fused with BM25 the gain shrinks to 0.01 to 0.02 (about one standard error): BM25 already finds most known items.
+  - On topics the best paragraph alone halves the score (0.06 against 0.12) and drags fusion down by 0.03 to 0.05: a topic matches what a project is about, which one paragraph rarely says. Adding the whole vector back keeps topics within a standard error of the whole vector alone.
+  - Costs: exact best paragraph 66 ms a query (376,619 rows scored). The IVF: build 108 s, load 10 to 11 s, about 480 MB in memory with vectors kept (inferred from the row sizes); document recall@10 against exact 0.80, 0.85, 0.89 and 0.93 at 16, 32, 64 and 128 lists, 7.3, 8.6, 12.0 and 19.9 ms a query. Rows took 36 to 38 s to append.
+- Trade-off: 33 times as many vectors to embed, store and index (the cache holds them already where fragments are embedded); queries 5 to 10 times slower than over whole READMEs. Best paragraph alone is worse for broad queries, so it should not replace the whole vector.
+- Verdict: **measured.** For finding a document by part of its content, score it by its best paragraph and its whole vector together: alone that gains 0.19 on known items and keeps topics, and fused with BM25 it is the best ranking measured here (0.836 on known-item test queries). Not a kernel option yet: a kernel version would be a vector view over fragments with documents scored at query time, worth building once a stronger embedder shows whether the gain holds.
+- Not measured: a transformer embedder (MiniLM or bge-small read at most a few hundred tokens, so their whole-README vector is a first-paragraph vector, inferred; model downloads are blocked here); weights other than the even mean of best paragraph and whole; the top k paragraphs instead of the best one.
+- Run: `cargo run --release --example fragment_vectors -- DIR` (DIR from `prepare.py`; not committed).
+
+### E331 ivf-routing (why the IVF needs so many lists on real vectors)
+- Branch / parent: exp/331-ivf-routing / exp/330-fragment-vectors (E330)
+- Question: on WordLlama vectors the IVF needs 64 of 106 lists for recall@10 0.99 (E326) and 128 of 613 for 0.93 (E330), where synthetic clusters needed 4 (E323). Is it the training (the kernel's callers use 20 sample rows a list and 8 rounds), or the vectors' geometry? Static models' vectors share a large common direction; does routing on mean-centred vectors help?
+- Hypothesis: both. Longer training on a larger sample evens the lists and raises recall at a fixed probe count. Centring the vectors before training and routing (scores still exact on the original vectors) spreads them over the sphere and raises recall per row scanned. (Source: E257, E326; the anisotropy of static and contextual embeddings, Ethayarajh, 2019, and mean-centring as a fix, Mu and Viswanath's "all-but-the-top", 2018.)
+- Change: none in the kernel. `examples/ivf_routing.rs`: in memory, outside the store, the kernel's `kmeans` and nearest-centroid rule; for each training setting, the share of each query's exact top 10 that lies in the lists it probes (the most any rescore can reach) and the rows those lists hold. Rows: E326's 11,384 README vectors (106 lists) and an even sample of 100,000 of E330's paragraph vectors (316 lists); the 1,130 E326 queries.
+- Result (share of the true top 10 in the probed lists, rows scanned in brackets; a 4-core cloud Xeon):
+
+  | Training | READMEs: 8 lists | 16 | 64 | Paragraphs: 8 lists | 16 | 64 | Train (READMEs / paragraphs) |
+  |---|---|---|---|---|---|---|---|
+  | 20 rows a list, 8 rounds (as now) | 0.670 (1,236) | 0.809 (2,444) | 0.987 (8,677) | 0.698 (3,790) | 0.764 (7,132) | 0.891 (25,659) | 0.6 s / 5.3 s |
+  | 100 rows a list, 20 rounds | 0.703 (1,013) | 0.828 (2,031) | 0.986 (7,822) | 0.748 (3,187) | 0.807 (6,154) | 0.909 (22,904) | 6.9 s / 59 s |
+  | Centred, 20 rows, 8 rounds | 0.527 (777) | 0.669 (1,568) | 0.944 (6,579) | 0.688 (2,791) | 0.747 (5,184) | 0.867 (18,981) | 0.6 s / 4.8 s |
+  | Centred, 100 rows, 20 rounds | 0.569 (751) | 0.713 (1,576) | 0.957 (6,722) | 0.734 (2,635) | 0.785 (5,040) | 0.887 (19,056) | 6.9 s / 60 s |
+
+  - The routing reproduces the kernel's IVF: 0.670 at 8 lists over READMEs, as E326 measured through the store.
+  - The geometry: READMEs sit at a mean cosine of 0.61 to their common mean (paragraphs 0.28), and the largest list holds 6.3 times the mean (paragraphs 9.1). Queries land in the large lists: at 64 of 106 lists the IVF scans 76% of the READMEs, so at this size it saves little over scanning them all.
+  - Longer training evens the lists (largest 3.8 and 5.4 times the mean) and gains up to 0.06 at a fixed probe count (0.02 to 0.06, except at 64 READMEs lists, where both reach 0.99) while scanning 10 to 18% fewer rows, for about 11 times the training time.
+  - Centring scans fewer rows a list but finds less: over READMEs it loses at every probe count, and over paragraphs it matches uncentred training at the same rows scanned (0.785 at 5,040 rows against about 0.78 interpolated). The hypothesis's second part does not hold.
+- Trade-off: training is a caller's choice (`kmeans(sample, k, iters)`), nothing to change in the kernel; 100 rows a list and 20 rounds cost a minute at 100,000 rows, once per index.
+- Verdict: **measured.** Train IVF centroids on about 100 rows a list for about 20 rounds for vectors like these; do not centre. With a static embedder the lists stay uneven and queries fall in the big ones, so below about 20,000 rows scan everything (E326: 1.5 ms at 11,384), and above it expect to probe 10 to 20% of the lists for recall 0.8 to 0.9. A graph index (HNSW, E257: 0.94 at ef 128 on 100,000 paragraphs) is the next thing to try for this case, not more IVF tuning.
+- Not measured: k-means++ seeding; more lists than sqrt(N); a transformer embedder's geometry.
+- Run: `cargo run --release --example ivf_routing -- DIR` and `-- DIR 100000` (DIR from `prepare.py`).
+
+### E332 hnsw (a graph vector index in the kernel, no dependency)
+- Branch / parent: exp/332-hnsw / exp/331-ivf-routing (E331)
+- Question: E331 found the IVF routes real queries into a few large lists, so at good recall it scans most rows (64 of 106 lists scan 76% of the READMEs). E257 measured a graph index (`hnsw_rs`, an outside crate, since dropped with the Rust-only kernel) at recall@10 0.94 on 100,000 paragraphs in 2.5 ms. Can the kernel hold its own graph index, with no dependency, stored beside the database, kept up by edits, and how does it compare with the loaded IVF (E325) on the same real vectors?
+- Hypothesis: a graph scores a few thousand vectors a query however the rows cluster, so at equal recall it is several times faster than the IVF on these vectors and the gap grows with the rows; building costs more than training the IVF. (Source: Malkov and Yashunin, "Efficient and robust approximate nearest neighbor search using hierarchical navigable small world graphs", 2018; E257, E331.)
+- Change: `src/hnsw.rs`, opt-in, nothing builds a graph unless a caller asks:
+  - `HnswIndex`: rows as nodes with up to `m` links a level (`2m` at the bottom), levels from a hash of each row's position (a build is deterministic), links chosen by the paper's heuristic (algorithm 4, pruned candidates fill up). `search(q, k, ef)` by dot product. `insert`, `extend`, and `remove`, which leaves the row in the graph as a waypoint and out of results.
+  - `Hnsw`: the graph stored as one content (each node's key, levels and links as varints; a removed node keeps its vector there, since the database no longer has it). `hnsw_build(db, prefix, index)`, `hnsw_save`, `hnsw_load(h, db)` (vectors of live rows read from the database), `hnsw_update(index, old, new, prefix)` (rows in the diff removed, new values inserted).
+  - Two options, off by default: `with_lanes` (E327's 16-sum dot product, also while linking) and `with_threads(n)`: `extend` links 1,024 rows at a time on `n` threads, each against the graph as it stood before the batch plus an exact scan of its batch; the graph differs from one built a row at a time, and is the same on every build with the same `n`.
+  - `tests/hnsw.rs`: recall above 0.95 against an exact scan on clustered vectors; a stored and loaded graph answers as the one in memory; three rounds of upserts, new rows and removals keep recall above 0.93, never return a removed row, and survive save and load; a threaded build is deterministic and recalls above 0.95.
+  - `examples/hnsw_graph.rs`: the graph against the loaded IVF (vectors kept, lanes, 100 rescored) and an exact scan, all through the store, on E330's WordLlama vectors (256 dimensions) and E326's 1,130 queries.
+- Result (recall@10 against an exact scan; query time; a 4-core cloud Xeon):
+
+  | Rows | Exact scan | IVF (sqrt(N) lists): probes, recall, ms | HNSW m 16: ef, recall, ms (vectors scored) |
+  |---|---|---|---|
+  | 11,384 READMEs | 0.76 ms | 32: 0.916, 0.59; 64: 0.987, 0.97 | 80: 0.921, 0.20 (1,215); 160: 0.961, 0.33 (2,038); 320: 0.983, 0.55 (3,316) |
+  | 100,000 paragraphs | 16 to 25 ms | 64: 0.891, 3.5; 128: 0.955, 6.0 | 80: 0.927, 0.35 (1,490); 160: 0.958, 0.71 (2,628); 320: 0.976, 1.35 (4,771) |
+  | 376,619 paragraphs | 52 ms | 64: 0.864, 8.1; 128: 0.913, 15.9 | 80: 0.902, 0.56 (1,491); 160: 0.934, 1.03 (2,572); 320: 0.962, 1.83 (4,634) |
+
+  - At equal recall the graph is about 3 times faster than the IVF at 11,384 rows, about 8 times at 100,000 and over 15 times at 376,619 (0.934 in 1.0 ms against 0.913 in 15.9 ms), and 50 times faster than the exact scan. It scores 1,200 to 1,500 vectors a query at ef 80 at every size.
+  - Against E257's `hnsw_rs` (13,055 READMEs, ef 64 0.81, ef 128 0.87; 100,000 paragraphs ef 128 0.94 in 2.5 ms): the kernel's graph recalls at least as well at the same ef and answers faster, on the same kind of machine.
+  - Recall needs a wide beam on these vectors (0.92 at ef 80, where the tests' synthetic clusters pass 0.95 at ef 64). Paragraph vectors as queries (`QUERIES=paragraphs`) give the same curve, so it is the vectors' geometry (E331), not short queries.
+  - Link count: m 8, 16, 24 at 100,000 rows give 0.844, 0.927, 0.947 at ef 80; m 24 costs 1.6 times the build and 40% more graph for about 0.02. m 16 is the default to suggest.
+  - Build at 100,000 rows: 102 s a row at a time, 44 s with lanes (the same recall), 25 s with lanes on 4 threads (recall 0.930 at ef 80, against 0.927). At 376,619 rows, 110 s on 4 threads, about as long as training and building the IVF (106 s). The stored graph is 8.5 MB at 100,000 rows (33 MB at 376,619; the vectors are 102 and 386 MB); loading it with the vectors takes 2.3 s and 9.3 s, nearly all reading vectors from the store.
+  - Updates: 1% of the rows given new values take 143 ms at 11,384 rows, 1.0 s at 100,000 (IVF 9.4 s, mostly E325's cause) and 4.3 s at 376,619 (IVF 147 s); recall at ef 80 stays where it was (0.90 to 0.93) against the new exact top 10, and the saved and reloaded graph answers the same.
+- Trade-off: memory, since a loaded graph keeps every vector (dim x 4 bytes a row, as `ivf_load_with(.., true)`), plus the links (about 85 bytes a row stored, more in memory); a removed row stays in the graph until a rebuild, so heavy churn needs one; `with_threads` gives a slightly different graph (recall within 0.005 here).
+- Verdict: **kept as an option.** For vectors like these, above about 20,000 rows, the graph is the index to use: 0.93 to 0.96 recall in about 1 ms at a few hundred thousand rows, where the IVF needs 6 to 16 ms for less. Below that, scan (E331). Suggested setting: m 16, ef_build 100, lanes on, threads as the machine has; search with ef 80 to 160, or ef 80 when fused with BM25 (E326: fusion hides most of the misses).
+- Not measured: the graph fused with BM25 on the judged queries; a graph over int8 codes (E253) to halve memory; deletes past 10% of rows; an Apple silicon run.
+- Run: `cargo run --release --example hnsw_graph -- DIR`, `-- DIR 100000`, `THREADS=4 MS=16 ... -- DIR 376619` (DIR from `prepare.py`).
+
+### E333 hybrid-graph (the best ranking with graph indexes, end to end)
+- Branch / parent: exp/333-hybrid-graph / exp/332-hnsw (E332)
+- Question: E330's best ranking (BM25 fused at convex 0.6 with the mean of a README's best-paragraph score and its whole-README score) scored both vector lists exactly: 63 ms a query over 376,619 paragraphs. With both lists from E332's graphs, does the ranking hold, and what does a query cost end to end?
+- Hypothesis: it holds within noise at a modest beam, since fusion hides most vector misses (E326) and the graph finds 0.9 of the exact top 10 paragraphs at ef 80 (E332); a query costs about 5 to 10 ms, most of it BM25 and the rescore.
+- Change: none in the kernel. `examples/hybrid_graph.rs`: the rows of E330 (text for BM25, one vector a README under `w/`, one a paragraph under `f/`) in one database; a graph over each (m 16, ef_build 100, lanes, 4 threads); a query searches BM25 (top 100), the README graph (top 100) and the paragraph graph (top `p` paragraphs, beam `p`), and rescores the union of their READMEs exactly as E330's best+whole, then fuses. Against the same computed by exact scans.
+- Result (nDCG@10, mean and standard error; 1,130 queries; a 4-core cloud Xeon):
+
+  | Vectors | Known items dev / test, convex 0.6 | Topics dev / test, convex 0.5 | Top 10 vs exact | Query end to end |
+  |---|---|---|---|---|
+  | BM25 alone | 0.796 / 0.802 | 0.128 / 0.106 | | 4.5 ms |
+  | Exact scans (E330) | 0.825 / 0.836 (0.016 / 0.015) | 0.136 / 0.136 | 1.000 | 4.5 + 63 ms |
+  | Graphs, README ef 80, 100 paragraphs | 0.825 / 0.835 | 0.136 / 0.134 | 0.975 | 8.7 ms |
+  | Graphs, README ef 80, 200 paragraphs | 0.824 / 0.837 | 0.137 / 0.134 | 0.985 | 12.0 ms |
+  | Graphs, README ef 160, 400 paragraphs | 0.824 / 0.836 | 0.136 / 0.133 | 0.995 | 20.1 ms |
+
+  - The ranking holds: every graph setting is within 0.002 of exact on known items and 0.003 on topics, far inside one standard error. Alone, the graph lists lose 0.02 at the smallest beam (0.697 against 0.719 on dev), which fusion hides, as in E326.
+  - End to end the smallest setting takes 8.7 ms against 68 ms with exact scans, 8 times faster. BM25 is about half of it (4.5 ms here against 2.2 ms in E324, likely because this process holds the 376,619 vectors three times: in the store, in the graph and in the example's own copy; not checked), the rescore of a few hundred READMEs' paragraphs most of the rest.
+  - Graph builds: 2.4 s for 11,384 READMEs, 105 s for the paragraphs, on 4 threads.
+- Trade-off: none beyond E332's memory: the rescore reads every paragraph vector of each candidate README, so the vectors stay in memory (here as the example's own copy).
+- Verdict: **measured.** The recommended semantic search for READMEs like these is BM25 fused at convex 0.6 with best paragraph plus whole, both lists from graphs at the smallest setting (README ef 80, 100 paragraphs): known items 0.83 (BM25 0.80), topics kept, about 9 ms a query at 376,619 paragraphs on this machine.
+- Not measured: the rescore from the graph's own vectors (it holds them; the example keeps a second copy); a transformer embedder (E306's vectors) in the same pipeline; an Apple silicon run.
+- Run: `cargo run --release --example hybrid_graph -- DIR` (DIR from `prepare.py`).
+
+### E334 hnsw-codes (a graph index that keeps int8 codes, a quarter of the memory)
+- Branch / parent: exp/334-hnsw-codes / exp/333-hybrid-graph (E333)
+- Question: E332's loaded graph keeps every row's f32 vector: 386 MB at 376,619 paragraphs of 256 dimensions, for a service that runs on the owner's own machine. With each row kept as E253's int8 code instead (96 MB), how much recall is lost, does a rescore of the best rows from the store win it back and at what cost, and does E333's full ranking hold?
+- Hypothesis: the walk reaches the same nodes (codes keep the order of near neighbours well), the final order loses a little where scores lie within quantization error, a rescore of the best 50 restores it, and fusion with BM25 hides the rest.
+- Change: `src/hnsw.rs`, both opt-in:
+  - `HnswIndex::with_codes(true)` (off by default; set on an empty index): rows kept as int8 codes; a query scores codes against the f32 query, links are chosen by code-to-code dot products (exact in i32). The stored graph records which kind it is; a removed row keeps its code there.
+  - `Repo::hnsw_search_rescored(index, db, q, k, ef, rescore)`: the best `rescore` rows rescored with their exact vectors read from the database; `HnswIndex::score(q, key)`: a row's score as the index keeps it.
+  - `tests/hnsw.rs`: a graph of codes, built on 2 threads, rescored: exact scores, recall above 0.95, stored and loaded the same, recall above 0.93 after upserts and removals.
+  - `examples/hnsw_graph.rs` gains `CODES=1`, `RESCORE=n` (0: none), `IVF=0` and `READ_CACHE=bytes`; `examples/hybrid_graph.rs` gains `CODES=1` and scores candidates from the graphs' own rows instead of a second copy.
+- Result (recall@10 against an exact scan, m 16, lanes, 4 threads; a 4-core cloud Xeon):
+
+  | Rows | Kept | ef 80: recall, ms | ef 160 | ef 320 | Build |
+  |---|---|---|---|---|---|
+  | 100,000 | vectors (E332) | 0.930, 0.45 | 0.962, 0.76 | 0.979, 1.34 | 25 s |
+  | 100,000 | codes | 0.908, 0.30 | 0.938, 0.55 | 0.953, 1.03 | 29 s |
+  | 100,000 | codes, best 50 rescored from the store | 0.930, 4.6 | 0.963, 5.4 | 0.980, 5.2 | |
+  | 376,619 | vectors (E332) | 0.902, 0.56 | 0.934, 1.03 | 0.962, 1.83 | 110 s |
+  | 376,619 | codes | 0.875, 0.50 | 0.908, 0.87 | 0.933, 1.67 | 133 s |
+
+  - The walk with codes scores exactly as many vectors as with f32 vectors (1,489 at ef 80) and the rescore gives back the same recall, within 0.001, so codes lose only in the final order: 0.02 to 0.03 of recall at every beam.
+  - The rescore costs about 85 µs a row read from the store (50 rows, 4.3 ms); with E294's read cache it is 36 µs (2.1 ms at ef 80), but the cache then holds the vectors codes were meant to drop. Reading a row by key from this store is the cost to look at next, not the graph.
+  - E333's full ranking with both graphs keeping codes, candidates scored from the codes (11,384 READMEs, 376,619 paragraphs; nDCG@10):
+
+    | Vectors | Known items dev / test, convex 0.6 | Topics dev / test, convex 0.5 | Top 10 vs exact |
+    |---|---|---|---|
+    | Exact scans (E330) | 0.825 / 0.836 | 0.136 / 0.136 | 1.000 |
+    | Graphs with vectors, README ef 80, 100 paragraphs | 0.825 / 0.835 | 0.136 / 0.134 | 0.975 |
+    | Graphs with codes, same setting | 0.823 / 0.836 | 0.134 / 0.133 | 0.952 |
+
+    Within 0.003 of exact everywhere, inside one standard error (0.015 known, 0.019 topics). End to end 13 to 14 ms for both kinds here, against E333's 8.7 ms: scoring candidates by key through the index's map likely costs those 5 ms (string hashing for a few thousand paragraphs a query; not profiled), a cost of the example's lookup, not of codes.
+  - Memory at 376,619 rows: 96 MB of codes against 386 MB of vectors, plus the links either way.
+- Trade-off: 0.02 to 0.03 recall alone, nothing measurable fused; builds 15 to 20% slower (likely the code-to-code products, written without lanes); `with_codes` must be set before rows are added.
+- Verdict: **kept as an option.** For E333's search on a machine where memory matters, keep both graphs as codes and do not rescore: the fused ranking is unchanged and the vectors take a quarter of the memory. Rescore from the store only for vector search alone, and only once reading a row costs less (next: where a point read's 40 to 80 µs go).
+- Not measured: codes of 4 bits or product quantization; `score` by position instead of by key; an Apple silicon run.
+- Run: `IVF=0 CODES=1 RESCORE=0 THREADS=4 MS=16 cargo run --release --example hnsw_graph -- DIR 100000` (and `RESCORE=50`, `READ_CACHE=536870912`, `376619`); `CODES=1 cargo run --release --example hybrid_graph -- DIR`.
+
+### E335 point-reads (where reading one row by key goes, and three fixes)
+- Branch / parent: exp/335-point-reads / exp/334-hnsw-codes (E334)
+- Question: E334 found that reading one row by key from an in-memory store costs 40 to 85 µs, so rescoring 50 candidates from the store costs more than the graph search. Where does that time go, and what of it can go without changing what a read checks or returns?
+- Hypothesis: the store's own read is a small part; most is decoding: the prolly chunks on the way down (hash, decompress, decode) and the value's content. (Source: E334; E294's read cache took about half off.)
+- Change:
+  - `examples/point_reads.rs`: a store that counts the reads, bytes and time of the store underneath (a `MemStore`), 100,000 rows of 1 KB values, 2,000 random keys read by `graph_node`, `db_get` and `graph_nodes_in` in batches of 50, without and with the read cache; and BLAKE3 at 1 to 64 KB. Profiled with callgrind at 20,000 rows.
+  - The profile: decoding whole graph chunks (every node's label and edges built as strings and vectors, then dropped, to keep one; about 73 nodes a chunk here) was the largest part; then a new zstd decompression context for every read (about 94 KB of state, set up each time) and a 64 KB step buffer zeroed for every read; then the hash that checks each chunk (about a fifth of a chunk read). The store's own read is under a tenth.
+  - Three fixes, none with a trade-off, so none is an option: `object::graph_scan` reads a chunk's encoding for a lookup, building only the nodes asked for or following one child, with the same checks and the same error for the same bytes (`graph_node`, and the leaves of `graph_nodes_in`; chunks from before E045 still decode as before). `unzstd_prefix_with` keeps one decompression context per thread (reset before each read; a context with a prepared dictionary is still made per read) and decompresses straight into its output.
+  - Test: `graph_scan_answers_as_decode`: on a leaf and an inner chunk, and on every one-bit change and every cut of their encodings, the scan keeps the same nodes, follows the same child and fails with the same error as decoding the whole chunk.
+- Result (µs a row, 100,000 rows, a 4-core cloud Xeon):
+
+  | Read | Before | After | With read cache, before | With read cache, after |
+  |---|---|---|---|---|
+  | `graph_node` | 98 | 40 | 59 | 18 |
+  | `db_get` (the node, then its value) | 114 | 32 | 61 | 19 |
+  | `graph_nodes_in`, 50 keys a batch | 74 | 27 | 37 | 20 |
+
+  - Each fix alone: the zeroed buffer about 10% of `db_get`; the scan took `graph_node` from 98 to 60 µs and with the cache from 58 to 18; the reused context the rest (60 to 40, and `db_get` 83 to 32). Hashing stays: BLAKE3 costs about 1 µs a KB at these sizes.
+  - E334's graph of codes, the best 50 rescored from the store (100,000 paragraphs, ef 80): 4.6 ms a query before, 2.0 ms after, recall 0.930 both; loading the graph with its vectors 2.4 s before, 1.1 s after. Rescoring now costs about 33 µs a row, so with codes and a rescore the graph answers at the recall of full vectors in about 2 ms without keeping the vectors in memory.
+  - E333's end to end (both graphs, f32 vectors): 13.9 ms, as in E334 (14.2 ms): that example's time is not in reads from the store.
+- Trade-off: none found: the same bytes read, checked and returned; one decompression context kept per thread that reads (94 KB after a chunk-sized read, from `DCtx::sizeof`).
+- Verdict: **kept, not an option** (no trade-off). Reading a row by key is about 3 times faster without the read cache and about 3 times with it. Every read of graph chunks and compressed contents gains; nothing else changes.
+- Not measured: an on-disk store (`FsStore`), where the file read adds its own cost; reuse of compression contexts on write (next: about a fifth of the write time at 20,000 rows was setting up a compressor); an Apple silicon run.
+- Run: `cargo run --release --example point_reads -- 100000` (`CACHE=0` or `CACHE=1` for one pass); `IVF=0 CODES=1 RESCORE=50 THREADS=4 MS=16 cargo run --release --example hnsw_graph -- DIR 100000`.
+
+### E336 write-ctx (one zstd compressor per thread for what ingest writes)
+- Branch / parent: exp/336-write-ctx / exp/335-point-reads (E335)
+- Question: E335's profile of building 20,000 rows put about a fifth of the append in zstd compression, most of it setting up a compressor for every frame. Does keeping one compressor per thread speed up writes, and does it write the same bytes?
+- Hypothesis: yes, for the many small frames an append writes (graph chunks, values); the frames are the same, since zstd starts each frame afresh. (Source: E335; E336's own profile at 20,000 rows.)
+- Change: `zstd_frame` at `MEASURE_LEVEL` (3, what ingest writes) without a dictionary takes a kept compressor from the thread, and puts it back after (a frame inside a frame gets its own). Other levels (repack's 19) and dictionaries still make one per frame: a level-19 context can hold tens of MB. Test `kept_framer_writes_what_a_new_one_writes`: 200 frames of 0 to 1 MB, in mixed order, are byte for byte those of a new compressor and decode back. `point_reads` also prints what a kept context holds.
+- Result (a 4-core cloud Xeon; two runs each, before / after):
+  - `db_append_cost 10 2000` (20,000 row events in memory): 5.0 to 5.3 s before, 2.8 to 3.6 s after; stored 5.8 MB both.
+  - `db_write_path` (a pack store on disk holding a database, one-row appends as `ikam db serve` writes them): the append p50 2.6 to 3.0 ms before, 1.4 to 2.0 ms after; with the commit, p50 3.9 to 4.4 ms before, 2.4 to 3.4 ms after (p95 5.6 to 6.1, 3.3 to 4.6); store 68.3 MB both.
+  - `point_reads 100000` (100,000 rows of 1 KB in one append): 7.2 to 7.3 s before, 4.7 to 5.3 s after.
+  - A kept level-3 compressor holds about 530 KB after a 32 KB frame (`CCtx::sizeof`); E335's kept decompressor about 94 KB.
+- Trade-off: about 0.5 MB kept by each thread that writes (more after larger frames, until zstd shrinks an oversized context); the same bytes are stored.
+- Verdict: **kept, not an option**: writes are 30 to 45% faster for half a megabyte a writing thread. If that memory matters on some host, it is one line to make it an option.
+- Not measured: repack at level 19 with a kept context (bigger, and runs rarely); dictionary frames; an Apple silicon run.
+- Run: `cargo run --release --example db_append_cost -- 10 2000`; `cargo run --release --example db_write_path -- DIR` (DIR must not exist); `CACHE=0 cargo run --release --example point_reads -- 100000`.
+
+### E337 hybrid-phases (where the full hybrid search's time goes; scoring by graph position)
+- Branch / parent: exp/337-hybrid-phases / exp/336-write-ctx (E336)
+- Question: E333's full search (BM25 plus each candidate's best paragraph and whole README from two graphs) took 8.7 ms a query with a second copy of the vectors, and 13 to 14 ms when the graphs score their own rows by key (E334). Where does the time go, and can scoring by the graph's own row position remove the key lookups without changing the ranking?
+- Hypothesis: most of the time is scoring every paragraph of every candidate (thousands a query), each through a string-keyed map; scoring by a position found once removes that, with the same scores. (Source: E334's "not measured".)
+- Change:
+  - `HnswIndex::position(key)` and `score_at(q, node)`: the node a key lives at, and its score by node. A position goes stale (None) once its key is inserted again or removed. Test `score_at_a_position_matches_score_by_key` (vectors and codes).
+  - `examples/hybrid_graph.rs`: the time of each step (BM25, the README graph, the paragraph graph, scoring the candidates, fusing), and two more scorers beside E334's by key: by position (`-at`), and by position with each document's best paragraph taken only from the paragraphs the graph returned (`-hits`; a document with none gets the lowest of them), which scores no paragraph twice.
+- Result (11,384 READMEs, 376,619 paragraphs, 1,130 queries; ms a query; a 4-core cloud Xeon; runs vary by about 1 ms):
+
+  | Setting (README ef, paragraphs returned) | By key | By position | Top 10 vs exact | `-hits` | Top 10 vs exact |
+  |---|---|---|---|---|---|
+  | f32 vectors, 80 / 100 | 12.8 | 7.2 | 0.975 | | |
+  | f32 vectors, 80 / 200 | 19.1 | 9.8 | 0.985 | | |
+  | f32 vectors, 160 / 400 | 28.9 | 14.6 | 0.995 | | |
+  | codes, 80 / 100 | 11.8 to 12.1 | 5.9 to 6.9 | 0.952 | 3.5 | 0.869 |
+  | codes, 80 / 200 | 15.1 to 17.0 | 7.8 to 8.7 | 0.959 | 4.1 | 0.924 |
+  | codes, 160 / 400 | 24.1 to 26.4 | 11.8 to 12.5 | 0.967 | 5.2 | 0.949 |
+
+  - At 80 / 100 with f32 vectors: BM25 2.1 ms, README graph 0.6, paragraph graph 0.8, fusing 0.08, and scoring the 186 candidates' 10,421 paragraphs 9.2 ms by key against 3.6 ms by position (0.9 against 0.35 µs a paragraph). With codes, 8.3 against 2.7 ms.
+  - By position ranks exactly as by key (every nDCG the same to four places).
+  - `-hits` (codes, convex 0.6, nDCG@10): known items 0.822 / 0.831 at 80 / 100 against 0.823 / 0.836, and 0.823 / 0.832 at 160 / 400 against 0.825 / 0.836; topics within 0.005 either way; each within one standard error (0.015 known, 0.019 topics), but lower on both known-item splits.
+- Trade-off: `position` and `score_at` have none. `-hits` trades a little of the known-item ranking (0.001 to 0.005, inside the noise) and 0.02 to 0.08 of agreement with the exact top 10 for half the time; it is a way of querying, shown in the example, not a kernel option.
+- Verdict: **kept** (`position`, `score_at`; no option needed). The full search with compact graphs answers in about 6 ms at E333's setting with the same ranking, and in 3.5 ms with `-hits` if a little ranking can go. BM25 (about 2 ms) is now the largest step.
+- Not measured: BM25's own query cost; `-hits` with f32 vectors; an Apple silicon run.
+- Run: `THREADS=4 cargo run --release --example hybrid_graph -- DIR` (and `CODES=1`).
+
+### E338 bm25-query (BM25's top k without a map and a full sort)
+- Branch / parent: exp/338-bm25-query / exp/337-hybrid-phases (E337)
+- Question: E337 left BM25 (about 2 ms) as the largest step of the full hybrid search. What does a BM25 query cost on its own, and can it be cut without changing a single result?
+- Hypothesis: most of it is the shape of `search`, not the scoring: a map from row to score, a copy of every matched row's key, and a sort of all of them, for a query that wants 10 or 100. (Source: E337's "not measured".)
+- Change: `Bm25::search` adds up scores in a dense array of the index's rows when the query's postings touch at least a sixteenth of them, else in a map as before, in the same order either way (so the same floats); it then picks the best `k` row numbers (`select_nth_unstable`), sorts only those (score, then key, as before) and copies only their keys. Test `dense_and_map_sums_agree`: both ways give the same rows and score bits as `search`, for k from 0 to more than every row. `examples/bm25_query.rs` writes every result's key and score bits, so two builds can be compared.
+- Result (11,384 READMEs, 1,130 queries, E326's set; best of 5; a 4-core cloud Xeon): k=10 1.62 to 0.15-0.16 ms a query, k=100 1.94 to 0.13-0.18 ms. All 1,130 queries' top 100 are byte for byte the same before and after (keys and score bits). E337's full search (`hybrid_graph`, f32 vectors, 80 / 100, by position) 7.2 to 4.8 ms a query, its BM25 step 2.1 to 0.23 ms; `-hits` 1.4 ms.
+- Trade-off: none; the dense array is one f32 a row of the index for the query's length, taken only when the query touches enough rows that a map would be as large.
+- Verdict: **kept, not an option** (same results, about 10x faster).
+- Not measured: an index of millions of rows; an Apple silicon run.
+- Run: `cargo run --release --example bm25_query -- DIR OUT` (DIR from `prepare.py`), and `cmp` two OUTs; `THREADS=4 cargo run --release --example hybrid_graph -- DIR`.
+
+### E339 lanes-avx2 (the lanes loops compiled for AVX2 where the processor has it)
+- Branch / parent: exp/339-lanes-avx2 / exp/338-bm25-query (E338)
+- Question: after E338, scoring candidates' paragraphs (`score_at`, 16-lane dot products of 256 f32s) is most of the full hybrid search. E327 measured the lanes loop 3x faster when built with `target-cpu=native`, which a portable build can't assume. Does choosing an AVX2 build of the same loop at run time give that speed, with the same results?
+- Hypothesis: yes for the loop; less end to end, since each paragraph's vector (1 KB) is read from memory. The results are the same bits: the AVX2 build runs the same 16 sums in the same order, and Rust never fuses a multiply and an add on its own (FMA is not enabled). (Source: E327.)
+- Change: `vectors::dot_lanes` and `code_dot_lanes` check for AVX2 (`is_x86_feature_detected!`, cached by the standard library) and then call the same loop compiled with `#[target_feature(enable = "avx2")]`; otherwise, and on other processors, the portable loop as before. Only where lanes are on (`with_lanes`, E327 and E332, still off by default). Test `dispatched_lanes_match_portable_bits`: every length from 0 to 299, ordinary, huge and tiny values, same bits for both loops.
+- Result (`hybrid_graph`, 11,384 READMEs, 376,619 paragraphs, 1,130 queries, 4 threads to build; ms a query; a 4-core cloud Xeon with AVX2; before is E338):
+
+  | Setting (80 / 100) | f32 before | f32 after | codes before | codes after |
+  |---|---|---|---|---|
+  | By position, end to end | 4.83 | 3.79 | 4.25 | 3.28 |
+  | Scoring candidates | 3.36 | 2.53 | 2.96 | 2.16 |
+  | Paragraph graph search | 0.75 | 0.64 | 0.66 | 0.55 |
+  | `-hits`, end to end | 1.43 | 1.08 | 1.21 | 1.20 |
+
+  - At 160 / 400 (f32, by position) 10.3 to 9.3 ms. Building the paragraph graph (f32, 4 threads) 103 to 83 s.
+  - Every recall and nDCG line of both runs, f32 and codes, is the same before and after.
+- Trade-off: none (same bits); a little unsafe code (two calls after the feature check).
+- Verdict: **kept, not an option**. The loop's gain end to end is about 20 to 25%, not E327's 3x, likely because scoring a paragraph waits on reading its vector (inferred, not profiled).
+- Not measured: Apple silicon, where NEON is always present and the portable lanes loop should already be vectorized, so E339 changes nothing there; AVX-512.
+- Run: `THREADS=4 cargo run --release --example hybrid_graph -- DIR` (and `CODES=1`), before and after.
+
+### E340 score-prefetch (candidates' paragraphs scored in one pass, rows read ahead)
+- Branch / parent: exp/340-score-prefetch / exp/339-lanes-avx2 (E339)
+- Question: after E339, scoring the candidates' paragraphs is still most of the full hybrid search, at about 250 ns a paragraph with f32 vectors and 230 ns with codes, where E327's loop alone takes about 20 ns a code. Is that time spent waiting on memory, and does asking for rows a few nodes ahead cut it?
+- Hypothesis: yes: a graph built by 4 threads leaves one document's paragraphs at scattered nodes, so each row is a read from memory, and reads can overlap if asked for early. (Source: E339's "not measured".)
+- Change:
+  - `HnswIndex::score_many(q, nodes, out)`: `score_at` for each node, in order, with the row of the node some places ahead asked of memory first (`_mm_prefetch`, x86-64 only; elsewhere none). 4 nodes ahead for codes and 8 for f32 vectors, the best of 4 and 8 measured below. Test `score_many_matches_score_at`: the same answers as `score_at`, removed, repeated and out-of-range nodes included, codes and lanes on and off.
+  - `examples/hybrid_graph.rs`: `MANY=1` scores all candidates' paragraphs in one `score_many` call and takes each document's best from its slice; `HOT=1` scores once untimed before the timed pass (rows in cache).
+  - Registry: a duplicate E325 row (left by a rebase since E327) removed.
+- Result (`hybrid_graph`, by position, 11,384 READMEs, 376,619 paragraphs, 1,130 queries; ms a query for scoring the candidates, at 80 / 100, 80 / 200 and 160 / 400; a 4-core cloud Xeon; one run each, runs vary by about 0.2 ms):
+
+  | Way of scoring | f32 | codes |
+  |---|---|---|
+  | One document at a time (E339) | 2.68, 4.25, 6.56 | 2.37, 3.25, 4.91 |
+  | The same, rows already in cache (`HOT=1`) | 2.51, 3.80, 6.05 | |
+  | One pass, no read-ahead | 1.94, 2.88, 4.28 | 1.86, 2.55, 4.44 |
+  | One pass, 4 nodes ahead | 1.85, 2.99, 4.73 | **0.71, 1.02, 1.72** |
+  | One pass, 8 nodes ahead | **1.55, 2.47, 3.76** | 0.88, 1.03, 2.09 |
+
+  - End to end at 80 / 100: f32 3.98 to 2.73 ms, codes 3.54 to 1.63 ms; at 160 / 400: f32 9.6 to 6.5, codes 7.3 to 3.9.
+  - Every recall and nDCG line is the same in all of these runs, f32 and codes.
+- Reading: the hypothesis was half right. With rows in cache the old loop is barely faster (2.51 against 2.68), so it was not mostly waiting on memory; one pass over a flat list (less work a paragraph in the example's loop, inferred) gives most of the f32 gain, and reading 8 ahead 15 to 20% more. For codes (256 bytes a row) reading 4 ahead is the larger part: 1.86 to 0.71 ms.
+- Trade-off: none (same scores); `score_many` is a new call, `score_at` is unchanged.
+- Verdict: **kept** (`score_many`; no option needed). The best full hybrid search measured (best paragraph plus whole README fused with BM25, E330) now answers in about 1.6 ms with codes and 2.7 ms with f32 vectors, against 68 ms with exact scans (E333).
+- Not measured: other distances ahead (only 4 and 8); Apple silicon, where there is no prefetch here yet (Rust's is unstable on aarch64), so only the one-pass gain applies.
+- Run: `MANY=1 THREADS=4 cargo run --release --example hybrid_graph -- DIR` (and `CODES=1`, `HOT=1`); for "no read-ahead" and "4 ahead" the distance in `score_many` changed by hand.

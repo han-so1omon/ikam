@@ -1,0 +1,18 @@
+# E327: execution modes for scoring a vector list's int8 codes (the inner
+# loop of an IVF query, E323 and E325): Rust as written, Rust with
+# independent lanes, integer queries, AVX2, clang and MLIR's vector
+# dialect. A separate crate so the kernel's builds do not depend on it.
+[package]
+name = "vector-modes"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[workspace]
+
+[dependencies]
+libc = "=0.2.189"
+tempfile = "3.27.0"
+
+[profile.release]
+debug = false

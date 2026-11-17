@@ -482,6 +482,100 @@ fn decode_compact(r: &mut Reader, level: u8) -> Result<Graph, Error> {
     Ok(Graph::Children(level, children))
 }
 
+/// What `graph_scan` found in one graph chunk.
+pub(crate) enum Found {
+    /// A leaf chunk: its nodes that `keep` kept.
+    Nodes(Vec<Node>),
+    /// An inner chunk: the last child whose first label is at most `label`.
+    Child(Option<Id>),
+}
+
+/// Read a graph chunk's encoding for a lookup (E335): checked as
+/// `Object::decode` checks it, the same errors for the same bytes, but
+/// only the nodes `keep` keeps are built, and an inner chunk gives the
+/// child to follow for `label`. Decoding a whole chunk built every node's
+/// label and edges to keep one of them. `None` for anything but a compact
+/// graph chunk (before E045, or not a graph); decode those.
+pub(crate) fn graph_scan(
+    encoded: &[u8],
+    keep: &dyn Fn(&str) -> bool,
+    label: &str,
+) -> Result<Option<Found>, Error> {
+    use std::cmp::Ordering::Greater;
+    let mut r = Reader(encoded);
+    match encoded {
+        [b'G', tag, ..] if tag & COMPACT != 0 => r.take(2)?,
+        _ => return Ok(None),
+    };
+    let level = encoded[1] & !COMPACT;
+    let n = r.varint()?;
+    let mut prev: Vec<u8> = Vec::new();
+    let mut sorted = true;
+    let found = if level == 0 {
+        let (mut prev_edge, mut kept) = (Vec::new(), Vec::new());
+        for i in 0..n {
+            let ord = r.front_step(&mut prev)?;
+            sorted &= i == 0 || ord == Greater;
+            let target = match r.take(1)?[0] {
+                0 => Target::None,
+                1 => Target::Content(r.arg()?),
+                2 => Target::Object(r.id()?),
+                _ => return Err(Error::Decode("unknown graph target")),
+            };
+            // Valid UTF-8: `front_step` checked it.
+            let name = std::str::from_utf8(&prev).unwrap_or_default();
+            let mine = keep(name);
+            let m = r.varint()?;
+            let mut edges = Vec::new();
+            let mut ascending = true;
+            let mut prev_to = [0u8; 8];
+            for j in 0..m {
+                let to: [u8; 8] = r.take(8)?.try_into().unwrap();
+                let ord = r.front_step(&mut prev_edge)?;
+                ascending &= j == 0 || to.cmp(&prev_to).then(ord) == Greater;
+                prev_to = to;
+                if mine {
+                    edges.push(Edge {
+                        to,
+                        label: String::from_utf8(prev_edge.clone())
+                            .map_err(|_| Error::Decode("string not utf-8"))?,
+                    });
+                }
+            }
+            if !ascending {
+                return Err(Error::Decode("graph edges not strictly ascending"));
+            }
+            if mine {
+                kept.push(Node {
+                    label: name.to_string(),
+                    target,
+                    edges,
+                });
+            }
+        }
+        Found::Nodes(kept)
+    } else {
+        if n == 0 {
+            return Err(Error::Decode("empty graph chunk"));
+        }
+        let mut child = None;
+        for i in 0..n {
+            let ord = r.front_step(&mut prev)?;
+            sorted &= i == 0 || ord == Greater;
+            let id = r.id()?;
+            if prev.as_slice() <= label.as_bytes() {
+                child = Some(id);
+            }
+        }
+        Found::Child(child)
+    };
+    if !sorted {
+        return Err(Error::Decode("graph labels not strictly ascending"));
+    }
+    r.finish()?;
+    Ok(Some(found))
+}
+
 /// Edge label for a selector, keeping range offsets visible.
 fn label(name: &str, a: &Arg) -> String {
     match a {
@@ -577,6 +671,23 @@ impl<'a> Reader<'a> {
         String::from_utf8(bytes).map_err(|_| Error::Decode("string not utf-8"))
     }
 
+    /// `front`, in place: the string after `prev` replaces it, and the
+    /// result says how the new string compares with the old.
+    fn front_step(&mut self, prev: &mut Vec<u8>) -> Result<std::cmp::Ordering, Error> {
+        let shared = self.varint()?;
+        let rest = self.varint()?;
+        if shared > prev.len() {
+            return Err(Error::Decode("bad front coding"));
+        }
+        let rest = self.take(rest)?;
+        // Both share `prev[..shared]`, so the rests decide.
+        let ord = rest.cmp(&prev[shared..]);
+        prev.truncate(shared);
+        prev.extend_from_slice(rest);
+        std::str::from_utf8(prev).map_err(|_| Error::Decode("string not utf-8"))?;
+        Ok(ord)
+    }
+
     fn string(&mut self) -> Result<String, Error> {
         let len = self.u32()?;
         String::from_utf8(self.take(len)?.to_vec()).map_err(|_| Error::Decode("string not utf-8"))
@@ -606,6 +717,92 @@ impl<'a> Reader<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// E335: `graph_scan` keeps the same nodes, follows the same child and
+    /// fails with the same error as decoding the whole chunk, on chunks and
+    /// on every one-byte change and cut of them.
+    #[test]
+    fn graph_scan_answers_as_decode() {
+        let mut seed = 7u64;
+        let mut next = move || {
+            seed = seed
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (seed >> 33) as usize
+        };
+        let labels: Vec<String> = {
+            let mut v: Vec<String> = (0..40)
+                .map(|i| format!("k/{:03}é{}", i * 7, i % 3))
+                .collect();
+            v.sort();
+            v
+        };
+        let nodes: Vec<Node> = labels
+            .iter()
+            .map(|l| {
+                let mut edges: Vec<Edge> = (0..next() % 4)
+                    .map(|_| Edge {
+                        to: crate::node_key(&labels[next() % labels.len()]),
+                        label: ["a", "ab", "b"][next() % 3].to_string(),
+                    })
+                    .collect();
+                edges.sort();
+                edges.dedup();
+                Node {
+                    label: l.clone(),
+                    target: match next() % 3 {
+                        0 => Target::None,
+                        1 => Target::Content(Arg::Whole(Id::of(l.as_bytes()))),
+                        _ => Target::Object(Id::of(&[1])),
+                    },
+                    edges,
+                }
+            })
+            .collect();
+        let children: Vec<(String, Id)> = labels
+            .iter()
+            .step_by(5)
+            .map(|l| (l.clone(), Id::of(l.as_bytes())))
+            .collect();
+        let probes: Vec<String> = labels
+            .iter()
+            .flat_map(|l| [l.clone(), format!("{l}~"), l[..l.len() - 1].to_string()])
+            .chain(["".to_string(), "zzz".to_string()])
+            .collect();
+        for g in [Graph::Nodes(nodes), Graph::Children(2, children)] {
+            let enc = Object::Graph(g.clone()).encode();
+            let mut cases = vec![enc.clone()];
+            for i in 0..enc.len() {
+                let mut e = enc.clone();
+                e[i] ^= 1 << (next() % 8);
+                cases.push(e);
+                cases.push(enc[..i].to_vec());
+            }
+            for e in &cases {
+                let want = Object::decode(e);
+                for p in probes.iter().step_by(if e == &enc { 1 } else { 17 }) {
+                    let keep = |l: &str| l == p || l.ends_with('1');
+                    let Some(got) = graph_scan(e, &keep, p).transpose() else {
+                        assert!(!matches!(want, Ok(Object::Graph(_)) if e[1] & COMPACT != 0));
+                        continue;
+                    };
+                    match (&want, got) {
+                        (Ok(Object::Graph(Graph::Nodes(all))), Ok(Found::Nodes(kept))) => {
+                            let expect: Vec<Node> =
+                                all.iter().filter(|n| keep(&n.label)).cloned().collect();
+                            assert_eq!(kept, expect);
+                        }
+                        (Ok(Object::Graph(Graph::Children(_, c))), Ok(Found::Child(got))) => {
+                            let expect = c.iter().rev().find(|(f, _)| f.as_str() <= p.as_str());
+                            assert_eq!(got, expect.map(|(_, id)| *id));
+                        }
+                        (Err(a), Err(b)) => assert_eq!(format!("{a:?}"), format!("{b:?}")),
+                        (a, b) => panic!("decode {a:?}, scan {:?}", b.is_ok()),
+                    }
+                }
+            }
+        }
+    }
 
     /// Graph chunks written before E045 (fixed-width counts and full
     /// labels) still decode to the same graph; the compact form round-trips
