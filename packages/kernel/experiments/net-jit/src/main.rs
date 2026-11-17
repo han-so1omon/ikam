@@ -22,8 +22,14 @@
 //!
 //! With `-- inc`, E288 instead: the incremental step compiled (see
 //! `inc.rs`).
+//!
+//! With `--features mlir -- mlir`, E311: table, Cranelift, clang -O2 and
+//! the step lowered through MLIR (see `mlir.rs`), as JSON lines. MLIR's
+//! tools are external programs, so default builds need none of them.
 
 mod inc;
+#[cfg(feature = "mlir")]
+mod mlir;
 
 use std::ffi::CString;
 use std::fmt::Write as _;
@@ -491,7 +497,128 @@ fn main_hub() {
     }
 }
 
+/// The first line `tool --version` prints, cut to its version number.
+#[cfg(feature = "mlir")]
+fn first_version(cmd: &str) -> String {
+    let out = Command::new(cmd).arg("--version").output();
+    let text = out.map(|o| String::from_utf8_lossy(&o.stdout).into_owned());
+    let line = text.unwrap_or_default();
+    let line = line.lines().next().unwrap_or("missing");
+    let v = line.split("version").nth(1).unwrap_or(line);
+    v.split_whitespace().next().unwrap_or("missing").to_string()
+}
+
+/// E311: every mode on the same nets and step counts, best of three timed
+/// walks each, compile timed once after an untimed warm-up of each tool
+/// chain. One JSON line per net and mode. With `smoke`, only the smallest
+/// net, to check that the MLIR pipeline works on this machine.
+#[cfg(feature = "mlir")]
+fn main_mlir(smoke: bool) {
+    let dir = tempfile::tempdir().unwrap();
+    let seed = 0x0123_4567_89AB_CDEF;
+    let v = |n: &str| mlir::version(n).unwrap_or_else(|| "missing".into());
+    println!(
+        "{{\"exp\":\"E311\",\"tools\":{{\"mlir_opt\":\"{}\",\"mlir_translate\":\"{}\",\"opt\":\"{}\",\"llc\":\"{}\",\"clang\":\"{}\"}},\"arch\":\"{}\",\"os\":\"{}\",\"cpus\":{}}}",
+        v("mlir-opt"),
+        v("mlir-translate"),
+        v("opt"),
+        v("llc"),
+        first_version("clang"),
+        std::env::consts::ARCH,
+        std::env::consts::OS,
+        std::thread::available_parallelism().map_or(0, |n| n.get())
+    );
+    let sizes: &[(usize, usize)] = if smoke {
+        &[(10, 20)]
+    } else {
+        &[(10, 20), (100, 200), (1000, 2000)]
+    };
+    // Untimed warm-up: loads each tool from disk once, so the timed
+    // compiles below do not include reading the programs from a slow drive.
+    let warm = random_net(&mut Rng(1), 4, 8).lower().unwrap();
+    let _ = compile_cranelift(&warm);
+    let _ = clang_native(dir.path(), 99, &warm);
+    let have_mlir = mlir::version("mlir-opt").is_some();
+    if have_mlir {
+        let _ = mlir::compile(dir.path(), "warm", &warm, true);
+    } else {
+        println!("{{\"exp\":\"E311\",\"note\":\"mlir-opt not found (set MLIR_BIN); MLIR modes skipped\"}}");
+    }
+    let best = |f: &dyn Fn() -> (Vec<u64>, u64, f64)| {
+        let mut out = f();
+        for _ in 0..2 {
+            let again = f();
+            assert_eq!((&again.0, again.1), (&out.0, out.1), "runs differ");
+            out.2 = out.2.min(again.2);
+        }
+        out
+    };
+    for (i, &(np, nt)) in sizes.iter().enumerate() {
+        let net = random_net(&mut Rng(0xA5A5_0000 + i as u64), np, nt);
+        net.check().unwrap();
+        let t = net.lower().unwrap();
+        let steps = if smoke {
+            100_000
+        } else {
+            (200_000_000 / nt as u64).clamp(100_000, 10_000_000)
+        };
+        let (tm, tdone, table_ns) = best(&|| {
+            let mut m = t.initial.clone();
+            let mut rng = Rng(seed);
+            let start = Instant::now();
+            let d = t.walk(&mut m, steps, |n| (rng.next() % n as u64) as usize);
+            (m, d, start.elapsed().as_nanos() as f64 / d.max(1) as f64)
+        });
+        assert_eq!(tdone, steps, "deadlock");
+        let line = |mode: &str, ns: f64, ms: f64, extra: &str| {
+            let repay = if ms == 0.0 {
+                "0".to_string()
+            } else if ns >= table_ns {
+                "null".to_string()
+            } else {
+                format!("{:.0}", ms * 1e6 / (table_ns - ns))
+            };
+            println!(
+                "{{\"exp\":\"E311\",\"net\":\"{np}x{nt}\",\"mode\":\"{mode}\",\"steps\":{steps},\"ns_per_step\":{ns:.2},\"compile_ms\":{ms:.2},\"repays_after_steps_vs_table\":{repay}{extra}}}"
+            );
+        };
+        line("table", table_ns, 0.0, "");
+
+        let start = Instant::now();
+        let (_module, cf) = compile_cranelift(&t);
+        let cl_ms = start.elapsed().as_secs_f64() * 1000.0;
+        let (cm, cdone, cl_ns) = best(&|| run(cf, &t, steps, seed));
+        assert_eq!((&cm, cdone), (&tm, tdone), "cranelift differs");
+        line("cranelift", cl_ns, cl_ms, "");
+
+        let (nf, cc_ms) = clang_native(dir.path(), i, &t);
+        let (nm, ndone, cc_ns) = best(&|| run(nf, &t, steps, seed));
+        assert_eq!((&nm, ndone), (&tm, tdone), "clang differs");
+        line("clang-O2", cc_ns, cc_ms, "");
+
+        for (mode, o2) in [("mlir+llc", false), ("mlir+opt", true)] {
+            if !have_mlir {
+                break;
+            }
+            let (mf, st) = mlir::compile(dir.path(), &format!("net{i}-{o2}"), &t, o2);
+            let (mm, mdone, m_ns) = best(&|| mlir::run(mf, &t, steps, seed));
+            assert_eq!((&mm, mdone), (&tm, tdone), "{mode} differs");
+            let extra = format!(
+                ",\"stages_ms\":{{\"mlir_opt\":{:.2},\"translate\":{:.2},\"llvm_opt\":{:.2},\"llc\":{:.2},\"link\":{:.2}}}",
+                st.mlir_opt, st.translate, st.llvm_opt, st.llc, st.link
+            );
+            line(mode, m_ns, st.total(), &extra);
+        }
+    }
+}
+
 fn main() {
+    if std::env::args().any(|a| a == "mlir" || a == "mlir-smoke") {
+        #[cfg(feature = "mlir")]
+        return main_mlir(std::env::args().any(|a| a == "mlir-smoke"));
+        #[cfg(not(feature = "mlir"))]
+        panic!("built without the mlir feature: cargo run --release --features mlir -- mlir");
+    }
     if std::env::args().any(|a| a == "inc") {
         return main_inc();
     }

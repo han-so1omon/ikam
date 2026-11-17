@@ -4782,6 +4782,45 @@ Gates on the branch (E229 to E233): every kernel test suite passes (release); cl
 - Not measured: a supervisor that itself dies; machines with differing clocks.
 - Run: as above (about 1 minute together).
 
+### E311 mlir-mode (a net's step lowered through MLIR)
+- Branch / parent: exp/311-mlir-mode / E282 (on main since PR 11)
+- Question: E277 and E282 measured the table, Cranelift and clang -O2 for a net's step and left MLIR unmeasured, because MLIR's tools were not installed on the cloud machine. Where does a step lowered through MLIR fall, in step time and in compile time?
+- Hypothesis: MLIR adds nothing for this step. Lowered from the func, arith, memref and cf dialects to the llvm dialect, the step reaches the same LLVM back end as clang, so with LLVM's -O2 middle end (`mlir+opt`) it runs within noise of clang -O2 and compiles in about the same time; with MLIR's own passes and llc alone (`mlir+llc`) it runs slower than clang -O2 and still compiles far slower than Cranelift. MLIR would only pay off with higher-level structure (many walks at once in vector or affine form), which this scalar step does not have. (Source: E277's and E282's "Not measured"; E277's reading for H3: melior needs a matching system LLVM and MLIR, so this uses MLIR's command-line tools instead of linking them; the MLIR, LLVM and Cranelift documentation.)
+- Change: none in the kernel. In `packages/kernel/experiments/net-jit` (separate crate), a `mlir` feature, off by default and adding no dependency, with `src/mlir.rs`: the step emitted as MLIR text with the same structure as the Cranelift function (a branch-free enabling pass storing each index at the next slot, the shared xorshift generator, `cf.switch` to one firing block per transition), the C interface wrapper (`llvm.emit_c_interface`), lowered with `mlir-opt` (canonicalize, cse, cf/arith/memref/func to llvm), `mlir-translate --mlir-to-llvmir`, optionally `opt -O2`, `llc -O2`, `cc -shared`, and loaded with dlopen. Subcommand `-- mlir` runs table, Cranelift, clang -O2, `mlir+llc` and `mlir+opt` on E282's three seeded nets (10 x 20, 100 x 200, 1,000 x 2,000) at E282's step counts, asserts every mode ends in the same marking after the same steps, keeps the fastest of three timed walks, times each compile once after an untimed warm-up of each tool chain, and prints JSON lines (with each MLIR compile by stage). `-- mlir-smoke` runs the smallest net only. Without `mlir-opt` (found in `MLIR_BIN` or on PATH) the MLIR modes are skipped. A unit test checks the emitted text without MLIR (each value defined once, every branch target exists).
+- Result: not yet run. Planned on an Apple silicon laptop with MLIR and LLVM 23.1.5 from conda-forge installed in a user folder.
+- Verdict: planned.
+- Run: `cargo run --release --features mlir -- mlir` in `packages/kernel/experiments/net-jit`, with `MLIR_BIN` set to the folder holding `mlir-opt`, `mlir-translate`, `opt` and `llc`.
+
+### E328 mlir-linux (E311's MLIR modes for a net's step, run on a cloud machine)
+- Branch / parent: exp/328-mlir-linux / exp/311-mlir-mode (E311, planned, not run)
+- Question: E311 is planned for an Apple silicon laptop with MLIR 23 from conda-forge. Ubuntu packages MLIR 18 (`mlir-18-tools`), so the same harness can run on a cloud machine now. Where does a net's step lowered through MLIR fall there, against the table, Cranelift and clang -O2?
+- Hypothesis: E311's, unchanged: `mlir+opt` within noise of clang -O2 in step time and about as slow to compile; `mlir+llc` slower than clang -O2 and far slower to compile than Cranelift.
+- Change: none. E311's harness as committed, MLIR, LLVM and clang 18.1.3 from Ubuntu 24.04 packages, one 4-core cloud x86-64 machine (AVX2, AVX-512).
+- Result (`MLIR_BIN=/usr/lib/llvm-18/bin cargo run --release --features mlir -- mlir` in `experiments/net-jit`; every mode ends in the same marking after the same steps):
+
+  | Net (places x transitions) | Mode | ns a step | Compile | Repays against the table after |
+  |---|---|---|---|---|
+  | 10 x 20 | table | 89.6 | none | |
+  | 10 x 20 | Cranelift | 28.5 | 1.3 ms | 21 thousand steps |
+  | 10 x 20 | clang -O2 | 24.2 | 81 ms | 1.2 million |
+  | 10 x 20 | mlir+llc | 47.3 | 96 ms | 2.3 million |
+  | 10 x 20 | mlir+opt | 32.0 | 98 ms | 1.7 million |
+  | 100 x 200 | table | 379 | none | |
+  | 100 x 200 | Cranelift | 176 | 9 ms | 44 thousand |
+  | 100 x 200 | clang -O2 | 103 | 2.0 s | 7.3 million |
+  | 100 x 200 | mlir+llc | 106 | 195 ms | 0.7 million |
+  | 100 x 200 | mlir+opt | 114 | 1.9 s | 7.2 million |
+  | 1,000 x 2,000 | table | 2,921 | none | |
+  | 1,000 x 2,000 | Cranelift | 1,623 | 83 ms | 64 thousand |
+  | 1,000 x 2,000 | clang -O2 | 1,012 | 124 s | 65 million |
+  | 1,000 x 2,000 | mlir+llc | 1,009 | 4.2 s | 2.2 million |
+  | 1,000 x 2,000 | mlir+opt | 959 | 102 s | 52 million |
+
+  - At 1,000 x 2,000, MLIR's own passes took 1.3 s, translation 0.2 s, llc 2.6 s, and LLVM's `opt -O2` 97 s of `mlir+opt`'s 102 s.
+- Hypothesis partly refuted. `mlir+opt` runs within 5% of clang -O2 and compiles about as slowly, as expected. But `mlir+llc` is not slower than clang -O2 on the two larger nets (106 vs 103 ns, 1,009 vs 1,012 ns) and compiles 10x to 30x faster than clang (195 ms vs 2.0 s, 4.2 s vs 124 s): the time clang spends is in LLVM's middle end on one very large function, which `mlir+llc` skips, and llc's own -O2 code generation recovers the step speed. Only on the smallest net is `mlir+llc` slower (47 vs 24 ns). Cranelift still compiles 20x to 50x faster than `mlir+llc` and steps 1.6x to 1.7x slower than it on the larger nets.
+- Verdict: **measured**. For a net, three points on one curve: Cranelift repays first (tens of thousands of steps), `mlir+llc` gives clang's step speed at a tenth to a thirtieth of its compile time and repays after about a million to two million steps, clang -O2 and `mlir+opt` only after tens of millions at the largest size. No kernel change: a net's step is not the loop's bottleneck (E277), so none of these modes is worth a dependency today.
+- Not measured: Apple silicon (E311's planned run); MLIR 23; nets with colors unfolded (E285).
+- Run: `apt-get install mlir-18-tools` (Ubuntu 24.04), then `MLIR_BIN=/usr/lib/llvm-18/bin cargo run --release --features mlir -- mlir` in `packages/kernel/experiments/net-jit`.
 ### E267 hot-cold-e2e (E260's two workloads with what E261 to E268 kept)
 - Branch / parent: exp/267-hot-cold-e2e / exp/268-incremental-repack a279f89, with exp/261-plain-hot-writes, exp/264-branch-hot-state and exp/263-temperature merged in (append-only doc conflicts kept both sides)
 - Question: with every option the hot and cold layers plan kept turned on together, how much faster is the hot layer than with today's opt-ins, what does the cold layer cost after a session, and how many bytes stay on disk, on E260's workloads?
