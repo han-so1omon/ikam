@@ -4965,3 +4965,31 @@ Gates on the branch (E229 to E233): every kernel test suite passes (release); cl
 - Verdict: **measured** (modes) and **kept** as an option (`with_lanes`, off).
 - Not measured: AVX-512 VNNI (`vpdpbusd`, present on this machine); Apple silicon (NEON, and the laptop's MLIR from E311); a fused filter or several queries at once, where MLIR's affine and linalg dialects could pay.
 - Run: `MLIR_BIN=/usr/lib/llvm-18/bin cargo run --release` in `packages/kernel/experiments/vector-modes` (add `RUSTFLAGS="-C target-cpu=native"` for the native rows); `cargo run --release --example vector_ivf -- 100000 256`.
+
+### E326 hybrid-kernel (keyword, vector and fused ranking all in the kernel, on real text)
+- Branch / parent: exp/326-hybrid-kernel / exp/327-vector-modes (E327; E325, E324 and E323 below it)
+- Question: E258 and E259 measured hybrid ranking with Tantivy and an exact vector scan outside the kernel's views. With the kernel's own BM25 (E324), its loaded IVF (E325, vectors kept, lanes from E327) and `fusion` (E312), how good is the whole path on real text, and how many lists must the IVF probe before its misses stop costing ranking quality?
+- Hypothesis: fused with BM25 by convex at E312's weight for a static model (0.6 to 0.7), the kernel path scores as E259's did (known items about 0.80, topics about 0.14). The IVF needs many probes on these vectors (E257: recall@10 0.69 at 8 of 109 lists, 0.93 at 32), and fusion hides part of its misses, because a missed row is often still in BM25's list. (Source: E257, E258, E259, E312.)
+- Change: none in the kernel. `examples/hybrid_kernel.rs`: rows `t/KEY` (text) and `v/KEY` (WordLlama vector of the whole README), BM25 over `t/`, an IVF over `v/` (sqrt(N) lists, k-means on a sample of 20 rows a list, 8 rounds) loaded with vectors kept and lanes on. Per query: BM25's top 100, the exact top 100, and the IVF's top 100 at 4 to all lists probed (best 200 rescored); each vector list alone, with RRF k 60 and with convex 0.5 to 0.8. Queries split in halves by a hash of their id.
+- Result (11,384 OSI-licensed PyPI READMEs and 1,130 queries from `prepare.py` on a fresh sample of PyPI's JSON API; WordLlama l2_supercat, 256 dimensions; a 4-core cloud Xeon). nDCG@10, dev / test:
+
+  | Ranking | Known item (495 / 505) | Topic (58 / 72) |
+  |---|---|---|
+  | BM25 (E324) | 0.796 / 0.802 | 0.128 / 0.106 |
+  | Vectors, exact | 0.528 / 0.535 | 0.122 / 0.107 |
+  | RRF k 60, exact vectors | 0.726 / 0.721 | 0.153 / 0.139 |
+  | Convex 0.6, exact vectors | 0.816 / 0.818 | 0.143 / 0.128 |
+  | Convex 0.7, exact vectors | 0.815 / 0.820 | 0.151 / 0.121 |
+  | Convex 0.7, IVF at 8 lists | 0.798 / 0.812 | 0.143 / 0.119 |
+  | Convex 0.5, IVF at 8 lists | 0.681 / 0.702 | 0.147 / 0.121 |
+  | Convex 0.7, IVF at 64 lists | 0.812 / 0.819 | 0.148 / 0.122 |
+
+  - Standard errors are about 0.016 on known items and 0.015 to 0.020 on topics.
+  - IVF (106 lists) recall@10 against exact, and ms a query: 4 lists 0.525 (0.40), 8 lists 0.670 (0.28), 16 lists 0.809 (0.39), 32 lists 0.916 (0.66), 64 lists 0.987 (1.13), all 1.000 (1.45). The 4-list time above the 8-list one is inferred to be the first search of each query paying cold caches.
+  - BM25 2.2 ms a query, fusion 0.06 ms; build: rows 8.7 s, BM25 3.9 s, IVF 1.5 s.
+  - As E259 found: convex at 0.6 to 0.7 is the best single weight on known items, about one standard error above BM25 alone (+0.016 to +0.020), and RRF falls below BM25 there by 0.07 to 0.08. On topics RRF k 60 leads by 0.025 to 0.033 over BM25, within two standard errors on sets this small.
+  - Fusion hides the index's misses at a high keyword weight: at 0.7 the 8-list IVF is within 0.02 of exact vectors on known items, but at 0.5 it is 0.08 to 0.11 below exact vectors at the same weight, because the vector list then decides more of the top 10.
+- Trade-off: none new. Probing 64 lists costs 1.13 ms against 0.28 ms for 8, all of it inside one query's total of about 3.4 ms.
+- Verdict: **measured.** The kernel alone gives the hybrid ranking E259 measured with Tantivy (0.82 against 0.805 on known items). For vectors like these, probe at least 60% of an IVF's lists, or probe them all below about 10,000 rows, where it costs 1.5 ms; a lower probe count is only safe with a keyword weight of 0.7 or more.
+- Not measured: a transformer embedder in this path (model downloads are blocked on this machine; E306 measured MiniLM and bge-small outside it); stemming; collections over 100,000 rows.
+- Run: `cargo run --release --example hybrid_kernel -- DIR` (DIR from `prepare.py` on exp/259-fusion-tune; not committed).
