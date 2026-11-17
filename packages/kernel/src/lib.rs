@@ -24,6 +24,7 @@ mod grant;
 mod graph;
 mod group;
 mod history;
+pub mod hnsw;
 pub mod hot;
 mod id;
 mod ingest;
