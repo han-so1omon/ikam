@@ -164,6 +164,23 @@ fn run(cmd: &mut Command) -> f64 {
     t.elapsed().as_secs_f64() * 1e3
 }
 
+/// E342: the module lowered to LLVM IR at `out`, for any target's llc.
+pub fn lower(bin: &str, out: &Path) {
+    let dir = tempfile::tempdir().unwrap();
+    let (src, low) = (dir.path().join("k.mlir"), dir.path().join("low.mlir"));
+    std::fs::write(&src, emit()).unwrap();
+    run(Command::new(tool(bin, "mlir-opt"))
+        .args(PASSES)
+        .arg(&src)
+        .arg("-o")
+        .arg(&low));
+    run(Command::new(tool(bin, "mlir-translate"))
+        .arg("--mlir-to-llvmir")
+        .arg(&low)
+        .arg("-o")
+        .arg(out));
+}
+
 /// The module built into a shared library: (library, stage times in ms).
 pub fn build(bin: &str, dir: &Path, llc_cpu: Option<&str>) -> (PathBuf, Vec<(String, f64)>) {
     let src = dir.join("k.mlir");

@@ -315,6 +315,14 @@ fn argmax_rows(s: &[f32], k: usize, out: &mut [u32]) {
 }
 
 fn main() {
+    // E342: `-- lower OUT.ll` writes the MLIR kernels as LLVM IR (see
+    // mlir-utility/probe.sh) and stops.
+    let args: Vec<String> = std::env::args().collect();
+    if let Some(i) = args.iter().position(|a| a == "lower") {
+        let bin = std::env::var("MLIR_BIN").expect("MLIR_BIN");
+        mlir::lower(&bin, Path::new(&args[i + 1]));
+        return;
+    }
     let smoke = std::env::args().any(|a| a == "smoke");
     let (runs, min_ms) = if smoke { (1, 1) } else { (5, 300) };
     let scan_sizes: &[usize] = if smoke { &[2_000] } else { &[10_000, 200_000] };
