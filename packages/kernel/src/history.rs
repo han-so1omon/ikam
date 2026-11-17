@@ -211,18 +211,101 @@ impl<S: Store> Repo<S> {
                 }
             }
         }
-        let mut deleted = 0;
+        let mut dead = Vec::new();
         for id in self.store.ids()? {
             if !objects.contains(&id)
                 && !content.contains(&id)
                 && !self.claim_is_live(&id, &content)?
             {
-                self.store.delete(&id)?;
-                deleted += 1;
+                dead.push(id);
             }
         }
+        let deleted = dead.len();
+        self.delete_readers_first(dead)?;
         self.reset_projections();
         Ok(deleted)
+    }
+
+    /// Delete `ids` so that, if deleting stops part way, no stored object
+    /// names one already gone (E310): an object goes only once none of
+    /// `ids` still stored needs it, to decode (its dictionary, group,
+    /// context or pointed content) or, for a derivation, to read its
+    /// function and arguments (stored, or produced by another derivation
+    /// among `ids`); objects before contents within a round. A cycle would
+    /// be deleted in order.
+    pub(crate) fn delete_readers_first(&mut self, ids: Vec<Id>) -> Result<(), Error> {
+        let mut by_prefix: std::collections::HashMap<&[u8], Vec<usize>> = Default::default();
+        for (i, id) in ids.iter().enumerate() {
+            for n in [crate::dict::DICT_REF_LEN, crate::group::GROUP_REF_LEN, 32] {
+                by_prefix.entry(&id.as_bytes()[..n]).or_default().push(i);
+            }
+        }
+        let (mut readers, mut reads) = (vec![0usize; ids.len()], vec![Vec::new(); ids.len()]);
+        let mut object = vec![false; ids.len()];
+        // A derivation reads its function and arguments: stored ones, and
+        // ones only another derivation among `ids` can produce.
+        let mut derivations = vec![None; ids.len()];
+        let mut produces: std::collections::HashMap<Id, Vec<usize>> = Default::default();
+        for (i, id) in ids.iter().enumerate() {
+            if object_tag(&self.store.read_head(id, 2)?) == Some(b'D')
+                && let Ok(Object::Derivation(d)) = self.get(id)
+            {
+                produces.entry(d.output).or_default().push(i);
+                derivations[i] = Some(d);
+            }
+        }
+        for (i, id) in ids.iter().enumerate() {
+            let head = self.store.read_head(id, 65)?;
+            object[i] = object_tag(&head).is_some();
+            let read: Vec<Id> = (derivations[i].iter())
+                .flat_map(|d| d.args.iter().map(Arg::id).chain([d.func, d.output]))
+                .collect();
+            let mut named: Vec<usize> = (needs(&head).into_iter())
+                .chain(tree_content(&head).as_ref().map(|c| &c.as_bytes()[..]))
+                .chain(read.iter().map(|r| &r.as_bytes()[..]))
+                .flat_map(|p| by_prefix.get(p).into_iter().flatten().copied())
+                .chain(
+                    read.iter()
+                        .flat_map(|r| produces.get(r).into_iter().flatten().copied()),
+                )
+                .filter(|&j| j != i)
+                .collect();
+            named.sort_unstable();
+            named.dedup();
+            for &j in &named {
+                readers[j] += 1;
+            }
+            reads[i] = named;
+        }
+        let mut left: Vec<usize> = (0..ids.len()).collect();
+        while !left.is_empty() {
+            let (mut ready, wait): (Vec<usize>, Vec<usize>) =
+                left.into_iter().partition(|&i| readers[i] == 0);
+            if ready.is_empty() {
+                ready = wait;
+                left = Vec::new();
+            } else {
+                left = wait;
+            }
+            // Objects first: a derivation names contents it does not decode with.
+            ready.sort_by_key(|&i| !object[i]);
+            let mut objects = true;
+            for i in ready {
+                if objects && !object[i] {
+                    // A store may hold deletes until `sync` (E300's deferred
+                    // FsStore) and then apply them in any order, so each step
+                    // is made durable before the next one starts.
+                    self.store.sync()?;
+                    objects = false;
+                }
+                self.store.delete(&ids[i])?;
+                for &j in &reads[i] {
+                    readers[j] -= 1;
+                }
+            }
+            self.store.sync()?;
+        }
+        Ok(())
     }
 
     /// Claims annotate content without keeping it alive: one survives while

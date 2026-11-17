@@ -30,11 +30,20 @@
 //!   that coding takes and the bench's end gives back (a work-in-progress
 //!   limit, as on a kanban board).
 //! - `2 cpus, 6 in flight`.
+//! - E322, not part of the night's default rule: `4 in flight, pilot` and
+//!   `2 cpus, 6, pilot`, the same with a pilot transition (a short bench on
+//!   what was built) before the full bench. A pilot that says worse sends
+//!   the candidate straight to its write-up and frees its slot. The pilot's
+//!   time and how often it stops a candidate are E322's measurements on the
+//!   fixed bench (`PILOT_SHARE`, `PILOT_STOPS`, `PILOT_FALSE_STOPS`), drawn
+//!   from a seed of their own so the queue is E287's.
 //!
-//! Reported: candidates finished, those left half-done, the first that
-//! stalled, agent and cpu busy shares. Then the best plan's firings are replayed on an IKAM store
-//! (`net_fire`, MemStore): replay equal, all finished ones waiting on the
-//! owner. No kernel change.
+//! Reported: candidates finished (with a pilot, how many of them were
+//! stopped at it, and how many of those the full bench would have kept),
+//! those left half-done, the first that stalled, agent and cpu busy
+//! shares. Then the best plan without a pilot, and the same night with
+//! one, are replayed on an IKAM store (`net_fire`, MemStore): replay equal,
+//! all finished ones waiting on the owner. No kernel change.
 //!
 //!   cargo run --release --example net_night_plan [-- QUEUE]
 
@@ -48,12 +57,41 @@ use ikam_kernel::{MemStore, Repo};
 const TONIGHT: [f64; 8] = [22.0, 9.4, 9.3, 7.2, 2.0, 12.9, 2.5, 2.8];
 const NIGHT_S: u64 = 8 * 3600;
 const WRITE_SHARE: f64 = 0.15;
+/// E322, measured on the fixed bench over 18 tunable variants: the pilot
+/// (`north/multiformat` alone, stopping above +1%) takes 30 s against 378 s
+/// for the two full runs the keep rule needs, stopped 8 of 18, and stopped
+/// none of the 3 the full runs kept.
+const PILOT_SHARE: f64 = 30.0 / 378.0;
+const PILOT_STOPS: f64 = 8.0 / 18.0;
+const PILOT_FALSE_STOPS: f64 = 0.0;
 
-fn net_text(cpus: u32, serial: bool, wip: u32) -> String {
+fn net_text(cpus: u32, serial: bool, wip: u32, pilot: bool) -> String {
     let (take, give) = if serial {
-        ("built, cpu, agent", "measured, cpu, agent, slot")
+        ("cpu, agent", "measured, cpu, agent, slot")
     } else {
-        ("built, cpu", "measured, cpu, slot")
+        ("cpu", "measured, cpu, slot")
+    };
+    // E322: with a pilot, a short bench runs first on what was built; one
+    // that says worse skips the full bench and goes to the write-up.
+    let (bench_from, pilot_places, pilot_text) = if pilot {
+        let (ptake, pback) = if serial {
+            ("built, cpu, agent", "cpu, agent")
+        } else {
+            ("built, cpu", "cpu")
+        };
+        (
+            "passed",
+            "place piloting colored\nplace passed colored\n",
+            format!(
+                "\
+transition pilot cmd pilot: {ptake} -> piloting
+transition piloted pure: piloting -> passed, {pback}
+transition stopped pure: piloting -> measured, {pback}, slot
+"
+            ),
+        )
+    } else {
+        ("built", "", String::new())
     };
     format!(
         "\
@@ -69,16 +107,16 @@ place running colored
 place measured colored
 place writing colored
 place waiting colored
-transition propose agent propose: -> ready
+{pilot_places}transition propose agent propose: -> ready
 transition ask agent propose: -> asks
 transition decide human: asks -> ready
 transition code agent code: ready, agent, slot -> coding
 transition coded pure: coding -> built, agent
-transition bench cmd bench: {take} -> running
+transition bench cmd bench: {bench_from}, {take} -> running
 transition benched pure: running -> {give}
 transition write agent write: measured, agent -> writing
 transition written pure: writing -> waiting, agent
-"
+{pilot_text}"
     )
 }
 
@@ -103,10 +141,19 @@ struct Cand {
     code: u64,
     bench: u64,
     write: u64,
+    /// E322: the pilot's time, and whether it says worse (and so stops the
+    /// candidate before its full bench).
+    pilot: u64,
+    stops: bool,
+    /// The pilot stopped a candidate the full bench would have kept.
+    false_stop: bool,
 }
 
 fn queue(n: usize, bench_share: f64, ask_share: f64) -> Vec<Cand> {
     let mut rng = Rng(0x0287_5EED_1234_ABCD);
+    // A second stream for the pilot's draws, so the queue E287 measured is
+    // unchanged.
+    let mut pilot_rng = Rng(0x0322_5EED_9876_FEDC);
     (0..n)
         .map(|i| {
             let mins = TONIGHT[(rng.next() % 8) as usize] * (0.5 + rng.unit());
@@ -119,7 +166,15 @@ fn queue(n: usize, bench_share: f64, ask_share: f64) -> Vec<Cand> {
                 code: (s as u64).saturating_sub(bench + write).max(1),
                 bench: bench.max(1),
                 write: write.max(1),
+                pilot: ((bench as f64 * PILOT_SHARE) as u64).max(1),
+                stops: false,
+                false_stop: false,
             }
+        })
+        .map(|mut c: Cand| {
+            c.stops = pilot_rng.unit() < PILOT_STOPS;
+            c.false_stop = c.stops && pilot_rng.unit() < PILOT_FALSE_STOPS;
+            c
         })
         .collect()
 }
@@ -131,6 +186,9 @@ enum Plan {
     Pipelined,
     PipelinedWip,
     Pipelined2Wip,
+    /// E322, off unless chosen: a pilot before each full bench.
+    PipelinedWipPilot,
+    Pipelined2WipPilot,
 }
 
 impl Plan {
@@ -141,30 +199,48 @@ impl Plan {
             Plan::Pipelined => "pipelined",
             Plan::PipelinedWip => "pipelined, 4 in flight",
             Plan::Pipelined2Wip => "2 cpus, 6 in flight",
+            Plan::PipelinedWipPilot => "4 in flight, pilot",
+            Plan::Pipelined2WipPilot => "2 cpus, 6, pilot",
         }
     }
     fn cpus(self) -> u32 {
-        if self == Plan::Pipelined2Wip { 2 } else { 1 }
+        if matches!(self, Plan::Pipelined2Wip | Plan::Pipelined2WipPilot) {
+            2
+        } else {
+            1
+        }
+    }
+    fn pilot(self) -> bool {
+        matches!(self, Plan::PipelinedWipPilot | Plan::Pipelined2WipPilot)
     }
     fn net(self) -> Net {
         let (serial, wip) = match self {
             Plan::SerialStrict | Plan::SerialSkip => (true, 1),
             Plan::Pipelined => (false, 1000),
-            Plan::PipelinedWip => (false, 4),
-            Plan::Pipelined2Wip => (false, 6),
+            Plan::PipelinedWip | Plan::PipelinedWipPilot => (false, 4),
+            Plan::Pipelined2Wip | Plan::Pipelined2WipPilot => (false, 6),
         };
-        Net::parse(&net_text(self.cpus(), serial, wip)).unwrap()
+        Net::parse(&net_text(self.cpus(), serial, wip, self.pilot())).unwrap()
     }
 }
 
 struct Outcome {
     finished: usize,
+    /// E322: of those finished, stopped at the pilot, and of those, ones
+    /// the full bench would have kept.
+    stopped: usize,
+    false_stops: usize,
     unfinished: usize,
     stalled_at: Option<String>,
     agent_busy: u64,
     cpu_busy: u64,
     firings: Vec<(String, String)>,
     marking: Marking,
+}
+
+/// What a candidate takes from coding to its write-up, end to end.
+fn span(plan: Plan, c: &Cand) -> u64 {
+    c.code + c.bench + c.write + if plan.pilot() { c.pilot } else { 0 }
 }
 
 fn has(m: &Marking, place: &str, tok: &str) -> bool {
@@ -200,10 +276,21 @@ fn simulate(plan: Plan, q: &[Cand]) -> Outcome {
         loop {
             let mut started = false;
             for (i, c) in q.iter().enumerate() {
-                for (t, end, place, dur) in [
+                let pilot_end = if c.stops { "stopped" } else { "piloted" };
+                let steps = [
                     ("write", "written", "measured", c.write),
-                    ("bench", "benched", "built", c.bench),
-                ] {
+                    (
+                        "bench",
+                        "benched",
+                        if plan.pilot() { "passed" } else { "built" },
+                        c.bench,
+                    ),
+                    ("pilot", pilot_end, "built", c.pilot),
+                ];
+                for (t, end, place, dur) in steps {
+                    if t == "pilot" && !plan.pilot() {
+                        continue;
+                    }
                     let tr = net.transition(t).unwrap();
                     if has(&m, place, &c.tok)
                         && now + dur <= NIGHT_S
@@ -229,8 +316,7 @@ fn simulate(plan: Plan, q: &[Cand]) -> Outcome {
                 q.get(next_rank).map(|c| (next_rank, c))
             } else {
                 q.iter().enumerate().find(|(_, c)| {
-                    has(&m, "ready", &c.tok)
-                        && c.code + c.bench + c.write <= NIGHT_S.saturating_sub(now)
+                    has(&m, "ready", &c.tok) && span(plan, c) <= NIGHT_S.saturating_sub(now)
                 })
             };
             if let Some((i, c)) = pick {
@@ -238,7 +324,7 @@ fn simulate(plan: Plan, q: &[Cand]) -> Outcome {
                     if stalled_at.is_none() && has(&m, "asks", &c.tok) {
                         stalled_at = Some(c.tok.clone());
                     }
-                } else if c.code + c.bench + c.write <= NIGHT_S.saturating_sub(now)
+                } else if span(plan, c) <= NIGHT_S.saturating_sub(now)
                     && net.is_enabled(&m, code, Some(&c.tok))
                 {
                     fire(&mut m, "code", &c.tok, &mut firings);
@@ -260,12 +346,24 @@ fn simulate(plan: Plan, q: &[Cand]) -> Outcome {
         fire(&mut m, end, &q[i].tok, &mut firings);
     }
     assert!(now <= NIGHT_S, "nothing runs past the night");
+    let stopped: Vec<&Cand> = q
+        .iter()
+        .filter(|c| {
+            c.stops
+                && has(&m, "waiting", &c.tok)
+                && firings.iter().any(|(t, k)| t == "stopped" && *k == c.tok)
+        })
+        .collect();
     Outcome {
         finished: m.get("waiting").map_or(0, |w| w.len()),
-        unfinished: ["coding", "built", "running", "measured", "writing"]
-            .iter()
-            .map(|p| m.get(*p).map_or(0, |w| w.len()))
-            .sum(),
+        stopped: stopped.len(),
+        false_stops: stopped.iter().filter(|c| c.false_stop).count(),
+        unfinished: [
+            "coding", "built", "piloting", "passed", "running", "measured", "writing",
+        ]
+        .iter()
+        .map(|p| m.get(*p).map_or(0, |w| w.len()))
+        .sum(),
         stalled_at,
         agent_busy,
         cpu_busy,
@@ -299,10 +397,20 @@ fn main() {
                 Plan::Pipelined,
                 Plan::PipelinedWip,
                 Plan::Pipelined2Wip,
+                Plan::PipelinedWipPilot,
+                Plan::Pipelined2WipPilot,
             ] {
                 let o = simulate(plan, &q);
+                let stops = if plan.pilot() {
+                    format!(
+                        " ({} stopped at the pilot, {} wrongly)",
+                        o.stopped, o.false_stops
+                    )
+                } else {
+                    String::new()
+                };
                 println!(
-                    "  {:<22} {:>3} finished, {} left half-done, agent busy {:>3.0}%, cpu busy {:>3.0}%{}",
+                    "  {:<22} {:>3} finished{stops}, {} left half-done, agent busy {:>3.0}%, cpu busy {:>3.0}%{}",
                     plan.name(),
                     o.finished,
                     o.unfinished,
@@ -314,6 +422,7 @@ fn main() {
                 );
                 if ask_share > 0.0
                     && bench_share == 0.5
+                    && !plan.pilot()
                     && best.as_ref().is_none_or(|(f, u, _, _)| {
                         (o.finished, Reverse(o.unfinished)) > (*f, Reverse(*u))
                     })
@@ -324,9 +433,16 @@ fn main() {
         }
     }
 
-    // Replay the best plan (asks at 25%, bench at 50%) on an IKAM store.
-    let (_, _, plan, q) = best.unwrap();
-    let o = simulate(plan, &q);
+    // Replay the best plan (asks at 25%, bench at 50%) on an IKAM store,
+    // then the same night with pilots (E322).
+    let (_, _, best_plan, q) = best.unwrap();
+    for plan in [best_plan, Plan::PipelinedWipPilot] {
+        replay(plan, &q);
+    }
+}
+
+fn replay(plan: Plan, q: &[Cand]) {
+    let o = simulate(plan, q);
     let net = plan.net();
     let mut repo = Repo::new(MemStore::default());
     let db = repo.db_empty().unwrap();
@@ -343,7 +459,7 @@ fn main() {
     let waiting = repo.net_enabled(&db, &net, false).unwrap();
     let decisions = waiting.iter().filter(|(t, _)| t == "decide").count();
     println!(
-        "best plan ({}) replayed on an IKAM store: {} firings, replay equal, {} waiting on the owner, {} owner decisions open",
+        "plan ({}) replayed on an IKAM store: {} firings, replay equal, {} waiting on the owner, {} owner decisions open",
         plan.name(),
         o.firings.len(),
         o.finished,

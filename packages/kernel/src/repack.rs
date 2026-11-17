@@ -226,20 +226,112 @@ impl<S: Store + Sync> Repo<S> {
             });
         }
         let keep: HashSet<Id> = fresh.store.ids()?.into_iter().collect();
-        for id in &keep {
-            // The fresh plan may encode existing content more compactly
-            // (e.g. against the new dictionary); both decode identically.
-            let encoded = fresh.store.read(id)?;
-            if !self.store.write(*id, &encoded)? && self.store.read(id)? != encoded {
-                self.store.replace(*id, &encoded)?;
+        // New objects first (the new dictionary, groups, contexts), made
+        // durable, and only then replacements, which may name them: a
+        // replacement written before what it names leaves the store
+        // unreadable if the repack stops there (E310).
+        let (mut new, mut replace) = (Vec::new(), Vec::new());
+        for id in fresh.store.ids()? {
+            let encoded = fresh.store.read(&id)?;
+            if !self.store.has(&id) {
+                new.push((id, encoded));
+            } else if self.store.read(&id)? != encoded {
+                replace.push(id);
+            } else {
+                self.note_needs(&encoded);
             }
-            self.note_needs(&encoded);
         }
+        // Among new objects, what one names goes before it.
+        while !new.is_empty() {
+            // A derivation names its inputs and output, so it goes last.
+            let derivation = |e: &[u8]| matches!(e.first(), Some(b'D' | b'd'));
+            let others = new.iter().any(|(_, e)| !derivation(e));
+            let waits: Vec<bool> = {
+                let waiting: HashSet<&[u8]> = (new.iter())
+                    .flat_map(|(id, _)| {
+                        [DICT_REF_LEN, GROUP_REF_LEN, 32].map(|n| &id.as_bytes()[..n])
+                    })
+                    .collect();
+                (new.iter())
+                    .map(|(id, encoded)| {
+                        (others && derivation(encoded))
+                            || (waits_on(encoded).iter())
+                                .any(|p| waiting.contains(p) && !id.as_bytes().starts_with(p))
+                    })
+                    .collect()
+            };
+            let (ready, rest): (Vec<_>, Vec<_>) =
+                (new.into_iter().zip(waits)).partition(|(_, w)| !w);
+            let (ready, rest): (Vec<_>, Vec<_>) = (
+                ready.into_iter().map(|(o, _)| o).collect(),
+                rest.into_iter().map(|(o, _)| o).collect(),
+            );
+            // Only a prefix shared by chance can leave none ready.
+            let (ready, rest) = match ready.is_empty() {
+                true => (rest, Vec::new()),
+                false => (ready, rest),
+            };
+            for (id, encoded) in ready {
+                self.store.write(id, &encoded)?;
+                self.note_needs(&encoded);
+            }
+            new = rest;
+        }
+        self.store.sync()?;
+        // Then replacements and garbage, in rounds, each only once the store
+        // reads right after it (E310): readers allow no chains, so an object
+        // becomes a member or a frame only once no stored frame reads it as
+        // a context, and a frame names only contexts stored as neither; an
+        // object is deleted only once nothing stored names it, derivations
+        // before the contents they name.
         let refs: HashSet<Id> = self.store.refs()?.into_iter().map(|(_, id)| id).collect();
+        let mut garbage = Vec::new();
         for id in self.store.ids()? {
             if !keep.contains(&id) && !refs.contains(&id) && self.is_content_or_derivation(&id)? {
-                self.store.delete(&id)?;
+                garbage.push(id);
             }
+        }
+        let mut replace = (replace.into_iter())
+            .map(|id| Ok((id, fresh.store.read(&id)?)))
+            .collect::<Result<Vec<_>, Error>>()?;
+        let chained = |e: &[u8]| matches!(e.first(), Some(b'S' | b'Q' | b'M'));
+        while !replace.is_empty() || !garbage.is_empty() {
+            let (mut named, mut contexts, mut frames) = (
+                crate::dict::Needed::default(),
+                HashSet::new(),
+                HashSet::new(),
+            );
+            for id in self.store.ids()? {
+                let head = self.store.read_head(&id, 65)?;
+                if chained(&head) {
+                    frames.insert(id);
+                }
+                for c in crate::dict::contexts(&head) {
+                    contexts.extend(c.try_into().ok().map(Id::from_bytes));
+                }
+                named.add(&head);
+            }
+            let ready = |(id, encoded): &(Id, Vec<u8>)| {
+                (crate::dict::contexts(encoded).iter())
+                    .filter_map(|c| <[u8; 32]>::try_from(*c).ok())
+                    .all(|c| !frames.contains(&Id::from_bytes(c)))
+                    && !(chained(encoded) && contexts.contains(id))
+            };
+            let (mut now, mut later): (Vec<_>, Vec<_>) = replace.into_iter().partition(ready);
+            let (mut gone, mut wait): (Vec<_>, Vec<_>) =
+                (garbage.into_iter()).partition(|id| !named.names(id) && !contexts.contains(id));
+            // Only a cycle can leave nothing ready: then the rest, in order.
+            if now.is_empty() && gone.is_empty() {
+                (now, gone) = (std::mem::take(&mut later), std::mem::take(&mut wait));
+            }
+            for (id, encoded) in now {
+                // The fresh plan may encode existing content more compactly
+                // (e.g. against the new dictionary); both decode identically.
+                self.store.replace(id, &encoded)?;
+                self.note_needs(&encoded);
+            }
+            self.delete_readers_first(gone)?;
+            (replace, garbage) = (later, wait);
         }
         if let Some((dict, _)) = fresh.dictionary() {
             let current = self.store.get_ref(DICT_REF)?;
@@ -1112,6 +1204,16 @@ impl ReadModel {
             spans.iter().map(|&(s, e, n)| covered(s, e) * n).sum()
         })
     }
+}
+
+/// The id prefixes an encoding cannot be read without: what `needs` names,
+/// and the content a tree or graph chunk stored as `t 2`/`g 2` points to.
+fn waits_on(encoded: &[u8]) -> Vec<&[u8]> {
+    let mut out = crate::dict::needs(encoded);
+    if let [b'a'..=b'z', 2, content @ ..] = encoded {
+        out.extend(content.get(..32));
+    }
+    out
 }
 
 #[cfg(test)]

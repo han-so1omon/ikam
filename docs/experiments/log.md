@@ -3819,6 +3819,125 @@ Gates on the branch (E229 to E233): every kernel test suite passes (release); cl
 - Verdict: **kept** as an option (opt-in API, grouping off by default). The cold work now follows the change: seconds where a full repack takes minutes or does not finish, with every file reading the same and killed passes leaving clean stores. The full repack stays for what only it finds (a new dictionary, templates across old and new files).
 - Run: `cargo run --release --example cold_pass -- [group] [nofull]`; `cargo run --release --example cold_pass -- kill 5000 30 [group]`; `cargo run --release --example cold_pass -- gccheck 100000 group`; `cargo run --release --example cold_pass -- repro 100000 group [nopass] [save=DIR]`, then `-- full DIR`; `cargo test --release --test coldpass`.
 - Gates on the branch: every kernel test suite passes (release, 247 tests); clippy `-D warnings` and fmt clean; the bench gives the same byte fields as main, north 0.3096 (corpora from git history left out, as for E265).
+
+### E310 repack-crash-safety (a full repack stopped after any of its writes leaves a clean store)
+- Branch / parent: exp/310-repack-crash-safety / exp/268-incremental-repack a279f89 (numbered E310 because E269 to E298 were taken by other work meanwhile)
+- Question: E268 found that the full repack's copy loop (`replan_store`) could replace entries durably before what their new encodings name is in place. Does a full repack stopped part way leave a store that reads the same and is fsck clean, and if not, what order makes it so?
+- Method: random kills first, as E268 did (`kill 3000 10 full`: ten full repacks of a 3,000-row store killed at a random time in the last fifth of their run, where the writes are). Then trace and replay (`crash N K [synced] [group]`): one full repack runs on a copy through a store that records every write, replace, delete, ref move and sync in order; for K points spread over that list (plus points where the kind of write changes, at most 3K in all), a fresh copy gets the writes up to the point on a deferred FsStore (with `synced`, one that places each write at once), its handle is lost without a drop, as in a crash, and it is reopened and checked: scan, `db_rebuild` and `fsck_deep` (every stored object, garbage included, decodes). A control replays every write and drops the handle as usual; it must be clean. The store is the kill store: N rows, a first cold pass (E268), then 1,000 upserts in batches of 100.
+- Before the fix (1,000 rows; the repack issues 3,043 writes: 332 new objects, 2,201 replacements, 508 deletes, 2 ref moves):
+  - Random kills found nothing: the repack plans for about 30 s and writes for well under a second at the end.
+  - Trace and replay: 1,109 of 1,126 stopping points failed their check, from the 126th write on, on the deferred store; the synced store failed too, so the order hurts, not only the deferral.
+- Causes, in the order they showed (each fix exposed the next; the last two only at 3,000 rows):
+  1. Replacements and new objects went out mixed, in id order: a content re-encoded against the new dictionary was replaced before the dictionary was written.
+  2. New objects went out before what they name (a group member before its group, a frame before its context, a derivation before its contents).
+  3. An old frame that the repack leaves as garbage, deleted only at the end, failed once its context was replaced by a group member or a frame (readers allow no chains).
+  4. Garbage derivations failed once the garbage contents they name were deleted first.
+  5. A kept content became a group member while a kept frame still to be rewritten read it as its context (37 of 78 points at 3,000 rows, synced).
+  6. gc, which the repack runs first and last, deleted garbage in id order: a garbage frame lost its context, and a garbage derivation lost the derivation that produced one of its arguments.
+- Change (not an option: the full repack's and gc's own correctness; the end state is the same):
+  - `replan_store` (src/repack.rs): new objects first, in rounds, each round writing those whose needs (`needs`, plus a tree or graph chunk's pointed content) are already stored, derivations last; then `sync`; then replacements and garbage deletes in rounds over the current store: an object becomes a member or a frame only once no stored frame reads it as a context, a frame is written only once its contexts are stored as neither, and garbage goes only once nothing stored names it. A round with nothing ready (a cycle, which a valid plan cannot hold) writes the rest in the old order.
+  - `Repo::delete_readers_first` (src/history.rs), used by gc and by `replan_store`: deletes a set so that no stored object in it names one already gone, by decoding (dictionary, group, context, pointed content) or as a derivation's function, argument or output, including an argument only another derivation in the set produces; objects before contents within a round.
+- Result after the fix:
+
+  | Run | Stopping points | Failing |
+  |---|---|---|
+  | 1,000 rows, deferred | 169 | 0 (was 1,109 of 1,126) |
+  | 1,000 rows after grouped passes, deferred | 165 | 0 |
+  | 3,000 rows, synced | 79 | 0 (was 37 of 78 with causes 1 to 4 fixed) |
+  | 3,000 rows, deferred | 79 | 0 |
+  | 3,000 rows, ten full repacks killed at random | 10 | 0 after the kill, 0 after a rerun |
+
+  - Tests (tests/repack_crash.rs, 2): every stopping point of a recorded full repack of a 400-row MemStore (first pass, five batches of 40 upserts), and every 75th of a 3,000-row one (ten batches of 100), each checked by scan and `fsck_deep`. On the parent's order the first fails at 790 of 915 points; with causes 1 to 5 fixed and gc unchanged the second fails at 3 of 74; with the fix both pass.
+  - The order costs no time that shows: the repack took 12.8 s at 1,000 rows and 31.7 s at 3,000 against 13.1 s and 31.4 s before; the bench's north corpora repack in 63.6 s of CPU against 60.4 s on the parent, within run-to-run spread on this machine.
+- Not covered: a crash inside a single write (FsStore writes each object through a temporary file and a rename); stores other than FsStore and MemStore; the incremental pass (E268's kill tests cover it); a grouped store at 100,000 rows.
+- Verdict: **kept** (a fix, no option). The gaps are on main too: the two tests, run on main without the first cold pass (which main lacks), fail at 763 of 910 and 67 of 74 stopping points.
+- Run: `cargo run --release --example cold_pass -- crash 1000 150 [synced] [group]`; `cargo run --release --example cold_pass -- crash 3000 60 [synced]`; `cargo run --release --example cold_pass -- kill 3000 10 full`; `cargo test --release --test repack_crash`.
+- Gates on the branch: every kernel test suite passes (release, 249 tests); clippy `-D warnings` and fmt clean; the bench gives the same byte fields as the parent, north 0.3096.
+- Follow-up after merging main (af24e4d, with E300's deferred deletes):
+  - E300 makes a deferred FsStore hold each delete until the next `sync` or ref move and then remove the files in id order. So a garbage frame deleted in one round could still be on disk when a later round replaced its context with a chained form: `crash 1000 150` on the deferred store failed at 4 of 169 points (after writes 2,862 to 2,874, each a replacement).
+  - Change: `Repo::delete_readers_first` syncs before the contents of each round and after each round, so each step of the deletes is durable before the next starts (12 syncs in a 1,000-row repack instead of 1).
+  - Result: 0 failing at every run: `crash 1000 150` (187 points), `crash 1000 150 group` (184), `crash 3000 60` deferred and synced (100 each), `kill 3000 10 full` (9 killed, 1 finished first). The repack took 16.7 s at 1,000 rows and 34.7 s at 3,000 while another build shared the machine, so these times are not comparable with the ones above.
+  - Test: `a_full_repack_with_deferred_deletes_stopped_after_any_write_reads_the_same` replays onto a MemStore that holds deletes until each sync or ref move and then applies them in reverse id order, at 1,000 rows, every 100th point and just before each sync or ref move. Without the change it fails at 1 of 35 points (after write 2,860); with it, it passes.
+
+### E263 temperature-by-age (old content re-encoded at the archive read weight)
+- Branch / parent: exp/263-temperature / exp/268-incremental-repack a279f89 (its restricted recompress and `Store::sync`)
+- Question: the Python-era design tiered content hot, warm and cold by age. As read weights (E069: stored bytes worth one decoded byte), does planning new content at the heavy weight and re-encoding aged content at the archive weight get most of the archive's bytes while recent reads stay as fast as all-heavy? What does promotion cost when old content turns hot again?
+- Change (opt-in, library only): `Repo::temperature_pass(TemperatureOpts { hot_commits, cold_read_weight })` (src/temperature.rs). Age is commit depth (the plan's variant A, deterministic): a content is hot if the tree of one of the newest `hot_commits` commits of some ref reaches it (each ref's history walked breadth-first from its head; 0 makes everything cold), cold if only older commits do. The pass re-encodes cold contents not cooled before at `cold_read_weight`, and re-encodes at the repo's own `read_weight` the cooled contents that are hot again (promotion happens only in a pass, never on read); a promoted content stored as a frame against another is written plain first, since recompress leaves frames alone. The cooled set is kept as a plain content under `meta/cooled`, so the next pass touches only what changed temperature. Contents that a stored encoding reads as its group, dictionary or context keep their encoding, as in E268. Variant B (age by read counts) was not built: it makes stored bytes depend on who read what. Kernel: `commit_tree` is now `pub(crate)`.
+  - Tests (tests/temperature.rs, 4): aged contents take at least 10% fewer bytes while hot contents keep their exact encodings, every version reads the same before and after gc, fsck clean; a second pass with nothing aged changes nothing; a version reverted into the head tree is promoted by the next pass back to a larger, heavy-weight encoding; nothing happens unless called.
+- Result (`examples/temperature.rs`; 200 generated files, half markdown and half CSV, then 2,000 one-line edits committed every 10, so 201 commits; FsStore; writes at the heavy weight 48.8 (the bench's `READ_WEIGHT`, E069) and a cold pass (E268) at that weight after the session; the cooled cases on copies of that store at the archive weight 0.00097 (the north score's, E099); reads from a freshly opened store, every version checked; every version read back and fsck clean after each case; a 4-core cloud machine, nothing else running; one run):
+
+  | Case | Stored | Read newest 10% (220 versions) | Read oldest 50% (1,100) | Pass |
+  |---|---|---|---|---|
+  | today: kernel default weight (0.001) at write and in the pass, its own store | 2.38 MB | 276 ms | 331 ms | 5.0 s (session 29.7 s) |
+  | all heavy (session 7.3 s, pass 3.3 s) | 7.09 MB | 1.3 ms | 6.9 ms | |
+  | all archive (temperature pass, nothing hot) | 3.28 MB | 8.2 ms | 39.6 ms | 6.2 s |
+  | temperature, newest 1 commit hot | 3.61 MB | 4.1 ms | 39.3 ms | 5.9 s |
+  | temperature, newest 10 commits hot | 3.76 MB | 2.3 ms | 37.2 ms | 5.5 s |
+  | temperature, newest 50 commits hot | 4.47 MB | 1.0 ms | 30.7 ms | 4.7 s |
+
+  - Ten hot commits keep 87% of the archive's saving (3.76 against 3.28 MB, from 7.09 all heavy) while the newest versions read in 2.3 ms against 1.3 all heavy and 8.2 all archive; with 50 hot commits the newest read as fast as all heavy and 68% of the saving is kept. Aged versions read 4 to 6 times slower than all heavy (30 to 40 ms against 6.9 for 1,100 versions), the price the archive weight sets.
+  - The cooled contents went from 5.06 to 1.63 MB at ten hot commits, mostly as frames against another cold version (the encoding tags in the tests: zstd to context frames).
+  - Today's default weight stores less than any tier (2.38 MB) but reads 100 to 200 times slower (276 ms for the newest 10%) and its session took 4 times longer (29.7 against 7.3 s): at that weight the write path plans slices of earlier versions. The tiers trade 1.5 to 1.9 times today's bytes for reads 70 to 280 times faster on new content and about 9 times faster on old.
+  - Promotion (ten hot commits; 20 files reverted to versions from the first half of the history in one commit): the next pass promoted 15 of them in 343 ms and cooled 17 contents the new commit aged; the other 5 are contexts of other cold frames and kept their encoding (readers allow no chains). Stored bytes rose 3.77 to 3.86 MB. Reading the 20 reverted files took 0.62 ms before and 0.48 ms after: too small a read to time well.
+- Not measured: databases (under commit depth a log's events never age, so only replaced graph chunks would cool); age by read counts (variant B); peak memory; macOS; a pass while writes run.
+- Verdict: **kept** as an option, off by default (a pass nothing calls unless a caller does). Age by commit depth gets most of the archive's bytes while recent reads stay heavy-weight fast. Whether to plan writes at the heavy weight is a separate choice: it is the kernel default's opposite, and the default's small stores cost slow reads.
+- Run: `cargo run --release --example temperature -- [FILES] [EDITS]`; `cargo test --release --test temperature`.
+
+### E264 branch-hot-state (each ref keeps its own hot state)
+- Branch / parent: exp/264-branch-hot-state / exp/268-incremental-repack a279f89 (its cold pass; E262's integrator and E265's merge are on main)
+- Question: if a ref keeps its own hot state (its newest database and its views, caught up by its own integrator), does a branch cost one ref to create, are edits on it as fast as on main, does one cold pass serve every ref because content addressing shares their objects, and can a merge run while either side's views lag (E265's variant b) and still give a merge with current views' database and view rows?
+- Change (opt-in, library only): `hot::HotRefs` (src/hot.rs). `open(name)` takes the ref's database from its commit and starts an E262 integrator from views given or built; `fork(from, to)` creates the ref at `from`'s head and starts an integrator from `from`'s newest view state, however far it lags, copying and rebuilding nothing; `append(name, events)` appends, commits to that ref and hands its integrator the database; `merge(into, from)` runs `Repo::merge` (E265) without waiting for views and hands `into`'s integrator the merged database (to merge with current views, `wait` on both first); `wait`, `lag`, `views`, `close`, `names`. The cold pass stays shared: `repack_incremental` (E268) walks every ref at once and skips what it planned before. No change to merge itself: it reads logs and trees only, so views lagging never blocked it; what E265 left open was handing the merged database to views that lag.
+  - Tests (tests/hot.rs, 6): a fork writes no object and shares the source's database, head and views; each ref's views equal a full build at its own database, and its committed database is its hot one; a merge while views lag gives the database and view rows a merge after both sides caught up gives; planted conflicts are reported while views lag and nothing moves; a fast-forward hands over the database; one cold pass and gc after branching keep every ref scanning and rebuilding the same, fsck clean.
+- Result (`examples/branch_hot.rs`; a generated table of 100,000 rows with E260's per-id sum view (incremental), FsStore with deferred sync (E227), `plain_db_events` (E232), `needed_index` (E129), shared with the integrators (`SharedStore`), integrators folding once views lag 50 events (E262's `min_events` 50); one cold pass after the load (52 s, 14.8 MB) so later passes see only the change; each case on a copy of that store; W3: `side` forked from `main`, 500 single upserts on each side in turn, each committed to its own ref, main on even rows and side on odd ones; a 4-core cloud machine, nothing else running; one run):
+
+  | Step | Result |
+  |---|---|
+  | 20 forks of `main` | p50 0.38 ms, slowest 621 ms; 0 objects and 0 bytes written; a branch building its own views would pay 19.5 s first |
+  | W3 hot latency (append, commit, hand-over), main / side | p50 13.3 / 13.3 ms, p99 23.1 / 24.0 ms (lagging run); 18.0 / 17.6, 28.8 / 27.6 ms (current run); the same 1,000 upserts on one ref: p50 16.6, p99 31.1 ms |
+  | views behind, per side | p50 37, p99 63 events |
+  | merge while views lag (variant b), 100 events behind in all | merge 352 ms; `main`'s views current 400 ms later |
+  | merge after both caught up (variant a) | wait 192 ms, merge 332 ms, views current 290 ms later |
+  | variants a and b | same merged database, same view rows; both equal a full build |
+  | stored, branched session merged / the same events on one ref | 20.93 / 21.28 MB; after a pass 20.84 / 21.19 MB |
+  | cold pass after the branch session and merge (45,162 new) / after a second branch's 500 upserts (22,485 new) / after the one-ref session (45,060 new) | 12.3 / 9.0 / 13.6 s |
+  | planted conflicts (48 of side's upserts on rows main wrote), merged while views lag | 48 found, none missed, none false, 33 ms; `main` did not move |
+
+  - A branch costs a ref: no object is written and the views are shared as they stand, where a branch with views of its own would rebuild them for 19.5 s at this size. Edits on a branch cost what edits on `main` cost (within 1 ms at the median in each run; the two runs differ by 5 ms, which the one-ref control sits between).
+  - Content addressing shares the two sides fully: the branched and merged store is 1.6% smaller than the same upserts on one ref, and each cold pass handles only its own new objects, at the same cost per object for the second branch as for the first.
+  - Merging while views lag (variant b) works with no change to the merge: the merge reads logs and trees only. It gives the merge commit 172 ms sooner than waiting first (352 against 524 ms) and current views about as soon (752 against 814 ms); the database and view rows are the same.
+  - The slowest fork (621 ms) and the slowest upsert on the second branch (2.2 s, in both runs) came once each; the second is the first append after the ref was reopened following a cold pass, which builds the writer's indexes (as E262's warm-up append does). Not traced further.
+- Not measured: hot state kept across restarts (it lives in memory, as E262's); pending view edges (E148) and deferred objects per ref, which the plan also named (the database and views were enough for this harness); gc while integrators run (not allowed, as in E262); file trees on branches (E265 covers their merge); 1M rows; macOS.
+- Verdict: **kept** as an option (opt-in library). Hot state per ref costs nothing to fork, edits run at `main`'s speed, branches share every object and one cold pass serves all refs; merges need not wait for views.
+- Run: `cargo run --release --example branch_hot -- [N]`; `cargo test --release --test hot`.
+
+### E261 plain-hot-writes (skip the storage-plan search on the hot path, leave it to the cold pass)
+- Branch / parent: exp/261-plain-hot-writes / exp/268-incremental-repack a279f89 (the cold pass it leans on)
+- Question: every new content goes through the storage-plan search (containers, slices, templates) before the write returns. If writes skip it and the cold pass plans later, how much faster is the hot path, and how much of the byte cost does one cold pass (E268) or a full repack take back? (Plan: E119's note, 1,000 single appends 3.1 to 0.9 s for 3.3 to 7.9 MB.)
+- Change (opt-in): `Repo::plain_hot_writes` (src/repo.rs, off by default; copied to siblings). With it on, `put_content_with` (src/ingest.rs) skips the container unpacking and the slice and template search, and stores the content compressed as it is; derivation hints are still tried. Nothing else changes: `plain_db_events` (E232) already stored database events plainly, so on a database what is skipped is the search for its own graph chunks.
+- Result (`examples/plain_writes.rs`; W1: 200 generated files, 1,000 one-line edits committed every 50; W2: a generated table, then 2,000 upserts in batches of 100 and 200 single upserts, each committed, with E260's opt-ins (deferred sync, `plain_db_events`, `needed_index`); FsStore; every store read back and `fsck_deep` clean after each step; a 4-core cloud machine; one run each):
+
+  | Workload | Measure | Planned at write | Plain hot writes |
+  |---|---|---|---|
+  | files | edit p50 / p95 | 2.5 / 15.3 ms | 1.7 / 2.8 ms |
+  | | stored after the session / after one pass / after a full repack | 2.17 / 2.09 MB / 410 KB | 4.98 / 4.18 MB / 388 KB |
+  | | read every file: session / pass / full repack | 127 / 206 / 128 ms | 17 / 32 / 346 ms |
+  | db 20,000 rows | batch of 100 p50, single upsert p50 | 111 ms, 13.0 ms | 50 ms, 5.8 ms |
+  | | stored after the session / after one pass / after a full repack | 6.25 / 5.17 / 4.37 MB | 13.6 / 6.95 / 11.9 MB |
+  | | read check: session / pass / full repack | 4.0 / 5.0 / 10.1 s | 1.3 / 2.7 / 4.5 s |
+  | | full repack time | 180 s | 92 s |
+  | db 100,000 rows | batch of 100 p50, single upsert p50 | 152 ms, 13.9 ms | 60 ms, 6.5 ms |
+  | | stored after the session / after one pass | 22.2 / 17.3 MB | 31.6 / 20.2 MB |
+  | | read check: session / pass | 17.5 / 29.0 s | 7.7 / 15.2 s |
+  | | cold pass time | 62 s | 66 s |
+
+  - The hot path is 2 to 2.5 times faster on databases and 1.5 times at the median on files, and the tail goes: file edits p95 15.3 to 2.8 ms, the slowest single upsert 27 to 10.5 ms at 100,000 rows. Reads are faster too until a full repack, since nothing stored is a slice or a frame.
+  - One cold pass takes back most of the database's extra bytes but not all: 17% more than planning at write at 100,000 rows (20.2 against 17.3 MB), 34% at 20,000. On files it takes back little (4.18 against 2.09 MB): the pass recompresses each content on its own or against one context and cannot rebuild an edit's slice of the file it came from, since contexts allow no chains. A full repack does rebuild them on files (388 KB, less than planned at write).
+  - A full repack does not take back the database's chunk sharing: 11.9 MB after it against 6.95 MB after the pass, 4.37 MB when planned at write. Stored bytes by encoding tag at 5,000 rows (`TAGS=1`) show where: graph chunk objects take 3.77 MB after the full repack with plain writes against 0.48 MB planned at write, and no derivation records are left (285 KB of them planned at write). So the full repack appears to build on what was recorded at write rather than search graph chunks from scratch (the plan's open question), and what plain writes skip there stays skipped. Not traced further.
+  - Loading the 100,000-row table took 21 s with plain writes against 11 s planned (one run; not looked into).
+- Not measured: a W1 session on its debounce; peak memory; 1M rows; macOS; plain writes with the background integrator (E262).
+- Verdict: **kept** as an option, off by default. It halves hot latency and cuts the tail, and one cold pass leaves databases within 17 to 34% of today's bytes; it is the wrong choice where a full repack is expected to restore sharing on databases, or for file stores that keep editing the same files.
+- Run: `cargo run --release --example plain_writes -- files db 20000 full`, `-- db 100000`; `TAGS=1 ... -- db 5000 full` for stored bytes by tag.
+
 ### E275 registry-gaps (the experiment loop's gap list, from the project's own records)
 - Branch / parent: exp/275-registry-gaps / main c92a279
 - Question: an experiment loop that runs with little input needs a queue of candidates. Do the project's records (registry, log, research notes) already hold one, and would a list built from them have pointed at what was run next? (Design: `docs/research/experiment-loop.md`.)
@@ -4702,3 +4821,98 @@ Gates on the branch (E229 to E233): every kernel test suite passes (release); cl
 - Verdict: **measured**. For a net, three points on one curve: Cranelift repays first (tens of thousands of steps), `mlir+llc` gives clang's step speed at a tenth to a thirtieth of its compile time and repays after about a million to two million steps, clang -O2 and `mlir+opt` only after tens of millions at the largest size. No kernel change: a net's step is not the loop's bottleneck (E277), so none of these modes is worth a dependency today.
 - Not measured: Apple silicon (E311's planned run); MLIR 23; nets with colors unfolded (E285).
 - Run: `apt-get install mlir-18-tools` (Ubuntu 24.04), then `MLIR_BIN=/usr/lib/llvm-18/bin cargo run --release --features mlir -- mlir` in `packages/kernel/experiments/net-jit`.
+### E267 hot-cold-e2e (E260's two workloads with what E261 to E268 kept)
+- Branch / parent: exp/267-hot-cold-e2e / exp/268-incremental-repack a279f89, with exp/261-plain-hot-writes, exp/264-branch-hot-state and exp/263-temperature merged in (append-only doc conflicts kept both sides)
+- Question: with every option the hot and cold layers plan kept turned on together, how much faster is the hot layer than with today's opt-ins, what does the cold layer cost after a session, and how many bytes stay on disk, on E260's workloads?
+- Change: none in the kernel. `examples/hot_cold.rs` gets a third setting, `kept`: today's opt-ins (`FsStore::open_deferred`, E227; `plain_db_events`, E232; `needed_index`, E129) plus `plain_hot_writes` (E261); for the database, views kept by a background integrator (E262, `min_events` 50) through `hot::HotRefs` on `main` (E264) on a `SharedStore`; the cold work is `repack_incremental` (E268), gc and fsck at every size, in place of the full repack. For the database, one pass runs after the load so the pass after the session sees only the session. Every setting now reports `hot_p50`/`hot_p99`, what a caller waits for per batch: append, commit and, with views kept each batch, the view update (`kept`: the hand-over to the integrator). E263's temperature pass is left out: the harness writes at the kernel's default read weight, which is already about the archive weight.
+- Result (`cargo run --release --example hot_cold -- files`, `-- db 20000`, `-- db 100000`; a 4-core cloud machine, nothing else running; one run each; every case checks views against a full build and the database against a rebuild, and fsck after the cold work):
+
+  | Case | default | opt | kept |
+  |---|---|---|---|
+  | files, commit every edit: edit p50 / p99 | 7.5 / 42.7 ms | 5.5 / 39.8 ms | 2.9 / 4.4 ms |
+  | files, commit every 50: edit p50 / p99 | 7.2 / 36.6 ms | 3.7 / 32.1 ms | 1.3 / 11.4 ms |
+  | files, cold work (commit every edit / every 50) | full repack 55.8 / 23.9 s | 56.1 / 22.8 s | incremental pass 6.6 / 2.7 s |
+  | files, disk after the cold work (every edit / every 50) | 778 / 410 KB | 778 / 410 KB | 2,109 / 568 KB |
+  | files, hot bytes written (every 50) | 2.08 MB | 2.08 MB | 4.74 MB |
+  | db 100k, single appends: hot p50 / p99, views each batch | 158.9 / 728 ms | 156.6 / 203 ms | 6.6 / 15.0 ms, views 73 events behind at p50 |
+  | db 100k, single appends: hot p50, views once at end | 22.9 ms | 14.1 ms | (as above) |
+  | db 100k, batches of 100: hot p50 / p99, views each batch | 7,311 / 13,766 ms | 370 / 408 ms | 63 / 206 ms |
+  | db 100k, one batch of 2,000: hot, views each batch | 141 s | 2.14 s | 0.57 s |
+  | db 100k, views caught up after the session | 0.2 to 0.4 s | 0.1 to 0.5 s | 0.18 to 0.36 s (wait) |
+  | db 100k, cold work after the 2,000 batch | no repack (E260: unfinished after 12 min); gc 1.2 s, fsck 1.4 s | same | pass 7.0 s (4,008 new), gc 2.4 s, fsck 2.4 s; a one-time pass after the load 56 s |
+  | db 100k, disk after the cold work | 19.96 MB | 19.96 MB | 17.57 MB |
+  | db 20k, one batch of 2,000: hot; cold work | 24.6 s; full repack 125 s | 0.74 s; full repack 123 s | 0.39 s; pass 2.3 s (after a 11.7 s pass after the load) |
+  | db 20k, disk after the cold work | 3.37 MB | 3.37 MB | 3.87 MB |
+
+  - The hot layer: with everything kept, an edit on files waits 1.3 to 2.9 ms at the median and its slow tail mostly goes (p99 4.4 against 39.8 ms when committing each edit); a database append that keeps views current waits 6.6 ms for one event at 100,000 rows, against 157 ms with today's opt-ins updating views each time and 14 ms with them not current at all. Batches of 100 and 2,000 are 3 to 6 times faster than today's opt-ins with views kept each batch.
+  - The views stay close behind instead of current: 73 events at the median for single appends, and further for batches (800 events at p50 with batches of 100, when the session outruns the integrator's folds); catching up after the session took under 0.4 s in every case.
+  - The cold layer: the incremental pass is the first cold work that runs at 100,000 rows (7 s after a session of 2,000 events), and on files it takes an eighth of the full repack's time. A pass after the load, 56 s at 100,000 rows, is paid once.
+  - Bytes are the price. Plain hot writes write 2.3 to 4 times the bytes during the session (E261). After the cold work, a database that has had its passes is 12% smaller than today's at 100,000 rows (no full repack can run there) but 15% larger than a full repack at 20,000; files are 39% larger than a full repack when committing every 50 edits and 2.7 times larger when committing every edit (the pass encodes each version on its own; a full repack shares across them). A full repack stays the way to get the smallest store, where it can finish.
+- Not measured: macOS (Mac steps below); E263 with the heavy read weight in this harness (E263 measures it alone); E264's branches (one ref here); 1M rows; repeated runs.
+- Verdict: **measured**, no new option. Together the kept options make the hot layer 2 to 24 times faster than today's opt-ins on these workloads and give a cold layer that runs at every size, for more bytes written and, against a full repack where one finishes, more bytes kept. All stay off by default.
+- Mac steps: `cargo run --release --example hot_cold -- files`, `-- db 20000`, `-- db 100000` on this branch, one at a time.
+- Run: `cargo run --release --example hot_cold -- [files|db] [default|opt|kept] [N...]`.
+
+### E312 fusion-default (convex fusion as the default hybrid ranking)
+- Branch / parent: exp/312-fusion-default / main
+- Question: which way of fusing a keyword list and a vector list should be ikam's default, and with what weight? The evidence is on unmerged branches: exp/258-real-hybrid and exp/259-fusion-tune (E258, E259: WordLlama vectors over OSI-licensed PyPI READMEs, judgments from the data's structure), and exp/304-beir-hybrid, exp/305-beir-fusion-tune and exp/306-transformer-vector-views (logged there as E304 to E306, numbers main uses for other entries: all-MiniLM-L6-v2 and bge-small-en-v1.5 on BEIR's NFCorpus, SciFact and FiQA with their human judgments, and on the PyPI set). Source: Bruch et al., 2022 (notes in docs/research/search-engines.md on exp/259-fusion-tune).
+- Change: `src/fusion.rs` (opt-in): `convex` (each list min-max normalized, `alpha * keyword + (1 - alpha) * vector`), `rrf`, and `hybrid`, the default, which is `convex` at `DEFAULT_ALPHA` 0.5. `STRONG_VECTORS_ALPHA` is 0.4. Nothing in the kernel calls them; tests in `tests/fusion.rs`.
+- Result (nDCG@10 on test queries; from the branches above, not rerun here):
+
+  | Embedder | Sets where fusion beats BM25 | Worst loss against each set's best weight, over five sets: 0.4 / 0.5 / 0.6 | Tuned convex against tuned RRF |
+  |---|---|---|---|
+  | all-MiniLM-L6-v2 | 5 of 5, by 2 to 6 standard errors | 0.042 / 0.016 / 0.053 | ahead or within 0.010 |
+  | bge-small-en-v1.5 | 5 of 5 | 0.010 / 0.032 / 0.066 | ahead or within 0.010 |
+  | WordLlama (static) | ties BM25 at best on known items; best weight 0.6 to 0.8 | | |
+
+  - The best weight follows the vectors' strength against BM25: it fell from 0.6 to 0.8 with a static model to 0.4 to 0.6 with MiniLM and 0.3 to 0.5 with bge-small. On FiQA, where vectors alone beat BM25 by 0.13 to 0.16, a weight of 0.6 falls below vectors alone.
+  - RRF's best k swings from 1 to 100 between sets and tasks; at its usual k of 60 it lost to BM25 on PyPI known items with MiniLM and with WordLlama.
+- Not measured: a weight chosen per query or per collection from unlabelled signals; embedders larger than bge-small.
+- Trade-off: none in cost (fusing two top-100 lists takes 0.03 to 0.04 ms). One weight is a compromise across collections.
+- Verdict: **kept**, opt-in. Convex is the default hybrid, at 0.5 for MiniLM-class embedders and 0.4 for bge-small-class ones; use 0.6 to 0.7 for a static model. Retune on a few hundred judged queries whenever the embedding model changes.
+- Run: `cargo test --test fusion`.
+
+
+### E321 wasmi-dev-stack (an interpreter program overflows the stack in a dev build)
+- Branch / parent: exp/321-wasmi-dev-stack / main at 17fa3a6 (E312)
+- Question: `cargo test --test exec` (dev profile) aborts in `interpreter_programs_reconstruct_exactly_and_price_their_fuel` with "has overflowed its stack", also with `RUST_MIN_STACK` at 16 MB. `cargo test --release` passes. Is it a recent merge, and what grows the stack?
+- Cause: wasmi 2.0's `auto-dispatch` picks its tail-call dispatch whenever wasmi is built at opt-level 2 or 3 (its `build.rs`); each instruction handler ends by calling the next one and relies on LLVM to turn that call into a jump. The dev profile builds dependencies at opt-level 2 (E069) but keeps debug assertions on, and with wasmi's debug assertions the calls stay calls: a debugger shows about 33,700 nested handler frames when the stack runs out, one per executed instruction, so any long enough program overflows any stack. Turning debug assertions off for every dependency passes; for `wasmi` alone passes; for `wasmi_ir` alone fails; debuginfo off fails. Which assertion blocks the jump is inferred, not traced: with debug assertions wasmi's `unreachable_unchecked!` becomes a formatted `unreachable!`, which takes the address of locals in each handler.
+- Not a recent merge: the same failure on af24e4d, before PRs 11 to 18. The opt-level override and wasmi's features date from E069. Test runs in this log use `--release`, which is why it did not show.
+- Change: `[profile.dev.package.wasmi] debug-assertions = false` in `packages/kernel/Cargo.toml`. Build setting only; release builds and the kernel's own debug assertions are unchanged.
+- Result: the test passes in a dev build. Full `cargo test` passes in dev and in release, 291 tests each.
+- Trade-off: dev builds lose wasmi's internal assertions, which release builds never had. A wasmi bug that only an assertion would catch now shows in neither.
+- Verdict: **kept** (fix).
+- Run: `cargo test --test exec` and `cargo test --release`.
+
+### E322 pilot-runs (a short bench before the full one: does its sign predict the full run's?)
+- Branch / parent: exp/322-pilot-runs / main at eecfe12 (E321)
+- Question: the second item of E283's queue. The loop could run a short pilot of the fixed bench before the full one, and stop a candidate the pilot says is worse. Does a pilot's sign predict the full run's verdict, what does it cost, and what does it buy a night of the loop (E287)?
+- Hypothesis: one corpus run alone predicts the sign of the score it belongs to well enough to stop most failing candidates early, without stopping ones the full runs keep. (Source: research preference models, arXiv 2608.13940, as read in E283: short pilot runs raised an agent's choice of what to run from 65-69% to 79-84% accuracy.)
+- Change: none in the kernel.
+  - `experiments/pilot-runs/drive.py`: 18 candidates, each one constant of a tunable the README names changed on its own: `STORE_LEVEL` 15 and 22, `MEASURE_LEVEL` 1 and 6, `STAR_CANDIDATES` 16 and 256, `GAP_DIFF` 256 and 4096, `DICT_SHORTLIST` 3, `MIN_MATCH` 48 and 192, the matcher's `MAX_CANDIDATES` 16, `GROUP_SIZE` 32 KiB, the group `SHORTLIST` 2, ingest `NEIGHBORS` 1, search `MAX_CHUNK` 4096, graph `MIN_CHUNK` 2048, the bench's `ARCHIVE_READS` 8. Each is built in release, run through the full command twice, then each corpus alone once as its pilot. The base gets two rounds (three full runs and two pilots per corpus each). One 4-core cloud machine with nothing else running.
+  - `experiments/pilot-runs/analyze.py`: each candidate's verdict by the keep rule against the pooled base runs; each pilot's change against the base pilots' median; signs (better, flat, worse); gates that stop a candidate when its pilot is worse than a threshold.
+  - `examples/net_night_plan.rs`: two plans with a pilot transition before the full bench (`4 in flight, pilot`, `2 cpus, 6, pilot`), fed with the numbers below. E287's plans, queue and numbers are unchanged.
+- Bench limit: four corpora (repo-history, repo-graph, structured, transcripts) are built from pinned commits that are not in the rewritten history, as for E265 and E266. "Full" here is the other seven cost corpora and the three north corpora, named on the command line. Base: cost 0.2433 (median of 5), north 0.3096.
+- Result (`python3 -I experiments/pilot-runs/analyze.py --exclude base/full2`):
+  - Noise: the base cost score over 5 runs is 0.2323 to 0.2499, up to 4.5% from its median (the README's spread is 2%). A sixth base run, 0.2743, overlapped a build of another example and is excluded. A cost corpus alone moves 9% (synthetic-history) to 25% (invoices) between runs of the same code. The north lines are deterministic.
+  - Full verdicts: 3 kept (`GAP_DIFF` 256 and 4096, `MIN_MATCH` 48: north -0.7% to -1.0%, cost within noise), 10 worse with the cost tolerance at this machine's 4.6% (12 at 2%), 5 hold. These are labels for scoring the pilots, not proposals: they were measured without the four history corpora, on a noisy machine. The three kept ones are candidates for experiments of their own.
+  - Signs: a cost corpus alone matches the cost score's sign on 11 to 15 of 18, no better than always guessing flat (12 of 18 at 2%, 14 at 4.6%). north/cases and north/multiformat match the north score's sign on 12 of 18 (always flat: 8); north/tables on 8.
+  - Gates (time saved against two full runs per candidate, 378 s, as the keep rule needs):
+
+  | Pilot | Time | Stop above | Stops | Worse caught (of 10) | Kept stopped (of 3) | Bench time saved |
+  |---|---|---|---|---|---|---|
+  | north/multiformat | 30 s | 0.5% | 9 | 7 | 1 | 42% |
+  | north/multiformat | 30 s | 1% | 8 | 7 | 0 | 36% |
+  | north/multiformat | 30 s | 2% | 7 | 6 | 0 | 31% |
+  | north/tables | 17 s | 0.5% | 6 | 3 | 2 | 29% |
+  | north/tables | 17 s | 1% | 2 | 2 | 0 | 6% |
+  | north/cases | 37 s | 0.5% | 2 | 2 | 0 | 1% |
+  | all three north corpora (the north score) | 85 s | 0.5% | 6 | 6 | 0 | 11% |
+  | md, at its own noise (17%) | 4.5 s | 17% | 4 | 1 | 0 | 21% |
+
+  - The north pilot misses the three candidates that are worse in cost only (`DICT_SHORTLIST` 3, `STAR_CANDIDATES` 256, `STORE_LEVEL` 22; north/multiformat 0.0%, 0.0%, -0.2%). Its one stop that was not worse was `MAX_CANDIDATES` 16 (hold). Three of md's four stops are holds: noise.
+  - Night plan (`cargo run --release --example net_night_plan`; the pilot at 30/378 of the bench, stopping 8 of 18, none wrongly): with the bench at 80% of each candidate, 4 in flight finishes 105 instead of 71 (44 of them answered at the pilot) and 2 cpus 150 instead of 141. With the bench at 20% or 50%, where the agent is the bottleneck, it gains nothing (100 instead of 104 at 50% with no decisions). With 25% needing the owner, 112 either way. Both pilot nights replay equal on an IKAM store.
+- Verdict: **kept as an option, off by default** (a measurement and two plans in an example; no kernel change). A pilot on one north corpus costs 8% of the two full runs and its result is deterministic, so it can stop north regressions early. A pilot on one cost corpus is noise on this machine and should stop nothing. Off by default because the sample is 18 candidates with 3 kept, so one wrong stop is a third of the keeps; the 1% threshold was chosen on the same 18 (0.5% stopped a keep); it never sees a regression in cost alone; and it pays only when the bench, not the agent, is the night's bottleneck, which E287 left unmeasured. For a bench-heavy night: north/multiformat, stop above 1%, and record each pilot beside its full run so the rule can be checked on real candidates.
+- Not measured: the four history corpora (they need the old history, for example on a clone that kept it); the cost noise of a quiet machine; pilots as a ranking signal rather than a gate (the paper's use); real candidates in place of tunables.
+- Run: `python3 -I experiments/pilot-runs/drive.py` (about 3.5 hours here), then `python3 -I experiments/pilot-runs/analyze.py`; `cargo run --release --example net_night_plan`.
+- Gates on the branch: `cargo test --release` passes (291 tests); clippy `-D warnings` (all targets) and fmt clean; the privacy scan is clean.
