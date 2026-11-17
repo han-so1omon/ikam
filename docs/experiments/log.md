@@ -5236,3 +5236,24 @@ Gates on the branch (E229 to E233): every kernel test suite passes (release); cl
 - Verdict: **kept, not an option** (same results, about 10x faster).
 - Not measured: an index of millions of rows; an Apple silicon run.
 - Run: `cargo run --release --example bm25_query -- DIR OUT` (DIR from `prepare.py`), and `cmp` two OUTs; `THREADS=4 cargo run --release --example hybrid_graph -- DIR`.
+
+### E339 lanes-avx2 (the lanes loops compiled for AVX2 where the processor has it)
+- Branch / parent: exp/339-lanes-avx2 / exp/338-bm25-query (E338)
+- Question: after E338, scoring candidates' paragraphs (`score_at`, 16-lane dot products of 256 f32s) is most of the full hybrid search. E327 measured the lanes loop 3x faster when built with `target-cpu=native`, which a portable build can't assume. Does choosing an AVX2 build of the same loop at run time give that speed, with the same results?
+- Hypothesis: yes for the loop; less end to end, since each paragraph's vector (1 KB) is read from memory. The results are the same bits: the AVX2 build runs the same 16 sums in the same order, and Rust never fuses a multiply and an add on its own (FMA is not enabled). (Source: E327.)
+- Change: `vectors::dot_lanes` and `code_dot_lanes` check for AVX2 (`is_x86_feature_detected!`, cached by the standard library) and then call the same loop compiled with `#[target_feature(enable = "avx2")]`; otherwise, and on other processors, the portable loop as before. Only where lanes are on (`with_lanes`, E327 and E332, still off by default). Test `dispatched_lanes_match_portable_bits`: every length from 0 to 299, ordinary, huge and tiny values, same bits for both loops.
+- Result (`hybrid_graph`, 11,384 READMEs, 376,619 paragraphs, 1,130 queries, 4 threads to build; ms a query; a 4-core cloud Xeon with AVX2; before is E338):
+
+  | Setting (80 / 100) | f32 before | f32 after | codes before | codes after |
+  |---|---|---|---|---|
+  | By position, end to end | 4.83 | 3.79 | 4.25 | 3.28 |
+  | Scoring candidates | 3.36 | 2.53 | 2.96 | 2.16 |
+  | Paragraph graph search | 0.75 | 0.64 | 0.66 | 0.55 |
+  | `-hits`, end to end | 1.43 | 1.08 | 1.21 | 1.20 |
+
+  - At 160 / 400 (f32, by position) 10.3 to 9.3 ms. Building the paragraph graph (f32, 4 threads) 103 to 83 s.
+  - Every recall and nDCG line of both runs, f32 and codes, is the same before and after.
+- Trade-off: none (same bits); a little unsafe code (two calls after the feature check).
+- Verdict: **kept, not an option**. The loop's gain end to end is about 20 to 25%, not E327's 3x, likely because scoring a paragraph waits on reading its vector (inferred, not profiled).
+- Not measured: Apple silicon, where NEON is always present and the portable lanes loop should already be vectorized, so E339 changes nothing there; AVX-512.
+- Run: `THREADS=4 cargo run --release --example hybrid_graph -- DIR` (and `CODES=1`), before and after.
