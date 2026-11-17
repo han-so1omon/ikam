@@ -4890,3 +4890,22 @@ Gates on the branch (E229 to E233): every kernel test suite passes (release); cl
 - Trade-off: none for callers who do not use it. Two modules and two tests added.
 - Verdict: **kept** (port, opt-in). The view and the cache work on main's line as they did on their own branch; the per-query floor is the next thing to fix.
 - Run: `cargo test --release --test vectors --test embeds`; `cargo run --release --example vector_ivf -- 20000 256`.
+
+### E324 bm25 (ranked keyword search in the kernel)
+- Branch / parent: exp/324-bm25 / exp/323-vector-views (E323)
+- Question: ikam's hybrid ranking (`fusion`, E312) fuses a keyword list with a vector list, but the kernel has no ranked keyword list: E258 and E259 used Tantivy behind a feature, and `search` answers which contents hold a pattern, not how well. Can a small BM25 over database rows, with no dependency, rank as well as Tantivy did on E258's task, and what does it cost?
+- Hypothesis: Okapi BM25 with Lucene's idf and Anserini's defaults (k1 0.9, b 0.4) over lowercased alphanumeric terms, without stemming, comes within a standard error of E258's Tantivy (stemmed) on known items and topics, and a query over about 10,000 documents takes a few milliseconds. (Source: Robertson and Zaragoza, 2009; Anserini's BM25 defaults; E258's numbers.)
+- Change (opt-in): `src/bm25.rs`: `terms`, `Repo::bm25_build(&db, prefix)` (one content: row keys and lengths, then each term's postings as varint row deltas and frequencies), `bm25_load`, `Bm25::search(query, k)` (ties by key). `tests/bm25.rs`: scores equal the formula computed row by row over 300 random rows (rows outside the prefix ignored, case folded, the stored index read back), and a small ranking case. Nothing in the kernel calls it.
+- Result (E326's data: 11,384 OSI-licensed PyPI READMEs, 61 MB of text, sampled from PyPI's JSON API with E256's `fetch.py` and `prepare.py`; E258's two tasks; a 4-core cloud Xeon; `cargo run --release --example hybrid_kernel -- DIR` on exp/326-hybrid-kernel):
+
+  | | Known item, dev / test (495 / 505 queries) | Topic, dev / test (58 / 72) |
+  |---|---|---|
+  | Kernel BM25, unstemmed | 0.796 / 0.802 (± 0.016) | 0.128 / 0.106 (± 0.017) |
+  | E258: Tantivy, stemmed (13,055 READMEs, another sample) | 0.804 (all 1,000) | 0.124 (all 142) |
+
+  - nDCG@10 with standard errors. The two samples differ, so the rows are comparable in size, not query for query.
+  - Build 3.9 s for 11,384 rows; index 8.7 MB (5.2 MB as stored); load 106 to 146 ms; a query 2.2 ms (mean of 1,130 queries, top 100).
+- Trade-off: the index is built whole, so any database update needs a rebuild (3.9 s here); E329 keeps one up by edits. No stemming or stop words: the stemmed engine scored the same here, but other text may want stemming. A loaded index lives in memory (about its stored size).
+- Verdict: **kept**, opt-in. BM25 in the kernel ranks as well as the Tantivy configuration that E258 and E259 measured, with no dependency, so hybrid ranking can run without the `search-tantivy` feature.
+- Not measured: stemming; BM25 over fragments rather than whole rows; collections over 100,000 rows.
+- Run: `cargo test --release --test bm25`; `cargo run --release --example hybrid_kernel -- DIR` (exp/326-hybrid-kernel; DIR from `prepare.py`, not committed).
