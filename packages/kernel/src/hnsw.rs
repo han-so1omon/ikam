@@ -503,6 +503,22 @@ impl HnswIndex {
         self.pos.get(key).map(|&i| self.sim(q, i))
     }
 
+    /// `key`'s node, for `score_at` (E337): it stays `key`'s until `key`
+    /// is inserted again or removed. None if absent or removed.
+    pub fn position(&self, key: &str) -> Option<u32> {
+        self.pos.get(key).copied()
+    }
+
+    /// `score` by `position`, without looking the key up: for scoring the
+    /// same rows for many queries. None if the node is out of range or
+    /// removed.
+    pub fn score_at(&self, q: &[f32], node: u32) -> Option<f32> {
+        match self.removed.get(node as usize) {
+            Some(false) => Some(self.sim(q, node)),
+            _ => None,
+        }
+    }
+
     /// Leave `key` out of results; it stays a waypoint. False if absent.
     pub fn remove(&mut self, key: &str) -> bool {
         match self.pos.remove(key) {

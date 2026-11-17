@@ -5199,3 +5199,29 @@ Gates on the branch (E229 to E233): every kernel test suite passes (release); cl
 - Verdict: **kept, not an option**: writes are 30 to 45% faster for half a megabyte a writing thread. If that memory matters on some host, it is one line to make it an option.
 - Not measured: repack at level 19 with a kept context (bigger, and runs rarely); dictionary frames; an Apple silicon run.
 - Run: `cargo run --release --example db_append_cost -- 10 2000`; `cargo run --release --example db_write_path -- DIR` (DIR must not exist); `CACHE=0 cargo run --release --example point_reads -- 100000`.
+
+### E337 hybrid-phases (where the full hybrid search's time goes; scoring by graph position)
+- Branch / parent: exp/337-hybrid-phases / exp/336-write-ctx (E336)
+- Question: E333's full search (BM25 plus each candidate's best paragraph and whole README from two graphs) took 8.7 ms a query with a second copy of the vectors, and 13 to 14 ms when the graphs score their own rows by key (E334). Where does the time go, and can scoring by the graph's own row position remove the key lookups without changing the ranking?
+- Hypothesis: most of the time is scoring every paragraph of every candidate (thousands a query), each through a string-keyed map; scoring by a position found once removes that, with the same scores. (Source: E334's "not measured".)
+- Change:
+  - `HnswIndex::position(key)` and `score_at(q, node)`: the node a key lives at, and its score by node. A position goes stale (None) once its key is inserted again or removed. Test `score_at_a_position_matches_score_by_key` (vectors and codes).
+  - `examples/hybrid_graph.rs`: the time of each step (BM25, the README graph, the paragraph graph, scoring the candidates, fusing), and two more scorers beside E334's by key: by position (`-at`), and by position with each document's best paragraph taken only from the paragraphs the graph returned (`-hits`; a document with none gets the lowest of them), which scores no paragraph twice.
+- Result (11,384 READMEs, 376,619 paragraphs, 1,130 queries; ms a query; a 4-core cloud Xeon; runs vary by about 1 ms):
+
+  | Setting (README ef, paragraphs returned) | By key | By position | Top 10 vs exact | `-hits` | Top 10 vs exact |
+  |---|---|---|---|---|---|
+  | f32 vectors, 80 / 100 | 12.8 | 7.2 | 0.975 | | |
+  | f32 vectors, 80 / 200 | 19.1 | 9.8 | 0.985 | | |
+  | f32 vectors, 160 / 400 | 28.9 | 14.6 | 0.995 | | |
+  | codes, 80 / 100 | 11.8 to 12.1 | 5.9 to 6.9 | 0.952 | 3.5 | 0.869 |
+  | codes, 80 / 200 | 15.1 to 17.0 | 7.8 to 8.7 | 0.959 | 4.1 | 0.924 |
+  | codes, 160 / 400 | 24.1 to 26.4 | 11.8 to 12.5 | 0.967 | 5.2 | 0.949 |
+
+  - At 80 / 100 with f32 vectors: BM25 2.1 ms, README graph 0.6, paragraph graph 0.8, fusing 0.08, and scoring the 186 candidates' 10,421 paragraphs 9.2 ms by key against 3.6 ms by position (0.9 against 0.35 µs a paragraph). With codes, 8.3 against 2.7 ms.
+  - By position ranks exactly as by key (every nDCG the same to four places).
+  - `-hits` (codes, convex 0.6, nDCG@10): known items 0.822 / 0.831 at 80 / 100 against 0.823 / 0.836, and 0.823 / 0.832 at 160 / 400 against 0.825 / 0.836; topics within 0.005 either way; each within one standard error (0.015 known, 0.019 topics), but lower on both known-item splits.
+- Trade-off: `position` and `score_at` have none. `-hits` trades a little of the known-item ranking (0.001 to 0.005, inside the noise) and 0.02 to 0.08 of agreement with the exact top 10 for half the time; it is a way of querying, shown in the example, not a kernel option.
+- Verdict: **kept** (`position`, `score_at`; no option needed). The full search with compact graphs answers in about 6 ms at E333's setting with the same ranking, and in 3.5 ms with `-hits` if a little ranking can go. BM25 (about 2 ms) is now the largest step.
+- Not measured: BM25's own query cost; `-hits` with f32 vectors; an Apple silicon run.
+- Run: `THREADS=4 cargo run --release --example hybrid_graph -- DIR` (and `CODES=1`).
