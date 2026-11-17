@@ -23,6 +23,18 @@ const US: char = '\u{1f}';
 /// Candidates scored by code, and the code packs read so far.
 type Scored = (Vec<(f32, String)>, BTreeMap<Id, Vec<u8>>);
 
+/// An IVF loaded once (E325): centroids, each list's rows and their codes
+/// in memory, so a query reads only the rows it rescores. With `vectors`
+/// (`ivf_load_with(.., true)`) the rows' exact vectors are kept too and a
+/// query reads nothing.
+pub struct IvfIndex {
+    dim: usize,
+    cents: Vec<f32>,
+    /// Per list: row keys, and their codes back to back.
+    lists: Vec<(Vec<String>, Vec<u8>)>,
+    vectors: Option<BTreeMap<String, Vec<f32>>>,
+}
+
 /// An IVF view: `centroids` is a content of `nlist * dim` f32s.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Ivf {
@@ -235,5 +247,106 @@ impl<S: Store> Repo<S> {
         exact.sort_by(|a, b| b.1.total_cmp(&a.1));
         exact.truncate(k);
         Ok(exact)
+    }
+}
+
+impl IvfIndex {
+    fn probe(&self, q: &[f32], nprobe: usize, rescore: usize) -> Vec<String> {
+        let dim = self.dim;
+        let mut order: Vec<usize> = (0..self.lists.len()).collect();
+        order.sort_by(|&a, &b| {
+            dot(&self.cents[b * dim..][..dim], q).total_cmp(&dot(&self.cents[a * dim..][..dim], q))
+        });
+        let mut scored: Vec<(f32, &String)> = Vec::new();
+        for &c in order.iter().take(nprobe) {
+            let (rows, codes) = &self.lists[c];
+            for (row, code) in rows.iter().zip(codes.chunks_exact(dim)) {
+                scored.push((code_dot(q, code), row));
+            }
+        }
+        scored.sort_by(|a, b| b.0.total_cmp(&a.0));
+        scored
+            .into_iter()
+            .take(rescore)
+            .map(|s| s.1.clone())
+            .collect()
+    }
+
+    /// The rows `ivf_search` would return, from the loaded lists; exact
+    /// vectors come from memory if kept, else from `db`.
+    pub fn search<S: Store>(
+        &self,
+        repo: &Repo<S>,
+        db: &Db,
+        q: &[f32],
+        k: usize,
+        nprobe: usize,
+        rescore: usize,
+    ) -> Result<Vec<(String, f32)>, Error> {
+        let keep = self.probe(q, nprobe, rescore.max(k));
+        let mut exact: Vec<(String, f32)> = match &self.vectors {
+            Some(v) => keep
+                .into_iter()
+                .map(|r| {
+                    let s = dot(q, &v[&r]);
+                    (r, s)
+                })
+                .collect(),
+            None => {
+                let keep: BTreeSet<String> = keep.into_iter().collect();
+                repo.graph_nodes_in(&db.kv, &keep)?
+                    .iter()
+                    .map(|n| Ok((n.label.clone(), dot(q, &to_f32s(&repo.node_value(n)?)))))
+                    .collect::<Result<_, Error>>()?
+            }
+        };
+        exact.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+        exact.truncate(k);
+        Ok(exact)
+    }
+}
+
+impl<S: Store> Repo<S> {
+    /// Load `ivf` for repeated queries; with `vectors`, also every row's
+    /// exact vector from `db` (dim x 4 bytes a row in memory).
+    pub fn ivf_load_with(&self, ivf: &Ivf, db: &Db, vectors: bool) -> Result<IvfIndex, Error> {
+        let cents = to_f32s(&self.read_content(&ivf.centroids)?);
+        let mut lists = vec![(Vec::new(), Vec::new()); ivf.nlist];
+        let mut packs: BTreeMap<Id, Vec<u8>> = BTreeMap::new();
+        for n in self.graph_nodes(&ivf.lists)? {
+            let Target::Content(Arg::Range { id, start, len }) = n.target else {
+                return Err(Error::Decode("ivf code"));
+            };
+            if let std::collections::btree_map::Entry::Vacant(e) = packs.entry(id) {
+                e.insert(self.read_content(&id)?);
+            }
+            let (c, row) = n.label.split_once(US).ok_or(Error::Decode("ivf label"))?;
+            let c: usize = c.parse().map_err(|_| Error::Decode("ivf list"))?;
+            let list = lists.get_mut(c).ok_or(Error::Decode("ivf list"))?;
+            list.0.push(row.to_string());
+            list.1
+                .extend_from_slice(&packs[&id][start as usize..(start + len) as usize]);
+        }
+        let vectors = if vectors {
+            let rows: BTreeSet<String> = lists.iter().flat_map(|l| l.0.iter().cloned()).collect();
+            Some(
+                self.graph_nodes_in(&db.kv, &rows)?
+                    .iter()
+                    .map(|n| Ok((n.label.clone(), to_f32s(&self.node_value(n)?))))
+                    .collect::<Result<_, Error>>()?,
+            )
+        } else {
+            None
+        };
+        Ok(IvfIndex {
+            dim: ivf.dim,
+            cents,
+            lists,
+            vectors,
+        })
+    }
+
+    pub fn ivf_load(&self, ivf: &Ivf, db: &Db) -> Result<IvfIndex, Error> {
+        self.ivf_load_with(ivf, db, false)
     }
 }

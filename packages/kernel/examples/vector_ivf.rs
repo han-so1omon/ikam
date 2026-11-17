@@ -119,6 +119,28 @@ fn main() {
             hit as f64 / (10 * queries.len()) as f64
         );
     }
+    // E325: the same queries on the loaded index, rows read from the
+    // database or kept in memory.
+    for keep in [false, true] {
+        let t = Instant::now();
+        let loaded = repo.ivf_load_with(&ivf2, &next, keep).unwrap();
+        let load_ms = t.elapsed().as_secs_f64() * 1e3;
+        for (nprobe, rescore) in [(1, 100), (4, 10), (4, 30), (4, 100), (16, 100), (64, 100)] {
+            if nprobe > nlist {
+                break;
+            }
+            let (mut hit, t) = (0, Instant::now());
+            for (q, want) in queries.iter().zip(&truth) {
+                let got = loaded.search(&repo, &next, q, 10, nprobe, rescore).unwrap();
+                hit += got.iter().filter(|g| want.contains(&g.0)).count();
+            }
+            let ms = t.elapsed().as_secs_f64() * 1e3 / queries.len() as f64;
+            println!(
+                "{{\"loaded\":true,\"vectors_kept\":{keep},\"load_ms\":{load_ms:.0},\"nprobe\":{nprobe},\"rescore\":{rescore},\"recall10\":{:.3},\"query_ms\":{ms:.3}}}",
+                hit as f64 / (10 * queries.len()) as f64
+            );
+        }
+    }
     // Where a query's time goes: the rescore reads rows from the database.
     for rescore in [10, 30, 100, 300] {
         let (mut hit, t) = (0, Instant::now());
