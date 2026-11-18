@@ -7,7 +7,7 @@ when authorized. Else graphs are completely separate."
 
 This note is the generic design for the kernel and its server. Which
 services are projects, and where they run, are deployment choices kept
-outside this repository. Shares (E315 to E318) and the host (E313, E314) are built and opt-in; E342 to E345 are not.
+outside this repository. Shares (E315 to E318) and the host (E313, E314) are built and opt-in; E348 to E351 are not.
 
 ## Where it starts
 
@@ -120,10 +120,10 @@ when each starts.
 | E316 | Does a scoped merge copy exactly and merge again cleanly? | byte-exact copy with provenance, incremental re-merge, conflicts reported, proposal branches |
 | E317 | Do revoke and expiry take effect at once? | reads, proposals and merges refused from the next request; merged copies read back and pass fsck |
 | E318 | Can search through a share leak? | no hit outside the scope, with near-identical text just outside it |
-| E342 | Does one project slow or break another? | import, repack and damage in A; B's p99 and uptime, with and without the job queue |
-| E343 | Are limits enforced per project? | 413, 507 and 429 at the set sizes and rates, other projects unaffected |
-| E344 | What does firing over HTTP cost? | net firing remote vs in-process (E293), with leases and beats (E303, E304) |
-| E345 | Can a project be backed up while it serves? | snapshot time, byte-exact restore, write latency during it |
+| E348 | Does one project slow or break another? | import, repack and damage in A; B's p99 and uptime, with and without the job queue |
+| E349 | Are limits enforced per project? | 413, 507 and 429 at the set sizes and rates, other projects unaffected |
+| E350 | What does firing over HTTP cost? | net firing remote vs in-process (E293), with leases and beats (E303, E304) |
+| E351 | Can a project be backed up while it serves? | snapshot time, byte-exact restore, write latency during it |
 
 Gates as for every experiment: byte-exact reads, search equal to a scan,
 clean fsck, in every project.
