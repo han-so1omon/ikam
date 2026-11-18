@@ -5322,3 +5322,57 @@ Gates on the branch (E229 to E233): every kernel test suite passes (release); cl
 - Verdict: **kept** (`score_many`; no option needed). The best full hybrid search measured (best paragraph plus whole README fused with BM25, E330) now answers in about 1.6 ms with codes and 2.7 ms with f32 vectors, against 68 ms with exact scans (E333).
 - Not measured: other distances ahead (only 4 and 8); Apple silicon, where there is no prefetch here yet (Rust's is unstable on aarch64), so only the one-pass gain applies.
 - Run: `MANY=1 THREADS=4 cargo run --release --example hybrid_graph -- DIR` (and `CODES=1`, `HOT=1`); for "no read-ahead" and "4 ahead" the distance in `score_many` changed by hand.
+
+### E315 share-scope-escape (scoped shares between separate projects)
+- Branch / parent: exp/315-scoped-shares / exp/313-tenant-host (the plan in `docs/plans/2026-11-15-tenant-host.md`)
+- Question: can one project give another read access to a scope of its data (a folder, a byte range of one file version, listed fragments, a key range of its database, or a label prefix of one graph) without the other ever reading a byte outside it?
+- Change: `src/share.rs` (new, nothing else calls it). A `Share` names its source and receiving projects, the source commit it is pinned to, a `Scope`, a `Right` (read, propose or merge) and an expiry. It is sealed with the source's key (keyed blake3, as E140's grants) and logged in the source's own `shares` database ref. `share_check` refuses a bad seal, another receiver, an expired share, one not in the log or replaced since, and a missing right. `share_files`, `share_read`, `share_fragment`, `share_records` and `share_nodes` return only what the scope covers, at the pinned commit. The caller checks before it reads; a host would call `share_check` on every request.
+- Result: `tests/share.rs`, all pass. Refused: a sibling folder with the same prefix (`pubx/` against `pub/`), `..` in a path, the folder itself, a missing file; a range one byte past either end of a section, an empty range, a whole-file read of a section, and a section grant for another version of the file; a fragment not listed; keys and records outside the range; graph nodes outside the prefix; a forged scope under a valid tag. A share pinned to a commit still reads that commit after the source moves on.
+- Not measured: time per check and read (E313 with the host); encoded paths over HTTP (E314).
+- Verdict: **kept**, opt-in. Nothing in the kernel or binary uses it yet.
+- Run: `cargo test --test share`.
+
+### E316 share-scoped-merge (merging a scope into another project's store)
+- Branch / parent: exp/315-scoped-shares / exp/313-tenant-host
+- Question: can a project merge a shared scope into its own store, so the copy is its own, and merge again later three-way against the last merge?
+- Change: `import_share` in `src/share.rs`. With the merge right, it copies the scope's bytes into the receiver's store on the ref `import/<from>/<share>` (one commit per merge, its message naming the source commit) and calls `Repo::merge` (E265) into the receiver's branch. Folder scopes replace the folder's files with the source's; database key ranges append the difference against the last merge (removes, then upserts). A proposal (`share_propose`, propose right) goes the other way: a branch `proposals/<share>` in the source, from the pinned commit; a section proposal may change bytes only inside its ranges (E140's `check_edit`).
+- Result: the copy is byte-exact and leaves the receiver's own files alone; a second merge brings the source's edits, adds and removes; both sides changing one imported file is a conflict and the branch stays put; key ranges merge incrementally (a removed key goes, a new one comes); fsck is clean on the receiver. Section, fragment and graph scopes refuse to merge (`NotMergeable`): a byte range is not a file, and graph nodes point at objects in the source's store.
+- Not measured: large scopes; who approves a merge (left to the caller; the plan has the owner approve each one).
+- Verdict: **kept**, opt-in, for folder and key-range scopes.
+- Run: `cargo test --test share`.
+
+### E317 share-revoke-expire
+- Branch / parent: exp/315-scoped-shares / exp/313-tenant-host
+- Question: does revoking, replacing or expiring a share stop it at once, and what happens to data already merged?
+- Result: revoking removes the share from the source's log, and the next check refuses it, with its seal still valid. Issuing another share under the same name retires the old one. A share fails its check from its expiry time on. Data merged before a revoke stays in the receiver's store, since it is a copy there.
+- Verdict: **kept**, as part of E315.
+- Run: `cargo test --test share`.
+
+### E318 share-scoped-search
+- Branch / parent: exp/315-scoped-shares / exp/313-tenant-host
+- Question: does a search through a share find only text inside the scope, when near-identical text sits just outside it?
+- Change: `share_search` searches only the scope's bytes: the folder's files, the granted ranges of a section, or the records in range.
+- Result: a word found in the shared folder is not found in a sibling folder or a private folder holding the same word; a word just outside a section's range is not found; keys outside a record range are not searched.
+- Not measured: vector and hybrid search through a share (the vector index covers the whole store; a scoped index is left for later).
+- Verdict: **kept**, as part of E315, for keyword search.
+- Run: `cargo test --test share`.
+
+### E313 project-host (several separate projects in one process)
+- Branch / parent: exp/313-project-host / exp/315-scoped-shares
+- Question: can one `ikam` process serve several projects, each its own store with its own users and limits, at little cost per request?
+- Change: `ikam host --config FILE [PORT]` (`src/bin/ikam/host.rs`). The config declares projects (`project NAME STORE_DIR [REF]`), the host names each answers to (`host NAME HOSTNAME`, plus `NAME.localhost`), users with a role (`user NAME read|write|owner LINE`, lines from `ikam passwd`) and per-project `max-store` and `max-body`. Each project is opened as `ikam live` opens one and served by the same page and WebDAV handlers. Routing is by Host name only: `live`'s pages and WebDAV answers use absolute links, so a path prefix would break them. Roles: read (GET, HEAD, PROPFIND), write (also edits and commits), owner (also repack, gc, fsck and shares). Share routes put E315 to E318 behind HTTP: the source owner issues, lists, revokes and accepts proposals at `/shares/...`; the receiving project reads, searches, proposes and merges at `/from/SOURCE/SHARE/...`, merging only as the receiver's owner; every refusal of a share answers 404. Each project's share key is made on first use in `STORE/share.key` (mode 0600). `--public` and a `public` line are refused. `Share::decode` and `Repo::share_named` (kernel) read a logged share back.
+- Result (in process, release build, a 13-byte cached file read through WebDAV, 20,000 requests, three rounds): 2.45 to 3.85 us called directly, 3.74 to 4.95 us through the host, so routing, the role check and three password checks add about 1.1 to 1.4 us a request; one password check is 0.21 to 0.30 us. A run over real HTTP on 127.0.0.1 with curl: two projects, writes, a share, a scoped read, a refused read outside the scope, a merge and a clean stop on SIGTERM all behave as in the tests.
+- Result on a laptop (Apple M3 Pro, 18 GB, macOS, external SSD over USB 2, commit 9f4d37e, the demo script): share tests 13 passed; host tests 6 passed, 1 ignored; in process 2.18 to 2.62 us direct and 3.37 to 3.41 us through the host, about 1.2 us added a request, one password check 0.23 to 0.24 us; 22 of 22 checks over HTTP on 127.0.0.1; 300 reads p50 0.35 ms, p99 0.48 ms (Linux cloud: p50 0.41 ms, p99 0.65 ms); clean stop on SIGTERM, fsck ok, run folder removed; 81 s in all.
+- Not measured: memory per project, start time with 5 and 50 projects, latency over the network, the one heavy-job queue across projects (not built: repack, gc and fsck of one project hold only that project's lock).
+- Verdict: **kept**, as a new command; `ikam live` and `ikam db serve` are unchanged.
+- Run: `cargo test --release --bin ikam host::tests::overhead -- --ignored --nocapture`; on a real machine, `ROOT=/path/to/new-folder bash packages/kernel/scripts/e313-host-demo.sh` (build, tests, 22 checks over HTTP on 127.0.0.1, timing; removes ROOT at the end; 22 of 22 on Linux and on macOS).
+
+### E314 project-separation (no path between projects without a share)
+- Branch / parent: exp/313-project-host / exp/315-scoped-shares
+- Question: through the host, can a user of one project read, list, search or write another project's data without a share?
+- Result: `cargo test --bin ikam host::`, all pass. A project's user gets 401 on every other project, the same answer as no password or a wrong one; an unknown host name and no Host header get 404 with the same body; listings and search in one project show nothing of another. A read user cannot write, a writer cannot run maintenance or manage shares, and a project's body limit holds for it alone. Through a share: reads inside the scope succeed, while a private folder, a sibling folder, the folder itself, `..` and percent-encoded `..` paths, another project's request, the source's own users, a missing, revoked or expired share, and merging or proposing through a read-only share all answer 404; only the receiver's owner merges, only the source's owner accepts a proposal, and a merge leaves out what the scope does not cover. A project whose lock was poisoned by a panic answers 500 while the others keep reading and writing. The config refuses two projects on one store, a host name used twice (configured or `NAME.localhost`), a project without an owner, and public projects.
+- Fix found here: a share path with an empty, `.` or `..` segment raised a store error (a 500 through the host) instead of `Outside`; `Share::covers_path` now refuses it.
+- Fixes from review (PR 41): a project's `max-body` now applies before its body is read (the server asks the limit of the project the Host header names; before, the listener used the largest limit of all projects, or none when one project had none); a merge into a project with `max-store` is refused with 507 when the scope's bytes would not fit; a project's data ref may not be `shares`, `import/...` or `proposals/...`, which shares write. Tests: `a_body_limit_per_host_applies_before_the_body_is_read`, `a_merge_keeps_to_the_receivers_store_limit`, three more config refusals; the demo script still passes 22 of 22.
+- Not measured: a request rate limit per project (not built); spoofed `X-Forwarded-*` headers (the host reads none).
+- Verdict: **kept**, as part of E313.
+- Run: `cargo test --bin ikam host::`.

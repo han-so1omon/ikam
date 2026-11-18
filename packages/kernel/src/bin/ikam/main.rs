@@ -5,6 +5,7 @@ mod auth;
 mod corpus;
 mod dav;
 mod dbserve;
+mod host;
 mod http;
 mod json;
 mod live;
@@ -30,6 +31,9 @@ const USAGE: &str = "usage: ikam [--store DIR] [--short-records] [--slow-codec-m
   db serve [--packs] [--plain-events] [--no-object-templates] [--concurrent-reads] [--edit-index] [--keep-counts N] [PORT]
                                    the store's databases over HTTP, for programs
                                    (default port 8740, 127.0.0.1 only; dbserve.rs)
+  host --config FILE [PORT]        several separate projects in one process, each
+                                   its own store, users and limits, chosen by Host
+                                   name; crossing only through scoped shares (host.rs)
   serve [PORT]                     browse, read and search in a local web page
                                    (default port 8737, 127.0.0.1 only)
   REV, ID and PATH arguments take a ref, a hex id or unique prefix, or REV:PATH.
@@ -106,6 +110,15 @@ fn main() -> ExitCode {
     let store_dir = take_flag(&mut args, "--store").unwrap_or_else(|| ".ikam".into());
     if args.first().map(String::as_str) == Some("passwd") {
         return match passwd(args.get(1).map(String::as_str)) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(msg) => {
+                eprintln!("{msg}");
+                ExitCode::FAILURE
+            }
+        };
+    }
+    if args.first().map(String::as_str) == Some("host") {
+        return match host::host_cmd(&args[1..]) {
             Ok(()) => ExitCode::SUCCESS,
             Err(msg) => {
                 eprintln!("{msg}");
@@ -673,6 +686,7 @@ fn live_cmd(
         max_body: max_body
             .or(public.then_some(PUBLIC_MAX_BODY))
             .map(|n| n as usize),
+        body_limit: None,
         max_conns: max_conns.or(public.then_some(PUBLIC_MAX_CONNS)),
         idle: if public {
             Duration::from_secs(30)
