@@ -15,10 +15,16 @@ use std::time::Duration;
 const MAX_LINE: usize = 16 << 10;
 const MAX_HEADERS: usize = 100;
 
-#[derive(Clone, Copy, Debug)]
+/// The body limit for a request, from its Host header ("" when it has
+/// none); none for no limit.
+pub type BodyLimit = dyn Fn(&str) -> Option<usize> + Send + Sync;
+
+#[derive(Clone, Copy)]
 pub struct Limits {
     /// Largest request body read, in bytes; none for no limit.
     pub max_body: Option<usize>,
+    /// When set, the limit for each request, in place of `max_body`.
+    pub body_limit: Option<&'static BodyLimit>,
     /// Connections served at once; more get 503 and are closed.
     pub max_conns: Option<usize>,
     /// How long a connection may sit idle between requests.
@@ -29,6 +35,7 @@ impl Default for Limits {
     fn default() -> Limits {
         Limits {
             max_body: None,
+            body_limit: None,
             max_conns: None,
             idle: Duration::from_secs(120),
         }
@@ -316,19 +323,23 @@ fn connection(
                 },
             }
         };
-        let too_large = |n: usize| limits.max_body.is_some_and(|max| n > max);
+        let max_body = match limits.body_limit {
+            Some(f) => f(get("host").as_deref().unwrap_or("")),
+            None => limits.max_body,
+        };
+        let too_large = |n: usize| max_body.is_some_and(|max| n > max);
         if length.is_some_and(too_large) {
             // Refused before reading it (or sending 100 Continue).
-            return refuse(&mut out, &slot, 413, &too_large_msg(limits));
+            return refuse(&mut out, &slot, 413, &too_large_msg(max_body));
         }
         if get("expect").is_some_and(|e| e.eq_ignore_ascii_case("100-continue")) {
             out.write_all(b"HTTP/1.1 100 Continue\r\n\r\n")?;
         }
         let body = match length {
-            None => match chunked(&mut input, limits.max_body) {
+            None => match chunked(&mut input, max_body) {
                 Ok(b) => b,
                 Err(e) if is(&e, TOO_LARGE) => {
-                    return refuse(&mut out, &slot, 413, &too_large_msg(limits));
+                    return refuse(&mut out, &slot, 413, &too_large_msg(max_body));
                 }
                 Err(e) => return Err(e),
             },
@@ -381,11 +392,8 @@ fn connection(
     }
 }
 
-fn too_large_msg(limits: Limits) -> String {
-    format!(
-        "uploads are limited to {} bytes here",
-        limits.max_body.unwrap_or(0)
-    )
+fn too_large_msg(max_body: Option<usize>) -> String {
+    format!("uploads are limited to {} bytes here", max_body.unwrap_or(0))
 }
 
 fn chunked(input: &mut BufReader<TcpStream>, max: Option<usize>) -> std::io::Result<Vec<u8>> {
@@ -513,11 +521,43 @@ mod tests {
     }
 
     #[test]
+    fn a_body_limit_per_host_applies_before_the_body_is_read() {
+        let limit: &'static BodyLimit = Box::leak(Box::new(|h: &str| match h {
+            "small" => Some(4),
+            "open" => None,
+            _ => Some(0),
+        }));
+        let port = start(Limits {
+            max_body: Some(1),
+            body_limit: Some(limit),
+            ..Limits::default()
+        });
+        let put = |host: &str, body: &str| {
+            let raw = format!(
+                "PUT /a HTTP/1.1\r\nHost: {host}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            send(port, raw.as_bytes())
+        };
+        assert!(put("small", "abcd").ends_with("got 4"));
+        assert!(put("small", "abcde").starts_with("HTTP/1.1 413"));
+        // The per-host limit replaces max_body, in both directions.
+        assert!(put("open", "abcdefgh").ends_with("got 8"));
+        assert!(put("other", "a").starts_with("HTTP/1.1 413"));
+        let r = send(
+            port,
+            b"PUT /a HTTP/1.1\r\nHost: small\r\nContent-Length: 999999999\r\nExpect: 100-continue\r\n\r\n",
+        );
+        assert!(r.starts_with("HTTP/1.1 413") && !r.contains("100 Continue"), "{r}");
+    }
+
+    #[test]
     fn limits_refuse_large_bodies_long_headers_and_extra_connections() {
         let port = start(Limits {
             max_body: Some(100),
             max_conns: Some(2),
             idle: Duration::from_secs(2),
+            ..Limits::default()
         });
         let ok = send(
             port,

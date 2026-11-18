@@ -36,7 +36,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
 
-use ikam_kernel::share::{Refused, Right, Scope, Share, import_share};
+use ikam_kernel::share::{Refused, Right, SHARES_REF, Scope, Share, import_share};
 use ikam_kernel::{Id, Kind, merge::Merged};
 
 use crate::auth::{self, Auth};
@@ -102,10 +102,16 @@ impl Config {
                     if projects.iter().any(|p| p.name == *name) {
                         return Err(bad(&format!("project {name} declared twice")));
                     }
+                    let refname = rest.first().unwrap_or(&"main").to_string();
+                    if reserved_ref(&refname) {
+                        return Err(bad(&format!(
+                            "ref {refname} is kept for shares, imports and proposals"
+                        )));
+                    }
                     projects.push(ProjectConfig {
                         name: name.to_string(),
                         store: PathBuf::from(store),
-                        refname: rest.first().unwrap_or(&"main").to_string(),
+                        refname,
                         hosts: Vec::new(),
                         users: Vec::new(),
                         max_store: None,
@@ -163,6 +169,35 @@ impl Config {
         }
         Ok(Config { port, projects })
     }
+}
+
+/// Refs that shares write in each project's store: the share log, imports
+/// (`import/SOURCE/SHARE`) and proposals (`proposals/SHARE`). A project's own
+/// data ref may not be one of them, or a share would move it.
+fn reserved_ref(name: &str) -> bool {
+    name == SHARES_REF || name.starts_with("import/") || name.starts_with("proposals/")
+}
+
+/// Bytes a merge of `share` may add to the receiver at most: every file the
+/// scope covers, or every record, before dedup.
+fn share_bytes<S: ikam_kernel::Store>(
+    repo: &mut ikam_kernel::Repo<S>,
+    share: &Share,
+) -> Result<usize, Refused> {
+    Ok(match &share.scope {
+        Scope::Records { .. } => repo
+            .share_records(share, "", None)?
+            .iter()
+            .map(|(k, v)| k.len() + v.len())
+            .sum(),
+        _ => {
+            let mut n = 0;
+            for (_, id) in repo.share_files(share)? {
+                n += repo.read_content(&id)?.len();
+            }
+            n
+        }
+    })
 }
 
 pub struct Project {
@@ -543,6 +578,19 @@ impl Host {
             return Response::text(500, e);
         }
         let into = req.param("into").unwrap_or_else(|| pl.refname.clone());
+        if reserved_ref(&into) {
+            return Response::text(400, "that ref is kept for shares");
+        }
+        if matches!(share.scope, Scope::Path(_) | Scope::Records { .. }) {
+            match share_bytes(&mut sl.repo, &share) {
+                Ok(n) if !pl.has_room(n) => {
+                    return Response::text(507, "this project's store is full");
+                }
+                Ok(_) => {}
+                Err(Refused::Store(e)) => return Response::text(500, e),
+                Err(_) => return no_share(),
+            }
+        }
         let msg = format!("merge {name} from {}", s.name);
         let out = import_share(&mut sl.repo, &share, &mut pl.repo, &into, &msg);
         let _ = pl.sync();
@@ -647,12 +695,6 @@ pub fn host_cmd(args: &[String]) -> Result<(), String> {
     if let Some(p) = args.first() {
         config.port = p.parse().map_err(|_| "PORT must be a number")?;
     }
-    let max_body = config
-        .projects
-        .iter()
-        .map(|p| p.max_body)
-        .collect::<Option<Vec<_>>>()
-        .and_then(|v| v.into_iter().max());
     let host = Arc::new(Host::open(config)?);
     auth::catch_stop_signals();
     {
@@ -681,8 +723,15 @@ pub fn host_cmd(args: &[String]) -> Result<(), String> {
         eprintln!("{t} project {}: {}", p.name, p.hosts.join(", "));
     }
     eprintln!("{t} host on 127.0.0.1:{}", host.port);
+    // Each project's body limit applies before its body is read: the
+    // server asks for the limit of the project the Host header names. An
+    // unknown host gets no body at all; its answer is 404 either way.
+    let b = host.clone();
+    let body_limit: &'static http::BodyLimit = Box::leak(Box::new(move |h: &str| {
+        b.project(Some(h)).map_or(Some(0), |p| p.max_body)
+    }));
     let limits = http::Limits {
-        max_body,
+        body_limit: Some(body_limit),
         ..http::Limits::default()
     };
     let port = host.port;
@@ -807,6 +856,10 @@ mod tests {
             format!(
                 "project a /tmp/x\nuser a owner {u}\nproject b /tmp/y\nuser b owner {u}\nhost b a.localhost\n"
             ),
+            // A share would move these refs.
+            format!("project a /tmp/x shares\nuser a owner {u}\n"),
+            format!("project a /tmp/x import/b/pub\nuser a owner {u}\n"),
+            format!("project a /tmp/x proposals/pub\nuser a owner {u}\n"),
         ];
         for t in bad {
             assert!(Config::parse(&t).is_err(), "{t}");
@@ -1022,6 +1075,34 @@ mod tests {
             .status,
             400
         );
+        done(dirs);
+    }
+
+    #[test]
+    fn a_merge_keeps_to_the_receivers_store_limit() {
+        let (h, dirs) = host("quota");
+        let post = |host: &str, who, path: &str| h.handle(req("POST", host, who, path, b""));
+        let get = |host: &str, who, path: &str| h.handle(req("GET", host, who, path, b""));
+        let issue = post(
+            "a.localhost",
+            OA,
+            "/shares/issue?name=pub&to=b&scope=path:pub&right=merge&expires=600",
+        );
+        assert_eq!(issue.status, 200);
+        {
+            let mut b = h.projects["b"].live.lock().unwrap();
+            let used = b.used_bytes();
+            b.max_store = Some(used + 4);
+        }
+        assert_eq!(post("b.localhost", OB, "/from/a/pub/merge").status, 507);
+        assert_eq!(get("b.localhost", OB, "/dav/pub/one.md").status, 404);
+        assert_eq!(
+            post("b.localhost", OB, "/from/a/pub/merge?into=shares").status,
+            400
+        );
+        h.projects["b"].live.lock().unwrap().max_store = None;
+        assert_eq!(post("b.localhost", OB, "/from/a/pub/merge").status, 200);
+        assert_eq!(get("b.localhost", OB, "/dav/pub/one.md").status, 200);
         done(dirs);
     }
 

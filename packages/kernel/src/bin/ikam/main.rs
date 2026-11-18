@@ -686,6 +686,7 @@ fn live_cmd(
         max_body: max_body
             .or(public.then_some(PUBLIC_MAX_BODY))
             .map(|n| n as usize),
+        body_limit: None,
         max_conns: max_conns.or(public.then_some(PUBLIC_MAX_CONNS)),
         idle: if public {
             Duration::from_secs(30)
