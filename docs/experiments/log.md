@@ -5576,3 +5576,24 @@ Gates on the branch (E229 to E233): every kernel test suite passes (release); cl
 - Verdict: **kept** for `MIN_MATCH` 32 (north -1.16% beyond the 0.5% tolerance; cost holds, with stored bytes unchanged). `GAP_DIFF`: **measured**, unchanged: every value tried beats 1024, but with no trend (256 and 4096 best, 512 and 2048 worse than both, 128 nearly flat), which reads as a few north/cases files sitting on a threshold rather than a better setting (inferred).
 - Not measured: the four history corpora (needs a clone with the old history); reads and search of slice-heavy content.
 - Run: the drivers are E322's `experiments/pilot-runs/drive.py` pattern; `cargo run --release --example bench -- --json north` for the sweep.
+
+### E348 matcher-density (candidates a seed and anchor density, after E347)
+- Branch / parent: exp/348-matcher-density / exp/347-match-tunables (E347)
+- Question: with the shortest match down to 32 bytes (E347), does the matcher now gain from keeping more candidates a seed (`MAX_CANDIDATES`, 4) or from denser or sparser anchors (`ANCHOR_SHIFT`, 58: one anchor in 64 positions)?
+- Hypothesis: shorter matches make more of a file matchable, so more candidates or more anchors could find spans that 4 candidates and 1 in 64 anchors miss. (Source: E347; `src/matcher.rs`.)
+- Result (the north corpora alone, `cargo run --release --example bench -- --json north`; the north score is deterministic, so one run each; lower is better):
+
+  | Variant | North | north/cases | north/multiformat | north/tables |
+  |---|---|---|---|---|
+  | E347 (4 candidates, 1 in 64) | **0.3060** | 0.4615 | 0.2953 | 0.2103 |
+  | 2 candidates | 0.3074 | 0.4635 | 0.3014 | 0.2079 |
+  | 8 candidates | 0.3094 | 0.4751 | 0.2984 | 0.2089 |
+  | 16 candidates | 0.3098 | 0.4716 | 0.3017 | 0.2089 |
+  | Anchors 1 in 128 (57) | 0.3307 | 0.4765 | 0.3033 | 0.2503 |
+  | Anchors 1 in 32 (59) | 0.3123 | 0.4719 | 0.2999 | 0.2153 |
+  | Anchors 1 in 16 (60) | 0.3088 | 0.4630 | 0.2914 | 0.2183 |
+
+  - Every variant is worse than E347's settings; more candidates are worse, not better.
+  - Denser anchors (1 in 16) make north/multiformat 1.3% smaller and north/tables 3.8% larger.
+- Verdict: **measured**, no change: at E347's shortest match, 4 candidates and one anchor in 64 positions are the best of those tried. More candidates being worse suggests the matcher's first candidates are its best and the extra ones crowd them out (inferred, not traced).
+- Not measured: the cost corpora (these constants could change their sizes and timings, unlike E347's); the history corpora.
