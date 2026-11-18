@@ -89,3 +89,26 @@ fn gc_empties_the_cache() {
     );
     assert_eq!(repo.read_content(&kept).unwrap(), b"kept by a ref");
 }
+
+/// E346: graph chunks kept by the cache answer walks as the store does,
+/// for every version, and a gc empties them too.
+#[test]
+fn kept_chunks_answer_walks_as_the_store() {
+    let (plain, a) = build(0);
+    let (cached, _) = build(64 << 20);
+    for db in [a[0], a[20], a[39]] {
+        for k in 0..25 {
+            let key = format!("item/{k:03}");
+            for _ in 0..2 {
+                assert_eq!(
+                    cached.db_get(&db, &key).unwrap(),
+                    plain.db_get(&db, &key).unwrap()
+                );
+                assert_eq!(
+                    cached.graph_node(&db.kv, &key).unwrap(),
+                    plain.graph_node(&db.kv, &key).unwrap()
+                );
+            }
+        }
+    }
+}

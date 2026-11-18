@@ -131,10 +131,18 @@ impl<S: Store> Repo<S> {
 
     /// A chunk's checked encoding, as `get` reads it.
     fn graph_encoded(&self, id: &Id) -> Result<Vec<u8>, Error> {
+        // E346: with `read_cache` on, a chunk checked once is kept beside
+        // the contents, so a walk from a root reads no object it read before.
+        if self.read_cache > 0
+            && let Some(bytes) = self.cache_get(id)
+        {
+            return Ok(bytes);
+        }
         let encoded = self.read_object(id)?;
         if Id::of(&encoded) != *id {
             return Err(Error::Corrupt(*id));
         }
+        self.cache_put(id, &encoded);
         Ok(encoded)
     }
 
