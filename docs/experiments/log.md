@@ -5506,3 +5506,24 @@ Gates on the branch (E229 to E233): every kernel test suite passes (release); cl
 - Verdict: **kept** as an option, off by default (a trade-off between the two tasks). For lookups of a known project, `with_weights(1.2, 0.9)` is the setting to try; topic search is weak with any weights (about 0.10) and is where E326's vectors helped.
 - Not measured: the weights inside E326's fused ranking (no embedder on this machine); other corpora than PyPI READMEs.
 - Run: `PERQ=out.tsv cargo run --release --example bm25_stem -- DIR`, with `K1` and `B` edited for each setting.
+
+### E351 bm25-prf (pseudo-relevance feedback for keyword search, on real text)
+- Branch / parent: exp/351-bm25-prf / exp/349-bm25-weights (E349)
+- Question: topic queries are where BM25 is weakest (nDCG@10 about 0.10 in E344 and E349). Does expanding a query with terms from its own best results (pseudo-relevance feedback, as in RM3) find more of the projects tagged with a topic, without a vector model?
+- Hypothesis: a short topic query ("Scientific Engineering Bio-Informatics") misses READMEs that use other words for the same thing; the best few hits share those words, so a second query on them reaches more of the topic. Known-item queries should lose, since the right README is usually already first. (Source: Lavrenko and Croft 2001; Abdul-Jaleel et al. 2004, RM3; E349.)
+- Method (`examples/bm25_prf.rs`, no kernel change): run the query; weight each term of the best `m` rows by its count over the row's length times its idf, summed over the rows, leaving out the query's own terms and terms in only one row; run the best `n` as a second query; fuse as `alpha` times the first ranking plus `1 - alpha` times the second, each scaled by its best score. `m` 3, 5, 10; `n` 5, 10, 20; `alpha` 0.5, 0.7, 0.85. E344's 17,266 READMEs, default weights, no stemming.
+- Result (nDCG@10, paired difference against plain BM25, standard error in brackets):
+
+  | m / n / alpha | Known dev | Known test | Topic dev | Topic test |
+  |---|---|---|---|---|
+  | plain | 0.802 | 0.809 | 0.112 | 0.102 |
+  | 3 / 20 / 0.5 (best topic dev) | -0.104 (0.009) | -0.099 (0.009) | **+0.016** (0.009) | +0.012 (0.007) |
+  | 5 / 10 / 0.85 | -0.007 (0.004) | -0.002 (0.004) | +0.007 (0.005) | +0.009 (0.005) |
+  | 10 / 5 / 0.5 | -0.279 (0.014) | -0.271 (0.014) | -0.001 (0.015) | -0.005 (0.009) |
+
+  - Every setting with `alpha` 0.85 moves topics up 0.001 to 0.009 and known items down 0.002 to 0.011; lower `alpha` trades much more known-item quality for little more topic gain.
+  - The best topic gain (+0.012 on test) is under two standard errors, and topics stay near 0.11.
+  - It doubles query time (two searches, plus reading the best rows' terms).
+- Verdict: **measured**, no kernel change. Feedback from a query's own hits does not fix topic search here; the vectors of E326 did more (topic 0.10 to about 0.13 with fusion). The example stays for reruns.
+- Not measured: feedback inside the fused ranking; feedback with E349's weights or with stemming.
+- Run: `cargo run --release --example bm25_prf -- DIR`.
