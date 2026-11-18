@@ -5417,3 +5417,25 @@ Gates on the branch (E229 to E233): every kernel test suite passes (release); cl
 - Verdict: **kept.** Assigning 400,000 paragraph-sized rows (E330's 376,619 is this size) goes from a minute to 30 s by default, and to 1.3 s with lanes and 4 threads. Since the IVF is the index whose build and update are cheapest to re-run (E332: its 1% update costs 147 s against HNSW's 4.3 s at 376k, mostly this step, inferred), its update cost should now be measured again.
 - Not measured: real vectors (no embedder on this machine tonight; E330's WordLlama vectors were not kept); an IVF's recall with lanes-trained centroids (the centroids came out identical here, so it would be the same on this data); a tighter compiled loop (E341's cloud check on its branch: clang's about twice as fast as `kernel-once`); Apple silicon.
 - Run: `cargo run --release --example kmeans_assign -- 100000 256 4` and `-- 400000 256 4`.
+### E345 fs-point-reads (one row read by key, from files and from a pack)
+- Branch / parent: exp/345-fs-point-reads / main at 8e50f83 (E340)
+- Question: E335 measured reading one row by key only from memory (`MemStore`), and named an on-disk store as not measured. What does a store on disk add to a point read, with and without E294's read cache, and does the layout (one file an object, or a pack) matter?
+- Hypothesis: each object read from `FsStore` is a file open, read and close, a few microseconds even from a warm page cache, so its cost grows with the 6 to 7 objects a read touches; `PackStore` reads from an open file at an offset and should be close to memory. (Source: E335; E122's store bake-off.)
+- Change: none in the kernel. `examples/point_reads.rs`: `STORE=fs` (`FsStore::open_deferred`) or `STORE=pack` (`PackStore`, default options) with `STORE_DIR`, besides the default memory store.
+- Result (100,000 rows of 1,024-byte values, one append, 2,000 random keys; page cache warm, since the append just wrote the files; a 4-core cloud machine). Microseconds a row, with the store's own share in brackets:
+
+  | Read | Memory | Files | Pack |
+  |---|---|---|---|
+  | `graph_node` | 28.7 (4.0) | 40.8 (16.6) | 30.6 (5.5) |
+  | `db_get` | 25.0 (2.6) | 38.3 (16.1) | 25.8 (3.5) |
+  | `graph_nodes_in` x50 | 18.6 (1.7) | 28.1 (8.2) | 20.6 (2.3) |
+  | `graph_node`, read cache | 13.9 (0.7) | 19.5 (5.6) | 13.6 (0.8) |
+  | `db_get`, read cache | 14.0 (0.7) | 20.6 (5.7) | 14.7 (0.9) |
+
+  - A file read costs about 2.3 to 2.7 µs an object; a pack read about 0.5 to 0.8, close to memory (0.4).
+  - Even with the cache, 3 objects a row are still read from the store: the graph chunks from the root down, which the cache does not keep (E294 keeps contents only).
+  - On disk: 106,606 objects take 436 MB as files and 117 MB as one pack. One file a row, each under the file system's 4 KB block, is 3.7 times the disk.
+- Trade-off: none; nothing changed.
+- Verdict: **measured.** For a store of many small rows (a vector or search index's rows, which E334's rescore reads 50 at a time), the pack is the store to use: point reads as fast as memory and a quarter of the disk; files add about 12 µs a row. The chunks the cache does not keep are next (E346).
+- Not measured: a cold page cache (dropping it needs privileges this machine does not give); the key-value backends (behind cargo features); Apple file systems, whose open and close costs differ.
+- Run: `STORE=fs STORE_DIR=/path/to/empty-dir cargo run --release --example point_reads -- 100000` (and `STORE=pack`, and no `STORE` for memory).

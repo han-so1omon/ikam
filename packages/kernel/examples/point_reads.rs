@@ -10,6 +10,12 @@
 //!
 //! `appends`: the rows written in that many appends (default 1). `CACHE=0`
 //! or `CACHE=1` runs only the pass without or with the read cache.
+//!
+//! E345: `STORE=fs` or `STORE=pack` with `STORE_DIR=/path/to/empty-dir`
+//! keeps the objects on disk (`FsStore` opened deferred, so the append is
+//! not one sync an object; `PackStore` with default options) instead of in
+//! memory. Reads then go through the operating system's page cache, warm
+//! since the append wrote them.
 
 use std::cell::Cell;
 use std::collections::BTreeSet;
@@ -17,7 +23,8 @@ use std::rc::Rc;
 use std::time::Instant;
 
 use ikam_kernel::vectors::from_f32s;
-use ikam_kernel::{Error, Event, Id, MemStore, Repo, Store};
+use ikam_kernel::backends::PackStore;
+use ikam_kernel::{Error, Event, FsStore, Id, MemStore, Repo, Store};
 
 /// Reads, bytes and nanoseconds of the store's own reads.
 #[derive(Default)]
@@ -27,9 +34,9 @@ struct Count {
     ns: Cell<u64>,
 }
 
-/// MemStore with its reads counted.
+/// A store with its reads counted.
 struct Counted {
-    inner: MemStore,
+    inner: Box<dyn Store>,
     count: Rc<Count>,
 }
 
@@ -48,6 +55,9 @@ impl Counted {
 }
 
 impl Store for Counted {
+    fn sync(&mut self) -> Result<(), Error> {
+        self.inner.sync()
+    }
     fn write(&mut self, id: Id, encoded: &[u8]) -> Result<bool, Error> {
         self.inner.write(id, encoded)
     }
@@ -111,8 +121,16 @@ fn main() {
     let rows = args.first().copied().unwrap_or(100_000);
     let appends = args.get(1).copied().unwrap_or(1).max(1);
     let count = Rc::new(Count::default());
+    let kind = std::env::var("STORE").unwrap_or_else(|_| "mem".into());
+    let dir = || std::env::var("STORE_DIR").expect("STORE_DIR for an on-disk store");
+    let inner: Box<dyn Store> = match kind.as_str() {
+        "mem" => Box::new(MemStore::default()),
+        "fs" => Box::new(FsStore::open_deferred(dir()).unwrap()),
+        "pack" => Box::new(PackStore::open(dir()).unwrap()),
+        other => panic!("STORE {other}: mem, fs or pack"),
+    };
     let mut repo = Repo::new(Counted {
-        inner: MemStore::default(),
+        inner,
         count: count.clone(),
     });
     let mut rng = Lcg(3);
@@ -132,7 +150,7 @@ fn main() {
         db = repo.db_append(&db, &events).unwrap();
     }
     println!(
-        "{{\"rows\":{rows},\"appends\":{appends},\"append_ms\":{:.0}}}",
+        "{{\"store\":\"{kind}\",\"rows\":{rows},\"appends\":{appends},\"append_ms\":{:.0}}}",
         t.elapsed().as_secs_f64() * 1e3
     );
     let probe: Vec<&String> = (0..2000)
