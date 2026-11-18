@@ -16,6 +16,12 @@
 //! len }` then `terms:varint { term_len term n { row_delta tf } }`
 //! (varints). It is built whole: a database update needs a rebuild.
 //!
+//! E344: `bm25_build_with` can stem terms (`Analyzer`); the index
+//! records its analyzer, and a query is cut the same way. A plain index's
+//! bytes are as before; a stemmed one starts `0x00 0x01 analyzer` (a plain
+//! index never does: zero rows means zero terms). The views below
+//! (`Bm25View`, `Bm25Live`) do not stem.
+//!
 //! Opt-in: nothing in the kernel builds or reads it unless a caller asks.
 
 use std::collections::{BTreeMap, HashMap};
@@ -33,6 +39,47 @@ pub struct Bm25 {
     lens: Vec<u32>,
     avg: f32,
     postings: HashMap<String, Vec<(u32, u32)>>,
+    analyzer: Analyzer,
+}
+
+/// How a row's text and a query become terms (E344).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Analyzer {
+    /// `terms` as they are.
+    #[default]
+    Plain,
+    /// Plural endings cut (`stem::plural`).
+    Plural,
+    /// Porter's stemmer (`stem::porter`).
+    Porter,
+}
+
+impl Analyzer {
+    fn byte(self) -> u8 {
+        match self {
+            Analyzer::Plain => 0,
+            Analyzer::Plural => 1,
+            Analyzer::Porter => 2,
+        }
+    }
+
+    fn from_byte(b: u8) -> Option<Self> {
+        Some(match b {
+            0 => Analyzer::Plain,
+            1 => Analyzer::Plural,
+            2 => Analyzer::Porter,
+            _ => return None,
+        })
+    }
+}
+
+/// `terms`, each cut as `a` says.
+pub fn terms_with(text: &str, a: Analyzer) -> impl Iterator<Item = String> + '_ {
+    terms(text).map(move |t| match a {
+        Analyzer::Plain => t,
+        Analyzer::Plural => crate::stem::plural(&t),
+        Analyzer::Porter => crate::stem::porter(&t),
+    })
 }
 
 /// The terms of `text`: alphanumeric runs, lowercased.
@@ -42,14 +89,17 @@ pub fn terms(text: &str) -> impl Iterator<Item = String> + '_ {
         .map(str::to_lowercase)
 }
 
-fn encode(rows: &[(String, Vec<u8>)]) -> Vec<u8> {
+fn encode(rows: &[(String, Vec<u8>)], analyzer: Analyzer) -> Vec<u8> {
     let mut post: BTreeMap<String, Vec<(usize, usize)>> = BTreeMap::new();
     let mut out = Vec::new();
+    if analyzer != Analyzer::Plain {
+        out.extend_from_slice(&[0, 1, analyzer.byte()]);
+    }
     put_varint(&mut out, rows.len());
     for (i, (key, value)) in rows.iter().enumerate() {
         let mut tf: BTreeMap<String, usize> = BTreeMap::new();
         let mut len = 0;
-        for t in terms(&String::from_utf8_lossy(value)) {
+        for t in terms_with(&String::from_utf8_lossy(value), analyzer) {
             *tf.entry(t).or_default() += 1;
             len += 1;
         }
@@ -75,6 +125,11 @@ fn encode(rows: &[(String, Vec<u8>)]) -> Vec<u8> {
 }
 
 fn decode(mut b: &[u8]) -> Option<Bm25> {
+    let mut analyzer = Analyzer::Plain;
+    if let [0, 1, a, rest @ ..] = b {
+        analyzer = Analyzer::from_byte(*a)?;
+        b = rest;
+    }
     let b = &mut b;
     let take = |b: &mut &[u8], n: usize| -> Option<String> {
         let (s, rest) = (b.get(..n)?, b.get(n..)?);
@@ -106,6 +161,7 @@ fn decode(mut b: &[u8]) -> Option<Bm25> {
         lens,
         avg,
         postings,
+        analyzer,
     })
 }
 
@@ -114,7 +170,7 @@ impl Bm25 {
     pub fn search(&self, query: &str, k: usize) -> Vec<(String, f32)> {
         let n = self.rows.len() as f32;
         let mut seen = std::collections::HashSet::new();
-        let lists: Vec<&Vec<(u32, u32)>> = terms(query)
+        let lists: Vec<&Vec<(u32, u32)>> = terms_with(query, self.analyzer)
             .filter_map(|t| self.postings.get(&t).filter(|_| seen.insert(t.clone())))
             .collect();
         // E338: sums in a dense array when the query touches enough rows,
@@ -182,8 +238,18 @@ impl Bm25 {
 impl<S: Store> Repo<S> {
     /// A BM25 index of the rows of `db` under `prefix`, stored as content.
     pub fn bm25_build(&mut self, db: &Db, prefix: &str) -> Result<Id, Error> {
+        self.bm25_build_with(db, prefix, Analyzer::Plain)
+    }
+
+    /// `bm25_build` with terms cut by `analyzer` (E344).
+    pub fn bm25_build_with(
+        &mut self,
+        db: &Db,
+        prefix: &str,
+        analyzer: Analyzer,
+    ) -> Result<Id, Error> {
         let rows = self.db_prefix(db, prefix, usize::MAX, false)?;
-        self.put_derived(&encode(&rows))
+        self.put_derived(&encode(&rows, analyzer))
     }
 
     pub fn bm25_load(&self, id: &Id) -> Result<Bm25, Error> {
@@ -622,6 +688,7 @@ mod tests {
             lens,
             avg,
             postings,
+            analyzer: Analyzer::Plain,
         };
         let n = bm.rows.len() as f32;
         for query in ["t1", "t2 t3 t2", "t0 t5 t9 t13 t19"] {

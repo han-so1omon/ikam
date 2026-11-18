@@ -5460,3 +5460,23 @@ Gates on the branch (E229 to E233): every kernel test suite passes (release); cl
 - Verdict: **kept** (inside the existing `read_cache` option, off by default). With the cache on, one row by key now costs about 8 µs from memory, files or a pack alike, against 25 to 38 µs with no cache: the store no longer matters for repeated reads.
 - Not measured: how much of the cache chunks take at a given size (the example does not report the cache's contents); a cold page cache; writes with the cache on (edits read chunks through the same path, and the suite with the cache forced on checks they store the same bytes).
 - Run: `CACHE=1 STORE=fs STORE_DIR=/path/to/empty-dir cargo run --release --example point_reads -- 100000` (and `STORE=pack`, and memory).
+### E344 bm25-stem (stemming for keyword search, on real text)
+- Branch / parent: exp/344-bm25-stem / main (8e50f83)
+- Question: BM25 matches words only as written, so "parsers" misses a README that says "parser". Does a stemmer, Harman's plural S-stemmer or Porter's, find more of the right documents on real text?
+- Hypothesis: stemming helps topic queries most (short, general words against many READMEs) and costs little on known items (a project's own summary against its README, which mostly shares the exact words). Lucene and Anserini stem English by default with Porter. (Source: Porter 1980; Harman 1991; E326.)
+- Change: `src/stem.rs` (Porter's five steps and Harman's three plural rules, no dependency; ASCII lowercase words longer than two letters only). `src/bm25.rs` `Analyzer` (Plain, Plural, Porter), `terms_with`, `bm25_build_with`; a stemmed index writes its analyzer in a three-byte prefix and stems queries the same way, and a plain index's bytes are unchanged. `Bm25View` and `Bm25Live` do not stem. Off by default. Tests `porter_paper_examples` (the paper's examples), `plural_examples`, `stemmed_index_matches_other_forms_and_plain_bytes_stay`.
+- Result (a fresh sample: 17,266 OSI-licensed PyPI READMEs from E256's `fetch.py`, E258's two tasks, so the figures do not compare with E326's line for line; nDCG@10, paired difference against no stemming with its standard error; a 4-core cloud machine; `cargo run --release --example bm25_stem -- DIR`):
+
+  | Stemmer | Known, 1,000 | Diff (se) | Topic, 151 | Diff (se) | Index | Build |
+  |---|---|---|---|---|---|---|
+  | None | 0.806 | | 0.106 | | 13.0 MB | 4.4 s |
+  | Plural | 0.804 | -0.002 (0.004) | 0.104 | -0.002 (0.005) | 12.3 MB | 4.3 s |
+  | Porter | 0.798 | -0.008 (0.006) | 0.115 | +0.009 (0.007) | 11.5 MB | 5.1 s |
+
+  - Porter moves topics up and known items down by about the same amount, each a little over one standard error, in both the dev and test halves (known -0.005 and -0.011, topics +0.005 and +0.011).
+  - The plural stemmer changes nothing measurable.
+  - Queries take 0.20 to 0.23 ms whatever the stemmer.
+- Trade-off: Porter merges words that mean different things ("general", "generate" and "generic" become one term), which hurts the exact-wording known-item task; it shrinks the index by 11%.
+- Verdict: **measured** (option, off by default). Neither stemmer beats no stemming beyond noise on this benchmark, so the default stays plain. The topic gain, if real, is small next to what vectors added in E326 (0.10 to about 0.13).
+- Not measured: stemming inside the fused ranking (no embedder on this machine, so E326's convex fusion could not be rerun); a larger topic set (151 queries leave the standard error near the effect); stemming in `Bm25View` and `Bm25Live`.
+- Run: `cargo run --release --example bm25_stem -- DIR`, with DIR from `prepare.py` (vectors not needed).
