@@ -5526,3 +5526,27 @@ Gates on the branch (E229 to E233): every kernel test suite passes (release); cl
 - Verdict: **measured**, no kernel change. Feedback from a query's own hits does not fix topic search here; the vectors of E326 did more (topic 0.10 to about 0.13 with fusion). The example stays for reruns.
 - Not measured: feedback inside the fused ranking; feedback with E349's weights or with stemming.
 - Run: `cargo run --release --example bm25_prf -- DIR`.
+
+### E352 lsa-vectors (a semantic layer with no model: LSA in the hybrid ranking)
+- Branch / parent: exp/352-lsa-vectors / exp/351-bm25-prf (E351)
+- Question: E326's hybrid ranking needs an embedding model (WordLlama), which a machine may not have. Can vectors made from the corpus itself, latent semantic analysis (a truncated SVD of the tf-idf matrix), stand in for one in the kernel's vector index and fusion? And does fusion still add once BM25 uses E349's weights?
+- Hypothesis: LSA links words that occur in the same READMEs, so it should help topic queries (other words for the same subject) more than known items; it is weaker than a trained model. (Source: Deerwester et al. 1990; E326; E349.)
+- Method: `experiments/real-text/lsa.py` (numpy only): sublinear tf-idf over the 30,000 most common terms in 3 or more READMEs, randomized SVD to 256 dimensions (16 s for 17,266 READMEs on 4 cores); documents are rows of U times S, queries are folded in through V; unit vectors written as `doc_whole.f32` and `queries.f32`. Then E326's `examples/hybrid_kernel.rs` unchanged on all of tonight's branches merged together, and once more with `with_weights(1.2, 0.9)` edited in.
+- Result (nDCG@10; exact vectors; IVF with 131 lists reaches recall@10 0.93 of exact at 32 probed lists, 0.98 at 64):
+
+  | Ranking | Known dev | Known test | Topic dev | Topic test |
+  |---|---|---|---|---|
+  | BM25 | 0.802 | 0.809 | 0.112 | 0.102 |
+  | LSA alone | 0.357 | 0.274 | 0.091 | 0.107 |
+  | Convex 0.7 | 0.815 | 0.817 | 0.118 | 0.117 |
+  | RRF 60 | 0.611 | 0.577 | 0.122 | **0.149** |
+  | BM25, weights 1.2 / 0.9 | 0.832 | 0.848 | 0.101 | 0.095 |
+  | The same, convex 0.8 | 0.833 | 0.848 | 0.105 | 0.102 |
+  | The same, RRF 60 | 0.576 | 0.533 | 0.115 | 0.127 |
+
+  - With the default weights, LSA in a convex fusion adds about 0.01 on known items; with E349's weights it adds nothing.
+  - On topics, RRF with LSA is the best of these (0.122 dev, 0.149 test), at a large cost on known items.
+  - The figures are means over the queries; this example does not give paired errors, and the topic sets (66 and 85 queries) leave about 0.02 of error on each mean.
+- Verdict: **measured**. A corpus-made LSA model is no stand-in for a trained embedder for known-item search; E349's weights alone do as well as LSA fusion. It may help topic search through RRF, within error here. The kernel's vector index and fusion handle it as they do WordLlama's vectors.
+- Not measured: paired differences; a trained model on this sample (none installed on this machine); LSA dimensions other than 256.
+- Run: `python3 -I experiments/real-text/lsa.py DIR`, then `cargo run --release --example hybrid_kernel -- DIR`.
