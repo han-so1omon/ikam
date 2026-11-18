@@ -5521,9 +5521,8 @@ Gates on the branch (E229 to E233): every kernel test suite passes (release); cl
   | 5 / 10 / 0.85 | -0.007 (0.004) | -0.002 (0.004) | +0.007 (0.005) | +0.009 (0.005) |
   | 10 / 5 / 0.5 | -0.279 (0.014) | -0.271 (0.014) | -0.001 (0.015) | -0.005 (0.009) |
 
-  - Every setting with `alpha` 0.85 moves topics up 0.001 to 0.009 and known items down 0.002 to 0.011; lower `alpha` trades much more known-item quality for little more topic gain.
+  - Every setting with `alpha` 0.85 moves topics by -0.001 to +0.009 and known items by -0.002 to -0.011; lower `alpha` trades much more known-item quality for little more topic gain.
   - The best topic gain (+0.012 on test) is under two standard errors, and topics stay near 0.11.
-  - It doubles query time (two searches, plus reading the best rows' terms).
 - Verdict: **measured**, no kernel change. Feedback from a query's own hits does not fix topic search here; the vectors of E326 did more (topic 0.10 to about 0.13 with fusion). The example stays for reruns.
 - Not measured: feedback inside the fused ranking; feedback with E349's weights or with stemming.
 - Run: `cargo run --release --example bm25_prf -- DIR`.
