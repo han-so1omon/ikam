@@ -4851,6 +4851,27 @@ Gates on the branch (E229 to E233): every kernel test suite passes (release); cl
 - Not measured: macOS (Mac steps below); E263 with the heavy read weight in this harness (E263 measures it alone); E264's branches (one ref here); 1M rows; repeated runs.
 - Verdict: **measured**, no new option. Together the kept options make the hot layer 2 to 24 times faster than today's opt-ins on these workloads and give a cold layer that runs at every size, for more bytes written and, against a full repack where one finishes, more bytes kept. All stay off by default.
 - Mac steps: `cargo run --release --example hot_cold -- files`, `-- db 20000`, `-- db 100000` on this branch, one at a time.
+- Mac run (Nov 15 to 16; an Apple M3 Pro laptop, 18 GB, macOS 26.2; the build, its target directory and the stores on an external APFS SSD that linked at 480 Mb/s, USB 2 speed, though the port supports 40 Gb/s; one run at a time, on power):
+  - What ran: `files` once (441 s). The two db runs got their arguments as one word, so `hot_cold` ran its whole suite (files, then db at the default 100,000 rows) twice, in 51,875 s and 57,043 s; db at 20,000 rows did not run. For opt and kept the two db runs agree within about 20% at p50; the default setting varies more (batches of 100: 375 against 544 s at p50, and single-append p99 4.6 against 40.3 s). The table gives the first.
+
+  | Case | default | opt | kept |
+  |---|---|---|---|
+  | files, commit every edit: edit p50 / p99 | 78.9 / 209.6 ms | 13.9 / 118.0 ms | 13.5 / 18.7 ms |
+  | files, commit every 50: edit p50 / p99 | 60.1 / 185.9 ms | 2.1 / 100.9 ms | 0.8 / 54.5 ms |
+  | files, commit p50 (every edit) | 16.4 ms | 11.6 ms | 11.2 ms |
+  | files, cold work (commit every edit / every 50) | full repack 76.0 / 37.7 s | 60.1 / 29.3 s | incremental pass 22.6 / 10.9 s |
+  | db 100k, single appends: hot p50 / p99, views each batch | 498 / 4,609 ms | 177.5 / 237 ms | 54.1 / 84.4 ms, views 41 events behind at p50 |
+  | db 100k, single appends: hot p50, views once at end | 394 ms | 66.4 ms | (as above) |
+  | db 100k, batches of 100: hot p50 / p99, views each batch | 375 / 959 s | 1,223 / 1,902 ms | 773 / 1,078 ms |
+  | db 100k, one batch of 2,000: hot, views each batch | 10,056 s (2.8 h) | 11.1 s | 5.35 s |
+  | db 100k, views caught up after the session | 0.1 to 2.2 s | 0.1 to 1.2 s | 0.14 to 0.96 s |
+  | db 100k, cold work after the 2,000 batch | no repack; gc 38.8 s, fsck 68.5 s | same | pass 94.5 s (4,008 new), gc 78.2 s, fsck 36.5 s; a one-time pass after the load 905 s |
+
+  Disk and hot bytes are the same as on Linux in every case.
+  - The kept options still win on the Mac: against today's opt-ins, single appends with views current are 3.3 times faster (54 against 178 ms), batches of 100 1.6 times and the 2,000 batch 2.1 times, and the edit p99 on files falls from 118 to 19 ms. The margin is smaller than on Linux because each commit still pays about 11 ms of flushes on this link.
+  - The default setting's batches are the outlier: 375 s at the median for a batch of 100 and 2.8 h for one of 2,000, 51 and 71 times the Linux times, where single appends are only 3 times slower. System time (6,412 s) is nearly seven times user time (952 s) over the run. Inference, not measured: the default path syncs each object it writes, and a flush over this USB 2 link costs tens of milliseconds, so a batch that writes many objects pays that many flushes. The opt-ins that defer syncs (E227) remove it. Worth a profile of where the default batch's syncs come from.
+  - The cold layer is also much slower here: the incremental pass after a 2,000 batch takes 94.5 s against 7.0 s on Linux, and the pass after the load 905 s against 56 s.
+  - Not comparable with a Mac run on the internal disk: at this link speed, files commits take about twice as long (16 against about 8 ms at p50). A rerun with the drive on a full-speed link, and the db run at 20,000 rows, are left to do.
 - Run: `cargo run --release --example hot_cold -- [files|db] [default|opt|kept] [N...]`.
 
 ### E312 fusion-default (convex fusion as the default hybrid ranking)
