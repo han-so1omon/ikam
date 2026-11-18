@@ -5570,6 +5570,7 @@ Gates on the branch (E229 to E233): every kernel test suite passes (release); cl
   - `GAP_DIFF` 256 with `MIN_MATCH` 48: -0.42%, less than either alone.
   - Almost all of the change is north/cases (`MIN_MATCH` 32: -3.4%); north/multiformat and north/tables do not move with `MIN_MATCH`.
   - Cost score: every variant's runs fall inside base's own spread (3.9% in the first round, 7.3% in the second; the office corpus alone moves up to 30% between base runs). The cost corpora's stored bytes (`repack`) are identical, byte for byte, for every variant and every run; only their timings differ, and those are within noise. So on this bench both tunables change only the north corpora's sizes.
+  - north/cases stored split by type (`kernel_split`, not part of the score) goes the other way: 388,346 to 390,631 bytes (+0.6%) at 32 and at 48.
   - `small_edit_stores_little` bounded an edit by `4 * MIN_MATCH`; the edit costs 177 bytes at both 96 and 32, so the bound now states its old value, 384 bytes, instead of following the constant.
 - Change: `MIN_MATCH` 96 to 32 (the seed window, `SEED`, below which the matcher finds nothing); `GAP_DIFF` stays 1024.
 - Trade-off: none measured on this bench. More, shorter slices could cost reads or stored bytes on the history corpora, where the matcher does most of its work; those were not run.
