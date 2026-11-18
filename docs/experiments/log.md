@@ -5343,3 +5343,29 @@ Gates on the branch (E229 to E233): every kernel test suite passes (release); cl
 - Verdict: **measured** (option, off by default). Neither stemmer beats no stemming beyond noise on this benchmark, so the default stays plain. The topic gain, if real, is small next to what vectors added in E326 (0.10 to about 0.13).
 - Not measured: stemming inside the fused ranking (no embedder on this machine, so E326's convex fusion could not be rerun); a larger topic set (151 queries leave the standard error near the effect); stemming in `Bm25View` and `Bm25Live`.
 - Run: `cargo run --release --example bm25_stem -- DIR`, with DIR from `prepare.py` (vectors not needed).
+
+### E349 bm25-weights (BM25's k1 and b on real text)
+- Branch / parent: exp/349-bm25-weights / exp/344-bm25-stem (E344)
+- Question: the kernel's BM25 uses Anserini's `K1` 0.9 and `B` 0.4, tuned for short passages. PyPI READMEs run from a few hundred bytes to 60 KB. Do other weights rank better on E344's benchmark?
+- Hypothesis: with lengths this uneven, stronger length normalization (higher `b`) keeps long READMEs that mention a query's words in passing from outranking the project they describe; Lucene's own defaults are 1.2 and 0.75. (Source: Robertson and Zaragoza 2009; E324; E344.)
+- Method: E344's 17,266 READMEs and 1,151 queries, no stemming. A grid of `K1` 0.6 to 2.0 and `B` 0.2 to 0.75, then eight settings with each query's nDCG@10 written out (`PERQ=path`) for paired differences against the defaults, split into the benchmark's dev and test halves.
+- Result (nDCG@10; paired difference against 0.9 / 0.4 with its standard error):
+
+  | k1 / b | Known dev | Known test | Topic dev | Topic test |
+  |---|---|---|---|---|
+  | 0.9 / 0.4 (default) | 0.802 | 0.809 | 0.112 | 0.102 |
+  | 0.9 / 0.75 | +0.026 (0.006) | +0.027 (0.005) | -0.012 (0.005) | +0.004 (0.004) |
+  | 1.2 / 0.75 | +0.028 (0.006) | +0.031 (0.006) | -0.012 (0.006) | -0.004 (0.004) |
+  | 1.5 / 0.75 | +0.030 (0.007) | +0.032 (0.006) | -0.013 (0.007) | -0.004 (0.005) |
+  | 1.2 / 0.9 | +0.030 (0.007) | **+0.039** (0.007) | -0.011 (0.007) | -0.008 (0.006) |
+  | 1.5 / 0.9 | +0.030 (0.007) | +0.039 (0.008) | -0.016 (0.008) | -0.005 (0.007) |
+  | 1.2 / 1.0 | +0.030 (0.007) | +0.042 (0.008) | -0.017 (0.009) | -0.006 (0.006) |
+  | 2.0 / 0.9 | +0.028 (0.008) | +0.039 (0.009) | -0.015 (0.009) | +0.001 (0.008) |
+
+  - `b` decides it; `k1` from 0.9 to 2.0 matters little. In the grid, `b` 0.2 does the reverse: topics dev 0.12 to 0.13, known items down to 0.77.
+  - Known items gain 4 to 6 standard errors at `b` 0.75 and above, on both halves; topics lose 1 to 2 on dev and about 1 on test.
+- Change: `Bm25::with_weights(k1, b)` and `Bm25::weights()` (query time only; the stored index is unchanged); `K1` and `B` stay the defaults, and `Bm25View` and `Bm25Live` keep them. Test `weights_change_scores_only_when_set`. `examples/bm25_stem.rs` writes per-query scores when `PERQ` is set.
+- Trade-off: a query for a project's own description finds it more often; a short topic query finds tagged projects a little less often.
+- Verdict: **kept** as an option, off by default (a trade-off between the two tasks). For lookups of a known project, `with_weights(1.2, 0.9)` is the setting to try; topic search is weak with any weights (about 0.10) and is where E326's vectors helped.
+- Not measured: the weights inside E326's fused ranking (no embedder on this machine); other corpora than PyPI READMEs.
+- Run: `PERQ=out.tsv cargo run --release --example bm25_stem -- DIR`, with `K1` and `B` edited for each setting.

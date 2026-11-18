@@ -22,6 +22,9 @@
 //! index never does: zero rows means zero terms). The views below
 //! (`Bm25View`, `Bm25Live`) do not stem.
 //!
+//! E349: `Bm25::with_weights` scores a loaded index with other `k1` and `b`
+//! (off by default; the views keep `K1` and `B`).
+//!
 //! Opt-in: nothing in the kernel builds or reads it unless a caller asks.
 
 use std::collections::{BTreeMap, HashMap};
@@ -40,6 +43,8 @@ pub struct Bm25 {
     avg: f32,
     postings: HashMap<String, Vec<(u32, u32)>>,
     analyzer: Analyzer,
+    /// `(k1, b)` for scoring; `(K1, B)` unless `with_weights` set others.
+    weights: (f32, f32),
 }
 
 /// How a row's text and a query become terms (E344).
@@ -162,10 +167,26 @@ fn decode(mut b: &[u8]) -> Option<Bm25> {
         avg,
         postings,
         analyzer,
+        weights: (K1, B),
     })
 }
 
 impl Bm25 {
+    /// The same index scoring with `k1` and `b` in place of `K1` and `B`
+    /// (E349, off by default). Query time only: the stored index is the
+    /// same. On E344's PyPI READMEs, `with_weights(1.2, 0.9)` (stronger
+    /// length normalization) found known items better (nDCG@10 +0.030 dev,
+    /// +0.039 test) and topics a little worse (-0.011, -0.008).
+    pub fn with_weights(mut self, k1: f32, b: f32) -> Self {
+        self.weights = (k1, b);
+        self
+    }
+
+    /// The `(k1, b)` this index scores with.
+    pub fn weights(&self) -> (f32, f32) {
+        self.weights
+    }
+
     /// The `k` best rows for `query`, best first, ties by key.
     pub fn search(&self, query: &str, k: usize) -> Vec<(String, f32)> {
         let n = self.rows.len() as f32;
@@ -197,13 +218,14 @@ impl Bm25 {
             let idf = (1.0 + (n - df + 0.5) / (df + 0.5)).ln();
             for &(row, tf) in list.iter() {
                 let (tf, dl) = (tf as f32, self.lens[row as usize] as f32);
-                let norm = K1 * (1.0 - B + B * dl / self.avg.max(1.0));
+                let (k1, b) = self.weights;
+                let norm = k1 * (1.0 - b + b * dl / self.avg.max(1.0));
                 let s = score.slot(row);
                 // Every term adds more than 0 (idf > 0, tf >= 1).
                 if *s == 0.0 {
                     hit.push(row);
                 }
-                *s += idf * tf * (K1 + 1.0) / (tf + norm);
+                *s += idf * tf * (k1 + 1.0) / (tf + norm);
             }
         }
         hit
@@ -689,6 +711,7 @@ mod tests {
             avg,
             postings,
             analyzer: Analyzer::Plain,
+            weights: (K1, B),
         };
         let n = bm.rows.len() as f32;
         for query in ["t1", "t2 t3 t2", "t0 t5 t9 t13 t19"] {
