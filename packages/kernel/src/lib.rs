@@ -44,6 +44,7 @@ mod repo;
 mod search;
 pub mod share;
 pub mod snapshot;
+pub mod stem;
 mod store;
 pub mod temperature;
 mod template;

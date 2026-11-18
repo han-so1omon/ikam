@@ -227,3 +227,66 @@ fn view_kept_by_updates_equals_the_formula() {
     // The merging view merged along the way.
     assert!(merges >= 2, "{merges}");
 }
+
+/// E344: a stemmed index finds a word's other forms, remembers its
+/// analyzer when stored, and a plain index's bytes are what they were.
+#[test]
+fn stemmed_index_matches_other_forms_and_plain_bytes_stay() {
+    use ikam_kernel::bm25::Analyzer;
+    let mut repo = Repo::new(MemStore::default());
+    let empty = repo.db_empty().unwrap();
+    let rows = [
+        ("r/1", "Indexes for semantic queries"),
+        ("r/2", "a graph store"),
+        ("r/3", "indexing tool"),
+    ];
+    let events: Vec<Event> = rows
+        .iter()
+        .map(|(k, v)| Event::upsert(k, v.as_bytes(), k))
+        .collect();
+    let db = repo.db_append(&empty, &events).unwrap();
+    let plain = repo.bm25_build(&db, "r/").unwrap();
+    let again = repo.bm25_build_with(&db, "r/", Analyzer::Plain).unwrap();
+    assert_eq!(plain, again);
+    assert!(repo.read_content(&plain).unwrap()[..2] != [0, 1]);
+    let porter = repo.bm25_build_with(&db, "r/", Analyzer::Porter).unwrap();
+    let plural = repo.bm25_build_with(&db, "r/", Analyzer::Plural).unwrap();
+    let keys = |id, q: &str| -> Vec<String> {
+        let ix = repo.bm25_load(id).unwrap();
+        ix.search(q, 3).into_iter().map(|x| x.0).collect()
+    };
+    assert_eq!(keys(&plain, "index"), Vec::<String>::new());
+    assert_eq!(keys(&plain, "query"), Vec::<String>::new());
+    let mut got = keys(&porter, "index");
+    got.sort();
+    assert_eq!(got, ["r/1", "r/3"]);
+    assert_eq!(keys(&porter, "query"), ["r/1"]);
+    assert_eq!(keys(&plural, "query"), ["r/1"]);
+    assert_eq!(keys(&plural, "indexing"), ["r/3"]);
+}
+
+#[test]
+fn weights_change_scores_only_when_set() {
+    let mut repo = Repo::new(MemStore::default());
+    let empty = repo.db_empty().unwrap();
+    let long = "alpha ".to_string() + &"filler ".repeat(200);
+    let events = vec![
+        Event::upsert("t/short", b"alpha beta", "a"),
+        Event::upsert("t/long", long.as_bytes(), "b"),
+    ];
+    let db = repo.db_append(&empty, &events).unwrap();
+    let id = repo.bm25_build(&db, "t/").unwrap();
+    let plain = repo.bm25_load(&id).unwrap();
+    assert_eq!(plain.weights(), (K1, B));
+    let same = repo.bm25_load(&id).unwrap().with_weights(K1, B);
+    assert_eq!(plain.search("alpha", 10), same.search("alpha", 10));
+    // No length normalization: both rows hold "alpha" once, so they tie.
+    let flat = repo.bm25_load(&id).unwrap().with_weights(K1, 0.0);
+    let hits = flat.search("alpha", 10);
+    assert_eq!(hits[0].1, hits[1].1);
+    // Full normalization pushes the long row further down than B does.
+    let full = repo.bm25_load(&id).unwrap().with_weights(K1, 1.0);
+    let gap = |h: &[(String, f32)]| h[0].1 - h[1].1;
+    assert_eq!(full.search("alpha", 10)[0].0, "t/short");
+    assert!(gap(&full.search("alpha", 10)) > gap(&plain.search("alpha", 10)));
+}

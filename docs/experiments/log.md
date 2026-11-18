@@ -5460,3 +5460,93 @@ Gates on the branch (E229 to E233): every kernel test suite passes (release); cl
 - Verdict: **kept** (inside the existing `read_cache` option, off by default). With the cache on, one row by key now costs about 8 µs from memory, files or a pack alike, against 25 to 38 µs with no cache: the store no longer matters for repeated reads.
 - Not measured: how much of the cache chunks take at a given size (the example does not report the cache's contents); a cold page cache; writes with the cache on (edits read chunks through the same path, and the suite with the cache forced on checks they store the same bytes).
 - Run: `CACHE=1 STORE=fs STORE_DIR=/path/to/empty-dir cargo run --release --example point_reads -- 100000` (and `STORE=pack`, and memory).
+### E344 bm25-stem (stemming for keyword search, on real text)
+- Branch / parent: exp/344-bm25-stem / main (8e50f83)
+- Question: BM25 matches words only as written, so "parsers" misses a README that says "parser". Does a stemmer, Harman's plural S-stemmer or Porter's, find more of the right documents on real text?
+- Hypothesis: stemming helps topic queries most (short, general words against many READMEs) and costs little on known items (a project's own summary against its README, which mostly shares the exact words). Lucene and Anserini stem English by default with Porter. (Source: Porter 1980; Harman 1991; E326.)
+- Change: `src/stem.rs` (Porter's five steps and Harman's three plural rules, no dependency; ASCII lowercase words longer than two letters only). `src/bm25.rs` `Analyzer` (Plain, Plural, Porter), `terms_with`, `bm25_build_with`; a stemmed index writes its analyzer in a three-byte prefix and stems queries the same way, and a plain index's bytes are unchanged. `Bm25View` and `Bm25Live` do not stem. Off by default. Tests `porter_paper_examples` (the paper's examples), `plural_examples`, `stemmed_index_matches_other_forms_and_plain_bytes_stay`.
+- Result (a fresh sample: 17,266 OSI-licensed PyPI READMEs from E256's `fetch.py`, E258's two tasks, so the figures do not compare with E326's line for line; nDCG@10, paired difference against no stemming with its standard error; a 4-core cloud machine; `cargo run --release --example bm25_stem -- DIR`):
+
+  | Stemmer | Known, 1,000 | Diff (se) | Topic, 151 | Diff (se) | Index | Build |
+  |---|---|---|---|---|---|---|
+  | None | 0.806 | | 0.106 | | 13.0 MB | 4.4 s |
+  | Plural | 0.804 | -0.002 (0.004) | 0.104 | -0.002 (0.005) | 12.3 MB | 4.3 s |
+  | Porter | 0.798 | -0.008 (0.006) | 0.115 | +0.009 (0.007) | 11.5 MB | 5.1 s |
+
+  - Porter moves topics up and known items down by about the same amount, each a little over one standard error, in both the dev and test halves (known -0.005 and -0.011, topics +0.005 and +0.011).
+  - The plural stemmer changes nothing measurable.
+  - Queries take 0.20 to 0.23 ms whatever the stemmer.
+- Trade-off: Porter merges words that mean different things ("general", "generate" and "generic" become one term), which hurts the exact-wording known-item task; it shrinks the index by 11%.
+- Verdict: **measured** (option, off by default). Neither stemmer beats no stemming beyond noise on this benchmark, so the default stays plain. The topic gain, if real, is small next to what vectors added in E326 (0.10 to about 0.13).
+- Not measured: stemming inside the fused ranking (no embedder on this machine, so E326's convex fusion could not be rerun); a larger topic set (151 queries leave the standard error near the effect); stemming in `Bm25View` and `Bm25Live`.
+- Run: `cargo run --release --example bm25_stem -- DIR`, with DIR from `prepare.py` (vectors not needed).
+
+### E349 bm25-weights (BM25's k1 and b on real text)
+- Branch / parent: exp/349-bm25-weights / exp/344-bm25-stem (E344)
+- Question: the kernel's BM25 uses Anserini's `K1` 0.9 and `B` 0.4, tuned for short passages. PyPI READMEs run from a few hundred bytes to 60 KB. Do other weights rank better on E344's benchmark?
+- Hypothesis: with lengths this uneven, stronger length normalization (higher `b`) keeps long READMEs that mention a query's words in passing from outranking the project they describe; Lucene's own defaults are 1.2 and 0.75. (Source: Robertson and Zaragoza 2009; E324; E344.)
+- Method: E344's 17,266 READMEs and 1,151 queries, no stemming. A grid of `K1` 0.6 to 2.0 and `B` 0.2 to 0.75, then eight settings with each query's nDCG@10 written out (`PERQ=path`) for paired differences against the defaults, split into the benchmark's dev and test halves.
+- Result (nDCG@10; paired difference against 0.9 / 0.4 with its standard error):
+
+  | k1 / b | Known dev | Known test | Topic dev | Topic test |
+  |---|---|---|---|---|
+  | 0.9 / 0.4 (default) | 0.802 | 0.809 | 0.112 | 0.102 |
+  | 0.9 / 0.75 | +0.026 (0.006) | +0.027 (0.005) | -0.012 (0.005) | +0.004 (0.004) |
+  | 1.2 / 0.75 | +0.028 (0.006) | +0.031 (0.006) | -0.012 (0.006) | -0.004 (0.004) |
+  | 1.5 / 0.75 | +0.030 (0.007) | +0.032 (0.006) | -0.013 (0.007) | -0.004 (0.005) |
+  | 1.2 / 0.9 | +0.030 (0.007) | **+0.039** (0.007) | -0.011 (0.007) | -0.008 (0.006) |
+  | 1.5 / 0.9 | +0.030 (0.007) | +0.039 (0.008) | -0.016 (0.008) | -0.005 (0.007) |
+  | 1.2 / 1.0 | +0.030 (0.007) | +0.042 (0.008) | -0.017 (0.009) | -0.006 (0.006) |
+  | 2.0 / 0.9 | +0.028 (0.008) | +0.039 (0.009) | -0.015 (0.009) | +0.001 (0.008) |
+
+  - `b` decides it; `k1` from 0.9 to 2.0 matters little. In the grid, `b` 0.2 does the reverse: topics dev 0.12 to 0.13, known items down to 0.77.
+  - Known items gain 4 to 6 standard errors at `b` 0.75 and above, on both halves; topics lose 1 to 2 on dev and about 1 on test.
+- Change: `Bm25::with_weights(k1, b)` and `Bm25::weights()` (query time only; the stored index is unchanged); `K1` and `B` stay the defaults, and `Bm25View` and `Bm25Live` keep them. Test `weights_change_scores_only_when_set`. `examples/bm25_stem.rs` writes per-query scores when `PERQ` is set.
+- Trade-off: a query for a project's own description finds it more often; a short topic query finds tagged projects a little less often.
+- Verdict: **kept** as an option, off by default (a trade-off between the two tasks). For lookups of a known project, `with_weights(1.2, 0.9)` is the setting to try; topic search is weak with any weights (about 0.10) and is where E326's vectors helped.
+- Not measured: the weights inside E326's fused ranking (no embedder on this machine); other corpora than PyPI READMEs.
+- Run: `PERQ=out.tsv cargo run --release --example bm25_stem -- DIR`, with `K1` and `B` edited for each setting.
+
+### E351 bm25-prf (pseudo-relevance feedback for keyword search, on real text)
+- Branch / parent: exp/351-bm25-prf / exp/349-bm25-weights (E349)
+- Question: topic queries are where BM25 is weakest (nDCG@10 about 0.10 in E344 and E349). Does expanding a query with terms from its own best results (pseudo-relevance feedback, as in RM3) find more of the projects tagged with a topic, without a vector model?
+- Hypothesis: a short topic query ("Scientific Engineering Bio-Informatics") misses READMEs that use other words for the same thing; the best few hits share those words, so a second query on them reaches more of the topic. Known-item queries should lose, since the right README is usually already first. (Source: Lavrenko and Croft 2001; Abdul-Jaleel et al. 2004, RM3; E349.)
+- Method (`examples/bm25_prf.rs`, no kernel change): run the query; weight each term of the best `m` rows by its count over the row's length times its idf, summed over the rows, leaving out the query's own terms and terms in only one row; run the best `n` as a second query; fuse as `alpha` times the first ranking plus `1 - alpha` times the second, each scaled by its best score. `m` 3, 5, 10; `n` 5, 10, 20; `alpha` 0.5, 0.7, 0.85. E344's 17,266 READMEs, default weights, no stemming.
+- Result (nDCG@10, paired difference against plain BM25, standard error in brackets):
+
+  | m / n / alpha | Known dev | Known test | Topic dev | Topic test |
+  |---|---|---|---|---|
+  | plain | 0.802 | 0.809 | 0.112 | 0.102 |
+  | 3 / 20 / 0.5 (best topic dev) | -0.104 (0.009) | -0.099 (0.009) | **+0.016** (0.009) | +0.012 (0.007) |
+  | 5 / 10 / 0.85 | -0.007 (0.004) | -0.002 (0.004) | +0.007 (0.005) | +0.009 (0.005) |
+  | 10 / 5 / 0.5 | -0.279 (0.014) | -0.271 (0.014) | -0.001 (0.015) | -0.005 (0.009) |
+
+  - Every setting with `alpha` 0.85 moves topics by -0.001 to +0.009 and known items by -0.002 to -0.011; lower `alpha` trades much more known-item quality for little more topic gain.
+  - The best topic gain (+0.012 on test) is under two standard errors, and topics stay near 0.11.
+- Verdict: **measured**, no kernel change. Feedback from a query's own hits does not fix topic search here; the vectors of E326 did more (topic 0.10 to about 0.13 with fusion). The example stays for reruns.
+- Not measured: feedback inside the fused ranking; feedback with E349's weights or with stemming.
+- Run: `cargo run --release --example bm25_prf -- DIR`.
+
+### E352 lsa-vectors (a semantic layer with no model: LSA in the hybrid ranking)
+- Branch / parent: exp/352-lsa-vectors / exp/351-bm25-prf (E351)
+- Question: E326's hybrid ranking needs an embedding model (WordLlama), which a machine may not have. Can vectors made from the corpus itself, latent semantic analysis (a truncated SVD of the tf-idf matrix), stand in for one in the kernel's vector index and fusion? And does fusion still add once BM25 uses E349's weights?
+- Hypothesis: LSA links words that occur in the same READMEs, so it should help topic queries (other words for the same subject) more than known items; it is weaker than a trained model. (Source: Deerwester et al. 1990; E326; E349.)
+- Method: `experiments/real-text/lsa.py` (numpy only): sublinear tf-idf over the 30,000 most common terms in 3 or more READMEs, randomized SVD to 256 dimensions (16 s for 17,266 READMEs on 4 cores); documents are rows of U times S, queries are folded in through V; unit vectors written as `doc_whole.f32` and `queries.f32`. Then E326's `examples/hybrid_kernel.rs` unchanged on all of tonight's branches merged together, and once more with `with_weights(1.2, 0.9)` edited in.
+- Result (nDCG@10; exact vectors; IVF with 131 lists reaches recall@10 0.93 of exact at 32 probed lists, 0.98 at 64):
+
+  | Ranking | Known dev | Known test | Topic dev | Topic test |
+  |---|---|---|---|---|
+  | BM25 | 0.802 | 0.809 | 0.112 | 0.102 |
+  | LSA alone | 0.357 | 0.274 | 0.091 | 0.107 |
+  | Convex 0.7 | 0.815 | 0.817 | 0.118 | 0.117 |
+  | RRF 60 | 0.611 | 0.577 | 0.122 | **0.149** |
+  | BM25, weights 1.2 / 0.9 | 0.832 | 0.848 | 0.101 | 0.095 |
+  | The same, convex 0.8 | 0.833 | 0.848 | 0.105 | 0.102 |
+  | The same, RRF 60 | 0.576 | 0.533 | 0.115 | 0.127 |
+
+  - With the default weights, LSA in a convex fusion adds about 0.01 on known items; with E349's weights it adds nothing.
+  - On topics, RRF with LSA is the best of these (0.122 dev, 0.149 test), at a large cost on known items.
+  - The figures are means over the queries; this example does not give paired errors, and the topic sets (66 and 85 queries) leave about 0.02 of error on each mean.
+- Verdict: **measured**. A corpus-made LSA model is no stand-in for a trained embedder for known-item search; E349's weights alone do as well as LSA fusion. It may help topic search through RRF, within error here. The kernel's vector index and fusion handle it as they do WordLlama's vectors.
+- Not measured: paired differences; a trained model on this sample (none installed on this machine); LSA dimensions other than 256.
+- Run: `python3 -I experiments/real-text/lsa.py DIR`, then `cargo run --release --example hybrid_kernel -- DIR`.

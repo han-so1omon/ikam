@@ -16,6 +16,15 @@
 //! len }` then `terms:varint { term_len term n { row_delta tf } }`
 //! (varints). It is built whole: a database update needs a rebuild.
 //!
+//! E344: `bm25_build_with` can stem terms (`Analyzer`); the index
+//! records its analyzer, and a query is cut the same way. A plain index's
+//! bytes are as before; a stemmed one starts `0x00 0x01 analyzer` (a plain
+//! index never does: zero rows means zero terms). The views below
+//! (`Bm25View`, `Bm25Live`) do not stem.
+//!
+//! E349: `Bm25::with_weights` scores a loaded index with other `k1` and `b`
+//! (off by default; the views keep `K1` and `B`).
+//!
 //! Opt-in: nothing in the kernel builds or reads it unless a caller asks.
 
 use std::collections::{BTreeMap, HashMap};
@@ -33,6 +42,49 @@ pub struct Bm25 {
     lens: Vec<u32>,
     avg: f32,
     postings: HashMap<String, Vec<(u32, u32)>>,
+    analyzer: Analyzer,
+    /// `(k1, b)` for scoring; `(K1, B)` unless `with_weights` set others.
+    weights: (f32, f32),
+}
+
+/// How a row's text and a query become terms (E344).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Analyzer {
+    /// `terms` as they are.
+    #[default]
+    Plain,
+    /// Plural endings cut (`stem::plural`).
+    Plural,
+    /// Porter's stemmer (`stem::porter`).
+    Porter,
+}
+
+impl Analyzer {
+    fn byte(self) -> u8 {
+        match self {
+            Analyzer::Plain => 0,
+            Analyzer::Plural => 1,
+            Analyzer::Porter => 2,
+        }
+    }
+
+    fn from_byte(b: u8) -> Option<Self> {
+        Some(match b {
+            0 => Analyzer::Plain,
+            1 => Analyzer::Plural,
+            2 => Analyzer::Porter,
+            _ => return None,
+        })
+    }
+}
+
+/// `terms`, each cut as `a` says.
+pub fn terms_with(text: &str, a: Analyzer) -> impl Iterator<Item = String> + '_ {
+    terms(text).map(move |t| match a {
+        Analyzer::Plain => t,
+        Analyzer::Plural => crate::stem::plural(&t),
+        Analyzer::Porter => crate::stem::porter(&t),
+    })
 }
 
 /// The terms of `text`: alphanumeric runs, lowercased.
@@ -42,14 +94,17 @@ pub fn terms(text: &str) -> impl Iterator<Item = String> + '_ {
         .map(str::to_lowercase)
 }
 
-fn encode(rows: &[(String, Vec<u8>)]) -> Vec<u8> {
+fn encode(rows: &[(String, Vec<u8>)], analyzer: Analyzer) -> Vec<u8> {
     let mut post: BTreeMap<String, Vec<(usize, usize)>> = BTreeMap::new();
     let mut out = Vec::new();
+    if analyzer != Analyzer::Plain {
+        out.extend_from_slice(&[0, 1, analyzer.byte()]);
+    }
     put_varint(&mut out, rows.len());
     for (i, (key, value)) in rows.iter().enumerate() {
         let mut tf: BTreeMap<String, usize> = BTreeMap::new();
         let mut len = 0;
-        for t in terms(&String::from_utf8_lossy(value)) {
+        for t in terms_with(&String::from_utf8_lossy(value), analyzer) {
             *tf.entry(t).or_default() += 1;
             len += 1;
         }
@@ -75,6 +130,11 @@ fn encode(rows: &[(String, Vec<u8>)]) -> Vec<u8> {
 }
 
 fn decode(mut b: &[u8]) -> Option<Bm25> {
+    let mut analyzer = Analyzer::Plain;
+    if let [0, 1, a, rest @ ..] = b {
+        analyzer = Analyzer::from_byte(*a)?;
+        b = rest;
+    }
     let b = &mut b;
     let take = |b: &mut &[u8], n: usize| -> Option<String> {
         let (s, rest) = (b.get(..n)?, b.get(n..)?);
@@ -106,15 +166,32 @@ fn decode(mut b: &[u8]) -> Option<Bm25> {
         lens,
         avg,
         postings,
+        analyzer,
+        weights: (K1, B),
     })
 }
 
 impl Bm25 {
+    /// The same index scoring with `k1` and `b` in place of `K1` and `B`
+    /// (E349, off by default). Query time only: the stored index is the
+    /// same. On E344's PyPI READMEs, `with_weights(1.2, 0.9)` (stronger
+    /// length normalization) found known items better (nDCG@10 +0.030 dev,
+    /// +0.039 test) and topics a little worse (-0.011, -0.008).
+    pub fn with_weights(mut self, k1: f32, b: f32) -> Self {
+        self.weights = (k1, b);
+        self
+    }
+
+    /// The `(k1, b)` this index scores with.
+    pub fn weights(&self) -> (f32, f32) {
+        self.weights
+    }
+
     /// The `k` best rows for `query`, best first, ties by key.
     pub fn search(&self, query: &str, k: usize) -> Vec<(String, f32)> {
         let n = self.rows.len() as f32;
         let mut seen = std::collections::HashSet::new();
-        let lists: Vec<&Vec<(u32, u32)>> = terms(query)
+        let lists: Vec<&Vec<(u32, u32)>> = terms_with(query, self.analyzer)
             .filter_map(|t| self.postings.get(&t).filter(|_| seen.insert(t.clone())))
             .collect();
         // E338: sums in a dense array when the query touches enough rows,
@@ -141,13 +218,14 @@ impl Bm25 {
             let idf = (1.0 + (n - df + 0.5) / (df + 0.5)).ln();
             for &(row, tf) in list.iter() {
                 let (tf, dl) = (tf as f32, self.lens[row as usize] as f32);
-                let norm = K1 * (1.0 - B + B * dl / self.avg.max(1.0));
+                let (k1, b) = self.weights;
+                let norm = k1 * (1.0 - b + b * dl / self.avg.max(1.0));
                 let s = score.slot(row);
                 // Every term adds more than 0 (idf > 0, tf >= 1).
                 if *s == 0.0 {
                     hit.push(row);
                 }
-                *s += idf * tf * (K1 + 1.0) / (tf + norm);
+                *s += idf * tf * (k1 + 1.0) / (tf + norm);
             }
         }
         hit
@@ -182,8 +260,18 @@ impl Bm25 {
 impl<S: Store> Repo<S> {
     /// A BM25 index of the rows of `db` under `prefix`, stored as content.
     pub fn bm25_build(&mut self, db: &Db, prefix: &str) -> Result<Id, Error> {
+        self.bm25_build_with(db, prefix, Analyzer::Plain)
+    }
+
+    /// `bm25_build` with terms cut by `analyzer` (E344).
+    pub fn bm25_build_with(
+        &mut self,
+        db: &Db,
+        prefix: &str,
+        analyzer: Analyzer,
+    ) -> Result<Id, Error> {
         let rows = self.db_prefix(db, prefix, usize::MAX, false)?;
-        self.put_derived(&encode(&rows))
+        self.put_derived(&encode(&rows, analyzer))
     }
 
     pub fn bm25_load(&self, id: &Id) -> Result<Bm25, Error> {
@@ -622,6 +710,8 @@ mod tests {
             lens,
             avg,
             postings,
+            analyzer: Analyzer::Plain,
+            weights: (K1, B),
         };
         let n = bm.rows.len() as f32;
         for query in ["t1", "t2 t3 t2", "t0 t5 t9 t13 t19"] {
