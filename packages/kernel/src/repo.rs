@@ -874,8 +874,14 @@ impl<S: Store> Repo<S> {
         Err(err)
     }
 
-    /// Keep checked content `bytes` of `id`, if `read_cache` is on.
-    fn cache_put(&self, id: &Id, bytes: &[u8]) {
+    /// What `read_cache` keeps for `id`, if anything (E346).
+    pub(crate) fn cache_get(&self, id: &Id) -> Option<Vec<u8>> {
+        self.cache.lock().unwrap().map.get(id).cloned()
+    }
+
+    /// Keep checked content `bytes` of `id`, if `read_cache` is on. E346:
+    /// also a graph chunk's checked encoding, under its object id.
+    pub(crate) fn cache_put(&self, id: &Id, bytes: &[u8]) {
         let limit = self.read_cache;
         if limit == 0 || bytes.len() > limit {
             return;

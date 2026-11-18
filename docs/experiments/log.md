@@ -5439,3 +5439,23 @@ Gates on the branch (E229 to E233): every kernel test suite passes (release); cl
 - Verdict: **measured.** For a store of many small rows (a vector or search index's rows, which E334's rescore reads 50 at a time), the pack is the store to use: point reads as fast as memory and a quarter of the disk; files add about 12 µs a row. The chunks the cache does not keep are next (E346).
 - Not measured: a cold page cache (dropping it needs privileges this machine does not give); the key-value backends (behind cargo features); Apple file systems, whose open and close costs differ.
 - Run: `STORE=fs STORE_DIR=/path/to/empty-dir cargo run --release --example point_reads -- 100000` (and `STORE=pack`, and no `STORE` for memory).
+### E346 chunk-cache (the read cache keeps graph chunks too)
+- Branch / parent: exp/346-chunk-cache / exp/345-fs-point-reads (E345)
+- Question: with E294's read cache on, a point read still read 3 objects from the store (E345): the graph chunks from the database's root down to the row, which the cache does not keep because it keeps contents only. On files that is about 6 of a read's 20 µs. What does keeping chunks too save?
+- Hypothesis: a chunk is immutable and checked against its id when read, like a content, so the same cache can keep its checked encoding under its object id and a repeated walk reads nothing from the store; the walk's decode and scan (E335) then is most of what is left. (Source: E345; E294; E335.)
+- Change: `src/graph.rs` `graph_encoded` (every chunk read: walks, scans, edits) serves and fills the read cache when `read_cache` is on; `src/repo.rs` `cache_get`. Off by default, as the cache is; chunks count toward its byte limit and gc empties them with the rest. Test `kept_chunks_answer_walks_as_the_store` (every version, with and without the cache, read twice).
+- Result (E345's run: 100,000 rows of 1,024-byte values, 2,000 random keys, the cache's second pass; a 4-core cloud machine). Microseconds a row, store's share in brackets:
+
+  | Read | Memory, E294 | Memory, E346 | Files, E294 | Files, E346 | Pack, E294 | Pack, E346 |
+  |---|---|---|---|---|---|---|
+  | `graph_node` | 13.9 (0.7) | **7.4** (0) | 19.5 (5.6) | **8.0** (0) | 13.6 (0.8) | **8.1** (0) |
+  | `db_get` | 14.0 (0.7) | **8.1** (0) | 20.6 (5.7) | **10.2** (0) | 14.7 (0.9) | **8.7** (0) |
+  | `graph_nodes_in` x50 | 13.7 (0.6) | 11.0 (0) | 21.1 (3.6) | 11.6 (0) | 16.1 (0.6) | 12.9 (0) |
+
+  - Objects read from the store a row: 3 to 0 (1.2 to 0 for the batch).
+  - In memory the gain is more than the store's share (0.7 µs of 6.5 saved): reading a chunk also decompresses it and hashes it to check it, and a kept chunk skips both.
+  - With the default cache forced to 64 MB for a check, every test passes but the same three as for E294 (`checked_raw_reads_check_their_crc`, `derivations_heal_a_corrupt_copy`, `derivation_cycles_are_errors`), each of which damages or removes stored files behind the repo after reading them.
+- Trade-off: memory, inside the limit the caller sets, as before. A chunk kept before the store was damaged still reads right, as a kept content does.
+- Verdict: **kept** (inside the existing `read_cache` option, off by default). With the cache on, one row by key now costs about 8 µs from memory, files or a pack alike, against 25 to 38 µs with no cache: the store no longer matters for repeated reads.
+- Not measured: how much of the cache chunks take at a given size (the example does not report the cache's contents); a cold page cache; writes with the cache on (edits read chunks through the same path, and the suite with the cache forced on checks they store the same bytes).
+- Run: `CACHE=1 STORE=fs STORE_DIR=/path/to/empty-dir cargo run --release --example point_reads -- 100000` (and `STORE=pack`, and memory).

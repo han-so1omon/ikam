@@ -22,8 +22,8 @@ use std::collections::BTreeSet;
 use std::rc::Rc;
 use std::time::Instant;
 
-use ikam_kernel::vectors::from_f32s;
 use ikam_kernel::backends::PackStore;
+use ikam_kernel::vectors::from_f32s;
 use ikam_kernel::{Error, Event, FsStore, Id, MemStore, Repo, Store};
 
 /// Reads, bytes and nanoseconds of the store's own reads.
