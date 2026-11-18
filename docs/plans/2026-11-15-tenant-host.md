@@ -7,7 +7,7 @@ when authorized. Else graphs are completely separate."
 
 This note is the generic design for the kernel and its server. Which
 services are projects, and where they run, are deployment choices kept
-outside this repository. Nothing here is built yet.
+outside this repository. Shares (E315 to E318) and the host (E313, E314) are built and opt-in; E342 to E345 are not.
 
 ## Where it starts
 
