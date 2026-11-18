@@ -83,6 +83,16 @@ fn main() {
         if base.is_empty() {
             base = scores.clone();
         }
+        // E349: `PERQ=path` writes each query's nDCG@10 for the paired
+        // comparisons of K1 and B settings (one line a query, task first).
+        if let Ok(path) = std::env::var("PERQ")
+            && name == "none"
+        {
+            let lines: Vec<String> = (0..queries.len())
+                .map(|i| format!("{}\t{}\t{}", queries[i].0, queries[i].1, scores[i]))
+                .collect();
+            std::fs::write(path, lines.join("\n") + "\n").unwrap();
+        }
         let mut cells = Vec::new();
         for task in ["known", "topic"] {
             for split in ["dev", "test", "all"] {

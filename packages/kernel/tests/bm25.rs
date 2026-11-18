@@ -264,3 +264,29 @@ fn stemmed_index_matches_other_forms_and_plain_bytes_stay() {
     assert_eq!(keys(&plural, "query"), ["r/1"]);
     assert_eq!(keys(&plural, "indexing"), ["r/3"]);
 }
+
+#[test]
+fn weights_change_scores_only_when_set() {
+    let mut repo = Repo::new(MemStore::default());
+    let empty = repo.db_empty().unwrap();
+    let long = "alpha ".to_string() + &"filler ".repeat(200);
+    let events = vec![
+        Event::upsert("t/short", b"alpha beta", "a"),
+        Event::upsert("t/long", long.as_bytes(), "b"),
+    ];
+    let db = repo.db_append(&empty, &events).unwrap();
+    let id = repo.bm25_build(&db, "t/").unwrap();
+    let plain = repo.bm25_load(&id).unwrap();
+    assert_eq!(plain.weights(), (K1, B));
+    let same = repo.bm25_load(&id).unwrap().with_weights(K1, B);
+    assert_eq!(plain.search("alpha", 10), same.search("alpha", 10));
+    // No length normalization: both rows hold "alpha" once, so they tie.
+    let flat = repo.bm25_load(&id).unwrap().with_weights(K1, 0.0);
+    let hits = flat.search("alpha", 10);
+    assert_eq!(hits[0].1, hits[1].1);
+    // Full normalization pushes the long row further down than B does.
+    let full = repo.bm25_load(&id).unwrap().with_weights(K1, 1.0);
+    let gap = |h: &[(String, f32)]| h[0].1 - h[1].1;
+    assert_eq!(full.search("alpha", 10)[0].0, "t/short");
+    assert!(gap(&full.search("alpha", 10)) > gap(&plain.search("alpha", 10)));
+}
