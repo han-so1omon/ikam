@@ -47,6 +47,8 @@ pub struct Ivf {
     pub lists: Id,
     pub nlist: usize,
     pub dim: usize,
+    /// How rows were assigned to lists (E343); updates assign the same way.
+    pub assign: Assign,
 }
 
 pub fn to_f32s(b: &[u8]) -> Vec<f32> {
@@ -154,23 +156,83 @@ mod avx2 {
     }
 }
 
-fn nearest(cents: &[f32], dim: usize, v: &[f32]) -> usize {
-    (0..cents.len() / dim)
-        .max_by(|&a, &b| {
-            dot(&cents[a * dim..][..dim], v).total_cmp(&dot(&cents[b * dim..][..dim], v))
-        })
-        .unwrap_or(0)
+/// How k-means and an IVF pick a vector's nearest centroid (E343).
+///
+/// The default scores with `dot`, as before E343. `lanes` scores with
+/// `dot_lanes` instead (faster, and the last bits can differ, so a row on
+/// the edge between two lists can land in the other one). `threads` above 1
+/// splits the rows between that many threads; it never changes a result.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Assign {
+    pub lanes: bool,
+    pub threads: usize,
+}
+
+/// The centroid of `cents` with the highest dot product with `v`, each
+/// scored once (E343). Ties go to the later centroid, as `max_by` gave
+/// before, so the result is the same as scoring each pair twice.
+fn nearest_by(cents: &[f32], dim: usize, v: &[f32], d: Dot) -> usize {
+    let mut best = (0, f32::NEG_INFINITY);
+    for (c, cent) in cents.chunks_exact(dim.max(1)).enumerate() {
+        let s = d(cent, v);
+        if c == 0 || s.total_cmp(&best.1).is_ge() {
+            best = (c, s);
+        }
+    }
+    best.0
+}
+
+fn nearest(cents: &[f32], dim: usize, v: &[f32], how: Assign) -> usize {
+    nearest_by(cents, dim, v, if how.lanes { dot_lanes } else { dot })
+}
+
+/// Each vector's nearest centroid, on `how.threads` threads.
+pub fn assign<V: AsRef<[f32]> + Sync>(
+    cents: &[f32],
+    dim: usize,
+    vs: &[V],
+    how: Assign,
+) -> Vec<usize> {
+    let threads = how.threads.clamp(1, vs.len().max(1));
+    if threads == 1 {
+        return vs
+            .iter()
+            .map(|v| nearest(cents, dim, v.as_ref(), how))
+            .collect();
+    }
+    let per = vs.len().div_ceil(threads);
+    std::thread::scope(|scope| {
+        let parts: Vec<_> = vs
+            .chunks(per)
+            .map(|part| {
+                scope.spawn(move || {
+                    part.iter()
+                        .map(|v| nearest(cents, dim, v.as_ref(), how))
+                        .collect::<Vec<_>>()
+                })
+            })
+            .collect();
+        parts
+            .into_iter()
+            .flat_map(|p| p.join().expect("assign thread"))
+            .collect()
+    })
 }
 
 /// `k` centroids from `sample` by spherical k-means (`iters` rounds), the
 /// first `k` sample vectors as the seeds.
 pub fn kmeans(sample: &[Vec<f32>], k: usize, iters: usize) -> Vec<f32> {
+    kmeans_with(sample, k, iters, Assign::default())
+}
+
+/// `kmeans` with its assignment step done as `how` says (E343). The sums
+/// are always added in sample order, so `threads` never changes a result.
+pub fn kmeans_with(sample: &[Vec<f32>], k: usize, iters: usize, how: Assign) -> Vec<f32> {
     let dim = sample.first().map_or(0, Vec::len);
     let mut cents: Vec<f32> = sample.iter().take(k).flatten().copied().collect();
     for _ in 0..iters {
         let mut sums = vec![0f32; cents.len()];
-        for v in sample {
-            let c = nearest(&cents, dim, v);
+        for (v, c) in sample.iter().zip(assign(&cents, dim, sample, how)) {
             for (s, x) in sums[c * dim..][..dim].iter_mut().zip(v) {
                 *s += x;
             }
@@ -199,9 +261,11 @@ impl<S: Store> Repo<S> {
         cents: &[f32],
         dim: usize,
         rows: &[(String, Vec<f32>)],
+        how: Assign,
     ) -> Result<Vec<Node>, Error> {
         let mut pack = Vec::with_capacity(rows.len() * dim);
-        let lists: Vec<usize> = rows.iter().map(|(_, v)| nearest(cents, dim, v)).collect();
+        let vs: Vec<&[f32]> = rows.iter().map(|(_, v)| v.as_slice()).collect();
+        let lists = assign(cents, dim, &vs, how);
         for (_, v) in rows {
             pack.extend(quantize(v));
         }
@@ -237,13 +301,27 @@ impl<S: Store> Repo<S> {
         cents: &[f32],
         dim: usize,
     ) -> Result<Ivf, Error> {
+        self.ivf_build_with(db, prefix, cents, dim, Assign::default())
+    }
+
+    /// `ivf_build`, rows assigned to lists as `how` says (E343). The index
+    /// remembers `how`, so `ivf_update` assigns the same way.
+    pub fn ivf_build_with(
+        &mut self,
+        db: &Db,
+        prefix: &str,
+        cents: &[f32],
+        dim: usize,
+        how: Assign,
+    ) -> Result<Ivf, Error> {
         let rows = self.vector_rows(&self.graph_prefix(&db.kv, prefix)?)?;
-        let nodes = self.ivf_nodes(cents, dim, &rows)?;
+        let nodes = self.ivf_nodes(cents, dim, &rows, how)?;
         Ok(Ivf {
             centroids: self.put_derived(&from_f32s(cents))?,
             lists: self.put_graph_with(nodes, Keys::Any)?,
             nlist: cents.len() / dim,
             dim,
+            assign: how,
         })
     }
 
@@ -263,14 +341,14 @@ impl<S: Store> Repo<S> {
                 continue;
             }
             if let Some(n) = before {
-                let c = nearest(&cents, ivf.dim, &to_f32s(&self.node_value(&n)?));
+                let c = nearest(&cents, ivf.dim, &to_f32s(&self.node_value(&n)?), ivf.assign);
                 edits.insert(list_label(c, &row), None);
             }
             if let Some(n) = after {
                 fresh.push((row, to_f32s(&self.node_value(&n)?)));
             }
         }
-        for n in self.ivf_nodes(&cents, ivf.dim, &fresh)? {
+        for n in self.ivf_nodes(&cents, ivf.dim, &fresh, ivf.assign)? {
             edits.insert(n.label.clone(), Some(n));
         }
         Ok(Ivf {

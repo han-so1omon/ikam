@@ -5397,3 +5397,23 @@ Gates on the branch (E229 to E233): every kernel test suite passes (release); cl
 - Not measured: a request rate limit per project (not built); spoofed `X-Forwarded-*` headers (the host reads none).
 - Verdict: **kept**, as part of E313.
 - Run: `cargo test --bin ikam host::`.
+### E343 kmeans-assign (k-means and the IVF scored every centroid twice)
+- Branch / parent: exp/343-kmeans-assign / main at 8e50f83 (E340)
+- Question: the assignment step behind `kmeans` and `ivf_build` (a vector's nearest centroid) ran about 11 times slower than scoring each centroid once with `dot_lanes` (E341's cloud check, on its branch). Where does the time go, and how much comes back without changing any result?
+- Hypothesis: `nearest` used `max_by` with a `dot` on both sides of each comparison, so every centroid was scored twice (2x for free), and `dot` is a sequential sum the compiler cannot vectorize (E327: 16 independent sums are many times faster, at the cost of the last bits). Assigning rows is independent work, so threads split it without changing anything. (Source: E341's cloud check; E327; E339.)
+- Change: `src/vectors.rs`: `nearest` scores each centroid once and keeps the later centroid on a tie, as `max_by` did, so it returns the same list. New `Assign { lanes, threads }` (default: neither), `assign` (each vector's list), `kmeans_with` and `ivf_build_with`. `Ivf` remembers its `assign`, so `ivf_update` assigns as the build did (a delete must find the list its row was put in). The sums of a round are always added in sample order, so threads never change a result. `kmeans` and `ivf_build` are unchanged in what they return. `examples/kmeans_assign.rs` (the old step copied in for timing and for the bit check); test `kmeans_assign_once_and_threads_match_old_bits` (with ties).
+- Result (clustered unit vectors, 256 dimensions, 512 topics of uneven weight as on real text (E331), sqrt(N) lists, a sample of 20 rows a list, 8 rounds; a 4-core cloud Xeon):
+
+  | Step | Old | Once (default) | Once, 4 threads | Lanes | Lanes, 4 threads |
+  |---|---|---|---|---|---|
+  | k-means, 100,000 rows (316 lists) | 3,637 ms | 1,890 | 528 | 330 | **103** |
+  | Assign 100,000 rows | 7,392 ms | 3,805 | 977 | 649 | **213** |
+  | k-means, 400,000 rows (632 lists) | 15,305 ms | 7,726 | 2,072 | 1,344 | **448** |
+  | Assign 400,000 rows | 60,034 ms | 29,525 | 8,021 | 5,163 | **1,327** |
+
+  - Once, with or without threads: the same centroid bits and every row in the same list as the old step.
+  - Lanes: the same centroid bits here (no sample row changed list in any round), and 1 of 100,000 and 5 of 400,000 rows in another list when all rows are assigned.
+- Trade-off: scoring once has none, so it is not an option. Lanes can move a row on the edge between two lists (5 in 400,000 here), so it is an option, off, as the loaded index's `with_lanes` is (E327). Threads change nothing but use more cores, so they are an option, off, as `HnswIndex::with_threads` is (E332).
+- Verdict: **kept.** Assigning 400,000 paragraph-sized rows (E330's 376,619 is this size) goes from a minute to 30 s by default, and to 1.3 s with lanes and 4 threads. Since the IVF is the index whose build and update are cheapest to re-run (E332: its 1% update costs 147 s against HNSW's 4.3 s at 376k, mostly this step, inferred), its update cost should now be measured again.
+- Not measured: real vectors (no embedder on this machine tonight; E330's WordLlama vectors were not kept); an IVF's recall with lanes-trained centroids (the centroids came out identical here, so it would be the same on this data); a tighter compiled loop (E341's cloud check on its branch: clang's about twice as fast as `kernel-once`); Apple silicon.
+- Run: `cargo run --release --example kmeans_assign -- 100000 256 4` and `-- 400000 256 4`.
