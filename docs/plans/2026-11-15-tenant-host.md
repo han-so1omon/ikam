@@ -120,10 +120,10 @@ when each starts.
 | E316 | Does a scoped merge copy exactly and merge again cleanly? | byte-exact copy with provenance, incremental re-merge, conflicts reported, proposal branches |
 | E317 | Do revoke and expiry take effect at once? | reads, proposals and merges refused from the next request; merged copies read back and pass fsck |
 | E318 | Can search through a share leak? | no hit outside the scope, with near-identical text just outside it |
-| E319 | Does one project slow or break another? | import, repack and damage in A; B's p99 and uptime, with and without the job queue |
-| E320 | Are limits enforced per project? | 413, 507 and 429 at the set sizes and rates, other projects unaffected |
-| E321 | What does firing over HTTP cost? | net firing remote vs in-process (E293), with leases and beats (E303, E304) |
-| E322 | Can a project be backed up while it serves? | snapshot time, byte-exact restore, write latency during it |
+| E342 | Does one project slow or break another? | import, repack and damage in A; B's p99 and uptime, with and without the job queue |
+| E343 | Are limits enforced per project? | 413, 507 and 429 at the set sizes and rates, other projects unaffected |
+| E344 | What does firing over HTTP cost? | net firing remote vs in-process (E293), with leases and beats (E303, E304) |
+| E345 | Can a project be backed up while it serves? | snapshot time, byte-exact restore, write latency during it |
 
 Gates as for every experiment: byte-exact reads, search equal to a scan,
 clean fsck, in every project.
