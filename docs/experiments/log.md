@@ -5550,3 +5550,72 @@ Gates on the branch (E229 to E233): every kernel test suite passes (release); cl
 - Verdict: **measured**. A corpus-made LSA model is no stand-in for a trained embedder for known-item search; E349's weights alone do as well as LSA fusion. It may help topic search through RRF, within error here. The kernel's vector index and fusion handle it as they do WordLlama's vectors.
 - Not measured: paired differences; a trained model on this sample (none installed on this machine); LSA dimensions other than 256.
 - Run: `python3 -I experiments/real-text/lsa.py DIR`, then `cargo run --release --example hybrid_kernel -- DIR`.
+### E347 match-tunables (the matcher's shortest match and the template's gap limit, pilot first)
+- Branch / parent: exp/347-match-tunables / main (8e50f83)
+- Question: E322 found `GAP_DIFF` 256 and 4096 and `MIN_MATCH` 48 passing the keep rule (north -0.7% to -1.0%) as a side result, scored once each. Do they hold up when rerun on their own, does combining them add, and which way does each one trend?
+- Hypothesis: a shorter shortest match lets more repeated spans become slices; the 96-byte floor was set from the raw size of two slice entries, which may overstate what a slice costs once stored. (Source: E322; `src/matcher.rs`.)
+- Method (E322's loop): seven candidates built in release; north/multiformat alone as the pilot, stopping a candidate more than 1% worse than base (E322's gate); then the full command (the 7 cost corpora and 3 north corpora; the 4 history corpora still cannot be built from the rewritten history) three times each, base twice a round, interleaved. Then the north corpora alone for a wider sweep (the north score is deterministic), and a second interleaved round of three full runs for `MIN_MATCH` 32 and 48. A 4-core cloud machine with nothing else running.
+- Result:
+  - Pilot: `GAP_DIFF` 512 (+1.7%) and 2048 (+1.1%) stopped; the other five went on.
+  - North score (base 0.30960; lower is better):
+
+    | `MIN_MATCH` | 32 | 48 | 64 | 80 | 96 (base) |
+    |---|---|---|---|---|---|
+    | North | **-1.16%** | -0.97% | -0.68% | +0.19% | 0 |
+
+    | `GAP_DIFF` | 128 | 256 | 512 | 1024 (base) | 2048 | 4096 | 8192 |
+    |---|---|---|---|---|---|---|---|
+    | North | -0.23% | -0.97% | -0.42% | 0 | -0.45% | -0.71% | -0.39% |
+
+  - `GAP_DIFF` 256 with `MIN_MATCH` 48: -0.42%, less than either alone.
+  - Almost all of the change is north/cases (`MIN_MATCH` 32: -3.4%); north/multiformat and north/tables do not move with `MIN_MATCH`.
+  - Cost score: every variant's runs fall inside base's own spread (3.9% in the first round, 7.3% in the second; the office corpus alone moves up to 30% between base runs). The cost corpora's stored bytes (`repack`) are identical, byte for byte, for every variant and every run; only their timings differ, and those are within noise. So on this bench both tunables change only the north corpora's sizes.
+  - north/cases stored split by type (`kernel_split`, not part of the score) goes the other way: 388,346 to 390,631 bytes (+0.6%) at 32 and at 48.
+  - `small_edit_stores_little` bounded an edit by `4 * MIN_MATCH`; the edit costs 177 bytes at both 96 and 32, so the bound now states its old value, 384 bytes, instead of following the constant.
+- Change: `MIN_MATCH` 96 to 32 (the seed window, `SEED`, below which the matcher finds nothing); `GAP_DIFF` stays 1024.
+- Trade-off: none measured on this bench. More, shorter slices could cost reads or stored bytes on the history corpora, where the matcher does most of its work; those were not run.
+- Verdict: **kept** for `MIN_MATCH` 32 (north -1.16% beyond the 0.5% tolerance; cost holds, with stored bytes unchanged). `GAP_DIFF`: **measured**, unchanged: every value tried beats 1024, but with no trend (256 and 4096 best, 512 and 2048 worse than both, 128 nearly flat), which reads as a few north/cases files sitting on a threshold rather than a better setting (inferred).
+- Not measured: the four history corpora (needs a clone with the old history); reads and search of slice-heavy content.
+- Run: the drivers are E322's `experiments/pilot-runs/drive.py` pattern; `cargo run --release --example bench -- --json north` for the sweep.
+
+### E348 matcher-density (candidates a seed and anchor density, after E347)
+- Branch / parent: exp/348-matcher-density / exp/347-match-tunables (E347)
+- Question: with the shortest match down to 32 bytes (E347), does the matcher now gain from keeping more candidates a seed (`MAX_CANDIDATES`, 4) or from denser or sparser anchors (`ANCHOR_SHIFT`, 58: one anchor in 64 positions)?
+- Hypothesis: shorter matches make more of a file matchable, so more candidates or more anchors could find spans that 4 candidates and 1 in 64 anchors miss. (Source: E347; `src/matcher.rs`.)
+- Result (the north corpora alone, `cargo run --release --example bench -- --json north`; the north score is deterministic, so one run each; lower is better):
+
+  | Variant | North | north/cases | north/multiformat | north/tables |
+  |---|---|---|---|---|
+  | E347 (4 candidates, 1 in 64) | **0.3060** | 0.4615 | 0.2953 | 0.2103 |
+  | 2 candidates | 0.3074 | 0.4635 | 0.3014 | 0.2079 |
+  | 8 candidates | 0.3094 | 0.4751 | 0.2984 | 0.2089 |
+  | 16 candidates | 0.3098 | 0.4716 | 0.3017 | 0.2089 |
+  | Anchors 1 in 128 (57) | 0.3307 | 0.4765 | 0.3033 | 0.2503 |
+  | Anchors 1 in 32 (59) | 0.3123 | 0.4719 | 0.2999 | 0.2153 |
+  | Anchors 1 in 16 (60) | 0.3088 | 0.4630 | 0.2914 | 0.2183 |
+
+  - Every variant is worse than E347's settings; more candidates are worse, not better.
+  - Denser anchors (1 in 16) make north/multiformat 1.3% smaller and north/tables 3.8% larger.
+- Verdict: **measured**, no change: at E347's shortest match, 4 candidates and one anchor in 64 positions are the best of those tried. More candidates being worse suggests the matcher's first candidates are its best and the extra ones crowd them out (inferred, not traced).
+- Not measured: the cost corpora (these constants could change their sizes and timings, unlike E347's); the history corpora.
+
+### E350 template-budget (the template's alignment settings, after E347)
+- Branch / parent: exp/350-template-budget / exp/348-matcher-density (E348)
+- Question: E347 found every `GAP_DIFF` beating 1024 with no trend, and guessed a threshold effect. Is the alignment work budget (`ALIGN_WORK`, 256 KiB) what makes it erratic, and do the template's other constants (`HOLE_COST` 8, `SEED_POSITIONS` 8) have room, now that the shortest match is 32 bytes?
+- Hypothesis: larger gaps use up the budget sooner, so `GAP_DIFF` and `ALIGN_WORK` interact; raising the budget would smooth `GAP_DIFF`'s curve. (Source: E347; `src/template.rs`.)
+- Result (the north corpora alone; deterministic; base is E347 at 0.3060):
+
+  | Variant | North | north/cases | north/multiformat | north/tables |
+  |---|---|---|---|---|
+  | E347 | **0.3060** | 0.4615 | 0.2953 | 0.2103 |
+  | `ALIGN_WORK` 64 KiB, 1 MiB, 4 MiB | 0.3060 | 0.4615 | 0.2953 | 0.2103 |
+  | `HOLE_COST` 4 / 16 / 32 | 0.3110 / 0.3131 / 0.3116 | 0.4717 / 0.4713 / 0.4736 | 0.3017 / 0.3017 / 0.3028 | 0.2114 / 0.2158 / 0.2111 |
+  | `SEED_POSITIONS` 2 / 32 | 0.3084 / 0.3060 | 0.4615 / 0.4615 | 0.3022 / 0.2953 | 0.2103 / 0.2103 |
+  | `GAP_DIFF` 4096, 4 MiB budget | 0.3065 | 0.4572 | 0.2969 | 0.2120 |
+  | `GAP_DIFF` 256, 4 MiB budget | 0.3071 | 0.4662 | 0.2936 | 0.2117 |
+
+  - The budget never binds on these corpora: 64 KiB to 4 MiB give the same bytes. The hypothesis is refuted.
+  - With E347's shortest match, `GAP_DIFF` 4096 and 256 no longer help (both worse than 1024), so most of what they gained in E347 is the same spans a shorter match now finds (inferred from the sizes).
+  - `HOLE_COST` 8 and `SEED_POSITIONS` 8 are the best tried.
+- Verdict: **refuted** (the budget hypothesis); no change. The template's constants are at a local best after E347.
+- Not measured: the cost and history corpora.
