@@ -5597,3 +5597,24 @@ Gates on the branch (E229 to E233): every kernel test suite passes (release); cl
   - Denser anchors (1 in 16) make north/multiformat 1.3% smaller and north/tables 3.8% larger.
 - Verdict: **measured**, no change: at E347's shortest match, 4 candidates and one anchor in 64 positions are the best of those tried. More candidates being worse suggests the matcher's first candidates are its best and the extra ones crowd them out (inferred, not traced).
 - Not measured: the cost corpora (these constants could change their sizes and timings, unlike E347's); the history corpora.
+
+### E350 template-budget (the template's alignment settings, after E347)
+- Branch / parent: exp/350-template-budget / exp/348-matcher-density (E348)
+- Question: E347 found every `GAP_DIFF` beating 1024 with no trend, and guessed a threshold effect. Is the alignment work budget (`ALIGN_WORK`, 256 KiB) what makes it erratic, and do the template's other constants (`HOLE_COST` 8, `SEED_POSITIONS` 8) have room, now that the shortest match is 32 bytes?
+- Hypothesis: larger gaps use up the budget sooner, so `GAP_DIFF` and `ALIGN_WORK` interact; raising the budget would smooth `GAP_DIFF`'s curve. (Source: E347; `src/template.rs`.)
+- Result (the north corpora alone; deterministic; base is E347 at 0.3060):
+
+  | Variant | North | north/cases | north/multiformat | north/tables |
+  |---|---|---|---|---|
+  | E347 | **0.3060** | 0.4615 | 0.2953 | 0.2103 |
+  | `ALIGN_WORK` 64 KiB, 1 MiB, 4 MiB | 0.3060 | 0.4615 | 0.2953 | 0.2103 |
+  | `HOLE_COST` 4 / 16 / 32 | 0.3110 / 0.3131 / 0.3116 | 0.4717 / 0.4713 / 0.4736 | 0.3017 / 0.3017 / 0.3028 | 0.2114 / 0.2158 / 0.2111 |
+  | `SEED_POSITIONS` 2 / 32 | 0.3084 / 0.3060 | 0.4615 / 0.4615 | 0.3022 / 0.2953 | 0.2103 / 0.2103 |
+  | `GAP_DIFF` 4096, 4 MiB budget | 0.3065 | 0.4572 | 0.2969 | 0.2120 |
+  | `GAP_DIFF` 256, 4 MiB budget | 0.3071 | 0.4662 | 0.2936 | 0.2117 |
+
+  - The budget never binds on these corpora: 64 KiB to 4 MiB give the same bytes. The hypothesis is refuted.
+  - With E347's shortest match, `GAP_DIFF` 4096 and 256 no longer help (both worse than 1024), so most of what they gained in E347 is the same spans a shorter match now finds (inferred from the sizes).
+  - `HOLE_COST` 8 and `SEED_POSITIONS` 8 are the best tried.
+- Verdict: **refuted** (the budget hypothesis); no change. The template's constants are at a local best after E347.
+- Not measured: the cost and history corpora.
