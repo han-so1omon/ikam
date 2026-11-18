@@ -5322,3 +5322,30 @@ Gates on the branch (E229 to E233): every kernel test suite passes (release); cl
 - Verdict: **kept** (`score_many`; no option needed). The best full hybrid search measured (best paragraph plus whole README fused with BM25, E330) now answers in about 1.6 ms with codes and 2.7 ms with f32 vectors, against 68 ms with exact scans (E333).
 - Not measured: other distances ahead (only 4 and 8); Apple silicon, where there is no prefetch here yet (Rust's is unstable on aarch64), so only the one-pass gain applies.
 - Run: `MANY=1 THREADS=4 cargo run --release --example hybrid_graph -- DIR` (and `CODES=1`, `HOT=1`); for "no read-ahead" and "4 ahead" the distance in `score_many` changed by hand.
+
+### E347 match-tunables (the matcher's shortest match and the template's gap limit, pilot first)
+- Branch / parent: exp/347-match-tunables / main (8e50f83)
+- Question: E322 found `GAP_DIFF` 256 and 4096 and `MIN_MATCH` 48 passing the keep rule (north -0.7% to -1.0%) as a side result, scored once each. Do they hold up when rerun on their own, does combining them add, and which way does each one trend?
+- Hypothesis: a shorter shortest match lets more repeated spans become slices; the 96-byte floor was set from the raw size of two slice entries, which may overstate what a slice costs once stored. (Source: E322; `src/matcher.rs`.)
+- Method (E322's loop): seven candidates built in release; north/multiformat alone as the pilot, stopping a candidate more than 1% worse than base (E322's gate); then the full command (the 7 cost corpora and 3 north corpora; the 4 history corpora still cannot be built from the rewritten history) three times each, base twice a round, interleaved. Then the north corpora alone for a wider sweep (the north score is deterministic), and a second interleaved round of three full runs for `MIN_MATCH` 32 and 48. A 4-core cloud machine with nothing else running.
+- Result:
+  - Pilot: `GAP_DIFF` 512 (+1.7%) and 2048 (+1.1%) stopped; the other five went on.
+  - North score (base 0.30960; lower is better):
+
+    | `MIN_MATCH` | 32 | 48 | 64 | 80 | 96 (base) |
+    |---|---|---|---|---|---|
+    | North | **-1.16%** | -0.97% | -0.68% | +0.19% | 0 |
+
+    | `GAP_DIFF` | 128 | 256 | 512 | 1024 (base) | 2048 | 4096 | 8192 |
+    |---|---|---|---|---|---|---|---|
+    | North | -0.23% | -0.97% | -0.42% | 0 | -0.45% | -0.71% | -0.39% |
+
+  - `GAP_DIFF` 256 with `MIN_MATCH` 48: -0.42%, less than either alone.
+  - Almost all of the change is north/cases (`MIN_MATCH` 32: -3.4%); north/multiformat and north/tables do not move with `MIN_MATCH`.
+  - Cost score: every variant's runs fall inside base's own spread (3.9% in the first round, 7.3% in the second; the office corpus alone moves up to 30% between base runs). The cost corpora's stored bytes (`repack`) are identical, byte for byte, for every variant and every run; only their timings differ, and those are within noise. So on this bench both tunables change only the north corpora's sizes.
+  - `small_edit_stores_little` bounded an edit by `4 * MIN_MATCH`; the edit costs 177 bytes at both 96 and 32, so the bound now states its old value, 384 bytes, instead of following the constant.
+- Change: `MIN_MATCH` 96 to 32 (the seed window, `SEED`, below which the matcher finds nothing); `GAP_DIFF` stays 1024.
+- Trade-off: none measured on this bench. More, shorter slices could cost reads or stored bytes on the history corpora, where the matcher does most of its work; those were not run.
+- Verdict: **kept** for `MIN_MATCH` 32 (north -1.16% beyond the 0.5% tolerance; cost holds, with stored bytes unchanged). `GAP_DIFF`: **measured**, unchanged: every value tried beats 1024, but with no trend (256 and 4096 best, 512 and 2048 worse than both, 128 nearly flat), which reads as a few north/cases files sitting on a threshold rather than a better setting (inferred).
+- Not measured: the four history corpora (needs a clone with the old history); reads and search of slice-heavy content.
+- Run: the drivers are E322's `experiments/pilot-runs/drive.py` pattern; `cargo run --release --example bench -- --json north` for the sweep.
