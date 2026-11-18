@@ -19,9 +19,11 @@ use crate::Id;
 pub(crate) const SEED: usize = 32;
 /// An anchor follows ~1 in 64 positions (top 6 gear-hash bits zero).
 const ANCHOR_SHIFT: u32 = 58;
-/// Shortest match worth a slice: one slice entry (48 B) plus the extra entry
-/// needed to resume the literal run.
-pub const MIN_MATCH: usize = 96;
+/// Shortest match kept as a slice: the seed window. E347: below the 96 bytes
+/// one slice entry and the entry resuming the literal run would take raw,
+/// a slice still pays on the north corpora (1.2% smaller; the other
+/// corpora's stored bytes are unchanged).
+pub const MIN_MATCH: usize = SEED;
 /// Candidates kept per seed; bounds work on highly repetitive input.
 const MAX_CANDIDATES: usize = 4;
 
