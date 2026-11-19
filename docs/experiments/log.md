@@ -5619,3 +5619,26 @@ Gates on the branch (E229 to E233): every kernel test suite passes (release); cl
   - `HOLE_COST` 8 and `SEED_POSITIONS` 8 are the best tried.
 - Verdict: **refuted** (the budget hypothesis); no change. The template's constants are at a local best after E347.
 - Not measured: the cost and history corpora.
+
+### E353 history-min-match (E347's 32-byte shortest match on the four history corpora)
+- Branch / parent: exp/353-history-min-match / main (cf0e237, E347 merged)
+- Question: E347 made the shortest match 32 bytes (`MIN_MATCH` = `SEED`) from the north corpora and the cost corpora without history, and left the four history corpora unrun, though the matcher does most of its work there. Do they hold?
+- Hypothesis: more, shorter slices could cost stored bytes or reads on repo-history, repo-graph, structured and transcripts. (Source: E347's trade-off line; `src/matcher.rs`.)
+- Benchmark fix: the history corpora were pinned to 6cd6921 and 0ca74e4, which the history rewrite removed, so they could not be built from any clone (E347, E349). The bench now pins them to 5850f9a and e4137ab, the commits at the same places (9 and 38 commits from the root). The rebuilt corpora match a run of main on the old history: repo-graph, structured and transcripts have the same input bytes, stored bytes and baselines as before the rewrite; repo-history's input is 252 bytes smaller (text scrubbed in the rewrite) and its stored bytes 1,103 bytes smaller.
+- Method: the fixed command for the four history corpora only (`bench -- --json repo-history repo-graph structured transcripts`), `MIN_MATCH` 96 (E347's base) against 32 (main), three runs each, interleaved, on a 4-core cloud machine with nothing else running. Then the north corpora once each, to confirm the two builds differ (0.3096 and 0.3060, as in E347).
+- Result:
+
+  | Corpus | Stored after repack (96 and 32) | Ingest ms | Repack ms | Read ms | Search ms |
+  |---|---|---|---|---|---|
+  | repo-history | 6,710,832, identical | 87 / 88 | 6141 / 6013 | 1.34 / 1.33 | 0.77 / 0.79 |
+  | repo-graph | 95,215, identical | 56 / 52 | 43 / 39 | 3.13 / 3.02 | - |
+  | structured | 9,120,810, identical | 28 / 29 | 1919 / 1836 | 1.45 / 1.36 | 0.17 / 0.16 |
+  | transcripts | 3,646,238, identical | 11 / 13 | 1294 / 1293 | 0.66 / 0.72 | 0.35 / 0.35 |
+
+  - Times are medians of three (96 / 32). Every pair of ranges overlaps: repo-history repack 5994-6161 against 5640-6336 ms, transcripts read 0.64-0.74 against 0.62-0.73 ms.
+  - Stored bytes after ingest and after repack, and the stored split by kind, are identical byte for byte in every run. Every file reconstructs exactly and passes fsck.
+  - Cost score over the four: 0.2389-0.2491 at 96, 0.2424-0.2489 at 32.
+- Change: none to the kernel. The bench's history pins (above).
+- Verdict: **measured**: the 32-byte shortest match holds on the history corpora; it changes none of their bytes and no time beyond noise, so E347's change stands with no trade-off found. Why nothing moves is not traced: the history corpora's repeats are presumably long (whole files and long spans between versions), so no match between 32 and 96 bytes is kept (inferred).
+- Not measured: the full command with all corpora together after the re-pin (each part was run, not the whole); `semantic/embed.py` still names the old pin and was not changed.
+- Run: `cargo run --release --example bench -- --json repo-history repo-graph structured transcripts`, with `MIN_MATCH` set to 96 in a worktree for the base.
