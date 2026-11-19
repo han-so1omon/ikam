@@ -109,15 +109,15 @@ fn synthetic_history() -> Vec<Snapshot> {
 /// commits from it back to the first. A shallow clone has none of them, or
 /// only the newest part of their history, and the corpora would come out
 /// empty or short.
-const PINNED: [(&str, usize); 2] = [("6cd6921", 9), ("0ca74e4", 38)];
+const PINNED: [(&str, usize); 2] = [("5850f9a", 9), ("e4137ab", 38)];
 
 /// The corpora read from this repository's git history, and the commit each
 /// is pinned to.
 const FROM_HISTORY: [(&str, &str); 4] = [
-    ("repo-history", "6cd6921"),
-    ("repo-graph", "0ca74e4"),
-    ("structured", "0ca74e4"),
-    ("transcripts", "0ca74e4"),
+    ("repo-history", "5850f9a"),
+    ("repo-graph", "e4137ab"),
+    ("structured", "e4137ab"),
+    ("transcripts", "e4137ab"),
 ];
 
 /// Why the selected corpora can't be built from this clone, if they can't:
@@ -175,7 +175,7 @@ fn repo_history() -> Vec<Snapshot> {
             .output()
             .unwrap()
     };
-    let commits = String::from_utf8(git(&["rev-list", "--reverse", "6cd6921"]).stdout).unwrap();
+    let commits = String::from_utf8(git(&["rev-list", "--reverse", "5850f9a"]).stdout).unwrap();
     commits
         .lines()
         .map(|c| {
@@ -208,7 +208,7 @@ fn repo_graph() -> Vec<Snapshot> {
     };
     let pattern = r"^\s*(from\s+[A-Za-z_][\w.]*\s+import|import\s+[A-Za-z_][\w.]*)|\]\([^)#[:space:]]+|^\s*(pub\s+)?mod\s+\w+;|use crate::\w+";
     let mut out = Vec::new();
-    for c in git(&["rev-list", "--reverse", "0ca74e4"]).lines() {
+    for c in git(&["rev-list", "--reverse", "e4137ab"]).lines() {
         let found = git(&[
             "grep",
             "-I",
@@ -241,7 +241,7 @@ fn repo_graph() -> Vec<Snapshot> {
 /// lines added and deleted) and a summary (`summary.json`: files and bytes
 /// per top-level directory). Real metadata, not the output of a short
 /// A coding agent's session log as it grows (since E055): the kernel's own
-/// sources pinned at 0ca74e4, plus a JSONL transcript of an agent reading
+/// sources pinned at e4137ab, plus a JSONL transcript of an agent reading
 /// them. Reads quote files as Read results do (line-numbered, JSON-escaped),
 /// whole or as 40-line ranges; searches quote matching lines. Every event
 /// carries a random id and its parent's, as real transcripts do. Snapshots
@@ -260,7 +260,7 @@ fn transcripts() -> Vec<Snapshot> {
         "ls-tree",
         "-r",
         "--name-only",
-        "0ca74e4",
+        "e4137ab",
         "packages/kernel/src",
     ])
     .lines()
@@ -268,7 +268,7 @@ fn transcripts() -> Vec<Snapshot> {
     .collect();
     let sources: Vec<(String, String)> = paths
         .iter()
-        .map(|p| (p.clone(), git(&["show", &format!("0ca74e4:{p}")])))
+        .map(|p| (p.clone(), git(&["show", &format!("e4137ab:{p}")])))
         .collect();
     let mut s = 0x0123_4567_89ab_cdefu64;
     let mut lcg = move || {
@@ -368,7 +368,7 @@ fn structured() -> Vec<Snapshot> {
             .unwrap();
         String::from_utf8(out.stdout).unwrap()
     };
-    let commits: Vec<String> = git(&["rev-list", "--reverse", "0ca74e4"])
+    let commits: Vec<String> = git(&["rev-list", "--reverse", "e4137ab"])
         .lines()
         .map(String::from)
         .collect();
