@@ -5683,3 +5683,41 @@ Gates on the branch (E229 to E233): every kernel test suite passes (release); cl
 - Verdict: **measured.** Holding: byte-exact storage and the bytes it saves (G2), trade-offs as options (G5), CPU execution modes (G6), separation (G7), privacy (G8). Gaps, largest first: the database's defaults (G4: a restarted server's first write grows with the store unless `--edit-index` is on, and append cost grows with table size); semantic search is not served (G3); sharing across file types saves 5% (G2); scoped merges and the host as a running service (G7); no tool interface for AI agents (G1).
 - Next (proposed, not started): make `--edit-index` and `--concurrent-reads` the `db serve` defaults or a single `--live` preset; a search route over E326's hybrid ranking; append cost against table size.
 - Run: `bench -- --json north`; `python3 experiments/goal-scorecard/db_first_write.py IKAM_BIN WORK 10000 2000` and `... 200000 2000 base,base+write-options`.
+
+### E355 service-stocktake (what the server lets a project use, against what the kernel can do)
+- Branch / parent: exp/354-goal-scorecard / E354
+- Question: E354 found the goals that fail. For the four uses the owner has named (a file service for AI tools; a project's whole record store; one service holding several separate projects; a cloud-hosted app using it), can ikam serve each today, what is missing, and what should be built first?
+- Method: read `src/lib.rs` and `src/bin/ikam/` on main d49ac2c and listed, for each kernel capability, whether any server route reaches it (`grep` for its functions under `src/bin/ikam/`). Sizes are from the code and E354's measurements; effort is a judgement (small: flags or one route; medium: a module of routes with tests; large: research).
+- Result: what each server exposes:
+  - `ikam live` / `serve`: WebDAV files, `/api/{status,search,commit,repack,gc,fsck}`, `/ask` (line numbers). Search is exact substring. Commits are made by the server ("live: N change(s)"); a client cannot name a message, read an earlier commit, or write to a branch over HTTP. History and versions are HTML pages only.
+  - `ikam db serve`: `append`, `get`, `scan`, `count`, `span`, `head`, reads `at=COMMIT`.
+  - `ikam host`: the above per project, plus share routes.
+  - Kernel capabilities on main that no route reaches: ranked keyword search kept by edits (`Bm25Live`, E329), vector indexes (`vectors`, E253; `hnsw`, E332), fused ranking (`fusion`, E326), kept views and joins (`views`, `join`, E242-E250), column blocks (E241), stable row ids (`db_insert`, E240), drafts as branches (`drafts`, E266), Petri nets of work (`net`, E269), verified derivations and WASM functions (`func`), the background integrator (E262), incremental repack (E268).
+  - So a client of the server gets files, exact search and a key-value log, and has to rebuild ranking, joins and aggregates itself (inferred cost: the client code E354's records test needed).
+
+  | Use | Today | Missing |
+  |---|---|---|
+  | File service for AI tools | partly: byte-exact files, versions, WebDAV, exact search, ask | a tool interface (no MCP or similar); ranked or semantic search over files; drafts, branches, commit messages and reads at a commit over HTTP |
+  | A project's whole record store | reads yes, with `--packs --plain-events --no-object-templates`; writes slow | write options off by default (E354: first write after restart 5.06 s at 200k rows, 0.11 s with them); append cost grows with the table (E354: 132 to 649-846 ms a batch); no served views, joins, row ids, ranked search, nets or derivations |
+  | Several separate projects in one service | partly: `ikam host` keeps them apart (E313, E314) and shares by scope (E315-E318) | not run as a service anywhere; no per-project rate limit or shared heavy-job queue; merges for folder and key-range scopes only; no vector search through a share |
+  | A cloud-hosted app | no | the host listens on 127.0.0.1 behind a private network; an app on a public cloud cannot reach it. Needs a public front door (the owner's decision) and, before that, per-project tokens and rate limits |
+
+- Proposed experiments, ranked by impact over effort (numbers reserved in the registry as `planned`):
+
+  | Rank | Id | What | Goal | Impact | Effort |
+  |---|---|---|---|---|---|
+  | 1 | E356 db-live-preset | `db serve --live` turning on `--packs --plain-events --no-object-templates --edit-index --concurrent-reads` together (or making them the defaults), with E354's test as its check | G4, G5 | high: removes the first-write stall | small |
+  | 2 | E357 append-scale | profile why an append's cost grows with the table (E354) and fix it; target: flat batch cost from 10k to 1M rows | G4 | high: writers can move onto ikam | medium, cause unknown |
+  | 3 | E358 served-search | `GET /db/NAME/search` (BM25 kept by appends), `POST /db/NAME/vsearch` (IVF or HNSW) and fused ranking, in `db serve` and `host`; files in `live` through fragment rows (E330) | G3 | high | medium |
+  | 4 | E359 agent-tools | `ikam mcp`: a stdio tool server over the same handlers (list, read a range, search, edit, commit with a message, diff, read at a commit, drafts) | G1 | high for AI tools | small to medium |
+  | 5 | E360 served-drafts | drafts, branches, commit messages and reads at a commit over HTTP in `live` and `host` (E266 is library only) | G1 | medium | small to medium |
+  | 6 | E361 served-views | kept views, joins and counts over `db serve`, so clients stop joining in their own code | G4 | medium | medium |
+  | 7 | E362 host-service | the host as a running service: per-project request rates, one heavy-job queue (repack, gc, index builds), memory and start time per project | G7 | medium | medium |
+  | 8 | E363 host-tokens | per-project scoped tokens and rate limits fit to put behind a public front door; the door itself is the owner's decision | G7, cloud apps | medium (blocks cloud apps) | small to medium |
+  | 9 | E364 embedder | an embedding source in the kernel (static token vectors, no model server), so semantic search works with no outside step; E352's LSA alone is weak (0.357) | G3 | medium | medium |
+  | 10 | E365 scoped-merge | merges for section, fragment and graph scopes (`NotMergeable` today) | G7 | low to medium | medium |
+  | 11 | E366 cross-type-sharing | raise sharing across file types (E354: 0.950) | G2 | low for these uses today (storage is the small part of cost) | large, research |
+
+- Change: none to the kernel; this entry and registry rows.
+- Verdict: **measured** (an inventory, not a score). The kernel already has most of what the four uses need; the server exposes little of it. The two first fixes are both on the database's write path (E356, E357); then serving search and a tool interface (E358, E359).
+- Not checked: E357's cause; whether the plan doc's follow-ups for the host (numbered E348-E351 when written, numbers since used by other experiments) overlap E362.
