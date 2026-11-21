@@ -5642,3 +5642,44 @@ Gates on the branch (E229 to E233): every kernel test suite passes (release); cl
 - Verdict: **measured**: the 32-byte shortest match holds on the history corpora; it changes none of their bytes and no time beyond noise, so E347's change stands with no trade-off found. Why nothing moves is not traced: the history corpora's repeats are presumably long (whole files and long spans between versions), so no match between 32 and 96 bytes is kept (inferred).
 - Not measured: the full command with all corpora together after the re-pin (each part was run, not the whole); `semantic/embed.py` still names the old pin and was not changed.
 - Run: `cargo run --release --example bench -- --json repo-history repo-graph structured transcripts`, with `MIN_MATCH` set to 96 in a worktree for the base.
+
+### E354 goal-scorecard (the project's stated goals, each as a measured test)
+- Branch / parent: exp/354-goal-scorecard / main (d49ac2c, E353)
+- Question: the log measures storage and speed one mechanism at a time. Measured against the goals the owner has stated for the project as a whole, which hold today on main and which do not?
+- Goals tested (owner's words unless marked): G1 a file service for projects that use AI to generate and change files; G2 one graph that reproduces every byte and stores shared information once, across file types (README); G3 semantic search; G4 the real database for projects, with a relational database kept only for comparisons; G5 optimizations with trade-offs are options; G6 execution modes judged on speed, utility, extensibility and portability; G7 projects separate by default, shared by scope when authorized; G8 nothing private in this public repository.
+- Method (4-core cloud machine; synthetic data only):
+  - G2: `bench -- --json north` on main.
+  - G4, G5: new `experiments/goal-scorecard/db_first_write.py`. `ikam db serve` on 127.0.0.1; a table of N rows with one index entry each, loaded in 2,000-row batches; the server is stopped and started again; then the first 2,000-row append into a new table, five more, and one into the big table. A client gives up after 120 s. Flag sets: none; base (`--packs --plain-events --no-object-templates`); base with the write options (`--edit-index --concurrent-reads`, E232).
+  - G7: `cargo test --release --test share` and the host tests in `src/bin/ikam`.
+  - G8: `.github/privacy/scan.py --all`.
+  - G1, G3, G6: earlier results (E133, E326, E351, E352, E311, E341, E342) and the routes in `src/bin/ikam`.
+- Result:
+
+  | Goal | Test | Result | Holds |
+  |---|---|---|---|
+  | G1 file service for AI | E133 goal pipeline; agent interface | E133: 9.22 GB read / 2.9 s with defaults, 554 MB / 0.87 s with options. Agents reach the store by WebDAV and `/api` only; no tool interface since the Python packages were removed | partly |
+  | G2 one graph | north score; `sharing_kernel` | north 0.306 (one graph is 31% of zstd with a trained dictionary); sharing 0.971 cases, 0.939 multiformat, 0.939 tables, 0.950 overall | bytes yes, cross-type sharing weak (5%) |
+  | G3 semantic search | what a server serves | the kernel has BM25, vectors, HNSW and fusion (E326 hybrid nDCG@10 0.82 against 0.805 keyword), but `live`, `serve` and `host` search is exact substring only; no route serves ranked or vector search | no |
+  | G4 database | first write after a restart, 120 s client | see the table below; base flags pass at 200k rows but the first write grows with the store (0.22 s at 10k, 5.06 s at 200k) | only with options |
+  | G5 trade-offs as options | defaults vs options | every trade-off is opt-in, as asked; but `db serve` with no flags is not usable as a database (4.4 s a batch at 10k rows), and the base flags pay a first-write cost the write options remove | yes, defaults weak |
+  | G6 execution modes | E311, E341, E342 | Cranelift within 8% of clang, compiles 40-180x faster, portable to five ISAs; MLIR adds nothing for these kernels; GPU through MLIR not measured | yes for CPU |
+  | G7 separate by default, shared by scope | share and host tests | 13 share tests and 9 host tests pass (Mac demo 22/22, E313). Merge works for folder and key-range scopes only; vector search through a share, a shared heavy-job queue and rate limits are not built; the host runs nowhere as a service | partly |
+  | G8 nothing private | privacy scan, whole tree | exit 0 | yes |
+
+  G4 detail (2,000-row batches; median of five later appends):
+
+  | Rows, flags | Load batch p50 | First write after restart | Later writes | Store |
+  |---|---|---|---|---|
+  | 10k, none | 4,412 ms | 2.70 s | 8,967 ms | 12.0 MB |
+  | 10k, base | 132 ms | 0.22 s | 130 ms | 14.1 MB |
+  | 10k, base + write options | 92 ms | 0.13 s | 131 ms | 14.1 MB |
+  | 200k, base | 649 ms | 5.06 s | 180 ms | 286.5 MB |
+  | 200k, base + write options | 846 ms | 0.11 s | 146 ms | 286.5 MB |
+
+  - With the write options the first write after a restart stays near 0.1 s at both sizes; with the base flags it grows with the store, 23x from 10k to 200k rows (one run each, so the trend is from two points). A client with a 120 s timeout would fail on a store a few GB in size if the growth is near linear (inferred, not measured).
+  - The load's batch cost also grows with the table, 132 to 649-846 ms, under both flag sets: appends get slower as a table grows.
+  - Times are one run each; Python tests ran beside the 200k load for about 30 s.
+- Change: none to the kernel. `experiments/goal-scorecard/db_first_write.py`.
+- Verdict: **measured.** Holding: byte-exact storage and the bytes it saves (G2), trade-offs as options (G5), CPU execution modes (G6), separation (G7), privacy (G8). Gaps, largest first: the database's defaults (G4: a restarted server's first write grows with the store unless `--edit-index` is on, and append cost grows with table size); semantic search is not served (G3); sharing across file types saves 5% (G2); scoped merges and the host as a running service (G7); no tool interface for AI agents (G1).
+- Next (proposed, not started): make `--edit-index` and `--concurrent-reads` the `db serve` defaults or a single `--live` preset; a search route over E326's hybrid ranking; append cost against table size.
+- Run: `bench -- --json north`; `python3 experiments/goal-scorecard/db_first_write.py IKAM_BIN WORK 10000 2000` and `... 200000 2000 base,base+write-options`.
