@@ -393,7 +393,10 @@ fn connection(
 }
 
 fn too_large_msg(max_body: Option<usize>) -> String {
-    format!("uploads are limited to {} bytes here", max_body.unwrap_or(0))
+    format!(
+        "uploads are limited to {} bytes here",
+        max_body.unwrap_or(0)
+    )
 }
 
 fn chunked(input: &mut BufReader<TcpStream>, max: Option<usize>) -> std::io::Result<Vec<u8>> {
@@ -548,7 +551,10 @@ mod tests {
             port,
             b"PUT /a HTTP/1.1\r\nHost: small\r\nContent-Length: 999999999\r\nExpect: 100-continue\r\n\r\n",
         );
-        assert!(r.starts_with("HTTP/1.1 413") && !r.contains("100 Continue"), "{r}");
+        assert!(
+            r.starts_with("HTTP/1.1 413") && !r.contains("100 Continue"),
+            "{r}"
+        );
     }
 
     #[test]

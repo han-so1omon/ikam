@@ -5784,13 +5784,61 @@ Gates on the branch (E229 to E233): every kernel test suite passes (release); cl
 - Next (proposed, not started): buffer index edits so a leaf is rewritten once for many entries (a small recent tree beside `kv`, merged in the background, E262's integrator), which needs every reader of `kv` (gets, ranges, `graph_diff` in views, BM25, vectors, joins) to read both; the 2 s first write after a restart on the plain store; per-chunk costs that do not change bytes (`node_size` encodes each node again to measure it; `merge` rebuilds a map of every touched chunk).
 - Run: `cargo run --release --example db_append_scale -- DIR 1000000 2000 index` (and with `plain-hot`, and without `index`); `python3 experiments/goal-scorecard/db_first_write.py IKAM_BIN WORK 200000 2000 base,live,live+plain-writes`.
 
+### E358 served-search (ranked, vector and fused search through `db serve`)
+- Branch / parent: exp/358-server-search / main (ccdf499, E357 merged)
+- Question: E354 and E355 found that the kernel ranks well (BM25, vectors, fusion: E324-E333) but no server route offers it, so a client gets exact matches or must scan rows and rank in its own code. Served from `db serve`, how good is ranked and semantic search on real text, what does a query cost, and what does keeping the indexes cost the server?
+- Hypothesis: routes over the kernel's own pieces rank as E326 did in process (BM25 about 0.80 on known items, convex fusion about +0.02), far above the substring matching a client can do today, at a few ms a query over HTTP; the cost is the index build on the first query and the memory to hold it. (Source: E324, E326, E329, E332, E355.)
+- Change: `src/bin/ikam/dbsearch.rs` and three routes in `db serve` (`dbserve.rs`):
+  - `GET /db/NAME/search?q=TEXT&prefix=P[&k=N]`: BM25 over the rows under P, kept by edits as a `Bm25Live` (E329; merged into its base past 5% of the rows, at least 1,000).
+  - `POST /db/NAME/vsearch?prefix=VP[&k=N]`: rows under VP hold unit vectors (f32, little endian); the body is the query vector (f32 or a JSON array). The server has no embedding model: the client embeds rows and queries (E364 is the planned in-kernel embedder). Exact scan by default; `--hnsw` (off) uses E332's graph (m 16, ef_build 100, ef 80, lanes).
+  - `POST /db/NAME/search?q=TEXT&prefix=P&vectors=VP[&alpha=A][&fuse=rrf]`: both lists (100 each) fused, convex with A on keywords (default `fusion::DEFAULT_ALPHA`, 0.5) or RRF k 60; row P+S and vector VP+S are the same item.
+  - Indexes are built on the first query of a database and prefix, kept in memory, and brought to the head on later queries from the `kv` diff (the BM25 update under the writer's lock, since it writes postings). Nothing is built for a prefix nobody searches; a restarted server builds again. Answers are at the head (no `at=`).
+  - Test `search_ranks_follows_appends_and_fuses` (with and without concurrent readers, exact and graph): ranking, rows outside the prefix left out, a changed and a removed row followed, the same answer as a server that builds at the head, vector and fused ranking, refusals. `cargo test --release`: 335 pass, 0 fail; clippy with `-D warnings` clean.
+  - `experiments/server-search/search_bench.py`.
+- Method: a fresh PyPI sample (exp/259's `fetch.py` over 40,000 names, `prepare.py`): 11,415 OSI-licensed READMEs (63.9 MB) as rows `t/NAME`, WordLlama l2_supercat whole-README vectors (256 dimensions) as `v/NAME`, loaded in 2,000-row batches into `db serve --live`; 1,000 known-item queries (a project's summary) and 148 topic queries (a Trove topic), split dev/test by a hash. Every query through HTTP on 127.0.0.1. The substring rankings are what a client can do today: `scan?prefix=t/` once, then the whole query, or every query word, as a case-insensitive substring, in key order. nDCG@10; differences are paired against BM25 with their standard error. A 4-core cloud machine; one run with exact vectors, one with `--hnsw`.
+- Result (nDCG@10 dev / test; difference against BM25 (se)):
+
+  | Ranking | Known items (489 / 511) | Topics (63 / 85) | Latency p50 / p95 |
+  |---|---|---|---|
+  | Whole query as a substring | 0.000 / 0.000 | 0.006 / 0.008 | scan 860 ms, then 38 ms matching |
+  | Every word as a substring | 0.238 / 0.207 | 0.030 / 0.037 | scan 860 ms, then 65 ms |
+  | BM25 (`search`) | 0.814 / 0.835 | 0.117 / 0.104 | 7.4 / 14.6 ms |
+  | Vectors, exact (`vsearch`) | 0.510 / 0.548 | 0.112 / 0.089 | 1.09 / 1.35 ms |
+  | Vectors, `--hnsw` | 0.454 / 0.492 | 0.111 / 0.087 | 0.69 / 0.98 ms |
+  | Convex 0.5 (default), exact | 0.799 / 0.820: -0.015 / -0.015 (0.009) | 0.133 / 0.129: +0.016 / +0.025 (0.011 / 0.009) | 8.6 / 17.1 ms |
+  | Convex 0.6, exact | 0.827 / 0.846: +0.013 / +0.011 (0.006 / 0.007) | 0.133 / 0.124: +0.015 / +0.020 (0.007 / 0.008) | 8.6 / 16.7 ms |
+  | Convex 0.7, exact | 0.828 / 0.853: +0.014 / +0.018 (0.005) | 0.127 / 0.119: +0.009 / +0.015 (0.004 / 0.006) | 8.4 / 16.0 ms |
+  | RRF k 60, exact | 0.721 / 0.747: -0.093 / -0.088 (0.014) | 0.131 / 0.129: +0.014 / +0.025 (0.012 / 0.011) | 8.4 / 16.0 ms |
+  | Convex 0.7, `--hnsw` | 0.826 / 0.849: +0.012 / +0.014 (0.005) | 0.127 / 0.121: +0.010 / +0.017 (0.004 / 0.005) | 8.5 / 16.3 ms |
+
+  - Served BM25 ranks as E326 and E344 did in process (0.80-0.81 there): known items 0.81-0.84 against 0.21-0.24 for the best substring matching, and 50 to 100 times faster than a scan plus client matching (7.4 ms against 0.9 s).
+  - Convex at 0.6-0.7 is the best for these vectors: +0.011 to +0.018 on known items, two to three standard errors, and +0.009 to +0.020 on topics. The default 0.5 (E259's weight for MiniLM-class models) costs 0.015 on known items with this static model and gains most on topics, as does RRF. A client with WordLlama-class vectors should pass `alpha=0.7`.
+  - The graph loses 0.05 alone at this size but fusion hides it (within 0.004 of exact at 0.7); at 11,415 rows it saves 0.4 ms a query, so it is for tables far larger than this (E332: from about 20,000 rows).
+- Costs (`--live`; one run each, the second run within 10% unless given):
+
+  | | Value |
+  |---|---|
+  | Load (11,415 rows and vectors) | 2.2 s; store 42.4 MB |
+  | First BM25 query (builds the view) | 8.6 s (7.7-9.5 over four builds); writes 46.6 MB to the store |
+  | First vector query | 0.14 s exact; 3.0-3.2 s `--hnsw` (rows inserted one at a time) |
+  | Server memory | 7 MB idle, 94 MB after the vectors, 844 MB after the BM25 build (a separate probe); 1,295 MB in the benchmark |
+  | 1% of the rows rewritten (114) | append 0.12 s; next BM25 query 0.24-0.30 s (the delta), then 5-6 ms; next vector query 0.09-0.13 s |
+  | Restart | first BM25 query 7.7-8.5 s again; store 133 MB at the end of the run |
+
+  - The store went from 42.4 to 133 MB: 46.6 MB for the first view, and about 44 MB more when the restart after the 1% update built a view of the changed rows (inferred from the totals). A restart with no change wrote nothing (probe: 133.0 MB before and after a rebuild), since the same rows give the same view.
+  - Where the 750 MB of the BM25 build stays resident (the view's build, the read cache or the allocator) was not traced.
+- Verdict: **kept** (routes and an option; no kernel code changed, so the scores cannot move). Ranked and semantic search are now served: BM25 alone lifts known-item search from 0.2 to 0.8 nDCG@10 over what a client can do with `scan`, and fusion with the client's vectors adds about 0.015 more at a weight of 0.6-0.7. G3 of E354 now holds for databases, with the client embedding.
+- Trade-offs: the first query of each prefix pays a full build (8.6 s at 64 MB of text), again after every restart; the BM25 view holds about 750 MB of memory at this size; its postings add about 1.1 times the text's stored size, and each restart after changes adds another view's worth.
+- Not done or not measured: search over files in `live` and `host` (`host` serves no databases); keeping the views across restarts (a ref or an entry in the commit tree); `at=COMMIT`; a fused result can name a text row that was removed while its vector was kept; stemming (E344: no gain); the graph built with `extend` on threads (E332: 4x faster builds); tables above 11,415 rows; macOS.
+- Next (proposed, not started): persist the BM25 and vector indexes with the database so a restart reads them back; trace the build's memory; a build in the background so the first query does not wait; the same routes over files in `live`; E364's embedder so the server can embed queries itself.
+- Run: `python3 -I experiments/server-search/search_bench.py IKAM_BIN WORK DIR --live` and `... --live --hnsw`, DIR from `prepare.py` (exp/259-fusion-tune; not committed).
 ### E368 deferred-kv (fold appends into the kv view in batches: buffered index edits)
 - Branch / parent: exp/368-deferred-kv / main (ccdf499, E357 merged)
 - Question: E357 left a 2,000-row batch with one index entry per row growing from 124 ms on an empty table to 1.0 s at 200k rows, because each new index entry lands in a different leaf of the kv view, so every batch rewrites about one leaf per entry; `--plain-writes` made each rewrite cheaper but not fewer. If the kv view is folded once for many batches, a leaf that many batches touch is rewritten once. How much does that save, what does it cost a read, and does it give the same database?
 - Hypothesis: the `Db` already records where each view stands in the log (`kv_at`), so appends can log events and index their idempotency keys at once and fold the kv view later, with the same roots as appending batch by batch. Loading would get several times faster and the store smaller; a read of the head pays for the fold of whatever waits.
 - Change: an option, off by default (not part of `--live`).
   - `src/db.rs`: `db_append` split into logging (`log`, `ids`: checks, contents, idempotency) and folding (`kv` and kept counts, in one edit). New `Repo::db_append_deferred` (log only, `kv_at` stays behind) and `Repo::db_catch_up` (folds every event after `kv_at` in one edit, as one append of them all would). `db_append` still refuses a view that lags.
-  - `ikam db serve --defer-kv N` (`dbserve.rs`, `main.rs`): appends are logged and committed at once; the kv view folds when N events wait, and before any read of a database's head (the fold is committed as "db: fold N event(s)"), so a read sees every answered write. Reads at an older commit fold that commit's view in memory. Without the flag, a view left behind by an earlier `--defer-kv` session folds on the first append. With `--keep-counts`, a lagging view folds before the counts are built.
+  - `ikam db serve --defer-kv N` (`dbserve.rs`, `main.rs`): appends are logged and committed at once; the kv view folds when N events wait, and before any read of a database's head (the fold is committed as "db: fold N event(s)"), so a read sees every answered write. Reads at an older commit fold that commit's view in memory. Without the flag, a view left behind by an earlier `--defer-kv` session folds on the first append. With `--keep-counts`, a lagging view folds before the counts are built. After E358 merged, its `search` and `vsearch` routes fold what waits first too (they answer at the head); its route test runs with no deferral and with folds left for reads.
   - Tests: `deferred_kv_catches_up_to_the_same_roots` (tests/db.rs: 30 random batches of upserts, removes, subtree and range removes, folded every 7 batches and at the end, equal roots to batch-by-batch appends, with range drops on and off and with kept counts; an append onto a lagging view is refused). `dbserve`'s route test runs with no deferral, a fold every 2 events and one only on reads.
   - `examples/db_append_scale.rs` takes `defer=N`; `experiments/goal-scorecard/defer_kv_served.py` (new) loads through the server and reads a just-written row every 10 batches.
 - Result (200k rows in 2,000-row batches, one index entry per row; a 4-core cloud machine):
