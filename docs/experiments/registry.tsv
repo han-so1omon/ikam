@@ -337,5 +337,5 @@ E361	served-views	capability	planned	exp/354-goal-scorecard	speed	db,views,join,
 E362	host-service	capability	planned	exp/354-goal-scorecard	safety	host,limits,queue	no	planned (E355): per-project rates, one heavy-job queue, memory and start time per project
 E363	host-tokens	capability	planned	exp/354-goal-scorecard	safety	host,auth	no	planned (E355): scoped per-project tokens and rate limits before any public front door
 E364	embedder	capability	planned	exp/354-goal-scorecard	search	search,vectors,embeds	no	planned (E355): in-kernel static embeddings so semantic search needs no outside model
-E365	scoped-merge	capability	planned	exp/354-goal-scorecard	safety	shares,merge	no	planned (E355): merge for section, fragment and graph scopes
+E365	scoped-merge	capability	kept	exp/365-scoped-merge	safety	shares,merge	no	import_share for section (joined granted ranges as one file), fragments (fragments/<hex>) and graph scopes (prefixed nodes, ranges copied as their own content, edges only inside the scope, object targets refused); re-import is three-way
 E366	cross-type-sharing	measurement	planned	exp/354-goal-scorecard	north	north,sharing	yes	planned (E355): raise one-graph sharing across file types from 0.950
