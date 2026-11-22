@@ -32,7 +32,7 @@ const USAGE: &str = "usage: ikam [--store DIR] [--short-records] [--slow-codec-m
   ls [REV[:PATH]] [-r]             list a directory of REV (default main)
   grep TEXT [REV]                  files of REV containing TEXT, with lines
   stats [REV]                      objects and bytes the store holds
-  db serve [--live] [--packs] [--plain-events] [--no-object-templates] [--concurrent-reads] [--edit-index] [--plain-writes] [--hnsw] [--keep-search] [--keep-counts N] [--defer-kv N] [--views FILE] [PORT]
+  db serve [--live] [--packs] [--plain-events] [--no-object-templates] [--concurrent-reads] [--edit-index] [--plain-writes] [--hnsw] [--keep-search] [--shared-store] [--keep-counts N] [--defer-kv N] [--views FILE] [PORT]
                                    the store's databases over HTTP, for programs
                                    (default port 8740, 127.0.0.1 only; dbserve.rs);
                                    --live turns on the five options a live
@@ -171,7 +171,7 @@ fn main() -> ExitCode {
 }
 
 /// `ikam db serve [--live] [--packs] [--plain-events] [--no-object-templates]
-/// [--concurrent-reads] [--edit-index] [--plain-writes] [--hnsw] [--keep-search] [--keep-counts N] [--defer-kv N]
+/// [--concurrent-reads] [--edit-index] [--plain-writes] [--hnsw] [--keep-search] [--shared-store] [--keep-counts N] [--defer-kv N]
 /// [--views FILE]
 /// [--allow-host NAME]...
 /// [--log-requests] [PORT]`:
@@ -209,6 +209,15 @@ fn main() -> ExitCode {
 /// `--views FILE` (E361) keeps the groups and indexes FILE defines for
 /// every database (`dbviews.rs`), read with `view?name=V`.
 ///
+/// `--shared-store` (E370, off) is for a store other processes write too
+/// (another server, `ikam mcp`, a script): each handle lists the store
+/// again when it misses an object another process stored
+/// (`Repo::refresh_ledger`, E298), and an append commits only over the
+/// head it read, applying its events again over a newer head, so neither
+/// process's reads fail nor its events get lost. A read of content that
+/// really is missing pays a listing of the store. Not for a pack store
+/// (`--packs`, `--live`), which one process opens.
+///
 /// `--live` (E356) is the five options a database kept by a running
 /// program wants, together: `--packs --plain-events --no-object-templates
 /// --concurrent-reads --edit-index`. Without `--edit-index` a restarted
@@ -219,7 +228,7 @@ fn main() -> ExitCode {
 fn db_cmd(store_dir: &str, args: &[String]) -> Result<(), String> {
     let mut args = args.to_vec();
     if args.first().map(String::as_str) != Some("serve") {
-        return Err("usage: ikam [--store DIR] db serve [--live] [--packs] [--plain-events] [--no-object-templates] [--concurrent-reads] [--edit-index] [--plain-writes] [--hnsw] [--keep-search] [--keep-counts N] [--defer-kv N] [--views FILE] [--allow-host NAME]... [--log-requests] [PORT]".into());
+        return Err("usage: ikam [--store DIR] db serve [--live] [--packs] [--plain-events] [--no-object-templates] [--concurrent-reads] [--edit-index] [--plain-writes] [--hnsw] [--keep-search] [--shared-store] [--keep-counts N] [--defer-kv N] [--views FILE] [--allow-host NAME]... [--log-requests] [PORT]".into());
     }
     args.remove(0);
     let mut allowed = Vec::new();
@@ -243,6 +252,11 @@ fn db_cmd(store_dir: &str, args: &[String]) -> Result<(), String> {
     };
     let (packs, log_requests, mut serve_opts) = db_flags(&mut args, keep_counts);
     serve_opts.defer_kv = defer_kv;
+    if packs && serve_opts.shared_store {
+        return Err(
+            "--shared-store is for a store on disk (FsStore), not --packs or --live".into(),
+        );
+    }
     let port: u16 = args.first().map_or(Ok(8740), |p| p.parse()).map_err(err)?;
     auth::catch_stop_signals();
     std::thread::spawn(|| {
@@ -291,6 +305,7 @@ fn db_flags(args: &mut Vec<String>, keep_counts: u32) -> (bool, bool, DbServeOpt
     let plain_writes = take("--plain-writes");
     let hnsw = take("--hnsw");
     let keep_search = take("--keep-search");
+    let shared_store = take("--shared-store");
     let opts = DbServeOpts {
         concurrent_reads,
         edit_index,
@@ -301,6 +316,7 @@ fn db_flags(args: &mut Vec<String>, keep_counts: u32) -> (bool, bool, DbServeOpt
         defer_kv: 0,
         hnsw,
         keep_search,
+        shared_store,
     };
     (packs, log_requests, opts)
 }
@@ -317,6 +333,7 @@ struct DbServeOpts {
     defer_kv: u64,
     hnsw: bool,
     keep_search: bool,
+    shared_store: bool,
 }
 
 /// `db serve` on `store`; with `concurrent_reads` the store is shared, so
@@ -345,6 +362,7 @@ fn serve_db<S: ikam_kernel::Store + Send + Sync + 'static>(
         r.plain_db_events = o.plain_events;
         r.object_templates = o.object_templates;
         r.plain_hot_writes = o.plain_writes;
+        r.refresh_ledger = o.shared_store;
         if o.edit_index {
             // E232: plan against what each edit reads (E133's scope and
             // hints), not an index of every stored object built on the
@@ -1078,6 +1096,7 @@ mod tests {
             defer_kv: 0,
             hnsw: false,
             keep_search: false,
+            shared_store: false,
         };
         let mut a = v(&["--live", "8752"]);
         assert_eq!(db_flags(&mut a, 0), (true, false, all));
@@ -1108,6 +1127,7 @@ mod tests {
             defer_kv: 0,
             hnsw: false,
             keep_search: false,
+            shared_store: false,
         };
         assert_eq!(db_flags(&mut a, 0), (false, false, off));
         // E357: `--plain-writes` is its own option, not part of `--live`.
@@ -1131,6 +1151,13 @@ mod tests {
         };
         assert_eq!(db_flags(&mut a, 0), (true, false, keep));
         assert!(a.is_empty());
+        // E370: `--shared-store` too.
+        let mut a = v(&["--shared-store"]);
+        let shared = DbServeOpts {
+            shared_store: true,
+            ..off
+        };
+        assert_eq!(db_flags(&mut a, 0), (false, false, shared));
     }
     use super::*;
 

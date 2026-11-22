@@ -81,6 +81,9 @@ pub struct Server<S: Store> {
     search: crate::dbsearch::Kept,
     /// Kept views (E361), built on a database's first view request.
     views: Option<crate::dbviews::Served>,
+    /// Other processes write this store too (E370): appends commit only
+    /// over the head they read, and read again on a conflict.
+    shared: bool,
 }
 
 fn refname(name: &str) -> String {
@@ -145,6 +148,7 @@ impl<S: Store> Server<S> {
             search: Default::default(),
             defer_kv: 0,
             views: None,
+            shared: false,
         }
     }
 
@@ -156,32 +160,55 @@ impl<S: Store> Server<S> {
 
     /// E368: before a read of `name`'s head, fold whatever the kv view lags
     /// behind the log and commit it, so a read sees every answered write.
-    /// Only the cached head is looked at when nothing lags.
+    /// Only the cached head is looked at when nothing lags, unless other
+    /// processes write the store (E370), whose head may have moved.
     fn settle(&self, name: &str) -> Result<(), Error> {
-        if let Some((_, db)) = self.heads.lock().unwrap().get(name)
+        if !self.shared
+            && let Some((_, db)) = self.heads.lock().unwrap().get(name)
             && db.kv_at == db.ids_at
         {
             return Ok(());
         }
         let mut repo = self.writer.lock().unwrap();
-        let (_, db) = open(&self.heads, &mut repo, name)?;
-        if db.kv_at == repo.db_head(&db.log)? {
-            return Ok(());
+        let mut tries = 0;
+        loop {
+            let (head, db) = open(&self.heads, &mut repo, name)?;
+            if db.kv_at == repo.db_head(&db.log)? {
+                return Ok(());
+            }
+            let caught = repo.db_catch_up(&db)?;
+            let msg = format!("db: fold {} event(s)", caught.kv_at - db.kv_at);
+            let c = match head {
+                Some(base) if self.shared => repo.db_commit_at(&refname(name), base, &caught, &msg),
+                _ => repo.db_commit(&refname(name), &caught, &msg),
+            };
+            match c {
+                // Another process moved the head: fold over its head.
+                Err(Error::RefConflict(_)) if self.shared && tries < 16 => tries += 1,
+                c => {
+                    self.heads
+                        .lock()
+                        .unwrap()
+                        .insert(name.to_string(), (Some(c?), caught));
+                    return Ok(());
+                }
+            }
         }
-        let caught = repo.db_catch_up(&db)?;
-        let msg = format!("db: fold {} event(s)", caught.kv_at - db.kv_at);
-        let c = repo.db_commit(&refname(name), &caught, &msg)?;
-        self.heads
-            .lock()
-            .unwrap()
-            .insert(name.to_string(), (Some(c), caught));
-        Ok(())
     }
-
 
     /// Keep `views` for every database (E361).
     pub fn views(mut self, views: Option<crate::dbviews::Served>) -> Server<S> {
         self.views = views;
+        self
+    }
+
+    /// Other processes write this store too (E370; off by default). Each
+    /// handle sees what they store (`Repo::refresh_ledger`, E298, which
+    /// the caller sets on the repo), and an append commits only over the
+    /// head it read (`db_commit_at`), reading the new head and applying its
+    /// events again on a conflict, so no process's events are lost.
+    pub fn shared_store(mut self, shared: bool) -> Server<S> {
+        self.shared = shared;
         self
     }
 
@@ -593,70 +620,72 @@ fn append<S: Store>(srv: &Server<S>, name: &str, req: &Request) -> Response {
         Err(e) => return Response::text(400, e),
     };
     let mut repo = srv.writer.lock().unwrap();
-    let (head, opened) = match open(&srv.heads, &mut repo, name) {
-        Ok(x) => x,
-        Err(e) => return fail(e),
-    };
+    // A conflict means another process committed since the head was read;
+    // the events are applied again over its head (their idempotency keys
+    // keep a retry from applying one twice).
+    let mut tries = 0;
+    loop {
+        match append_once(srv, &mut repo, name, req, &events) {
+            Err(Error::RefConflict(_)) if srv.shared && tries < 16 => tries += 1,
+            Ok(r) => return r,
+            Err(e) => return fail(e),
+        }
+    }
+}
+
+/// One try of `append`: read the head, apply `events`, commit.
+fn append_once<S: Store>(
+    srv: &Server<S>,
+    repo: &mut Repo<S>,
+    name: &str,
+    req: &Request,
+    events: &[Event],
+) -> Result<Response, Error> {
+    let (head, opened) = open(&srv.heads, repo, name)?;
     let db = match srv.keep_counts {
         0 => opened,
         // E368: counts are built from a current view, so a view left
         // behind by deferred appends folds first.
         d if !opened.counts.is_some_and(|c| c.depth == d) => {
-            match repo
-                .db_catch_up(&opened)
-                .and_then(|o| repo.db_keep_counts(&o, d))
-            {
-                Ok(db) => db,
-                Err(e) => return fail(e),
-            }
+            let o = repo.db_catch_up(&opened)?;
+            repo.db_keep_counts(&o, d)?
         }
-        d => match repo.db_keep_counts(&opened, d) {
-            Ok(db) => db,
-            Err(e) => return fail(e),
-        },
+        d => repo.db_keep_counts(&opened, d)?,
     };
-    let seq = match repo.db_head(&db.log) {
-        Ok(s) => s,
-        Err(e) => return fail(e),
-    };
+    let seq = repo.db_head(&db.log)?;
     if let Some(want) = req.header("if-head")
         && want.trim().parse::<u64>().ok() != Some(seq)
     {
-        return Response::new(409).body("application/json", head_json(head, seq));
+        return Ok(Response::new(409).body("application/json", head_json(head, seq)));
     }
     // E368: with `--defer-kv` the kv view folds once enough events wait;
     // without it, a view left behind (a store written with it) folds first.
     let new = if srv.defer_kv > 0 {
-        repo.db_append_deferred(&db, &events).and_then(|d| {
-            if d.ids_at - d.kv_at >= srv.defer_kv {
-                repo.db_catch_up(&d)
-            } else {
-                Ok(d)
-            }
-        })
+        let d = repo.db_append_deferred(&db, events)?;
+        if d.ids_at - d.kv_at >= srv.defer_kv {
+            repo.db_catch_up(&d)?
+        } else {
+            d
+        }
     } else {
-        repo.db_catch_up(&db)
-            .and_then(|d| repo.db_append(&d, &events))
-    };
-    let new = match new {
-        Ok(d) => d,
-        Err(e) => return fail(e),
+        let d = repo.db_catch_up(&db)?;
+        repo.db_append(&d, events)?
     };
     if new.log == db.log {
         // Every event was a retry: nothing to commit.
-        return Response::new(200).body("application/json", head_json(head, seq));
+        return Ok(Response::new(200).body("application/json", head_json(head, seq)));
     }
     let msg = format!("db: {} event(s)", new.ids_at - seq);
-    match repo.db_commit(&refname(name), &new, &msg) {
-        Ok(c) => {
-            srv.heads
-                .lock()
-                .unwrap()
-                .insert(name.to_string(), (Some(c), new));
-            Response::new(200).body("application/json", head_json(Some(c), new.ids_at))
-        }
-        Err(e) => fail(e),
-    }
+    let c = match head {
+        Some(base) if srv.shared => repo.db_commit_at(&refname(name), base, &new, &msg)?,
+        None if srv.shared => repo.db_commit_new(&refname(name), &new, &msg)?,
+        _ => repo.db_commit(&refname(name), &new, &msg)?,
+    };
+    srv.heads
+        .lock()
+        .unwrap()
+        .insert(name.to_string(), (Some(c), new));
+    Ok(Response::new(200).body("application/json", head_json(Some(c), new.ids_at)))
 }
 
 /// Serve `repo`'s databases on 127.0.0.1:PORT until stopped; with
@@ -678,13 +707,17 @@ pub fn serve<S: Store + Send + 'static>(
     if reader.is_some() && auth.is_none() {
         return Err("IKAM_READ_AUTH needs IKAM_AUTH too".into());
     }
+    // A handle set to see other writers' objects (`--shared-store`) is one
+    // whose appends must not overwrite theirs either.
+    let shared = repo.refresh_ledger;
     let state = Arc::new(
         Server::new(repo, readers)
             .keep_counts(keep_counts)
             .defer_kv(defer_kv)
             .vector_index(search.index)
             .keep_search(search.keep)
-            .views(views),
+            .views(views)
+            .shared_store(shared),
     );
     let hosts = Hosts::new(port, allowed);
     let password = auth.is_some();
@@ -976,6 +1009,96 @@ mod tests {
         handle(&off, &req("GET", "/db/s/search?q=json&prefix=u/", b"", &[]));
         let other = crate::dbsearch::bm25_ref("s", "u/");
         assert!(store.get_ref(&other).unwrap().is_none());
+    }
+
+    #[test]
+    fn shared_store_servers_see_each_others_writes() {
+        // E370: two servers with their own handles on one store, as two
+        // processes would be. By default the first cannot read what the
+        // second stores as derivations, and an append can drop the
+        // other's; with `shared_store` (and `refresh_ledger`) both read
+        // everything and no event is lost.
+        for shared in [false, true] {
+            let store = ikam_kernel::SharedStore::new(MemStore::default());
+            let server = || {
+                let mut r = Repo::new(store.clone());
+                r.refresh_ledger = shared;
+                Server::new(r, None).shared_store(shared)
+            };
+            let (a, b) = (server(), server());
+            let ct = [("content-type", EVENTS)];
+            let append = |st: &Server<_>, ev: &[Event]| {
+                handle(st, &req("POST", "/db/s/append", &encode_events(ev), &ct)).status
+            };
+            let row = |i: usize, w: &str| {
+                let text = format!("row {i} about {w} and json");
+                Event::upsert(&format!("t/{i:03}"), text.as_bytes(), &format!("{w}{i}"))
+            };
+            let words = ["maps", "sound", "files"];
+            let rows: Vec<Event> = (0..60).map(|i| row(i, words[i % 3])).collect();
+            assert_eq!(append(&a, &rows), 200);
+            let q = "/db/s/search?q=json+sound&prefix=t/&k=5";
+            let search = |st: &Server<_>| handle(st, &req("GET", q, b"", &[]));
+            assert_eq!(search(&a).status, 200);
+            // b rewrites rows a has searched; then a searches, reads a row
+            // and appends.
+            assert_eq!(append(&b, &[row(1, "sound sound"), row(4, "sound")]), 200);
+            let after = search(&a);
+            let got = handle(&a, &req("GET", "/db/s/get?key=t/001", b"", &[]));
+            let fresh = search(&server()).body;
+            let more = append(&a, &[row(70, "late")]);
+            if !shared {
+                // What this option is for.
+                assert!(after.status == 500 || got.status == 500 || more == 500);
+                continue;
+            }
+            assert_eq!(after.status, 200);
+            assert_eq!(got.status, 200);
+            assert_eq!(got.body, b"row 1 about sound sound and json");
+            assert_eq!(more, 200);
+            // The same answer as a server that builds at that head.
+            assert_eq!(after.body, fresh);
+            // Appends that race, from two threads: each server appends
+            // over heads the other moves; every event lands.
+            std::thread::scope(|sc| {
+                for (st, base) in [(&a, 100), (&b, 200)] {
+                    sc.spawn(move || {
+                        for i in 0..10 {
+                            let w = if base == 100 { "a" } else { "b" };
+                            assert_eq!(append(st, &[row(base + i, w)]), 200);
+                        }
+                    });
+                }
+            });
+            // Two servers creating one database at once: both batches land.
+            std::thread::scope(|sc| {
+                for (st, base) in [(&a, 300), (&b, 400)] {
+                    sc.spawn(move || {
+                        let ev: Vec<Event> = (0..20)
+                            .map(|i| {
+                                let k = format!("n/{:03}", base + i);
+                                Event::upsert(&k, b"x", &k)
+                            })
+                            .collect();
+                        let body = encode_events(&ev);
+                        let r = handle(st, &req("POST", "/db/new/append", &body, &ct));
+                        assert_eq!(r.status, 200);
+                    });
+                }
+            });
+            let c = server();
+            let r = handle(&c, &req("GET", "/db/new/count?prefix=n/", b"", &[]));
+            assert!(String::from_utf8(r.body).unwrap().contains("40"));
+            let n = |p: &str| {
+                let r = handle(
+                    &c,
+                    &req("GET", &format!("/db/s/count?prefix={p}"), b"", &[]),
+                );
+                String::from_utf8(r.body).unwrap()
+            };
+            assert!(n("t/").contains("81"), "{}", n("t/"));
+            assert!(Repo::new(store.clone()).fsck().unwrap().is_empty());
+        }
     }
 
     #[test]

@@ -845,3 +845,30 @@ fn deferred_kv_catches_up_to_the_same_roots() {
         );
     }
 }
+
+/// E370: `db_commit_new` makes a database's first commit only while its
+/// ref does not exist, so a second writer creating the same database is
+/// refused and retries over the first one's head.
+#[test]
+fn commit_new_refuses_an_existing_database() {
+    let mut repo = Repo::new(MemStore::default());
+    let empty = repo.db_empty().unwrap();
+    let a = repo.db_append(&empty, &[up("k/a", "a", "ia")]).unwrap();
+    let b = repo.db_append(&empty, &[up("k/b", "b", "ib")]).unwrap();
+    let first = repo.db_commit_new("db/x", &a, "A").unwrap();
+    let Object::Commit(c) = repo.get(&first).unwrap() else {
+        panic!()
+    };
+    assert!(c.parents.is_empty());
+    assert!(matches!(
+        repo.db_commit_new("db/x", &b, "B"),
+        Err(Error::RefConflict(_))
+    ));
+    assert_eq!(repo.resolve("db/x").unwrap(), first);
+    let now = repo.db_at(&first).unwrap();
+    let b = repo.db_append(&now, &[up("k/b", "b", "ib")]).unwrap();
+    repo.db_commit_at("db/x", first, &b, "B again").unwrap();
+    let db = repo.db_at(&repo.resolve("db/x").unwrap()).unwrap();
+    assert_eq!(repo.db_get(&db, "k/a").unwrap().as_deref(), Some(&b"a"[..]));
+    assert_eq!(repo.db_get(&db, "k/b").unwrap().as_deref(), Some(&b"b"[..]));
+}
