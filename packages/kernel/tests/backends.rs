@@ -819,3 +819,60 @@ fn pack_store_prefix_lookups_in_the_open_pack_match_a_mem_store() {
         );
     }
 }
+
+/// E367: `PackStore::heads` gives what listing the ids and reading each head
+/// gives, across a sealed pack, a lazy checkpoint, records after it, unflushed
+/// writes, deletes and replaces.
+#[test]
+fn pack_heads_match_listing() {
+    use ikam_kernel::backends::PackOptions;
+    use std::collections::BTreeMap;
+    let lazy = PackOptions {
+        lazy_checkpoint: true,
+        filters: true,
+        ..PackOptions::default()
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let blob = |n: u32| -> (Id, Vec<u8>) {
+        let b = format!("object {n} {}", "z".repeat((n % 300) as usize)).into_bytes();
+        (Id::of(&b), b)
+    };
+    let big = vec![7u8; 3 << 20]; // larger than a read block
+    let big_id = Id::of(&big);
+    {
+        let mut s = PackStore::open_with(dir.path(), lazy).unwrap();
+        for n in 0..3000 {
+            let (i, b) = blob(n);
+            s.write(i, &b).unwrap();
+        }
+        s.write(big_id, &big).unwrap();
+        s.delete(&blob(5).0).unwrap();
+        s.compact().unwrap(); // seals
+        s.delete(&blob(6).0).unwrap(); // a tombstone over a sealed record
+        s.replace(blob(7).0, b"replaced").unwrap();
+        for n in 3000..4000 {
+            let (i, b) = blob(n);
+            s.write(i, &b).unwrap();
+        }
+    } // close writes the checkpoint
+    let mut s = PackStore::open_with(dir.path(), lazy).unwrap();
+    for n in 4000..4500 {
+        let (i, b) = blob(n);
+        s.write(i, &b).unwrap(); // some still in the write buffer
+    }
+    s.delete(&blob(3500).0).unwrap();
+    s.replace(blob(8).0, b"again").unwrap();
+    for n in [1usize, 32, 300, 4 << 20] {
+        let mut want = BTreeMap::new();
+        for id in s.ids().unwrap() {
+            want.insert(id, s.read_head(&id, n).unwrap());
+        }
+        let mut got = BTreeMap::new();
+        s.heads(n, &mut |id, h| {
+            assert!(got.insert(id, h.to_vec()).is_none(), "one head an id");
+        })
+        .unwrap();
+        assert_eq!(got.len(), 4500 + 1 - 3);
+        assert!(got == want, "heads({n}) matches the listing");
+    }
+}

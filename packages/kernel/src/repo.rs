@@ -493,31 +493,33 @@ impl<S: Store> Repo<S> {
         // (E134), so a fresh handle reads the store once, not twice.
         let mut needed = (self.needed_index && self.needed.lock().unwrap().is_none())
             .then(crate::dict::Needed::default);
-        let listed = self.store.ids()?;
-        ledger.seen = listed.iter().copied().collect();
-        for id in listed {
-            // Both projections need only an encoding's header, except for
-            // derivation records, which are read whole (E135).
-            // Deleted by another handle since the listing (E292).
-            let head = match self.store.read_head(&id, crate::dict::HEAD_LEN) {
-                Ok(head) => head,
-                Err(Error::NotFound(_)) => continue,
-                Err(e) => return Err(e),
-            };
+        // Both projections need only an encoding's header, except for
+        // derivation records, which are read whole (E135), after the pass
+        // over every head (one pass, E367).
+        let (mut found, mut listed) = (Vec::new(), Vec::new());
+        self.store.heads(crate::dict::HEAD_LEN, &mut |id, head| {
+            listed.push(id);
             if let Some(set) = needed.as_mut() {
-                set.add(&head);
+                set.add(head);
             }
-            if object_tag(&head) != Some(b'D') {
-                continue;
+            if object_tag(head) == Some(b'D') {
+                let whole = head.len() < crate::dict::HEAD_LEN;
+                found.push((id, whole.then(|| head.to_vec())));
             }
-            let encoded = if head.len() < crate::dict::HEAD_LEN {
-                head
-            } else {
-                match self.store.read(&id) {
+        })?;
+        // Built once at its full size, not grown an insert at a time.
+        ledger.seen = listed.into_iter().collect();
+        // In id order, as the listing gave them before E367.
+        found.sort_unstable_by_key(|(id, _)| *id);
+        for (id, head) in found {
+            let encoded = match head {
+                Some(head) => head,
+                None => match self.store.read(&id) {
                     Ok(encoded) => encoded,
+                    // Deleted by another handle since the pass (E292).
                     Err(Error::NotFound(_)) => continue,
                     Err(e) => return Err(e),
-                }
+                },
             };
             outputs.extend(self.derivation_output(&id, &encoded));
             records.push((id, encoded));

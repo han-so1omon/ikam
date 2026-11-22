@@ -846,6 +846,30 @@ impl Sealed {
         ))
     }
 
+    /// Every entry of the index, in id order, read in large blocks (E367)
+    /// rather than one read an entry.
+    fn entries(&self) -> Result<Vec<(Id, u64, u32)>, Error> {
+        let n = self.fanout[255] as u64;
+        let mut out = Vec::with_capacity(n as usize);
+        let per = (1u64 << 20) / IDX_ENTRY; // entries a block
+        let mut buf = Vec::new();
+        let mut i = 0u64;
+        while i < n {
+            let k = per.min(n - i);
+            buf.resize((k * IDX_ENTRY) as usize, 0);
+            self.idx.read_exact_at(&mut buf, IDX_HEAD + i * IDX_ENTRY)?;
+            for e in buf.chunks_exact(IDX_ENTRY as usize) {
+                out.push((
+                    Id::from_bytes(e[..32].try_into().unwrap()),
+                    u64::from_le_bytes(e[32..40].try_into().unwrap()),
+                    u32::from_le_bytes(e[40..44].try_into().unwrap()),
+                ));
+            }
+            i += k;
+        }
+        Ok(out)
+    }
+
     /// Offset and length of `id` (length `TOMBSTONE` if deleted here).
     fn find(&self, id: &Id) -> Result<Option<(u64, u32)>, Error> {
         if let Some(f) = &self.filter
@@ -2040,6 +2064,75 @@ impl Store for PackStore {
     // E139: the first `n` bytes of a record, read from the pack alone.
     fn read_head(&self, id: &Id, n: usize) -> Result<Vec<u8>, Error> {
         self.read_prefix(id, n)
+    }
+
+    // E367: every live record's head in one pass: the indexes read in large
+    // blocks, then each pack's heads in offset order, in large blocks, in
+    // place of a lookup and a read for each id.
+    fn heads(&self, n: usize, f: &mut dyn FnMut(Id, &[u8])) -> Result<(), Error> {
+        // Newest wins, as in `locate`: sealed oldest first, then the open
+        // pack's checkpoint, then the records after it. `None` is the open
+        // pack. Each source is in id order, so a stable sort of them all,
+        // oldest first, only merges runs, and the last of each id is newest.
+        let mut all: Vec<(Id, Option<usize>, u64, u32)> = Vec::new();
+        for (i, s) in self.sealed.iter().enumerate() {
+            all.extend(
+                s.entries()?
+                    .into_iter()
+                    .map(|(id, o, l)| (id, Some(i), o, l)),
+            );
+        }
+        if let Some(b) = &self.base {
+            all.extend(b.entries()?.into_iter().map(|(id, o, l)| (id, None, o, l)));
+        }
+        let mut open: Vec<_> = self
+            .active_index
+            .iter()
+            .map(|(id, &(o, l))| (*id, None, o, l))
+            .collect();
+        open.sort_unstable_by_key(|e| e.0);
+        all.extend(open);
+        all.sort_by_key(|e| e.0);
+        let mut by_pack: Vec<Vec<(u64, u32, Id)>> = vec![Vec::new(); self.sealed.len() + 1];
+        for (k, &(id, pack, off, len)) in all.iter().enumerate() {
+            let newest = all.get(k + 1).is_none_or(|next| next.0 != id);
+            if newest && len != TOMBSTONE {
+                by_pack[pack.unwrap_or(self.sealed.len())].push((off, len, id));
+            }
+        }
+        drop(all);
+        const BLOCK: u64 = 1 << 20;
+        let mut block = Vec::new();
+        for (p, mut recs) in by_pack.into_iter().enumerate() {
+            recs.sort_unstable_by_key(|r| r.0);
+            let (file, end) = match self.sealed.get(p) {
+                Some(s) => (&s.pack, s.pack.metadata()?.len()),
+                None => (&self.active, self.flushed),
+            };
+            let mut at0 = 0u64; // where `block` starts in the file
+            block.clear();
+            for (off, len, id) in recs {
+                let at = off + RECORD_HEAD;
+                let k = (len as usize).min(n);
+                if p == self.sealed.len() && at >= self.flushed {
+                    let s = (at - self.flushed) as usize;
+                    f(id, &self.buf[s..s + k]);
+                    continue;
+                }
+                if at < at0 || at + k as u64 > at0 + block.len() as u64 {
+                    let want = BLOCK.max(k as u64).min(end.saturating_sub(at));
+                    if want < k as u64 {
+                        return Err(Error::Corrupt(id));
+                    }
+                    block.resize(want as usize, 0);
+                    file.read_exact_at(&mut block, at)?;
+                    at0 = at;
+                }
+                let s = (at - at0) as usize;
+                f(id, &block[s..s + k]);
+            }
+        }
+        Ok(())
     }
 
     // E147: from the index alone.
