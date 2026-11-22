@@ -21,10 +21,18 @@
 //!
 //! Opt-in: nothing in the kernel defines or updates views unless a caller
 //! does.
+//!
+//! A view's rule is a plain function (`Map`, `GroupSum`) or, for views
+//! defined while a program runs, a shared closure (`MapWith`,
+//! `GroupSumWith`, E361); both give the same rows for the same rule.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::Arc;
 
 use crate::{Arg, Db, Error, Id, Node, Repo, Store, Target};
+
+/// The most value bytes one content holds for a view (E361).
+const VALUE_BLOB: usize = 64 * 1024;
 
 /// Rows: key to value.
 pub type Rows = BTreeMap<String, Vec<u8>>;
@@ -38,7 +46,7 @@ pub enum Mode {
     Incremental,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 pub enum ViewOp {
     /// An input row to at most one output row. Distinct input keys must
     /// give distinct output keys.
@@ -46,6 +54,35 @@ pub enum ViewOp {
     /// An input row to a group and a measure; the view keeps
     /// `count,sum` per group, and drops a group whose count falls to 0.
     GroupSum(GroupFn),
+    /// `Map` with a closure (E361), such as a rule read from a file.
+    MapWith(MapRule),
+    /// `GroupSum` with a closure (E361).
+    GroupSumWith(GroupRule),
+}
+
+/// A `MapFn` that may hold data.
+pub type MapRule = Arc<dyn Fn(&str, &[u8]) -> Option<(String, Vec<u8>)> + Send + Sync>;
+/// A `GroupFn` that may hold data.
+pub type GroupRule = Arc<dyn Fn(&str, &[u8]) -> Option<(String, i64)> + Send + Sync>;
+
+type MapDyn<'a> = &'a (dyn Fn(&str, &[u8]) -> Option<(String, Vec<u8>)> + Send + Sync);
+type GroupDyn<'a> = &'a (dyn Fn(&str, &[u8]) -> Option<(String, i64)> + Send + Sync);
+
+/// A view's rule, whichever way it was given.
+enum Rule<'a> {
+    Map(MapDyn<'a>),
+    Group(GroupDyn<'a>),
+}
+
+impl ViewOp {
+    fn rule(&self) -> Rule<'_> {
+        match self {
+            ViewOp::Map(f) => Rule::Map(f),
+            ViewOp::MapWith(f) => Rule::Map(f.as_ref()),
+            ViewOp::GroupSum(f) => Rule::Group(f),
+            ViewOp::GroupSumWith(f) => Rule::Group(f.as_ref()),
+        }
+    }
 }
 
 /// A row to its output row, if any.
@@ -126,10 +163,10 @@ fn parse_group(v: &[u8]) -> Result<(i64, i64), Error> {
 }
 
 /// A view's rows from its input's rows.
-fn compute(op: ViewOp, input: &Rows) -> Result<Rows, Error> {
+fn compute(op: &ViewOp, input: &Rows) -> Result<Rows, Error> {
     let mut out = Rows::new();
-    match op {
-        ViewOp::Map(f) => {
+    match op.rule() {
+        Rule::Map(f) => {
             for (k, v) in input {
                 if let Some((key, value)) = f(k, v)
                     && out.insert(key.clone(), value).is_some()
@@ -138,7 +175,7 @@ fn compute(op: ViewOp, input: &Rows) -> Result<Rows, Error> {
                 }
             }
         }
-        ViewOp::GroupSum(f) => {
+        Rule::Group(f) => {
             let mut groups: BTreeMap<String, (i64, i64)> = BTreeMap::new();
             for (k, v) in input {
                 if let Some((g, m)) = f(k, v) {
@@ -190,9 +227,30 @@ impl<S: Store> Repo<S> {
     }
 
     fn graph_rows(&self, root: &Id) -> Result<Rows, Error> {
-        let mut out = Rows::new();
-        for n in self.graph_nodes(root)? {
-            out.insert(n.label.clone(), self.node_value(&n)?);
+        Ok(self
+            .node_values(self.graph_nodes(root)?)?
+            .into_iter()
+            .collect())
+    }
+
+    /// Nodes' labels and values, reading each content once however many
+    /// of the nodes are ranges of it.
+    pub(crate) fn node_values(&self, nodes: Vec<Node>) -> Result<Vec<(String, Vec<u8>)>, Error> {
+        let mut read: BTreeMap<Id, Vec<u8>> = BTreeMap::new();
+        let mut out = Vec::with_capacity(nodes.len());
+        for n in nodes {
+            let value = match &n.target {
+                Target::Content(Arg::Range { id, start, len }) => {
+                    if !read.contains_key(id) {
+                        read.insert(*id, self.read_content(id)?);
+                    }
+                    crate::repo::select(&read[id], *start, *len)
+                        .ok_or(Error::Corrupt(*id))?
+                        .to_vec()
+                }
+                _ => self.node_value(&n)?,
+            };
+            out.push((n.label, value));
         }
         Ok(out)
     }
@@ -204,29 +262,54 @@ impl<S: Store> Repo<S> {
         &mut self,
         rows: impl Iterator<Item = (&'a String, &'a Vec<u8>)>,
     ) -> Result<Vec<Node>, Error> {
-        let (mut blob, mut spans) = (Vec::new(), Vec::new());
+        // E361: values go into contents of at most VALUE_BLOB bytes, not
+        // one for the whole view, so reading one row reads one small
+        // content (a stored content is read whole to check its id).
+        let empty = Id::of_content(&[]);
+        let mut nodes = Vec::new();
+        let (mut blob, mut spans): (Vec<u8>, Vec<(String, usize, usize)>) =
+            (Vec::new(), Vec::new());
+        let mut any_empty = false;
+        let mut flush =
+            |repo: &mut Self, blob: &mut Vec<u8>, spans: &mut Vec<(String, usize, usize)>| {
+                if spans.is_empty() {
+                    return Ok::<(), Error>(());
+                }
+                let id = if blob.is_empty() {
+                    empty
+                } else {
+                    repo.put_derived(blob)?
+                };
+                for (label, start, len) in spans.drain(..) {
+                    nodes.push(Node {
+                        label,
+                        target: Target::Content(match len {
+                            0 => Arg::Whole(empty),
+                            _ => Arg::Range {
+                                id,
+                                start: start as u64,
+                                len: len as u64,
+                            },
+                        }),
+                        edges: Vec::new(),
+                    });
+                }
+                blob.clear();
+                Ok(())
+            };
         for (k, v) in rows {
+            if !blob.is_empty() && blob.len() + v.len() > VALUE_BLOB {
+                flush(self, &mut blob, &mut spans)?;
+            }
+            any_empty |= v.is_empty();
             spans.push((k.clone(), blob.len(), v.len()));
             blob.extend_from_slice(v);
         }
-        let id = self.put_derived(&blob)?;
-        let empty = Id::of_content(&[]);
-        if spans.iter().any(|s| s.2 == 0) {
+        flush(self, &mut blob, &mut spans)?;
+        if any_empty {
             self.put_derived(&[])?;
         }
-        let node = |(label, start, len): (String, usize, usize)| Node {
-            label,
-            target: Target::Content(match len {
-                0 => Arg::Whole(empty),
-                _ => Arg::Range {
-                    id,
-                    start: start as u64,
-                    len: len as u64,
-                },
-            }),
-            edges: Vec::new(),
-        };
-        Ok(spans.into_iter().map(node).collect())
+        Ok(nodes)
     }
 
     fn put_rows(&mut self, rows: &Rows) -> Result<Id, Error> {
@@ -242,8 +325,35 @@ impl<S: Store> Repo<S> {
         let v = g.get(name)?;
         match state.roots.get(name) {
             Some(root) => self.graph_rows(root),
-            None => compute(v.op, &self.view_rows(g, state, &v.input)?),
+            None => compute(&v.op, &self.view_rows(g, state, &v.input)?),
         }
+    }
+
+    /// A stored view's rows whose keys start with `prefix`, in key order,
+    /// at most `limit`, reading only the chunks they fall in (E361). An
+    /// `OnRead` view is computed whole and then cut.
+    pub fn view_prefix(
+        &self,
+        g: &ViewGraph,
+        state: &ViewState,
+        name: &str,
+        prefix: &str,
+        limit: usize,
+    ) -> Result<Vec<(String, Vec<u8>)>, Error> {
+        let Some(root) = state.roots.get(name) else {
+            let rows = self.view_rows(g, state, name)?;
+            return Ok(rows
+                .into_iter()
+                .filter(|(k, _)| k.starts_with(prefix))
+                .take(limit)
+                .collect());
+        };
+        let nodes = self
+            .graph_prefix(root, prefix)?
+            .into_iter()
+            .take(limit)
+            .collect();
+        self.node_values(nodes)
     }
 
     /// Build every stored and incremental view from `db`, in order, and
@@ -253,8 +363,17 @@ impl<S: Store> Repo<S> {
             roots: BTreeMap::new(),
             db: *db,
         };
+        // `kv` is read once for every view that reads it (E361).
+        let mut kv: Option<Rows> = None;
         for v in &g.views {
-            let rows = compute(v.op, &self.view_rows(g, &state, &v.input)?)?;
+            let rows = if v.input == "kv" {
+                if kv.is_none() {
+                    kv = Some(self.view_rows(g, &state, "kv")?);
+                }
+                compute(&v.op, kv.as_ref().unwrap())?
+            } else {
+                compute(&v.op, &self.view_rows(g, &state, &v.input)?)?
+            };
             run_check(v, rows.iter())?;
             if v.mode != Mode::OnRead {
                 let root = self.put_rows(&rows)?;
@@ -287,7 +406,7 @@ impl<S: Store> Repo<S> {
             let (root, delta) = if input.is_empty() {
                 (old, Delta::new())
             } else if v.mode == Mode::Stored {
-                let rows = compute(v.op, &self.view_rows(g, &next, &v.input)?)?;
+                let rows = compute(&v.op, &self.view_rows(g, &next, &v.input)?)?;
                 let root = self.put_rows(&rows)?;
                 (root, self.kv_delta(&old, &root)?)
             } else {
@@ -322,9 +441,19 @@ impl<S: Store> Repo<S> {
     /// Rows that differ between two graphs of rows, with their values.
     fn kv_delta(&self, a: &Id, b: &Id) -> Result<Delta, Error> {
         let mut out = Delta::new();
+        let (mut olds, mut news, mut labels) = (Vec::new(), Vec::new(), Vec::new());
         for (label, before, after) in self.graph_diff(a, b)? {
-            let before = before.map(|n| self.node_value(&n)).transpose()?;
-            let after = after.map(|n| self.node_value(&n)).transpose()?;
+            labels.push((label, before.is_some(), after.is_some()));
+            olds.extend(before);
+            news.extend(after);
+        }
+        // E361: one read per content, not per row (a batch's rows share
+        // its event).
+        let mut olds = self.node_values(olds)?.into_iter().map(|(_, v)| v);
+        let mut news = self.node_values(news)?.into_iter().map(|(_, v)| v);
+        for (label, had, has) in labels {
+            let before = if had { olds.next() } else { None };
+            let after = if has { news.next() } else { None };
             if before != after {
                 out.insert(label, (before, after));
             }
@@ -335,8 +464,8 @@ impl<S: Store> Repo<S> {
     /// A view's changes from its input's, reading only the groups touched.
     fn view_delta(&self, v: &View, old: &Id, input: &Delta) -> Result<Delta, Error> {
         let mut out = Delta::new();
-        match v.op {
-            ViewOp::Map(f) => {
+        match v.op.rule() {
+            Rule::Map(f) => {
                 for (k, (before, after)) in input {
                     if let Some((key, val)) = before.as_ref().and_then(|b| f(k, b)) {
                         out.entry(key).or_insert((Some(val), None));
@@ -346,7 +475,7 @@ impl<S: Store> Repo<S> {
                     }
                 }
             }
-            ViewOp::GroupSum(f) => {
+            Rule::Group(f) => {
                 let mut moves: BTreeMap<String, (i64, i64)> = BTreeMap::new();
                 for (k, (before, after)) in input {
                     for (row, sign) in [(before, -1), (after, 1)] {
@@ -357,10 +486,10 @@ impl<S: Store> Repo<S> {
                     }
                 }
                 let groups: BTreeSet<String> = moves.keys().cloned().collect();
-                let mut current = BTreeMap::new();
-                for n in self.graph_nodes_in(old, &groups)? {
-                    current.insert(n.label.clone(), self.node_value(&n)?);
-                }
+                let mut current: BTreeMap<String, Vec<u8>> = self
+                    .node_values(self.graph_nodes_in(old, &groups)?)?
+                    .into_iter()
+                    .collect();
                 for (g, (dc, ds)) in moves {
                     let before = current.remove(&g);
                     let (c, s) = before

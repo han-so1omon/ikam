@@ -23,6 +23,8 @@
 //!   With `--keep-counts N` (E233) `count?prefix=` and `span` read kept
 //!   counts for prefixes ending in `/` of up to N segments.
 //! - `GET head`: `{"head":N,"commit":"..."|null}`.
+//! - `GET views` and `GET view?name=V`: kept groups and indexes read from
+//!   `--views FILE` (E361, `dbviews.rs`).
 //! - `GET search?q=TEXT&prefix=P`, `POST vsearch?prefix=VP` and their
 //!   fusion: ranked and vector search (E358, `dbsearch.rs`).
 //!
@@ -77,6 +79,8 @@ pub struct Server<S: Store> {
     defer_kv: u64,
     /// Ranked and vector search indexes (E358), built when first searched.
     search: crate::dbsearch::Kept,
+    /// Kept views (E361), built on a database's first view request.
+    views: Option<crate::dbviews::Served>,
 }
 
 fn refname(name: &str) -> String {
@@ -140,6 +144,7 @@ impl<S: Store> Server<S> {
             keep_counts: 0,
             search: Default::default(),
             defer_kv: 0,
+            views: None,
         }
     }
 
@@ -171,6 +176,13 @@ impl<S: Store> Server<S> {
             .unwrap()
             .insert(name.to_string(), (Some(c), caught));
         Ok(())
+    }
+
+
+    /// Keep `views` for every database (E361).
+    pub fn views(mut self, views: Option<crate::dbviews::Served>) -> Server<S> {
+        self.views = views;
+        self
     }
 
     /// Search vector rows with `index` (E358; exact by default).
@@ -339,6 +351,13 @@ fn handle<S: Store>(srv: &Server<S>, req: &Request) -> Response {
                 Err(e) => fail(e),
             };
         }
+        // E368: a view answers at the head, so it folds what waits first.
+        ("GET", "views" | "view") => {
+            return match srv.settle(name) {
+                Ok(()) => views(srv, name, route, req),
+                Err(e) => fail(e),
+            };
+        }
         _ => {}
     }
     let heads = &srv.heads;
@@ -497,6 +516,64 @@ fn search<S: Store>(srv: &Server<S>, name: &str, req: &Request) -> Response {
     srv.read(|r| srv.search.answer(r, name, &db, bm25, &q, req))
 }
 
+/// `GET views` and `GET view` (E361): the views are brought to the head
+/// under the writer's lock, then read like any other read.
+fn views<S: Store>(srv: &Server<S>, name: &str, route: &str, req: &Request) -> Response {
+    let Some(served) = &srv.views else {
+        return Response::text(404, "no views: start with --views FILE");
+    };
+    if route == "views" {
+        return Response::new(200).body("application/json", served.list_json());
+    }
+    let Some(rule) = req.param("name").and_then(|v| served.rule(&v).cloned()) else {
+        return Response::text(404, "no such view");
+    };
+    let limit = match req.param("limit").map(|n| n.parse()) {
+        None => usize::MAX,
+        Some(Ok(n)) => n,
+        Some(Err(_)) => return Response::text(400, "limit=N"),
+    };
+    let index = rule.kind == crate::dbviews::Kind::Index;
+    let prefix = match (index, req.param("eq"), req.param("prefix")) {
+        (true, Some(x), None) => format!("{x}{}", crate::dbviews::US),
+        (false, None, p) => p.unwrap_or_default(),
+        _ => return Response::text(400, "an index takes eq=X; a group, prefix=P"),
+    };
+    let (db, state) = {
+        let mut w = srv.writer.lock().unwrap();
+        let db = match open(&srv.heads, &mut w, name) {
+            Ok((_, db)) => db,
+            Err(e) => return fail(e),
+        };
+        match served.at(&mut w, name, &db) {
+            Ok(st) => (db, st),
+            Err(e) => return fail(e),
+        }
+    };
+    let keys_only = matches!(req.param("keys").as_deref(), Some("1" | "true"));
+    srv.read(|repo| {
+        let rows = match served.rows(repo, &state, &rule.name, &prefix, limit) {
+            Ok(r) => r,
+            Err(e) => return fail(e),
+        };
+        if !index {
+            return pairs_response(req, rows);
+        }
+        let keys = rows
+            .into_iter()
+            .map(|(_, k)| String::from_utf8(k).unwrap_or_default());
+        if keys_only {
+            return pairs_response(req, keys.map(|k| (k, Vec::new())).collect());
+        }
+        let keys: std::collections::BTreeSet<String> = keys.collect();
+        match repo.db_get_many(&db, &keys) {
+            Ok(pairs) if pairs.len() == keys.len() => pairs_response(req, pairs),
+            Ok(_) => fail(Error::Decode("view row not in kv")),
+            Err(e) => fail(e),
+        }
+    })
+}
+
 /// `POST append`, under the writer's lock.
 fn append<S: Store>(srv: &Server<S>, name: &str, req: &Request) -> Response {
     if req
@@ -582,7 +659,7 @@ pub fn serve<S: Store + Send + 'static>(
     repo: Repo<S>,
     readers: Option<ReaderFactory<S>>,
     (keep_counts, defer_kv): (u32, u64),
-    index: crate::dbsearch::VectorIndex,
+    (index, views): (crate::dbsearch::VectorIndex, Option<crate::dbviews::Served>),
     port: u16,
     allowed: Vec<String>,
     log_requests: bool,
@@ -599,7 +676,8 @@ pub fn serve<S: Store + Send + 'static>(
         Server::new(repo, readers)
             .keep_counts(keep_counts)
             .defer_kv(defer_kv)
-            .vector_index(index),
+            .vector_index(index)
+            .views(views),
     );
     let hosts = Hosts::new(port, allowed);
     let password = auth.is_some();
@@ -696,6 +774,120 @@ mod tests {
             .iter()
             .map(|h| h.get("key").unwrap().as_str().unwrap().to_string())
             .collect()
+    }
+
+    /// `format=json` pairs as (key, value) strings.
+    fn pairs_of(r: &Response) -> Vec<(String, String)> {
+        assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
+        let j = crate::json::parse(std::str::from_utf8(&r.body).unwrap()).unwrap();
+        j.as_arr()
+            .iter()
+            .map(|p| {
+                let s = |i: usize| p.as_arr()[i].as_str().unwrap().to_string();
+                (s(0), s(1))
+            })
+            .collect()
+    }
+
+    #[test]
+    fn views_follow_appends_and_match_a_build_at_the_head() {
+        for shared in [false, true] {
+            viewed(shared);
+        }
+    }
+
+    fn viewed(shared: bool) {
+        let spec = "by_status group t/o/ by=field:status sum=field:amount\n\
+                    by_cust index t/o/ by=field:customer\n\
+                    per_day group t/e/ by=seg:0\n";
+        let served =
+            || Some(crate::dbviews::Served::new(crate::dbviews::parse(spec).unwrap()).unwrap());
+        let store = ikam_kernel::SharedStore::new(MemStore::default());
+        let make = || -> Option<ReaderFactory<_>> {
+            shared.then(|| Box::new(|w: &Repo<_>| w.sibling()) as ReaderFactory<_>)
+        };
+        let st = Server::new(Repo::new(store.clone()), make()).views(served());
+        let h = |st: &Server<_>, q: &str| handle(st, &req("GET", q, b"", &[]));
+        let ct = [("content-type", EVENTS)];
+        let o = |c: &str, s: &str, a: i64| {
+            format!(r#"{{"customer":"{c}","status":"{s}","amount":{a}}}"#)
+        };
+        let body = encode_events(&[
+            Event::upsert("t/o/1", o("c1", "open", 5).as_bytes(), "1"),
+            Event::upsert("t/o/2", o("c2", "open", 7).as_bytes(), "2"),
+            Event::upsert("t/o/3", o("c1", "paid", 11).as_bytes(), "3"),
+            Event::upsert("t/o/4", b"not json", "4"),
+            Event::upsert("t/e/2026-11-21/a", b"x", "5"),
+            Event::upsert("t/e/2026-11-21/b", b"x", "6"),
+            Event::upsert("t/e/2026-11-22/a", b"x", "7"),
+            Event::upsert("u/o/9", o("c1", "open", 100).as_bytes(), "8"),
+        ]);
+        let a = handle(&st, &req("POST", "/db/m/append", &body, &ct));
+        assert_eq!(a.status, 200);
+        let pairs = |st: &Server<_>, q: &str| pairs_of(&h(st, &format!("{q}&format=json")));
+        let p = |v: &[(&str, &str)]| -> Vec<(String, String)> {
+            v.iter()
+                .map(|(a, b)| (a.to_string(), b.to_string()))
+                .collect()
+        };
+        assert_eq!(
+            pairs(&st, "/db/m/view?name=by_status"),
+            p(&[("open", "2,12"), ("paid", "1,11")])
+        );
+        assert_eq!(
+            pairs(&st, "/db/m/view?name=per_day"),
+            p(&[("2026-11-21", "2,0"), ("2026-11-22", "1,0")])
+        );
+        assert_eq!(
+            pairs(&st, "/db/m/view?name=per_day&prefix=2026-11-22"),
+            p(&[("2026-11-22", "1,0")])
+        );
+        let c1 = pairs(&st, "/db/m/view?name=by_cust&eq=c1");
+        assert_eq!(
+            c1.iter().map(|x| x.0.as_str()).collect::<Vec<_>>(),
+            ["t/o/1", "t/o/3"]
+        );
+        assert_eq!(c1[0].1, o("c1", "open", 5));
+        assert_eq!(
+            pairs(&st, "/db/m/view?name=by_cust&eq=c1&keys=1&limit=1"),
+            p(&[("t/o/1", "")])
+        );
+        // Changes: a moved order, a removed one, a new customer.
+        let more = encode_events(&[
+            Event::upsert("t/o/1", o("c3", "paid", 6).as_bytes(), "9"),
+            Event::remove("t/o/2", false, "10"),
+            Event::remove("t/e/2026-11-22", true, "11"),
+        ]);
+        assert_eq!(
+            handle(&st, &req("POST", "/db/m/append", &more, &ct)).status,
+            200
+        );
+        let after: Vec<_> = ["by_status", "per_day"]
+            .iter()
+            .map(|v| pairs(&st, &format!("/db/m/view?name={v}")))
+            .collect();
+        assert_eq!(after[0], p(&[("paid", "2,17")]));
+        assert_eq!(after[1], p(&[("2026-11-21", "2,0")]));
+        assert_eq!(
+            pairs(&st, "/db/m/view?name=by_cust&eq=c1"),
+            p(&[("t/o/3", &o("c1", "paid", 11))])
+        );
+        // The same rows as a server that builds the views at the head.
+        let fresh = Server::new(Repo::new(store.clone()), make()).views(served());
+        for (i, v) in ["by_status", "per_day"].iter().enumerate() {
+            assert_eq!(pairs(&fresh, &format!("/db/m/view?name={v}")), after[i]);
+        }
+        let list = String::from_utf8(h(&st, "/db/m/views").body).unwrap();
+        assert!(
+            list.contains(r#"{"name":"by_cust","kind":"index","prefix":"t/o/"}"#),
+            "{list}"
+        );
+        // Refusals.
+        assert_eq!(h(&st, "/db/m/view?name=nope").status, 404);
+        assert_eq!(h(&st, "/db/m/view?name=by_cust").status, 400);
+        assert_eq!(h(&st, "/db/m/view?name=by_status&eq=x").status, 400);
+        let plain = Server::new(Repo::new(store.clone()), make());
+        assert_eq!(h(&plain, "/db/m/view?name=by_status").status, 404);
     }
 
     #[test]
