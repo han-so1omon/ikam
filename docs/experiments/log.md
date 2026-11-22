@@ -5721,3 +5721,25 @@ Gates on the branch (E229 to E233): every kernel test suite passes (release); cl
 - Change: none to the kernel; this entry and registry rows.
 - Verdict: **measured** (an inventory, not a score). The kernel already has most of what the four uses need; the server exposes little of it. The two first fixes are both on the database's write path (E356, E357); then serving search and a tool interface (E358, E359).
 - Not checked: E357's cause; whether the plan doc's follow-ups for the host (numbered E348-E351 when written, numbers since used by other experiments) overlap E362.
+
+### E356 db-live-preset (one flag for the options a live database wants)
+- Branch / parent: exp/356-db-live-preset / E355 (exp/354-goal-scorecard 2543cda)
+- Question: E354 found that a restarted `db serve` stalls on its first write unless `--edit-index` is on, and E355 ranked a preset first. Does one `--live` flag give a live database the write path E354 measured with the options named one by one?
+- Hypothesis: `--live` = `--packs --plain-events --no-object-templates --concurrent-reads --edit-index` keeps the first write after a restart near 0.1 s at any size, with the same stored bytes. (Source: E354, E232.)
+- Change: `src/bin/ikam/main.rs`: `--live` for `db serve`; the switches are read by one function, `db_flags`, with a test that `--live` and the five options named one by one give the same settings, and that naming one of them beside `--live` changes nothing. Defaults are unchanged (every trade-off stays an option). `experiments/goal-scorecard/db_first_write.py` gains a `live` flag set.
+- Result (`db_first_write.py`, 2,000-row batches with one index entry each, 120 s client timeout, 4-core cloud machine, one run each):
+
+  | Rows, flags | Load batch p50 | First write after restart | Later writes p50 | Append to the big table | Store |
+  |---|---|---|---|---|---|
+  | 10k, base | 84 ms | 0.198 s | 130 ms | 0.134 s | 14.1 MB |
+  | 10k, `--live` | 89 ms | 0.115 s | 104 ms | 0.134 s | 14.1 MB |
+  | 200k, base | 588 ms | 4.563 s | 145 ms | 0.838 s | 286.5 MB |
+  | 200k, `--live` | 761 ms | 0.093 s | 124 ms | 0.974 s | 286.5 MB |
+
+  - The first write after a restart is 49x faster at 200k rows (4.56 to 0.09 s) and does not grow with the store; E354 gave 5.06 against 0.11 s for the same settings, so the effect repeats.
+  - Stored bytes are identical.
+  - The trade-off: a bulk load is 23-29% slower with the options (588 to 761 ms a batch here, 649 to 846 ms in E354), and one append to the big table 16% slower (0.84 to 0.97 s). Inferred cause: `--concurrent-reads` puts the store behind a shared lock; not traced.
+  - `cargo test --release --bin ikam`: 35 pass, 1 ignored; clippy with `-D warnings` clean.
+- Verdict: **kept** (an option; it adds a capability and changes no score: no kernel code changed). For a server that restarts and must answer its first write within a client's timeout, `--live` is the setting; for a one-off bulk load into a fresh store, the base flags are about a quarter faster.
+- Not measured: stores above 200k rows; macOS; the growth of a batch's cost with the table (E357).
+- Run: `python3 experiments/goal-scorecard/db_first_write.py IKAM_BIN WORK 10000 2000 base,live` and the same with 200000.

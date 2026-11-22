@@ -30,6 +30,7 @@ SETS = {
     "defaults": [],
     "base": BASE,
     "base+write-options": BASE + ["--edit-index", "--concurrent-reads"],
+    "live": ["--live"],
 }
 PASSWORD = "e354-test"
 
