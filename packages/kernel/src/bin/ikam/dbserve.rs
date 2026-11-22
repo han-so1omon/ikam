@@ -694,6 +694,16 @@ mod tests {
         drop(w);
         assert_eq!(body(&server(true)), fresh);
         assert!(Repo::new(store.clone()).bm25_live_load(&refname).is_ok());
+        // A long prefix gets a bounded ref name (hashed), and works.
+        let long = format!("t/{}", "x".repeat(200));
+        let lq = format!("/db/s/search?q=json&prefix={long}");
+        assert_eq!(
+            handle(&server(true), &req("GET", &lq, b"", &[])).status,
+            200
+        );
+        let lref = crate::dbsearch::bm25_ref("s", &long);
+        assert!(lref.len() < 80, "{lref}");
+        assert!(store.get_ref(&lref).unwrap().is_some());
         // Without the option nothing is kept.
         let off = server(false);
         handle(&off, &req("GET", "/db/s/search?q=json&prefix=u/", b"", &[]));

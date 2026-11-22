@@ -100,8 +100,16 @@ pub struct SearchOpts {
     pub keep: bool,
 }
 
-/// The ref a kept BM25 view of `prefix` in `name` lives on.
+/// The ref a kept BM25 view of `prefix` in `name` lives on: `p` and the
+/// prefix in hex, or for a prefix over 32 bytes `h` and its BLAKE3 hash,
+/// so the name stays within a file name's length on disk.
 pub fn bm25_ref(name: &str, prefix: &str) -> String {
+    if prefix.len() > 32 {
+        return format!(
+            "search/{name}/h{}",
+            blake3::hash(prefix.as_bytes()).to_hex()
+        );
+    }
     let hex: String = prefix.bytes().map(|b| format!("{b:02x}")).collect();
     format!("search/{name}/p{hex}")
 }
@@ -261,8 +269,15 @@ impl Kept {
                 w.bm25_live_build(db, prefix, (rows / 20).max(1000))?
             }
         };
-        if self.keep {
-            w.bm25_live_save(&refname, db, &v)?;
+        // A view that cannot be kept is still served; the next restart
+        // builds it again.
+        if self.keep
+            && let Err(e) = w.bm25_live_save(&refname, db, &v)
+        {
+            eprintln!(
+                "{} keeping the search view of {name}: {e}",
+                crate::live::stamp()
+            );
         }
         kept.insert(key, (*db, v));
         Ok(v)
