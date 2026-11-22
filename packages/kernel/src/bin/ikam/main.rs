@@ -30,7 +30,7 @@ const USAGE: &str = "usage: ikam [--store DIR] [--short-records] [--slow-codec-m
   ls [REV[:PATH]] [-r]             list a directory of REV (default main)
   grep TEXT [REV]                  files of REV containing TEXT, with lines
   stats [REV]                      objects and bytes the store holds
-  db serve [--live] [--packs] [--plain-events] [--no-object-templates] [--concurrent-reads] [--edit-index] [--plain-writes] [--hnsw] [--keep-counts N] [PORT]
+  db serve [--live] [--packs] [--plain-events] [--no-object-templates] [--concurrent-reads] [--edit-index] [--plain-writes] [--hnsw] [--keep-counts N] [--defer-kv N] [PORT]
                                    the store's databases over HTTP, for programs
                                    (default port 8740, 127.0.0.1 only; dbserve.rs);
                                    --live turns on the five options a live
@@ -153,7 +153,7 @@ fn main() -> ExitCode {
 }
 
 /// `ikam db serve [--live] [--packs] [--plain-events] [--no-object-templates]
-/// [--concurrent-reads] [--edit-index] [--plain-writes] [--hnsw] [--keep-counts N]
+/// [--concurrent-reads] [--edit-index] [--plain-writes] [--hnsw] [--keep-counts N] [--defer-kv N]
 /// [--allow-host NAME]...
 /// [--log-requests] [PORT]`:
 /// the store's databases over HTTP (`dbserve.rs`), on 127.0.0.1:PORT (default
@@ -173,7 +173,10 @@ fn main() -> ExitCode {
 /// faster, since a rewritten chunk is no longer a slice of the one before.
 /// `--keep-counts N` (E233, off) keeps the number of
 /// keys under each prefix of up to N segments, edited by every append, so
-/// `count?prefix=` and `span` read one node per prefix.
+/// `count?prefix=` and `span` read one node per prefix. `--defer-kv N`
+/// (E368, off) logs each append at once but folds appends into the kv view
+/// only once N events wait, or before a read of the head, so a view chunk
+/// that many batches touch is rewritten once (`Repo::db_append_deferred`).
 ///
 /// `search` and `vsearch` (E358) rank rows by BM25, by a vector the client
 /// sends, or both fused; their indexes are built on a prefix's first query
@@ -190,7 +193,7 @@ fn main() -> ExitCode {
 fn db_cmd(store_dir: &str, args: &[String]) -> Result<(), String> {
     let mut args = args.to_vec();
     if args.first().map(String::as_str) != Some("serve") {
-        return Err("usage: ikam [--store DIR] db serve [--live] [--packs] [--plain-events] [--no-object-templates] [--concurrent-reads] [--edit-index] [--plain-writes] [--hnsw] [--keep-counts N] [--allow-host NAME]... [--log-requests] [PORT]".into());
+        return Err("usage: ikam [--store DIR] db serve [--live] [--packs] [--plain-events] [--no-object-templates] [--concurrent-reads] [--edit-index] [--plain-writes] [--hnsw] [--keep-counts N] [--defer-kv N] [--allow-host NAME]... [--log-requests] [PORT]".into());
     }
     args.remove(0);
     let mut allowed = Vec::new();
@@ -201,7 +204,12 @@ fn db_cmd(store_dir: &str, args: &[String]) -> Result<(), String> {
         Some(n) => n.parse().map_err(err)?,
         None => 0,
     };
-    let (packs, log_requests, serve_opts) = db_flags(&mut args, keep_counts);
+    let defer_kv: u64 = match take_flag(&mut args, "--defer-kv") {
+        Some(n) => n.parse().map_err(err)?,
+        None => 0,
+    };
+    let (packs, log_requests, mut serve_opts) = db_flags(&mut args, keep_counts);
+    serve_opts.defer_kv = defer_kv;
     let port: u16 = args.first().map_or(Ok(8740), |p| p.parse()).map_err(err)?;
     auth::catch_stop_signals();
     std::thread::spawn(|| {
@@ -256,6 +264,7 @@ fn db_flags(args: &mut Vec<String>, keep_counts: u32) -> (bool, bool, DbServeOpt
         plain_events,
         object_templates,
         keep_counts,
+        defer_kv: 0,
         hnsw,
     };
     (packs, log_requests, opts)
@@ -269,6 +278,8 @@ struct DbServeOpts {
     plain_events: bool,
     object_templates: bool,
     keep_counts: u32,
+    /// E368: fold appends into the kv view once this many events wait.
+    defer_kv: u64,
     hnsw: bool,
 }
 
@@ -307,7 +318,7 @@ fn serve_db<S: ikam_kernel::Store + Send + Sync + 'static>(
         dbserve::serve(
             tune(Repo::new(shared), o),
             Some(make),
-            o.keep_counts,
+            (o.keep_counts, o.defer_kv),
             index(o),
             port,
             allowed,
@@ -317,7 +328,7 @@ fn serve_db<S: ikam_kernel::Store + Send + Sync + 'static>(
         dbserve::serve(
             tune(Repo::new(store), o),
             None,
-            o.keep_counts,
+            (o.keep_counts, o.defer_kv),
             index(o),
             port,
             allowed,
@@ -1022,6 +1033,7 @@ mod tests {
             plain_events: true,
             object_templates: false,
             keep_counts: 0,
+            defer_kv: 0,
             hnsw: false,
         };
         let mut a = v(&["--live", "8752"]);
@@ -1050,6 +1062,7 @@ mod tests {
             plain_events: false,
             object_templates: true,
             keep_counts: 0,
+            defer_kv: 0,
             hnsw: false,
         };
         assert_eq!(db_flags(&mut a, 0), (false, false, off));

@@ -5,9 +5,14 @@
 //! `index`, one index entry under `i/big/by_word/WORD/pNNN` (a word drawn
 //! from 5,000, so its keys land all over the table).
 //!
-//! `cargo run --release --example db_append_scale -- DIR ROWS [BATCH] [live] [index] [plain-hot]`
+//! `cargo run --release --example db_append_scale -- DIR ROWS [BATCH] [live] [index] [plain-hot] [defer=N]`
 //!
 //! `plain-hot` is `db serve --plain-writes` (`Repo::plain_hot_writes`).
+//! `defer=N` is `db serve --defer-kv N` (E368): each batch is logged with
+//! `db_append_deferred` and the kv view is folded (`db_catch_up`) once N
+//! events wait, and at the end; `fold_ms` is the fold's time in a window
+//! (0 when none ran), and `append_ms` the p50 of a batch's whole cost, its
+//! share of a fold included.
 //!
 //! DIR is created and must not exist. Prints one JSON line per window of
 //! ten batches: rows before it, the p50 of append and commit, and bytes
@@ -80,6 +85,10 @@ fn main() {
     let live = a.iter().any(|f| f == "live");
     let index = a.iter().any(|f| f == "index");
     let plain_hot = a.iter().any(|f| f == "plain-hot");
+    let defer: u64 = a
+        .iter()
+        .find_map(|f| f.strip_prefix("defer="))
+        .map_or(0, |n| n.parse().unwrap());
     let opts = PackOptions {
         lazy_checkpoint: true,
         ref_log: false,
@@ -98,14 +107,28 @@ fn main() {
     let path = std::path::Path::new(&dir);
     let mut db = repo.db_empty().unwrap();
     let (mut app, mut com, mut grew) = (Vec::new(), Vec::new(), Vec::new());
+    let (mut fold_ms, mut total_ms) = (0.0, 0.0);
     let mut window_start = 0;
     let t0 = Instant::now();
     for start in (0..rows).step_by(per) {
         let events = batch(start, per.min(rows - start), index);
         let before = dir_bytes(path);
         let t = Instant::now();
-        let new = repo.db_append(&db, &events).unwrap();
+        let new = if defer > 0 {
+            let d = repo.db_append_deferred(&db, &events).unwrap();
+            if d.ids_at - d.kv_at >= defer || start + per >= rows {
+                let f = Instant::now();
+                let caught = repo.db_catch_up(&d).unwrap();
+                fold_ms += f.elapsed().as_secs_f64() * 1000.0;
+                caught
+            } else {
+                d
+            }
+        } else {
+            repo.db_append(&db, &events).unwrap()
+        };
         app.push(t.elapsed().as_secs_f64() * 1000.0);
+        total_ms += t.elapsed().as_secs_f64() * 1000.0;
         let t = Instant::now();
         repo.db_commit("db/t", &new, "batch").unwrap();
         com.push(t.elapsed().as_secs_f64() * 1000.0);
@@ -113,15 +136,17 @@ fn main() {
         db = new;
         if app.len() == 10 || start + per >= rows {
             println!(
-                "{{\"rows\":{window_start},\"append_ms\":{:.1},\"commit_ms\":{:.1},\
+                "{{\"rows\":{window_start},\"append_ms\":{:.1},\"mean_ms\":{:.1},\"fold_ms\":{fold_ms:.0},\"commit_ms\":{:.1},\
                  \"grew_mb\":{:.2},\"store_mb\":{:.1},\"elapsed_s\":{:.1}}}",
-                median(&mut app),
+                median(&mut app.clone()),
+                app.iter().sum::<f64>() / app.len() as f64,
                 median(&mut com),
                 median(&mut grew) / 1e6,
                 dir_bytes(path) as f64 / 1e6,
                 t0.elapsed().as_secs_f64()
             );
             app.clear();
+            fold_ms = 0.0;
             com.clear();
             grew.clear();
             window_start = start + per;
@@ -144,7 +169,8 @@ fn main() {
     }
     let get_ms = t.elapsed().as_secs_f64() * 1000.0;
     print!(
-        "{{\"done\":{rows},\"store_mb\":{:.1},\"index_rows\":{n},\"scan_index_ms\":{scan_ms:.0},\"get_1000_ms\":{get_ms:.0}",
+        "{{\"done\":{rows},\"append_total_s\":{:.1},\"store_mb\":{:.1},\"index_rows\":{n},\"scan_index_ms\":{scan_ms:.0},\"get_1000_ms\":{get_ms:.0}",
+        total_ms / 1000.0,
         dir_bytes(path) as f64 / 1e6
     );
     println!("}}");
