@@ -5783,3 +5783,33 @@ Gates on the branch (E229 to E233): every kernel test suite passes (release); cl
 - Not measured: macOS; batches other than 2,000; more than one index per table; writes with `--plain-writes` and a full repack afterwards.
 - Next (proposed, not started): buffer index edits so a leaf is rewritten once for many entries (a small recent tree beside `kv`, merged in the background, E262's integrator), which needs every reader of `kv` (gets, ranges, `graph_diff` in views, BM25, vectors, joins) to read both; the 2 s first write after a restart on the plain store; per-chunk costs that do not change bytes (`node_size` encodes each node again to measure it; `merge` rebuilds a map of every touched chunk).
 - Run: `cargo run --release --example db_append_scale -- DIR 1000000 2000 index` (and with `plain-hot`, and without `index`); `python3 experiments/goal-scorecard/db_first_write.py IKAM_BIN WORK 200000 2000 base,live,live+plain-writes`.
+
+### E367 restart-first-write (why the first write after a restart is slow, and a one-pass ledger)
+- Branch / parent: exp/367-restart-first-write / main (ccdf499, E357 merged)
+- Question: E357 left open why `db serve --live --plain-writes` took 1.9 s for its first write after a restart at 200k rows, against 0.11 s for `--live`, and why reopening the same store gave 0.09 s or 2.2 s in turn whatever the flag. What is the first write waiting for, and can it be made cheap without changing what is stored?
+- Method: `experiments/goal-scorecard/db_first_write.py`'s server and rows, driven by `restart_first_write.py` (new, same folder), which loads 200k rows (2,000-row batches, one index entry each) and then restarts the server several times with given flags, timing the first and second write after each start. Stacks were sampled with `gdb` during the first write; timers were added for one run to `Repo::ledger` and to `db serve`'s append (not committed). A 4-core cloud machine; the main build and this branch were measured in the same session.
+- Cause: the first write builds the `Repo`'s ledger (the derivation records and the set of every stored id), which is built once per handle and was not built at start.
+  - With `--plain-events` (part of `--live`) each fresh event asks `has_content`, which asks the ledger whether a derivation already gives the content.
+  - The ledger listed every id in the store (655k-690k at 200k rows: rows, index entries, events and view chunks), then read each object's 32-byte head through the pack store's index: an on-disk interpolation search and one read per id. That took 1.5-1.7 s of the 1.9 s.
+  - Why it "did not follow the flag": a start whose store holds derivation records written by an earlier session (planned writes, i.e. `--live` without `--plain-writes`) reads derived content while opening the database, which builds the ledger during start, so the first write then takes 0.05-0.07 s. A start after a `--plain-writes` session finds no derivation records to read at start, so the build falls to the first write. Reproduced: first writes of 1.86, 1.61, 0.054, 1.89, 0.068 and 1.79 s over six restarts alternating the flags.
+- Change: no format change and no option (the stored bytes, roots and ledger are the same).
+  - `Store::heads(n, f)`: every stored object's id and the first `n` bytes of its encoding, in no set order. The default lists the ids and reads each head, as the ledger did; `SharedStore` runs its store's under one lock.
+  - `PackStore::heads`: reads the sealed indexes and the open pack's checkpoint in 1 MiB blocks, merges them with the open pack's records newest-first (a stable sort of the sources, which are each in id order), drops deleted ids, then reads each pack's heads in offset order in 1 MiB blocks (unflushed records from the write buffer).
+  - `Repo::ledger` builds from one `heads` pass: the id set is built once at its full size, derivation records are read whole after the pass, in id order as before.
+  - New test `pack_heads_match_listing` (tests/backends.rs): `heads` equals listing the ids and reading each head, at head sizes 1, 32, 300 and 4 MiB, over a sealed pack, a lazy checkpoint, records after it, unflushed writes, deletes, replaces and a 3 MiB record.
+- Result (200k rows, `--live --plain-writes`, first write after a restart; one run of three or four restarts each):
+
+  | Build | First write | Second write |
+  |---|---|---|
+  | main (ccdf499) | 1.86, 1.87, 1.96 s | 0.07-0.08 s |
+  | first version (hash-map merge) | 0.46-0.55 s | 0.06-0.07 s |
+  | this branch | 0.34, 0.39, 0.39 s | 0.07-0.09 s |
+
+  - The ledger build went from about 1.6 s to 0.34-0.40 s: index merge and sort about 0.1 s, reading the 434 MB pack in blocks about 0.15 s (it is read once, cached: every 4 KiB page holds about six records, so reading only heads still touches every page), building the id set and the needed index about 0.1 s.
+  - The first write after a restart is about 5 times faster; it still grows with the store, as the ledger does.
+  - The fixed benchmark is unchanged: bytes, proxy and read scores and the north score (0.306) are identical to main; the cost score was 0.2503 here and 0.2662 on main in the same session, which is its timing noise (the bench writes no plain events and builds no ledger on a restart).
+  - `cargo test --release` (kernel and binary): 335 pass, 4 ignored; clippy clean.
+- Verdict: **kept** (no format change, no option, benchmark unchanged).
+- Not measured: macOS; stores of more than one pack; FsStore (it keeps the default `heads`).
+- Next (proposed, not started): skip the ledger in `has_content` for fresh plain events while it is not built (a rare second plain copy of content a derivation already gives, which `repack` drops), which would make the first write independent of the store's size; or build the ledger on a thread at start.
+- Run: `python3 experiments/goal-scorecard/restart_first_write.py IKAM_BIN WORK 200000 "--live --plain-writes;--live --plain-writes;--live --plain-writes;--live --plain-writes"` (loads with the first flag set, then restarts once per later set); `cargo test --release --test backends pack_heads`.

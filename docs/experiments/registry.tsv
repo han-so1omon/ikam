@@ -339,3 +339,4 @@ E363	host-tokens	capability	planned	exp/354-goal-scorecard	safety	host,auth	no	p
 E364	embedder	capability	planned	exp/354-goal-scorecard	search	search,vectors,embeds	no	planned (E355): in-kernel static embeddings so semantic search needs no outside model
 E365	scoped-merge	capability	planned	exp/354-goal-scorecard	safety	shares,merge	no	planned (E355): merge for section, fragment and graph scopes
 E366	cross-type-sharing	measurement	planned	exp/354-goal-scorecard	north	north,sharing	yes	planned (E355): raise one-graph sharing across file types from 0.950
+E367	restart-first-write	measurement	kept	exp/367-restart-first-write	cost	ledger,packs,serve	no	first write after a restart with --plain-writes waited on the ledger build (one index lookup and read per stored id, ~660k ids at 200k rows): Store::heads reads pack indexes and packs in blocks, first write 1.86-1.96 s -> 0.34-0.39 s; no format change; bench unchanged
