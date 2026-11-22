@@ -23,6 +23,8 @@
 //!   With `--keep-counts N` (E233) `count?prefix=` and `span` read kept
 //!   counts for prefixes ending in `/` of up to N segments.
 //! - `GET head`: `{"head":N,"commit":"..."|null}`.
+//! - `GET search?q=TEXT&prefix=P`, `POST vsearch?prefix=VP` and their
+//!   fusion: ranked and vector search (E358, `dbsearch.rs`).
 //!
 //! `GET /db/` lists the databases. Add `format=json` to a scan or a get for
 //! `[["key","value"],...]` (values must be UTF-8).
@@ -70,6 +72,8 @@ pub struct Server<S: Store> {
     readers: Option<Readers<S>>,
     /// Keep counts of key prefixes up to this many segments (E233); 0: no.
     keep_counts: u32,
+    /// Ranked and vector search indexes (E358), built when first searched.
+    search: crate::dbsearch::Kept,
 }
 
 fn refname(name: &str) -> String {
@@ -128,7 +132,14 @@ impl<S: Store> Server<S> {
             heads: Mutex::new(HashMap::new()),
             readers: readers.map(|f| (f, Mutex::new(Vec::new()))),
             keep_counts: 0,
+            search: Default::default(),
         }
+    }
+
+    /// Search vector rows with `index` (E358; exact by default).
+    pub fn vector_index(mut self, index: crate::dbsearch::VectorIndex) -> Server<S> {
+        self.search.index = index;
+        self
     }
 
     /// Keep counts of key prefixes of up to `depth` segments in every
@@ -282,8 +293,10 @@ fn handle<S: Store>(srv: &Server<S>, req: &Request) -> Response {
     if !valid_name(name) {
         return Response::text(400, "database names are [A-Za-z0-9._-]");
     }
-    if (req.method.as_str(), route) == ("POST", "append") {
-        return append(srv, name, req);
+    match (req.method.as_str(), route) {
+        ("POST", "append") => return append(srv, name, req),
+        ("GET" | "POST", "search") | ("POST", "vsearch") => return search(srv, name, req),
+        _ => {}
     }
     let heads = &srv.heads;
     let at_param = req.param("at");
@@ -410,6 +423,31 @@ fn handle<S: Store>(srv: &Server<S>, req: &Request) -> Response {
     })
 }
 
+/// `search` and `vsearch` (E358, `dbsearch.rs`): the keyword view is
+/// brought to the head under the writer's lock (it writes postings), then
+/// the query runs on a reader.
+fn search<S: Store>(srv: &Server<S>, name: &str, req: &Request) -> Response {
+    let q = match crate::dbsearch::Query::parse(req, req.path.ends_with("/vsearch")) {
+        Ok(q) => q,
+        Err(r) => return r,
+    };
+    let (db, bm25) = {
+        let mut w = srv.writer.lock().unwrap();
+        let db = match open(&srv.heads, &mut w, name) {
+            Ok((_, db)) => db,
+            Err(e) => return fail(e),
+        };
+        match q.keyword_prefix() {
+            None => (db, None),
+            Some(p) => match srv.search.bm25_at(&mut w, name, p, &db) {
+                Ok(v) => (db, Some(v)),
+                Err(e) => return fail(e),
+            },
+        }
+    };
+    srv.read(|r| srv.search.answer(r, name, &db, bm25, &q, req))
+}
+
 /// `POST append`, under the writer's lock.
 fn append<S: Store>(srv: &Server<S>, name: &str, req: &Request) -> Response {
     if req
@@ -470,6 +508,7 @@ pub fn serve<S: Store + Send + 'static>(
     repo: Repo<S>,
     readers: Option<ReaderFactory<S>>,
     keep_counts: u32,
+    index: crate::dbsearch::VectorIndex,
     port: u16,
     allowed: Vec<String>,
     log_requests: bool,
@@ -482,7 +521,11 @@ pub fn serve<S: Store + Send + 'static>(
     if reader.is_some() && auth.is_none() {
         return Err("IKAM_READ_AUTH needs IKAM_AUTH too".into());
     }
-    let state = Arc::new(Server::new(repo, readers).keep_counts(keep_counts));
+    let state = Arc::new(
+        Server::new(repo, readers)
+            .keep_counts(keep_counts)
+            .vector_index(index),
+    );
     let hosts = Hosts::new(port, allowed);
     let password = auth.is_some();
     let handler = Arc::new(move |req: Request| {
@@ -565,6 +608,116 @@ mod tests {
         assert_eq!(decode_events(&encode_events(&events)).unwrap(), events);
         assert!(decode_events(&[0, 0, 0, 0, 9]).is_err());
         assert!(decode_events(&[7, 0, 0, 0, 0, 0, 0, 0, 0]).is_err());
+    }
+
+    fn vec_body(v: &[f32]) -> Vec<u8> {
+        v.iter().flat_map(|x| x.to_le_bytes()).collect()
+    }
+
+    fn keys_of(r: &Response) -> Vec<String> {
+        assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
+        let j = crate::json::parse(std::str::from_utf8(&r.body).unwrap()).unwrap();
+        j.as_arr()
+            .iter()
+            .map(|h| h.get("key").unwrap().as_str().unwrap().to_string())
+            .collect()
+    }
+
+    #[test]
+    fn search_ranks_follows_appends_and_fuses() {
+        use crate::dbsearch::VectorIndex;
+        for shared in [false, true] {
+            for index in [VectorIndex::Exact, VectorIndex::Hnsw] {
+                searched(shared, index);
+            }
+        }
+    }
+
+    fn searched(shared: bool, index: crate::dbsearch::VectorIndex) {
+        let store = ikam_kernel::SharedStore::new(MemStore::default());
+        let make = || -> Option<ReaderFactory<_>> {
+            shared.then(|| Box::new(|w: &Repo<_>| w.sibling()) as ReaderFactory<_>)
+        };
+        let st = Server::new(Repo::new(store.clone()), make()).vector_index(index);
+        let h = |st: &Server<_>, r: Request| handle(st, &r);
+        let ct = [("content-type", EVENTS)];
+        let x = |a: f32, b: f32| vec_body(&[a, b, 0.0]);
+        let body = encode_events(&[
+            Event::upsert("t/a", b"a parser for json files", "1"),
+            Event::upsert("t/b", b"resize images quickly", "2"),
+            Event::upsert("t/c", b"json json schema checks", "3"),
+            Event::upsert("u/z", b"json outside the prefix", "4"),
+            Event::upsert("v/a", &x(1.0, 0.0), "5"),
+            Event::upsert("v/b", &x(0.0, 1.0), "6"),
+            Event::upsert("v/c", &x(0.6, 0.8), "7"),
+        ]);
+        assert_eq!(h(&st, req("POST", "/db/s/append", &body, &ct)).status, 200);
+        let get = |st: &Server<_>, q: &str| keys_of(&h(st, req("GET", q, b"", &[])));
+        assert_eq!(get(&st, "/db/s/search?q=json&prefix=t/"), ["t/c", "t/a"]);
+        assert_eq!(get(&st, "/db/s/search?q=json&prefix=t/&k=1"), ["t/c"]);
+        assert!(get(&st, "/db/nobody/search?q=json&prefix=t/").is_empty());
+        // The index follows appends: a changed row and a removed one.
+        let more = encode_events(&[
+            Event::upsert("t/b", b"json images", "8"),
+            Event::remove("t/c", false, "9"),
+            Event::upsert("v/b", &x(0.8, 0.6), "10"),
+        ]);
+        assert_eq!(h(&st, req("POST", "/db/s/append", &more, &ct)).status, 200);
+        let after = get(&st, "/db/s/search?q=json&prefix=t/");
+        assert_eq!(after, ["t/b", "t/a"]);
+        // The same answer as a server that builds the index at the head.
+        let fresh = Server::new(Repo::new(store.clone()), make()).vector_index(index);
+        assert_eq!(get(&fresh, "/db/s/search?q=json&prefix=t/"), after);
+        // Vectors: nearest by dot product, as f32 or JSON.
+        let v = |st: &Server<_>, q: &str, body: Vec<u8>, json: bool| {
+            let hdr = [("content-type", "application/json")];
+            keys_of(&h(st, req("POST", q, &body, if json { &hdr } else { &[] })))
+        };
+        assert_eq!(
+            v(&st, "/db/s/vsearch?prefix=v/&k=2", x(1.0, 0.0), false),
+            ["v/a", "v/b"]
+        );
+        assert_eq!(
+            v(&st, "/db/s/vsearch?prefix=v/", b"[0,1,0]".to_vec(), true),
+            ["v/c", "v/b", "v/a"]
+        );
+        assert_eq!(
+            v(&st, "/db/s/vsearch?prefix=v/", b"[0,1,0]".to_vec(), true)[0],
+            "v/c"
+        );
+        // Fused: keyword rows t/a and t/b; the vector picks between them.
+        let fuse = "/db/s/search?q=json&prefix=t/&vectors=v/&alpha=0.3";
+        assert_eq!(v(&st, fuse, x(1.0, 0.0), false)[0], "t/a");
+        assert_eq!(v(&st, fuse, x(0.0, 1.0), false)[0], "t/b");
+        let rrf = "/db/s/search?q=json&prefix=t/&vectors=v/&fuse=rrf";
+        assert_eq!(
+            v(&st, rrf, x(0.0, 1.0), false).len(),
+            3,
+            "t/c's vector is kept"
+        );
+        // Refusals.
+        let status = |q: &str, body: &[u8]| h(&st, req("POST", q, body, &[])).status;
+        assert_eq!(
+            status("/db/s/vsearch?prefix=v/", &vec_body(&[1.0, 0.0])),
+            400
+        );
+        assert_eq!(status("/db/s/vsearch?prefix=v/", b"abc"), 400);
+        assert_eq!(status("/db/s/vsearch", &x(1.0, 0.0)), 400);
+        assert_eq!(status("/db/s/search?prefix=t/", b""), 400);
+        assert_eq!(status(&format!("{fuse}&fuse=max"), &x(1.0, 0.0)), 400);
+        assert_eq!(status("/db/s/vsearch?prefix=t/", &x(1.0, 0.0)), 422);
+        // A prefix searched while empty takes its dimension from the first
+        // vectors appended later.
+        assert!(v(&st, "/db/s/vsearch?prefix=w/", x(1.0, 0.0), false).is_empty());
+        let late = encode_events(&[
+            Event::upsert("w/a", &x(1.0, 0.0), "11"),
+            Event::upsert("w/b", &x(0.0, 1.0), "12"),
+        ]);
+        assert_eq!(h(&st, req("POST", "/db/s/append", &late, &ct)).status, 200);
+        assert_eq!(
+            v(&st, "/db/s/vsearch?prefix=w/", x(0.0, 1.0), false),
+            ["w/b", "w/a"]
+        );
     }
 
     #[test]
