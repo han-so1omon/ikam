@@ -5832,3 +5832,317 @@ Gates on the branch (E229 to E233): every kernel test suite passes (release); cl
 - Not done or not measured: search over files in `live` and `host` (`host` serves no databases); keeping the views across restarts (a ref or an entry in the commit tree); `at=COMMIT`; a fused result can name a text row that was removed while its vector was kept; stemming (E344: no gain); the graph built with `extend` on threads (E332: 4x faster builds); tables above 11,415 rows; macOS.
 - Next (proposed, not started): persist the BM25 and vector indexes with the database so a restart reads them back; trace the build's memory; a build in the background so the first query does not wait; the same routes over files in `live`; E364's embedder so the server can embed queries itself.
 - Run: `python3 -I experiments/server-search/search_bench.py IKAM_BIN WORK DIR --live` and `... --live --hnsw`, DIR from `prepare.py` (exp/259-fusion-tune; not committed).
+### E359 agent-tools (`ikam mcp`: the store as tools an AI agent calls)
+- Branch / parent: exp/359-agent-tools / main (ccdf499, E357 merged)
+- Question: E355 ranked a tool interface fourth for the "file service for AI tools" use: an agent today reaches ikam only through WebDAV (whole files) and `/api/search`. Can one stdio server give an agent's MCP client the live handlers (ranges, search, edits, commits with its own message, diffs, reads at a commit, drafts), does a standard client accept it, and what does a call cost?
+- Hypothesis: a Model Context Protocol server over `Live` (E110) needs no new kernel code, passes a standard client, answers reads and searches in milliseconds, and lets an agent change one line of a large file while taking in a small fraction of the file. (Source: E355's inventory; the MCP specification's stdio transport and tool calls.)
+- Change: `src/bin/ikam/mcp.rs` (new): `ikam --store S [--ref R] mcp`, JSON-RPC 2.0 one message a line on stdin/stdout, protocol versions 2024-11-05 to 2025-11-25 (the client's if known). 16 tools: `list`, `read` (line range; `at` any revision; a binary file's extracted text), `search` (E110's exact search), `passages` (`ask`'s ranked passages, no model), `write`, `edit` (replace text that must occur once, or `all`), `remove`, `move`, `status`, `commit` (the agent's message), `history` (or a file's versions), `diff` (paths between revisions, or a unified diff of one file, with `similar`, already a dependency), `drafts`, `draft_open`, `draft_promote`, `draft_discard` (E266, on the session's ref). Tool failures are tool results with `isError`, not protocol errors. Output is capped at 64 KiB and says where to read on. Edits wait until `commit` (no timer); edits pending when stdin closes are committed as "mcp: N change(s) left at exit". `live.rs`: `Live::flush_with` (a commit message) and `Live::base_tree`. Four unit tests in `mcp.rs`. `experiments/agent-tools/mcp_check.py` drives it with the official MCP Python SDK (2.3.0) client. README section.
+- Result (`mcp_check.py`, corpus: this repository's `docs/` and `packages/kernel/src/`, 113 files, 2.8 MB, copied 1 or 40 times, 40 with a line added to every file of every copy after the first so no content repeats; 4-core cloud machine; medians of 5 calls unless given):
+
+  | | 113 files, 2.8 MB | 4,520 files, 111 MB |
+  |---|---|---|
+  | start and initialize (text of every file extracted) | 42 ms | 384 ms |
+  | search (one word) | 1.1 ms | 17.7 ms |
+  | read 21 lines of an 825 KB file | 1.1 ms | 1.1 ms |
+  | read without a range (cut at 64 KiB) | 1.8 ms | 1.8 ms |
+  | edit one word in the 825 KB file (1 call) | 125 ms | 113 ms |
+  | edit a 1.1 KB file (median of 10) | 0.7 ms | 5.1 ms |
+  | commit | 2.7 ms | 3.2 ms |
+  | history, 20 commits | 0.7 ms | 2.5 ms |
+  | unified diff of the edited file between two commits | 6.1 ms | 6.0 ms |
+  | passages for a question | 2.6 ms | 67.5 ms |
+
+  - The SDK client negotiated 2025-11-25, listed 16 tools, and every call answered: a renamed word shows in `history` and `diff`; a draft's file is absent at `main` until `draft_promote`, then present; a missing path comes back as a tool error; the edit left pending at exit was committed.
+  - The task (rename one identifier that occurs once, in `docs/experiments/log.md`, 825 KB): search, read 21 lines around the hit, edit, commit. The agent took in 4,745 characters (113 files) to 14,799 (4,520 files, where the word is in 40 copies and the search lists each) and sent about 165. Through WebDAV it would read and write the whole file (825 KB each way), and with files only and no server search, find the word by reading every file (2.8 MB to 111 MB). So 56 to 174 times less text in than a whole-file read.
+  - A small edit grows with the number of files (0.7 to 5.1 ms), since `Live::apply` rebuilds the path view of the whole tree after each edit; the big edit's time is storing and extracting the 825 KB file.
+  - `cargo test --release --bin ikam`: 39 pass, 1 ignored; clippy `-D warnings` clean. No kernel code changed, so the scores cannot move.
+- Verdict: **kept** (a capability; no score changes). An agent with an MCP client can use an ikam store as its file system with history: ranges, search, edits, commits with its own messages, diffs, reads at any commit, and drafts it can promote or throw away.
+- Fixes from the PR's automated review: `diff` compares bytes, so two different non-UTF-8 files that decode to the same replacement characters report "binary file changed" instead of "no changes"; `read` takes `start_char`, and a line longer than one answer is shown in pieces that each say where the next starts (before, the rest of such a line could not be read). Test `long_lines_page_and_binary_diffs_compare_bytes`; 40 pass, 1 ignored.
+- Not measured: a model using the tools (only a scripted client here); running beside `ikam live` on the same store; macOS; non-UTF-8 text files (read as extracted text, edited only with `write`); E358's ranked search, which a later change can add as a tool.
+- Run: `pip install mcp`, then `python3 experiments/agent-tools/mcp_check.py IKAM_BIN WORK CORPUS_DIR 1` and `... 40 distinct`.
+
+### E360 served-drafts (the agent tools over HTTP: drafts, history, commit messages and reads at a commit)
+- Branch / parent: exp/360-served-drafts / exp/359-agent-tools (fcea74a)
+- Question: E355 ranked serving drafts, history, commit messages and reads at a commit fifth for safe edits by AI tools: `ikam mcp` (E359) gives them to an agent that starts its own process over stdio, but a program talking to a running `ikam live` or `host` had only whole files (WebDAV), search and an unnamed commit. Can the same handlers answer over the server's `/api`, with writes kept to POST and the owner alone promoting in `host`, and what does a call cost?
+- Hypothesis: the MCP session's tool handlers run unchanged on the served `Live` behind its lock, answer in about a millisecond for reads, and a draft can be opened, written, committed and promoted over HTTP while `main` stays as it was until the promote. (Source: E355's inventory; E359's tools.)
+- Change:
+  - `ui.rs`: `GET /api/tools` (the tool list, as `tools/list` gives it); `/api/tool/NAME`. Tools that change nothing (`list`, `read`, `search`, `passages`, `status`, `history`, `diff`, `drafts`) answer GET with their arguments in the query; the rest need POST (405 otherwise), with a JSON object of arguments as the body. The answer is `{"text": ..., "error": false}`, or 400 with `"error": true`; an unknown tool is 404. POSTs need the `X-Ikam` header, as every `/api` POST does. `POST /api/commit?message=...` names the commit.
+  - `mcp.rs`: `Session` holds anything that derefs to a `Live` (its own, or the server's under the lock), so both front ends share the handlers. The session's home ref is now `Live::home`, and drafts switch the `Live` in place (`Live::switch_ref`) instead of reopening the store. Query arguments come as strings, so booleans also accept "true" and "1".
+  - `live.rs`: `Live::home` (the ref it was opened on), `Live::switch_ref` (refuses while edits are pending), `Live::switch_ref_dropping` (drops them, for `draft_discard`), and `Live::hold_until`: an edit made through a tool keeps the server's timed commit (`commit_after`, 1.5 s) off the pending edits for up to 10 minutes (`mcp::HOLD`), so the agent's own `commit` keeps its message and its boundary (found by the PR's automated review). WebDAV and page edits made meanwhile wait with them.
+  - `host.rs`: `/api/tool/draft_promote` needs the owner role; other writes need the writer role, as before.
+  - Tests: `ui::tests::agent_tools_over_http` (list, 405 and 404, write, the timed commit leaving a tool edit pending, commit with a message, `/api/commit?message`, history, a read at the first commit, a draft opened, written, committed and promoted with `main` read before and after, a tool error, a POST without the header refused) and more cases in `host::tests::roles_limit_what_a_user_does` (a reader can call `status` but not `write`, a writer cannot promote, an owner can).
+  - `experiments/agent-tools/http_check.py`. README.
+- Fix found on the way: E359's `draft_discard` with edits still pending on the draft failed once it switched in place ("commit pending edits first"). Reopening the store had dropped them silently; the discard now drops them on purpose.
+- Result (`http_check.py` on `ikam live`, this repository's `docs/` and `packages/kernel/src/`, 113 files, 2.7 MB, loaded through `/api/tool/write`; a 4-core cloud machine; medians of 5 calls, two runs):
+
+  | | ms |
+  |---|---|
+  | load 113 files with `write`, then `commit` (whole) | 710-740 |
+  | `GET /api/tools` | 0.6-0.8 |
+  | search (one word) | 1.0-1.2 |
+  | read 21 lines of the 830 KB file | 1.0-1.1 |
+  | history, 20 commits | 0.6-0.9 |
+  | edit one word in the 830 KB file (1 call) | 32-37 |
+  | commit | 2.2-2.5 |
+  | write a small file (median of 10) | 3.8-4.1 |
+  | `POST /api/commit?message=` | 2.2-2.4 |
+  | unified diff of the edited file between two commits | 5.4-6.2 |
+  | draft open, write, commit, check `main` without it, promote, check `main` with it | 8.6-9.0 |
+
+  - Every answer matched E359's stdio tools; a GET of `write` was 405, a POST without the header 403.
+  - The edit of the big file took 32-37 ms here against 113-125 ms over stdio in E359 (not traced; the corpus here is loaded by writes, E359's by indexing a folder); reads cost the same.
+  - `cargo test --release --bin ikam`: 40 pass, 1 ignored; clippy clean. No kernel code changed, so the scores cannot move.
+- Verdict: **kept** (a capability; no score changes). A program next to a running server can edit on a draft with its own commit messages, read history and any commit, and promote or discard, without a second process on the store.
+- Trade-off left as it is: a draft opened over HTTP moves the whole served session (the web page and WebDAV too) onto the draft until it is promoted or discarded, because a `Live` has one ref. Drafts per caller would need a `Live` per draft (a later change).
+- Not measured: a model using the tools; `host` timings (only its role checks were tested); two programs using drafts at once (the second is refused while the first is open); macOS.
+- Run: `python3 experiments/agent-tools/http_check.py IKAM_BIN WORK CORPUS_DIR` (CORPUS_DIR: a copy of `docs/` and `packages/kernel/src/`); `cargo test --release --bin ikam agent_tools roles`.
+### E367 restart-first-write (why the first write after a restart is slow, and a one-pass ledger)
+- Branch / parent: exp/367-restart-first-write / main (ccdf499, E357 merged)
+- Question: E357 left open why `db serve --live --plain-writes` took 1.9 s for its first write after a restart at 200k rows, against 0.11 s for `--live`, and why reopening the same store gave 0.09 s or 2.2 s in turn whatever the flag. What is the first write waiting for, and can it be made cheap without changing what is stored?
+- Method: `experiments/goal-scorecard/db_first_write.py`'s server and rows, driven by `restart_first_write.py` (new, same folder), which loads 200k rows (2,000-row batches, one index entry each) and then restarts the server several times with given flags, timing the first and second write after each start. Stacks were sampled with `gdb` during the first write; timers were added for one run to `Repo::ledger` and to `db serve`'s append (not committed). A 4-core cloud machine; the main build and this branch were measured in the same session.
+- Cause: the first write builds the `Repo`'s ledger (the derivation records and the set of every stored id), which is built once per handle and was not built at start.
+  - With `--plain-events` (part of `--live`) each fresh event asks `has_content`, which asks the ledger whether a derivation already gives the content.
+  - The ledger listed every id in the store (655k-690k at 200k rows: rows, index entries, events and view chunks), then read each object's 32-byte head through the pack store's index: an on-disk interpolation search and one read per id. That took 1.5-1.7 s of the 1.9 s.
+  - Why it "did not follow the flag": a start whose store holds derivation records written by an earlier session (planned writes, i.e. `--live` without `--plain-writes`) reads derived content while opening the database, which builds the ledger during start, so the first write then takes 0.05-0.07 s. A start after a `--plain-writes` session finds no derivation records to read at start, so the build falls to the first write. Reproduced: first writes of 1.86, 1.61, 0.054, 1.89, 0.068 and 1.79 s over six restarts alternating the flags.
+- Change: no format change and no option (the stored bytes, roots and ledger are the same).
+  - `Store::heads(n, f)`: every stored object's id and the first `n` bytes of its encoding, in no set order. The default lists the ids and reads each head, as the ledger did; `SharedStore` runs its store's under one lock.
+  - `PackStore::heads`: reads the sealed indexes and the open pack's checkpoint in 1 MiB blocks, merges them with the open pack's records newest-first (a stable sort of the sources, which are each in id order), drops deleted ids, then reads each pack's heads in offset order in 1 MiB blocks (unflushed records from the write buffer).
+  - `Repo::ledger` builds from one `heads` pass: the id set is built once at its full size, derivation records are read whole after the pass, in id order as before.
+  - New test `pack_heads_match_listing` (tests/backends.rs): `heads` equals listing the ids and reading each head, at head sizes 1, 32, 300 and 4 MiB, over a sealed pack, a lazy checkpoint, records after it, unflushed writes, deletes, replaces and a 3 MiB record.
+- Result (200k rows, `--live --plain-writes`, first write after a restart; one run of three or four restarts each):
+
+  | Build | First write | Second write |
+  |---|---|---|
+  | main (ccdf499) | 1.86, 1.87, 1.96 s | 0.07-0.08 s |
+  | first version (hash-map merge) | 0.46-0.55 s | 0.06-0.07 s |
+  | this branch | 0.34, 0.39, 0.39 s | 0.07-0.09 s |
+
+  - The ledger build went from about 1.6 s to 0.34-0.40 s: index merge and sort about 0.1 s, reading the 434 MB pack in blocks about 0.15 s (it is read once, cached: every 4 KiB page holds about six records, so reading only heads still touches every page), building the id set and the needed index about 0.1 s.
+  - The first write after a restart is about 5 times faster; it still grows with the store, as the ledger does.
+  - The fixed benchmark is unchanged: bytes, proxy and read scores and the north score (0.306) are identical to main; the cost score was 0.2503 here and 0.2662 on main in the same session, which is its timing noise (the bench writes no plain events and builds no ledger on a restart).
+  - `cargo test --release` (kernel and binary): 335 pass, 4 ignored; clippy clean.
+- Verdict: **kept** (no format change, no option, benchmark unchanged).
+- Not measured: macOS; stores of more than one pack; FsStore (it keeps the default `heads`).
+- Next (proposed, not started): skip the ledger in `has_content` for fresh plain events while it is not built (a rare second plain copy of content a derivation already gives, which `repack` drops), which would make the first write independent of the store's size; or build the ledger on a thread at start.
+- Run: `python3 experiments/goal-scorecard/restart_first_write.py IKAM_BIN WORK 200000 "--live --plain-writes;--live --plain-writes;--live --plain-writes;--live --plain-writes"` (loads with the first flag set, then restarts once per later set); `cargo test --release --test backends pack_heads`.
+### E368 deferred-kv (fold appends into the kv view in batches: buffered index edits)
+- Branch / parent: exp/368-deferred-kv / main (ccdf499, E357 merged)
+- Question: E357 left a 2,000-row batch with one index entry per row growing from 124 ms on an empty table to 1.0 s at 200k rows, because each new index entry lands in a different leaf of the kv view, so every batch rewrites about one leaf per entry; `--plain-writes` made each rewrite cheaper but not fewer. If the kv view is folded once for many batches, a leaf that many batches touch is rewritten once. How much does that save, what does it cost a read, and does it give the same database?
+- Hypothesis: the `Db` already records where each view stands in the log (`kv_at`), so appends can log events and index their idempotency keys at once and fold the kv view later, with the same roots as appending batch by batch. Loading would get several times faster and the store smaller; a read of the head pays for the fold of whatever waits.
+- Change: an option, off by default (not part of `--live`).
+  - `src/db.rs`: `db_append` split into logging (`log`, `ids`: checks, contents, idempotency) and folding (`kv` and kept counts, in one edit). New `Repo::db_append_deferred` (log only, `kv_at` stays behind) and `Repo::db_catch_up` (folds every event after `kv_at` in one edit, as one append of them all would). `db_append` still refuses a view that lags.
+  - `ikam db serve --defer-kv N` (`dbserve.rs`, `main.rs`): appends are logged and committed at once; the kv view folds when N events wait, and before any read of a database's head (the fold is committed as "db: fold N event(s)"), so a read sees every answered write. Reads at an older commit fold that commit's view in memory. Without the flag, a view left behind by an earlier `--defer-kv` session folds on the first append. With `--keep-counts`, a lagging view folds before the counts are built. After E358 merged, its `search` and `vsearch` routes fold what waits first too (they answer at the head); its route test runs with no deferral and with folds left for reads.
+  - Tests: `deferred_kv_catches_up_to_the_same_roots` (tests/db.rs: 30 random batches of upserts, removes, subtree and range removes, folded every 7 batches and at the end, equal roots to batch-by-batch appends, with range drops on and off and with kept counts; an append onto a lagging view is refused). `dbserve`'s route test runs with no deferral, a fold every 2 events and one only on reads.
+  - `examples/db_append_scale.rs` takes `defer=N`; `experiments/goal-scorecard/defer_kv_served.py` (new) loads through the server and reads a just-written row every 10 batches.
+- Result (200k rows in 2,000-row batches, one index entry per row; a 4-core cloud machine):
+
+  `db_append_scale` (the kernel with a pack store, `live index`):
+
+  | | load | batch p50 at 180k rows | store |
+  |---|---|---|---|
+  | no deferral (as `--live`) | 65.8 s | 1,111 ms | 274 MB |
+  | `plain-hot` (as `--plain-writes`) | 27.4 s | 409 ms | 449 MB |
+  | `defer=20000` | 23.0 s | 79 ms (+ a 2.6 s fold every 10 batches) | 159 MB |
+  | `defer=100000` | 12.5 s | 84 ms (+ a 1.4 s fold every 50 batches) | 120 MB |
+  | `plain-hot defer=20000` | 15.1 s | 80 ms (+ a 1.2 s fold every 10 batches) | 210 MB |
+
+  Through `ikam db serve` (`defer_kv_served.py`, a read of the last row written after every 10 batches):
+
+  | flags | load | append p50 / p99 | read p50 / max | store |
+  |---|---|---|---|---|
+  | `--live` | 74-77 s | 770-799 / 1,424-1,540 ms | 5.8 / 7.9 ms | 276 MB |
+  | `--live --plain-writes` | 33.1 s | 323 / 731 ms | 3.2 / 6.0 ms | 452 MB |
+  | `--live --defer-kv 20000` | 27.7 s | 117 / 1,763 ms | 17.9 / 24.3 ms | 161 MB |
+  | `--live --defer-kv 100000` | 20.0-21.5 s | 101-111 / 167-169 ms | 1,044-1,111 / 1,421-1,429 ms | 131 MB |
+
+  - Loading is 3.6-5.3 times faster than `--live` and the store 2.1-2.3 times smaller (likely because each leaf is rewritten once a fold, not once a batch, so fewer superseded versions are stored; not traced). Against `--plain-writes`, it is faster and 2.8-3.5 times smaller.
+  - The fold still grows with the index (0.3 s at the first fold to 2.6 s at 180k rows with a fold every 20k events), since one fold touches nearly every leaf once the index is spread over them. So the cost per row is not flat, but it grows far more slowly.
+  - A read pays for the fold of whatever waits: up to 1.4 s after 20,000 unfolded events at 200k rows with `--defer-kv 100000`. With `--defer-kv 20000` the appends fold before the reads came, so reads took 18-24 ms, and the append that folds takes up to 1.8 s. N trades a load's speed against the longest wait of one request.
+  - The fixed benchmark is unchanged (it writes no databases): bytes, proxy and read scores and the north score (0.306) equal main's; the cost score was 0.2523 against main's 0.2662 in the same session, within its timing noise.
+  - `cargo test --release`: 335 pass, 4 ignored; clippy clean.
+- Verdict: **kept as an option** (`--defer-kv N`, off by default). For bulk loads and write-heavy work it is the fastest and smallest way to write indexed tables here.
+- Limits: a store left with a lagging view (the server stopped before a fold) is read and appended to by `db serve`, which folds it, but the kernel's other writers (`merge`, sync and shares, hot tables) refuse it with "db views are behind the log" until then. Folds hold the writer lock, so other appends wait for them.
+- Not measured: macOS; the Mac's SSD; mixed read and write traffic; folding on a timer or a background thread (a later change could fold while idle); `--defer-kv` together with `--plain-writes` through the server.
+- Run: `cargo run --release --example db_append_scale -- DIR 200000 2000 live index defer=100000`; `python3 experiments/goal-scorecard/defer_kv_served.py IKAM_BIN WORK 200000 10 "--live;--live --defer-kv 20000;--live --defer-kv 100000"`.
+
+### E361 served-views (kept groups and indexes over `db serve`)
+- Branch / parent: exp/361-served-views / main (1d7c26d, E358 merged)
+- Question: E355 ranked kept views as what stops clients grouping and filtering in their own code: today a client that wants a total per status, or one customer's rows, scans the table over HTTP and does the work itself, every time. Can the server keep groups and secondary indexes with the kernel's incremental views (E242), what does a read cost against the client's scan, and what does keeping them cost an append and a restart?
+- Change (an option, `--views FILE`, off by default; the kernel changes are additive):
+  - Kernel (`src/views.rs`): `ViewOp::MapWith` and `ViewOp::GroupSumWith` take a rule as a shared closure (`Arc<dyn Fn + Send + Sync>`), so a rule can come from a file at run time; they store what the `fn` rules store (test `closure_rules_store_what_function_rules_store`). `Repo::view_prefix` reads a stored view's rows under a prefix from the chunks they fall in.
+  - Kernel, found by this experiment and fixed:
+    - `db_scan` read a batch's event once for every key the batch wrote (it called `db_get` per key). It now reads each event once (`db_range`): a first build at 20k rows took 2.79 s, now 0.25 s. `db_get_many` reads a set of keys the same way.
+    - A view stored all its values in one content, and reading one row read that content whole (a stored content is read whole to check its id): an index lookup of 20 rows at 200k rows took 112 ms. Values now go into contents of at most 64 KiB (test `big_views_keep_their_values_in_bounded_contents`), and reads of several rows read each content once: 1.5-2.8 ms.
+    - `views_update` read one event per changed row for the `kv` diff, and the served update now uses `prune_diff` (E249, same changes either way) so it does not list every leaf of both heads: a 20-row change at 200k rows took 230 ms, now about 55 ms.
+  - Server (`src/bin/ikam/dbviews.rs`, `dbserve.rs`, `main.rs`): a views file has one view a line, `NAME group PREFIX by=field:F|seg:N [sum=field:F]` (count and whole-number sum per group) or `NAME index PREFIX by=field:F|seg:N` (the rows with each value). `GET /db/NAME/views` lists them; `GET /db/NAME/view?name=V[&prefix=P]` reads a group, `...&eq=X[&keys=1]` an index's rows with their values read at the same head. A database's views are built on its first view request and brought to the head from the `kv` diff on each later one, under the writer's lock; appends never wait for them. Test `views_follow_appends_and_match_a_build_at_the_head` (shared and plain stores).
+- Result (`experiments/served-views/served_views.py`: synthetic orders with a customer, a status, an amount and a day, 2,000-row batches, `--live`; views by status with the amount summed, per day, per customer, and an index of orders by customer; a 4-core cloud machine; the client's numbers are a full scan over HTTP plus grouping in Python):
+
+  | Step | 20k rows | 200k rows |
+  |---|---|---|
+  | client: scan, group and filter | 0.15-0.20 s | 1.74-1.76 s |
+  | first view request (builds all four) | 0.24-0.26 s | 2.6-3.3 s |
+  | a group read, warm (median) | 0.7 ms | 0.7 ms |
+  | one customer's 20 orders from the index, warm (median) | 1.7 ms | 1.7-2.8 ms |
+  | first view request after 1% rewritten, 1% added, 0.1% removed | 0.10-0.12 s | 1.1 s |
+  | first view request after 0.01% rewritten | 9-22 ms | 47-55 ms |
+  | rebuild after a restart | 0.27-0.31 s | 2.9-3.3 s |
+  | server memory after the build | 50 MB | 455 MB (222 MB before) |
+
+  - Every served answer matched the client's, before and after the changes and after the restart.
+  - A read is 1,000 times cheaper than the client's scan at 200k rows and does not grow with the table. A first build costs 1.5 to 1.9 times one client scan, so views pay for themselves on the second read.
+  - An update costs about 1 ms for each chunk of each view graph its changes touch (`graph_edit`), so a change spread over 1% of a table rewrites most of an index (6,176 edits into 200k nodes: 0.7 s of the 1.1 s). Small changes, as one request makes, cost tens of milliseconds.
+  - Fixed benchmark (`examples/bench`, branch against main 1d7c26d): every stored byte and peak the same, `_north` the same; the summary score (0.2348 on the branch, 0.2305 on main) differs only by timing noise (the per-corpus cost moved both ways).
+- Verdict: **kept** (an option, off by default). A client can ask the server for a total per group or the rows with a value and get it in about a millisecond, kept current as the table changes.
+- Limits and not done: joins are not served (the kernel's join rules are `fn` pointers; a lookup join is an index read and a `get` today); the views live in memory and are built again after each restart (the graphs are written but no commit points at them); only whole-number sums; one rule file for every database of a server; a build holds the writer's lock (2.6 s at 200k rows); memory during a build roughly doubles the server's.
+- Next (proposed, not started): keep the view roots in the database's commit so a restart reads them back; buffer a view's edits across requests (as E148 does for pages) to flatten the cost of spread-out changes; served joins.
+- Run: `python3 -I experiments/served-views/served_views.py IKAM_BIN WORK 200000`; `cargo test --release --test views`; `cargo test --release --bin ikam views`.
+
+### E363 host-tokens (tokens and rate limits for `ikam host`)
+- Branch / parent: exp/363-host-tokens / main (1d7c26d, E358 merged)
+- Question: E355 ranked tokens and rate limits as what blocks putting `ikam host` behind a public front door: today every caller is a person's password (`user NAME ROLE USER:SALT:HASH`), and nothing stops one project's callers from using up a host that others share. What do per-project tokens and rates cost a request, and do they keep projects apart? (The front door itself is the owner's decision; nothing here opens one.)
+- Change (`src/bin/ikam/tokens.rs`, `host.rs`, `main.rs`; config lines, so nothing changes for a config without them):
+  - `ikam token` prints a new token: `CONFIG=ID:HASH` for the config and `TOKEN=ikt_ID_SECRET` for the client (a 64-bit id and a 256-bit secret from `/dev/urandom`; the hash is BLAKE3 with its own derive-key context over the secret). The config never holds the secret.
+  - `token NAME ROLE ID:HASH [rate=N/s|N/m|N/h] [expires=SECS]`: the token opens project NAME only, with ROLE (read, write or owner, checked like a user's role), until SECS (seconds since 1970). Sent as `Authorization: Bearer ikt_...`. The same token in two projects is refused when the config is read, since it would open both.
+  - `rate NAME N/s` (or `/m`, `/h`): one bucket of N requests for all of the project's callers, users and tokens together, refilled at that rate; a token's `rate=` is a bucket of its own. A request over either gets 429 `Too Many Requests` with `Retry-After` in whole seconds, before it reaches the project. Only requests that passed the password or token check are counted.
+  - An unknown, wrong, expired or other project's token gets the same 401 as a wrong password.
+  - Tests: `tokens_open_one_project_with_their_role_and_rates_answer_429` (host.rs: a read token reads and cannot write; a token of b opens nothing in a; an expired owner token, a wrong secret, a write token on `/api/gc`; a token's own rate answers 429 with a `Retry-After` and leaves other callers alone; a project rate counts a token and a password together; a wrong password is not counted; config refusals), `rates_parse_and_buckets_refill` and `tokens_prove_their_secret_until_they_expire` (tokens.rs).
+- Result (`host::tests::token_overhead`, 20,000 requests a round, `GET /dav/one.md` through `Host::handle`, three rounds; a 4-core cloud machine, with other builds running):
+
+  | Request | Time |
+  |---|---|
+  | with a password | 2.95-3.20 us |
+  | with a token | 2.73-3.31 us |
+  | with a token that has a rate | 2.77-3.51 us |
+  | a refused, malformed token (401) | 0.38-0.50 us |
+  | one bucket take | 0.04 us |
+  | a burst of 20,000 against `rate a 100/s` | 101 answered, 19,899 refused with 429, 0.82 us a request |
+
+  - A token costs what a password does (one BLAKE3 hash): the difference is within the rounds' spread. A rate adds about 0.04 us. Refusing over a rate costs under 1 us, so a caller flooding one project is turned away for less than a served request costs.
+  - The fixed benchmark is untouched (no kernel code changed).
+- Verdict: **kept** (config lines, nothing on by default). A program can now reach one project with a token that opens nothing else and expires, and a project's callers can be capped so they cannot starve the host's other projects.
+- Limits and not done: a token covers a whole project (no path or share scope: enforcing a path over every route of `live`, pages, WebDAV and the API, is its own piece of work); failed checks are not limited (a front door should limit them by address, which the host does not see behind a proxy); buckets live in memory and start full after a restart; revoking a token means removing its line and restarting; one host-wide rate (across projects) is not offered. No front door was set up or tried.
+- Run: `cargo test --release --bin ikam host::tests::token_overhead -- --ignored --nocapture`; `cargo test --release --bin ikam host tokens`.
+
+### E362 host-service (one queue for heavy jobs on `ikam host`)
+- Branch / parent: exp/362-host-service / exp/363-host-tokens (E363's rates are the per-project half of E355's item)
+- Question: E355 ranked the host as a running service: per-project rates (E363), one queue for heavy jobs, and memory and start time per project. On a shared host, every owner's repack, gc and fsck run at once. What does one project's maintenance do to another project's reads, and does making heavy jobs take turns help?
+- Change (`src/bin/ikam/host.rs`; config lines, so nothing changes for a config without them):
+  - `heavy-jobs N` lets at most N maintenance jobs (`/api/repack`, `/api/gc`, `/api/fsck`) run at once across all projects. The others wait their turn in arrival order (a ticket queue on a condition variable) for up to `heavy-wait SECS` (60 by default); a job still waiting then gets 503 with `Retry-After`, and leaves the queue. Reads and writes never wait.
+  - Test `heavy_jobs_take_turns_across_projects`: two projects' jobs never overlap at `heavy-jobs 1`; a waiter that gives up gets 503 and leaves the queue; a waiter goes in once the running job ends; config refusals.
+- Result (`experiments/host-service/heavy_jobs.py`, two runs: projects a and b with 3,000 synthetic text files each (81 MB stores), c with 20; a and b both start a repack, then a gc, while c's file is read every 10 ms; a 4-core cloud machine):
+
+  | | no limit | `heavy-jobs 1` |
+  |---|---|---|
+  | c's reads while the jobs run, median | 1.8 ms | 0.8 ms |
+  | c's reads while the jobs run, p99 | 9.9 ms | 5.9-6.0 ms |
+  | c's reads when quiet, median | 0.8 ms | 0.8 ms |
+  | first repack done | 36.4-37.0 s | 23.6-24.0 s |
+  | both repacks done | 36.4-37.0 s | 47.8-48.6 s |
+  | host's peak memory | 491-494 MB | 371-389 MB |
+
+  - With one heavy job at a time, another project's reads run at their quiet speed (median), against 2.2 times slower when both repacks run at once. Each repack alone takes 24 s, against 36 s each when they run together on 4 cores, so the first owner gets their result 12 s sooner and the second 12 s later; all maintenance ends 31% later. The host's peak memory drops by a fifth.
+  - Start time and memory by project count (empty stores): 1, 10 and 40 projects all start in 0.02 s (0.12 s the first time at 40, creating the stores) at 6.2-6.5 MB, so the per-project cost of an idle project is not what limits a host; a project's memory comes from its own work.
+  - The fixed benchmark is untouched (no kernel code changed).
+- Verdict: **kept** (a config line, off by default). A host shared by several projects can keep one owner's maintenance from slowing everyone else, at the cost of maintenance taking turns.
+- Limits and not done: only the three maintenance routes queue (a large upload or a big search does not); the queue is in memory, so a restart forgets who was waiting; no per-project share of the queue (one owner can queue several jobs ahead of another); index builds are not a host job today. Start time with large stores was not measured.
+- Run: `python3 -I experiments/host-service/heavy_jobs.py IKAM_BIN WORK 3000`; `cargo test --release --bin ikam host`.
+
+### E365 scoped-merge (merges for section, fragment and graph shares)
+- Branch / parent: exp/365-scoped-merge / main (1d7c26d, E358 merged)
+- Question: E355 ranked this tenth: a share with the merge right could be imported only for path and records scopes; section, fragment and graph shares gave `Refused::NotMergeable`, so a project granted part of a file, a few fragments or part of a graph could read them but not take them in.
+- Hypothesis: each scope can be imported as a commit that holds only the share's bytes, so the existing three-way `Repo::merge` of the import branch (E276) applies unchanged and a second import follows the source's changes.
+- Change: `import_share` in `src/share.rs` gains three arms; the merge, the import branch `import/<from>/<name>` and the right check are as before.
+  - Section: the file is checked against the commit first (a section of a version the commit does not hold is `Outside`, as for reads); the granted ranges are sorted and joined (touching or overlapping), and their bytes, in order, become one file at the section's path.
+  - Fragments: each listed fragment, read through the share, becomes `fragments/<hex id>`.
+  - Graph: the scope's nodes are copied into a new graph at the scope's path, in an otherwise empty tree. A whole-content target is copied; a range target is copied as its own content holding just those bytes, so the receiver never gets the rest of the blob it pointed into; an empty target stays empty; an edge is kept only when it points at a node in the scope. A node whose target is another object (a tree or commit) is refused as `NotMergeable`, since what it reaches is not in the scope.
+  - A section or graph whose path lands in the top-level `db` entry (which a commit keeps for its database and `Repo::merge` merges as one) is refused as `NotMergeable` (a review finding on the PR).
+  - Tests (`tests/share.rs`): `section_and_fragment_scopes_merge_only_their_bytes` (joined ranges, a second import after the source edits, a stale section refused, fragments by id, the receiver's own files kept, fsck clean), `graph_scope_merges_its_nodes_without_other_bytes` (two of three nodes, the range copied as its own bytes, the outside blob absent from the receiver's store, the edge out of the scope dropped, a second import follows a changed node, an object target refused) and `a_read_share_does_not_merge` (replaces `only_path_and_records_scopes_merge`).
+- Method: the kernel's tests, clippy and rustfmt in the cloud container; no timing, since the cost is one read per range or fragment and one graph write, as for the path scope.
+- Result: the 15 share tests pass; the whole suite and clippy as recorded below.
+- Verdict: **kept** (a capability: every scope a share can name now merges). No other kernel path changed, so search and storage numbers cannot move.
+- Trade-offs: an imported section is a new file of only the granted bytes, not the source's file, so its id differs from the source's and a later share of the whole file does not dedupe with it; a range-target node becomes a whole-content node in the receiver (same bytes, new id). Both sides changing the imported file is a conflict, as for path scopes: there is no content-level merge.
+- Not done or not measured: a content-level (line or range) merge for two edits of one imported section; keeping the source's node keys stable across a re-import when a range's bytes change (the graph is rewritten each time); scoped imports through `host` routes (the kernel call only); macOS.
+- Next (proposed, not started): a `host` route for scoped imports between projects (with E363's tokens); a line-level merge for section imports.
+
+### E369 kept-search (BM25 views that outlive a restart of `db serve`)
+- Branch / parent: exp/369-kept-search / main (1d7c26d, E358 merged)
+- Question: E358 serves BM25 search, but its view lives in memory only: every restart builds it again on the first query (8.6 s for 64 MB of README text, about 750 MB of memory), and a restart after changes writes a whole new view to the store (+44 MB). Can a restarted server read the view back and pay only for the rows changed since?
+- Hypothesis: `Bm25Live` (E329) is a handful of ids (two graphs, the database it was built at, a row count), so keeping it on a ref costs one small commit per update, and a restart costs a read of that commit plus the delta update E329 already does.
+- Change:
+  - Kernel (`src/bm25.rs`): `Repo::bm25_live_save(ref, at, view)` writes a commit with no parent whose tree holds `at` and `base_db` (as the `db` directories `db_commit` writes), the `base` and `delta` graphs and `merge_rows`, and moves the ref to it; `Repo::bm25_live_load(ref)` reads it back and checks both graphs can be read. `src/db.rs`: `db_at`'s reading of a `db` directory is split out as `db_in`.
+  - `db serve --keep-search` (option, off, not in `--live`): `dbsearch::Kept` loads a prefix's view from `search/NAME/p<hex prefix>` when it has none in memory (one that cannot be read is built again) and saves it after every build or update. A view at the head writes nothing. A prefix over 32 bytes is named by its BLAKE3 hash (`h<hex>`), since a long hex name passed a file name's length on disk (a review finding: 500 on FsStore at 125 bytes); a save that fails is logged and the search still answered.
+  - Test `kept_search_views_outlive_a_restart` (`dbserve.rs`): a restart with no change reads the view back and writes no object; after rows change under a server without the option and a `gc`, a restarted server's answer (scores included) equals a fresh build's; a ref naming a missing graph is built again; without the option no ref is written. Flag test extended.
+  - `experiments/kept-search/restart_bench.py`.
+- Method: 11,000 generated rows (about 4.4 KB each, 950 words drawn from a 30,000-word vocabulary with Zipf weights; 48.8 MB of text) loaded in 2,000-row batches into a fresh store with `--live`, then one three-word query timed: the first one, after a restart with no change, after a restart once 1% of the rows were rewritten by a server that searched nothing, and after one more restart. Two runs each, without and with `--keep-search`, one server at a time, in the cloud container.
+- Result (run 1 / run 2):
+
+  | Step | `--live` | `--live --keep-search` |
+  |---|---|---|
+  | First query (build) | 9.81 / 10.23 s | 9.94 / 9.95 s |
+  | Restart, no change | 8.48 / 8.66 s | 0.003 / 0.003 s |
+  | Restart, 1% rewritten | 8.52 / 8.42 s | 0.42 / 0.29 s |
+  | Restart, no change again | 8.88 / 8.51 s | 0.107 / 0.077 s |
+  | Store after the last step | 58.8 MB | 43.5 MB |
+  | Server memory after the restart's first query | 1,145 MB | 12 MB (58 MB after the 1% update) |
+
+  - The answers after each restart were the same as before it (the bench's check); the test checks scores against a fresh build.
+  - Saving costs 0.3 MB at the first query (41.7 to 42.0 MB): two `db` directories and a commit.
+  - The last restart takes 77-107 ms, not 3 ms, with a delta of 110 rows to read beside the base (not traced further).
+- Verdict: **kept** (option). A restart no longer pays for the view: the first query after one takes milliseconds, or the delta update for what changed, and the build's memory is never taken.
+- Trade-offs: the ref keeps the view's postings (19 MB here, 0.4 times the raw text), the database it was last brought to and the one its base was built at, live through `gc`, so a database nobody searches any more keeps them until the ref is deleted (nothing deletes it yet); one small commit per search after a change; a view read back is trusted to match its rows (it is checked for readable graphs, not rebuilt).
+- Found on the way: two server processes writing one store at once break each other's search (500, object not found), with or without the option: a `Repo` does not see objects another writer stored as derivations unless `refresh_ledger` is on. `db serve` is one writer per store, so this only matters for a second writer (a CLI append) next to a running server; not fixed here.
+- Not done or not measured: vector indexes (exact loads in one scan; `--hnsw` builds again, 3 s in E358); E361's views (PR 56) the same way; deleting a ref when its database is removed; the real README table and its 750 MB build; macOS.
+- Next (proposed, not started): keep `--hnsw` graphs and E361 views the same way; a route or `gc` rule that drops kept views of removed databases.
+- Run: `python3 -I experiments/kept-search/restart_bench.py IKAM_BIN WORK 11000 --live [--keep-search]`.
+
+### E370 second-writer (`db serve` with other processes writing its store)
+- Branch / parent: exp/370-second-writer / main (1d7c26d, E358 merged)
+- Question: found while testing E369: two servers on one store break each other's search with a 500 (object not found). What happens to reads and appends when a second process (another `db serve`, `ikam mcp` from E359, a script) writes a store a server is serving, and can an option make it safe?
+- Hypothesis: as in E298, a handle's ledger never learns of derivations another process stores, so the server's reads of what the other process wrote fail; and `db serve` commits appends with `db_commit`, which replaces whatever the ref points at, so events can be lost. `Repo::refresh_ledger` (E298) plus `db_commit_at` with a retry should fix both.
+- Change:
+  - `db serve --shared-store` (option, off; refused with `--packs` and `--live`, a pack store being opened by one process): sets `Repo::refresh_ledger` on the writer (and its reader siblings), and the server's appends commit with `db_commit_at` over the head they read; on a conflict the head is read again and the events applied over it (their idempotency keys keep a retry from applying one twice), up to 16 tries.
+  - `dbserve.rs`: `append` split into a retry loop and `append_once`; `Server::shared_store`.
+  - Kernel (`src/db.rs`): `Repo::db_commit_new`, a database's first commit only while its ref does not exist (`RefConflict` otherwise), so two writers creating one database cannot drop one's first batch; the server uses it for a database's first append. Test `commit_new_refuses_an_existing_database` (`tests/db.rs`).
+  - Test `shared_store_servers_see_each_others_writes` (two servers with their own handles on one store, as two processes): off, the first server's search, read or append after the second's write fails; on, all succeed, the search equals a fresh build's at that head, 20 appends from two threads at once all land, two servers creating one database at once both land their batch, fsck is clean. Flag test extended.
+  - `experiments/shared-store/two_servers.py`.
+- Method: in the cloud container, server A loads 2,000 short rows and searches them; then A and B (two `ikam db serve` processes on one FsStore directory) each append 40 batches of 50 rows of their own from their own thread, and after each batch read one of the other's rows and run a search; a third server counts the rows afterwards. Two runs each, without and with the option; and two runs each with only A appending (`SOLO=1`).
+- Result (run 1 / run 2):
+
+  | Setting | Failed requests (append, get, search) | Rows found of expected | Append p50 / max |
+  |---|---|---|---|
+  | Two writers, default | 39, 39, 39 / 39, 39, 39 | 4,000 of 6,000 / 4,000 of 6,000 | 27.9 / 81.7 ms; 25.2 / 140.5 ms |
+  | Two writers, `--shared-store` | 0, 0, 0 / 0, 0, 0 | 6,000 of 6,000 / 6,000 of 6,000 | 67.7 / 267.4 ms; 63.4 / 265.1 ms |
+  | One writer, default | 0 / 0 | 4,000 of 4,000 | 42.5 / 65.7 ms; 41.6 / 60.8 ms |
+  | One writer, `--shared-store` | 0 / 0 | 4,000 of 4,000 | 38.2 / 62.6 ms; 46.9 / 78.1 ms |
+
+  - By default the server that did not write first fails every request from its second batch on (its handle cannot read the other's new database), so one writer's rows after the first batch never land: the same as E298's worker processes.
+  - With the option nothing fails and nothing is lost; appends take about 2.4 times as long while both write (retries after conflicts and the listings after misses; not split), and the same as without it when only one writes.
+- Verdict: **kept** (option). A store can now be served while another process writes it, which `ikam mcp` (E359) next to `db serve` would otherwise break silently for one of them.
+- Trade-offs: a read of content that is really missing lists the store (E298); appends from two writers at once are slower and may be applied more than once before one commits (each retry is a new `db_append`); a pack store is refused (one process).
+- Not done or not measured: `ikam live` and `host` with other writers; more than two writers or a heavy write mix; how many retries a run needed; kept search views (E358) of a database another process writes are updated from the diff as usual (covered by the test, not the bench); macOS.
+- Run: `python3 -I experiments/shared-store/two_servers.py IKAM_BIN WORK 40 [--shared-store]`, with `SOLO=1` for one writer.
+- Review fix: a batch of retries (or an empty batch) over a commit left behind by `--defer-kv`, sent to a server without it, folded the view but returned without committing it, so the stored view still lagged. The server now commits whenever the database changed, not only when the log did (test `a_retry_over_a_lagging_commit_commits_the_fold`); 337 pass, clippy clean.
+- Review fix: an index left out a row whose value held U+001F (its separator), so `eq=` missed valid rows. In an index's view keys the value is now escaped (`%` as `%25`, U+001F as `%1F`), and `eq=` escapes the same way, so every row is indexed; 340 pass, clippy clean.
+
+### E371 overnight-combined (the ten overnight options on one build)
+
+- Question: do E359-E370 work together on one build, and what does `--live` gain from adding `--defer-kv` and `--keep-search` to it?
+- Setup: branch `exp/overnight-all` merges the ten overnight branches onto main 1d7c26d in PR order. Conflicts were only in `db serve` (flags, `serve()` arguments, append): a view or search request folds a deferred kv view first; that fold commits with compare-and-swap under `--shared-store`; append keeps E368's head (`ids_at`) and E370's commit rules. Linux cloud container; Mac not run.
+- Checks: `cargo test --release`: 358 pass, 0 fail; clippy clean; privacy scan clean.
+- Results, 200k indexed rows through the server in 2,000-row batches, a read of a fresh row every 10 batches (`experiments/goal-scorecard/defer_kv_served.py`):
+
+  | flags | load | append p50 / p99 | read p50 / max | store |
+  | --- | --- | --- | --- | --- |
+  | `--live` | 78.6 s | 830 / 1,381 ms | 6.6 / 9.6 ms | 276 MB |
+  | `--live --defer-kv 20000 --keep-search` | 28.3 s | 111 / 2,010 ms | 17.6 / 27.2 ms | 161 MB |
+
+- Results, first BM25 query after a restart, 11,000 rows of 48.8 MB text (`experiments/kept-search/restart_bench.py`):
+
+  | flags | first query | restart, no change | after 1% rewritten | store at end |
+  | --- | --- | --- | --- | --- |
+  | `--live` | 10.4 s | 8.8 s | 9.0 s | 58.8 MB |
+  | `--live --defer-kv 20000 --keep-search` | 11.6 s | 4 ms | 0.29 s | 43.5 MB |
+
+- Findings: together the two options cut the load 2.8x and the store 42%, and a restart's first search from about 9 s to milliseconds. The cost is a slower worst append (the batch that folds, 2.0 s vs 1.4 s) and reads 2-3x slower while folds wait (still under 30 ms here). `--shared-store` is refused with `--live` (packs), as E370 set.
+- Verdict: **measured**, no new code. Whether `--live` should include `--defer-kv` (and which N) and `--keep-search` is the owner's call.
+- Not measured: the Mac; `--views` in the same run; mixed traffic.

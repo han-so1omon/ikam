@@ -23,6 +23,8 @@
 //!   With `--keep-counts N` (E233) `count?prefix=` and `span` read kept
 //!   counts for prefixes ending in `/` of up to N segments.
 //! - `GET head`: `{"head":N,"commit":"..."|null}`.
+//! - `GET views` and `GET view?name=V`: kept groups and indexes read from
+//!   `--views FILE` (E361, `dbviews.rs`).
 //! - `GET search?q=TEXT&prefix=P`, `POST vsearch?prefix=VP` and their
 //!   fusion: ranked and vector search (E358, `dbsearch.rs`).
 //!
@@ -72,8 +74,16 @@ pub struct Server<S: Store> {
     readers: Option<Readers<S>>,
     /// Keep counts of key prefixes up to this many segments (E233); 0: no.
     keep_counts: u32,
+    /// E368: fold appends into the kv view once this many events wait
+    /// (and before a read of the head); 0: fold every append.
+    defer_kv: u64,
     /// Ranked and vector search indexes (E358), built when first searched.
     search: crate::dbsearch::Kept,
+    /// Kept views (E361), built on a database's first view request.
+    views: Option<crate::dbviews::Served>,
+    /// Other processes write this store too (E370): appends commit only
+    /// over the head they read, and read again on a conflict.
+    shared: bool,
 }
 
 fn refname(name: &str) -> String {
@@ -120,7 +130,10 @@ fn at<S: Store>(
             let id: Id = hex
                 .parse()
                 .map_err(|_| Response::text(400, "at: a full commit id"))?;
-            repo.db_at(&id).map_err(fail)
+            // E368: a commit whose kv view lags is folded for the read.
+            repo.db_at(&id)
+                .and_then(|db| repo.db_catch_up(&db))
+                .map_err(fail)
         }
     }
 }
@@ -133,12 +146,81 @@ impl<S: Store> Server<S> {
             readers: readers.map(|f| (f, Mutex::new(Vec::new()))),
             keep_counts: 0,
             search: Default::default(),
+            defer_kv: 0,
+            views: None,
+            shared: false,
         }
+    }
+
+    /// E368: leave appends' kv folding until `events` wait (0: off).
+    pub fn defer_kv(mut self, events: u64) -> Server<S> {
+        self.defer_kv = events;
+        self
+    }
+
+    /// E368: before a read of `name`'s head, fold whatever the kv view lags
+    /// behind the log and commit it, so a read sees every answered write.
+    /// Only the cached head is looked at when nothing lags, unless other
+    /// processes write the store (E370), whose head may have moved.
+    fn settle(&self, name: &str) -> Result<(), Error> {
+        if !self.shared
+            && let Some((_, db)) = self.heads.lock().unwrap().get(name)
+            && db.kv_at == db.ids_at
+        {
+            return Ok(());
+        }
+        let mut repo = self.writer.lock().unwrap();
+        let mut tries = 0;
+        loop {
+            let (head, db) = open(&self.heads, &mut repo, name)?;
+            if db.kv_at == repo.db_head(&db.log)? {
+                return Ok(());
+            }
+            let caught = repo.db_catch_up(&db)?;
+            let msg = format!("db: fold {} event(s)", caught.kv_at - db.kv_at);
+            let c = match head {
+                Some(base) if self.shared => repo.db_commit_at(&refname(name), base, &caught, &msg),
+                _ => repo.db_commit(&refname(name), &caught, &msg),
+            };
+            match c {
+                // Another process moved the head: fold over its head.
+                Err(Error::RefConflict(_)) if self.shared && tries < 16 => tries += 1,
+                c => {
+                    self.heads
+                        .lock()
+                        .unwrap()
+                        .insert(name.to_string(), (Some(c?), caught));
+                    return Ok(());
+                }
+            }
+        }
+    }
+
+    /// Keep `views` for every database (E361).
+    pub fn views(mut self, views: Option<crate::dbviews::Served>) -> Server<S> {
+        self.views = views;
+        self
+    }
+
+    /// Other processes write this store too (E370; off by default). Each
+    /// handle sees what they store (`Repo::refresh_ledger`, E298, which
+    /// the caller sets on the repo), and an append commits only over the
+    /// head it read (`db_commit_at`), reading the new head and applying its
+    /// events again on a conflict, so no process's events are lost.
+    pub fn shared_store(mut self, shared: bool) -> Server<S> {
+        self.shared = shared;
+        self
     }
 
     /// Search vector rows with `index` (E358; exact by default).
     pub fn vector_index(mut self, index: crate::dbsearch::VectorIndex) -> Server<S> {
         self.search.index = index;
+        self
+    }
+
+    /// Keep BM25 views on refs across restarts (E369; off by default).
+    pub fn keep_search(mut self, keep: bool) -> Server<S> {
+        self.search.keep = keep;
         self
     }
 
@@ -295,11 +377,30 @@ fn handle<S: Store>(srv: &Server<S>, req: &Request) -> Response {
     }
     match (req.method.as_str(), route) {
         ("POST", "append") => return append(srv, name, req),
-        ("GET" | "POST", "search") | ("POST", "vsearch") => return search(srv, name, req),
+        // E368: a search answers at the head, so it folds what waits first.
+        ("GET" | "POST", "search") | ("POST", "vsearch") => {
+            return match srv.settle(name) {
+                Ok(()) => search(srv, name, req),
+                Err(e) => fail(e),
+            };
+        }
+        // E368: a view answers at the head, so it folds what waits first.
+        ("GET", "views" | "view") => {
+            return match srv.settle(name) {
+                Ok(()) => views(srv, name, route, req),
+                Err(e) => fail(e),
+            };
+        }
         _ => {}
     }
     let heads = &srv.heads;
     let at_param = req.param("at");
+    if at_param.is_none()
+        && route != "head"
+        && let Err(e) = srv.settle(name)
+    {
+        return fail(e);
+    }
     srv.read(|repo| {
         let at = at_param.as_deref();
         match (req.method.as_str(), route) {
@@ -448,6 +549,66 @@ fn search<S: Store>(srv: &Server<S>, name: &str, req: &Request) -> Response {
     srv.read(|r| srv.search.answer(r, name, &db, bm25, &q, req))
 }
 
+/// `GET views` and `GET view` (E361): the views are brought to the head
+/// under the writer's lock, then read like any other read.
+fn views<S: Store>(srv: &Server<S>, name: &str, route: &str, req: &Request) -> Response {
+    let Some(served) = &srv.views else {
+        return Response::text(404, "no views: start with --views FILE");
+    };
+    if route == "views" {
+        return Response::new(200).body("application/json", served.list_json());
+    }
+    let Some(rule) = req.param("name").and_then(|v| served.rule(&v).cloned()) else {
+        return Response::text(404, "no such view");
+    };
+    let limit = match req.param("limit").map(|n| n.parse()) {
+        None => usize::MAX,
+        Some(Ok(n)) => n,
+        Some(Err(_)) => return Response::text(400, "limit=N"),
+    };
+    let index = rule.kind == crate::dbviews::Kind::Index;
+    let prefix = match (index, req.param("eq"), req.param("prefix")) {
+        (true, Some(x), None) => {
+            format!("{}{}", crate::dbviews::index_value(&x), crate::dbviews::US)
+        }
+        (false, None, p) => p.unwrap_or_default(),
+        _ => return Response::text(400, "an index takes eq=X; a group, prefix=P"),
+    };
+    let (db, state) = {
+        let mut w = srv.writer.lock().unwrap();
+        let db = match open(&srv.heads, &mut w, name) {
+            Ok((_, db)) => db,
+            Err(e) => return fail(e),
+        };
+        match served.at(&mut w, name, &db) {
+            Ok(st) => (db, st),
+            Err(e) => return fail(e),
+        }
+    };
+    let keys_only = matches!(req.param("keys").as_deref(), Some("1" | "true"));
+    srv.read(|repo| {
+        let rows = match served.rows(repo, &state, &rule.name, &prefix, limit) {
+            Ok(r) => r,
+            Err(e) => return fail(e),
+        };
+        if !index {
+            return pairs_response(req, rows);
+        }
+        let keys = rows
+            .into_iter()
+            .map(|(_, k)| String::from_utf8(k).unwrap_or_default());
+        if keys_only {
+            return pairs_response(req, keys.map(|k| (k, Vec::new())).collect());
+        }
+        let keys: std::collections::BTreeSet<String> = keys.collect();
+        match repo.db_get_many(&db, &keys) {
+            Ok(pairs) if pairs.len() == keys.len() => pairs_response(req, pairs),
+            Ok(_) => fail(Error::Decode("view row not in kv")),
+            Err(e) => fail(e),
+        }
+    })
+}
+
 /// `POST append`, under the writer's lock.
 fn append<S: Store>(srv: &Server<S>, name: &str, req: &Request) -> Response {
     if req
@@ -461,45 +622,74 @@ fn append<S: Store>(srv: &Server<S>, name: &str, req: &Request) -> Response {
         Err(e) => return Response::text(400, e),
     };
     let mut repo = srv.writer.lock().unwrap();
-    let (head, opened) = match open(&srv.heads, &mut repo, name) {
-        Ok(x) => x,
-        Err(e) => return fail(e),
-    };
+    // A conflict means another process committed since the head was read;
+    // the events are applied again over its head (their idempotency keys
+    // keep a retry from applying one twice).
+    let mut tries = 0;
+    loop {
+        match append_once(srv, &mut repo, name, req, &events) {
+            Err(Error::RefConflict(_)) if srv.shared && tries < 16 => tries += 1,
+            Ok(r) => return r,
+            Err(e) => return fail(e),
+        }
+    }
+}
+
+/// One try of `append`: read the head, apply `events`, commit.
+fn append_once<S: Store>(
+    srv: &Server<S>,
+    repo: &mut Repo<S>,
+    name: &str,
+    req: &Request,
+    events: &[Event],
+) -> Result<Response, Error> {
+    let (head, opened) = open(&srv.heads, repo, name)?;
     let db = match srv.keep_counts {
         0 => opened,
-        d => match repo.db_keep_counts(&opened, d) {
-            Ok(db) => db,
-            Err(e) => return fail(e),
-        },
+        // E368: counts are built from a current view, so a view left
+        // behind by deferred appends folds first.
+        d if !opened.counts.is_some_and(|c| c.depth == d) => {
+            let o = repo.db_catch_up(&opened)?;
+            repo.db_keep_counts(&o, d)?
+        }
+        d => repo.db_keep_counts(&opened, d)?,
     };
-    let seq = match repo.db_head(&db.log) {
-        Ok(s) => s,
-        Err(e) => return fail(e),
-    };
+    let seq = repo.db_head(&db.log)?;
     if let Some(want) = req.header("if-head")
         && want.trim().parse::<u64>().ok() != Some(seq)
     {
-        return Response::new(409).body("application/json", head_json(head, seq));
+        return Ok(Response::new(409).body("application/json", head_json(head, seq)));
     }
-    let new = match repo.db_append(&db, &events) {
-        Ok(d) => d,
-        Err(e) => return fail(e),
-    };
-    if new.log == db.log {
-        // Every event was a retry: nothing to commit.
-        return Response::new(200).body("application/json", head_json(head, seq));
-    }
-    let msg = format!("db: {} event(s)", new.kv_at - seq);
-    match repo.db_commit(&refname(name), &new, &msg) {
-        Ok(c) => {
-            srv.heads
-                .lock()
-                .unwrap()
-                .insert(name.to_string(), (Some(c), new));
-            Response::new(200).body("application/json", head_json(Some(c), new.kv_at))
+    // E368: with `--defer-kv` the kv view folds once enough events wait;
+    // without it, a view left behind (a store written with it) folds first.
+    let new = if srv.defer_kv > 0 {
+        let d = repo.db_append_deferred(&db, events)?;
+        if d.ids_at - d.kv_at >= srv.defer_kv {
+            repo.db_catch_up(&d)?
+        } else {
+            d
         }
-        Err(e) => fail(e),
+    } else {
+        let d = repo.db_catch_up(&db)?;
+        repo.db_append(&d, events)?
+    };
+    if new == db {
+        // Every event was a retry and no view was folded: nothing to
+        // commit. (A batch of retries over a commit left behind by
+        // `--defer-kv` still commits the folded view.)
+        return Ok(Response::new(200).body("application/json", head_json(head, seq)));
     }
+    let msg = format!("db: {} event(s)", new.ids_at - seq);
+    let c = match head {
+        Some(base) if srv.shared => repo.db_commit_at(&refname(name), base, &new, &msg)?,
+        None if srv.shared => repo.db_commit_new(&refname(name), &new, &msg)?,
+        _ => repo.db_commit(&refname(name), &new, &msg)?,
+    };
+    srv.heads
+        .lock()
+        .unwrap()
+        .insert(name.to_string(), (Some(c), new));
+    Ok(Response::new(200).body("application/json", head_json(Some(c), new.ids_at)))
 }
 
 /// Serve `repo`'s databases on 127.0.0.1:PORT until stopped; with
@@ -507,8 +697,8 @@ fn append<S: Store>(srv: &Server<S>, name: &str, req: &Request) -> Response {
 pub fn serve<S: Store + Send + 'static>(
     repo: Repo<S>,
     readers: Option<ReaderFactory<S>>,
-    keep_counts: u32,
-    index: crate::dbsearch::VectorIndex,
+    (keep_counts, defer_kv): (u32, u64),
+    (search, views): (crate::dbsearch::SearchOpts, Option<crate::dbviews::Served>),
     port: u16,
     allowed: Vec<String>,
     log_requests: bool,
@@ -521,10 +711,17 @@ pub fn serve<S: Store + Send + 'static>(
     if reader.is_some() && auth.is_none() {
         return Err("IKAM_READ_AUTH needs IKAM_AUTH too".into());
     }
+    // A handle set to see other writers' objects (`--shared-store`) is one
+    // whose appends must not overwrite theirs either.
+    let shared = repo.refresh_ledger;
     let state = Arc::new(
         Server::new(repo, readers)
             .keep_counts(keep_counts)
-            .vector_index(index),
+            .defer_kv(defer_kv)
+            .vector_index(search.index)
+            .keep_search(search.keep)
+            .views(views)
+            .shared_store(shared),
     );
     let hosts = Hosts::new(port, allowed);
     let password = auth.is_some();
@@ -623,22 +820,312 @@ mod tests {
             .collect()
     }
 
+    /// `format=json` pairs as (key, value) strings.
+    fn pairs_of(r: &Response) -> Vec<(String, String)> {
+        assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
+        let j = crate::json::parse(std::str::from_utf8(&r.body).unwrap()).unwrap();
+        j.as_arr()
+            .iter()
+            .map(|p| {
+                let s = |i: usize| p.as_arr()[i].as_str().unwrap().to_string();
+                (s(0), s(1))
+            })
+            .collect()
+    }
+
+    #[test]
+    fn views_follow_appends_and_match_a_build_at_the_head() {
+        for shared in [false, true] {
+            viewed(shared);
+        }
+    }
+
+    fn viewed(shared: bool) {
+        let spec = "by_status group t/o/ by=field:status sum=field:amount\n\
+                    by_cust index t/o/ by=field:customer\n\
+                    per_day group t/e/ by=seg:0\n";
+        let served =
+            || Some(crate::dbviews::Served::new(crate::dbviews::parse(spec).unwrap()).unwrap());
+        let store = ikam_kernel::SharedStore::new(MemStore::default());
+        let make = || -> Option<ReaderFactory<_>> {
+            shared.then(|| Box::new(|w: &Repo<_>| w.sibling()) as ReaderFactory<_>)
+        };
+        let st = Server::new(Repo::new(store.clone()), make()).views(served());
+        let h = |st: &Server<_>, q: &str| handle(st, &req("GET", q, b"", &[]));
+        let ct = [("content-type", EVENTS)];
+        let o = |c: &str, s: &str, a: i64| {
+            format!(r#"{{"customer":"{c}","status":"{s}","amount":{a}}}"#)
+        };
+        let body = encode_events(&[
+            Event::upsert("t/o/1", o("c1", "open", 5).as_bytes(), "1"),
+            Event::upsert("t/o/2", o("c2", "open", 7).as_bytes(), "2"),
+            Event::upsert("t/o/3", o("c1", "paid", 11).as_bytes(), "3"),
+            Event::upsert("t/o/4", b"not json", "4"),
+            Event::upsert("t/e/2026-11-21/a", b"x", "5"),
+            Event::upsert("t/e/2026-11-21/b", b"x", "6"),
+            Event::upsert("t/e/2026-11-22/a", b"x", "7"),
+            Event::upsert("u/o/9", o("c1", "open", 100).as_bytes(), "8"),
+        ]);
+        let a = handle(&st, &req("POST", "/db/m/append", &body, &ct));
+        assert_eq!(a.status, 200);
+        let pairs = |st: &Server<_>, q: &str| pairs_of(&h(st, &format!("{q}&format=json")));
+        let p = |v: &[(&str, &str)]| -> Vec<(String, String)> {
+            v.iter()
+                .map(|(a, b)| (a.to_string(), b.to_string()))
+                .collect()
+        };
+        assert_eq!(
+            pairs(&st, "/db/m/view?name=by_status"),
+            p(&[("open", "2,12"), ("paid", "1,11")])
+        );
+        assert_eq!(
+            pairs(&st, "/db/m/view?name=per_day"),
+            p(&[("2026-11-21", "2,0"), ("2026-11-22", "1,0")])
+        );
+        assert_eq!(
+            pairs(&st, "/db/m/view?name=per_day&prefix=2026-11-22"),
+            p(&[("2026-11-22", "1,0")])
+        );
+        let c1 = pairs(&st, "/db/m/view?name=by_cust&eq=c1");
+        assert_eq!(
+            c1.iter().map(|x| x.0.as_str()).collect::<Vec<_>>(),
+            ["t/o/1", "t/o/3"]
+        );
+        assert_eq!(c1[0].1, o("c1", "open", 5));
+        assert_eq!(
+            pairs(&st, "/db/m/view?name=by_cust&eq=c1&keys=1&limit=1"),
+            p(&[("t/o/1", "")])
+        );
+        // Changes: a moved order, a removed one, a new customer.
+        let more = encode_events(&[
+            Event::upsert("t/o/1", o("c3", "paid", 6).as_bytes(), "9"),
+            Event::remove("t/o/2", false, "10"),
+            Event::remove("t/e/2026-11-22", true, "11"),
+        ]);
+        assert_eq!(
+            handle(&st, &req("POST", "/db/m/append", &more, &ct)).status,
+            200
+        );
+        let after: Vec<_> = ["by_status", "per_day"]
+            .iter()
+            .map(|v| pairs(&st, &format!("/db/m/view?name={v}")))
+            .collect();
+        assert_eq!(after[0], p(&[("paid", "2,17")]));
+        assert_eq!(after[1], p(&[("2026-11-21", "2,0")]));
+        assert_eq!(
+            pairs(&st, "/db/m/view?name=by_cust&eq=c1"),
+            p(&[("t/o/3", &o("c1", "paid", 11))])
+        );
+        // The same rows as a server that builds the views at the head.
+        let fresh = Server::new(Repo::new(store.clone()), make()).views(served());
+        for (i, v) in ["by_status", "per_day"].iter().enumerate() {
+            assert_eq!(pairs(&fresh, &format!("/db/m/view?name={v}")), after[i]);
+        }
+        let list = String::from_utf8(h(&st, "/db/m/views").body).unwrap();
+        assert!(
+            list.contains(r#"{"name":"by_cust","kind":"index","prefix":"t/o/"}"#),
+            "{list}"
+        );
+        // Refusals.
+        assert_eq!(h(&st, "/db/m/view?name=nope").status, 404);
+        assert_eq!(h(&st, "/db/m/view?name=by_cust").status, 400);
+        assert_eq!(h(&st, "/db/m/view?name=by_status&eq=x").status, 400);
+        let plain = Server::new(Repo::new(store.clone()), make());
+        assert_eq!(h(&plain, "/db/m/view?name=by_status").status, 404);
+    }
+
+    #[test]
+    fn kept_search_views_outlive_a_restart() {
+        // E369: with `keep_search` a restarted server reads the BM25 view
+        // back (writing nothing when the rows have not changed) and
+        // updates it from the rows changed since; scores match a fresh
+        // build, and the ref keeps the view through gc. One server runs
+        // at a time, as a restart does (two writing one store at once do
+        // not see each other's writes, kept views or not).
+        let store = ikam_kernel::SharedStore::new(MemStore::default());
+        let server = |keep: bool| Server::new(Repo::new(store.clone()), None).keep_search(keep);
+        let ct = [("content-type", EVENTS)];
+        let append = |st: &Server<_>, ev: &[Event]| {
+            let r = handle(st, &req("POST", "/db/s/append", &encode_events(ev), &ct));
+            assert_eq!(r.status, 200);
+        };
+        let q = "/db/s/search?q=json+sound&prefix=t/&k=5";
+        let body = |st: &Server<_>| {
+            let r = handle(st, &req("GET", q, b"", &[]));
+            assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
+            r.body
+        };
+        let rows: Vec<Event> = (0..60)
+            .map(|i| {
+                let text = format!(
+                    "row {i} about {} and json",
+                    ["maps", "sound", "files"][i % 3]
+                );
+                Event::upsert(&format!("t/{i:03}"), text.as_bytes(), &format!("{i}"))
+            })
+            .collect();
+        let st = server(true);
+        append(&st, &rows);
+        let first = body(&st);
+        drop(st);
+        let refname = crate::dbsearch::bm25_ref("s", "t/");
+        assert!(store.get_ref(&refname).unwrap().is_some());
+        // A restart with no change: read back, nothing written.
+        let before = store.ids().unwrap().len();
+        assert_eq!(body(&server(true)), first);
+        assert_eq!(store.ids().unwrap().len(), before, "no rebuild");
+        // Changes while no server kept the view, then gc: read back and
+        // brought to the head, the same as a fresh build.
+        append(
+            &server(false),
+            &[
+                Event::upsert("t/001", b"json sound sound sound", "a"),
+                Event::remove("t/004", false, "b"),
+            ],
+        );
+        assert!(Repo::new(store.clone()).gc().unwrap() > 0);
+        let kept = body(&server(true));
+        let fresh = body(&server(false));
+        assert_eq!(kept, fresh);
+        assert_ne!(kept, first);
+        assert_eq!(body(&server(true)), fresh, "read back after the update");
+        // A ref naming what is gone is built again.
+        let mut w = Repo::new(store.clone());
+        let (at, mut v) = w.bm25_live_load(&refname).unwrap().unwrap();
+        v.base.root = ikam_kernel::Id::of_content(b"never stored");
+        w.bm25_live_save(&refname, &at, &v).unwrap();
+        assert!(w.bm25_live_load(&refname).is_err());
+        drop(w);
+        assert_eq!(body(&server(true)), fresh);
+        assert!(Repo::new(store.clone()).bm25_live_load(&refname).is_ok());
+        // A long prefix gets a bounded ref name (hashed), and works.
+        let long = format!("t/{}", "x".repeat(200));
+        let lq = format!("/db/s/search?q=json&prefix={long}");
+        assert_eq!(
+            handle(&server(true), &req("GET", &lq, b"", &[])).status,
+            200
+        );
+        let lref = crate::dbsearch::bm25_ref("s", &long);
+        assert!(lref.len() < 80, "{lref}");
+        assert!(store.get_ref(&lref).unwrap().is_some());
+        // Without the option nothing is kept.
+        let off = server(false);
+        handle(&off, &req("GET", "/db/s/search?q=json&prefix=u/", b"", &[]));
+        let other = crate::dbsearch::bm25_ref("s", "u/");
+        assert!(store.get_ref(&other).unwrap().is_none());
+    }
+
+    #[test]
+    fn shared_store_servers_see_each_others_writes() {
+        // E370: two servers with their own handles on one store, as two
+        // processes would be. By default the first cannot read what the
+        // second stores as derivations, and an append can drop the
+        // other's; with `shared_store` (and `refresh_ledger`) both read
+        // everything and no event is lost.
+        for shared in [false, true] {
+            let store = ikam_kernel::SharedStore::new(MemStore::default());
+            let server = || {
+                let mut r = Repo::new(store.clone());
+                r.refresh_ledger = shared;
+                Server::new(r, None).shared_store(shared)
+            };
+            let (a, b) = (server(), server());
+            let ct = [("content-type", EVENTS)];
+            let append = |st: &Server<_>, ev: &[Event]| {
+                handle(st, &req("POST", "/db/s/append", &encode_events(ev), &ct)).status
+            };
+            let row = |i: usize, w: &str| {
+                let text = format!("row {i} about {w} and json");
+                Event::upsert(&format!("t/{i:03}"), text.as_bytes(), &format!("{w}{i}"))
+            };
+            let words = ["maps", "sound", "files"];
+            let rows: Vec<Event> = (0..60).map(|i| row(i, words[i % 3])).collect();
+            assert_eq!(append(&a, &rows), 200);
+            let q = "/db/s/search?q=json+sound&prefix=t/&k=5";
+            let search = |st: &Server<_>| handle(st, &req("GET", q, b"", &[]));
+            assert_eq!(search(&a).status, 200);
+            // b rewrites rows a has searched; then a searches, reads a row
+            // and appends.
+            assert_eq!(append(&b, &[row(1, "sound sound"), row(4, "sound")]), 200);
+            let after = search(&a);
+            let got = handle(&a, &req("GET", "/db/s/get?key=t/001", b"", &[]));
+            let fresh = search(&server()).body;
+            let more = append(&a, &[row(70, "late")]);
+            if !shared {
+                // What this option is for.
+                assert!(after.status == 500 || got.status == 500 || more == 500);
+                continue;
+            }
+            assert_eq!(after.status, 200);
+            assert_eq!(got.status, 200);
+            assert_eq!(got.body, b"row 1 about sound sound and json");
+            assert_eq!(more, 200);
+            // The same answer as a server that builds at that head.
+            assert_eq!(after.body, fresh);
+            // Appends that race, from two threads: each server appends
+            // over heads the other moves; every event lands.
+            std::thread::scope(|sc| {
+                for (st, base) in [(&a, 100), (&b, 200)] {
+                    sc.spawn(move || {
+                        for i in 0..10 {
+                            let w = if base == 100 { "a" } else { "b" };
+                            assert_eq!(append(st, &[row(base + i, w)]), 200);
+                        }
+                    });
+                }
+            });
+            // Two servers creating one database at once: both batches land.
+            std::thread::scope(|sc| {
+                for (st, base) in [(&a, 300), (&b, 400)] {
+                    sc.spawn(move || {
+                        let ev: Vec<Event> = (0..20)
+                            .map(|i| {
+                                let k = format!("n/{:03}", base + i);
+                                Event::upsert(&k, b"x", &k)
+                            })
+                            .collect();
+                        let body = encode_events(&ev);
+                        let r = handle(st, &req("POST", "/db/new/append", &body, &ct));
+                        assert_eq!(r.status, 200);
+                    });
+                }
+            });
+            let c = server();
+            let r = handle(&c, &req("GET", "/db/new/count?prefix=n/", b"", &[]));
+            assert!(String::from_utf8(r.body).unwrap().contains("40"));
+            let n = |p: &str| {
+                let r = handle(
+                    &c,
+                    &req("GET", &format!("/db/s/count?prefix={p}"), b"", &[]),
+                );
+                String::from_utf8(r.body).unwrap()
+            };
+            assert!(n("t/").contains("81"), "{}", n("t/"));
+            assert!(Repo::new(store.clone()).fsck().unwrap().is_empty());
+        }
+    }
+
     #[test]
     fn search_ranks_follows_appends_and_fuses() {
         use crate::dbsearch::VectorIndex;
         for shared in [false, true] {
             for index in [VectorIndex::Exact, VectorIndex::Hnsw] {
-                searched(shared, index);
+                // E368: with folds left for reads, a search folds first.
+                for defer in [0, 100] {
+                    searched(shared, index, defer);
+                }
             }
         }
     }
 
-    fn searched(shared: bool, index: crate::dbsearch::VectorIndex) {
+    fn searched(shared: bool, index: crate::dbsearch::VectorIndex, defer: u64) {
         let store = ikam_kernel::SharedStore::new(MemStore::default());
         let make = || -> Option<ReaderFactory<_>> {
             shared.then(|| Box::new(|w: &Repo<_>| w.sibling()) as ReaderFactory<_>)
         };
-        let st = Server::new(Repo::new(store.clone()), make()).vector_index(index);
+        let st = Server::new(Repo::new(store.clone()), make())
+            .vector_index(index)
+            .defer_kv(defer);
         let h = |st: &Server<_>, r: Request| handle(st, &r);
         let ct = [("content-type", EVENTS)];
         let x = |a: f32, b: f32| vec_body(&[a, b, 0.0]);
@@ -720,16 +1207,46 @@ mod tests {
         );
     }
 
+    /// A server without `--defer-kv` over a commit whose kv view lags folds
+    /// it and commits the fold, even for an empty batch or one of retries.
+    #[test]
+    fn a_retry_over_a_lagging_commit_commits_the_fold() {
+        for batch in [vec![], vec![Event::upsert("t/a", b"1", "a")]] {
+            let mut repo = Repo::new(MemStore::default());
+            let empty = repo.db_empty().unwrap();
+            let late = repo
+                .db_append_deferred(&empty, &[Event::upsert("t/a", b"1", "a")])
+                .unwrap();
+            repo.db_commit(&refname("m"), &late, "deferred").unwrap();
+            let st = Server::new(repo, None);
+            let ct = [("content-type", EVENTS)];
+            let r = handle(
+                &st,
+                &req("POST", "/db/m/append", &encode_events(&batch), &ct),
+            );
+            assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
+            let mut w = st.writer.lock().unwrap();
+            let c = w.store().get_ref(&refname("m")).unwrap().unwrap();
+            let db = w.db_at(&c).unwrap();
+            assert_eq!((db.kv_at, db.ids_at), (1, 1), "{} events", batch.len());
+            assert!(w.db_append(&db, &[Event::upsert("t/b", b"2", "b")]).is_ok());
+        }
+    }
+
     #[test]
     fn append_scan_get_and_read_at_an_older_commit() {
         for shared in [false, true] {
             for keep_counts in [0, 3] {
-                served_routes(shared, keep_counts);
+                // E368: with the kv view folded every 2 events, or only
+                // when read, every answer is the same.
+                for defer in [0, 2, 1000] {
+                    served_routes(shared, keep_counts, defer);
+                }
             }
         }
     }
 
-    fn served_routes(shared: bool, keep_counts: u32) {
+    fn served_routes(shared: bool, keep_counts: u32, defer: u64) {
         let st = if shared {
             let store = ikam_kernel::SharedStore::new(MemStore::default());
             let make: ReaderFactory<_> = Box::new(|w: &Repo<_>| w.sibling());
@@ -740,7 +1257,8 @@ mod tests {
                 None,
             )
         }
-        .keep_counts(keep_counts);
+        .keep_counts(keep_counts)
+        .defer_kv(defer);
         let h = |r: Request| handle(&st, &r);
         let ev = [(EVENTS.to_string())];
         let ct = [("content-type", ev[0].as_str())];

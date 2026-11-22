@@ -1,7 +1,7 @@
 //! E242: a view graph's updates give the roots a full build gives.
 
 use ikam_kernel::views::{Mode, View, ViewGraph, ViewOp};
-use ikam_kernel::{Db, Event, MemStore, Repo};
+use ikam_kernel::{Arg, Db, Event, MemStore, Repo, Target};
 
 fn field(v: &[u8], j: usize) -> &str {
     std::str::from_utf8(v).unwrap().split(',').nth(j).unwrap()
@@ -172,4 +172,135 @@ fn bad_graphs_and_failed_checks_are_refused() {
         .unwrap();
     assert!(repo.views_update(&g, &state, &bad).is_err());
     assert!(repo.views_build(&g, &bad).is_err());
+}
+
+/// E361: the same graph with its rules given as closures.
+fn closure_graph(mode: Mode) -> ViewGraph {
+    use std::sync::Arc;
+    let warn = "warn".to_string();
+    let flag: ikam_kernel::views::MapRule = Arc::new(move |k, v| {
+        (field(v, 2) == warn).then(|| {
+            (
+                format!("flagged/{k}"),
+                format!("{},{}", field(v, 0), field(v, 1)).into_bytes(),
+            )
+        })
+    });
+    let group = || -> ikam_kernel::views::GroupRule { Arc::new(by_group) };
+    let v = |name: &str, input: &str, op: ViewOp| View {
+        name: name.into(),
+        input: input.into(),
+        mode,
+        op,
+        check: None,
+    };
+    ViewGraph::new(vec![
+        v("flagged_by_group", "flagged", ViewOp::GroupSumWith(group())),
+        v("by_group", "kv", ViewOp::GroupSumWith(group())),
+        v("flagged", "kv", ViewOp::MapWith(flag)),
+    ])
+    .unwrap()
+}
+
+#[test]
+fn closure_rules_store_what_function_rules_store() {
+    let mut rng = Lcg(31);
+    let mut repo = Repo::new(MemStore::default());
+    let empty = repo.db_empty().unwrap();
+    let events: Vec<Event> = (0..2000)
+        .map(|i| Event::upsert(&format!("r/{i:05}"), &value(&mut rng), &format!("w{i}")))
+        .collect();
+    let mut db = repo.db_append(&empty, &events).unwrap();
+    let (fns, dyns) = (graph(Mode::Incremental), closure_graph(Mode::Incremental));
+    let mut a = repo.views_build(&fns, &db).unwrap();
+    let mut b = repo.views_build(&dyns, &db).unwrap();
+    let names = ["by_group", "flagged", "flagged_by_group"];
+    for round in 0..8 {
+        for n in names {
+            assert_eq!(a.roots[n], b.roots[n], "{n} round {round}");
+        }
+        let batch: Vec<Event> = (0..30)
+            .map(|j| {
+                let k = format!("r/{:05}", rng.next() % 2200);
+                match rng.next() % 3 {
+                    0 => Event::remove(&k, false, &format!("c{round}-{j}")),
+                    _ => Event::upsert(&k, &value(&mut rng), &format!("c{round}-{j}")),
+                }
+            })
+            .collect();
+        db = repo.db_append(&db, &batch).unwrap();
+        a = repo.views_update(&fns, &a, &db).unwrap();
+        b = repo.views_update(&dyns, &b, &db).unwrap();
+    }
+    // A prefix read gives the rows the whole view has under it.
+    let whole = repo.view_rows(&dyns, &b, "flagged").unwrap();
+    let want: Vec<_> = whole
+        .into_iter()
+        .filter(|(k, _)| k.starts_with("flagged/r/000"))
+        .collect();
+    let got = repo
+        .view_prefix(&dyns, &b, "flagged", "flagged/r/000", usize::MAX)
+        .unwrap();
+    assert!(!want.is_empty());
+    assert_eq!(got, want);
+    let two = repo
+        .view_prefix(&dyns, &b, "flagged", "flagged/", 2)
+        .unwrap();
+    assert_eq!(two.len(), 2);
+}
+
+fn same(k: &str, v: &[u8]) -> Option<(String, Vec<u8>)> {
+    Some((k.to_string(), v.to_vec()))
+}
+
+#[test]
+fn big_views_keep_their_values_in_bounded_contents() {
+    // E361: a view's values go into contents of at most 64 KiB, so one
+    // row's read does not read the whole view's values.
+    let mut repo = Repo::new(MemStore::default());
+    let empty = repo.db_empty().unwrap();
+    let pad = |i: usize, w: &str| format!("{w}{i:06}{}", "x".repeat(120)).into_bytes();
+    let events: Vec<Event> = (0..3000)
+        .map(|i| Event::upsert(&format!("r/{i:05}"), &pad(i, "a"), &format!("w{i}")))
+        .collect();
+    let db = repo.db_append(&empty, &events).unwrap();
+    let g = ViewGraph::new(vec![View {
+        name: "same".into(),
+        input: "kv".into(),
+        mode: Mode::Incremental,
+        op: ViewOp::Map(same),
+        check: None,
+    }])
+    .unwrap();
+    let s = repo.views_build(&g, &db).unwrap();
+    let nodes = repo.graph_nodes(&s.roots["same"]).unwrap();
+    let blobs: std::collections::BTreeSet<_> = nodes
+        .iter()
+        .map(|n| match &n.target {
+            Target::Content(Arg::Range { id, start, len }) => {
+                assert!(start + len <= 64 * 1024);
+                *id
+            }
+            _ => panic!("a range"),
+        })
+        .collect();
+    assert!(blobs.len() >= 6, "{} contents", blobs.len());
+    let batch: Vec<Event> = (0..3000)
+        .step_by(7)
+        .map(|i| Event::upsert(&format!("r/{i:05}"), &pad(i, "b"), &format!("u{i}")))
+        .collect();
+    let db = repo.db_append(&db, &batch).unwrap();
+    let s = repo.views_update(&g, &s, &db).unwrap();
+    let want: Vec<_> = repo.db_scan(&db).unwrap().into_iter().collect();
+    let got: Vec<_> = repo
+        .view_rows(&g, &s, "same")
+        .unwrap()
+        .into_iter()
+        .collect();
+    assert_eq!(got, want);
+    let part = repo
+        .view_prefix(&g, &s, "same", "r/014", usize::MAX)
+        .unwrap();
+    assert_eq!(part.len(), 100);
+    assert_eq!(part[7].1, pad(1407, "b"));
 }

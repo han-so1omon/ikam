@@ -32,6 +32,9 @@ pub struct Live {
     pub repo: Repo<FsStore>,
     pub store_dir: PathBuf,
     pub refname: String,
+    /// The ref the process opened (E360): drafts are made at, and promoted
+    /// to, it, while `refname` may be a draft.
+    pub home: String,
     /// The commit pending edits apply on, and its tree.
     base: Option<Id>,
     base_tree: Option<Id>,
@@ -40,6 +43,10 @@ pub struct Live {
     pub work: Id,
     last_edit: Instant,
     pub commit_after: Duration,
+    /// E360: edits made through the agent tools wait for their own
+    /// `commit` (and its message) until this instant: the timed commit of
+    /// `flush(false)` leaves them alone. Cleared by a commit.
+    pub hold_until: Option<Instant>,
     trees: HashMap<Id, Arc<Vec<TreeEntry>>>,
     sizes: HashMap<Id, u64>,
     sizes_file: Option<std::fs::File>,
@@ -135,12 +142,14 @@ impl Live {
             repo,
             store_dir,
             refname: refname.into(),
+            home: refname.into(),
             base: None,
             base_tree: None,
             pending: Vec::new(),
             work: Id::of(b""),
             last_edit: Instant::now(),
             commit_after: Duration::from_millis(1500),
+            hold_until: None,
             trees: HashMap::new(),
             sizes,
             sizes_file,
@@ -188,6 +197,41 @@ impl Live {
             );
         }
         Ok(())
+    }
+
+    /// E360: move onto `refname` (a draft, or back home), keeping the
+    /// caches and settings: the same store, extracted text and timers.
+    /// Pending edits must be committed first.
+    pub fn switch_ref(&mut self, refname: &str) -> Result<(), String> {
+        if !self.pending.is_empty() {
+            return Err("commit pending edits first".into());
+        }
+        self.switch_ref_dropping(refname)
+    }
+
+    /// `switch_ref` that drops pending edits instead of refusing (a draft
+    /// being discarded).
+    pub fn switch_ref_dropping(&mut self, refname: &str) -> Result<(), String> {
+        self.pending.clear();
+        self.hold_until = None;
+        let base = self.repo.store().get_ref(refname).map_err(err)?;
+        let base_tree = base
+            .map(|c| snapshot::tree_of(&self.repo, &c))
+            .transpose()
+            .map_err(err)?;
+        self.work = match base_tree {
+            Some(t) => t,
+            None => self.repo.edit_tree(None, &[]).map_err(err)?,
+        };
+        self.refname = refname.into();
+        self.base = base;
+        self.base_tree = base_tree;
+        self.refresh()
+    }
+
+    /// The tree of `head`, which pending edits apply on.
+    pub fn base_tree(&self) -> Option<Id> {
+        self.base_tree
     }
 
     /// The commit the ref points at, as this process last saw it.
@@ -530,16 +574,26 @@ impl Live {
 
     /// Commit pending edits if the last was `commit_after` ago (or `now`).
     pub fn flush(&mut self, now: bool) -> Result<Option<Id>, String> {
+        self.flush_with(now, None)
+    }
+
+    /// `flush` with a commit message of the caller's (`ikam mcp`, E359);
+    /// `None` gives the default "live: N change(s)".
+    pub fn flush_with(&mut self, now: bool, message: Option<&str>) -> Result<Option<Id>, String> {
         if self.pending.is_empty() || (!now && self.last_edit.elapsed() < self.commit_after) {
             return Ok(None);
         }
+        if !now && self.hold_until.is_some_and(|t| Instant::now() < t) {
+            return Ok(None);
+        }
+        self.hold_until = None;
         self.sync()?;
         if Some(self.work) == self.base_tree {
             self.pending.clear();
             return Ok(None);
         }
         let n = self.pending.len();
-        let message = format!("live: {n} change(s)");
+        let message = message.map_or_else(|| format!("live: {n} change(s)"), String::from);
         let commit = self
             .repo
             .commit(&self.refname, self.work, &message)

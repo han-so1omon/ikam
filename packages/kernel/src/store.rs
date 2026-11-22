@@ -32,6 +32,22 @@ pub trait Store {
     }
     fn has(&self, id: &Id) -> bool;
     fn ids(&self) -> Result<Vec<Id>, Error>;
+    /// Every stored object's id and the first `n` bytes of its encoding, in
+    /// no set order (E367), for passes over the whole store such as the
+    /// ledger's build. `f` must not call the store. The default lists the ids
+    /// and reads each head; a store that can read its records in one pass
+    /// overrides it.
+    fn heads(&self, n: usize, f: &mut dyn FnMut(Id, &[u8])) -> Result<(), Error> {
+        for id in self.ids()? {
+            match self.read_head(&id, n) {
+                Ok(head) => f(id, &head),
+                // Deleted by another handle since the listing (E292).
+                Err(Error::NotFound(_)) => continue,
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(())
+    }
     /// Stored ids starting with `prefix` (an abbreviated id, as in git).
     fn ids_with_prefix(&self, prefix: &[u8]) -> Result<Vec<Id>, Error>;
     fn delete(&mut self, id: &Id) -> Result<(), Error>;
@@ -105,6 +121,9 @@ impl<S: Store> Store for SharedStore<S> {
     }
     fn ids(&self) -> Result<Vec<Id>, Error> {
         self.r().ids()
+    }
+    fn heads(&self, n: usize, f: &mut dyn FnMut(Id, &[u8])) -> Result<(), Error> {
+        self.r().heads(n, f)
     }
     fn ids_with_prefix(&self, prefix: &[u8]) -> Result<Vec<Id>, Error> {
         self.r().ids_with_prefix(prefix)

@@ -12,7 +12,7 @@ use ikam_kernel::{Id, Kind};
 use crate::http::{Request, Response, enc, esc};
 use crate::json::{Json, quote};
 use crate::live::{Live, humantime, norm};
-use crate::{ask, corpus, serve, text};
+use crate::{ask, corpus, json as jsonfmt, mcp, serve, text};
 
 const PREVIEW: usize = 256 * 1024;
 
@@ -376,6 +376,61 @@ fn num(x: f64) -> Json {
     Json::Num(x)
 }
 
+/// E360: the agent tools (`ikam mcp`) over HTTP, on the served `Live`.
+/// Tools that change nothing answer GET with their arguments in the query;
+/// the rest take POST, with a JSON object of arguments as the body (or the
+/// query). The answer is `{"text": ..., "error": false}`, or status 400
+/// with `"error": true`. Drafts move the whole served session onto the
+/// draft until it is promoted or discarded.
+fn tool(live: &Mutex<Live>, name: &str, req: &Request) -> Response {
+    let known = mcp::tool_list();
+    let known = known
+        .as_arr()
+        .iter()
+        .any(|t| t.get("name").and_then(Json::as_str) == Some(name));
+    if !known {
+        return Response::text(404, format!("no tool {name}"));
+    }
+    let reads = mcp::READ_TOOLS.contains(&name);
+    if req.method != "POST" && !reads {
+        return Response::text(405, format!("{name} changes the store: send it with POST"));
+    }
+    let args = if req.method == "POST" && !req.body.is_empty() {
+        match std::str::from_utf8(&req.body)
+            .map_err(|e| e.to_string())
+            .and_then(jsonfmt::parse)
+        {
+            Ok(a @ Json::Obj(_)) => a,
+            Ok(_) => return Response::text(400, "the body must be a JSON object"),
+            Err(e) => return Response::text(400, format!("bad JSON: {e}")),
+        }
+    } else {
+        let keys: Vec<&str> = req
+            .query
+            .split('&')
+            .filter_map(|kv| kv.split_once('=').map(|(k, _)| k).or(Some(kv)))
+            .filter(|k| !k.is_empty())
+            .collect();
+        Json::Obj(
+            keys.into_iter()
+                .filter_map(|k| Some((k.to_string(), Json::Str(req.param(k)?))))
+                .collect(),
+        )
+    };
+    let mut session = mcp::Session {
+        live: live.lock().unwrap(),
+    };
+    let (status, text, error) = match session.call(name, &args) {
+        Ok(t) => (200, t, false),
+        Err(e) => (400, e, true),
+    };
+    let body = Json::Obj(vec![
+        ("text".into(), Json::Str(mcp::capped(text))),
+        ("error".into(), Json::Bool(error)),
+    ]);
+    Response::new(status).body("application/json", body.encode())
+}
+
 fn api(live: &Mutex<Live>, name: &str, req: &Request) -> Response {
     if req.method == "POST" && req.header("x-ikam").is_none() {
         return Response::text(403, "missing X-Ikam header");
@@ -473,9 +528,12 @@ fn api(live: &Mutex<Live>, name: &str, req: &Request) -> Response {
                 }
                 json(Json::Obj(fields))
             }
+            ("GET", "tools") => json(mcp::tool_list()),
+            (_, t) if t.starts_with("tool/") => tool(live, &t["tool/".len()..], req),
             ("POST", "commit") => {
+                // E360: `?message=` names the commit.
                 let mut l = live.lock().unwrap();
-                match l.flush(true)? {
+                match l.flush_with(true, req.param("message").as_deref())? {
                     Some(c) => Response::text(200, format!("committed {}", &c.to_hex()[..12])),
                     None => Response::text(200, "nothing to commit"),
                 }
@@ -492,4 +550,121 @@ fn api(live: &Mutex<Live>, name: &str, req: &Request) -> Response {
         })
     })();
     r.unwrap_or_else(|e| Response::text(500, e))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn call(live: &Mutex<Live>, method: &str, target: &str, body: &str) -> (u16, Json) {
+        let (path, query) = target.split_once('?').unwrap_or((target, ""));
+        let req = Request {
+            method: method.into(),
+            path: path.into(),
+            query: query.into(),
+            headers: vec![("X-Ikam".into(), "1".into())],
+            body: body.as_bytes().to_vec(),
+        };
+        let r = handle(live, &req);
+        let j = jsonfmt::parse(&String::from_utf8_lossy(&r.body))
+            .unwrap_or_else(|_| Json::Str(String::from_utf8_lossy(&r.body).into()));
+        (r.status, j)
+    }
+
+    fn text(j: &Json) -> String {
+        j.get("text")
+            .and_then(Json::as_str)
+            .unwrap_or("")
+            .to_string()
+    }
+
+    /// E360: drafts, commit messages, history and reads at a commit over
+    /// HTTP, through the same handlers as `ikam mcp`.
+    #[test]
+    fn agent_tools_over_http() {
+        let dir = std::env::temp_dir().join(format!("ikam-ui-tools-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut l = Live::open(dir.to_str().unwrap(), "main").unwrap();
+        l.index_all(false).unwrap();
+        let live = Mutex::new(l);
+        let (st, j) = call(&live, "GET", "/api/tools", "");
+        assert_eq!(st, 200);
+        assert!(j.as_arr().len() >= 16);
+        // Writes go by POST; a GET of one is refused, unknown tools are 404.
+        let w = r#"{"path":"notes/a.md","content":"one\ntwo\n"}"#;
+        assert_eq!(call(&live, "GET", "/api/tool/write?path=x", "").0, 405);
+        assert_eq!(call(&live, "GET", "/api/tool/nope", "").0, 404);
+        assert_eq!(call(&live, "POST", "/api/tool/write", w).0, 200);
+        // The server's timed commit leaves tool edits for their own commit.
+        {
+            let mut l = live.lock().unwrap();
+            l.commit_after = std::time::Duration::ZERO;
+            assert_eq!(l.flush(false).unwrap(), None);
+            assert_eq!(l.pending(), 1);
+        }
+        let (st, j) = call(&live, "POST", "/api/tool/commit", r#"{"message":"first"}"#);
+        assert_eq!(st, 200, "{}", text(&j));
+        // `/api/commit` takes a message too.
+        let e = r#"{"path":"notes/a.md","old":"two","new":"three"}"#;
+        assert_eq!(call(&live, "POST", "/api/tool/edit", e).0, 200);
+        let (st, _) = call(&live, "POST", "/api/commit?message=second%20edit", "");
+        assert_eq!(st, 200);
+        let (st, j) = call(&live, "GET", "/api/tool/history?limit=5", "");
+        assert_eq!(st, 200);
+        let h = text(&j);
+        assert!(h.contains("first") && h.contains("second edit"), "{h}");
+        // Read at the first commit: the text before the edit.
+        let first = h
+            .lines()
+            .find(|l| l.contains("first"))
+            .and_then(|l| l.split_whitespace().next())
+            .unwrap()
+            .to_string();
+        let (st, j) = call(
+            &live,
+            "GET",
+            &format!("/api/tool/read?path=notes/a.md&at={first}"),
+            "",
+        );
+        assert_eq!(st, 200, "{}", text(&j));
+        assert!(text(&j).contains("two") && !text(&j).contains("three"));
+        // A draft keeps its commits off main until promoted.
+        assert_eq!(
+            call(&live, "POST", "/api/tool/draft_open", r#"{"name":"try"}"#).0,
+            200
+        );
+        let w2 = r#"{"path":"notes/b.md","content":"draft\n"}"#;
+        assert_eq!(call(&live, "POST", "/api/tool/write", w2).0, 200);
+        assert_eq!(
+            call(
+                &live,
+                "POST",
+                "/api/tool/commit",
+                r#"{"message":"on draft"}"#
+            )
+            .0,
+            200
+        );
+        let main_has_b = |live: &Mutex<Live>| {
+            call(live, "GET", "/api/tool/read?path=notes/b.md&at=main", "").0 == 200
+        };
+        assert!(!main_has_b(&live));
+        let (st, j) = call(&live, "POST", "/api/tool/draft_promote", "");
+        assert_eq!(st, 200, "{}", text(&j));
+        assert!(main_has_b(&live));
+        assert_eq!(live.lock().unwrap().refname, "main");
+        // A tool error is a 400 with `error: true`.
+        let (st, j) = call(&live, "POST", "/api/tool/draft_discard", "");
+        assert_eq!((st, j.get("error")), (400, Some(&Json::Bool(true))));
+        // POSTs without the header a cross-site form cannot send are refused.
+        let req = Request {
+            method: "POST".into(),
+            path: "/api/tool/write".into(),
+            query: String::new(),
+            headers: Vec::new(),
+            body: w.as_bytes().to_vec(),
+        };
+        assert_eq!(handle(&live, &req).status, 403);
+        let _ = std::fs::remove_dir_all(dir);
+    }
 }

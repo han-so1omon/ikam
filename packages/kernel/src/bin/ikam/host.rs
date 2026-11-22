@@ -28,12 +28,24 @@
 //!   as if the share did not exist.
 //!
 //! A panic while serving one project is caught and answered 500; the other
-//! projects keep serving. `--public` is refused: every request needs a user.
+//! projects keep serving. `--public` is refused: every request needs a user
+//! or a token.
+//!
+//! Tokens and rates (E363, `tokens.rs`): `token NAME ROLE ID:HASH
+//! [rate=N/s] [expires=SECS]` lets a program in with `Authorization: Bearer`
+//! (`ikam token` makes one); `rate NAME N/s` limits all of a project's
+//! callers together. Over a rate, a request gets 429 and `Retry-After`.
+//!
+//! Heavy jobs (E362): `heavy-jobs N` lets at most N maintenance jobs
+//! (`/api/repack`, `/api/gc`, `/api/fsck`) run at once across all projects;
+//! the others wait their turn in order, for up to `heavy-wait SECS` (60 by
+//! default), then get 503 with `Retry-After`. Without the line, as before,
+//! every owner's job runs at once.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, SystemTime};
 
 use ikam_kernel::share::{Refused, Right, SHARES_REF, Scope, Share, import_share};
@@ -43,6 +55,7 @@ use crate::auth::{self, Auth};
 use crate::http::{self, Request, Response};
 use crate::json::Json;
 use crate::live::{self, Live};
+use crate::tokens::{Bucket, Rate, Token};
 use crate::{dav, ui};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -61,11 +74,17 @@ pub struct ProjectConfig {
     pub users: Vec<(Role, String)>,
     pub max_store: Option<u64>,
     pub max_body: Option<usize>,
+    /// E363: role, `ID:HASH` and the words after it.
+    pub tokens: Vec<(Role, String, Vec<String>)>,
+    /// E363: a rate for all the project's callers together.
+    pub rate: Option<Rate>,
 }
 
 pub struct Config {
     pub port: u16,
     pub projects: Vec<ProjectConfig>,
+    /// E362: heavy jobs at once across the host, and how long one waits.
+    pub heavy: Option<(usize, Duration)>,
 }
 
 fn valid_name(s: &str) -> bool {
@@ -78,10 +97,12 @@ fn valid_name(s: &str) -> bool {
 impl Config {
     /// Lines: `port N`, `project NAME STORE_DIR [REF]`, `host NAME HOSTNAME`,
     /// `user NAME ROLE USER:SALT:HASH` (from `ikam passwd`), `max-store NAME
-    /// BYTES`, `max-body NAME BYTES`; `#` starts a comment.
+    /// BYTES`, `max-body NAME BYTES`, `token NAME ROLE ID:HASH [rate=N/s]
+    /// [expires=SECS]` and `rate NAME N/s` (E363); `#` starts a comment.
     pub fn parse(text: &str) -> Result<Config, String> {
         let mut port = 8750;
         let mut projects: Vec<ProjectConfig> = Vec::new();
+        let (mut heavy_jobs, mut heavy_wait) = (None, Duration::from_secs(60));
         for (n, line) in text.lines().enumerate() {
             let line = line.split('#').next().unwrap_or("").trim();
             if line.is_empty() {
@@ -95,6 +116,14 @@ impl Config {
             };
             match words.as_slice() {
                 ["port", p] => port = p.parse().map_err(|_| bad("port N"))?,
+                ["heavy-jobs", n] => match n.parse() {
+                    Ok(n) if n > 0 => heavy_jobs = Some(n),
+                    _ => return Err(bad("heavy-jobs N, at least 1")),
+                },
+                ["heavy-wait", secs] => match secs.parse() {
+                    Ok(s) => heavy_wait = Duration::from_secs(s),
+                    _ => return Err(bad("heavy-wait SECS")),
+                },
                 ["project", name, store, rest @ ..] if rest.len() <= 1 => {
                     if !valid_name(name) {
                         return Err(bad("a project name is a-z, 0-9 and -"));
@@ -116,6 +145,8 @@ impl Config {
                         users: Vec::new(),
                         max_store: None,
                         max_body: None,
+                        tokens: Vec::new(),
+                        rate: None,
                     });
                 }
                 ["host", name, host] => {
@@ -128,14 +159,30 @@ impl Config {
                 }
                 ["user", name, role, line] => {
                     let i = project(&mut projects, name)?;
-                    let role = match *role {
-                        "read" => Role::Read,
-                        "write" => Role::Write,
-                        "owner" => Role::Owner,
-                        _ => return Err(bad("a role is read, write or owner")),
-                    };
+                    let role =
+                        parse_role(role).ok_or_else(|| bad("a role is read, write or owner"))?;
                     Auth::parse(line).map_err(|e| bad(&e))?;
                     projects[i].users.push((role, line.to_string()));
+                }
+                ["token", name, role, line, rest @ ..] => {
+                    let i = project(&mut projects, name)?;
+                    let role =
+                        parse_role(role).ok_or_else(|| bad("a role is read, write or owner"))?;
+                    let t = Token::parse(role, line, rest, std::time::Instant::now())
+                        .map_err(|e| bad(&e))?;
+                    if projects.iter().any(|p| {
+                        p.tokens
+                            .iter()
+                            .any(|(_, l, _)| l.starts_with(&format!("{}:", t.id)))
+                    }) {
+                        return Err(bad("this token is in the config already"));
+                    }
+                    let rest = rest.iter().map(|w| w.to_string()).collect();
+                    projects[i].tokens.push((role, line.to_string(), rest));
+                }
+                ["rate", name, rate] => {
+                    let i = project(&mut projects, name)?;
+                    projects[i].rate = Some(Rate::parse(rate).map_err(|e| bad(&e))?);
                 }
                 ["max-store", name, bytes] | ["max-body", name, bytes] => {
                     let i = project(&mut projects, name)?;
@@ -167,7 +214,20 @@ impl Config {
                 }
             }
         }
-        Ok(Config { port, projects })
+        Ok(Config {
+            port,
+            projects,
+            heavy: heavy_jobs.map(|n| (n, heavy_wait)),
+        })
+    }
+}
+
+fn parse_role(s: &str) -> Option<Role> {
+    match s {
+        "read" => Some(Role::Read),
+        "write" => Some(Role::Write),
+        "owner" => Some(Role::Owner),
+        _ => None,
     }
 }
 
@@ -178,28 +238,6 @@ fn reserved_ref(name: &str) -> bool {
     name == SHARES_REF || name.starts_with("import/") || name.starts_with("proposals/")
 }
 
-/// Bytes a merge of `share` may add to the receiver at most: every file the
-/// scope covers, or every record, before dedup.
-fn share_bytes<S: ikam_kernel::Store>(
-    repo: &mut ikam_kernel::Repo<S>,
-    share: &Share,
-) -> Result<usize, Refused> {
-    Ok(match &share.scope {
-        Scope::Records { .. } => repo
-            .share_records(share, "", None)?
-            .iter()
-            .map(|(k, v)| k.len() + v.len())
-            .sum(),
-        _ => {
-            let mut n = 0;
-            for (_, id) in repo.share_files(share)? {
-                n += repo.read_content(&id)?.len();
-            }
-            n
-        }
-    })
-}
-
 pub struct Project {
     pub name: String,
     pub live: Arc<Mutex<Live>>,
@@ -207,11 +245,82 @@ pub struct Project {
     hosts: Vec<String>,
     max_body: Option<usize>,
     key: [u8; 32],
+    tokens: Vec<Token>,
+    bucket: Option<Mutex<Bucket>>,
 }
 
 pub struct Host {
     pub projects: BTreeMap<String, Project>,
     port: u16,
+    heavy: Option<Heavy>,
+}
+
+/// E362: at most `max` heavy jobs at once across the host's projects; the
+/// rest wait in the order they came, each for up to `wait`.
+pub struct Heavy {
+    max: usize,
+    wait: Duration,
+    state: Mutex<HeavyState>,
+    turn: Condvar,
+}
+
+#[derive(Default)]
+struct HeavyState {
+    running: usize,
+    waiting: VecDeque<u64>,
+    next: u64,
+}
+
+/// A running heavy job; its place is given up when dropped.
+pub struct Permit<'a>(&'a Heavy);
+
+impl Drop for Permit<'_> {
+    fn drop(&mut self) {
+        self.0.state.lock().unwrap().running -= 1;
+        self.0.turn.notify_all();
+    }
+}
+
+impl Heavy {
+    pub fn new(max: usize, wait: Duration) -> Heavy {
+        Heavy {
+            max,
+            wait,
+            state: Mutex::new(HeavyState::default()),
+            turn: Condvar::new(),
+        }
+    }
+
+    /// Wait for a turn; none if `wait` passed first.
+    pub fn enter(&self) -> Option<Permit<'_>> {
+        let mut s = self.state.lock().unwrap();
+        let me = s.next;
+        s.next += 1;
+        s.waiting.push_back(me);
+        let deadline = std::time::Instant::now() + self.wait;
+        loop {
+            if s.waiting.front() == Some(&me) && s.running < self.max {
+                s.waiting.pop_front();
+                s.running += 1;
+                self.turn.notify_all();
+                return Some(Permit(self));
+            }
+            let now = std::time::Instant::now();
+            if now >= deadline {
+                s.waiting.retain(|t| *t != me);
+                self.turn.notify_all();
+                return None;
+            }
+            s = self.turn.wait_timeout(s, deadline - now).unwrap().0;
+        }
+    }
+
+    /// Jobs running and waiting.
+    #[cfg(test)]
+    pub fn load(&self) -> (usize, usize) {
+        let s = self.state.lock().unwrap();
+        (s.running, s.waiting.len())
+    }
 }
 
 /// The project's share key, kept in `STORE/share.key`, made on first use.
@@ -273,6 +382,15 @@ impl Host {
                 .iter()
                 .map(|(r, line)| Auth::parse(line).map(|a| (*r, a)))
                 .collect::<Result<_, _>>()?;
+            let start = std::time::Instant::now();
+            let tokens = p
+                .tokens
+                .iter()
+                .map(|(r, line, words)| {
+                    let words: Vec<&str> = words.iter().map(String::as_str).collect();
+                    Token::parse(*r, line, &words, start)
+                })
+                .collect::<Result<_, _>>()?;
             let mut hosts = p.hosts.clone();
             hosts.push(format!("{}.localhost", p.name));
             projects.insert(
@@ -284,12 +402,15 @@ impl Host {
                     hosts,
                     max_body: p.max_body,
                     key,
+                    tokens,
+                    bucket: p.rate.map(|r| Mutex::new(Bucket::new(r, start))),
                 },
             );
         }
         Ok(Host {
             projects,
             port: config.port,
+            heavy: config.heavy.map(|(n, wait)| Heavy::new(n, wait)),
         })
     }
 
@@ -310,18 +431,32 @@ impl Host {
         if req.path == "/robots.txt" {
             return Response::text(200, "User-agent: *\nDisallow: /\n");
         }
-        let role = p
-            .users
-            .iter()
-            .filter(|(_, a)| a.check(&req).is_none())
-            .map(|(r, _)| *r)
-            .max();
+        let token = crate::tokens::bearer(&p.tokens, req.header("authorization"), now());
+        let role = match token {
+            Some(t) => Some(t.role),
+            None => p
+                .users
+                .iter()
+                .filter(|(_, a)| a.check(&req).is_none())
+                .map(|(r, _)| *r)
+                .max(),
+        };
         let Some(role) = role else {
             return Response::text(401, "password required").with(
                 "WWW-Authenticate",
                 "Basic realm=\"ikam\", charset=\"UTF-8\"",
             );
         };
+        // E363: the project's rate, then the token's.
+        let at = std::time::Instant::now();
+        let buckets = [p.bucket.as_ref(), token.and_then(|t| t.bucket.as_ref())];
+        for b in buckets.into_iter().flatten() {
+            if let Err(wait) = b.lock().unwrap().take(at) {
+                let secs = wait.as_secs_f64().ceil().max(1.0) as u64;
+                return Response::text(429, "too many requests for this project")
+                    .with("Retry-After", secs.to_string());
+            }
+        }
         if p.max_body.is_some_and(|m| req.body.len() > m) {
             return Response::text(413, "body too large for this project");
         }
@@ -365,8 +500,24 @@ impl Host {
         if admin && role < Role::Owner {
             return Response::text(403, "the project's owner runs maintenance");
         }
+        // E362: a heavy job waits for its turn across the host.
+        let _turn = match (&self.heavy, admin) {
+            (Some(h), true) => match h.enter() {
+                Some(p) => Some(p),
+                None => {
+                    let secs = h.wait.as_secs().max(1).to_string();
+                    return Response::text(503, "the host is busy with maintenance; try again")
+                        .with("Retry-After", &secs);
+                }
+            },
+            _ => None,
+        };
         if crate::writes(req) && role < Role::Write {
             return Response::text(403, "this user may only read");
+        }
+        // E360: promoting a draft writes the project's main ref, as a merge does.
+        if req.path == "/api/tool/draft_promote" && role < Role::Owner {
+            return Response::text(403, "the project's owner promotes drafts");
         }
         if req.path == dav::PREFIX || req.path.starts_with("/dav/") {
             dav::handle(&mut p.live.lock().unwrap(), req)
@@ -581,15 +732,16 @@ impl Host {
         if reserved_ref(&into) {
             return Response::text(400, "that ref is kept for shares");
         }
-        if matches!(share.scope, Scope::Path(_) | Scope::Records { .. }) {
-            match share_bytes(&mut sl.repo, &share) {
-                Ok(n) if !pl.has_room(n) => {
-                    return Response::text(507, "this project's store is full");
-                }
-                Ok(_) => {}
-                Err(Refused::Store(e)) => return Response::text(500, e),
-                Err(_) => return no_share(),
+        match sl.repo.share_import_bytes(&share) {
+            Ok(n) if !pl.has_room(n) => {
+                return Response::text(507, "this project's store is full");
             }
+            Ok(_) => {}
+            Err(Refused::NotMergeable) => {
+                return Response::text(409, "this kind of scope can be read but not merged");
+            }
+            Err(Refused::Store(e)) => return Response::text(500, e),
+            Err(_) => return no_share(),
         }
         let msg = format!("merge {name} from {}", s.name);
         let out = import_share(&mut sl.repo, &share, &mut pl.repo, &into, &msg);
@@ -908,6 +1060,163 @@ mod tests {
         done(dirs);
     }
 
+    fn bearer(method: &str, host: &str, token: &str, target: &str, body: &[u8]) -> Request {
+        let mut r = req(method, host, None, target, body);
+        r.headers
+            .push(("Authorization".into(), format!("Bearer {token}")));
+        r
+    }
+
+    #[test]
+    fn tokens_open_one_project_with_their_role_and_rates_answer_429() {
+        let dirs: Vec<PathBuf> = ["a", "b"]
+            .iter()
+            .map(|p| dir(&format!("tok-{p}")))
+            .collect();
+        let (ra, ta) = crate::tokens::make().unwrap();
+        let (wa, twa) = crate::tokens::make().unwrap();
+        let (old, told) = crate::tokens::make().unwrap();
+        let (rb, tb) = crate::tokens::make().unwrap();
+        let mut text = String::new();
+        for (p, d) in ["a", "b"].iter().zip(&dirs) {
+            text += &format!("project {p} {}\n", d.display());
+            text += &format!("user {p} owner {}\n", user(&format!("{p}-owner"), "pw"));
+        }
+        text += &format!("token a read {ra}\ntoken a write {wa} rate=3/m\n");
+        text += &format!("token a owner {old} expires=1000\ntoken b read {rb}\n");
+        text += "rate b 5/m\n";
+        // One token in two projects would join them.
+        let twice = format!("{text}token b read {ra}\n");
+        assert!(Config::parse(&twice).is_err());
+        assert!(Config::parse(&format!("{text}token a read nope\n")).is_err());
+        assert!(Config::parse(&format!("{text}rate a 5\n")).is_err());
+        let h = Host::open(Config::parse(&text).unwrap()).unwrap();
+        let st = |r: Request| h.handle(r).status;
+        // A read token reads its project only, and writes nothing.
+        assert_eq!(st(req("GET", "a.localhost", OA, "/", b"")), 200);
+        assert_eq!(st(bearer("GET", "a.localhost", &ta, "/", b"")), 200);
+        assert_eq!(
+            st(bearer("PUT", "a.localhost", &ta, "/dav/x.md", b"x")),
+            403
+        );
+        assert_eq!(st(bearer("GET", "b.localhost", &ta, "/", b"")), 401);
+        assert_eq!(st(bearer("GET", "a.localhost", &tb, "/", b"")), 401);
+        // An expired owner token, a wrong secret, an owner action with a
+        // write token.
+        assert_eq!(st(bearer("GET", "a.localhost", &told, "/", b"")), 401);
+        let wrong = format!("{}0", &ta[..ta.len() - 1]);
+        let wrong = if wrong == ta {
+            format!("{}1", &ta[..ta.len() - 1])
+        } else {
+            wrong
+        };
+        assert_eq!(st(bearer("GET", "a.localhost", &wrong, "/", b"")), 401);
+        assert_eq!(st(bearer("POST", "a.localhost", &twa, "/api/gc", b"")), 403);
+        // The write token's own rate: 3 a minute, the first taken above.
+        assert_eq!(
+            st(bearer("PUT", "a.localhost", &twa, "/dav/w.md", b"w")),
+            201
+        );
+        assert_eq!(
+            st(bearer("GET", "a.localhost", &twa, "/dav/w.md", b"")),
+            200
+        );
+        let over = h.handle(bearer("GET", "a.localhost", &twa, "/dav/w.md", b""));
+        assert_eq!(over.status, 429);
+        let retry: u64 = over
+            .headers
+            .iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case("retry-after"))
+            .unwrap()
+            .1
+            .parse()
+            .unwrap();
+        assert!((1..=20).contains(&retry), "{retry}");
+        // Others in a are not slowed by it.
+        assert_eq!(st(bearer("GET", "a.localhost", &ta, "/dav/w.md", b"")), 200);
+        // b's rate counts its token and its owner together.
+        for _ in 0..3 {
+            assert_eq!(st(bearer("GET", "b.localhost", &tb, "/", b"")), 200);
+        }
+        let ob = Some(("b-owner", "pw"));
+        assert_eq!(st(req("GET", "b.localhost", ob, "/", b"")), 200);
+        assert_eq!(st(req("GET", "b.localhost", ob, "/", b"")), 200);
+        assert_eq!(st(req("GET", "b.localhost", ob, "/", b"")), 429);
+        assert_eq!(st(bearer("GET", "b.localhost", &tb, "/", b"")), 429);
+        // A wrong password is not counted, and still gets 401.
+        assert_eq!(
+            st(req("GET", "b.localhost", Some(("b-owner", "no")), "/", b"")),
+            401
+        );
+        assert_eq!(st(req("GET", "a.localhost", OA, "/", b"")), 200);
+        done(dirs);
+    }
+
+    #[test]
+    fn heavy_jobs_take_turns_across_projects() {
+        let ms = Duration::from_millis;
+        let h = Heavy::new(1, ms(50));
+        let first = h.enter().unwrap();
+        assert_eq!(h.load(), (1, 0));
+        let t = std::time::Instant::now();
+        assert!(h.enter().is_none());
+        assert!(t.elapsed() >= ms(50));
+        assert_eq!(h.load(), (1, 0), "a waiter that gave up leaves the queue");
+        // A waiter goes in once the running job ends.
+        let h = Arc::new(Heavy::new(1, Duration::from_secs(10)));
+        let held = h.enter().unwrap();
+        let h2 = h.clone();
+        let waiter = std::thread::spawn(move || {
+            let t = std::time::Instant::now();
+            h2.enter().map(|_| t.elapsed())
+        });
+        std::thread::sleep(ms(100));
+        assert_eq!(h.load(), (1, 1));
+        drop(held);
+        let waited = waiter.join().unwrap().unwrap();
+        assert!(waited >= ms(90), "{waited:?}");
+        assert_eq!(h.load(), (0, 0));
+        let two = Heavy::new(2, ms(10));
+        let (_a, _b) = (two.enter().unwrap(), two.enter().unwrap());
+        assert!(two.enter().is_none());
+        drop(first);
+        // Through the host: a heavy job past the wait gets 503; other
+        // requests do not wait.
+        let (hst, dirs) = host("heavy");
+        let mut text = String::from("heavy-jobs 1\nheavy-wait 0\n");
+        for (p, d) in ["a", "b"].iter().zip(&dirs) {
+            text += &format!("project {p} {}\n", d.display());
+            text += &format!("user {p} owner {}\n", user(&format!("{p}-owner"), "pw"));
+        }
+        drop(hst);
+        assert!(Config::parse("heavy-jobs 0\n").is_err());
+        let h = Host::open(Config::parse(&text).unwrap()).unwrap();
+        assert_eq!(
+            h.handle(req("POST", "b.localhost", OB, "/api/fsck", b""))
+                .status,
+            200
+        );
+        let busy = h.heavy.as_ref().unwrap().enter().unwrap();
+        let r = h.handle(req("POST", "b.localhost", OB, "/api/fsck", b""));
+        assert_eq!(r.status, 503);
+        assert!(
+            r.headers
+                .iter()
+                .any(|(k, v)| k == "Retry-After" && v == "1")
+        );
+        assert_eq!(
+            h.handle(req("GET", "a.localhost", OA, "/", b"")).status,
+            200
+        );
+        drop(busy);
+        assert_eq!(
+            h.handle(req("POST", "a.localhost", OA, "/api/fsck", b""))
+                .status,
+            200
+        );
+        done(dirs);
+    }
+
     #[test]
     fn roles_limit_what_a_user_does() {
         let (h, dirs) = host("roles");
@@ -929,6 +1238,12 @@ mod tests {
         );
         assert_eq!(r("GET", "a-writer", "/shares"), 403);
         assert_eq!(r("POST", "a-owner", "/api/fsck"), 200);
+        // E360: the agent tools follow the same roles; promoting a draft
+        // writes the main ref, so it is the owner's.
+        assert_eq!(r("GET", "a-reader", "/api/tool/status"), 200);
+        assert_eq!(r("POST", "a-reader", "/api/tool/write"), 403);
+        assert_eq!(r("POST", "a-writer", "/api/tool/draft_promote"), 403);
+        assert_eq!(r("POST", "a-owner", "/api/tool/draft_promote"), 400);
         // Per-project body limit.
         let big = vec![b'x'; 2048];
         assert_eq!(
@@ -1107,6 +1422,34 @@ mod tests {
     }
 
     #[test]
+    fn section_and_fragment_merges_keep_to_the_store_limit() {
+        let (h, dirs) = host("quota-scopes");
+        let post = |host: &str, who, path: &str| h.handle(req("POST", host, who, path, b""));
+        let two = match h.projects["a"].live.lock().unwrap().stat("pub/two.md") {
+            Ok(Some((_, id))) => id,
+            _ => panic!("no pub/two.md"),
+        };
+        for (name, scope) in [
+            ("sec", "section:pub/one.md@0-12".to_string()),
+            ("frag", format!("fragments:{}", two.to_hex())),
+        ] {
+            let issue =
+                format!("/shares/issue?name={name}&to=b&scope={scope}&right=merge&expires=600");
+            assert_eq!(post("a.localhost", OA, &issue).status, 200);
+            let merge = format!("/from/a/{name}/merge");
+            {
+                let mut b = h.projects["b"].live.lock().unwrap();
+                let used = b.used_bytes();
+                b.max_store = Some(used + 4);
+            }
+            assert_eq!(post("b.localhost", OB, &merge).status, 507, "{name}");
+            h.projects["b"].live.lock().unwrap().max_store = None;
+            assert_eq!(post("b.localhost", OB, &merge).status, 200, "{name}");
+        }
+        done(dirs);
+    }
+
+    #[test]
     fn proposals_wait_for_the_source_owner() {
         let (h, dirs) = host("propose");
         let post =
@@ -1190,6 +1533,85 @@ mod tests {
             b"x"
         );
         done(dirs);
+    }
+
+    /// E363: what a token check and the rate buckets add to a request.
+    /// `cargo test --release --bin ikam host::tests::token_overhead --
+    /// --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn token_overhead() {
+        let d = dir("tok-cost");
+        let (line, token) = crate::tokens::make().unwrap();
+        let (rated, rtoken) = crate::tokens::make().unwrap();
+        let text = format!(
+            "project a {}\nuser a owner {}\ntoken a read {line}\ntoken a read {rated} rate=1000000/s\n",
+            d.display(),
+            user("a-owner", "pw")
+        );
+        let h = Host::open(Config::parse(&text).unwrap()).unwrap();
+        {
+            let mut l = h.projects["a"].live.lock().unwrap();
+            l.apply(vec![live::Op::Put("one.md".into(), b"alpha\n".to_vec())])
+                .unwrap();
+            l.flush(true).unwrap();
+        }
+        let n = 20_000;
+        let time = |make: &dyn Fn() -> Request, want: u16| {
+            let reqs: Vec<Request> = (0..n).map(|_| make()).collect();
+            let t = std::time::Instant::now();
+            for r in reqs {
+                assert_eq!(h.handle(r).status, want);
+            }
+            t.elapsed().as_secs_f64() * 1e6 / n as f64
+        };
+        for round in 0..3 {
+            let pw = time(&|| req("GET", "a.localhost", OA, "/dav/one.md", b""), 200);
+            let tk = time(
+                &|| bearer("GET", "a.localhost", &token, "/dav/one.md", b""),
+                200,
+            );
+            let rt = time(
+                &|| bearer("GET", "a.localhost", &rtoken, "/dav/one.md", b""),
+                200,
+            );
+            let bad = time(
+                &|| bearer("GET", "a.localhost", &token[..20], "/dav/one.md", b""),
+                401,
+            );
+            let mut b = crate::tokens::Bucket::new(
+                crate::tokens::Rate::parse("1000000000/s").unwrap(),
+                std::time::Instant::now(),
+            );
+            let t = std::time::Instant::now();
+            for _ in 0..n {
+                let _ = b.take(std::time::Instant::now());
+            }
+            let bk = t.elapsed().as_secs_f64() * 1e6 / n as f64;
+            println!(
+                "round {round}: password {pw:.2} us, token {tk:.2} us, token with a rate {rt:.2} us, refused token {bad:.2} us, one bucket take {bk:.3} us"
+            );
+        }
+        // A burst against a project rate: how fast 429s are answered.
+        let text = format!("{text}rate a 100/s\n");
+        let h = Host::open(Config::parse(&text).unwrap()).unwrap();
+        let t = std::time::Instant::now();
+        let (mut ok, mut limited) = (0, 0);
+        for _ in 0..n {
+            match h
+                .handle(bearer("GET", "a.localhost", &token, "/dav/one.md", b""))
+                .status
+            {
+                200 => ok += 1,
+                429 => limited += 1,
+                s => panic!("{s}"),
+            }
+        }
+        let us = t.elapsed().as_secs_f64() * 1e6 / n as f64;
+        println!(
+            "burst of {n} at rate 100/s: {ok} answered, {limited} refused, {us:.2} us a request"
+        );
+        let _ = std::fs::remove_dir_all(d);
     }
 
     /// E313: what routing through the host adds to a request, against the

@@ -313,6 +313,9 @@ fn parse_seq(label: &str) -> Result<u64, Error> {
     }
 }
 
+/// A logged event, its encoding and its id (E368: what a fold reads).
+type Logged = (Event, Vec<u8>, Id);
+
 impl<S: Store> Repo<S> {
     /// An empty database: three empty graphs, at log position 0.
     pub fn db_empty(&mut self) -> Result<Db, Error> {
@@ -333,6 +336,12 @@ impl<S: Store> Repo<S> {
         let Some(db) = self.tree_entry(&self.commit_tree(commit)?, "db")? else {
             return self.db_empty();
         };
+        self.db_in(&db)
+    }
+
+    /// The database a `db` directory (as `db_entry` writes it) holds.
+    pub(crate) fn db_in(&mut self, db: &Id) -> Result<Db, Error> {
+        let db = *db;
         let views = self.tree_entry(&db, "views")?.ok_or(Error::WrongKind(db))?;
         let get = |r: &Self, t: &Id, n: &str| r.tree_entry(t, n)?.ok_or(Error::WrongKind(*t));
         let log = get(self, &db, "log")?;
@@ -380,6 +389,60 @@ impl<S: Store> Repo<S> {
         if db.ids_at != head || db.kv_at != head || db.counts.is_some_and(|c| c.at != head) {
             return Err(Error::Decode("db views are behind the log"));
         }
+        let (logged, span) = self.db_log_events(db, head, events)?;
+        if span.is_empty() {
+            return Ok(*db);
+        }
+        self.db_fold_kv(&logged, &span)
+    }
+
+    /// E368: `db_append` that leaves the kv view (and kept counts) behind
+    /// the log: the events are logged, their contents stored and their
+    /// idempotency keys indexed, but no kv chunk is rewritten. A later
+    /// `db_catch_up` folds every event since in one edit of the view, so
+    /// a chunk that many batches touch is rewritten once, not once a
+    /// batch. Reads of kv (`db_get`, `db_range`, ...) see the view as of
+    /// `kv_at` until then.
+    pub fn db_append_deferred(&mut self, db: &Db, events: &[Event]) -> Result<Db, Error> {
+        let head = self.db_head(&db.log)?;
+        if db.ids_at != head {
+            return Err(Error::Decode("db views are behind the log"));
+        }
+        Ok(self.db_log_events(db, head, events)?.0)
+    }
+
+    /// E368: fold the events logged after `kv_at` into the kv view (and
+    /// kept counts), as one append of them all would: the same roots as
+    /// appending them batch by batch (tests/db.rs).
+    pub fn db_catch_up(&mut self, db: &Db) -> Result<Db, Error> {
+        let head = self.db_head(&db.log)?;
+        if db.kv_at == head {
+            return Ok(*db);
+        }
+        if db.kv_at > head || db.counts.is_some_and(|c| c.at != db.kv_at) {
+            return Err(Error::Decode("db views are out of step"));
+        }
+        let mut span = Vec::new();
+        for n in self.graph_range(&db.log, &seq_label(db.kv_at + 1), None, usize::MAX, false)? {
+            let Target::Content(a) = n.target else {
+                return Err(Error::Decode("db log"));
+            };
+            let bytes = self.read_content(&a.id())?;
+            span.push((Event::decode(&bytes)?.0, bytes, a.id()));
+        }
+        self.db_fold_kv(db, &span)
+    }
+
+    /// Check `events`, store their contents and log the fresh ones (those
+    /// whose idempotency key is new) after `head`, editing `log` and `ids`.
+    /// Returns the database with those two advanced, and the fresh events
+    /// with their encodings and ids, for `db_fold_kv`.
+    fn db_log_events(
+        &mut self,
+        db: &Db,
+        head: u64,
+        events: &[Event],
+    ) -> Result<(Db, Vec<Logged>), Error> {
         // Every idempotency key in the batch, looked up in one pass.
         let keys = events.iter().map(|e| e.idempotency_key.clone()).collect();
         let mut seen: BTreeMap<String, Id> = BTreeMap::new();
@@ -403,30 +466,45 @@ impl<S: Store> Repo<S> {
                 None => {}
             }
             seen.insert(e.idempotency_key.clone(), id);
-            fresh.push((e, bytes, id));
+            fresh.push((e.clone(), bytes, id));
         }
         if fresh.is_empty() {
-            return Ok(*db);
+            return Ok((*db, fresh));
         }
-        let (mut log, mut ids, mut changes) = (BTreeMap::new(), BTreeMap::new(), Changes::new());
-        let mut drops: Vec<(String, String)> = Vec::new();
+        let (mut log, mut ids) = (BTreeMap::new(), BTreeMap::new());
         let mut seq = head;
-        for (e, bytes, id) in fresh {
+        for (e, bytes, id) in &fresh {
             seq += 1;
             if self.plain_db_events {
-                if !self.has_content(&id)? {
-                    let plain = self.encode_plain(&bytes);
-                    self.materialize(id, &plain, &bytes)?;
+                if !self.has_content(id)? {
+                    let plain = self.encode_plain(bytes);
+                    self.materialize(*id, &plain, bytes)?;
                 }
             } else {
-                self.put_content(&bytes)?;
+                self.put_content(bytes)?;
             }
             if matches!(e.op, Op::Upsert(ref v) if v.is_empty()) {
                 self.put_content(&[])?;
             }
-            let entry = entry(seq, e, id);
+            let entry = entry(seq, e, *id);
             log.insert(entry.log.label.clone(), Some(entry.log));
             ids.insert(entry.id.label.clone(), Some(entry.id));
+        }
+        let logged = Db {
+            log: self.graph_edit(&db.log, log)?,
+            ids: self.graph_edit_with(&db.ids, ids, Keys::Any)?,
+            ids_at: seq,
+            ..*db
+        };
+        Ok((logged, fresh))
+    }
+
+    /// Fold `span`, the events logged right after `db.kv_at` (and already
+    /// stored), into the kv view and kept counts, in one edit.
+    fn db_fold_kv(&mut self, db: &Db, span: &[Logged]) -> Result<Db, Error> {
+        let mut changes = Changes::new();
+        let mut drops: Vec<(String, String)> = Vec::new();
+        for (e, bytes, id) in span {
             let range = match &e.op {
                 // `/` is followed by `0`: the keys below `k` are [k/, k0).
                 Op::Remove { subtree: true } => {
@@ -453,11 +531,12 @@ impl<S: Store> Repo<S> {
                 &mut changes,
                 &below,
                 e,
-                id,
-                Event::decode(&bytes)?.1,
+                *id,
+                Event::decode(bytes)?.1,
                 bytes.len(),
             );
         }
+        let seq = db.kv_at + span.len() as u64;
         let counts = match db.counts {
             Some(c) => Some(Counts {
                 root: self.count_edit(db, &c, &changes)?,
@@ -478,12 +557,10 @@ impl<S: Store> Repo<S> {
             kv_root = self.graph_drop_range(&kv_root, &lo, Some(&hi))?;
         }
         Ok(Db {
-            log: self.graph_edit(&db.log, log)?,
-            ids: self.graph_edit_with(&db.ids, ids, Keys::Any)?,
             kv: self.graph_edit_with(&kv_root, kv, Keys::Any)?,
-            ids_at: seq,
             kv_at: seq,
             counts,
+            ..*db
         })
     }
 
@@ -698,13 +775,10 @@ impl<S: Store> Repo<S> {
     }
 
     /// Every key and its value, in key order.
+    /// Reads each event once, however many keys it wrote (E361: it read a
+    /// batch's event again for every key the batch wrote).
     pub fn db_scan(&self, db: &Db) -> Result<Vec<(String, Vec<u8>)>, Error> {
-        let mut out = Vec::new();
-        for n in self.graph_nodes(&db.kv)? {
-            let value = self.db_get(db, &n.label)?.ok_or(Error::Decode("db kv"))?;
-            out.push((n.label, value));
-        }
-        Ok(out)
+        self.db_range(db, "", None, usize::MAX, false)
     }
 
     /// Keys from `start` (inclusive) to `end` (exclusive; `None`: to the
@@ -720,6 +794,22 @@ impl<S: Store> Repo<S> {
         reverse: bool,
     ) -> Result<Vec<(String, Vec<u8>)>, Error> {
         let nodes = self.graph_range(&db.kv, start, end, limit, reverse)?;
+        self.node_pairs(nodes)
+    }
+
+    /// The keys of `keys` that are set, with their values, in key order,
+    /// reading the chunks they fall in once and each event once (E361).
+    pub fn db_get_many(
+        &self,
+        db: &Db,
+        keys: &BTreeSet<String>,
+    ) -> Result<Vec<(String, Vec<u8>)>, Error> {
+        let nodes = self.graph_nodes_in(&db.kv, keys)?;
+        self.node_pairs(nodes)
+    }
+
+    /// `kv` nodes to their keys and values, reading each event once.
+    fn node_pairs(&self, nodes: Vec<Node>) -> Result<Vec<(String, Vec<u8>)>, Error> {
         let mut events: BTreeMap<Id, Vec<u8>> = BTreeMap::new();
         let mut out = Vec::with_capacity(nodes.len());
         for n in nodes {
@@ -846,6 +936,25 @@ impl<S: Store> Repo<S> {
         entries.push(self.db_entry(db)?);
         let tree = self.put(&Object::tree(entries)?)?;
         self.commit(name, tree, message)
+    }
+
+    /// Commit `db` as the first commit of `name`, only if the ref does not
+    /// exist yet (E370): two writers creating one database cannot both
+    /// succeed; the other gets `Error::RefConflict`, writing no ref, and
+    /// reads the new head and tries again with `db_commit_at`.
+    pub fn db_commit_new(&mut self, name: &str, db: &Db, message: &str) -> Result<Id, Error> {
+        if self.store.get_ref(name)?.is_some() {
+            return Err(Error::RefConflict(name.into()));
+        }
+        let entry = self.db_entry(db)?;
+        let tree = self.put(&Object::tree(vec![entry])?)?;
+        let id = self.put(&Object::Commit(crate::Commit {
+            tree,
+            parents: Vec::new(),
+            message: message.into(),
+        }))?;
+        self.store.set_ref(name, None, id)?;
+        Ok(id)
     }
 
     /// Commit `db` to `name` only if the ref still points at `base`, the

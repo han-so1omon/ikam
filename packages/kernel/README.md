@@ -129,6 +129,35 @@ read-back against a copy of the tree, search freshness, restart).
 archives; see `docs/experiments/options.md`). Real-world corpora and how the
 kernel does on them: `realworld/README.md`.
 
+For an AI agent (E359): `ikam --store S mcp` serves the store as tools over
+the Model Context Protocol's stdio transport, so an agent's MCP client can
+start it as a local server.
+
+```json
+{"mcpServers": {"ikam": {"command": "ikam", "args": ["--store", "/path/to/store", "mcp"]}}}
+```
+
+- Tools: `list`, `read` (a line range, at any revision; a binary file's
+  extracted text), `search`, `passages`, `write`, `edit` (replace text that
+  occurs once), `remove`, `move`, `status`, `commit` (with the agent's
+  message), `history`, `diff` (paths, or a unified diff of one file),
+  `drafts`, `draft_open`, `draft_promote`, `draft_discard`.
+- Edits wait until `commit`; nothing commits on a timer. Edits still pending
+  when the client closes the server are committed as "mcp: N change(s) left
+  at exit". A tool returns at most 64 KiB of text and says where to read on.
+- One process owns the store, as `live` does. Running both on one store at
+  once is not tested.
+- The same tools over HTTP (E360), in `ikam live` and `host`: `GET
+  /api/tools` lists them; `GET /api/tool/NAME?arg=...` runs a tool that
+  changes nothing; `POST /api/tool/NAME` with a JSON object of arguments
+  (and the `X-Ikam: 1` header) runs the rest. The answer is `{"text": ...,
+  "error": false}`, or status 400 with `"error": true`. `POST
+  /api/commit?message=...` names a commit. A draft opened over HTTP moves
+  the whole served session onto it until it is promoted or discarded; in
+  `host`, only the project's owner promotes one. Edits made through the
+  tools wait for the tools' `commit` (up to 10 minutes) instead of the
+  server's timed commit, so their message is kept.
+
 Benchmark (deterministic corpora from this repo, verified exact, with zstd baselines):
 
 ```sh

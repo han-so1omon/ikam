@@ -767,3 +767,108 @@ fn commit_at_refuses_a_stale_database() {
     let db = repo.db_at(&repo.resolve("main").unwrap()).unwrap();
     assert_eq!(repo.db_get(&db, "k/a").unwrap(), None);
 }
+
+/// E368: appending with the kv view left behind, then catching it up, gives
+/// the same database as appending batch by batch: with subtree and range
+/// removes, with range drops on and off, and with kept counts. A deferred
+/// append leaves kv (and counts) where they were.
+#[test]
+fn deferred_kv_catches_up_to_the_same_roots() {
+    for (range_drop, counts) in [(false, false), (true, false), (false, true)] {
+        let mut repo = Repo::new(MemStore::default());
+        repo.db_range_drop = range_drop;
+        let empty = repo.db_empty().unwrap();
+        let start = if counts {
+            repo.db_keep_counts(&empty, 2).unwrap()
+        } else {
+            empty
+        };
+        let (mut now, mut late) = (start, start);
+        let mut s = 0x2545f4914f6cdd1du64;
+        let mut next = || {
+            s ^= s << 13;
+            s ^= s >> 7;
+            s ^= s << 17;
+            s
+        };
+        let mut i = 0;
+        for round in 0..30 {
+            let batch: Vec<Event> = (0..1 + next() % 200)
+                .map(|_| {
+                    i += 1;
+                    let r = next();
+                    let key = format!("t:{}/r:{}/{}", r % 10, (r >> 8) % 40, (r >> 16) % 5);
+                    let idem = format!("e{i}");
+                    match r % 25 {
+                        0 => rm(&format!("t:{}", r % 10), true, &idem),
+                        1 => Event::remove_range(
+                            &format!("t:{}/r:1", r % 10),
+                            &format!("t:{}/r:3", r % 10),
+                            &idem,
+                        ),
+                        2..=4 => rm(&key, false, &idem),
+                        _ => up(&key, &"v".repeat((r >> 24) as usize % 300), &idem),
+                    }
+                })
+                .collect();
+            now = repo.db_append(&now, &batch).unwrap();
+            let before = late;
+            late = repo.db_append_deferred(&late, &batch).unwrap();
+            assert_eq!(
+                (late.kv, late.kv_at, late.counts),
+                (before.kv, before.kv_at, before.counts)
+            );
+            assert_eq!(
+                (late.log, late.ids, late.ids_at),
+                (now.log, now.ids, now.ids_at)
+            );
+            if round % 7 == 6 {
+                late = repo.db_catch_up(&late).unwrap();
+                assert_eq!(
+                    late, now,
+                    "round {round}, drop {range_drop}, counts {counts}"
+                );
+            }
+        }
+        late = repo.db_catch_up(&late).unwrap();
+        assert_eq!(late, now);
+        assert_eq!(repo.db_catch_up(&late).unwrap(), late, "nothing to fold");
+        // An append onto a lagging view is refused; catching up first works.
+        let lag = repo
+            .db_append_deferred(&late, &[up("t:0/x", "1", "last")])
+            .unwrap();
+        assert!(repo.db_append(&lag, &[up("t:0/y", "2", "later")]).is_err());
+        let caught = repo.db_catch_up(&lag).unwrap();
+        assert_eq!(
+            caught,
+            repo.db_append(&late, &[up("t:0/x", "1", "last")]).unwrap()
+        );
+    }
+}
+
+/// E370: `db_commit_new` makes a database's first commit only while its
+/// ref does not exist, so a second writer creating the same database is
+/// refused and retries over the first one's head.
+#[test]
+fn commit_new_refuses_an_existing_database() {
+    let mut repo = Repo::new(MemStore::default());
+    let empty = repo.db_empty().unwrap();
+    let a = repo.db_append(&empty, &[up("k/a", "a", "ia")]).unwrap();
+    let b = repo.db_append(&empty, &[up("k/b", "b", "ib")]).unwrap();
+    let first = repo.db_commit_new("db/x", &a, "A").unwrap();
+    let Object::Commit(c) = repo.get(&first).unwrap() else {
+        panic!()
+    };
+    assert!(c.parents.is_empty());
+    assert!(matches!(
+        repo.db_commit_new("db/x", &b, "B"),
+        Err(Error::RefConflict(_))
+    ));
+    assert_eq!(repo.resolve("db/x").unwrap(), first);
+    let now = repo.db_at(&first).unwrap();
+    let b = repo.db_append(&now, &[up("k/b", "b", "ib")]).unwrap();
+    repo.db_commit_at("db/x", first, &b, "B again").unwrap();
+    let db = repo.db_at(&repo.resolve("db/x").unwrap()).unwrap();
+    assert_eq!(repo.db_get(&db, "k/a").unwrap().as_deref(), Some(&b"a"[..]));
+    assert_eq!(repo.db_get(&db, "k/b").unwrap().as_deref(), Some(&b"b"[..]));
+}

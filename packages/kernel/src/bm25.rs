@@ -618,6 +618,83 @@ impl<S: Store> Repo<S> {
         })
     }
 
+    /// Keep `v`, at `at`, on the ref `name` (E369): a commit with no
+    /// parent whose tree holds both databases (`at`, `base_db`), both
+    /// graphs and `merge_rows`, so the view outlives the process and
+    /// `gc` keeps what it needs while the ref stands. Each save replaces
+    /// the last; nothing older stays reachable.
+    pub fn bm25_live_save(&mut self, name: &str, at: &Db, v: &Bm25Live) -> Result<Id, Error> {
+        use crate::{Commit, Kind, Object, TreeEntry};
+        let dir = |r: &mut Self, label: &str, db: &Db| -> Result<TreeEntry, Error> {
+            Ok(TreeEntry {
+                name: label.into(),
+                ..r.db_entry(db)?
+            })
+        };
+        let graph = |label: &str, id: Id| TreeEntry {
+            name: label.into(),
+            kind: Kind::Graph,
+            id,
+        };
+        let rows = self.put_content(v.merge_rows.to_string().as_bytes())?.id;
+        let entries = vec![
+            dir(self, "at", at)?,
+            dir(self, "base_db", &v.base_db)?,
+            graph("base", v.base.root),
+            graph("delta", v.delta),
+            TreeEntry {
+                name: "merge_rows".into(),
+                kind: Kind::File,
+                id: rows,
+            },
+        ];
+        let tree = self.put(&Object::tree(entries)?)?;
+        let commit = self.put(&Object::Commit(Commit {
+            tree,
+            parents: Vec::new(),
+            message: "bm25 view".into(),
+        }))?;
+        let old = self.store.get_ref(name)?;
+        self.store.set_ref(name, old, commit)?;
+        Ok(commit)
+    }
+
+    /// The view `bm25_live_save` kept on `name`, and the database it is
+    /// at; none without the ref. An error if what it names cannot be read.
+    pub fn bm25_live_load(&mut self, name: &str) -> Result<Option<(Db, Bm25Live)>, Error> {
+        use crate::Object;
+        let Some(c) = self.store.get_ref(name)? else {
+            return Ok(None);
+        };
+        let tree = self.commit_tree(&c)?;
+        let Object::Tree(entries) = self.get(&tree)? else {
+            return Err(Error::WrongKind(tree));
+        };
+        let get = |n: &str| {
+            entries
+                .iter()
+                .find(|e| e.name == n)
+                .map(|e| e.id)
+                .ok_or(Error::Decode("kept bm25 view"))
+        };
+        let at = self.db_in(&get("at")?)?;
+        let base_db = self.db_in(&get("base_db")?)?;
+        let merge_rows = String::from_utf8(self.read_content(&get("merge_rows")?)?)
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .ok_or(Error::Decode("kept bm25 merge_rows"))?;
+        let v = Bm25Live {
+            base: Bm25View { root: get("base")? },
+            base_db,
+            delta: get("delta")?,
+            merge_rows,
+        };
+        // Both graphs readable, or the caller builds again.
+        self.bm25_stats(&v.base.root)?;
+        self.bm25_stats(&v.delta)?;
+        Ok(Some((at, v)))
+    }
+
     /// `bm25_view_search` over a live view: the same scores as a view
     /// built at the rows it is at.
     pub fn bm25_live_search(
