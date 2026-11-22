@@ -9,6 +9,7 @@ mod host;
 mod http;
 mod json;
 mod live;
+mod mcp;
 mod serve;
 mod text;
 mod ui;
@@ -101,6 +102,10 @@ const USAGE: &str = "usage: ikam [--store DIR] [--short-records] [--slow-codec-m
   write PATH [FILE|-]              store FILE (or stdin) at PATH in REF, commit
   rm PATH | mkdir PATH             remove a file or folder / make a folder in REF
   mv FROM TO | cp FROM TO          rename or copy a file or folder in REF
+  mcp                              the store as tools for an AI agent: a Model
+                                   Context Protocol server on stdin/stdout (list,
+                                   read, search, write, edit, commit with a
+                                   message, diff, history, drafts) (E359)
   search TEXT                      files of REF whose text contains TEXT (also the
                                    text inside docx, xlsx, pdf and tar members)
   ask QUESTION [--llm]             the passages of REF that answer QUESTION best;
@@ -537,6 +542,11 @@ fn run(store_dir: &str, args: &mut Vec<String>) -> Result<(), String> {
             serve::serve(&repo, port)?;
         }
         Some("gc") => println!("deleted {} objects", repo.gc().map_err(err)?),
+        Some("mcp") => {
+            drop(repo);
+            let stdin = std::io::stdin();
+            mcp::run(store_dir, &refname, stdin.lock(), std::io::stdout().lock())?;
+        }
         Some("live") => {
             let needed_index = repo.needed_index;
             drop(repo);

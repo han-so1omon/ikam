@@ -5783,3 +5783,31 @@ Gates on the branch (E229 to E233): every kernel test suite passes (release); cl
 - Not measured: macOS; batches other than 2,000; more than one index per table; writes with `--plain-writes` and a full repack afterwards.
 - Next (proposed, not started): buffer index edits so a leaf is rewritten once for many entries (a small recent tree beside `kv`, merged in the background, E262's integrator), which needs every reader of `kv` (gets, ranges, `graph_diff` in views, BM25, vectors, joins) to read both; the 2 s first write after a restart on the plain store; per-chunk costs that do not change bytes (`node_size` encodes each node again to measure it; `merge` rebuilds a map of every touched chunk).
 - Run: `cargo run --release --example db_append_scale -- DIR 1000000 2000 index` (and with `plain-hot`, and without `index`); `python3 experiments/goal-scorecard/db_first_write.py IKAM_BIN WORK 200000 2000 base,live,live+plain-writes`.
+
+### E359 agent-tools (`ikam mcp`: the store as tools an AI agent calls)
+- Branch / parent: exp/359-agent-tools / main (ccdf499, E357 merged)
+- Question: E355 ranked a tool interface fourth for the "file service for AI tools" use: an agent today reaches ikam only through WebDAV (whole files) and `/api/search`. Can one stdio server give an agent's MCP client the live handlers (ranges, search, edits, commits with its own message, diffs, reads at a commit, drafts), does a standard client accept it, and what does a call cost?
+- Hypothesis: a Model Context Protocol server over `Live` (E110) needs no new kernel code, passes a standard client, answers reads and searches in milliseconds, and lets an agent change one line of a large file while taking in a small fraction of the file. (Source: E355's inventory; the MCP specification's stdio transport and tool calls.)
+- Change: `src/bin/ikam/mcp.rs` (new): `ikam --store S [--ref R] mcp`, JSON-RPC 2.0 one message a line on stdin/stdout, protocol versions 2024-11-05 to 2025-11-25 (the client's if known). 16 tools: `list`, `read` (line range; `at` any revision; a binary file's extracted text), `search` (E110's exact search), `passages` (`ask`'s ranked passages, no model), `write`, `edit` (replace text that must occur once, or `all`), `remove`, `move`, `status`, `commit` (the agent's message), `history` (or a file's versions), `diff` (paths between revisions, or a unified diff of one file, with `similar`, already a dependency), `drafts`, `draft_open`, `draft_promote`, `draft_discard` (E266, on the session's ref). Tool failures are tool results with `isError`, not protocol errors. Output is capped at 64 KiB and says where to read on. Edits wait until `commit` (no timer); edits pending when stdin closes are committed as "mcp: N change(s) left at exit". `live.rs`: `Live::flush_with` (a commit message) and `Live::base_tree`. Four unit tests in `mcp.rs`. `experiments/agent-tools/mcp_check.py` drives it with the official MCP Python SDK (2.3.0) client. README section.
+- Result (`mcp_check.py`, corpus: this repository's `docs/` and `packages/kernel/src/`, 113 files, 2.8 MB, copied 1 or 40 times, 40 with a line added to every file of every copy after the first so no content repeats; 4-core cloud machine; medians of 5 calls unless given):
+
+  | | 113 files, 2.8 MB | 4,520 files, 111 MB |
+  |---|---|---|
+  | start and initialize (text of every file extracted) | 42 ms | 384 ms |
+  | search (one word) | 1.1 ms | 17.7 ms |
+  | read 21 lines of an 825 KB file | 1.1 ms | 1.1 ms |
+  | read without a range (cut at 64 KiB) | 1.8 ms | 1.8 ms |
+  | edit one word in the 825 KB file (1 call) | 125 ms | 113 ms |
+  | edit a 1.1 KB file (median of 10) | 0.7 ms | 5.1 ms |
+  | commit | 2.7 ms | 3.2 ms |
+  | history, 20 commits | 0.7 ms | 2.5 ms |
+  | unified diff of the edited file between two commits | 6.1 ms | 6.0 ms |
+  | passages for a question | 2.6 ms | 67.5 ms |
+
+  - The SDK client negotiated 2025-11-25, listed 16 tools, and every call answered: a renamed word shows in `history` and `diff`; a draft's file is absent at `main` until `draft_promote`, then present; a missing path comes back as a tool error; the edit left pending at exit was committed.
+  - The task (rename one identifier that occurs once, in `docs/experiments/log.md`, 825 KB): search, read 21 lines around the hit, edit, commit. The agent took in 4,745 characters (113 files) to 14,799 (4,520 files, where the word is in 40 copies and the search lists each) and sent about 165. Through WebDAV it would read and write the whole file (825 KB each way), and with files only and no server search, find the word by reading every file (2.8 MB to 111 MB). So 56 to 174 times less text in than a whole-file read.
+  - A small edit grows with the number of files (0.7 to 5.1 ms), since `Live::apply` rebuilds the path view of the whole tree after each edit; the big edit's time is storing and extracting the 825 KB file.
+  - `cargo test --release --bin ikam`: 39 pass, 1 ignored; clippy `-D warnings` clean. No kernel code changed, so the scores cannot move.
+- Verdict: **kept** (a capability; no score changes). An agent with an MCP client can use an ikam store as its file system with history: ranges, search, edits, commits with its own messages, diffs, reads at any commit, and drafts it can promote or throw away.
+- Not measured: a model using the tools (only a scripted client here); running beside `ikam live` on the same store; macOS; non-UTF-8 text files (read as extracted text, edited only with `write`); E358's ranked search, which a later change can add as a tool.
+- Run: `pip install mcp`, then `python3 experiments/agent-tools/mcp_check.py IKAM_BIN WORK CORPUS_DIR 1` and `... 40 distinct`.

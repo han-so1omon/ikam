@@ -190,6 +190,11 @@ impl Live {
         Ok(())
     }
 
+    /// The tree of `head`, which pending edits apply on.
+    pub fn base_tree(&self) -> Option<Id> {
+        self.base_tree
+    }
+
     /// The commit the ref points at, as this process last saw it.
     pub fn head(&self) -> Option<Id> {
         self.base
@@ -530,6 +535,12 @@ impl Live {
 
     /// Commit pending edits if the last was `commit_after` ago (or `now`).
     pub fn flush(&mut self, now: bool) -> Result<Option<Id>, String> {
+        self.flush_with(now, None)
+    }
+
+    /// `flush` with a commit message of the caller's (`ikam mcp`, E359);
+    /// `None` gives the default "live: N change(s)".
+    pub fn flush_with(&mut self, now: bool, message: Option<&str>) -> Result<Option<Id>, String> {
         if self.pending.is_empty() || (!now && self.last_edit.elapsed() < self.commit_after) {
             return Ok(None);
         }
@@ -539,7 +550,7 @@ impl Live {
             return Ok(None);
         }
         let n = self.pending.len();
-        let message = format!("live: {n} change(s)");
+        let message = message.map_or_else(|| format!("live: {n} change(s)"), String::from);
         let commit = self
             .repo
             .commit(&self.refname, self.work, &message)
