@@ -32,11 +32,13 @@ const USAGE: &str = "usage: ikam [--store DIR] [--short-records] [--slow-codec-m
   ls [REV[:PATH]] [-r]             list a directory of REV (default main)
   grep TEXT [REV]                  files of REV containing TEXT, with lines
   stats [REV]                      objects and bytes the store holds
-  db serve [--live] [--packs] [--plain-events] [--no-object-templates] [--concurrent-reads] [--edit-index] [--plain-writes] [--hnsw] [--keep-search] [--shared-store] [--keep-counts N] [--defer-kv N] [--views FILE] [PORT]
+  db serve [--live] [--packs] [--plain-events] [--no-object-templates] [--concurrent-reads] [--edit-index] [--plain-writes] [--hnsw] [--keep-search] [--no-keep-search] [--shared-store] [--keep-counts N] [--defer-kv N] [--views FILE] [PORT]
                                    the store's databases over HTTP, for programs
                                    (default port 8740, 127.0.0.1 only; dbserve.rs);
-                                   --live turns on the five options a live
-                                   database wants (E356)
+                                   --live turns on the options a live database
+                                   wants (E356, E372: with --defer-kv 20000 and
+                                   --keep-search; --defer-kv 0 or --no-keep-search
+                                   turns those off)
   host --config FILE [PORT]        several separate projects in one process, each
                                    its own store, users and limits, chosen by Host
                                    name; crossing only through scoped shares (host.rs)
@@ -171,7 +173,7 @@ fn main() -> ExitCode {
 }
 
 /// `ikam db serve [--live] [--packs] [--plain-events] [--no-object-templates]
-/// [--concurrent-reads] [--edit-index] [--plain-writes] [--hnsw] [--keep-search] [--shared-store] [--keep-counts N] [--defer-kv N]
+/// [--concurrent-reads] [--edit-index] [--plain-writes] [--hnsw] [--keep-search] [--no-keep-search] [--shared-store] [--keep-counts N] [--defer-kv N]
 /// [--views FILE]
 /// [--allow-host NAME]...
 /// [--log-requests] [PORT]`:
@@ -193,7 +195,7 @@ fn main() -> ExitCode {
 /// `--keep-counts N` (E233, off) keeps the number of
 /// keys under each prefix of up to N segments, edited by every append, so
 /// `count?prefix=` and `span` read one node per prefix. `--defer-kv N`
-/// (E368, off) logs each append at once but folds appends into the kv view
+/// (E368, off; 20000 under `--live`) logs each append at once but folds appends into the kv view
 /// only once N events wait, or before a read of the head, so a view chunk
 /// that many batches touch is rewritten once (`Repo::db_append_deferred`).
 ///
@@ -201,7 +203,7 @@ fn main() -> ExitCode {
 /// sends, or both fused; their indexes are built on a prefix's first query
 /// and kept in memory. Vectors are scored exactly unless `--hnsw` (off)
 /// searches them with a graph (E332: about 0.93 of the exact top 10).
-/// `--keep-search` (E369, off) keeps each BM25 view on a ref, so a
+/// `--keep-search` (E369, off; on under `--live`) keeps each BM25 view on a ref, so a
 /// restarted server reads it back instead of building it on the first
 /// query (E358: 8.6 s for 64 MB of text); the ref keeps the view's data
 /// through `gc`.
@@ -218,17 +220,21 @@ fn main() -> ExitCode {
 /// really is missing pays a listing of the store. Not for a pack store
 /// (`--packs`, `--live`), which one process opens.
 ///
-/// `--live` (E356) is the five options a database kept by a running
-/// program wants, together: `--packs --plain-events --no-object-templates
-/// --concurrent-reads --edit-index`. Without `--edit-index` a restarted
-/// server's first write builds the whole store's index (E354: 0.22 s at 10k
-/// rows, 5.06 s at 200k; 0.11-0.13 s with it). It is still an option, as
-/// every trade-off is; it implies `--packs`, so use it on a new store or a
-/// pack store.
+/// `--live` (E356) is the options a database kept by a running program
+/// wants, together: `--packs --plain-events --no-object-templates
+/// --concurrent-reads --edit-index`, and since E372 `--defer-kv 20000
+/// --keep-search` (E371: a 200k-row load 78.6 to 28.3 s, store 276 to
+/// 161 MB, a restart's first search 8.8 s to 4 ms; reads wait for a fold,
+/// p50 6.6 to 17.6 ms). Without `--edit-index` a restarted server's first
+/// write builds the whole store's index (E354: 0.22 s at 10k rows, 5.06 s at
+/// 200k; 0.11-0.13 s with it). It is still an option, as every trade-off is:
+/// `--defer-kv N` sets another N (0 folds every append at once) and
+/// `--no-keep-search` keeps search views in memory only. It implies
+/// `--packs`, so use it on a new store or a pack store.
 fn db_cmd(store_dir: &str, args: &[String]) -> Result<(), String> {
     let mut args = args.to_vec();
     if args.first().map(String::as_str) != Some("serve") {
-        return Err("usage: ikam [--store DIR] db serve [--live] [--packs] [--plain-events] [--no-object-templates] [--concurrent-reads] [--edit-index] [--plain-writes] [--hnsw] [--keep-search] [--shared-store] [--keep-counts N] [--defer-kv N] [--views FILE] [--allow-host NAME]... [--log-requests] [PORT]".into());
+        return Err("usage: ikam [--store DIR] db serve [--live] [--packs] [--plain-events] [--no-object-templates] [--concurrent-reads] [--edit-index] [--plain-writes] [--hnsw] [--keep-search] [--no-keep-search] [--shared-store] [--keep-counts N] [--defer-kv N] [--views FILE] [--allow-host NAME]... [--log-requests] [PORT]".into());
     }
     args.remove(0);
     let mut allowed = Vec::new();
@@ -239,9 +245,9 @@ fn db_cmd(store_dir: &str, args: &[String]) -> Result<(), String> {
         Some(n) => n.parse().map_err(err)?,
         None => 0,
     };
-    let defer_kv: u64 = match take_flag(&mut args, "--defer-kv") {
-        Some(n) => n.parse().map_err(err)?,
-        None => 0,
+    let defer_kv: Option<u64> = match take_flag(&mut args, "--defer-kv") {
+        Some(n) => Some(n.parse().map_err(err)?),
+        None => None,
     };
     let views = match take_flag(&mut args, "--views") {
         Some(path) => {
@@ -250,8 +256,7 @@ fn db_cmd(store_dir: &str, args: &[String]) -> Result<(), String> {
         }
         None => None,
     };
-    let (packs, log_requests, mut serve_opts) = db_flags(&mut args, keep_counts);
-    serve_opts.defer_kv = defer_kv;
+    let (packs, log_requests, serve_opts) = db_flags(&mut args, keep_counts, defer_kv);
     if packs && serve_opts.shared_store {
         return Err(
             "--shared-store is for a store on disk (FsStore), not --packs or --live".into(),
@@ -287,9 +292,16 @@ fn db_cmd(store_dir: &str, args: &[String]) -> Result<(), String> {
 /// Takes `db serve`'s switches out of `args`: whether the store is a pack
 /// store, whether to log requests, and the serving options. `--live` turns
 /// on `--packs`, `--plain-events`, `--no-object-templates`,
-/// `--concurrent-reads` and `--edit-index` (E356); naming any of them as
-/// well changes nothing.
-fn db_flags(args: &mut Vec<String>, keep_counts: u32) -> (bool, bool, DbServeOpts) {
+/// `--concurrent-reads` and `--edit-index` (E356), and `--keep-search` and
+/// `--defer-kv` [`LIVE_DEFER_KV`] (E372); naming any of them as well
+/// changes nothing. `defer_kv` is the `--defer-kv` value, if one was given:
+/// it wins over the preset's, so `--defer-kv 0` turns deferring off, and
+/// `--no-keep-search` turns kept search views off.
+fn db_flags(
+    args: &mut Vec<String>,
+    keep_counts: u32,
+    defer_kv: Option<u64>,
+) -> (bool, bool, DbServeOpts) {
     let mut take = |name: &str| {
         let before = args.len();
         args.retain(|a| a != name);
@@ -304,7 +316,9 @@ fn db_flags(args: &mut Vec<String>, keep_counts: u32) -> (bool, bool, DbServeOpt
     let edit_index = take("--edit-index") || live;
     let plain_writes = take("--plain-writes");
     let hnsw = take("--hnsw");
-    let keep_search = take("--keep-search");
+    let keep_search = take("--keep-search") || live;
+    let keep_search = !take("--no-keep-search") && keep_search;
+    let defer_kv = defer_kv.unwrap_or(if live { LIVE_DEFER_KV } else { 0 });
     let shared_store = take("--shared-store");
     let opts = DbServeOpts {
         concurrent_reads,
@@ -313,13 +327,16 @@ fn db_flags(args: &mut Vec<String>, keep_counts: u32) -> (bool, bool, DbServeOpt
         plain_events,
         object_templates,
         keep_counts,
-        defer_kv: 0,
+        defer_kv,
         hnsw,
         keep_search,
         shared_store,
     };
     (packs, log_requests, opts)
 }
+
+/// `--defer-kv` under `--live` (E372): the N measured in E371.
+const LIVE_DEFER_KV: u64 = 20_000;
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct DbServeOpts {
@@ -1084,7 +1101,7 @@ fn list(repo: &Repo<FsStore>, spec: &str, recursive: bool) -> Result<(), String>
 mod tests {
 
     #[test]
-    fn db_live_turns_on_the_five_options() {
+    fn db_live_turns_on_the_live_options() {
         let v = |a: &[&str]| a.iter().map(|s| s.to_string()).collect::<Vec<_>>();
         let all = DbServeOpts {
             concurrent_reads: true,
@@ -1093,13 +1110,13 @@ mod tests {
             plain_events: true,
             object_templates: false,
             keep_counts: 0,
-            defer_kv: 0,
+            defer_kv: LIVE_DEFER_KV,
             hnsw: false,
-            keep_search: false,
+            keep_search: true,
             shared_store: false,
         };
         let mut a = v(&["--live", "8752"]);
-        assert_eq!(db_flags(&mut a, 0), (true, false, all));
+        assert_eq!(db_flags(&mut a, 0, None), (true, false, all));
         assert_eq!(a, v(&["8752"]));
         let mut a = v(&[
             "--packs",
@@ -1107,14 +1124,15 @@ mod tests {
             "--no-object-templates",
             "--concurrent-reads",
             "--edit-index",
+            "--keep-search",
         ]);
-        assert_eq!(db_flags(&mut a, 0), (true, false, all));
+        assert_eq!(db_flags(&mut a, 0, Some(LIVE_DEFER_KV)), (true, false, all));
         let mut a = v(&["--live", "--edit-index", "--log-requests"]);
         let counted = DbServeOpts {
             keep_counts: 3,
             ..all
         };
-        assert_eq!(db_flags(&mut a, 3), (true, true, counted));
+        assert_eq!(db_flags(&mut a, 3, None), (true, true, counted));
         assert!(a.is_empty());
         let mut a = v(&["8740"]);
         let off = DbServeOpts {
@@ -1129,35 +1147,61 @@ mod tests {
             keep_search: false,
             shared_store: false,
         };
-        assert_eq!(db_flags(&mut a, 0), (false, false, off));
+        assert_eq!(db_flags(&mut a, 0, None), (false, false, off));
         // E357: `--plain-writes` is its own option, not part of `--live`.
         let mut a = v(&["--live", "--plain-writes"]);
         let plain = DbServeOpts {
             plain_writes: true,
             ..all
         };
-        assert_eq!(db_flags(&mut a, 0), (true, false, plain));
+        assert_eq!(db_flags(&mut a, 0, None), (true, false, plain));
         assert!(a.is_empty());
         // E358: `--hnsw` is its own option too.
         let mut a = v(&["--live", "--hnsw"]);
         let graph = DbServeOpts { hnsw: true, ..all };
-        assert_eq!(db_flags(&mut a, 0), (true, false, graph));
+        assert_eq!(db_flags(&mut a, 0, None), (true, false, graph));
         assert!(a.is_empty());
-        // E369: so is `--keep-search`.
+        // E372: `--live` keeps search views and defers kv folds; each can
+        // be turned off or set on its own.
         let mut a = v(&["--live", "--keep-search"]);
-        let keep = DbServeOpts {
-            keep_search: true,
+        assert_eq!(db_flags(&mut a, 0, None), (true, false, all));
+        assert!(a.is_empty());
+        let mut a = v(&["--live", "--no-keep-search"]);
+        let unkept = DbServeOpts {
+            keep_search: false,
             ..all
         };
-        assert_eq!(db_flags(&mut a, 0), (true, false, keep));
+        assert_eq!(db_flags(&mut a, 0, None), (true, false, unkept));
         assert!(a.is_empty());
+        let mut a = v(&["--live"]);
+        let folded = DbServeOpts { defer_kv: 0, ..all };
+        assert_eq!(db_flags(&mut a, 0, Some(0)), (true, false, folded));
+        let mut a = v(&["--live"]);
+        let more = DbServeOpts {
+            defer_kv: 100_000,
+            ..all
+        };
+        assert_eq!(db_flags(&mut a, 0, Some(100_000)), (true, false, more));
+        // Without `--live` neither is on.
+        let mut a = v(&["--keep-search"]);
+        let keep = DbServeOpts {
+            keep_search: true,
+            ..off
+        };
+        assert_eq!(db_flags(&mut a, 0, None), (false, false, keep));
+        let mut a = v(&[]);
+        let deferred = DbServeOpts {
+            defer_kv: 500,
+            ..off
+        };
+        assert_eq!(db_flags(&mut a, 0, Some(500)), (false, false, deferred));
         // E370: `--shared-store` too.
         let mut a = v(&["--shared-store"]);
         let shared = DbServeOpts {
             shared_store: true,
             ..off
         };
-        assert_eq!(db_flags(&mut a, 0), (false, false, shared));
+        assert_eq!(db_flags(&mut a, 0, None), (false, false, shared));
     }
     use super::*;
 

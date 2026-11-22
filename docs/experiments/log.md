@@ -6146,3 +6146,14 @@ Gates on the branch (E229 to E233): every kernel test suite passes (release); cl
 - Findings: together the two options cut the load 2.8x and the store 42%, and a restart's first search from about 9 s to milliseconds. The cost is a slower worst append (the batch that folds, 2.0 s vs 1.4 s) and reads 2-3x slower while folds wait (still under 30 ms here). `--shared-store` is refused with `--live` (packs), as E370 set.
 - Verdict: **measured**, no new code. Whether `--live` should include `--defer-kv` (and which N) and `--keep-search` is the owner's call.
 - Not measured: the Mac; `--views` in the same run; mixed traffic.
+
+### E372 live-defaults (`--live` turns on `--defer-kv 20000` and `--keep-search`)
+
+- Question: E371 measured `--live` with and without `--defer-kv 20000 --keep-search`; the owner chose to make both part of the preset. Does the preset still let each be turned off or set?
+- Change: `db serve --live` now also sets `--defer-kv 20000` (`LIVE_DEFER_KV`) and `--keep-search`. An explicit `--defer-kv N` wins over the preset (`--defer-kv 0` folds every append at once, as before), and the new `--no-keep-search` keeps search views in memory only. Without `--live` both stay off. `--plain-writes`, `--hnsw` and `--shared-store` are unchanged (`--shared-store` is still refused with `--live`).
+- Expected effect (from E371, 200k indexed rows, Linux): load 78.6 to 28.3 s, store 276 to 161 MB, a restart's first search 8.8 s to 4 ms; read p50 6.6 to 17.6 ms and append p99 1.4 to 2.0 s while folds wait.
+- Checks: `db_live_turns_on_the_live_options` covers the preset, each opt-out, an explicit N and both options without `--live`.
+- Check through the server, 60k indexed rows in 2,000-row batches, a read every 10 batches (`defer_kv_served.py`, Linux): `--live --defer-kv 0 --no-keep-search` (the E356 preset) 10.8 s load, store 50.1 MB, read p50 6.6 ms; `--live` now 5.4 s, 34.4 MB, read p50 11.3 ms. `cargo test --release`: 359 pass; clippy clean.
+- Note for older runs: a bench that passes only `--live` (`restart_bench.py`, `search_bench.py`, `served_views.py`, `db_first_write.py`) now measures the new preset; `--live --defer-kv 0 --no-keep-search` is the E356 preset.
+- Verdict: **kept** (preset change, each part still an option).
+- Not measured: the Mac; whether 20000 is the best N for other row sizes (E368 measured 100k, E371 20000).
