@@ -136,7 +136,7 @@ def run(binary, work, name, flags, rows, batch):
     load = []
     t0 = time.time()
     for start in range(0, rows, batch):
-        dt, ok = s.append(events(b"big", start, batch, b"load"), timeout=600)
+        dt, ok = s.append(events(b"big", start, min(batch, rows - start), b"load"), timeout=600)
         load.append(dt)
         if not ok:
             break
