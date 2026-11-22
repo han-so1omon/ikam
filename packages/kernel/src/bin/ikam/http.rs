@@ -123,6 +123,7 @@ fn reason(status: u16) -> &'static str {
         415 => "Unsupported Media Type",
         416 => "Range Not Satisfiable",
         423 => "Locked",
+        429 => "Too Many Requests",
         431 => "Request Header Fields Too Large",
         500 => "Internal Server Error",
         502 => "Bad Gateway",

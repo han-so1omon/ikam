@@ -12,6 +12,7 @@ mod json;
 mod live;
 mod serve;
 mod text;
+mod tokens;
 mod ui;
 
 use std::io::{Read, Write};
@@ -99,6 +100,8 @@ const USAGE: &str = "usage: ikam [--store DIR] [--short-records] [--slow-codec-m
                                    wait, so it is off by default.
   passwd USER                      read a password from stdin, print the
                                    IKAM_AUTH line for it
+  token                            a new host token (E363): the config's
+                                   ID:HASH and the Bearer token for a client
   write PATH [FILE|-]              store FILE (or stdin) at PATH in REF, commit
   rm PATH | mkdir PATH             remove a file or folder / make a folder in REF
   mv FROM TO | cp FROM TO          rename or copy a file or folder in REF
@@ -114,6 +117,20 @@ fn main() -> ExitCode {
     if args.first().map(String::as_str) == Some("passwd") {
         return match passwd(args.get(1).map(String::as_str)) {
             Ok(()) => ExitCode::SUCCESS,
+            Err(msg) => {
+                eprintln!("{msg}");
+                ExitCode::FAILURE
+            }
+        };
+    }
+    if args.first().map(String::as_str) == Some("token") {
+        // E363: a host token; the config gets its hash, the client the token.
+        return match tokens::make() {
+            Ok((config, token)) => {
+                println!("CONFIG={config}");
+                println!("TOKEN={token}");
+                ExitCode::SUCCESS
+            }
             Err(msg) => {
                 eprintln!("{msg}");
                 ExitCode::FAILURE
