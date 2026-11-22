@@ -238,28 +238,6 @@ fn reserved_ref(name: &str) -> bool {
     name == SHARES_REF || name.starts_with("import/") || name.starts_with("proposals/")
 }
 
-/// Bytes a merge of `share` may add to the receiver at most: every file the
-/// scope covers, or every record, before dedup.
-fn share_bytes<S: ikam_kernel::Store>(
-    repo: &mut ikam_kernel::Repo<S>,
-    share: &Share,
-) -> Result<usize, Refused> {
-    Ok(match &share.scope {
-        Scope::Records { .. } => repo
-            .share_records(share, "", None)?
-            .iter()
-            .map(|(k, v)| k.len() + v.len())
-            .sum(),
-        _ => {
-            let mut n = 0;
-            for (_, id) in repo.share_files(share)? {
-                n += repo.read_content(&id)?.len();
-            }
-            n
-        }
-    })
-}
-
 pub struct Project {
     pub name: String,
     pub live: Arc<Mutex<Live>>,
@@ -754,15 +732,16 @@ impl Host {
         if reserved_ref(&into) {
             return Response::text(400, "that ref is kept for shares");
         }
-        if matches!(share.scope, Scope::Path(_) | Scope::Records { .. }) {
-            match share_bytes(&mut sl.repo, &share) {
-                Ok(n) if !pl.has_room(n) => {
-                    return Response::text(507, "this project's store is full");
-                }
-                Ok(_) => {}
-                Err(Refused::Store(e)) => return Response::text(500, e),
-                Err(_) => return no_share(),
+        match sl.repo.share_import_bytes(&share) {
+            Ok(n) if !pl.has_room(n) => {
+                return Response::text(507, "this project's store is full");
             }
+            Ok(_) => {}
+            Err(Refused::NotMergeable) => {
+                return Response::text(409, "this kind of scope can be read but not merged");
+            }
+            Err(Refused::Store(e)) => return Response::text(500, e),
+            Err(_) => return no_share(),
         }
         let msg = format!("merge {name} from {}", s.name);
         let out = import_share(&mut sl.repo, &share, &mut pl.repo, &into, &msg);
@@ -1439,6 +1418,34 @@ mod tests {
         h.projects["b"].live.lock().unwrap().max_store = None;
         assert_eq!(post("b.localhost", OB, "/from/a/pub/merge").status, 200);
         assert_eq!(get("b.localhost", OB, "/dav/pub/one.md").status, 200);
+        done(dirs);
+    }
+
+    #[test]
+    fn section_and_fragment_merges_keep_to_the_store_limit() {
+        let (h, dirs) = host("quota-scopes");
+        let post = |host: &str, who, path: &str| h.handle(req("POST", host, who, path, b""));
+        let two = match h.projects["a"].live.lock().unwrap().stat("pub/two.md") {
+            Ok(Some((_, id))) => id,
+            _ => panic!("no pub/two.md"),
+        };
+        for (name, scope) in [
+            ("sec", "section:pub/one.md@0-12".to_string()),
+            ("frag", format!("fragments:{}", two.to_hex())),
+        ] {
+            let issue =
+                format!("/shares/issue?name={name}&to=b&scope={scope}&right=merge&expires=600");
+            assert_eq!(post("a.localhost", OA, &issue).status, 200);
+            let merge = format!("/from/a/{name}/merge");
+            {
+                let mut b = h.projects["b"].live.lock().unwrap();
+                let used = b.used_bytes();
+                b.max_store = Some(used + 4);
+            }
+            assert_eq!(post("b.localhost", OB, &merge).status, 507, "{name}");
+            h.projects["b"].live.lock().unwrap().max_store = None;
+            assert_eq!(post("b.localhost", OB, &merge).status, 200, "{name}");
+        }
         done(dirs);
     }
 

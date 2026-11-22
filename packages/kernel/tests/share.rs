@@ -537,6 +537,7 @@ fn section_and_fragment_scopes_merge_only_their_bytes() {
     };
     // Two touching ranges and one apart: "alpha shared" and "second".
     let s = section(c, file, vec![6..12, 0..6, 18..24]);
+    assert_eq!(a.share_import_bytes(&s).unwrap(), 18);
     import_share(&mut a, &s, &mut b, "main", "sections").unwrap();
     assert_eq!(
         read(&b, "main", "pub/one.md").unwrap(),
@@ -585,6 +586,7 @@ fn section_and_fragment_scopes_merge_only_their_bytes() {
     // Fragments land under fragments/, by id.
     let f = a.put_content(b"frag bytes").unwrap().id;
     let frag = share("f", c, Scope::Fragments(vec![f]), Right::Merge);
+    assert_eq!(a.share_import_bytes(&frag).unwrap(), 10);
     import_share(&mut a, &frag, &mut b, "main", "fragments").unwrap();
     assert_eq!(
         read(&b, "main", &format!("fragments/{}", f.to_hex())).unwrap(),
@@ -663,6 +665,8 @@ fn graph_scope_merges_its_nodes_without_other_bytes() {
     let mut b = Repo::new(MemStore::default());
     put(&mut b, "main", &[("own.md", "b's own\n")]);
     let s = share("g", c, scope(), Right::Merge);
+    // Two labels of 3 bytes, a 6-byte range and a 10-byte whole node.
+    assert_eq!(a.share_import_bytes(&s).unwrap(), 22);
     import_share(&mut a, &s, &mut b, "main", "graph").unwrap();
     let got = |b: &Repo<MemStore>| {
         let root = tree(b, b.resolve("main").unwrap());

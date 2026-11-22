@@ -421,6 +421,57 @@ impl<S: Store> Repo<S> {
         Ok(out)
     }
 
+    /// Bytes a merge of `share` copies into a receiver at most, before
+    /// dedup: what `import_share` puts for each kind of scope. A host checks
+    /// this against the receiver's store limit before it merges.
+    pub fn share_import_bytes(&mut self, share: &Share) -> Result<usize, Refused> {
+        use crate::{Arg, Target};
+        if let Scope::Section { path, .. } | Scope::Graph { path, .. } = &share.scope
+            && in_db(path)
+        {
+            return Err(Refused::NotMergeable);
+        }
+        let mut n = 0;
+        match &share.scope {
+            Scope::Path(_) => {
+                for (_, id) in self.share_files(share)? {
+                    n += self.read_content(&id)?.len();
+                }
+            }
+            Scope::Records { .. } => {
+                for (k, v) in self.share_records(share, "", None)? {
+                    n += k.len() + v.len();
+                }
+            }
+            Scope::Section { id, ranges, .. } => {
+                if self.share_files(share)?.is_empty() {
+                    return Err(Refused::Outside);
+                }
+                let len = self.read_content(id)?.len() as u64;
+                for r in joined(ranges) {
+                    n += (r.end.min(len) - r.start.min(len)) as usize;
+                }
+            }
+            Scope::Fragments(ids) => {
+                for f in ids {
+                    n += self.share_fragment(share, f)?.len();
+                }
+            }
+            Scope::Graph { .. } => {
+                for node in self.share_nodes(share, "")? {
+                    n += node.label.len();
+                    n += match &node.target {
+                        Target::None => 0,
+                        Target::Content(Arg::Whole(id)) => self.read_content(id)?.len(),
+                        Target::Content(Arg::Range { len, .. }) => *len as usize,
+                        _ => return Err(Refused::NotMergeable),
+                    };
+                }
+            }
+        }
+        Ok(n)
+    }
+
     /// Bytes `range` (or all) of the file at `path` through `share`.
     pub fn share_read(
         &self,
@@ -715,13 +766,13 @@ pub fn import_share<S: Store, T: Store>(
     Ok(dst.merge(into, &import, message)?)
 }
 
-/// `ranges` sorted, with overlapping or touching ones joined.
 /// Whether `path` lands in the top-level `db` entry, which a commit keeps
 /// for its database and `Repo::merge` merges as one (not as files).
 fn in_db(path: &str) -> bool {
     path.trim_start_matches('/').split('/').next() == Some("db")
 }
 
+/// `ranges` sorted, with overlapping or touching ones joined.
 fn joined(ranges: &[Range<u64>]) -> Vec<Range<u64>> {
     let mut rs: Vec<Range<u64>> = ranges.iter().filter(|r| r.start < r.end).cloned().collect();
     rs.sort_by_key(|r| r.start);
