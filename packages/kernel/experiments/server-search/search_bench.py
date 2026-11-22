@@ -89,8 +89,14 @@ class Server:
         h = {"Host": f"127.0.0.1:{self.port}"}
         if ctype:
             h["Content-Type"] = ctype
-        self.conn.request(method, path, body=body, headers=h)
-        r = self.conn.getresponse()
+        try:
+            self.conn.request(method, path, body=body, headers=h)
+            r = self.conn.getresponse()
+        except (http.client.RemoteDisconnected, BrokenPipeError, ConnectionResetError):
+            # The server closes a connection idle for 2 minutes.
+            self.conn = http.client.HTTPConnection("127.0.0.1", self.port, timeout=600)
+            self.conn.request(method, path, body=body, headers=h)
+            r = self.conn.getresponse()
         data = r.read()
         if r.status != 200:
             raise RuntimeError(f"{method} {path[:80]}: {r.status} {data[:200]!r}")
