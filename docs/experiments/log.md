@@ -6123,3 +6123,26 @@ Gates on the branch (E229 to E233): every kernel test suite passes (release); cl
 - Run: `python3 -I experiments/shared-store/two_servers.py IKAM_BIN WORK 40 [--shared-store]`, with `SOLO=1` for one writer.
 - Review fix: a batch of retries (or an empty batch) over a commit left behind by `--defer-kv`, sent to a server without it, folded the view but returned without committing it, so the stored view still lagged. The server now commits whenever the database changed, not only when the log did (test `a_retry_over_a_lagging_commit_commits_the_fold`); 337 pass, clippy clean.
 - Review fix: an index left out a row whose value held U+001F (its separator), so `eq=` missed valid rows. In an index's view keys the value is now escaped (`%` as `%25`, U+001F as `%1F`), and `eq=` escapes the same way, so every row is indexed; 340 pass, clippy clean.
+
+### E371 overnight-combined (the ten overnight options on one build)
+
+- Question: do E359-E370 work together on one build, and what does `--live` gain from adding `--defer-kv` and `--keep-search` to it?
+- Setup: branch `exp/overnight-all` merges the ten overnight branches onto main 1d7c26d in PR order. Conflicts were only in `db serve` (flags, `serve()` arguments, append): a view or search request folds a deferred kv view first; that fold commits with compare-and-swap under `--shared-store`; append keeps E368's head (`ids_at`) and E370's commit rules. Linux cloud container; Mac not run.
+- Checks: `cargo test --release`: 358 pass, 0 fail; clippy clean; privacy scan clean.
+- Results, 200k indexed rows through the server in 2,000-row batches, a read of a fresh row every 10 batches (`experiments/goal-scorecard/defer_kv_served.py`):
+
+  | flags | load | append p50 / p99 | read p50 / max | store |
+  | --- | --- | --- | --- | --- |
+  | `--live` | 78.6 s | 830 / 1,381 ms | 6.6 / 9.6 ms | 276 MB |
+  | `--live --defer-kv 20000 --keep-search` | 28.3 s | 111 / 2,010 ms | 17.6 / 27.2 ms | 161 MB |
+
+- Results, first BM25 query after a restart, 11,000 rows of 48.8 MB text (`experiments/kept-search/restart_bench.py`):
+
+  | flags | first query | restart, no change | after 1% rewritten | store at end |
+  | --- | --- | --- | --- | --- |
+  | `--live` | 10.4 s | 8.8 s | 9.0 s | 58.8 MB |
+  | `--live --defer-kv 20000 --keep-search` | 11.6 s | 4 ms | 0.29 s | 43.5 MB |
+
+- Findings: together the two options cut the load 2.8x and the store 42%, and a restart's first search from about 9 s to milliseconds. The cost is a slower worst append (the batch that folds, 2.0 s vs 1.4 s) and reads 2-3x slower while folds wait (still under 30 ms here). `--shared-store` is refused with `--live` (packs), as E370 set.
+- Verdict: **measured**, no new code. Whether `--live` should include `--defer-kv` (and which N) and `--keep-search` is the owner's call.
+- Not measured: the Mac; `--views` in the same run; mixed traffic.
