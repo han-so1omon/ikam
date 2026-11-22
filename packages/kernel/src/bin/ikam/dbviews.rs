@@ -21,7 +21,9 @@
 //!   adds a whole-number field (a fraction is rounded; a row without it
 //!   adds 0); without `sum` the sum is 0.
 //! - An index maps KEY's value, U+001F and the row's key after PREFIX to the
-//!   row's key, so the rows with a value are one prefix of the view.
+//!   row's key, so the rows with a value are one prefix of the view. In the
+//!   value, `%` and U+001F are written `%25` and `%1F`, so a value holding
+//!   U+001F is still indexed and cannot run into another value's rows.
 //!
 //! A database's views are built on its first view request and kept in
 //! memory with the head they reflect; each later request brings them to
@@ -71,6 +73,12 @@ pub struct Rule {
 
 /// The separator between an index's value and the row's key.
 pub const US: char = '\u{1f}';
+
+/// An index's value as its view keys hold it: `%` and [`US`] escaped, so
+/// the first `US` of a view key always ends the value.
+pub fn index_value(x: &str) -> String {
+    x.replace('%', "%25").replace(US, "%1F")
+}
 
 fn field_text(v: &Json) -> Option<String> {
     match v {
@@ -145,10 +153,7 @@ impl Rule {
                 let f: MapRule = Arc::new(move |k: &str, v: &[u8]| {
                     let rest = k.strip_prefix(prefix.as_str())?;
                     let doc = if by.needs_doc() { parsed(v) } else { None };
-                    let x = by.key(rest, doc.as_ref())?;
-                    if x.contains(US) {
-                        return None;
-                    }
+                    let x = index_value(&by.key(rest, doc.as_ref())?);
                     Some((format!("{x}{US}{rest}"), k.as_bytes().to_vec()))
                 });
                 ViewOp::MapWith(f)
@@ -345,5 +350,15 @@ mod tests {
             Some((format!("y{US}x/y/z"), b"t/x/y/z".to_vec()))
         );
         assert_eq!(m("t/x", b""), None);
+        // A value with the separator or `%` is escaped, not dropped.
+        let ViewOp::MapWith(f) = parse("i index t/ by=field:k").unwrap()[0].op() else {
+            panic!()
+        };
+        let v = "{\"k\":\"a\\u001fb%\"}";
+        assert_eq!(
+            f("t/r", v.as_bytes()),
+            Some((format!("a%1Fb%25{US}r"), b"t/r".to_vec()))
+        );
+        assert_eq!(index_value(&format!("a{US}b%")), "a%1Fb%25");
     }
 }
