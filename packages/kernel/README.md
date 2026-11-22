@@ -154,7 +154,9 @@ start it as a local server.
   "error": false}`, or status 400 with `"error": true`. `POST
   /api/commit?message=...` names a commit. A draft opened over HTTP moves
   the whole served session onto it until it is promoted or discarded; in
-  `host`, only the project's owner promotes one.
+  `host`, only the project's owner promotes one. Edits made through the
+  tools wait for the tools' `commit` (up to 10 minutes) instead of the
+  server's timed commit, so their message is kept.
 
 Benchmark (deterministic corpora from this repo, verified exact, with zstd baselines):
 

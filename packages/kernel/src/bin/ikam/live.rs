@@ -43,6 +43,10 @@ pub struct Live {
     pub work: Id,
     last_edit: Instant,
     pub commit_after: Duration,
+    /// E360: edits made through the agent tools wait for their own
+    /// `commit` (and its message) until this instant: the timed commit of
+    /// `flush(false)` leaves them alone. Cleared by a commit.
+    pub hold_until: Option<Instant>,
     trees: HashMap<Id, Arc<Vec<TreeEntry>>>,
     sizes: HashMap<Id, u64>,
     sizes_file: Option<std::fs::File>,
@@ -145,6 +149,7 @@ impl Live {
             work: Id::of(b""),
             last_edit: Instant::now(),
             commit_after: Duration::from_millis(1500),
+            hold_until: None,
             trees: HashMap::new(),
             sizes,
             sizes_file,
@@ -208,6 +213,7 @@ impl Live {
     /// being discarded).
     pub fn switch_ref_dropping(&mut self, refname: &str) -> Result<(), String> {
         self.pending.clear();
+        self.hold_until = None;
         let base = self.repo.store().get_ref(refname).map_err(err)?;
         let base_tree = base
             .map(|c| snapshot::tree_of(&self.repo, &c))
@@ -577,6 +583,10 @@ impl Live {
         if self.pending.is_empty() || (!now && self.last_edit.elapsed() < self.commit_after) {
             return Ok(None);
         }
+        if !now && self.hold_until.is_some_and(|t| Instant::now() < t) {
+            return Ok(None);
+        }
+        self.hold_until = None;
         self.sync()?;
         if Some(self.work) == self.base_tree {
             self.pending.clear();

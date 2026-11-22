@@ -595,6 +595,13 @@ mod tests {
         assert_eq!(call(&live, "GET", "/api/tool/write?path=x", "").0, 405);
         assert_eq!(call(&live, "GET", "/api/tool/nope", "").0, 404);
         assert_eq!(call(&live, "POST", "/api/tool/write", w).0, 200);
+        // The server's timed commit leaves tool edits for their own commit.
+        {
+            let mut l = live.lock().unwrap();
+            l.commit_after = std::time::Duration::ZERO;
+            assert_eq!(l.flush(false).unwrap(), None);
+            assert_eq!(l.pending(), 1);
+        }
         let (st, j) = call(&live, "POST", "/api/tool/commit", r#"{"message":"first"}"#);
         assert_eq!(st, 200, "{}", text(&j));
         // `/api/commit` takes a message too.

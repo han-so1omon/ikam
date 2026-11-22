@@ -76,6 +76,10 @@ impl Session {
 }
 
 /// Tools that change nothing, which `ikam live` serves on GET (E360).
+/// E360: how long edits made through the tools wait for their `commit`
+/// before a served `Live`'s timed commit takes them.
+pub const HOLD: std::time::Duration = std::time::Duration::from_secs(600);
+
 pub const READ_TOOLS: &[&str] = &[
     "list", "read", "search", "passages", "status", "history", "diff", "drafts",
 ];
@@ -345,6 +349,9 @@ impl<L: DerefMut<Target = Live>> Session<L> {
             return Err("the store is full (--max-store)".into());
         }
         let cost = self.live.apply(vec![op])?;
+        // E360: on a served `Live`, the timed commit leaves these edits
+        // for the agent's own `commit` (and message), for up to HOLD.
+        self.live.hold_until = Some(std::time::Instant::now() + HOLD);
         Ok(format!(
             "{done} ({} new bytes stored); {} change(s) pending, call commit to keep them",
             cost.new_bytes,
