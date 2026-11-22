@@ -32,6 +32,9 @@ pub struct Live {
     pub repo: Repo<FsStore>,
     pub store_dir: PathBuf,
     pub refname: String,
+    /// The ref the process opened (E360): drafts are made at, and promoted
+    /// to, it, while `refname` may be a draft.
+    pub home: String,
     /// The commit pending edits apply on, and its tree.
     base: Option<Id>,
     base_tree: Option<Id>,
@@ -135,6 +138,7 @@ impl Live {
             repo,
             store_dir,
             refname: refname.into(),
+            home: refname.into(),
             base: None,
             base_tree: None,
             pending: Vec::new(),
@@ -188,6 +192,35 @@ impl Live {
             );
         }
         Ok(())
+    }
+
+    /// E360: move onto `refname` (a draft, or back home), keeping the
+    /// caches and settings: the same store, extracted text and timers.
+    /// Pending edits must be committed first.
+    pub fn switch_ref(&mut self, refname: &str) -> Result<(), String> {
+        if !self.pending.is_empty() {
+            return Err("commit pending edits first".into());
+        }
+        self.switch_ref_dropping(refname)
+    }
+
+    /// `switch_ref` that drops pending edits instead of refusing (a draft
+    /// being discarded).
+    pub fn switch_ref_dropping(&mut self, refname: &str) -> Result<(), String> {
+        self.pending.clear();
+        let base = self.repo.store().get_ref(refname).map_err(err)?;
+        let base_tree = base
+            .map(|c| snapshot::tree_of(&self.repo, &c))
+            .transpose()
+            .map_err(err)?;
+        self.work = match base_tree {
+            Some(t) => t,
+            None => self.repo.edit_tree(None, &[]).map_err(err)?,
+        };
+        self.refname = refname.into();
+        self.base = base;
+        self.base_tree = base_tree;
+        self.refresh()
     }
 
     /// The tree of `head`, which pending edits apply on.

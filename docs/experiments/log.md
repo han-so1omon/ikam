@@ -5811,3 +5811,39 @@ Gates on the branch (E229 to E233): every kernel test suite passes (release); cl
 - Verdict: **kept** (a capability; no score changes). An agent with an MCP client can use an ikam store as its file system with history: ranges, search, edits, commits with its own messages, diffs, reads at any commit, and drafts it can promote or throw away.
 - Not measured: a model using the tools (only a scripted client here); running beside `ikam live` on the same store; macOS; non-UTF-8 text files (read as extracted text, edited only with `write`); E358's ranked search, which a later change can add as a tool.
 - Run: `pip install mcp`, then `python3 experiments/agent-tools/mcp_check.py IKAM_BIN WORK CORPUS_DIR 1` and `... 40 distinct`.
+
+### E360 served-drafts (the agent tools over HTTP: drafts, history, commit messages and reads at a commit)
+- Branch / parent: exp/360-served-drafts / exp/359-agent-tools (fcea74a)
+- Question: E355 ranked serving drafts, history, commit messages and reads at a commit fifth for safe edits by AI tools: `ikam mcp` (E359) gives them to an agent that starts its own process over stdio, but a program talking to a running `ikam live` or `host` had only whole files (WebDAV), search and an unnamed commit. Can the same handlers answer over the server's `/api`, with writes kept to POST and the owner alone promoting in `host`, and what does a call cost?
+- Hypothesis: the MCP session's tool handlers run unchanged on the served `Live` behind its lock, answer in about a millisecond for reads, and a draft can be opened, written, committed and promoted over HTTP while `main` stays as it was until the promote. (Source: E355's inventory; E359's tools.)
+- Change:
+  - `ui.rs`: `GET /api/tools` (the tool list, as `tools/list` gives it); `/api/tool/NAME`. Tools that change nothing (`list`, `read`, `search`, `passages`, `status`, `history`, `diff`, `drafts`) answer GET with their arguments in the query; the rest need POST (405 otherwise), with a JSON object of arguments as the body. The answer is `{"text": ..., "error": false}`, or 400 with `"error": true`; an unknown tool is 404. POSTs need the `X-Ikam` header, as every `/api` POST does. `POST /api/commit?message=...` names the commit.
+  - `mcp.rs`: `Session` holds anything that derefs to a `Live` (its own, or the server's under the lock), so both front ends share the handlers. The session's home ref is now `Live::home`, and drafts switch the `Live` in place (`Live::switch_ref`) instead of reopening the store. Query arguments come as strings, so booleans also accept "true" and "1".
+  - `live.rs`: `Live::home` (the ref it was opened on), `Live::switch_ref` (refuses while edits are pending), `Live::switch_ref_dropping` (drops them, for `draft_discard`).
+  - `host.rs`: `/api/tool/draft_promote` needs the owner role; other writes need the writer role, as before.
+  - Tests: `ui::tests::agent_tools_over_http` (list, 405 and 404, write, commit with a message, `/api/commit?message`, history, a read at the first commit, a draft opened, written, committed and promoted with `main` read before and after, a tool error, a POST without the header refused) and more cases in `host::tests::roles_limit_what_a_user_does` (a reader can call `status` but not `write`, a writer cannot promote, an owner can).
+  - `experiments/agent-tools/http_check.py`. README.
+- Fix found on the way: E359's `draft_discard` with edits still pending on the draft failed once it switched in place ("commit pending edits first"). Reopening the store had dropped them silently; the discard now drops them on purpose.
+- Result (`http_check.py` on `ikam live`, this repository's `docs/` and `packages/kernel/src/`, 113 files, 2.7 MB, loaded through `/api/tool/write`; a 4-core cloud machine; medians of 5 calls, two runs):
+
+  | | ms |
+  |---|---|
+  | load 113 files with `write`, then `commit` (whole) | 710-740 |
+  | `GET /api/tools` | 0.6-0.8 |
+  | search (one word) | 1.0-1.2 |
+  | read 21 lines of the 830 KB file | 1.0-1.1 |
+  | history, 20 commits | 0.6-0.9 |
+  | edit one word in the 830 KB file (1 call) | 32-37 |
+  | commit | 2.2-2.5 |
+  | write a small file (median of 10) | 3.8-4.1 |
+  | `POST /api/commit?message=` | 2.2-2.4 |
+  | unified diff of the edited file between two commits | 5.4-6.2 |
+  | draft open, write, commit, check `main` without it, promote, check `main` with it | 8.6-9.0 |
+
+  - Every answer matched E359's stdio tools; a GET of `write` was 405, a POST without the header 403.
+  - The edit of the big file took 32-37 ms here against 113-125 ms over stdio in E359 (not traced; the corpus here is loaded by writes, E359's by indexing a folder); reads cost the same.
+  - `cargo test --release --bin ikam`: 40 pass, 1 ignored; clippy clean. No kernel code changed, so the scores cannot move.
+- Verdict: **kept** (a capability; no score changes). A program next to a running server can edit on a draft with its own commit messages, read history and any commit, and promote or discard, without a second process on the store.
+- Trade-off left as it is: a draft opened over HTTP moves the whole served session (the web page and WebDAV too) onto the draft until it is promoted or discarded, because a `Live` has one ref. Drafts per caller would need a `Live` per draft (a later change).
+- Not measured: a model using the tools; `host` timings (only its role checks were tested); two programs using drafts at once (the second is refused while the first is open); macOS.
+- Run: `python3 experiments/agent-tools/http_check.py IKAM_BIN WORK CORPUS_DIR` (CORPUS_DIR: a copy of `docs/` and `packages/kernel/src/`); `cargo test --release --bin ikam agent_tools roles`.

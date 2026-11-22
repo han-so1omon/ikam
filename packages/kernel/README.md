@@ -147,6 +147,14 @@ start it as a local server.
   at exit". A tool returns at most 64 KiB of text and says where to read on.
 - One process owns the store, as `live` does. Running both on one store at
   once is not tested.
+- The same tools over HTTP (E360), in `ikam live` and `host`: `GET
+  /api/tools` lists them; `GET /api/tool/NAME?arg=...` runs a tool that
+  changes nothing; `POST /api/tool/NAME` with a JSON object of arguments
+  (and the `X-Ikam: 1` header) runs the rest. The answer is `{"text": ...,
+  "error": false}`, or status 400 with `"error": true`. `POST
+  /api/commit?message=...` names a commit. A draft opened over HTTP moves
+  the whole served session onto it until it is promoted or discarded; in
+  `host`, only the project's owner promotes one.
 
 Benchmark (deterministic corpora from this repo, verified exact, with zstd baselines):
 

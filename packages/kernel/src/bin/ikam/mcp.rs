@@ -16,6 +16,7 @@
 //!   floods the agent's context.
 
 use std::io::{BufRead, Write};
+use std::ops::DerefMut;
 
 use ikam_kernel::merge::Merged;
 use ikam_kernel::{Id, Kind};
@@ -30,11 +31,10 @@ pub const MAX_TEXT: usize = 64 * 1024;
 
 const VERSIONS: &[&str] = &["2024-11-05", "2025-03-26", "2025-06-18", "2025-11-25"];
 
-pub struct Session {
-    live: Live,
-    store_dir: String,
-    /// The ref the session started on; drafts are made at, and promoted to, it.
-    target: String,
+/// The tools over one `Live`: owned by `ikam mcp`, or a lock on the one
+/// `ikam live` and `host` serve (E360), so the same handlers answer both.
+pub struct Session<L: DerefMut<Target = Live> = Box<Live>> {
+    pub live: L,
 }
 
 /// Serve one client on `input`/`output` until `input` closes.
@@ -70,12 +70,27 @@ impl Session {
         let mut live = Live::open(store_dir, refname)?;
         live.index_all(false)?;
         Ok(Session {
-            live,
-            store_dir: store_dir.into(),
-            target: refname.into(),
+            live: Box::new(live),
         })
     }
+}
 
+/// Tools that change nothing, which `ikam live` serves on GET (E360).
+pub const READ_TOOLS: &[&str] = &[
+    "list", "read", "search", "passages", "status", "history", "diff", "drafts",
+];
+
+/// The tool list with its schemas, as `tools/list` gives it.
+pub fn tool_list() -> Json {
+    Json::Arr(tools())
+}
+
+/// `text` cut to `MAX_TEXT`, as a tool result is.
+pub fn capped(text: String) -> String {
+    cap(text)
+}
+
+impl<L: DerefMut<Target = Live>> Session<L> {
     /// The reply to one JSON-RPC message, or `None` for a notification.
     pub fn handle(&mut self, line: &str) -> Option<Json> {
         let msg = match json::parse(line) {
@@ -463,7 +478,7 @@ impl Session {
         let list = self.live.repo.drafts().map_err(err)?;
         let mut out = format!(
             "session on {} (target {})\n",
-            self.live.refname, self.target
+            self.live.refname, self.live.home
         );
         for (name, head) in list {
             out.push_str(&format!("{name} at {head}\n"));
@@ -471,13 +486,8 @@ impl Session {
         Ok(out)
     }
 
-    fn reopen(&mut self, refname: &str) -> Result<(), String> {
-        self.live = Live::open(&self.store_dir, refname)?;
-        self.live.index_all(false)
-    }
-
     fn draft_open(&mut self, name: &str) -> Result<String, String> {
-        if self.live.refname != self.target {
+        if self.live.refname != self.live.home {
             return Err(format!(
                 "already on {}; promote or discard it first",
                 self.live.refname
@@ -486,11 +496,12 @@ impl Session {
         if self.live.pending() > 0 {
             return Err("commit pending edits first".into());
         }
-        let draft = self.live.repo.draft(&self.target, name).map_err(err)?;
-        self.reopen(&draft)?;
+        let home = self.live.home.clone();
+        let draft = self.live.repo.draft(&home, name).map_err(err)?;
+        self.live.switch_ref(&draft)?;
         Ok(format!(
             "on {draft}; edits and commits stay off {} until draft_promote",
-            self.target
+            self.live.home
         ))
     }
 
@@ -507,7 +518,7 @@ impl Session {
         let draft = self.on_draft()?;
         let msg = message.map_or_else(|| format!("promote {draft}"), String::from);
         self.live.flush_with(true, Some(&msg))?;
-        let target = self.target.clone();
+        let target = self.live.home.clone();
         let merged = self
             .live
             .repo
@@ -523,15 +534,15 @@ impl Session {
             Merged::FastForward(id) => format!("{target} fast-forwarded to {id}"),
             Merged::Commit(id) => format!("{target} merged {draft} as {id}"),
         };
-        self.reopen(&target)?;
+        self.live.switch_ref(&target)?;
         Ok(out)
     }
 
     fn draft_discard(&mut self) -> Result<String, String> {
         let draft = self.on_draft()?;
         self.live.repo.discard_draft(&draft).map_err(err)?;
-        let target = self.target.clone();
-        self.reopen(&target)?;
+        let target = self.live.home.clone();
+        self.live.switch_ref_dropping(&target)?;
         Ok(format!("discarded {draft}; back on {target}"))
     }
 }
@@ -770,7 +781,11 @@ fn num(a: &Json, k: &str) -> Option<usize> {
 }
 
 fn flag(a: &Json, k: &str) -> bool {
-    matches!(a.get(k), Some(Json::Bool(true)))
+    match a.get(k) {
+        Some(Json::Bool(b)) => *b,
+        Some(Json::Str(t)) => matches!(t.as_str(), "true" | "1"),
+        _ => false,
+    }
 }
 
 #[cfg(test)]

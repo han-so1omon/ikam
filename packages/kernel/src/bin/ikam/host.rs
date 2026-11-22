@@ -368,6 +368,10 @@ impl Host {
         if crate::writes(req) && role < Role::Write {
             return Response::text(403, "this user may only read");
         }
+        // E360: promoting a draft writes the project's main ref, as a merge does.
+        if req.path == "/api/tool/draft_promote" && role < Role::Owner {
+            return Response::text(403, "the project's owner promotes drafts");
+        }
         if req.path == dav::PREFIX || req.path.starts_with("/dav/") {
             dav::handle(&mut p.live.lock().unwrap(), req)
         } else {
@@ -929,6 +933,12 @@ mod tests {
         );
         assert_eq!(r("GET", "a-writer", "/shares"), 403);
         assert_eq!(r("POST", "a-owner", "/api/fsck"), 200);
+        // E360: the agent tools follow the same roles; promoting a draft
+        // writes the main ref, so it is the owner's.
+        assert_eq!(r("GET", "a-reader", "/api/tool/status"), 200);
+        assert_eq!(r("POST", "a-reader", "/api/tool/write"), 403);
+        assert_eq!(r("POST", "a-writer", "/api/tool/draft_promote"), 403);
+        assert_eq!(r("POST", "a-owner", "/api/tool/draft_promote"), 400);
         // Per-project body limit.
         let big = vec![b'x'; 2048];
         assert_eq!(
