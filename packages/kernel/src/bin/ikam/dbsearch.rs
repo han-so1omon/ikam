@@ -22,6 +22,14 @@
 //! the rows that changed; a restarted server builds it again. The BM25
 //! view's postings are written to the store as content no commit names.
 //! Nothing is built for a database nobody searches.
+//!
+//! `--keep-search` (E369, off by default) keeps each BM25 view on a ref of
+//! its own, `search/NAME/p` and the prefix in hex, written after every
+//! build or update: a restarted server reads the view back and updates it
+//! from the rows changed since, instead of building it again. The ref
+//! keeps the view's graphs (and the two databases it was built from)
+//! through `gc`. Vector indexes are not kept (an exact one loads in a
+//! scan; `--hnsw` builds again).
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -80,6 +88,30 @@ pub struct Kept {
     bm25: Mutex<HashMap<Key, (Db, Bm25Live)>>,
     vecs: Mutex<HashMap<Key, Arc<Mutex<KeptVecs>>>>,
     pub index: VectorIndex,
+    /// Keep BM25 views on refs across restarts (E369).
+    pub keep: bool,
+}
+
+/// How a server searches: its vector index and whether it keeps BM25
+/// views across restarts (E369).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct SearchOpts {
+    pub index: VectorIndex,
+    pub keep: bool,
+}
+
+/// The ref a kept BM25 view of `prefix` in `name` lives on: `p` and the
+/// prefix in hex, or for a prefix over 32 bytes `h` and its BLAKE3 hash,
+/// so the name stays within a file name's length on disk.
+pub fn bm25_ref(name: &str, prefix: &str) -> String {
+    if prefix.len() > 32 {
+        return format!(
+            "search/{name}/h{}",
+            blake3::hash(prefix.as_bytes()).to_hex()
+        );
+    }
+    let hex: String = prefix.bytes().map(|b| format!("{b:02x}")).collect();
+    format!("search/{name}/p{hex}")
 }
 
 fn fail(e: Error) -> Response {
@@ -218,14 +250,35 @@ impl Kept {
     ) -> Result<Bm25Live, Error> {
         let mut kept = self.bm25.lock().unwrap();
         let key = (name.to_string(), prefix.to_string());
-        let v = match kept.get(&key) {
-            Some((at, v)) if at == db => return Ok(*v),
-            Some((at, v)) => w.bm25_live_update(v, at, db, prefix)?,
+        let refname = bm25_ref(name, prefix);
+        let held = match kept.get(&key) {
+            Some(held) => Some(*held),
+            // A view kept by an earlier run; one that cannot be read is
+            // built again.
+            None if self.keep => w.bm25_live_load(&refname).ok().flatten(),
+            None => None,
+        };
+        let v = match held {
+            Some((at, v)) if at == *db => {
+                kept.insert(key, (at, v));
+                return Ok(v);
+            }
+            Some((at, v)) => w.bm25_live_update(&v, &at, db, prefix)?,
             None => {
                 let rows = w.db_count_prefix(db, prefix)?;
                 w.bm25_live_build(db, prefix, (rows / 20).max(1000))?
             }
         };
+        // A view that cannot be kept is still served; the next restart
+        // builds it again.
+        if self.keep
+            && let Err(e) = w.bm25_live_save(&refname, db, &v)
+        {
+            eprintln!(
+                "{} keeping the search view of {name}: {e}",
+                crate::live::stamp()
+            );
+        }
         kept.insert(key, (*db, v));
         Ok(v)
     }

@@ -191,6 +191,12 @@ impl<S: Store> Server<S> {
         self
     }
 
+    /// Keep BM25 views on refs across restarts (E369; off by default).
+    pub fn keep_search(mut self, keep: bool) -> Server<S> {
+        self.search.keep = keep;
+        self
+    }
+
     /// Keep counts of key prefixes of up to `depth` segments in every
     /// database this server appends to (E233): built on a database's next
     /// append when it has none, and edited by each append after.
@@ -659,7 +665,7 @@ pub fn serve<S: Store + Send + 'static>(
     repo: Repo<S>,
     readers: Option<ReaderFactory<S>>,
     (keep_counts, defer_kv): (u32, u64),
-    (index, views): (crate::dbsearch::VectorIndex, Option<crate::dbviews::Served>),
+    (search, views): (crate::dbsearch::SearchOpts, Option<crate::dbviews::Served>),
     port: u16,
     allowed: Vec<String>,
     log_requests: bool,
@@ -676,7 +682,8 @@ pub fn serve<S: Store + Send + 'static>(
         Server::new(repo, readers)
             .keep_counts(keep_counts)
             .defer_kv(defer_kv)
-            .vector_index(index)
+            .vector_index(search.index)
+            .keep_search(search.keep)
             .views(views),
     );
     let hosts = Hosts::new(port, allowed);
@@ -888,6 +895,87 @@ mod tests {
         assert_eq!(h(&st, "/db/m/view?name=by_status&eq=x").status, 400);
         let plain = Server::new(Repo::new(store.clone()), make());
         assert_eq!(h(&plain, "/db/m/view?name=by_status").status, 404);
+    }
+
+    #[test]
+    fn kept_search_views_outlive_a_restart() {
+        // E369: with `keep_search` a restarted server reads the BM25 view
+        // back (writing nothing when the rows have not changed) and
+        // updates it from the rows changed since; scores match a fresh
+        // build, and the ref keeps the view through gc. One server runs
+        // at a time, as a restart does (two writing one store at once do
+        // not see each other's writes, kept views or not).
+        let store = ikam_kernel::SharedStore::new(MemStore::default());
+        let server = |keep: bool| Server::new(Repo::new(store.clone()), None).keep_search(keep);
+        let ct = [("content-type", EVENTS)];
+        let append = |st: &Server<_>, ev: &[Event]| {
+            let r = handle(st, &req("POST", "/db/s/append", &encode_events(ev), &ct));
+            assert_eq!(r.status, 200);
+        };
+        let q = "/db/s/search?q=json+sound&prefix=t/&k=5";
+        let body = |st: &Server<_>| {
+            let r = handle(st, &req("GET", q, b"", &[]));
+            assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
+            r.body
+        };
+        let rows: Vec<Event> = (0..60)
+            .map(|i| {
+                let text = format!(
+                    "row {i} about {} and json",
+                    ["maps", "sound", "files"][i % 3]
+                );
+                Event::upsert(&format!("t/{i:03}"), text.as_bytes(), &format!("{i}"))
+            })
+            .collect();
+        let st = server(true);
+        append(&st, &rows);
+        let first = body(&st);
+        drop(st);
+        let refname = crate::dbsearch::bm25_ref("s", "t/");
+        assert!(store.get_ref(&refname).unwrap().is_some());
+        // A restart with no change: read back, nothing written.
+        let before = store.ids().unwrap().len();
+        assert_eq!(body(&server(true)), first);
+        assert_eq!(store.ids().unwrap().len(), before, "no rebuild");
+        // Changes while no server kept the view, then gc: read back and
+        // brought to the head, the same as a fresh build.
+        append(
+            &server(false),
+            &[
+                Event::upsert("t/001", b"json sound sound sound", "a"),
+                Event::remove("t/004", false, "b"),
+            ],
+        );
+        assert!(Repo::new(store.clone()).gc().unwrap() > 0);
+        let kept = body(&server(true));
+        let fresh = body(&server(false));
+        assert_eq!(kept, fresh);
+        assert_ne!(kept, first);
+        assert_eq!(body(&server(true)), fresh, "read back after the update");
+        // A ref naming what is gone is built again.
+        let mut w = Repo::new(store.clone());
+        let (at, mut v) = w.bm25_live_load(&refname).unwrap().unwrap();
+        v.base.root = ikam_kernel::Id::of_content(b"never stored");
+        w.bm25_live_save(&refname, &at, &v).unwrap();
+        assert!(w.bm25_live_load(&refname).is_err());
+        drop(w);
+        assert_eq!(body(&server(true)), fresh);
+        assert!(Repo::new(store.clone()).bm25_live_load(&refname).is_ok());
+        // A long prefix gets a bounded ref name (hashed), and works.
+        let long = format!("t/{}", "x".repeat(200));
+        let lq = format!("/db/s/search?q=json&prefix={long}");
+        assert_eq!(
+            handle(&server(true), &req("GET", &lq, b"", &[])).status,
+            200
+        );
+        let lref = crate::dbsearch::bm25_ref("s", &long);
+        assert!(lref.len() < 80, "{lref}");
+        assert!(store.get_ref(&lref).unwrap().is_some());
+        // Without the option nothing is kept.
+        let off = server(false);
+        handle(&off, &req("GET", "/db/s/search?q=json&prefix=u/", b"", &[]));
+        let other = crate::dbsearch::bm25_ref("s", "u/");
+        assert!(store.get_ref(&other).unwrap().is_none());
     }
 
     #[test]
