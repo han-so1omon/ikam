@@ -4,6 +4,7 @@ mod ask;
 mod auth;
 mod corpus;
 mod dav;
+mod dbsearch;
 mod dbserve;
 mod host;
 mod http;
@@ -29,7 +30,7 @@ const USAGE: &str = "usage: ikam [--store DIR] [--short-records] [--slow-codec-m
   ls [REV[:PATH]] [-r]             list a directory of REV (default main)
   grep TEXT [REV]                  files of REV containing TEXT, with lines
   stats [REV]                      objects and bytes the store holds
-  db serve [--live] [--packs] [--plain-events] [--no-object-templates] [--concurrent-reads] [--edit-index] [--plain-writes] [--keep-counts N] [PORT]
+  db serve [--live] [--packs] [--plain-events] [--no-object-templates] [--concurrent-reads] [--edit-index] [--plain-writes] [--hnsw] [--keep-counts N] [PORT]
                                    the store's databases over HTTP, for programs
                                    (default port 8740, 127.0.0.1 only; dbserve.rs);
                                    --live turns on the five options a live
@@ -152,7 +153,7 @@ fn main() -> ExitCode {
 }
 
 /// `ikam db serve [--live] [--packs] [--plain-events] [--no-object-templates]
-/// [--concurrent-reads] [--edit-index] [--plain-writes] [--keep-counts N]
+/// [--concurrent-reads] [--edit-index] [--plain-writes] [--hnsw] [--keep-counts N]
 /// [--allow-host NAME]...
 /// [--log-requests] [PORT]`:
 /// the store's databases over HTTP (`dbserve.rs`), on 127.0.0.1:PORT (default
@@ -174,6 +175,11 @@ fn main() -> ExitCode {
 /// keys under each prefix of up to N segments, edited by every append, so
 /// `count?prefix=` and `span` read one node per prefix.
 ///
+/// `search` and `vsearch` (E358) rank rows by BM25, by a vector the client
+/// sends, or both fused; their indexes are built on a prefix's first query
+/// and kept in memory. Vectors are scored exactly unless `--hnsw` (off)
+/// searches them with a graph (E332: about 0.93 of the exact top 10).
+///
 /// `--live` (E356) is the five options a database kept by a running
 /// program wants, together: `--packs --plain-events --no-object-templates
 /// --concurrent-reads --edit-index`. Without `--edit-index` a restarted
@@ -184,7 +190,7 @@ fn main() -> ExitCode {
 fn db_cmd(store_dir: &str, args: &[String]) -> Result<(), String> {
     let mut args = args.to_vec();
     if args.first().map(String::as_str) != Some("serve") {
-        return Err("usage: ikam [--store DIR] db serve [--live] [--packs] [--plain-events] [--no-object-templates] [--concurrent-reads] [--edit-index] [--plain-writes] [--keep-counts N] [--allow-host NAME]... [--log-requests] [PORT]".into());
+        return Err("usage: ikam [--store DIR] db serve [--live] [--packs] [--plain-events] [--no-object-templates] [--concurrent-reads] [--edit-index] [--plain-writes] [--hnsw] [--keep-counts N] [--allow-host NAME]... [--log-requests] [PORT]".into());
     }
     args.remove(0);
     let mut allowed = Vec::new();
@@ -242,6 +248,7 @@ fn db_flags(args: &mut Vec<String>, keep_counts: u32) -> (bool, bool, DbServeOpt
     let concurrent_reads = take("--concurrent-reads") || live;
     let edit_index = take("--edit-index") || live;
     let plain_writes = take("--plain-writes");
+    let hnsw = take("--hnsw");
     let opts = DbServeOpts {
         concurrent_reads,
         edit_index,
@@ -249,6 +256,7 @@ fn db_flags(args: &mut Vec<String>, keep_counts: u32) -> (bool, bool, DbServeOpt
         plain_events,
         object_templates,
         keep_counts,
+        hnsw,
     };
     (packs, log_requests, opts)
 }
@@ -261,10 +269,18 @@ struct DbServeOpts {
     plain_events: bool,
     object_templates: bool,
     keep_counts: u32,
+    hnsw: bool,
 }
 
 /// `db serve` on `store`; with `concurrent_reads` the store is shared, so
 /// reads get `Repo`s of their own (E232).
+fn index(o: DbServeOpts) -> dbsearch::VectorIndex {
+    match o.hnsw {
+        true => dbsearch::VectorIndex::Hnsw,
+        false => dbsearch::VectorIndex::Exact,
+    }
+}
+
 fn serve_db<S: ikam_kernel::Store + Send + Sync + 'static>(
     store: S,
     o: DbServeOpts,
@@ -292,6 +308,7 @@ fn serve_db<S: ikam_kernel::Store + Send + Sync + 'static>(
             tune(Repo::new(shared), o),
             Some(make),
             o.keep_counts,
+            index(o),
             port,
             allowed,
             log_requests,
@@ -301,6 +318,7 @@ fn serve_db<S: ikam_kernel::Store + Send + Sync + 'static>(
             tune(Repo::new(store), o),
             None,
             o.keep_counts,
+            index(o),
             port,
             allowed,
             log_requests,
@@ -1004,6 +1022,7 @@ mod tests {
             plain_events: true,
             object_templates: false,
             keep_counts: 0,
+            hnsw: false,
         };
         let mut a = v(&["--live", "8752"]);
         assert_eq!(db_flags(&mut a, 0), (true, false, all));
@@ -1031,6 +1050,7 @@ mod tests {
             plain_events: false,
             object_templates: true,
             keep_counts: 0,
+            hnsw: false,
         };
         assert_eq!(db_flags(&mut a, 0), (false, false, off));
         // E357: `--plain-writes` is its own option, not part of `--live`.
@@ -1040,6 +1060,11 @@ mod tests {
             ..all
         };
         assert_eq!(db_flags(&mut a, 0), (true, false, plain));
+        assert!(a.is_empty());
+        // E358: `--hnsw` is its own option too.
+        let mut a = v(&["--live", "--hnsw"]);
+        let graph = DbServeOpts { hnsw: true, ..all };
+        assert_eq!(db_flags(&mut a, 0), (true, false, graph));
         assert!(a.is_empty());
     }
     use super::*;
