@@ -338,7 +338,7 @@ E359	agent-tools	capability	planned	exp/354-goal-scorecard	loop	serve,tools	no	p
 E360	served-drafts	capability	planned	exp/354-goal-scorecard	safety	serve,drafts,history	no	planned (E355): drafts, branches, commit messages, reads at a commit over HTTP
 E361	served-views	capability	kept	exp/361-served-views	speed	db,views,serve	no	groups and indexes kept by db serve (--views FILE): a group read 0.7 ms and an index lookup about 2 ms at 200k rows against a 1.7 s client scan; fixed db_scan and view value reads
 E362	host-service	capability	planned	exp/354-goal-scorecard	safety	host,limits,queue	no	planned (E355): per-project rates, one heavy-job queue, memory and start time per project
-E363	host-tokens	capability	planned	exp/354-goal-scorecard	safety	host,auth	no	planned (E355): scoped per-project tokens and rate limits before any public front door
+E363	host-tokens	capability	kept	exp/363-host-tokens	safety	host,auth,limits	no	bearer tokens per project (role, expiry) and request rates per token and project; 429 under 1 us, a token costs what a password does
 E364	embedder	capability	planned	exp/354-goal-scorecard	search	search,vectors,embeds	no	planned (E355): in-kernel static embeddings so semantic search needs no outside model
 E365	scoped-merge	capability	planned	exp/354-goal-scorecard	safety	shares,merge	no	planned (E355): merge for section, fragment and graph scopes
 E366	cross-type-sharing	measurement	planned	exp/354-goal-scorecard	north	north,sharing	yes	planned (E355): raise one-graph sharing across file types from 0.950

@@ -5996,3 +5996,29 @@ Gates on the branch (E229 to E233): every kernel test suite passes (release); cl
 - Limits and not done: joins are not served (the kernel's join rules are `fn` pointers; a lookup join is an index read and a `get` today); the views live in memory and are built again after each restart (the graphs are written but no commit points at them); only whole-number sums; one rule file for every database of a server; a build holds the writer's lock (2.6 s at 200k rows); memory during a build roughly doubles the server's.
 - Next (proposed, not started): keep the view roots in the database's commit so a restart reads them back; buffer a view's edits across requests (as E148 does for pages) to flatten the cost of spread-out changes; served joins.
 - Run: `python3 -I experiments/served-views/served_views.py IKAM_BIN WORK 200000`; `cargo test --release --test views`; `cargo test --release --bin ikam views`.
+
+### E363 host-tokens (tokens and rate limits for `ikam host`)
+- Branch / parent: exp/363-host-tokens / main (1d7c26d, E358 merged)
+- Question: E355 ranked tokens and rate limits as what blocks putting `ikam host` behind a public front door: today every caller is a person's password (`user NAME ROLE USER:SALT:HASH`), and nothing stops one project's callers from using up a host that others share. What do per-project tokens and rates cost a request, and do they keep projects apart? (The front door itself is the owner's decision; nothing here opens one.)
+- Change (`src/bin/ikam/tokens.rs`, `host.rs`, `main.rs`; config lines, so nothing changes for a config without them):
+  - `ikam token` prints a new token: `CONFIG=ID:HASH` for the config and `TOKEN=ikt_ID_SECRET` for the client (a 64-bit id and a 256-bit secret from `/dev/urandom`; the hash is BLAKE3 with its own derive-key context over the secret). The config never holds the secret.
+  - `token NAME ROLE ID:HASH [rate=N/s|N/m|N/h] [expires=SECS]`: the token opens project NAME only, with ROLE (read, write or owner, checked like a user's role), until SECS (seconds since 1970). Sent as `Authorization: Bearer ikt_...`. The same token in two projects is refused when the config is read, since it would open both.
+  - `rate NAME N/s` (or `/m`, `/h`): one bucket of N requests for all of the project's callers, users and tokens together, refilled at that rate; a token's `rate=` is a bucket of its own. A request over either gets 429 `Too Many Requests` with `Retry-After` in whole seconds, before it reaches the project. Only requests that passed the password or token check are counted.
+  - An unknown, wrong, expired or other project's token gets the same 401 as a wrong password.
+  - Tests: `tokens_open_one_project_with_their_role_and_rates_answer_429` (host.rs: a read token reads and cannot write; a token of b opens nothing in a; an expired owner token, a wrong secret, a write token on `/api/gc`; a token's own rate answers 429 with a `Retry-After` and leaves other callers alone; a project rate counts a token and a password together; a wrong password is not counted; config refusals), `rates_parse_and_buckets_refill` and `tokens_prove_their_secret_until_they_expire` (tokens.rs).
+- Result (`host::tests::token_overhead`, 20,000 requests a round, `GET /dav/one.md` through `Host::handle`, three rounds; a 4-core cloud machine, with other builds running):
+
+  | Request | Time |
+  |---|---|
+  | with a password | 2.95-3.20 us |
+  | with a token | 2.73-3.31 us |
+  | with a token that has a rate | 2.77-3.51 us |
+  | a refused, malformed token (401) | 0.38-0.50 us |
+  | one bucket take | 0.04 us |
+  | a burst of 20,000 against `rate a 100/s` | 101 answered, 19,899 refused with 429, 0.82 us a request |
+
+  - A token costs what a password does (one BLAKE3 hash): the difference is within the rounds' spread. A rate adds about 0.04 us. Refusing over a rate costs under 1 us, so a caller flooding one project is turned away for less than a served request costs.
+  - The fixed benchmark is untouched (no kernel code changed).
+- Verdict: **kept** (config lines, nothing on by default). A program can now reach one project with a token that opens nothing else and expires, and a project's callers can be capped so they cannot starve the host's other projects.
+- Limits and not done: a token covers a whole project (no path or share scope: enforcing a path over every route of `live`, pages, WebDAV and the API, is its own piece of work); failed checks are not limited (a front door should limit them by address, which the host does not see behind a proxy); buckets live in memory and start full after a restart; revoking a token means removing its line and restarting; one host-wide rate (across projects) is not offered. No front door was set up or tried.
+- Run: `cargo test --release --bin ikam host::tests::token_overhead -- --ignored --nocapture`; `cargo test --release --bin ikam host tokens`.
