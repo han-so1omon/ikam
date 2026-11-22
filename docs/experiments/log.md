@@ -5832,3 +5832,29 @@ Gates on the branch (E229 to E233): every kernel test suite passes (release); cl
 - Not done or not measured: search over files in `live` and `host` (`host` serves no databases); keeping the views across restarts (a ref or an entry in the commit tree); `at=COMMIT`; a fused result can name a text row that was removed while its vector was kept; stemming (E344: no gain); the graph built with `extend` on threads (E332: 4x faster builds); tables above 11,415 rows; macOS.
 - Next (proposed, not started): persist the BM25 and vector indexes with the database so a restart reads them back; trace the build's memory; a build in the background so the first query does not wait; the same routes over files in `live`; E364's embedder so the server can embed queries itself.
 - Run: `python3 -I experiments/server-search/search_bench.py IKAM_BIN WORK DIR --live` and `... --live --hnsw`, DIR from `prepare.py` (exp/259-fusion-tune; not committed).
+
+### E370 second-writer (`db serve` with other processes writing its store)
+- Branch / parent: exp/370-second-writer / main (1d7c26d, E358 merged)
+- Question: found while testing E369: two servers on one store break each other's search with a 500 (object not found). What happens to reads and appends when a second process (another `db serve`, `ikam mcp` from E359, a script) writes a store a server is serving, and can an option make it safe?
+- Hypothesis: as in E298, a handle's ledger never learns of derivations another process stores, so the server's reads of what the other process wrote fail; and `db serve` commits appends with `db_commit`, which replaces whatever the ref points at, so events can be lost. `Repo::refresh_ledger` (E298) plus `db_commit_at` with a retry should fix both.
+- Change:
+  - `db serve --shared-store` (option, off; refused with `--packs` and `--live`, a pack store being opened by one process): sets `Repo::refresh_ledger` on the writer (and its reader siblings), and the server's appends commit with `db_commit_at` over the head they read; on a conflict the head is read again and the events applied over it (their idempotency keys keep a retry from applying one twice), up to 16 tries.
+  - `dbserve.rs`: `append` split into a retry loop and `append_once`; `Server::shared_store`.
+  - Test `shared_store_servers_see_each_others_writes` (two servers with their own handles on one store, as two processes): off, the first server's search, read or append after the second's write fails; on, all succeed, the search equals a fresh build's at that head, 20 appends from two threads at once all land, fsck is clean. Flag test extended.
+  - `experiments/shared-store/two_servers.py`.
+- Method: in the cloud container, server A loads 2,000 short rows and searches them; then A and B (two `ikam db serve` processes on one FsStore directory) each append 40 batches of 50 rows of their own from their own thread, and after each batch read one of the other's rows and run a search; a third server counts the rows afterwards. Two runs each, without and with the option; and two runs each with only A appending (`SOLO=1`).
+- Result (run 1 / run 2):
+
+  | Setting | Failed requests (append, get, search) | Rows found of expected | Append p50 / max |
+  |---|---|---|---|
+  | Two writers, default | 39, 39, 39 / 39, 39, 39 | 4,000 of 6,000 / 4,000 of 6,000 | 27.9 / 81.7 ms; 25.2 / 140.5 ms |
+  | Two writers, `--shared-store` | 0, 0, 0 / 0, 0, 0 | 6,000 of 6,000 / 6,000 of 6,000 | 67.7 / 267.4 ms; 63.4 / 265.1 ms |
+  | One writer, default | 0 / 0 | 4,000 of 4,000 | 42.5 / 65.7 ms; 41.6 / 60.8 ms |
+  | One writer, `--shared-store` | 0 / 0 | 4,000 of 4,000 | 38.2 / 62.6 ms; 46.9 / 78.1 ms |
+
+  - By default the server that did not write first fails every request from its second batch on (its handle cannot read the other's new database), so one writer's rows after the first batch never land: the same as E298's worker processes.
+  - With the option nothing fails and nothing is lost; appends take about 2.4 times as long while both write (retries after conflicts and the listings after misses; not split), and the same as without it when only one writes.
+- Verdict: **kept** (option). A store can now be served while another process writes it, which `ikam mcp` (E359) next to `db serve` would otherwise break silently for one of them.
+- Trade-offs: a read of content that is really missing lists the store (E298); appends from two writers at once are slower and may be applied more than once before one commits (each retry is a new `db_append`); a pack store is refused (one process).
+- Not done or not measured: `ikam live` and `host` with other writers; more than two writers or a heavy write mix; how many retries a run needed; the first append that creates a database still uses `db_commit` (two processes creating the same database at once can drop one's first batch); kept search views (E358) of a database another process writes are updated from the diff as usual (covered by the test, not the bench); macOS.
+- Run: `python3 -I experiments/shared-store/two_servers.py IKAM_BIN WORK 40 [--shared-store]`, with `SOLO=1` for one writer.

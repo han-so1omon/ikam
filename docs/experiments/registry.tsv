@@ -339,3 +339,4 @@ E363	host-tokens	capability	planned	exp/354-goal-scorecard	safety	host,auth	no	p
 E364	embedder	capability	planned	exp/354-goal-scorecard	search	search,vectors,embeds	no	planned (E355): in-kernel static embeddings so semantic search needs no outside model
 E365	scoped-merge	capability	planned	exp/354-goal-scorecard	safety	shares,merge	no	planned (E355): merge for section, fragment and graph scopes
 E366	cross-type-sharing	measurement	planned	exp/354-goal-scorecard	north	north,sharing	yes	planned (E355): raise one-graph sharing across file types from 0.950
+E370	second-writer	option	kept	exp/370-second-writer	safety	serve,ledger,commit,processes	no	db serve --shared-store (refresh_ledger + db_commit_at retry): two servers on one FsStore, 40x50 rows each: off 117 failed requests and 2,000 of 6,000 rows lost; on 0 and all rows, appends 26 to 65 ms p50 while both write, no cost with one writer
