@@ -142,6 +142,7 @@ impl<L: DerefMut<Target = Live>> Session<L> {
                 opt(a, "at").as_deref(),
                 num(a, "start_line"),
                 num(a, "end_line"),
+                num(a, "start_char"),
             ),
             "search" => Ok(self.search(&req(a, "query")?, num(a, "limit").unwrap_or(50))),
             "passages" => Ok(self.passages(&req(a, "question")?, num(a, "k").unwrap_or(8))),
@@ -246,6 +247,7 @@ impl<L: DerefMut<Target = Live>> Session<L> {
         at: Option<&str>,
         start: Option<usize>,
         end: Option<usize>,
+        start_char: Option<usize>,
     ) -> Result<String, String> {
         let path = live::norm(path);
         let root = self.tree_at(at)?;
@@ -285,9 +287,34 @@ impl<L: DerefMut<Target = Live>> Session<L> {
         }
         let mut out = String::new();
         let mut shown = first - 1;
-        for line in &lines[first - 1..last] {
-            if out.len() + line.len() > MAX_TEXT - 200 && shown >= first {
-                break;
+        let skip = start_char.unwrap_or(1).max(1) - 1;
+        let room = MAX_TEXT - 200;
+        for (i, line) in lines[first - 1..last].iter().enumerate() {
+            // `start_char` applies to the first line shown.
+            let line: &str = if i == 0 && skip > 0 {
+                line.char_indices()
+                    .nth(skip)
+                    .map_or("", |(b, _)| &line[b..])
+            } else {
+                line
+            };
+            if out.len() + line.len() > room {
+                if shown >= first {
+                    break;
+                }
+                // One line longer than an answer: show its start and say
+                // where it goes on, so the rest stays reachable.
+                let mut cut = room.min(line.len());
+                while !line.is_char_boundary(cut) {
+                    cut -= 1;
+                }
+                let next = skip + line[..cut].chars().count() + 1;
+                return Ok(format!(
+                    "{head}{path}: line {first} of {} (from character {})\n{}\n(line {first} is cut; read on with start_line={first} and start_char={next})",
+                    lines.len(),
+                    skip + 1,
+                    &line[..cut]
+                ));
             }
             out.push_str(line);
             shown += 1;
@@ -459,22 +486,29 @@ impl<L: DerefMut<Target = Live>> Session<L> {
             });
         };
         let path = live::norm(path);
-        let mut text_at = |root: Option<Id>| -> Result<String, String> {
+        let mut bytes_at = |root: Option<Id>| -> Result<Vec<u8>, String> {
             let Some(root) = root else {
-                return Ok(String::new());
+                return Ok(Vec::new());
             };
             match self.stat_in(root, &path)? {
-                Some((Kind::File, id)) => {
-                    Ok(String::from_utf8_lossy(&self.live.read(&id)?).into_owned())
-                }
-                _ => Ok(String::new()),
+                Some((Kind::File, id)) => Ok(self.live.read(&id)?.to_vec()),
+                _ => Ok(Vec::new()),
             }
         };
-        let (x, y) = (text_at(a)?, text_at(Some(b))?);
-        if x == y {
+        let (xb, yb) = (bytes_at(a)?, bytes_at(Some(b))?);
+        if xb == yb {
             return Ok(format!("{path}: no changes"));
         }
-        let d = similar::TextDiff::from_lines(&x, &y);
+        // Compare bytes, not lossy text: two different non-UTF-8 files can
+        // decode to the same replacement characters.
+        let (Ok(x), Ok(y)) = (std::str::from_utf8(&xb), std::str::from_utf8(&yb)) else {
+            return Ok(format!(
+                "{path}: binary file changed ({} bytes to {} bytes)",
+                xb.len(),
+                yb.len()
+            ));
+        };
+        let d = similar::TextDiff::from_lines(x, y);
         Ok(d.unified_diff()
             .context_radius(3)
             .header(&format!("a/{path}"), &format!("b/{path}"))
@@ -611,6 +645,11 @@ fn tools() -> Vec<Json> {
                 rev,
                 ("start_line", "integer", "first line"),
                 ("end_line", "integer", "last line"),
+                (
+                    "start_char",
+                    "integer",
+                    "first character of start_line (for a line longer than one answer)",
+                ),
             ],
             &["path"],
         ),
@@ -939,6 +978,73 @@ mod tests {
                 .ends_with("v2")
         );
         assert!(call(&mut s, "drafts", "{}").unwrap().lines().count() == 1);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// A line longer than one answer is shown in pieces, each saying where
+    /// the next starts; a diff of two non-UTF-8 files that decode alike
+    /// still reports the change.
+    #[test]
+    fn long_lines_page_and_binary_diffs_compare_bytes() {
+        let (dir, mut s) = session("longline");
+        let line: String = (0..30_000)
+            .map(|i| char::from(b'a' + (i % 26) as u8))
+            .collect();
+        let line = format!("{line}é{line}{line}\nnext\n");
+        call(
+            &mut s,
+            "write",
+            &format!(r#"{{"path":"one","content":{}}}"#, json::quote(&line)),
+        )
+        .unwrap();
+        let mut got = String::new();
+        let mut from = 1;
+        for _ in 0..10 {
+            let r = call(
+                &mut s,
+                "read",
+                &format!(r#"{{"path":"one","start_line":1,"end_line":1,"start_char":{from}}}"#),
+            )
+            .unwrap();
+            let body = r.split_once('\n').unwrap().1;
+            match body.rsplit_once("\n(line 1 is cut; read on with start_line=1 and start_char=") {
+                Some((piece, rest)) => {
+                    got.push_str(piece);
+                    from = rest.trim_end_matches(')').parse().unwrap();
+                }
+                None => {
+                    got.push_str(body);
+                    break;
+                }
+            }
+        }
+        assert_eq!(got, line.lines().next().unwrap().to_string() + "\n");
+        call(&mut s, "commit", r#"{"message":"text"}"#).unwrap();
+        let first = s.live.head().unwrap().to_hex();
+        s.live
+            .apply(vec![Op::Put("bin".into(), vec![0x80, 1])])
+            .unwrap();
+        s.live.flush_with(true, Some("bin a")).unwrap();
+        let a = s.live.head().unwrap().to_hex();
+        s.live
+            .apply(vec![Op::Put("bin".into(), vec![0x81, 1])])
+            .unwrap();
+        s.live.flush_with(true, Some("bin b")).unwrap();
+        let b = s.live.head().unwrap().to_hex();
+        let d = call(
+            &mut s,
+            "diff",
+            &format!(r#"{{"from":"{a}","to":"{b}","path":"bin"}}"#),
+        )
+        .unwrap();
+        assert!(d.contains("binary file changed"), "{d}");
+        let d = call(
+            &mut s,
+            "diff",
+            &format!(r#"{{"from":"{first}","to":"{a}","path":"one"}}"#),
+        )
+        .unwrap();
+        assert!(d.contains("no changes"), "{d}");
         let _ = std::fs::remove_dir_all(dir);
     }
 

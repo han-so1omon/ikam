@@ -5809,6 +5809,7 @@ Gates on the branch (E229 to E233): every kernel test suite passes (release); cl
   - A small edit grows with the number of files (0.7 to 5.1 ms), since `Live::apply` rebuilds the path view of the whole tree after each edit; the big edit's time is storing and extracting the 825 KB file.
   - `cargo test --release --bin ikam`: 39 pass, 1 ignored; clippy `-D warnings` clean. No kernel code changed, so the scores cannot move.
 - Verdict: **kept** (a capability; no score changes). An agent with an MCP client can use an ikam store as its file system with history: ranges, search, edits, commits with its own messages, diffs, reads at any commit, and drafts it can promote or throw away.
+- Fixes from the PR's automated review: `diff` compares bytes, so two different non-UTF-8 files that decode to the same replacement characters report "binary file changed" instead of "no changes"; `read` takes `start_char`, and a line longer than one answer is shown in pieces that each say where the next starts (before, the rest of such a line could not be read). Test `long_lines_page_and_binary_diffs_compare_bytes`; 40 pass, 1 ignored.
 - Not measured: a model using the tools (only a scripted client here); running beside `ikam live` on the same store; macOS; non-UTF-8 text files (read as extracted text, edited only with `write`); E358's ranked search, which a later change can add as a tool.
 - Run: `pip install mcp`, then `python3 experiments/agent-tools/mcp_check.py IKAM_BIN WORK CORPUS_DIR 1` and `... 40 distinct`.
 
