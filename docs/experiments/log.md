@@ -5642,3 +5642,104 @@ Gates on the branch (E229 to E233): every kernel test suite passes (release); cl
 - Verdict: **measured**: the 32-byte shortest match holds on the history corpora; it changes none of their bytes and no time beyond noise, so E347's change stands with no trade-off found. Why nothing moves is not traced: the history corpora's repeats are presumably long (whole files and long spans between versions), so no match between 32 and 96 bytes is kept (inferred).
 - Not measured: the full command with all corpora together after the re-pin (each part was run, not the whole); `semantic/embed.py` still names the old pin and was not changed.
 - Run: `cargo run --release --example bench -- --json repo-history repo-graph structured transcripts`, with `MIN_MATCH` set to 96 in a worktree for the base.
+
+### E354 goal-scorecard (the project's stated goals, each as a measured test)
+- Branch / parent: exp/354-goal-scorecard / main (d49ac2c, E353)
+- Question: the log measures storage and speed one mechanism at a time. Measured against the goals the owner has stated for the project as a whole, which hold today on main and which do not?
+- Goals tested (owner's words unless marked): G1 a file service for projects that use AI to generate and change files; G2 one graph that reproduces every byte and stores shared information once, across file types (README); G3 semantic search; G4 the real database for projects, with a relational database kept only for comparisons; G5 optimizations with trade-offs are options; G6 execution modes judged on speed, utility, extensibility and portability; G7 projects separate by default, shared by scope when authorized; G8 nothing private in this public repository.
+- Method (4-core cloud machine; synthetic data only):
+  - G2: `bench -- --json north` on main.
+  - G4, G5: new `experiments/goal-scorecard/db_first_write.py`. `ikam db serve` on 127.0.0.1; a table of N rows with one index entry each, loaded in 2,000-row batches; the server is stopped and started again; then the first 2,000-row append into a new table, five more, and one into the big table. A client gives up after 120 s. Flag sets: none; base (`--packs --plain-events --no-object-templates`); base with the write options (`--edit-index --concurrent-reads`, E232).
+  - G7: `cargo test --release --test share` and the host tests in `src/bin/ikam`.
+  - G8: `.github/privacy/scan.py --all`.
+  - G1, G3, G6: earlier results (E133, E326, E351, E352, E311, E341, E342) and the routes in `src/bin/ikam`.
+- Result:
+
+  | Goal | Test | Result | Holds |
+  |---|---|---|---|
+  | G1 file service for AI | E133 goal pipeline; agent interface | E133: 9.22 GB read / 2.9 s with defaults, 554 MB / 0.87 s with options. Agents reach the store by WebDAV and `/api` only; no tool interface since the Python packages were removed | partly |
+  | G2 one graph | north score; `sharing_kernel` | north 0.306 (one graph is 31% of zstd with a trained dictionary); sharing 0.971 cases, 0.939 multiformat, 0.939 tables, 0.950 overall | bytes yes, cross-type sharing weak (5%) |
+  | G3 semantic search | what a server serves | the kernel has BM25, vectors, HNSW and fusion (E326 hybrid nDCG@10 0.82 against 0.805 keyword), but `live`, `serve` and `host` search is exact substring only; no route serves ranked or vector search | no |
+  | G4 database | first write after a restart, 120 s client | see the table below; base flags pass at 200k rows but the first write grows with the store (0.22 s at 10k, 5.06 s at 200k) | only with options |
+  | G5 trade-offs as options | defaults vs options | every trade-off is opt-in, as asked; but `db serve` with no flags is not usable as a database (4.4 s a batch at 10k rows), and the base flags pay a first-write cost the write options remove | yes, defaults weak |
+  | G6 execution modes | E311, E341, E342 | Cranelift within 8% of clang, compiles 40-180x faster, portable to five ISAs; MLIR adds nothing for these kernels; GPU through MLIR not measured | yes for CPU |
+  | G7 separate by default, shared by scope | share and host tests | 13 share tests and 9 host tests pass (Mac demo 22/22, E313). Merge works for folder and key-range scopes only; vector search through a share, a shared heavy-job queue and rate limits are not built; the host runs nowhere as a service | partly |
+  | G8 nothing private | privacy scan, whole tree | exit 0 | yes |
+
+  G4 detail (2,000-row batches; median of five later appends):
+
+  | Rows, flags | Load batch p50 | First write after restart | Later writes | Store |
+  |---|---|---|---|---|
+  | 10k, none | 4,412 ms | 2.70 s | 8,967 ms | 12.0 MB |
+  | 10k, base | 132 ms | 0.22 s | 130 ms | 14.1 MB |
+  | 10k, base + write options | 92 ms | 0.13 s | 131 ms | 14.1 MB |
+  | 200k, base | 649 ms | 5.06 s | 180 ms | 286.5 MB |
+  | 200k, base + write options | 846 ms | 0.11 s | 146 ms | 286.5 MB |
+
+  - With the write options the first write after a restart stays near 0.1 s at both sizes; with the base flags it grows with the store, 23x from 10k to 200k rows (one run each, so the trend is from two points). A client with a 120 s timeout would fail on a store a few GB in size if the growth is near linear (inferred, not measured).
+  - The load's batch cost also grows with the table, 132 to 649-846 ms, under both flag sets: appends get slower as a table grows.
+  - Times are one run each; Python tests ran beside the 200k load for about 30 s.
+- Change: none to the kernel. `experiments/goal-scorecard/db_first_write.py`.
+- Verdict: **measured.** Holding: byte-exact storage and the bytes it saves (G2), trade-offs as options (G5), CPU execution modes (G6), separation (G7), privacy (G8). Gaps, largest first: the database's defaults (G4: a restarted server's first write grows with the store unless `--edit-index` is on, and append cost grows with table size); semantic search is not served (G3); sharing across file types saves 5% (G2); scoped merges and the host as a running service (G7); no tool interface for AI agents (G1).
+- Next (proposed, not started): make `--edit-index` and `--concurrent-reads` the `db serve` defaults or a single `--live` preset; a search route over E326's hybrid ranking; append cost against table size.
+- Run: `bench -- --json north`; `python3 experiments/goal-scorecard/db_first_write.py IKAM_BIN WORK 10000 2000` and `... 200000 2000 base,base+write-options`.
+
+### E355 service-stocktake (what the server lets a project use, against what the kernel can do)
+- Branch / parent: exp/354-goal-scorecard / E354
+- Question: E354 found the goals that fail. For the four uses the owner has named (a file service for AI tools; a project's whole record store; one service holding several separate projects; a cloud-hosted app using it), can ikam serve each today, what is missing, and what should be built first?
+- Method: read `src/lib.rs` and `src/bin/ikam/` on main d49ac2c and listed, for each kernel capability, whether any server route reaches it (`grep` for its functions under `src/bin/ikam/`). Sizes are from the code and E354's measurements; effort is a judgement (small: flags or one route; medium: a module of routes with tests; large: research).
+- Result: what each server exposes:
+  - `ikam live` / `serve`: WebDAV files, `/api/{status,search,commit,repack,gc,fsck}`, `/ask` (line numbers). Search is exact substring. Commits are made by the server ("live: N change(s)"); a client cannot name a message, read an earlier commit, or write to a branch over HTTP. History and versions are HTML pages only.
+  - `ikam db serve`: `append`, `get`, `scan`, `count`, `span`, `head`, reads `at=COMMIT`.
+  - `ikam host`: the above per project, plus share routes.
+  - Kernel capabilities on main that no route reaches: ranked keyword search kept by edits (`Bm25Live`, E329), vector indexes (`vectors`, E253; `hnsw`, E332), fused ranking (`fusion`, E326), kept views and joins (`views`, `join`, E242-E250), column blocks (E241), stable row ids (`db_insert`, E240), drafts as branches (`drafts`, E266), Petri nets of work (`net`, E269), verified derivations and WASM functions (`func`), the background integrator (E262), incremental repack (E268).
+  - So a client of the server gets files, exact search and a key-value log, and has to rebuild ranking, joins and aggregates itself (inferred cost: the client code E354's records test needed).
+
+  | Use | Today | Missing |
+  |---|---|---|
+  | File service for AI tools | partly: byte-exact files, versions, WebDAV, exact search, ask | a tool interface (no MCP or similar); ranked or semantic search over files; drafts, branches, commit messages and reads at a commit over HTTP |
+  | A project's whole record store | reads yes, with `--packs --plain-events --no-object-templates`; writes slow | write options off by default (E354: first write after restart 5.06 s at 200k rows, 0.11 s with them); append cost grows with the table (E354: 132 to 649-846 ms a batch); no served views, joins, row ids, ranked search, nets or derivations |
+  | Several separate projects in one service | partly: `ikam host` keeps them apart (E313, E314) and shares by scope (E315-E318) | not run as a service anywhere; no per-project rate limit or shared heavy-job queue; merges for folder and key-range scopes only; no vector search through a share |
+  | A cloud-hosted app | no | the host listens on 127.0.0.1 behind a private network; an app on a public cloud cannot reach it. Needs a public front door (the owner's decision) and, before that, per-project tokens and rate limits |
+
+- Proposed experiments, ranked by impact over effort (numbers reserved in the registry as `planned`):
+
+  | Rank | Id | What | Goal | Impact | Effort |
+  |---|---|---|---|---|---|
+  | 1 | E356 db-live-preset | `db serve --live` turning on `--packs --plain-events --no-object-templates --edit-index --concurrent-reads` together (or making them the defaults), with E354's test as its check | G4, G5 | high: removes the first-write stall | small |
+  | 2 | E357 append-scale | profile why an append's cost grows with the table (E354) and fix it; target: flat batch cost from 10k to 1M rows | G4 | high: writers can move onto ikam | medium, cause unknown |
+  | 3 | E358 served-search | `GET /db/NAME/search` (BM25 kept by appends), `POST /db/NAME/vsearch` (IVF or HNSW) and fused ranking, in `db serve` and `host`; files in `live` through fragment rows (E330) | G3 | high | medium |
+  | 4 | E359 agent-tools | `ikam mcp`: a stdio tool server over the same handlers (list, read a range, search, edit, commit with a message, diff, read at a commit, drafts) | G1 | high for AI tools | small to medium |
+  | 5 | E360 served-drafts | drafts, branches, commit messages and reads at a commit over HTTP in `live` and `host` (E266 is library only) | G1 | medium | small to medium |
+  | 6 | E361 served-views | kept views, joins and counts over `db serve`, so clients stop joining in their own code | G4 | medium | medium |
+  | 7 | E362 host-service | the host as a running service: per-project request rates, one heavy-job queue (repack, gc, index builds), memory and start time per project | G7 | medium | medium |
+  | 8 | E363 host-tokens | per-project scoped tokens and rate limits fit to put behind a public front door; the door itself is the owner's decision | G7, cloud apps | medium (blocks cloud apps) | small to medium |
+  | 9 | E364 embedder | an embedding source in the kernel (static token vectors, no model server), so semantic search works with no outside step; E352's LSA alone is weak (0.357) | G3 | medium | medium |
+  | 10 | E365 scoped-merge | merges for section, fragment and graph scopes (`NotMergeable` today) | G7 | low to medium | medium |
+  | 11 | E366 cross-type-sharing | raise sharing across file types (E354: 0.950) | G2 | low for these uses today (storage is the small part of cost) | large, research |
+
+- Change: none to the kernel; this entry and registry rows.
+- Verdict: **measured** (an inventory, not a score). The kernel already has most of what the four uses need; the server exposes little of it. The two first fixes are both on the database's write path (E356, E357); then serving search and a tool interface (E358, E359).
+- Not checked: E357's cause; whether the plan doc's follow-ups for the host (numbered E348-E351 when written, numbers since used by other experiments) overlap E362.
+
+### E356 db-live-preset (one flag for the options a live database wants)
+- Branch / parent: exp/356-db-live-preset / E355 (exp/354-goal-scorecard 2543cda)
+- Question: E354 found that a restarted `db serve` stalls on its first write unless `--edit-index` is on, and E355 ranked a preset first. Does one `--live` flag give a live database the write path E354 measured with the options named one by one?
+- Hypothesis: `--live` = `--packs --plain-events --no-object-templates --concurrent-reads --edit-index` keeps the first write after a restart near 0.1 s at any size, with the same stored bytes. (Source: E354, E232.)
+- Change: `src/bin/ikam/main.rs`: `--live` for `db serve`; the switches are read by one function, `db_flags`, with a test that `--live` and the five options named one by one give the same settings, and that naming one of them beside `--live` changes nothing. Defaults are unchanged (every trade-off stays an option). `experiments/goal-scorecard/db_first_write.py` gains a `live` flag set.
+- Result (`db_first_write.py`, 2,000-row batches with one index entry each, 120 s client timeout, 4-core cloud machine, one run each):
+
+  | Rows, flags | Load batch p50 | First write after restart | Later writes p50 | Append to the big table | Store |
+  |---|---|---|---|---|---|
+  | 10k, base | 84 ms | 0.198 s | 130 ms | 0.134 s | 14.1 MB |
+  | 10k, `--live` | 89 ms | 0.115 s | 104 ms | 0.134 s | 14.1 MB |
+  | 200k, base | 588 ms | 4.563 s | 145 ms | 0.838 s | 286.5 MB |
+  | 200k, `--live` | 761 ms | 0.093 s | 124 ms | 0.974 s | 286.5 MB |
+
+  - The first write after a restart is 49x faster at 200k rows (4.56 to 0.09 s) and does not grow with the store; E354 gave 5.06 against 0.11 s for the same settings, so the effect repeats.
+  - Stored bytes are identical.
+  - The trade-off: a bulk load is 23-29% slower with the options (588 to 761 ms a batch here, 649 to 846 ms in E354), and one append to the big table 16% slower (0.84 to 0.97 s). Inferred cause: `--concurrent-reads` puts the store behind a shared lock; not traced.
+  - `cargo test --release --bin ikam`: 35 pass, 1 ignored; clippy with `-D warnings` clean.
+- Verdict: **kept** (an option; it adds a capability and changes no score: no kernel code changed). For a server that restarts and must answer its first write within a client's timeout, `--live` is the setting; for a one-off bulk load into a fresh store, the base flags are about a quarter faster.
+- Not measured: stores above 200k rows; macOS; the growth of a batch's cost with the table (E357).
+- Run: `python3 experiments/goal-scorecard/db_first_write.py IKAM_BIN WORK 10000 2000 base,live` and the same with 200000.

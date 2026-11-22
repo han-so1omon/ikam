@@ -28,9 +28,11 @@ const USAGE: &str = "usage: ikam [--store DIR] [--short-records] [--slow-codec-m
   ls [REV[:PATH]] [-r]             list a directory of REV (default main)
   grep TEXT [REV]                  files of REV containing TEXT, with lines
   stats [REV]                      objects and bytes the store holds
-  db serve [--packs] [--plain-events] [--no-object-templates] [--concurrent-reads] [--edit-index] [--keep-counts N] [PORT]
+  db serve [--live] [--packs] [--plain-events] [--no-object-templates] [--concurrent-reads] [--edit-index] [--keep-counts N] [PORT]
                                    the store's databases over HTTP, for programs
-                                   (default port 8740, 127.0.0.1 only; dbserve.rs)
+                                   (default port 8740, 127.0.0.1 only; dbserve.rs);
+                                   --live turns on the five options a live
+                                   database wants (E356)
   host --config FILE [PORT]        several separate projects in one process, each
                                    its own store, users and limits, chosen by Host
                                    name; crossing only through scoped shares (host.rs)
@@ -160,10 +162,18 @@ fn main() -> ExitCode {
 /// on its first write. `--keep-counts N` (E233, off) keeps the number of
 /// keys under each prefix of up to N segments, edited by every append, so
 /// `count?prefix=` and `span` read one node per prefix.
+///
+/// `--live` (E356) is the five options a database kept by a running
+/// program wants, together: `--packs --plain-events --no-object-templates
+/// --concurrent-reads --edit-index`. Without `--edit-index` a restarted
+/// server's first write builds the whole store's index (E354: 0.22 s at 10k
+/// rows, 5.06 s at 200k; 0.11-0.13 s with it). It is still an option, as
+/// every trade-off is; it implies `--packs`, so use it on a new store or a
+/// pack store.
 fn db_cmd(store_dir: &str, args: &[String]) -> Result<(), String> {
     let mut args = args.to_vec();
     if args.first().map(String::as_str) != Some("serve") {
-        return Err("usage: ikam [--store DIR] db serve [--packs] [--plain-events] [--no-object-templates] [--concurrent-reads] [--edit-index] [--keep-counts N] [--allow-host NAME]... [--log-requests] [PORT]".into());
+        return Err("usage: ikam [--store DIR] db serve [--live] [--packs] [--plain-events] [--no-object-templates] [--concurrent-reads] [--edit-index] [--keep-counts N] [--allow-host NAME]... [--log-requests] [PORT]".into());
     }
     args.remove(0);
     let mut allowed = Vec::new();
@@ -174,31 +184,7 @@ fn db_cmd(store_dir: &str, args: &[String]) -> Result<(), String> {
         Some(n) => n.parse().map_err(err)?,
         None => 0,
     };
-    let before = args.len();
-    args.retain(|a| a != "--packs");
-    let packs = args.len() != before;
-    let before = args.len();
-    args.retain(|a| a != "--log-requests");
-    let log_requests = args.len() != before;
-    let before = args.len();
-    args.retain(|a| a != "--plain-events");
-    let plain_events = args.len() != before;
-    let before = args.len();
-    args.retain(|a| a != "--no-object-templates");
-    let object_templates = args.len() == before;
-    let before = args.len();
-    args.retain(|a| a != "--concurrent-reads");
-    let concurrent_reads = args.len() != before;
-    let before = args.len();
-    args.retain(|a| a != "--edit-index");
-    let edit_index = args.len() != before;
-    let serve_opts = DbServeOpts {
-        concurrent_reads,
-        edit_index,
-        plain_events,
-        object_templates,
-        keep_counts,
-    };
+    let (packs, log_requests, serve_opts) = db_flags(&mut args, keep_counts);
     let port: u16 = args.first().map_or(Ok(8740), |p| p.parse()).map_err(err)?;
     auth::catch_stop_signals();
     std::thread::spawn(|| {
@@ -226,7 +212,35 @@ fn db_cmd(store_dir: &str, args: &[String]) -> Result<(), String> {
     }
 }
 
-#[derive(Clone, Copy)]
+/// Takes `db serve`'s switches out of `args`: whether the store is a pack
+/// store, whether to log requests, and the serving options. `--live` turns
+/// on `--packs`, `--plain-events`, `--no-object-templates`,
+/// `--concurrent-reads` and `--edit-index` (E356); naming any of them as
+/// well changes nothing.
+fn db_flags(args: &mut Vec<String>, keep_counts: u32) -> (bool, bool, DbServeOpts) {
+    let mut take = |name: &str| {
+        let before = args.len();
+        args.retain(|a| a != name);
+        args.len() != before
+    };
+    let live = take("--live");
+    let packs = take("--packs") || live;
+    let log_requests = take("--log-requests");
+    let plain_events = take("--plain-events") || live;
+    let object_templates = !(take("--no-object-templates") || live);
+    let concurrent_reads = take("--concurrent-reads") || live;
+    let edit_index = take("--edit-index") || live;
+    let opts = DbServeOpts {
+        concurrent_reads,
+        edit_index,
+        plain_events,
+        object_templates,
+        keep_counts,
+    };
+    (packs, log_requests, opts)
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
 struct DbServeOpts {
     concurrent_reads: bool,
     edit_index: bool,
@@ -959,6 +973,45 @@ fn list(repo: &Repo<FsStore>, spec: &str, recursive: bool) -> Result<(), String>
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn db_live_turns_on_the_five_options() {
+        let v = |a: &[&str]| a.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let all = DbServeOpts {
+            concurrent_reads: true,
+            edit_index: true,
+            plain_events: true,
+            object_templates: false,
+            keep_counts: 0,
+        };
+        let mut a = v(&["--live", "8752"]);
+        assert_eq!(db_flags(&mut a, 0), (true, false, all));
+        assert_eq!(a, v(&["8752"]));
+        let mut a = v(&[
+            "--packs",
+            "--plain-events",
+            "--no-object-templates",
+            "--concurrent-reads",
+            "--edit-index",
+        ]);
+        assert_eq!(db_flags(&mut a, 0), (true, false, all));
+        let mut a = v(&["--live", "--edit-index", "--log-requests"]);
+        let counted = DbServeOpts {
+            keep_counts: 3,
+            ..all
+        };
+        assert_eq!(db_flags(&mut a, 3), (true, true, counted));
+        assert!(a.is_empty());
+        let mut a = v(&["8740"]);
+        let off = DbServeOpts {
+            concurrent_reads: false,
+            edit_index: false,
+            plain_events: false,
+            object_templates: true,
+            keep_counts: 0,
+        };
+        assert_eq!(db_flags(&mut a, 0), (false, false, off));
+    }
     use super::*;
 
     #[test]
