@@ -559,8 +559,10 @@ fn append<S: Store>(srv: &Server<S>, name: &str, req: &Request) -> Response {
         Ok(d) => d,
         Err(e) => return fail(e),
     };
-    if new.log == db.log {
-        // Every event was a retry: nothing to commit.
+    if new == db {
+        // Every event was a retry and no view was folded: nothing to
+        // commit. (A batch of retries over a commit left behind by
+        // `--defer-kv` still commits the folded view.)
         return Response::new(200).body("application/json", head_json(head, seq));
     }
     let msg = format!("db: {} event(s)", new.ids_at - seq);
@@ -798,6 +800,32 @@ mod tests {
             v(&st, "/db/s/vsearch?prefix=w/", x(0.0, 1.0), false),
             ["w/b", "w/a"]
         );
+    }
+
+    /// A server without `--defer-kv` over a commit whose kv view lags folds
+    /// it and commits the fold, even for an empty batch or one of retries.
+    #[test]
+    fn a_retry_over_a_lagging_commit_commits_the_fold() {
+        for batch in [vec![], vec![Event::upsert("t/a", b"1", "a")]] {
+            let mut repo = Repo::new(MemStore::default());
+            let empty = repo.db_empty().unwrap();
+            let late = repo
+                .db_append_deferred(&empty, &[Event::upsert("t/a", b"1", "a")])
+                .unwrap();
+            repo.db_commit(&refname("m"), &late, "deferred").unwrap();
+            let st = Server::new(repo, None);
+            let ct = [("content-type", EVENTS)];
+            let r = handle(
+                &st,
+                &req("POST", "/db/m/append", &encode_events(&batch), &ct),
+            );
+            assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
+            let mut w = st.writer.lock().unwrap();
+            let c = w.store().get_ref(&refname("m")).unwrap().unwrap();
+            let db = w.db_at(&c).unwrap();
+            assert_eq!((db.kv_at, db.ids_at), (1, 1), "{} events", batch.len());
+            assert!(w.db_append(&db, &[Event::upsert("t/b", b"2", "b")]).is_ok());
+        }
     }
 
     #[test]
