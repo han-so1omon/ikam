@@ -848,6 +848,25 @@ impl<S: Store> Repo<S> {
         self.commit(name, tree, message)
     }
 
+    /// Commit `db` as the first commit of `name`, only if the ref does not
+    /// exist yet (E370): two writers creating one database cannot both
+    /// succeed; the other gets `Error::RefConflict`, writing no ref, and
+    /// reads the new head and tries again with `db_commit_at`.
+    pub fn db_commit_new(&mut self, name: &str, db: &Db, message: &str) -> Result<Id, Error> {
+        if self.store.get_ref(name)?.is_some() {
+            return Err(Error::RefConflict(name.into()));
+        }
+        let entry = self.db_entry(db)?;
+        let tree = self.put(&Object::tree(vec![entry])?)?;
+        let id = self.put(&Object::Commit(crate::Commit {
+            tree,
+            parents: Vec::new(),
+            message: message.into(),
+        }))?;
+        self.store.set_ref(name, None, id)?;
+        Ok(id)
+    }
+
     /// Commit `db` to `name` only if the ref still points at `base`, the
     /// commit `db` was read from (E292, opt-in). `db_commit` builds on
     /// whatever the ref points at now, so a writer whose `db` was read

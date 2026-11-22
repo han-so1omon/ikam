@@ -515,6 +515,7 @@ fn append_once<S: Store>(
     let msg = format!("db: {} event(s)", new.kv_at - seq);
     let c = match head {
         Some(base) if srv.shared => repo.db_commit_at(&refname(name), base, &new, &msg)?,
+        None if srv.shared => repo.db_commit_new(&refname(name), &new, &msg)?,
         _ => repo.db_commit(&refname(name), &new, &msg)?,
     };
     srv.heads
@@ -708,7 +709,25 @@ mod tests {
                     });
                 }
             });
+            // Two servers creating one database at once: both batches land.
+            std::thread::scope(|sc| {
+                for (st, base) in [(&a, 300), (&b, 400)] {
+                    sc.spawn(move || {
+                        let ev: Vec<Event> = (0..20)
+                            .map(|i| {
+                                let k = format!("n/{:03}", base + i);
+                                Event::upsert(&k, b"x", &k)
+                            })
+                            .collect();
+                        let body = encode_events(&ev);
+                        let r = handle(st, &req("POST", "/db/new/append", &body, &ct));
+                        assert_eq!(r.status, 200);
+                    });
+                }
+            });
             let c = server();
+            let r = handle(&c, &req("GET", "/db/new/count?prefix=n/", b"", &[]));
+            assert!(String::from_utf8(r.body).unwrap().contains("40"));
             let n = |p: &str| {
                 let r = handle(
                     &c,
