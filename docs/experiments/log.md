@@ -5858,3 +5858,27 @@ Gates on the branch (E229 to E233): every kernel test suite passes (release); cl
 - Verdict: **kept** (config lines, nothing on by default). A program can now reach one project with a token that opens nothing else and expires, and a project's callers can be capped so they cannot starve the host's other projects.
 - Limits and not done: a token covers a whole project (no path or share scope: enforcing a path over every route of `live`, pages, WebDAV and the API, is its own piece of work); failed checks are not limited (a front door should limit them by address, which the host does not see behind a proxy); buckets live in memory and start full after a restart; revoking a token means removing its line and restarting; one host-wide rate (across projects) is not offered. No front door was set up or tried.
 - Run: `cargo test --release --bin ikam host::tests::token_overhead -- --ignored --nocapture`; `cargo test --release --bin ikam host tokens`.
+
+### E362 host-service (one queue for heavy jobs on `ikam host`)
+- Branch / parent: exp/362-host-service / exp/363-host-tokens (E363's rates are the per-project half of E355's item)
+- Question: E355 ranked the host as a running service: per-project rates (E363), one queue for heavy jobs, and memory and start time per project. On a shared host, every owner's repack, gc and fsck run at once. What does one project's maintenance do to another project's reads, and does making heavy jobs take turns help?
+- Change (`src/bin/ikam/host.rs`; config lines, so nothing changes for a config without them):
+  - `heavy-jobs N` lets at most N maintenance jobs (`/api/repack`, `/api/gc`, `/api/fsck`) run at once across all projects. The others wait their turn in arrival order (a ticket queue on a condition variable) for up to `heavy-wait SECS` (60 by default); a job still waiting then gets 503 with `Retry-After`, and leaves the queue. Reads and writes never wait.
+  - Test `heavy_jobs_take_turns_across_projects`: two projects' jobs never overlap at `heavy-jobs 1`; a waiter that gives up gets 503 and leaves the queue; a waiter goes in once the running job ends; config refusals.
+- Result (`experiments/host-service/heavy_jobs.py`, two runs: projects a and b with 3,000 synthetic text files each (81 MB stores), c with 20; a and b both start a repack, then a gc, while c's file is read every 10 ms; a 4-core cloud machine):
+
+  | | no limit | `heavy-jobs 1` |
+  |---|---|---|
+  | c's reads while the jobs run, median | 1.8 ms | 0.8 ms |
+  | c's reads while the jobs run, p99 | 9.9 ms | 5.9-6.0 ms |
+  | c's reads when quiet, median | 0.8 ms | 0.8 ms |
+  | first repack done | 36.4-37.0 s | 23.6-24.0 s |
+  | both repacks done | 36.4-37.0 s | 47.8-48.6 s |
+  | host's peak memory | 491-494 MB | 371-389 MB |
+
+  - With one heavy job at a time, another project's reads run at their quiet speed (median), against 2.2 times slower when both repacks run at once. Each repack alone takes 24 s, against 36 s each when they run together on 4 cores, so the first owner gets their result 12 s sooner and the second 12 s later; all maintenance ends 31% later. The host's peak memory drops by a fifth.
+  - Start time and memory by project count (empty stores): 1, 10 and 40 projects all start in 0.02 s (0.12 s the first time at 40, creating the stores) at 6.2-6.5 MB, so the per-project cost of an idle project is not what limits a host; a project's memory comes from its own work.
+  - The fixed benchmark is untouched (no kernel code changed).
+- Verdict: **kept** (a config line, off by default). A host shared by several projects can keep one owner's maintenance from slowing everyone else, at the cost of maintenance taking turns.
+- Limits and not done: only the three maintenance routes queue (a large upload or a big search does not); the queue is in memory, so a restart forgets who was waiting; no per-project share of the queue (one owner can queue several jobs ahead of another); index builds are not a host job today. Start time with large stores was not measured.
+- Run: `python3 -I experiments/host-service/heavy_jobs.py IKAM_BIN WORK 3000`; `cargo test --release --bin ikam host`.

@@ -35,11 +35,17 @@
 //! [rate=N/s] [expires=SECS]` lets a program in with `Authorization: Bearer`
 //! (`ikam token` makes one); `rate NAME N/s` limits all of a project's
 //! callers together. Over a rate, a request gets 429 and `Retry-After`.
+//!
+//! Heavy jobs (E362): `heavy-jobs N` lets at most N maintenance jobs
+//! (`/api/repack`, `/api/gc`, `/api/fsck`) run at once across all projects;
+//! the others wait their turn in order, for up to `heavy-wait SECS` (60 by
+//! default), then get 503 with `Retry-After`. Without the line, as before,
+//! every owner's job runs at once.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, SystemTime};
 
 use ikam_kernel::share::{Refused, Right, SHARES_REF, Scope, Share, import_share};
@@ -77,6 +83,8 @@ pub struct ProjectConfig {
 pub struct Config {
     pub port: u16,
     pub projects: Vec<ProjectConfig>,
+    /// E362: heavy jobs at once across the host, and how long one waits.
+    pub heavy: Option<(usize, Duration)>,
 }
 
 fn valid_name(s: &str) -> bool {
@@ -94,6 +102,7 @@ impl Config {
     pub fn parse(text: &str) -> Result<Config, String> {
         let mut port = 8750;
         let mut projects: Vec<ProjectConfig> = Vec::new();
+        let (mut heavy_jobs, mut heavy_wait) = (None, Duration::from_secs(60));
         for (n, line) in text.lines().enumerate() {
             let line = line.split('#').next().unwrap_or("").trim();
             if line.is_empty() {
@@ -107,6 +116,14 @@ impl Config {
             };
             match words.as_slice() {
                 ["port", p] => port = p.parse().map_err(|_| bad("port N"))?,
+                ["heavy-jobs", n] => match n.parse() {
+                    Ok(n) if n > 0 => heavy_jobs = Some(n),
+                    _ => return Err(bad("heavy-jobs N, at least 1")),
+                },
+                ["heavy-wait", secs] => match secs.parse() {
+                    Ok(s) => heavy_wait = Duration::from_secs(s),
+                    _ => return Err(bad("heavy-wait SECS")),
+                },
                 ["project", name, store, rest @ ..] if rest.len() <= 1 => {
                     if !valid_name(name) {
                         return Err(bad("a project name is a-z, 0-9 and -"));
@@ -197,7 +214,11 @@ impl Config {
                 }
             }
         }
-        Ok(Config { port, projects })
+        Ok(Config {
+            port,
+            projects,
+            heavy: heavy_jobs.map(|n| (n, heavy_wait)),
+        })
     }
 }
 
@@ -253,6 +274,75 @@ pub struct Project {
 pub struct Host {
     pub projects: BTreeMap<String, Project>,
     port: u16,
+    heavy: Option<Heavy>,
+}
+
+/// E362: at most `max` heavy jobs at once across the host's projects; the
+/// rest wait in the order they came, each for up to `wait`.
+pub struct Heavy {
+    max: usize,
+    wait: Duration,
+    state: Mutex<HeavyState>,
+    turn: Condvar,
+}
+
+#[derive(Default)]
+struct HeavyState {
+    running: usize,
+    waiting: VecDeque<u64>,
+    next: u64,
+}
+
+/// A running heavy job; its place is given up when dropped.
+pub struct Permit<'a>(&'a Heavy);
+
+impl Drop for Permit<'_> {
+    fn drop(&mut self) {
+        self.0.state.lock().unwrap().running -= 1;
+        self.0.turn.notify_all();
+    }
+}
+
+impl Heavy {
+    pub fn new(max: usize, wait: Duration) -> Heavy {
+        Heavy {
+            max,
+            wait,
+            state: Mutex::new(HeavyState::default()),
+            turn: Condvar::new(),
+        }
+    }
+
+    /// Wait for a turn; none if `wait` passed first.
+    pub fn enter(&self) -> Option<Permit<'_>> {
+        let mut s = self.state.lock().unwrap();
+        let me = s.next;
+        s.next += 1;
+        s.waiting.push_back(me);
+        let deadline = std::time::Instant::now() + self.wait;
+        loop {
+            if s.waiting.front() == Some(&me) && s.running < self.max {
+                s.waiting.pop_front();
+                s.running += 1;
+                self.turn.notify_all();
+                return Some(Permit(self));
+            }
+            let now = std::time::Instant::now();
+            if now >= deadline {
+                s.waiting.retain(|t| *t != me);
+                self.turn.notify_all();
+                return None;
+            }
+            s = self.turn.wait_timeout(s, deadline - now).unwrap().0;
+        }
+    }
+
+    /// Jobs running and waiting.
+    #[cfg(test)]
+    pub fn load(&self) -> (usize, usize) {
+        let s = self.state.lock().unwrap();
+        (s.running, s.waiting.len())
+    }
 }
 
 /// The project's share key, kept in `STORE/share.key`, made on first use.
@@ -342,6 +432,7 @@ impl Host {
         Ok(Host {
             projects,
             port: config.port,
+            heavy: config.heavy.map(|(n, wait)| Heavy::new(n, wait)),
         })
     }
 
@@ -431,6 +522,18 @@ impl Host {
         if admin && role < Role::Owner {
             return Response::text(403, "the project's owner runs maintenance");
         }
+        // E362: a heavy job waits for its turn across the host.
+        let _turn = match (&self.heavy, admin) {
+            (Some(h), true) => match h.enter() {
+                Some(p) => Some(p),
+                None => {
+                    let secs = h.wait.as_secs().max(1).to_string();
+                    return Response::text(503, "the host is busy with maintenance; try again")
+                        .with("Retry-After", &secs);
+                }
+            },
+            _ => None,
+        };
         if crate::writes(req) && role < Role::Write {
             return Response::text(403, "this user may only read");
         }
@@ -1063,6 +1166,71 @@ mod tests {
             401
         );
         assert_eq!(st(req("GET", "a.localhost", OA, "/", b"")), 200);
+        done(dirs);
+    }
+
+    #[test]
+    fn heavy_jobs_take_turns_across_projects() {
+        let ms = Duration::from_millis;
+        let h = Heavy::new(1, ms(50));
+        let first = h.enter().unwrap();
+        assert_eq!(h.load(), (1, 0));
+        let t = std::time::Instant::now();
+        assert!(h.enter().is_none());
+        assert!(t.elapsed() >= ms(50));
+        assert_eq!(h.load(), (1, 0), "a waiter that gave up leaves the queue");
+        // A waiter goes in once the running job ends.
+        let h = Arc::new(Heavy::new(1, Duration::from_secs(10)));
+        let held = h.enter().unwrap();
+        let h2 = h.clone();
+        let waiter = std::thread::spawn(move || {
+            let t = std::time::Instant::now();
+            h2.enter().map(|_| t.elapsed())
+        });
+        std::thread::sleep(ms(100));
+        assert_eq!(h.load(), (1, 1));
+        drop(held);
+        let waited = waiter.join().unwrap().unwrap();
+        assert!(waited >= ms(90), "{waited:?}");
+        assert_eq!(h.load(), (0, 0));
+        let two = Heavy::new(2, ms(10));
+        let (_a, _b) = (two.enter().unwrap(), two.enter().unwrap());
+        assert!(two.enter().is_none());
+        drop(first);
+        // Through the host: a heavy job past the wait gets 503; other
+        // requests do not wait.
+        let (hst, dirs) = host("heavy");
+        let mut text = String::from("heavy-jobs 1\nheavy-wait 0\n");
+        for (p, d) in ["a", "b"].iter().zip(&dirs) {
+            text += &format!("project {p} {}\n", d.display());
+            text += &format!("user {p} owner {}\n", user(&format!("{p}-owner"), "pw"));
+        }
+        drop(hst);
+        assert!(Config::parse("heavy-jobs 0\n").is_err());
+        let h = Host::open(Config::parse(&text).unwrap()).unwrap();
+        assert_eq!(
+            h.handle(req("POST", "b.localhost", OB, "/api/fsck", b""))
+                .status,
+            200
+        );
+        let busy = h.heavy.as_ref().unwrap().enter().unwrap();
+        let r = h.handle(req("POST", "b.localhost", OB, "/api/fsck", b""));
+        assert_eq!(r.status, 503);
+        assert!(
+            r.headers
+                .iter()
+                .any(|(k, v)| k == "Retry-After" && v == "1")
+        );
+        assert_eq!(
+            h.handle(req("GET", "a.localhost", OA, "/", b"")).status,
+            200
+        );
+        drop(busy);
+        assert_eq!(
+            h.handle(req("POST", "a.localhost", OA, "/api/fsck", b""))
+                .status,
+            200
+        );
         done(dirs);
     }
 
