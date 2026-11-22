@@ -339,3 +339,4 @@ E363	host-tokens	capability	planned	exp/354-goal-scorecard	safety	host,auth	no	p
 E364	embedder	capability	planned	exp/354-goal-scorecard	search	search,vectors,embeds	no	planned (E355): in-kernel static embeddings so semantic search needs no outside model
 E365	scoped-merge	capability	planned	exp/354-goal-scorecard	safety	shares,merge	no	planned (E355): merge for section, fragment and graph scopes
 E366	cross-type-sharing	measurement	planned	exp/354-goal-scorecard	north	north,sharing	yes	planned (E355): raise one-graph sharing across file types from 0.950
+E369	kept-search	option	kept	exp/369-kept-search	search	search,bm25,serve,restart	no	db serve --keep-search keeps BM25 views on refs (search/NAME/p<hex>): restart first query 8.4-8.9 s to 3 ms (no change), 0.29-0.42 s after 1% rewritten, 48.8 MB text; store 58.8 to 43.5 MB; RSS after restart 1,145 to 12 MB

@@ -333,6 +333,12 @@ impl<S: Store> Repo<S> {
         let Some(db) = self.tree_entry(&self.commit_tree(commit)?, "db")? else {
             return self.db_empty();
         };
+        self.db_in(&db)
+    }
+
+    /// The database a `db` directory (as `db_entry` writes it) holds.
+    pub(crate) fn db_in(&mut self, db: &Id) -> Result<Db, Error> {
+        let db = *db;
         let views = self.tree_entry(&db, "views")?.ok_or(Error::WrongKind(db))?;
         let get = |r: &Self, t: &Id, n: &str| r.tree_entry(t, n)?.ok_or(Error::WrongKind(*t));
         let log = get(self, &db, "log")?;

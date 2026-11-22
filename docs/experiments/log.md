@@ -5832,3 +5832,34 @@ Gates on the branch (E229 to E233): every kernel test suite passes (release); cl
 - Not done or not measured: search over files in `live` and `host` (`host` serves no databases); keeping the views across restarts (a ref or an entry in the commit tree); `at=COMMIT`; a fused result can name a text row that was removed while its vector was kept; stemming (E344: no gain); the graph built with `extend` on threads (E332: 4x faster builds); tables above 11,415 rows; macOS.
 - Next (proposed, not started): persist the BM25 and vector indexes with the database so a restart reads them back; trace the build's memory; a build in the background so the first query does not wait; the same routes over files in `live`; E364's embedder so the server can embed queries itself.
 - Run: `python3 -I experiments/server-search/search_bench.py IKAM_BIN WORK DIR --live` and `... --live --hnsw`, DIR from `prepare.py` (exp/259-fusion-tune; not committed).
+
+### E369 kept-search (BM25 views that outlive a restart of `db serve`)
+- Branch / parent: exp/369-kept-search / main (1d7c26d, E358 merged)
+- Question: E358 serves BM25 search, but its view lives in memory only: every restart builds it again on the first query (8.6 s for 64 MB of README text, about 750 MB of memory), and a restart after changes writes a whole new view to the store (+44 MB). Can a restarted server read the view back and pay only for the rows changed since?
+- Hypothesis: `Bm25Live` (E329) is a handful of ids (two graphs, the database it was built at, a row count), so keeping it on a ref costs one small commit per update, and a restart costs a read of that commit plus the delta update E329 already does.
+- Change:
+  - Kernel (`src/bm25.rs`): `Repo::bm25_live_save(ref, at, view)` writes a commit with no parent whose tree holds `at` and `base_db` (as the `db` directories `db_commit` writes), the `base` and `delta` graphs and `merge_rows`, and moves the ref to it; `Repo::bm25_live_load(ref)` reads it back and checks both graphs can be read. `src/db.rs`: `db_at`'s reading of a `db` directory is split out as `db_in`.
+  - `db serve --keep-search` (option, off, not in `--live`): `dbsearch::Kept` loads a prefix's view from `search/NAME/p<hex prefix>` when it has none in memory (one that cannot be read is built again) and saves it after every build or update. A view at the head writes nothing.
+  - Test `kept_search_views_outlive_a_restart` (`dbserve.rs`): a restart with no change reads the view back and writes no object; after rows change under a server without the option and a `gc`, a restarted server's answer (scores included) equals a fresh build's; a ref naming a missing graph is built again; without the option no ref is written. Flag test extended.
+  - `experiments/kept-search/restart_bench.py`.
+- Method: 11,000 generated rows (about 4.4 KB each, 950 words drawn from a 30,000-word vocabulary with Zipf weights; 48.8 MB of text) loaded in 2,000-row batches into a fresh store with `--live`, then one three-word query timed: the first one, after a restart with no change, after a restart once 1% of the rows were rewritten by a server that searched nothing, and after one more restart. Two runs each, without and with `--keep-search`, one server at a time, in the cloud container.
+- Result (run 1 / run 2):
+
+  | Step | `--live` | `--live --keep-search` |
+  |---|---|---|
+  | First query (build) | 9.81 / 10.23 s | 9.94 / 9.95 s |
+  | Restart, no change | 8.48 / 8.66 s | 0.003 / 0.003 s |
+  | Restart, 1% rewritten | 8.52 / 8.42 s | 0.42 / 0.29 s |
+  | Restart, no change again | 8.88 / 8.51 s | 0.107 / 0.077 s |
+  | Store after the last step | 58.8 MB | 43.5 MB |
+  | Server memory after the restart's first query | 1,145 MB | 12 MB (58 MB after the 1% update) |
+
+  - The answers after each restart were the same as before it (the bench's check); the test checks scores against a fresh build.
+  - Saving costs 0.3 MB at the first query (41.7 to 42.0 MB): two `db` directories and a commit.
+  - The last restart takes 77-107 ms, not 3 ms, with a delta of 110 rows to read beside the base (not traced further).
+- Verdict: **kept** (option). A restart no longer pays for the view: the first query after one takes milliseconds, or the delta update for what changed, and the build's memory is never taken.
+- Trade-offs: the ref keeps the view's postings (19 MB here, 0.4 times the raw text), the database it was last brought to and the one its base was built at, live through `gc`, so a database nobody searches any more keeps them until the ref is deleted (nothing deletes it yet); one small commit per search after a change; a view read back is trusted to match its rows (it is checked for readable graphs, not rebuilt).
+- Found on the way: two server processes writing one store at once break each other's search (500, object not found), with or without the option: a `Repo` does not see objects another writer stored as derivations unless `refresh_ledger` is on. `db serve` is one writer per store, so this only matters for a second writer (a CLI append) next to a running server; not fixed here.
+- Not done or not measured: vector indexes (exact loads in one scan; `--hnsw` builds again, 3 s in E358); E361's views (PR 56) the same way; deleting a ref when its database is removed; the real README table and its 750 MB build; macOS.
+- Next (proposed, not started): keep `--hnsw` graphs and E361 views the same way; a route or `gc` rule that drops kept views of removed databases.
+- Run: `python3 -I experiments/kept-search/restart_bench.py IKAM_BIN WORK 11000 --live [--keep-search]`.
