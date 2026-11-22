@@ -568,7 +568,9 @@ fn views<S: Store>(srv: &Server<S>, name: &str, route: &str, req: &Request) -> R
     };
     let index = rule.kind == crate::dbviews::Kind::Index;
     let prefix = match (index, req.param("eq"), req.param("prefix")) {
-        (true, Some(x), None) => format!("{x}{}", crate::dbviews::US),
+        (true, Some(x), None) => {
+            format!("{}{}", crate::dbviews::index_value(&x), crate::dbviews::US)
+        }
         (false, None, p) => p.unwrap_or_default(),
         _ => return Response::text(400, "an index takes eq=X; a group, prefix=P"),
     };
