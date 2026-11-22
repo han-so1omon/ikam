@@ -698,13 +698,10 @@ impl<S: Store> Repo<S> {
     }
 
     /// Every key and its value, in key order.
+    /// Reads each event once, however many keys it wrote (E361: it read a
+    /// batch's event again for every key the batch wrote).
     pub fn db_scan(&self, db: &Db) -> Result<Vec<(String, Vec<u8>)>, Error> {
-        let mut out = Vec::new();
-        for n in self.graph_nodes(&db.kv)? {
-            let value = self.db_get(db, &n.label)?.ok_or(Error::Decode("db kv"))?;
-            out.push((n.label, value));
-        }
-        Ok(out)
+        self.db_range(db, "", None, usize::MAX, false)
     }
 
     /// Keys from `start` (inclusive) to `end` (exclusive; `None`: to the
@@ -720,6 +717,22 @@ impl<S: Store> Repo<S> {
         reverse: bool,
     ) -> Result<Vec<(String, Vec<u8>)>, Error> {
         let nodes = self.graph_range(&db.kv, start, end, limit, reverse)?;
+        self.node_pairs(nodes)
+    }
+
+    /// The keys of `keys` that are set, with their values, in key order,
+    /// reading the chunks they fall in once and each event once (E361).
+    pub fn db_get_many(
+        &self,
+        db: &Db,
+        keys: &BTreeSet<String>,
+    ) -> Result<Vec<(String, Vec<u8>)>, Error> {
+        let nodes = self.graph_nodes_in(&db.kv, keys)?;
+        self.node_pairs(nodes)
+    }
+
+    /// `kv` nodes to their keys and values, reading each event once.
+    fn node_pairs(&self, nodes: Vec<Node>) -> Result<Vec<(String, Vec<u8>)>, Error> {
         let mut events: BTreeMap<Id, Vec<u8>> = BTreeMap::new();
         let mut out = Vec::with_capacity(nodes.len());
         for n in nodes {

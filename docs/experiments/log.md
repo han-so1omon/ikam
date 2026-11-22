@@ -5832,3 +5832,35 @@ Gates on the branch (E229 to E233): every kernel test suite passes (release); cl
 - Not done or not measured: search over files in `live` and `host` (`host` serves no databases); keeping the views across restarts (a ref or an entry in the commit tree); `at=COMMIT`; a fused result can name a text row that was removed while its vector was kept; stemming (E344: no gain); the graph built with `extend` on threads (E332: 4x faster builds); tables above 11,415 rows; macOS.
 - Next (proposed, not started): persist the BM25 and vector indexes with the database so a restart reads them back; trace the build's memory; a build in the background so the first query does not wait; the same routes over files in `live`; E364's embedder so the server can embed queries itself.
 - Run: `python3 -I experiments/server-search/search_bench.py IKAM_BIN WORK DIR --live` and `... --live --hnsw`, DIR from `prepare.py` (exp/259-fusion-tune; not committed).
+
+### E361 served-views (kept groups and indexes over `db serve`)
+- Branch / parent: exp/361-served-views / main (1d7c26d, E358 merged)
+- Question: E355 ranked kept views as what stops clients grouping and filtering in their own code: today a client that wants a total per status, or one customer's rows, scans the table over HTTP and does the work itself, every time. Can the server keep groups and secondary indexes with the kernel's incremental views (E242), what does a read cost against the client's scan, and what does keeping them cost an append and a restart?
+- Change (an option, `--views FILE`, off by default; the kernel changes are additive):
+  - Kernel (`src/views.rs`): `ViewOp::MapWith` and `ViewOp::GroupSumWith` take a rule as a shared closure (`Arc<dyn Fn + Send + Sync>`), so a rule can come from a file at run time; they store what the `fn` rules store (test `closure_rules_store_what_function_rules_store`). `Repo::view_prefix` reads a stored view's rows under a prefix from the chunks they fall in.
+  - Kernel, found by this experiment and fixed:
+    - `db_scan` read a batch's event once for every key the batch wrote (it called `db_get` per key). It now reads each event once (`db_range`): a first build at 20k rows took 2.79 s, now 0.25 s. `db_get_many` reads a set of keys the same way.
+    - A view stored all its values in one content, and reading one row read that content whole (a stored content is read whole to check its id): an index lookup of 20 rows at 200k rows took 112 ms. Values now go into contents of at most 64 KiB (test `big_views_keep_their_values_in_bounded_contents`), and reads of several rows read each content once: 1.5-2.8 ms.
+    - `views_update` read one event per changed row for the `kv` diff, and the served update now uses `prune_diff` (E249, same changes either way) so it does not list every leaf of both heads: a 20-row change at 200k rows took 230 ms, now about 55 ms.
+  - Server (`src/bin/ikam/dbviews.rs`, `dbserve.rs`, `main.rs`): a views file has one view a line, `NAME group PREFIX by=field:F|seg:N [sum=field:F]` (count and whole-number sum per group) or `NAME index PREFIX by=field:F|seg:N` (the rows with each value). `GET /db/NAME/views` lists them; `GET /db/NAME/view?name=V[&prefix=P]` reads a group, `...&eq=X[&keys=1]` an index's rows with their values read at the same head. A database's views are built on its first view request and brought to the head from the `kv` diff on each later one, under the writer's lock; appends never wait for them. Test `views_follow_appends_and_match_a_build_at_the_head` (shared and plain stores).
+- Result (`experiments/served-views/served_views.py`: synthetic orders with a customer, a status, an amount and a day, 2,000-row batches, `--live`; views by status with the amount summed, per day, per customer, and an index of orders by customer; a 4-core cloud machine; the client's numbers are a full scan over HTTP plus grouping in Python):
+
+  | Step | 20k rows | 200k rows |
+  |---|---|---|
+  | client: scan, group and filter | 0.15-0.20 s | 1.74-1.76 s |
+  | first view request (builds all four) | 0.24-0.26 s | 2.6-3.3 s |
+  | a group read, warm (median) | 0.7 ms | 0.7 ms |
+  | one customer's 20 orders from the index, warm (median) | 1.7 ms | 1.7-2.8 ms |
+  | first view request after 1% rewritten, 1% added, 0.1% removed | 0.10-0.12 s | 1.1 s |
+  | first view request after 0.01% rewritten | 9-22 ms | 47-55 ms |
+  | rebuild after a restart | 0.27-0.31 s | 2.9-3.3 s |
+  | server memory after the build | 50 MB | 455 MB (222 MB before) |
+
+  - Every served answer matched the client's, before and after the changes and after the restart.
+  - A read is 1,000 times cheaper than the client's scan at 200k rows and does not grow with the table. A first build costs 1.5 to 1.9 times one client scan, so views pay for themselves on the second read.
+  - An update costs about 1 ms for each chunk of each view graph its changes touch (`graph_edit`), so a change spread over 1% of a table rewrites most of an index (6,176 edits into 200k nodes: 0.7 s of the 1.1 s). Small changes, as one request makes, cost tens of milliseconds.
+  - Fixed benchmark (`examples/bench`, branch against main 1d7c26d): every stored byte and peak the same, `_north` the same; the summary score (0.2348 on the branch, 0.2305 on main) differs only by timing noise (the per-corpus cost moved both ways).
+- Verdict: **kept** (an option, off by default). A client can ask the server for a total per group or the rows with a value and get it in about a millisecond, kept current as the table changes.
+- Limits and not done: joins are not served (the kernel's join rules are `fn` pointers; a lookup join is an index read and a `get` today); the views live in memory and are built again after each restart (the graphs are written but no commit points at them); only whole-number sums; one rule file for every database of a server; a build holds the writer's lock (2.6 s at 200k rows); memory during a build roughly doubles the server's.
+- Next (proposed, not started): keep the view roots in the database's commit so a restart reads them back; buffer a view's edits across requests (as E148 does for pages) to flatten the cost of spread-out changes; served joins.
+- Run: `python3 -I experiments/served-views/served_views.py IKAM_BIN WORK 200000`; `cargo test --release --test views`; `cargo test --release --bin ikam views`.

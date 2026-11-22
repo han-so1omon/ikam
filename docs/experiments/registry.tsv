@@ -333,7 +333,7 @@ E357	append-scale	option	kept	exp/357-append-scale	speed	db,serve,graph	no	batch
 E358	served-search	option	kept	exp/358-server-search	search	search,bm25,vectors,hnsw,fusion,serve	no	db serve search (Bm25Live), vsearch (client vectors, exact or --hnsw) and fused routes, built on first query and kept in memory; 11,415 READMEs: substring 0.00 / all-words 0.22 known items vs BM25 0.83 (7.4 ms p50), convex 0.7 +0.014/+0.018 known, +0.009/+0.015 topics; first query 8.6 s and ~840 MB RSS; not persisted
 E359	agent-tools	capability	planned	exp/354-goal-scorecard	loop	serve,tools	no	planned (E355): ikam mcp stdio tool server over the live handlers
 E360	served-drafts	capability	planned	exp/354-goal-scorecard	safety	serve,drafts,history	no	planned (E355): drafts, branches, commit messages, reads at a commit over HTTP
-E361	served-views	capability	planned	exp/354-goal-scorecard	speed	db,views,join,serve	no	planned (E355): kept views, joins and counts over db serve
+E361	served-views	capability	kept	exp/361-served-views	speed	db,views,serve	no	groups and indexes kept by db serve (--views FILE): a group read 0.7 ms and an index lookup about 2 ms at 200k rows against a 1.7 s client scan; fixed db_scan and view value reads
 E362	host-service	capability	planned	exp/354-goal-scorecard	safety	host,limits,queue	no	planned (E355): per-project rates, one heavy-job queue, memory and start time per project
 E363	host-tokens	capability	planned	exp/354-goal-scorecard	safety	host,auth	no	planned (E355): scoped per-project tokens and rate limits before any public front door
 E364	embedder	capability	planned	exp/354-goal-scorecard	search	search,vectors,embeds	no	planned (E355): in-kernel static embeddings so semantic search needs no outside model

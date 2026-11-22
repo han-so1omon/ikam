@@ -6,6 +6,7 @@ mod corpus;
 mod dav;
 mod dbsearch;
 mod dbserve;
+mod dbviews;
 mod host;
 mod http;
 mod json;
@@ -29,7 +30,7 @@ const USAGE: &str = "usage: ikam [--store DIR] [--short-records] [--slow-codec-m
   ls [REV[:PATH]] [-r]             list a directory of REV (default main)
   grep TEXT [REV]                  files of REV containing TEXT, with lines
   stats [REV]                      objects and bytes the store holds
-  db serve [--live] [--packs] [--plain-events] [--no-object-templates] [--concurrent-reads] [--edit-index] [--plain-writes] [--hnsw] [--keep-counts N] [PORT]
+  db serve [--live] [--packs] [--plain-events] [--no-object-templates] [--concurrent-reads] [--edit-index] [--plain-writes] [--hnsw] [--keep-counts N] [--views FILE] [PORT]
                                    the store's databases over HTTP, for programs
                                    (default port 8740, 127.0.0.1 only; dbserve.rs);
                                    --live turns on the five options a live
@@ -149,6 +150,7 @@ fn main() -> ExitCode {
 
 /// `ikam db serve [--live] [--packs] [--plain-events] [--no-object-templates]
 /// [--concurrent-reads] [--edit-index] [--plain-writes] [--hnsw] [--keep-counts N]
+/// [--views FILE]
 /// [--allow-host NAME]...
 /// [--log-requests] [PORT]`:
 /// the store's databases over HTTP (`dbserve.rs`), on 127.0.0.1:PORT (default
@@ -175,6 +177,9 @@ fn main() -> ExitCode {
 /// and kept in memory. Vectors are scored exactly unless `--hnsw` (off)
 /// searches them with a graph (E332: about 0.93 of the exact top 10).
 ///
+/// `--views FILE` (E361) keeps the groups and indexes FILE defines for
+/// every database (`dbviews.rs`), read with `view?name=V`.
+///
 /// `--live` (E356) is the five options a database kept by a running
 /// program wants, together: `--packs --plain-events --no-object-templates
 /// --concurrent-reads --edit-index`. Without `--edit-index` a restarted
@@ -185,7 +190,7 @@ fn main() -> ExitCode {
 fn db_cmd(store_dir: &str, args: &[String]) -> Result<(), String> {
     let mut args = args.to_vec();
     if args.first().map(String::as_str) != Some("serve") {
-        return Err("usage: ikam [--store DIR] db serve [--live] [--packs] [--plain-events] [--no-object-templates] [--concurrent-reads] [--edit-index] [--plain-writes] [--hnsw] [--keep-counts N] [--allow-host NAME]... [--log-requests] [PORT]".into());
+        return Err("usage: ikam [--store DIR] db serve [--live] [--packs] [--plain-events] [--no-object-templates] [--concurrent-reads] [--edit-index] [--plain-writes] [--hnsw] [--keep-counts N] [--views FILE] [--allow-host NAME]... [--log-requests] [PORT]".into());
     }
     args.remove(0);
     let mut allowed = Vec::new();
@@ -195,6 +200,13 @@ fn db_cmd(store_dir: &str, args: &[String]) -> Result<(), String> {
     let keep_counts: u32 = match take_flag(&mut args, "--keep-counts") {
         Some(n) => n.parse().map_err(err)?,
         None => 0,
+    };
+    let views = match take_flag(&mut args, "--views") {
+        Some(path) => {
+            let text = std::fs::read_to_string(&path).map_err(err)?;
+            Some(dbviews::parse(&text)?)
+        }
+        None => None,
     };
     let (packs, log_requests, serve_opts) = db_flags(&mut args, keep_counts);
     let port: u16 = args.first().map_or(Ok(8740), |p| p.parse()).map_err(err)?;
@@ -217,10 +229,10 @@ fn db_cmd(store_dir: &str, args: &[String]) -> Result<(), String> {
             filters: true,
         };
         let store = ikam_kernel::backends::PackStore::open_with(store_dir, opts).map_err(err)?;
-        serve_db(store, serve_opts, port, allowed, log_requests)
+        serve_db(store, serve_opts, views, port, allowed, log_requests)
     } else {
         let store = FsStore::open(store_dir).map_err(err)?;
-        serve_db(store, serve_opts, port, allowed, log_requests)
+        serve_db(store, serve_opts, views, port, allowed, log_requests)
     }
 }
 
@@ -279,10 +291,12 @@ fn index(o: DbServeOpts) -> dbsearch::VectorIndex {
 fn serve_db<S: ikam_kernel::Store + Send + Sync + 'static>(
     store: S,
     o: DbServeOpts,
+    views: Option<Vec<dbviews::Rule>>,
     port: u16,
     allowed: Vec<String>,
     log_requests: bool,
 ) -> Result<(), String> {
+    let views = views.map(dbviews::Served::new).transpose()?;
     fn tune<T: ikam_kernel::Store>(mut r: Repo<T>, o: DbServeOpts) -> Repo<T> {
         r.plain_db_events = o.plain_events;
         r.object_templates = o.object_templates;
@@ -303,7 +317,7 @@ fn serve_db<S: ikam_kernel::Store + Send + Sync + 'static>(
             tune(Repo::new(shared), o),
             Some(make),
             o.keep_counts,
-            index(o),
+            (index(o), views),
             port,
             allowed,
             log_requests,
@@ -313,7 +327,7 @@ fn serve_db<S: ikam_kernel::Store + Send + Sync + 'static>(
             tune(Repo::new(store), o),
             None,
             o.keep_counts,
-            index(o),
+            (index(o), views),
             port,
             allowed,
             log_requests,
