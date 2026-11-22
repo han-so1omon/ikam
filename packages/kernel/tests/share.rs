@@ -566,6 +566,22 @@ fn section_and_fragment_scopes_merge_only_their_bytes() {
         import_share(&mut a, &stale, &mut b, "main", "stale"),
         Err(Refused::Outside)
     );
+    // A section may not land in the database's own entry.
+    let db_path = Scope::Section {
+        path: "db/one.md".into(),
+        id: file2,
+        ranges: vec![0..6],
+    };
+    assert_eq!(
+        import_share(
+            &mut a,
+            &share("d", c2, db_path, Right::Merge),
+            &mut b,
+            "main",
+            "m"
+        ),
+        Err(Refused::NotMergeable)
+    );
     // Fragments land under fragments/, by id.
     let f = a.put_content(b"frag bytes").unwrap().id;
     let frag = share("f", c, Scope::Fragments(vec![f]), Right::Merge);
@@ -683,6 +699,21 @@ fn graph_scope_merges_its_nodes_without_other_bytes() {
     let s2 = share("g", c2, scope(), Right::Merge);
     import_share(&mut a, &s2, &mut b, "main", "graph again").unwrap();
     assert_eq!(bytes(&b, &got(&b)[1]), b"v2");
+    // Nor may a graph land in the database's own entry.
+    let in_db = Scope::Graph {
+        path: "db/g".into(),
+        prefix: "x/".into(),
+    };
+    assert_eq!(
+        import_share(
+            &mut a,
+            &share("g", c2, in_db, Right::Merge),
+            &mut b,
+            "main",
+            "m"
+        ),
+        Err(Refused::NotMergeable)
+    );
     // A node pointing at another object is not in the scope: refused.
     let mut nodes3 = nodes.clone();
     nodes3[0].target = Target::Object(c);

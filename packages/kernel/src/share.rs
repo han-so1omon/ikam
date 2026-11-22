@@ -670,6 +670,9 @@ pub fn import_share<S: Store, T: Store>(
         // E365: the other scopes import what a reader of the share sees,
         // as a fresh tree each time (the scope's state at the share's
         // commit), so merging again is three-way against the last import.
+        Scope::Section { path, .. } | Scope::Graph { path, .. } if in_db(path) => {
+            return Err(Refused::NotMergeable);
+        }
         Scope::Section { path, id, ranges } => {
             if src.share_files(share)?.is_empty() {
                 return Err(Refused::Outside);
@@ -713,6 +716,12 @@ pub fn import_share<S: Store, T: Store>(
 }
 
 /// `ranges` sorted, with overlapping or touching ones joined.
+/// Whether `path` lands in the top-level `db` entry, which a commit keeps
+/// for its database and `Repo::merge` merges as one (not as files).
+fn in_db(path: &str) -> bool {
+    path.trim_start_matches('/').split('/').next() == Some("db")
+}
+
 fn joined(ranges: &[Range<u64>]) -> Vec<Range<u64>> {
     let mut rs: Vec<Range<u64>> = ranges.iter().filter(|r| r.start < r.end).cloned().collect();
     rs.sort_by_key(|r| r.start);
