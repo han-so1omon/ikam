@@ -5743,3 +5743,43 @@ Gates on the branch (E229 to E233): every kernel test suite passes (release); cl
 - Verdict: **kept** (an option; it adds a capability and changes no score: no kernel code changed). For a server that restarts and must answer its first write within a client's timeout, `--live` is the setting; for a one-off bulk load into a fresh store, the base flags are about a quarter faster.
 - Not measured: stores above 200k rows; macOS; the growth of a batch's cost with the table (E357).
 - Run: `python3 experiments/goal-scorecard/db_first_write.py IKAM_BIN WORK 10000 2000 base,live` and the same with 200000.
+
+### E357 append-scale (why a batch's cost grows with the table, and an option against it)
+- Branch / parent: exp/357-append-scale / main (745b1c7, E356 merged)
+- Question: E354 and E356 found the load's 2,000-row batch slowing from about 0.1 s to 0.6-0.85 s between 10k and 200k rows, under every flag set. Why, does it keep growing to 1M rows, and what removes it?
+- Method: new `examples/db_append_scale.rs`: a pack store on disk with `db serve`'s base settings (packs, plain events, no object templates), 2,000-row batches each committed, rows of the shape `db_first_write.py` sends (a row under `t/big/pN`, keys in insertion order, and with `index` one entry under `i/big/by_word/WORD/pN`, WORD one of 5,000, so index keys land all over the table). One JSON line per ten batches (median append and commit, bytes the store grew a batch). To split an append by step, timers were added for one run to `db_append` (idempotency lookup, events, log, ids and kv views) and to the graph edit (chunks read, chunks written); they are not committed. Then `db_first_write.py` against `ikam db serve` at 200k rows. A 4-core cloud machine; one run each unless given; a build ran beside part of the 1M base run.
+- Result: batch cost against table size (`db_append_scale`, base settings):
+
+  | Rows before the batch | Rows only | Rows + index | Rows + index, plain writes |
+  |---|---|---|---|
+  | 0 | 32 ms | 124 ms | 71 ms |
+  | 100k | 54 ms | 690 ms | 172 ms |
+  | 200k | 62 ms | 1,010 ms | 214 ms |
+  | 500k | 52 ms | 1,252 ms | 258 ms |
+  | 980k | 51 ms | 1,315 ms | 273 ms |
+  | store at 1M rows | 0.31 GB | 1.86 GB | 3.29 GB |
+  | store growth a batch at 1M | 0.54 MB | 3.5 MB | 6.8 MB |
+
+  - Rows with keys in insertion order stay flat (about 50 ms). The growth comes from the index entries.
+  - At 150k rows the kv view's edit was 832 ms of the append (idempotency lookup 10, events 39, log 13, ids 29 ms). It read and rewrote about 1,500 leaf chunks a batch, 9.6 MB of chunk bytes, for 2,000 new index entries: 0.12 ms reading each chunk and 0.30 ms writing it (the plan search that stores the new chunk as a slice of the old one).
+  - Cause: the view is a prolly tree with 4-32 KiB leaves. A batch of keys spread over the index part touches min(batch, leaves) leaves, and each touched leaf is read, re-cut and written whole. The cost grows until the index has many more leaves than a batch has entries, then levels off at about one leaf rewritten per entry: here from about 300k rows, at 1.25-1.3 s. So it does not keep growing to 1M, but the plateau is ten times the cost at 10k rows.
+  - Plain writes (`Repo::plain_hot_writes`, E261: a rewritten chunk is stored compressed as it is, not planned as a slice) cut the per-chunk write: the batch is 4.8 times faster at 1M rows (273 against 1,315 ms) and still grows 3.9x from empty to 1M. The store grows twice as fast a batch (6.8 against 3.5 MB) and is 1.77x larger at 1M rows (3.29 against 1.86 GB), since each old version of a leaf is kept whole in history.
+
+  Through the server (`db_first_write.py`, 200k rows, 2,000-row batches, 120 s client timeout):
+
+  | Flags | Load batch p50 | Load | First write after restart | Later writes p50 | Append to the big table | Store |
+  |---|---|---|---|---|---|---|
+  | base | 699 ms | 65.5 s | 5.34 s | 180 ms | 1.03 s | 286.5 MB |
+  | `--live` | 864 ms | 82.7 s | 0.11 s | 179 ms | 1.22 s | 286.5 MB |
+  | `--live --plain-writes` | 343 / 349 ms | 35.1 / 35.2 s | 1.93 / 1.95 s | 103 / 95 ms | 0.39 / 0.39 s | 465.9 MB |
+
+  - With `--plain-writes` the load is 2.4 times faster than `--live` and an append to the 200k-row table 3.1 times faster; the store is 1.63x larger.
+  - Its first write after a restart was 1.9 s in both runs, against 0.11 s for `--live`. At 50k rows it was 0.26-0.28 s (against 0.42 s). Reopening that store three more times gave first writes of 2.25 s with `--live`, 0.09 s with `--live --plain-writes`, then 2.22 s with `--live`, so the stall does not follow the flag alone. Not traced.
+  - Reads after the load (`db_append_scale`, 200k rows): the whole index in key order 1,359 ms planned, 958 ms plain; 1,000 row reads 153 and 54 ms. Plain chunks are read without rebuilding a slice.
+  - The roots are the same either way (ids are of the chunks' bytes, not how they are stored): new test `plain_db_writes_keep_the_same_roots` in `tests/plain_writes.rs` (same `Db`, rebuild from the log equal, fsck clean).
+  - A cold pass (`repack_incremental`, E268) at 20k rows took 18-22 s and left the store larger (12.5 to 22.7 MB planned, 14.7 to 24.8 MB plain); not traced, so it is not offered as a way to take the plain bytes back.
+- Change: `ikam db serve --plain-writes` (off; not part of `--live`) sets `Repo::plain_hot_writes`; test of the switch in `src/bin/ikam/main.rs`. `examples/db_append_scale.rs`. `db_first_write.py` gains the set `live+plain-writes`. No kernel code changed, so the scores cannot move.
+- Verdict: **kept** (an option). The cause is found: index entries spread over a table rewrite about one 4-32 KiB leaf each once the index outgrows a batch. `--plain-writes` makes appends to such a table 2.4 to 4.8 times faster at 1.6 to 1.8 times the store. The target (flat batch cost from 10k to 1M rows) is not met: plain writes still grow 3.9x, and nothing here changes how many leaves a batch rewrites.
+- Not measured: macOS; batches other than 2,000; more than one index per table; writes with `--plain-writes` and a full repack afterwards.
+- Next (proposed, not started): buffer index edits so a leaf is rewritten once for many entries (a small recent tree beside `kv`, merged in the background, E262's integrator), which needs every reader of `kv` (gets, ranges, `graph_diff` in views, BM25, vectors, joins) to read both; the 2 s first write after a restart on the plain store; per-chunk costs that do not change bytes (`node_size` encodes each node again to measure it; `merge` rebuilds a map of every touched chunk).
+- Run: `cargo run --release --example db_append_scale -- DIR 1000000 2000 index` (and with `plain-hot`, and without `index`); `python3 experiments/goal-scorecard/db_first_write.py IKAM_BIN WORK 200000 2000 base,live,live+plain-writes`.

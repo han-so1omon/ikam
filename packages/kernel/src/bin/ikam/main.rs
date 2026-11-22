@@ -28,7 +28,7 @@ const USAGE: &str = "usage: ikam [--store DIR] [--short-records] [--slow-codec-m
   ls [REV[:PATH]] [-r]             list a directory of REV (default main)
   grep TEXT [REV]                  files of REV containing TEXT, with lines
   stats [REV]                      objects and bytes the store holds
-  db serve [--live] [--packs] [--plain-events] [--no-object-templates] [--concurrent-reads] [--edit-index] [--keep-counts N] [PORT]
+  db serve [--live] [--packs] [--plain-events] [--no-object-templates] [--concurrent-reads] [--edit-index] [--plain-writes] [--keep-counts N] [PORT]
                                    the store's databases over HTTP, for programs
                                    (default port 8740, 127.0.0.1 only; dbserve.rs);
                                    --live turns on the five options a live
@@ -146,8 +146,9 @@ fn main() -> ExitCode {
     }
 }
 
-/// `ikam db serve [--packs] [--plain-events] [--no-object-templates]
-/// [--concurrent-reads] [--edit-index] [--keep-counts N] [--allow-host NAME]...
+/// `ikam db serve [--live] [--packs] [--plain-events] [--no-object-templates]
+/// [--concurrent-reads] [--edit-index] [--plain-writes] [--keep-counts N]
+/// [--allow-host NAME]...
 /// [--log-requests] [PORT]`:
 /// the store's databases over HTTP (`dbserve.rs`), on 127.0.0.1:PORT (default
 /// 8740). With `--packs` the store is a pack store (E122), which keeps many
@@ -159,7 +160,12 @@ fn main() -> ExitCode {
 /// on a shared store, so they wait neither for an append nor for each other;
 /// `--edit-index` (E232, off) plans each write against the chunks it read
 /// instead of an index of the whole store, which a restarted server builds
-/// on its first write. `--keep-counts N` (E233, off) keeps the number of
+/// on its first write. `--plain-writes` (E357, off) stores the view chunks
+/// an append rewrites compressed as they are, without the plan search
+/// (`Repo::plain_hot_writes`, E261): appends to a table with keys spread
+/// over it (a secondary index) are 3 to 5 times faster, and the store grows
+/// faster, since a rewritten chunk is no longer a slice of the one before.
+/// `--keep-counts N` (E233, off) keeps the number of
 /// keys under each prefix of up to N segments, edited by every append, so
 /// `count?prefix=` and `span` read one node per prefix.
 ///
@@ -173,7 +179,7 @@ fn main() -> ExitCode {
 fn db_cmd(store_dir: &str, args: &[String]) -> Result<(), String> {
     let mut args = args.to_vec();
     if args.first().map(String::as_str) != Some("serve") {
-        return Err("usage: ikam [--store DIR] db serve [--live] [--packs] [--plain-events] [--no-object-templates] [--concurrent-reads] [--edit-index] [--keep-counts N] [--allow-host NAME]... [--log-requests] [PORT]".into());
+        return Err("usage: ikam [--store DIR] db serve [--live] [--packs] [--plain-events] [--no-object-templates] [--concurrent-reads] [--edit-index] [--plain-writes] [--keep-counts N] [--allow-host NAME]... [--log-requests] [PORT]".into());
     }
     args.remove(0);
     let mut allowed = Vec::new();
@@ -230,9 +236,11 @@ fn db_flags(args: &mut Vec<String>, keep_counts: u32) -> (bool, bool, DbServeOpt
     let object_templates = !(take("--no-object-templates") || live);
     let concurrent_reads = take("--concurrent-reads") || live;
     let edit_index = take("--edit-index") || live;
+    let plain_writes = take("--plain-writes");
     let opts = DbServeOpts {
         concurrent_reads,
         edit_index,
+        plain_writes,
         plain_events,
         object_templates,
         keep_counts,
@@ -244,6 +252,7 @@ fn db_flags(args: &mut Vec<String>, keep_counts: u32) -> (bool, bool, DbServeOpt
 struct DbServeOpts {
     concurrent_reads: bool,
     edit_index: bool,
+    plain_writes: bool,
     plain_events: bool,
     object_templates: bool,
     keep_counts: u32,
@@ -261,6 +270,7 @@ fn serve_db<S: ikam_kernel::Store + Send + Sync + 'static>(
     fn tune<T: ikam_kernel::Store>(mut r: Repo<T>, o: DbServeOpts) -> Repo<T> {
         r.plain_db_events = o.plain_events;
         r.object_templates = o.object_templates;
+        r.plain_hot_writes = o.plain_writes;
         if o.edit_index {
             // E232: plan against what each edit reads (E133's scope and
             // hints), not an index of every stored object built on the
@@ -980,6 +990,7 @@ mod tests {
         let all = DbServeOpts {
             concurrent_reads: true,
             edit_index: true,
+            plain_writes: false,
             plain_events: true,
             object_templates: false,
             keep_counts: 0,
@@ -1006,11 +1017,20 @@ mod tests {
         let off = DbServeOpts {
             concurrent_reads: false,
             edit_index: false,
+            plain_writes: false,
             plain_events: false,
             object_templates: true,
             keep_counts: 0,
         };
         assert_eq!(db_flags(&mut a, 0), (false, false, off));
+        // E357: `--plain-writes` is its own option, not part of `--live`.
+        let mut a = v(&["--live", "--plain-writes"]);
+        let plain = DbServeOpts {
+            plain_writes: true,
+            ..all
+        };
+        assert_eq!(db_flags(&mut a, 0), (true, false, plain));
+        assert!(a.is_empty());
     }
     use super::*;
 
