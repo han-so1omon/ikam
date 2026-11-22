@@ -70,6 +70,9 @@ pub struct Server<S: Store> {
     readers: Option<Readers<S>>,
     /// Keep counts of key prefixes up to this many segments (E233); 0: no.
     keep_counts: u32,
+    /// E368: fold appends into the kv view once this many events wait
+    /// (and before a read of the head); 0: fold every append.
+    defer_kv: u64,
 }
 
 fn refname(name: &str) -> String {
@@ -116,7 +119,10 @@ fn at<S: Store>(
             let id: Id = hex
                 .parse()
                 .map_err(|_| Response::text(400, "at: a full commit id"))?;
-            repo.db_at(&id).map_err(fail)
+            // E368: a commit whose kv view lags is folded for the read.
+            repo.db_at(&id)
+                .and_then(|db| repo.db_catch_up(&db))
+                .map_err(fail)
         }
     }
 }
@@ -128,7 +134,38 @@ impl<S: Store> Server<S> {
             heads: Mutex::new(HashMap::new()),
             readers: readers.map(|f| (f, Mutex::new(Vec::new()))),
             keep_counts: 0,
+            defer_kv: 0,
         }
+    }
+
+    /// E368: leave appends' kv folding until `events` wait (0: off).
+    pub fn defer_kv(mut self, events: u64) -> Server<S> {
+        self.defer_kv = events;
+        self
+    }
+
+    /// E368: before a read of `name`'s head, fold whatever the kv view lags
+    /// behind the log and commit it, so a read sees every answered write.
+    /// Only the cached head is looked at when nothing lags.
+    fn settle(&self, name: &str) -> Result<(), Error> {
+        if let Some((_, db)) = self.heads.lock().unwrap().get(name)
+            && db.kv_at == db.ids_at
+        {
+            return Ok(());
+        }
+        let mut repo = self.writer.lock().unwrap();
+        let (_, db) = open(&self.heads, &mut repo, name)?;
+        if db.kv_at == repo.db_head(&db.log)? {
+            return Ok(());
+        }
+        let caught = repo.db_catch_up(&db)?;
+        let msg = format!("db: fold {} event(s)", caught.kv_at - db.kv_at);
+        let c = repo.db_commit(&refname(name), &caught, &msg)?;
+        self.heads
+            .lock()
+            .unwrap()
+            .insert(name.to_string(), (Some(c), caught));
+        Ok(())
     }
 
     /// Keep counts of key prefixes of up to `depth` segments in every
@@ -287,6 +324,12 @@ fn handle<S: Store>(srv: &Server<S>, req: &Request) -> Response {
     }
     let heads = &srv.heads;
     let at_param = req.param("at");
+    if at_param.is_none()
+        && route != "head"
+        && let Err(e) = srv.settle(name)
+    {
+        return fail(e);
+    }
     srv.read(|repo| {
         let at = at_param.as_deref();
         match (req.method.as_str(), route) {
@@ -429,6 +472,17 @@ fn append<S: Store>(srv: &Server<S>, name: &str, req: &Request) -> Response {
     };
     let db = match srv.keep_counts {
         0 => opened,
+        // E368: counts are built from a current view, so a view left
+        // behind by deferred appends folds first.
+        d if !opened.counts.is_some_and(|c| c.depth == d) => {
+            match repo
+                .db_catch_up(&opened)
+                .and_then(|o| repo.db_keep_counts(&o, d))
+            {
+                Ok(db) => db,
+                Err(e) => return fail(e),
+            }
+        }
         d => match repo.db_keep_counts(&opened, d) {
             Ok(db) => db,
             Err(e) => return fail(e),
@@ -443,7 +497,21 @@ fn append<S: Store>(srv: &Server<S>, name: &str, req: &Request) -> Response {
     {
         return Response::new(409).body("application/json", head_json(head, seq));
     }
-    let new = match repo.db_append(&db, &events) {
+    // E368: with `--defer-kv` the kv view folds once enough events wait;
+    // without it, a view left behind (a store written with it) folds first.
+    let new = if srv.defer_kv > 0 {
+        repo.db_append_deferred(&db, &events).and_then(|d| {
+            if d.ids_at - d.kv_at >= srv.defer_kv {
+                repo.db_catch_up(&d)
+            } else {
+                Ok(d)
+            }
+        })
+    } else {
+        repo.db_catch_up(&db)
+            .and_then(|d| repo.db_append(&d, &events))
+    };
+    let new = match new {
         Ok(d) => d,
         Err(e) => return fail(e),
     };
@@ -451,14 +519,14 @@ fn append<S: Store>(srv: &Server<S>, name: &str, req: &Request) -> Response {
         // Every event was a retry: nothing to commit.
         return Response::new(200).body("application/json", head_json(head, seq));
     }
-    let msg = format!("db: {} event(s)", new.kv_at - seq);
+    let msg = format!("db: {} event(s)", new.ids_at - seq);
     match repo.db_commit(&refname(name), &new, &msg) {
         Ok(c) => {
             srv.heads
                 .lock()
                 .unwrap()
                 .insert(name.to_string(), (Some(c), new));
-            Response::new(200).body("application/json", head_json(Some(c), new.kv_at))
+            Response::new(200).body("application/json", head_json(Some(c), new.ids_at))
         }
         Err(e) => fail(e),
     }
@@ -469,7 +537,7 @@ fn append<S: Store>(srv: &Server<S>, name: &str, req: &Request) -> Response {
 pub fn serve<S: Store + Send + 'static>(
     repo: Repo<S>,
     readers: Option<ReaderFactory<S>>,
-    keep_counts: u32,
+    (keep_counts, defer_kv): (u32, u64),
     port: u16,
     allowed: Vec<String>,
     log_requests: bool,
@@ -482,7 +550,11 @@ pub fn serve<S: Store + Send + 'static>(
     if reader.is_some() && auth.is_none() {
         return Err("IKAM_READ_AUTH needs IKAM_AUTH too".into());
     }
-    let state = Arc::new(Server::new(repo, readers).keep_counts(keep_counts));
+    let state = Arc::new(
+        Server::new(repo, readers)
+            .keep_counts(keep_counts)
+            .defer_kv(defer_kv),
+    );
     let hosts = Hosts::new(port, allowed);
     let password = auth.is_some();
     let handler = Arc::new(move |req: Request| {
@@ -571,12 +643,16 @@ mod tests {
     fn append_scan_get_and_read_at_an_older_commit() {
         for shared in [false, true] {
             for keep_counts in [0, 3] {
-                served_routes(shared, keep_counts);
+                // E368: with the kv view folded every 2 events, or only
+                // when read, every answer is the same.
+                for defer in [0, 2, 1000] {
+                    served_routes(shared, keep_counts, defer);
+                }
             }
         }
     }
 
-    fn served_routes(shared: bool, keep_counts: u32) {
+    fn served_routes(shared: bool, keep_counts: u32, defer: u64) {
         let st = if shared {
             let store = ikam_kernel::SharedStore::new(MemStore::default());
             let make: ReaderFactory<_> = Box::new(|w: &Repo<_>| w.sibling());
@@ -587,7 +663,8 @@ mod tests {
                 None,
             )
         }
-        .keep_counts(keep_counts);
+        .keep_counts(keep_counts)
+        .defer_kv(defer);
         let h = |r: Request| handle(&st, &r);
         let ev = [(EVENTS.to_string())];
         let ct = [("content-type", ev[0].as_str())];

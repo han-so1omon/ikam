@@ -313,6 +313,9 @@ fn parse_seq(label: &str) -> Result<u64, Error> {
     }
 }
 
+/// A logged event, its encoding and its id (E368: what a fold reads).
+type Logged = (Event, Vec<u8>, Id);
+
 impl<S: Store> Repo<S> {
     /// An empty database: three empty graphs, at log position 0.
     pub fn db_empty(&mut self) -> Result<Db, Error> {
@@ -380,6 +383,60 @@ impl<S: Store> Repo<S> {
         if db.ids_at != head || db.kv_at != head || db.counts.is_some_and(|c| c.at != head) {
             return Err(Error::Decode("db views are behind the log"));
         }
+        let (logged, span) = self.db_log_events(db, head, events)?;
+        if span.is_empty() {
+            return Ok(*db);
+        }
+        self.db_fold_kv(&logged, &span)
+    }
+
+    /// E368: `db_append` that leaves the kv view (and kept counts) behind
+    /// the log: the events are logged, their contents stored and their
+    /// idempotency keys indexed, but no kv chunk is rewritten. A later
+    /// `db_catch_up` folds every event since in one edit of the view, so
+    /// a chunk that many batches touch is rewritten once, not once a
+    /// batch. Reads of kv (`db_get`, `db_range`, ...) see the view as of
+    /// `kv_at` until then.
+    pub fn db_append_deferred(&mut self, db: &Db, events: &[Event]) -> Result<Db, Error> {
+        let head = self.db_head(&db.log)?;
+        if db.ids_at != head {
+            return Err(Error::Decode("db views are behind the log"));
+        }
+        Ok(self.db_log_events(db, head, events)?.0)
+    }
+
+    /// E368: fold the events logged after `kv_at` into the kv view (and
+    /// kept counts), as one append of them all would: the same roots as
+    /// appending them batch by batch (tests/db.rs).
+    pub fn db_catch_up(&mut self, db: &Db) -> Result<Db, Error> {
+        let head = self.db_head(&db.log)?;
+        if db.kv_at == head {
+            return Ok(*db);
+        }
+        if db.kv_at > head || db.counts.is_some_and(|c| c.at != db.kv_at) {
+            return Err(Error::Decode("db views are out of step"));
+        }
+        let mut span = Vec::new();
+        for n in self.graph_range(&db.log, &seq_label(db.kv_at + 1), None, usize::MAX, false)? {
+            let Target::Content(a) = n.target else {
+                return Err(Error::Decode("db log"));
+            };
+            let bytes = self.read_content(&a.id())?;
+            span.push((Event::decode(&bytes)?.0, bytes, a.id()));
+        }
+        self.db_fold_kv(db, &span)
+    }
+
+    /// Check `events`, store their contents and log the fresh ones (those
+    /// whose idempotency key is new) after `head`, editing `log` and `ids`.
+    /// Returns the database with those two advanced, and the fresh events
+    /// with their encodings and ids, for `db_fold_kv`.
+    fn db_log_events(
+        &mut self,
+        db: &Db,
+        head: u64,
+        events: &[Event],
+    ) -> Result<(Db, Vec<Logged>), Error> {
         // Every idempotency key in the batch, looked up in one pass.
         let keys = events.iter().map(|e| e.idempotency_key.clone()).collect();
         let mut seen: BTreeMap<String, Id> = BTreeMap::new();
@@ -403,30 +460,45 @@ impl<S: Store> Repo<S> {
                 None => {}
             }
             seen.insert(e.idempotency_key.clone(), id);
-            fresh.push((e, bytes, id));
+            fresh.push((e.clone(), bytes, id));
         }
         if fresh.is_empty() {
-            return Ok(*db);
+            return Ok((*db, fresh));
         }
-        let (mut log, mut ids, mut changes) = (BTreeMap::new(), BTreeMap::new(), Changes::new());
-        let mut drops: Vec<(String, String)> = Vec::new();
+        let (mut log, mut ids) = (BTreeMap::new(), BTreeMap::new());
         let mut seq = head;
-        for (e, bytes, id) in fresh {
+        for (e, bytes, id) in &fresh {
             seq += 1;
             if self.plain_db_events {
-                if !self.has_content(&id)? {
-                    let plain = self.encode_plain(&bytes);
-                    self.materialize(id, &plain, &bytes)?;
+                if !self.has_content(id)? {
+                    let plain = self.encode_plain(bytes);
+                    self.materialize(*id, &plain, bytes)?;
                 }
             } else {
-                self.put_content(&bytes)?;
+                self.put_content(bytes)?;
             }
             if matches!(e.op, Op::Upsert(ref v) if v.is_empty()) {
                 self.put_content(&[])?;
             }
-            let entry = entry(seq, e, id);
+            let entry = entry(seq, e, *id);
             log.insert(entry.log.label.clone(), Some(entry.log));
             ids.insert(entry.id.label.clone(), Some(entry.id));
+        }
+        let logged = Db {
+            log: self.graph_edit(&db.log, log)?,
+            ids: self.graph_edit_with(&db.ids, ids, Keys::Any)?,
+            ids_at: seq,
+            ..*db
+        };
+        Ok((logged, fresh))
+    }
+
+    /// Fold `span`, the events logged right after `db.kv_at` (and already
+    /// stored), into the kv view and kept counts, in one edit.
+    fn db_fold_kv(&mut self, db: &Db, span: &[Logged]) -> Result<Db, Error> {
+        let mut changes = Changes::new();
+        let mut drops: Vec<(String, String)> = Vec::new();
+        for (e, bytes, id) in span {
             let range = match &e.op {
                 // `/` is followed by `0`: the keys below `k` are [k/, k0).
                 Op::Remove { subtree: true } => {
@@ -453,11 +525,12 @@ impl<S: Store> Repo<S> {
                 &mut changes,
                 &below,
                 e,
-                id,
-                Event::decode(&bytes)?.1,
+                *id,
+                Event::decode(bytes)?.1,
                 bytes.len(),
             );
         }
+        let seq = db.kv_at + span.len() as u64;
         let counts = match db.counts {
             Some(c) => Some(Counts {
                 root: self.count_edit(db, &c, &changes)?,
@@ -478,12 +551,10 @@ impl<S: Store> Repo<S> {
             kv_root = self.graph_drop_range(&kv_root, &lo, Some(&hi))?;
         }
         Ok(Db {
-            log: self.graph_edit(&db.log, log)?,
-            ids: self.graph_edit_with(&db.ids, ids, Keys::Any)?,
             kv: self.graph_edit_with(&kv_root, kv, Keys::Any)?,
-            ids_at: seq,
             kv_at: seq,
             counts,
+            ..*db
         })
     }
 

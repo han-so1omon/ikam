@@ -5783,3 +5783,43 @@ Gates on the branch (E229 to E233): every kernel test suite passes (release); cl
 - Not measured: macOS; batches other than 2,000; more than one index per table; writes with `--plain-writes` and a full repack afterwards.
 - Next (proposed, not started): buffer index edits so a leaf is rewritten once for many entries (a small recent tree beside `kv`, merged in the background, E262's integrator), which needs every reader of `kv` (gets, ranges, `graph_diff` in views, BM25, vectors, joins) to read both; the 2 s first write after a restart on the plain store; per-chunk costs that do not change bytes (`node_size` encodes each node again to measure it; `merge` rebuilds a map of every touched chunk).
 - Run: `cargo run --release --example db_append_scale -- DIR 1000000 2000 index` (and with `plain-hot`, and without `index`); `python3 experiments/goal-scorecard/db_first_write.py IKAM_BIN WORK 200000 2000 base,live,live+plain-writes`.
+
+### E368 deferred-kv (fold appends into the kv view in batches: buffered index edits)
+- Branch / parent: exp/368-deferred-kv / main (ccdf499, E357 merged)
+- Question: E357 left a 2,000-row batch with one index entry per row growing from 124 ms on an empty table to 1.0 s at 200k rows, because each new index entry lands in a different leaf of the kv view, so every batch rewrites about one leaf per entry; `--plain-writes` made each rewrite cheaper but not fewer. If the kv view is folded once for many batches, a leaf that many batches touch is rewritten once. How much does that save, what does it cost a read, and does it give the same database?
+- Hypothesis: the `Db` already records where each view stands in the log (`kv_at`), so appends can log events and index their idempotency keys at once and fold the kv view later, with the same roots as appending batch by batch. Loading would get several times faster and the store smaller; a read of the head pays for the fold of whatever waits.
+- Change: an option, off by default (not part of `--live`).
+  - `src/db.rs`: `db_append` split into logging (`log`, `ids`: checks, contents, idempotency) and folding (`kv` and kept counts, in one edit). New `Repo::db_append_deferred` (log only, `kv_at` stays behind) and `Repo::db_catch_up` (folds every event after `kv_at` in one edit, as one append of them all would). `db_append` still refuses a view that lags.
+  - `ikam db serve --defer-kv N` (`dbserve.rs`, `main.rs`): appends are logged and committed at once; the kv view folds when N events wait, and before any read of a database's head (the fold is committed as "db: fold N event(s)"), so a read sees every answered write. Reads at an older commit fold that commit's view in memory. Without the flag, a view left behind by an earlier `--defer-kv` session folds on the first append. With `--keep-counts`, a lagging view folds before the counts are built.
+  - Tests: `deferred_kv_catches_up_to_the_same_roots` (tests/db.rs: 30 random batches of upserts, removes, subtree and range removes, folded every 7 batches and at the end, equal roots to batch-by-batch appends, with range drops on and off and with kept counts; an append onto a lagging view is refused). `dbserve`'s route test runs with no deferral, a fold every 2 events and one only on reads.
+  - `examples/db_append_scale.rs` takes `defer=N`; `experiments/goal-scorecard/defer_kv_served.py` (new) loads through the server and reads a just-written row every 10 batches.
+- Result (200k rows in 2,000-row batches, one index entry per row; a 4-core cloud machine):
+
+  `db_append_scale` (the kernel with a pack store, `live index`):
+
+  | | load | batch p50 at 180k rows | store |
+  |---|---|---|---|
+  | no deferral (as `--live`) | 65.8 s | 1,111 ms | 274 MB |
+  | `plain-hot` (as `--plain-writes`) | 27.4 s | 409 ms | 449 MB |
+  | `defer=20000` | 23.0 s | 79 ms (+ a 2.6 s fold every 10 batches) | 159 MB |
+  | `defer=100000` | 12.5 s | 84 ms (+ a 1.4 s fold every 50 batches) | 120 MB |
+  | `plain-hot defer=20000` | 15.1 s | 80 ms (+ a 1.2 s fold every 10 batches) | 210 MB |
+
+  Through `ikam db serve` (`defer_kv_served.py`, a read of the last row written after every 10 batches):
+
+  | flags | load | append p50 / p99 | read p50 / max | store |
+  |---|---|---|---|---|
+  | `--live` | 74-77 s | 770-799 / 1,424-1,540 ms | 5.8 / 7.9 ms | 276 MB |
+  | `--live --plain-writes` | 33.1 s | 323 / 731 ms | 3.2 / 6.0 ms | 452 MB |
+  | `--live --defer-kv 20000` | 27.7 s | 117 / 1,763 ms | 17.9 / 24.3 ms | 161 MB |
+  | `--live --defer-kv 100000` | 20.0-21.5 s | 101-111 / 167-169 ms | 1,044-1,111 / 1,421-1,429 ms | 131 MB |
+
+  - Loading is 3.6-5.3 times faster than `--live` and the store 2.1-2.3 times smaller (likely because each leaf is rewritten once a fold, not once a batch, so fewer superseded versions are stored; not traced). Against `--plain-writes`, it is faster and 2.8-3.5 times smaller.
+  - The fold still grows with the index (0.3 s at the first fold to 2.6 s at 180k rows with a fold every 20k events), since one fold touches nearly every leaf once the index is spread over them. So the cost per row is not flat, but it grows far more slowly.
+  - A read pays for the fold of whatever waits: up to 1.4 s after 20,000 unfolded events at 200k rows with `--defer-kv 100000`. With `--defer-kv 20000` the appends fold before the reads came, so reads took 18-24 ms, and the append that folds takes up to 1.8 s. N trades a load's speed against the longest wait of one request.
+  - The fixed benchmark is unchanged (it writes no databases): bytes, proxy and read scores and the north score (0.306) equal main's; the cost score was 0.2523 against main's 0.2662 in the same session, within its timing noise.
+  - `cargo test --release`: 335 pass, 4 ignored; clippy clean.
+- Verdict: **kept as an option** (`--defer-kv N`, off by default). For bulk loads and write-heavy work it is the fastest and smallest way to write indexed tables here.
+- Limits: a store left with a lagging view (the server stopped before a fold) is read and appended to by `db serve`, which folds it, but the kernel's other writers (`merge`, sync and shares, hot tables) refuse it with "db views are behind the log" until then. Folds hold the writer lock, so other appends wait for them.
+- Not measured: macOS; the Mac's SSD; mixed read and write traffic; folding on a timer or a background thread (a later change could fold while idle); `--defer-kv` together with `--plain-writes` through the server.
+- Run: `cargo run --release --example db_append_scale -- DIR 200000 2000 live index defer=100000`; `python3 experiments/goal-scorecard/defer_kv_served.py IKAM_BIN WORK 200000 10 "--live;--live --defer-kv 20000;--live --defer-kv 100000"`.
