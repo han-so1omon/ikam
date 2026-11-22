@@ -72,3 +72,52 @@ fn plain_writes_skip_slices_and_read_back() {
         assert_eq!(plain.read_content(id).unwrap(), text(i));
     }
 }
+
+/// E357 (`db serve --plain-writes`): a database whose batches touch keys all
+/// over its table (an index) gets the same roots with plain writes as with
+/// planned ones, since ids are of the chunks' bytes and not of how they are
+/// stored; the log rebuilds to the same views, and fsck stays clean.
+#[test]
+fn plain_db_writes_keep_the_same_roots() {
+    let load = |plain: bool| {
+        let mut repo = Repo::new(MemStore::default());
+        repo.plain_db_events = true;
+        repo.plain_hot_writes = plain;
+        let mut db = repo.db_empty().unwrap();
+        for b in 0..6 {
+            let events: Vec<ikam_kernel::Event> = (b * 300..(b + 1) * 300)
+                .flat_map(|i| {
+                    let pk = format!("p{i:08}");
+                    [
+                        ikam_kernel::Event::upsert(
+                            &format!("t/big/{pk}"),
+                            b"row",
+                            &format!("r{i}"),
+                        ),
+                        ikam_kernel::Event::upsert(
+                            &format!("i/big/w{}/{pk}", (i * 7919) % 97),
+                            pk.as_bytes(),
+                            &format!("i{i}"),
+                        ),
+                    ]
+                })
+                .collect();
+            db = repo.db_append(&db, &events).unwrap();
+        }
+        repo.db_commit("db/t", &db, "load").unwrap();
+        (repo, db)
+    };
+    let (planned_repo, planned) = load(false);
+    let (mut repo, db) = load(true);
+    assert_eq!(db, planned);
+    assert!(stored(&repo) > stored(&planned_repo));
+    let rebuilt = repo.db_rebuild(&db.log).unwrap();
+    assert_eq!((rebuilt.kv, rebuilt.ids), (db.kv, db.ids));
+    assert_eq!(
+        repo.db_prefix(&db, "i/big/", usize::MAX, false)
+            .unwrap()
+            .len(),
+        1800
+    );
+    assert!(repo.fsck().unwrap().is_empty());
+}
