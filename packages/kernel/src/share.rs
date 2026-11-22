@@ -18,13 +18,18 @@
 //! of its scope, from file, record or node layers, never storage objects (a
 //! group or dictionary object can hold bytes of other files, E126).
 //!
-//! A merge ([`import_share`]) copies a `Path` or `Records` scope into the
+//! A merge ([`import_share`]) copies a share's scope into the
 //! receiving project's own store: bytes are put again there, so the two
 //! stores share nothing. Each import is a commit on the receiver's
 //! `import/<project>/<share>` ref, built on the previous import, and is then
 //! merged into the target ref with `Repo::merge` (E265), so merging again
 //! is three-way against what was merged last and a change on both sides is
-//! a conflict. Who may authorize a merge is the caller's decision.
+//! a conflict. Who may authorize a merge is the caller's decision. A
+//! `Section` import is the file at its path holding only the granted
+//! ranges, joined in order; a `Fragments` import is `fragments/<id>` for
+//! each fragment; a `Graph` import is a graph at its path with the share's
+//! nodes, each node's bytes put again (a range as its own content) and
+//! only the edges among them (E365).
 
 use std::ops::Range;
 
@@ -662,11 +667,141 @@ pub fn import_share<S: Store, T: Store>(
             }
             dst.db_commit(&import, &db, &note)?
         }
-        _ => return Err(Refused::NotMergeable),
+        // E365: the other scopes import what a reader of the share sees,
+        // as a fresh tree each time (the scope's state at the share's
+        // commit), so merging again is three-way against the last import.
+        Scope::Section { path, .. } | Scope::Graph { path, .. } if in_db(path) => {
+            return Err(Refused::NotMergeable);
+        }
+        Scope::Section { path, id, ranges } => {
+            if src.share_files(share)?.is_empty() {
+                return Err(Refused::Outside);
+            }
+            let mut bytes = Vec::new();
+            for r in joined(ranges) {
+                bytes.extend(src.read_range(id, r.start, r.end - r.start)?.0);
+            }
+            let id = dst.put_content(&bytes)?.id;
+            let edits = [Edit::Put {
+                path: path.clone(),
+                id,
+            }];
+            let tree = dst.edit_tree(None, &edits)?;
+            dst.commit(&import, tree, &note)?
+        }
+        Scope::Fragments(ids) => {
+            let mut edits = Vec::new();
+            for f in ids {
+                let id = dst.put_content(&src.share_fragment(share, f)?)?.id;
+                edits.push(Edit::Put {
+                    path: format!("fragments/{}", f.to_hex()),
+                    id,
+                });
+            }
+            let tree = dst.edit_tree(None, &edits)?;
+            dst.commit(&import, tree, &note)?
+        }
+        Scope::Graph { path, .. } => {
+            let graph = copy_nodes(src, &src.share_nodes(share, "")?, dst)?;
+            let empty = dst.edit_tree(None, &[])?;
+            let tree = put_entry(dst, empty, &split_path(path)?, Kind::Graph, graph)?;
+            dst.commit(&import, tree, &note)?
+        }
     };
     if dst.store.get_ref(into)?.is_none() {
         dst.branch(into, head)?;
         return Ok(Merged::FastForward(head));
     }
     Ok(dst.merge(into, &import, message)?)
+}
+
+/// `ranges` sorted, with overlapping or touching ones joined.
+/// Whether `path` lands in the top-level `db` entry, which a commit keeps
+/// for its database and `Repo::merge` merges as one (not as files).
+fn in_db(path: &str) -> bool {
+    path.trim_start_matches('/').split('/').next() == Some("db")
+}
+
+fn joined(ranges: &[Range<u64>]) -> Vec<Range<u64>> {
+    let mut rs: Vec<Range<u64>> = ranges.iter().filter(|r| r.start < r.end).cloned().collect();
+    rs.sort_by_key(|r| r.start);
+    let mut out: Vec<Range<u64>> = Vec::new();
+    for r in rs {
+        match out.last_mut() {
+            Some(last) if r.start <= last.end => last.end = last.end.max(r.end),
+            _ => out.push(r),
+        }
+    }
+    out
+}
+
+/// `nodes` (from a share) as a graph in `dst`: each node's bytes put again
+/// there, a range as its own content (the content it is a range of may
+/// hold bytes outside the share), and only the edges between the nodes.
+/// A node that points at another object is refused, since that object is
+/// not in the scope.
+fn copy_nodes<S: Store, T: Store>(
+    src: &Repo<S>,
+    nodes: &[Node],
+    dst: &mut Repo<T>,
+) -> Result<Id, Refused> {
+    use crate::{Arg, Target};
+    let keys: std::collections::HashSet<[u8; 8]> = nodes
+        .iter()
+        .map(|n| crate::object::node_key(&n.label))
+        .collect();
+    let mut out = Vec::with_capacity(nodes.len());
+    for n in nodes {
+        let target = match &n.target {
+            Target::None => Target::None,
+            Target::Content(Arg::Whole(id)) => {
+                Target::Content(Arg::Whole(dst.put_content(&src.read_content(id)?)?.id))
+            }
+            Target::Content(Arg::Range { id, start, len }) => {
+                let bytes = src.read_range(id, *start, *len)?.0;
+                Target::Content(Arg::Whole(dst.put_content(&bytes)?.id))
+            }
+            _ => return Err(Refused::NotMergeable),
+        };
+        let mut edges = n.edges.clone();
+        edges.retain(|e| keys.contains(&e.to));
+        out.push(Node {
+            label: n.label.clone(),
+            target,
+            edges,
+        });
+    }
+    Ok(dst.put_graph(out)?)
+}
+
+/// Tree `root` with the entry at `parts` set to `(kind, id)`, making
+/// directories as needed.
+fn put_entry<T: Store>(
+    dst: &mut Repo<T>,
+    root: Id,
+    parts: &[&str],
+    kind: Kind,
+    id: Id,
+) -> Result<Id, Refused> {
+    let mut entries = match dst.get(&root)? {
+        Object::Tree(es) => es,
+        _ => return Err(Refused::Store(format!("{root}: not a tree"))),
+    };
+    let (name, rest) = (parts[0], &parts[1..]);
+    let (kind, id) = if rest.is_empty() {
+        (kind, id)
+    } else {
+        let sub = match entries.iter().find(|e| e.name == name) {
+            Some(e) if e.kind == Kind::Tree => e.id,
+            _ => dst.edit_tree(None, &[])?,
+        };
+        (Kind::Tree, put_entry(dst, sub, rest, kind, id)?)
+    };
+    entries.retain(|e| e.name != name);
+    entries.push(crate::TreeEntry {
+        name: name.to_string(),
+        kind,
+        id,
+    });
+    Ok(dst.put(&Object::tree(entries)?)?)
 }

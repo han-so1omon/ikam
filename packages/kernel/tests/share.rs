@@ -7,7 +7,9 @@
 
 use ikam_kernel::merge::{Conflict, Merged};
 use ikam_kernel::share::{Refused, Right, Scope, Share, import_share};
-use ikam_kernel::{Edit, Event, Id, Kind, MemStore, Node, Object, Repo, Target, TreeEntry};
+use ikam_kernel::{
+    Arg, Edge, Edit, Event, Id, Kind, MemStore, Node, Object, Repo, Target, TreeEntry,
+};
 
 const KEY: [u8; 32] = [7; 32];
 const NOW: u64 = 1_000;
@@ -504,21 +506,224 @@ fn merge_copies_records_incrementally() {
 }
 
 #[test]
-fn only_path_and_records_scopes_merge() {
+fn a_read_share_does_not_merge() {
     let (mut a, c) = source();
     let mut b = Repo::new(MemStore::default());
-    let f = a.put_content(b"frag").unwrap().id;
     let read_share = share("x", c, Scope::Path("pub".into()), Right::Read);
     assert_eq!(
         import_share(&mut a, &read_share, &mut b, "main", "m"),
         Err(Refused::Right)
     );
-    let frag = share("f", c, Scope::Fragments(vec![f]), Right::Merge);
+    assert!(b.resolve("main").is_err());
+}
+
+#[test]
+fn section_and_fragment_scopes_merge_only_their_bytes() {
+    // E365: a section import is the granted ranges only; again three-way.
+    let (mut a, c) = source();
+    let mut b = Repo::new(MemStore::default());
+    put(&mut b, "main", &[("own.md", "b's own\n")]);
+    let file = a
+        .put_content(b"alpha shared line\nsecond line\n")
+        .unwrap()
+        .id;
+    let section = |c: Id, id: Id, ranges: Vec<std::ops::Range<u64>>| {
+        let scope = Scope::Section {
+            path: "pub/one.md".into(),
+            id,
+            ranges,
+        };
+        share("s", c, scope, Right::Merge)
+    };
+    // Two touching ranges and one apart: "alpha shared" and "second".
+    let s = section(c, file, vec![6..12, 0..6, 18..24]);
+    import_share(&mut a, &s, &mut b, "main", "sections").unwrap();
     assert_eq!(
-        import_share(&mut a, &frag, &mut b, "main", "m"),
+        read(&b, "main", "pub/one.md").unwrap(),
+        b"alpha sharedsecond"
+    );
+    assert_eq!(read(&b, "main", "own.md").unwrap(), b"b's own\n");
+    assert!(read(&b, "main", "pub/two.md").is_none());
+    // The source edits inside the section; the receiver's file follows.
+    let c2 = put(
+        &mut a,
+        "main",
+        &[("pub/one.md", "ALPHA shared line\nsecond line\n")],
+    );
+    let file2 = a
+        .put_content(b"ALPHA shared line\nsecond line\n")
+        .unwrap()
+        .id;
+    let s2 = section(c2, file2, vec![0..12]);
+    assert!(matches!(
+        import_share(&mut a, &s2, &mut b, "main", "again").unwrap(),
+        Merged::FastForward(_) | Merged::Commit(_)
+    ));
+    assert_eq!(read(&b, "main", "pub/one.md").unwrap(), b"ALPHA shared");
+    // A section of a file version the commit does not have is refused.
+    let stale = section(c2, file, vec![0..6]);
+    assert_eq!(
+        import_share(&mut a, &stale, &mut b, "main", "stale"),
+        Err(Refused::Outside)
+    );
+    // A section may not land in the database's own entry.
+    let db_path = Scope::Section {
+        path: "db/one.md".into(),
+        id: file2,
+        ranges: vec![0..6],
+    };
+    assert_eq!(
+        import_share(
+            &mut a,
+            &share("d", c2, db_path, Right::Merge),
+            &mut b,
+            "main",
+            "m"
+        ),
         Err(Refused::NotMergeable)
     );
-    assert!(b.resolve("main").is_err());
+    // Fragments land under fragments/, by id.
+    let f = a.put_content(b"frag bytes").unwrap().id;
+    let frag = share("f", c, Scope::Fragments(vec![f]), Right::Merge);
+    import_share(&mut a, &frag, &mut b, "main", "fragments").unwrap();
+    assert_eq!(
+        read(&b, "main", &format!("fragments/{}", f.to_hex())).unwrap(),
+        b"frag bytes"
+    );
+    assert!(b.fsck().unwrap().is_empty());
+}
+
+#[test]
+fn graph_scope_merges_its_nodes_without_other_bytes() {
+    // E365: a graph import holds the scope's nodes with their bytes copied
+    // (a range as its own content), and edges only among them.
+    let (mut a, c0) = source();
+    let blob = a.put_content(b"inside|OUTSIDE").unwrap().id;
+    let whole = a.put_content(b"whole node").unwrap().id;
+    let edge = |to: &str| Edge {
+        to: ikam_kernel::node_key(to),
+        label: "rel".into(),
+    };
+    let nodes = vec![
+        Node {
+            label: "x/1".into(),
+            target: Target::Content(Arg::Range {
+                id: blob,
+                start: 0,
+                len: 6,
+            }),
+            edges: vec![edge("x/2"), edge("y/1")],
+        },
+        Node {
+            label: "x/2".into(),
+            target: Target::Content(Arg::Whole(whole)),
+            edges: vec![],
+        },
+        Node {
+            label: "y/1".into(),
+            target: Target::Content(Arg::Range {
+                id: blob,
+                start: 7,
+                len: 7,
+            }),
+            edges: vec![],
+        },
+    ];
+    let graph_commit = |a: &mut Repo<MemStore>, nodes: Vec<Node>| {
+        let g = a.put_graph(nodes).unwrap();
+        let root = tree(a, a.resolve("main").unwrap());
+        let Object::Tree(mut entries) = a.get(&root).unwrap() else {
+            unreachable!()
+        };
+        entries.retain(|e| e.name != "kg");
+        let sub = a
+            .put(
+                &Object::tree(vec![TreeEntry {
+                    name: "g".into(),
+                    kind: Kind::Graph,
+                    id: g,
+                }])
+                .unwrap(),
+            )
+            .unwrap();
+        entries.push(TreeEntry {
+            name: "kg".into(),
+            kind: Kind::Tree,
+            id: sub,
+        });
+        let t = a.put(&Object::tree(entries).unwrap()).unwrap();
+        a.commit("main", t, "graph").unwrap()
+    };
+    let _ = c0;
+    let c = graph_commit(&mut a, nodes.clone());
+    let scope = || Scope::Graph {
+        path: "kg/g".into(),
+        prefix: "x/".into(),
+    };
+    let mut b = Repo::new(MemStore::default());
+    put(&mut b, "main", &[("own.md", "b's own\n")]);
+    let s = share("g", c, scope(), Right::Merge);
+    import_share(&mut a, &s, &mut b, "main", "graph").unwrap();
+    let got = |b: &Repo<MemStore>| {
+        let root = tree(b, b.resolve("main").unwrap());
+        let Object::Tree(es) = b.get(&root).unwrap() else {
+            unreachable!()
+        };
+        let kg = es.iter().find(|e| e.name == "kg").unwrap().id;
+        let Object::Tree(es) = b.get(&kg).unwrap() else {
+            unreachable!()
+        };
+        let g = es.iter().find(|e| e.name == "g").unwrap();
+        assert_eq!(g.kind, Kind::Graph);
+        b.graph_nodes(&g.id).unwrap()
+    };
+    let ns = got(&b);
+    assert_eq!(
+        ns.iter().map(|n| n.label.as_str()).collect::<Vec<_>>(),
+        ["x/1", "x/2"]
+    );
+    let bytes = |b: &Repo<MemStore>, n: &Node| match &n.target {
+        Target::Content(Arg::Whole(id)) => b.read_content(id).unwrap(),
+        t => panic!("{t:?}"),
+    };
+    assert_eq!(bytes(&b, &ns[0]), b"inside");
+    assert_eq!(bytes(&b, &ns[1]), b"whole node");
+    assert_eq!(ns[0].edges, vec![edge("x/2")], "no edge out of the scope");
+    // Nothing outside the scope reached b's store.
+    assert!(b.read_content(&blob).is_err());
+    assert_eq!(read(&b, "main", "own.md").unwrap(), b"b's own\n");
+    // The source changes a node in the scope; importing again follows it.
+    let mut nodes2 = nodes.clone();
+    nodes2[1].target = Target::Content(Arg::Whole(a.put_content(b"v2").unwrap().id));
+    let c2 = graph_commit(&mut a, nodes2);
+    let s2 = share("g", c2, scope(), Right::Merge);
+    import_share(&mut a, &s2, &mut b, "main", "graph again").unwrap();
+    assert_eq!(bytes(&b, &got(&b)[1]), b"v2");
+    // Nor may a graph land in the database's own entry.
+    let in_db = Scope::Graph {
+        path: "db/g".into(),
+        prefix: "x/".into(),
+    };
+    assert_eq!(
+        import_share(
+            &mut a,
+            &share("g", c2, in_db, Right::Merge),
+            &mut b,
+            "main",
+            "m"
+        ),
+        Err(Refused::NotMergeable)
+    );
+    // A node pointing at another object is not in the scope: refused.
+    let mut nodes3 = nodes.clone();
+    nodes3[0].target = Target::Object(c);
+    let c3 = graph_commit(&mut a, nodes3);
+    let s3 = share("g", c3, scope(), Right::Merge);
+    assert_eq!(
+        import_share(&mut a, &s3, &mut b, "main", "m"),
+        Err(Refused::NotMergeable)
+    );
+    assert!(b.fsck().unwrap().is_empty());
 }
 
 #[test]
