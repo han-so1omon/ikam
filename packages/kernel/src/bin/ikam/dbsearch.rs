@@ -240,6 +240,12 @@ impl Kept {
     ) -> Result<Arc<Mutex<KeptVecs>>, Response> {
         let key = (name.to_string(), prefix.to_string());
         let slot = self.vecs.lock().unwrap().get(&key).cloned();
+        // An index built while the prefix held no vectors has no dimension
+        // yet: build it again, from the rows, once the database changes.
+        let slot = slot.filter(|s| {
+            let k = s.lock().unwrap();
+            k.dim > 0 || k.at == *db
+        });
         let slot = match slot {
             Some(s) => s,
             None => {

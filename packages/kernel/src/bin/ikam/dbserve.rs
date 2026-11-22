@@ -706,6 +706,18 @@ mod tests {
         assert_eq!(status("/db/s/search?prefix=t/", b""), 400);
         assert_eq!(status(&format!("{fuse}&fuse=max"), &x(1.0, 0.0)), 400);
         assert_eq!(status("/db/s/vsearch?prefix=t/", &x(1.0, 0.0)), 422);
+        // A prefix searched while empty takes its dimension from the first
+        // vectors appended later.
+        assert!(v(&st, "/db/s/vsearch?prefix=w/", x(1.0, 0.0), false).is_empty());
+        let late = encode_events(&[
+            Event::upsert("w/a", &x(1.0, 0.0), "11"),
+            Event::upsert("w/b", &x(0.0, 1.0), "12"),
+        ]);
+        assert_eq!(h(&st, req("POST", "/db/s/append", &late, &ct)).status, 200);
+        assert_eq!(
+            v(&st, "/db/s/vsearch?prefix=w/", x(0.0, 1.0), false),
+            ["w/b", "w/a"]
+        );
     }
 
     #[test]
