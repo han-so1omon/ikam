@@ -6175,8 +6175,9 @@ Gates on the branch (E229 to E233): every kernel test suite passes (release); cl
   | E379 served index view | E377's slowest step (rows by a secondary index) and E371 "`--views` in the same run" | records live |
   | E380 kept views | E379's 3 s first lookup after every start | records live |
   | E381 view update cost | E380's 200 ms lookup after a 100-row change; E368 and E371 mixed traffic | records live |
+  | E382 one-pass search build | E375's 46 s and 3.8 GB first search of a 1M-row table | records live, questions over records |
 
   Left for later: the rest of E368 and E371 mixed traffic (E381 took the view side), E367's ledger skip, E365's line-level merge, and every Mac row (this night ran in the cloud only).
-- Journal: `loop_journal E374 E381 2026-11-22` on a scratch copy of main's docs with the eight entries appended (each branch keeps its own entry; nothing merged): 8 experiments, 32 firings on `night/2026-11-22`, replay equal to the marking, each finish output equal to its log entry, fsck clean; a second run fired nothing new. Five wait for the owner (E374, E376, E378, E380, E381: changes to merge) and three are closed (E375, E377, E379: measurements).
+- Journal: `loop_journal E374 E382 2026-11-22` on a scratch copy of main's docs with the nine entries appended (each branch keeps its own entry; nothing merged): 9 experiments, 36 firings on `night/2026-11-22`, replay equal to the marking, each finish output equal to its log entry, fsck clean; a second run fired nothing new. Six wait for the owner (E374, E376, E378, E380, E381, E382: changes to merge) and three are closed (E375, E377, E379: measurements).
 - Verdict: **measured** (a plan; no code).
-- Run: `cargo run --release --example loop_gaps`, then `cargo run --release --example loop_journal -- E374 E381 2026-11-22 STORE_DIR` once the entries are on one branch.
+- Run: `cargo run --release --example loop_gaps`, then `cargo run --release --example loop_journal -- E374 E382 2026-11-22 STORE_DIR` once the entries are on one branch.
