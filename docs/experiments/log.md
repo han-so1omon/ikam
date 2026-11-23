@@ -6203,6 +6203,29 @@ Gates on the branch (E229 to E233): every kernel test suite passes (release); cl
 - Next: rows by an index in one request (the server joining index and rows, or E361 views), and a cache of recently read view chunks; the load gap (where the 2.3 s p99 batches go: folds under `--defer-kv`).
 - Not measured: the Mac; concurrent clients; larger rows; PostgreSQL tuned (it ran with defaults).
 - Run: `python3 -I experiments/ab/ab_bench.py IKAM_BIN PG_BIN_DIR WORK 200000 "--live"`.
+
+### E379 index-view (rows by a field through a served index view, in E377's A/B)
+
+- Branch / parent: exp/379-index-view / E377 (exp/377-ab-harness)
+- Question: E377's slowest ikam step was rows by a secondary field (4.0 ms against PostgreSQL's 0.21 ms), with the client writing its own index entries beside each row. Does `db serve --views` (E361), where the server keeps the index and a lookup is one `view?eq=` request, close that gap, and what does it do to the load?
+- Setup: E377's harness with a `view` argument: rows are JSON objects, no client index entries, `db serve --live --views FILE` with `by_word index t/r/ by=field:word`; otherwise the same 200,000 rows, steps and same-rows check (which also compares the row counts of three lookups). One run each way on the same machine within minutes; the index-alone timing (`keys=1`) is from a third run.
+- Results, 200k rows, ikam `--live`:
+
+  | step | client index entries (E377) | served index view | PostgreSQL |
+  | --- | --- | --- | --- |
+  | load | 41.3 s (batch p99 2.2 s) | **13.1 to 16.7 s** (p99 0.3 to 0.4 s) | 9.9 to 11.2 s |
+  | rows by word p50 / p99 | 4.9 / 7.4 ms | 3.1 to 3.4 / 4.8 ms | 0.26 / 0.67 ms |
+  | the same, index only (`keys=1`) | | 0.44 / 0.85 ms | |
+  | first lookup (builds the view) | 4.6 ms | 3.0 to 3.5 s | 0.5 ms |
+  | first lookup after a restart | 3.2 ms | 3.1 to 3.6 s (built again) | 0.8 ms |
+  | size on disk | 144 MB | **94 MB** | 277 MB |
+
+  Other steps were within noise of E377. Same rows on both sides in every run.
+- Findings: half the rows a client writes in E377 are its own index entries, and they cost most of the load: with the server keeping the index the load is 2.5x to 3.2x faster (now 1.2x to 1.5x PostgreSQL's) and the store a third smaller. A lookup is only a little faster: the index part takes 0.44 ms, the rest (about 3 ms for some 40 rows) is reading each row's value from the chunk its key falls in. The view is built on its first request after every start (3 s at 200k rows), as E361 and E369 noted.
+- Verdict: **measured** (no kernel change): a program keeping records in `db serve` should declare its indexes with `--views` rather than write index entries itself. The lookup gap is now the row reads, not the index.
+- Next: keep views on a ref across restarts as `--keep-search` does for search (E369's gap); read the rows of a lookup with fewer chunk decodes (sort keys by chunk, or a cache of decoded chunks); an index view that can carry chosen fields so a lookup answers from the view alone.
+- Not measured: the Mac; more than one index; group views in the same run; values that change the indexed field often.
+- Run: `python3 -I experiments/ab/ab_bench.py IKAM_BIN PG_BIN_DIR WORK 200000 "--live" view`.
 ### E376 skip-unchanged (sending the same rows again writes nothing)
 
 - Branch / parent: exp/376-skip-unchanged / main 021f129
