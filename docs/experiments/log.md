@@ -6168,4 +6168,3 @@ Gates on the branch (E229 to E233): every kernel test suite passes (release); cl
 - Found on the way: a lookup after a 100-row change costs about 200 ms with or without the option (E361 measured about 50 ms after 20 rows), so the incremental update, not the save, is what mixed traffic pays.
 - Verdict: **kept** as an option (off by default).
 - Not measured: the Mac; more than 200k rows; several databases; what a restart costs when many more rows changed while the server was down.
-
