@@ -574,23 +574,27 @@ fn views<S: Store>(srv: &Server<S>, name: &str, route: &str, req: &Request) -> R
         (false, None, p) => p.unwrap_or_default(),
         _ => return Response::text(400, "an index takes eq=X; a group, prefix=P"),
     };
-    let (db, state) = {
-        let mut w = srv.writer.lock().unwrap();
-        let db = match open(&srv.heads, &mut w, name) {
-            Ok((_, db)) => db,
-            Err(e) => return fail(e),
+    // Kept views (E380) that fail a read are built afresh, once.
+    let (db, rows) = loop {
+        let (db, state) = {
+            let mut w = srv.writer.lock().unwrap();
+            let db = match open(&srv.heads, &mut w, name) {
+                Ok((_, db)) => db,
+                Err(e) => return fail(e),
+            };
+            match served.at(&mut w, name, &db) {
+                Ok(st) => (db, st),
+                Err(e) => return fail(e),
+            }
         };
-        match served.at(&mut w, name, &db) {
-            Ok(st) => (db, st),
+        match srv.read(|repo| served.rows(repo, &state, &rule.name, &prefix, limit)) {
+            Ok(rows) => break (db, rows),
+            Err(_) if served.forget(name) => continue,
             Err(e) => return fail(e),
         }
     };
     let keys_only = matches!(req.param("keys").as_deref(), Some("1" | "true"));
     srv.read(|repo| {
-        let rows = match served.rows(repo, &state, &rule.name, &prefix, limit) {
-            Ok(r) => r,
-            Err(e) => return fail(e),
-        };
         if !index {
             return pairs_response(req, rows);
         }
@@ -1139,6 +1143,80 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
+    }
+
+    #[test]
+    fn kept_views_with_missing_chunks_are_built_again() {
+        // E380 review: a kept root can be read while chunks under it are
+        // gone; the first read that fails builds the views afresh.
+        let spec = "by_cust index t/o/ by=field:customer\n";
+        let ct = [("content-type", EVENTS)];
+        let rules = format!("{:?}", crate::dbviews::parse(spec).unwrap());
+        let server = |s: &ikam_kernel::SharedStore<MemStore>, keep: bool| {
+            let v = crate::dbviews::Served::new(crate::dbviews::parse(spec).unwrap()).unwrap();
+            Server::new(Repo::new(s.clone()), None).views(Some(v.keep(keep)))
+        };
+        let rows = |n: usize| -> Vec<u8> {
+            let ev: Vec<Event> = (0..3000)
+                .map(|i| {
+                    let v = format!(r#"{{"customer":"c{}"}}"#, i % n);
+                    Event::upsert(&format!("t/o/{i:05}"), v.as_bytes(), &format!("{i}"))
+                })
+                .collect();
+            encode_events(&ev)
+        };
+        let q = "/db/v/view?name=by_cust&eq=c7&keys=1";
+        let (a, b) = (
+            ikam_kernel::SharedStore::new(MemStore::default()),
+            ikam_kernel::SharedStore::new(MemStore::default()),
+        );
+        for (s, n) in [(&a, 50), (&b, 51)] {
+            let st = server(s, true);
+            let r = handle(&st, &req("POST", "/db/v/append", &rows(n), &ct));
+            assert_eq!(r.status, 200);
+            assert_eq!(handle(&st, &req("GET", q, b"", &[])).status, 200);
+        }
+        let want = handle(&server(&a, false), &req("GET", q, b"", &[])).body;
+        // `a` keeps `b`'s root, copied alone: the chunks it lists are not in `a`.
+        let refname = crate::dbviews::views_ref("v");
+        let theirs = Repo::new(b.clone())
+            .views_load(&refname, &rules)
+            .unwrap()
+            .unwrap();
+        let root = theirs.roots["by_cust"];
+        let chunk = Repo::new(b.clone()).get(&root).unwrap();
+        let mut w = Repo::new(a.clone());
+        let mut ours = w.views_load(&refname, &rules).unwrap().unwrap();
+        ours.roots.insert("by_cust".into(), root);
+        w.plain_hot_writes = true;
+        assert_eq!(w.put(&chunk).unwrap(), root);
+        w.views_save(&refname, &rules, &ours).unwrap();
+        let loaded = w
+            .views_load(&refname, &rules)
+            .unwrap()
+            .expect("the root reads");
+        assert!(
+            w.view_prefix(
+                &crate::dbviews::Served::graph_for_tests(spec),
+                &loaded,
+                "by_cust",
+                "",
+                10_000
+            )
+            .is_err(),
+            "a chunk under the root is missing"
+        );
+        drop(w);
+        let st = server(&a, true);
+        let r = handle(&st, &req("GET", q, b"", &[]));
+        assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
+        assert_eq!(r.body, want);
+        // Built afresh and kept again.
+        let again = Repo::new(a.clone())
+            .views_load(&refname, &rules)
+            .unwrap()
+            .unwrap();
+        assert_ne!(again.roots["by_cust"], root);
     }
 
     #[test]

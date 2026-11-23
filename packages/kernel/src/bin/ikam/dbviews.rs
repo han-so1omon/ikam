@@ -47,7 +47,7 @@
 //!
 //! Add `format=json` for `[["key","value"],...]` (values must be UTF-8).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 
 use ikam_kernel::views::{GroupRule, MapRule, Mode, View, ViewGraph, ViewOp, ViewState};
@@ -233,6 +233,11 @@ pub struct Served {
     states: Mutex<HashMap<String, ViewState>>,
     /// Keep each database's views on a ref across restarts (E380).
     keep: bool,
+    /// Databases whose held views came from a ref and have not been
+    /// built since: their roots were checked, not every chunk under them.
+    from_ref: Mutex<HashSet<String>>,
+    /// Databases whose kept views failed a read: built afresh from now on.
+    no_ref: Mutex<HashSet<String>>,
 }
 
 /// The ref a database's kept views live on (E380).
@@ -258,6 +263,8 @@ impl Served {
             graph,
             states: Mutex::new(HashMap::new()),
             keep: false,
+            from_ref: Mutex::new(HashSet::new()),
+            no_ref: Mutex::new(HashSet::new()),
         })
     }
 
@@ -294,7 +301,7 @@ impl Served {
             Some(s) => (Some(s), false),
             // Views kept by an earlier run; ones that cannot be read are
             // built again.
-            None if self.keep => {
+            None if self.keep && !self.no_ref.lock().unwrap().contains(name) => {
                 let s = writer
                     .views_load(&views_ref(name), &self.rules_text())
                     .ok()
@@ -303,6 +310,10 @@ impl Served {
             }
             None => (None, false),
         };
+        let checked = !loaded && !self.from_ref.lock().unwrap().contains(name);
+        if loaded && kept.is_some() {
+            self.from_ref.lock().unwrap().insert(name.to_string());
+        }
         let state = match kept {
             Some(s) if s.db == *db => {
                 self.states
@@ -319,11 +330,17 @@ impl Served {
                 writer.prune_diff = prune;
                 match out {
                     Ok(st) => st,
-                    Err(_) if loaded => writer.views_build(&self.graph, db)?,
+                    Err(_) if !checked => {
+                        self.from_ref.lock().unwrap().remove(name);
+                        writer.views_build(&self.graph, db)?
+                    }
                     Err(e) => return Err(e),
                 }
             }
-            None => writer.views_build(&self.graph, db)?,
+            None => {
+                self.from_ref.lock().unwrap().remove(name);
+                writer.views_build(&self.graph, db)?
+            }
         };
         // Views that cannot be kept are still served; the next restart
         // builds them again.
@@ -337,6 +354,23 @@ impl Served {
             .unwrap()
             .insert(name.to_string(), state.clone());
         Ok(state)
+    }
+
+    /// After a failed read of `name`'s views: true when they came from a
+    /// ref and were not built since, so the next `at` builds them afresh
+    /// (a kept root can name chunks that are gone or damaged).
+    pub fn forget(&self, name: &str) -> bool {
+        if !self.from_ref.lock().unwrap().remove(name) {
+            return false;
+        }
+        self.states.lock().unwrap().remove(name);
+        self.no_ref.lock().unwrap().insert(name.to_string());
+        true
+    }
+
+    #[cfg(test)]
+    pub fn graph_for_tests(spec: &str) -> ViewGraph {
+        Served::new(parse(spec).unwrap()).unwrap().graph
     }
 
     /// Rows of view `view` at `state` starting with `prefix`.
