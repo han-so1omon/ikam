@@ -356,6 +356,70 @@ impl<S: Store> Repo<S> {
         self.node_values(nodes)
     }
 
+    /// Keep `state` on the ref `name` (E380), so a later process can read
+    /// its views back instead of building them: a commit whose tree holds
+    /// the database the views are at, `rules` (the caller's text naming the
+    /// views' rules, compared on load) and each stored view's graph.
+    pub fn views_save(&mut self, name: &str, rules: &str, state: &ViewState) -> Result<Id, Error> {
+        use crate::{Commit, Kind, Object, TreeEntry};
+        let mut entries = vec![
+            TreeEntry {
+                name: "at".into(),
+                ..self.db_entry(&state.db)?
+            },
+            TreeEntry {
+                name: "rules".into(),
+                kind: Kind::File,
+                id: self.put_content(rules.as_bytes())?.id,
+            },
+        ];
+        for (view, root) in &state.roots {
+            entries.push(TreeEntry {
+                name: format!("v_{view}"),
+                kind: Kind::Graph,
+                id: *root,
+            });
+        }
+        let tree = self.put(&Object::tree(entries)?)?;
+        let commit = self.put(&Object::Commit(Commit {
+            tree,
+            parents: Vec::new(),
+            message: "views".into(),
+        }))?;
+        let old = self.store.get_ref(name)?;
+        self.store.set_ref(name, old, commit)?;
+        Ok(commit)
+    }
+
+    /// The views `views_save` kept on `name`: none without the ref, or when
+    /// they were kept for other rules than `rules`. An error if what the
+    /// ref names cannot be read (the caller builds again).
+    pub fn views_load(&mut self, name: &str, rules: &str) -> Result<Option<ViewState>, Error> {
+        use crate::Object;
+        let Some(c) = self.store.get_ref(name)? else {
+            return Ok(None);
+        };
+        let tree = self.commit_tree(&c)?;
+        let Object::Tree(entries) = self.get(&tree)? else {
+            return Err(Error::WrongKind(tree));
+        };
+        let find = |n: &str| entries.iter().find(|e| e.name == n).map(|e| e.id);
+        let bad = || Error::Decode("kept views");
+        if self.read_content(&find("rules").ok_or_else(bad)?)? != rules.as_bytes() {
+            return Ok(None);
+        }
+        let db = self.db_in(&find("at").ok_or_else(bad)?)?;
+        let mut roots = BTreeMap::new();
+        for e in &entries {
+            if let Some(view) = e.name.strip_prefix("v_") {
+                // Readable, or the caller builds again.
+                self.get(&e.id)?;
+                roots.insert(view.to_string(), e.id);
+            }
+        }
+        Ok(Some(ViewState { roots, db }))
+    }
+
     /// Build every stored and incremental view from `db`, in order, and
     /// run each view's check on all its rows.
     pub fn views_build(&mut self, g: &ViewGraph, db: &Db) -> Result<ViewState, Error> {
