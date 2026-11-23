@@ -192,7 +192,7 @@ impl Live {
         self.refresh()?;
         if progress {
             let bytes: usize = self.docs.values().map(|d| d.bytes()).sum();
-            eprintln!(
+            say!(
                 "{} indexed {} files ({} bytes of text) in {:.1} s",
                 stamp(),
                 self.docs.len(),

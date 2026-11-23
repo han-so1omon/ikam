@@ -12,11 +12,11 @@ use crate::corpus::{self, err};
 
 pub fn serve<S: Store>(repo: &Repo<S>, port: u16) -> Result<(), String> {
     let listener = TcpListener::bind(("127.0.0.1", port)).map_err(err)?;
-    eprintln!("serving on http://127.0.0.1:{port}/");
+    say!("serving on http://127.0.0.1:{port}/");
     for stream in listener.incoming() {
         let Ok(stream) = stream else { continue };
         if let Err(e) = handle(repo, stream) {
-            eprintln!("request failed: {e}");
+            say!("request failed: {e}");
         }
     }
     Ok(())

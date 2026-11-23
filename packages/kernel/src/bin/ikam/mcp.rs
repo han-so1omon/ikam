@@ -63,7 +63,7 @@ pub fn run(
     if n > 0 {
         let msg = format!("mcp: {n} change(s) left at exit");
         if let Some(c) = s.live.flush_with(true, Some(&msg))? {
-            eprintln!("{msg}: committed as {c}");
+            say!("{msg}: committed as {c}");
         }
     }
     Ok(())
