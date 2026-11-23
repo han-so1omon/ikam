@@ -27,11 +27,14 @@ for fl in sets:
     w = os.path.join(work, "m"); shutil.rmtree(w, ignore_errors=True); os.makedirs(w)
     store = os.path.join(w, "store")
     s = d.Server(binary, store, fl.split()); s.start()
-    curve, t0 = [], time.time()
+    curve, t0, due = [], time.time(), check
     for start in range(0, rows, BATCH):
         assert s.append(d.events(b"big", start, min(BATCH, rows - start), b"load"), 600)[1]
-        if (start + BATCH) % check == 0:
-            curve.append(dict(rows=start + BATCH, s=round(time.time() - t0), **mem(s.proc.pid)))
+        loaded = min(start + BATCH, rows)
+        if loaded >= due or loaded == rows:  # any CHECK, and the last batch
+            curve.append(dict(rows=loaded, s=round(time.time() - t0), **mem(s.proc.pid)))
+            while due <= loaded:
+                due += check
     s.req("GET", "/db/t/count?prefix=t/big/", None, 600)
     end = mem(s.proc.pid)
     s.stop(); s.start()
