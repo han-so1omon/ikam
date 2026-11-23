@@ -6173,8 +6173,10 @@ Gates on the branch (E229 to E233): every kernel test suite passes (release); cl
   | E377 A/B harness | the owner's plan to compare against PostgreSQL only as a yardstick | records live |
   | E378 passage index | E358 and E359 "search over files in `live`" | questions over files |
   | E379 served index view | E377's slowest step (rows by a secondary index) and E371 "`--views` in the same run" | records live |
+  | E380 kept views | E379's 3 s first lookup after every start | records live |
+  | E381 view update cost | E380's 200 ms lookup after a 100-row change; E368 and E371 mixed traffic | records live |
 
-  Left for later: E368 and E371 mixed read and write traffic, E367's ledger skip, E365's line-level merge, and every Mac row (this night ran in the cloud only).
-- Journal: `loop_journal E374 E379 2026-11-22` on a scratch copy of main's docs with the six entries appended (each branch keeps its own entry; nothing merged): 6 experiments, 24 firings on `night/2026-11-22`, replay equal to the marking, each finish output equal to its log entry, fsck clean; a second run fired nothing new. Three wait for the owner (E374, E376, E378: options to merge) and three are closed (E375, E377, E379: measurements).
+  Left for later: the rest of E368 and E371 mixed traffic (E381 took the view side), E367's ledger skip, E365's line-level merge, and every Mac row (this night ran in the cloud only).
+- Journal: `loop_journal E374 E381 2026-11-22` on a scratch copy of main's docs with the eight entries appended (each branch keeps its own entry; nothing merged): 8 experiments, 32 firings on `night/2026-11-22`, replay equal to the marking, each finish output equal to its log entry, fsck clean; a second run fired nothing new. Five wait for the owner (E374, E376, E378, E380, E381: changes to merge) and three are closed (E375, E377, E379: measurements).
 - Verdict: **measured** (a plan; no code).
-- Run: `cargo run --release --example loop_gaps`, then `cargo run --release --example loop_journal -- E374 E379 2026-11-22 STORE_DIR` once the entries are on one branch.
+- Run: `cargo run --release --example loop_gaps`, then `cargo run --release --example loop_journal -- E374 E381 2026-11-22 STORE_DIR` once the entries are on one branch.
