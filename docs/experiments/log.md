@@ -6158,6 +6158,26 @@ Gates on the branch (E229 to E233): every kernel test suite passes (release); cl
 - Verdict: **kept** (preset change, each part still an option).
 - Not measured: the Mac; whether 20000 is the best N for other row sizes (E368 measured 100k, E371 20000).
 
+### E378 passage-index (questions answered from an index of words, not a scan)
+
+- Branch / parent: exp/378-passage-index / main 021f129
+- Question: ikam's business case is a service that projects use to find and change files; questions (`ikam live`'s Ask, `/api/ask`, the agent tools' `passages`, `ikam mcp`) rank passages by scanning every extracted text for every term (E358, E359), so each costs time in proportion to all the text held. Does an index of words kept as files change give the same answers faster, and for how much memory?
+- Change: `text::PassageIndex` (src/bin/ikam/text.rs): for each lowercased word of ASCII letters, digits and `_`, the passages holding it and how often, kept by `Live`'s refresh as files are added, changed, renamed, copied and removed. `retrieve_indexed` reads the postings of every word a term begins (the scan's word-start match) and ranks with the scan's own BM25 (`rank`, shared), so scores are the same bit for bit; a question with a term that is not ASCII is answered by the scan. `--passage-index` (off) on `ikam live` and `ikam mcp`. `rank` also works out each path's boost once rather than per passage and orders only the best k (the same k as a full sort), for both paths.
+- Setup: Linux cloud container, 4 cores. A store of 216 files from the public corpora `realworld/fetch.py` downloads (four pandas sdists, click sdists, docx, pdf and pptx samples): 98 MB of extracted text. A second store with eight copies of the same tree (1,728 paths, 785 MB of text across paths; the copies share content, so the store is the same 33 MB). `experiments/passage-index/ask_bench.py`: `ikam live` with and without the flag, 20 questions 5 times each through `/api/ask` (sources only, no model), the server's own retrieval time, resident memory once serving, and the first answer's sources compared.
+- Results:
+
+  | store | flag | ready | memory | ask p50 | ask p95 | same answers |
+  | --- | --- | --- | --- | --- | --- | --- |
+  | 216 files, 98 MB text | scan (default) | 13.7 s | 310 MB | 38.1 ms | 94.8 ms | - |
+  | 216 files, 98 MB text | `--passage-index` | 18.3 s | 438 MB | 5.3 ms | 38.0 ms | 20/20 |
+  | 1,728 paths, 785 MB text | scan (default) | 14.1 s | 310 MB | 257 ms | 737 ms | - |
+  | 1,728 paths, 785 MB text | `--passage-index` | 52.0 s | 1,364 MB | 56.4 ms | 496 ms | 20/20 |
+
+  A first build without interned words held 602 MB and 2,475 MB; word numbers in place of a string per file and word cut that. Questions whose terms are common (a prefix that begins thousands of words) still read long postings, so the p95 gains less than the median.
+- Checks: `the_passage_index_answers_as_the_scan` (random files over a small vocabulary with non-ASCII and punctuation, 20 rounds of puts and removals, 14 questions at k 1, 5 and 50: same passages, lines, text and scores) and `the_passage_index_follows_edits` (put, overwrite, rename, copy, remove through `Live`). `cargo test --release`: 361 pass, 0 fail; clippy `-D warnings` clean.
+- Verdict: **kept** (option, off). Median 4 to 7 times faster at the same answers; costs memory in proportion to the text (about 1.3 MB per MB of text here) and a slower start (about 5 s per 100 MB of text to build).
+- Not measured: the Mac; a store of distinct text at 785 MB (the copies make every posting list eight times longer, which a real store of that size would not); edits while serving at that size (each changed file's words are taken out of their lists one by one).
+- Run: `python3 -I experiments/passage-index/ask_bench.py IKAM_BIN STORE 5 ";--passage-index"`.
 ### E377 ab-harness (one workload against `db serve` and a throwaway PostgreSQL)
 
 - Branch / parent: exp/377-ab-harness / main 021f129
@@ -6206,3 +6226,107 @@ Gates on the branch (E229 to E233): every kernel test suite passes (release); cl
 - Next: keep views on a ref across restarts as `--keep-search` does for search (E369's gap); read the rows of a lookup with fewer chunk decodes (sort keys by chunk, or a cache of decoded chunks); an index view that can carry chosen fields so a lookup answers from the view alone.
 - Not measured: the Mac; more than one index; group views in the same run; values that change the indexed field often.
 - Run: `python3 -I experiments/ab/ab_bench.py IKAM_BIN PG_BIN_DIR WORK 200000 "--live" view`.
+### E376 skip-unchanged (sending the same rows again writes nothing)
+
+- Branch / parent: exp/376-skip-unchanged / main 021f129
+- Question: a program that keeps its records in ikam often sends a whole table again when little changed (a collector polling its source, an import run again after a fix). What does that cost under `db serve --live`, and can the server leave out rows that would write a key's current value?
+- Setup: Linux cloud container, 4 cores. `experiments/reimport/reimport_unchanged.py`: 200,000 indexed rows (a row and an index entry each) loaded in 2,000-row batches, then sent twice more with new idempotency keys, once unchanged and once with 1% of rows given a new value; time of each pass, store size and log length after it. Both flag sets with this branch's build, one after the other on an otherwise idle machine.
+- Results, main's behaviour (the option off):
+
+  | flags | load | same rows again | 1% changed |
+  | --- | --- | --- | --- |
+  | `--live` | 32.7 s, 161 MB, log 400k | 52.2 s, **348 MB**, log 800k | 52.9 s, **533 MB**, log 1.2M |
+  | `--live --defer-kv 0 --no-keep-search` | 75.2 s, 276 MB | 103.0 s, 601 MB | 104.2 s, 929 MB |
+
+  Every unchanged row was logged again, its value stored again and its view chunk rewritten: the store grows by more than the first load each time.
+- Change: `--skip-unchanged` (off) on `db serve`. Before an append the server reads the batch's keys from the kv view and drops each upsert whose bytes equal the key's current value. Under `--defer-kv` the kv view lags, so the server keeps the latest value (by id) of every key its own deferred appends wrote since the view's position and compares against that; a database whose view lags for any other reason (a restart, another writer) is checked only from its next fold. A key already written earlier in the same batch is never dropped (that write may be a retry the log ignores), nor is anything after a subtree or range removal in a batch, and nothing is skipped with `--shared-store`. A dropped event's idempotency key is not recorded. The commit message counts what was skipped.
+- Results, the option on:
+
+  | flags | load | same rows again | 1% changed |
+  | --- | --- | --- | --- |
+  | `--live --skip-unchanged` | 42.5 s, 161 MB | 23.1 s, **161 MB**, log 400k | 24.4 s, **163 MB**, log 402k |
+  | `--live --defer-kv 0 --no-keep-search --skip-unchanged` | 94.5 s, 276 MB | 21.6 s, 276 MB | 23.4 s, 278 MB |
+
+  (The second row ran while other work used the machine; its times are rough.) Sending the same table again takes 2.3x less time and leaves the store as it was; the 1% change logs only its 2,000 events. The cost is on new rows: the check reads the view for every key, which made the first load 30% slower (append p50 124 to 247 ms).
+- Checks: `unchanged_upserts_are_skipped_with_the_same_rows` (with the kv view folded every append, every 3 events and lazily: the same rows as a server without the option after loads, edits, a value set back while its edit is still unfolded, a key written twice in one batch, a removal, and a retry of an old write followed by that value again; a second identical load logs nothing). `cargo test --release`: 360 pass, 0 fail; clippy `-D warnings` clean.
+- Verdict: **kept** (option, off). It fits a database fed by repeated imports; a program that only appends new rows should leave it off.
+- Not measured: the Mac; batches with removals; a restart between the two passes (nothing is skipped until the view folds, up to 20,000 events under `--live`).
+- Run: `python3 -I experiments/reimport/reimport_unchanged.py IKAM_BIN WORK 200000 1 "--live;--live --skip-unchanged"`.
+### E375 memory-curve (resident memory of `db serve --live` up to a million rows)
+
+- Branch / parent: exp/375-memory-curve / main 021f129
+- Question: a project's live database grows for months. How much memory does `ikam db serve --live` hold as a table grows past the 200k rows measured so far (E356 gap: stores above 200k rows), does a restart give it back, and what does the first ranked search of a large table cost?
+- Setup: Linux cloud container, 4 cores, 15 GB. `experiments/memory/rss_load.py`: 1,000,000 indexed rows (each row and one index entry, as E354) in 2,000-row batches; the server's resident memory (VmRSS) and peak (VmHWM) from /proc as it loads, after a restart and a full count, after the first BM25 search of the table, and after a second restart and the same search. Run twice (checks every 100k and every 250k rows): the figures agree within 5%.
+- Results:
+
+  | point | rows | elapsed | memory | peak |
+  | --- | --- | --- | --- | --- |
+  | loading | 200k | 29 s | 537 MB | 608 MB |
+  | loading | 500k | 135 s | 1,469 MB | 1,603 MB |
+  | loading | 1M | 362 s | 3,095 MB | 3,251 MB |
+  | restarted, counted | 1M | | 1,507-1,589 MB | 1,606-1,687 MB |
+  | first search ever (45.6-45.8 s) | 1M | | 5,339 MB | 5,645 MB |
+  | restarted again, same search (under 0.05 s) | 1M | | 1,647 MB | 1,647 MB |
+
+  Store 1,338 MB. Memory grows about 3 MB per thousand rows while loading, and about half of it is given back only by a restart. The first search of a table nobody searched builds its BM25 view from every row: 46 s and 3.8 GB more at its peak. With `--keep-search` (on under `--live`) the view is kept, so a later restart answers the same search at once.
+- Verdict: **measured**, no code change. Neither number is a failure at 1M rows on a machine with 16 GB, but both grow with the table: a long-running server's memory and the one-time cost of the first search are the two things to watch.
+- Next: where the 1.5 GB a running server holds beyond a restarted one goes (caches of chunks it wrote, the deferred-fold buffers); a BM25 view built in pieces as rows arrive, so no single query pays for a whole table.
+- Not measured: the Mac (18 GB); tables of longer text; `--defer-kv 0`.
+- Run: `python3 -I experiments/memory/rss_load.py IKAM_BIN WORK 1000000 250000 "--live"`.
+### E374 crash-safety (kills, stop signals and a server whose output went away)
+
+- Branch / parent: exp/374-crash-safety / main 021f129
+- Question: a project's live database must not lose an answered write when its process dies, and must not die without saying so. Does `ikam db serve` keep every append it answered through SIGKILL (an out-of-memory kill, a crash), and how do `db serve` and `ikam live` end on each stop signal, and when the terminal or pipe their log goes to is gone?
+- Setup: Linux cloud container, 4 cores. `experiments/crash-safety/kill_mid_append.py`: 20,000 indexed rows loaded, then a writer sends 2,000-row batches (own idempotency keys, a marker row each) while the server is killed with SIGKILL after a random 0.5-6 s; restarted on the same store and checked (every answered batch whole, any unanswered one whole or absent, `ikam fsck` after the kill and at the end, an append after the restart). 10 trials per flag set. `experiments/crash-safety/stop_signals.py`: each server sent SIGHUP or SIGTERM, with its stderr kept or closed (its reader gone), and for `live` a file written just before the signal (`--commit-after 60000`, so only a stop commits it).
+- Results, kills (SIGKILL mid-append):
+
+  | flags | trials | answered batches | lost | unanswered that landed | torn | fsck clean | restart max | first read max |
+  | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+  | `--live` | 10 | 190 | 0 | 0 of 10 | 0 | 10/10, 10/10 | 0.21 s | 492 ms |
+  | `--live --defer-kv 0 --no-keep-search` | 10 | 93 | 0 | 0 of 10 | 0 | 10/10, 10/10 | 0.25 s | 59 ms |
+  | `--plain-events --edit-index` (FsStore) | 10 | 3 | 0 | 0 of 10 | 0 | 10/10, 10/10 | 0.47 s | 406 ms |
+
+  Every append the server answered survived, every store passed fsck straight after the kill, and every restarted server took the next append. Under `--live` the first read after a restart pays the fold of deferred appends (E368), up to 0.5 s here.
+- Results, stop signals, main 021f129 (before this change):
+
+  | case | exits | logged | requests answered | file committed |
+  | --- | --- | --- | --- | --- |
+  | `db serve --live`, SIGHUP | killed by the signal | nothing | 5/5 | - |
+  | `db serve --live`, SIGTERM | 0 | `stopped` | 5/5 | - |
+  | `db serve --live`, stderr gone, SIGTERM | **never** (killed after 5 s) | - | 5/5 | - |
+  | `db serve --live --log-requests`, stderr gone | never | - | **0/5** (connection closed) | - |
+  | `live`, SIGHUP | killed by the signal | nothing | 5/5 | **no** (edit lost) |
+  | `live`, SIGTERM | 0 | `stopped` | 5/5 | yes |
+  | `live --log-requests`, stderr gone, SIGTERM | never | - | 0/5 | yes |
+
+  Causes: SIGHUP (sent when the terminal that started a server closes) was not caught, so it ended the process with no line and, for `live`, without committing pending edits. `eprintln!` panics when stderr is gone: in a request with `--log-requests` the request's thread died (the client saw a closed connection), and in the stop watcher the `stopped` line panicked before `exit`, so SIGTERM never stopped the server.
+- Change: servers write their log lines with `say!`, which ignores a write error instead of panicking (all `eprintln!` in `src/bin/ikam`). `auth::catch_stop_signals` also catches SIGHUP, as a stop like SIGTERM (`live` and `host` commit pending edits first), and the stop line names the signal (`stopped (SIGHUP)`). `--keep-on-hangup` (off by default; `db serve`, `live`, `host`) ignores SIGHUP instead, as `nohup` would, so a server started from a terminal outlives it.
+- Results, stop signals, this branch: SIGHUP and SIGTERM exit 0 with `stopped (SIGHUP)` / `stopped (SIGTERM)`; with `--keep-on-hangup` SIGHUP leaves `db serve` running; with stderr gone SIGTERM exits 0 and every request is answered (5/5, also with `--log-requests`); `live` commits the file on SIGHUP.
+- Checks: `cargo test --release`: 361 pass, 0 fail (new: `a_stop_names_its_signal`, `a_switch_is_taken_out_of_the_arguments`); clippy `-D warnings` clean.
+- Verdict: **kept**. Crash safety under SIGKILL: measured, no change needed. The logging fix and the SIGHUP stop are fixes (no trade-off); ignoring SIGHUP is an option, off.
+- Not measured: macOS (its signals are the same numbers; launchd sends SIGTERM); kills during `repack` or `gc`; a full disk; kills of `live` mid-commit; more than 10 trials a set; what ended a server elsewhere (a server killed by SIGKILL still logs nothing: only the supervisor, or the system log, can say).
+### E373 night-gaps (the loop's gap list, and tonight's picks by business case)
+
+- Branch / parent: exp/373-night-log / main 021f129
+- Question: which of the open gaps fit the business cases E354 and E355 scored (a program keeping its records in `db serve`; questions over a folder of files through `live` and `mcp`; one service holding several projects), and what should one night in the cloud run?
+- Setup: `cargo run --release --example loop_gaps` (E275, E290) on main: the registry, the log's "Not measured" lines, stale verdicts and open hypotheses. Then each gap that cites E354 to E372 was read against the scorecard's rows. Two of the business cases (records running live, one service for several projects) are goals the owner has not confirmed; where that shaped a pick it says so.
+- Result: 184 gaps (131 not measured, 43 stale, 10 open hypotheses; 55 touch a weighty mechanism), from 350 registry rows and 331 log entries. 17 cite E354 to E372. Tonight's picks, in the order run (eleven):
+
+  | pick | gap or source | business case |
+  | --- | --- | --- |
+  | E374 crash safety | not on the list: the scorecard's "runs unattended" row had no kill test | records live (unconfirmed goal) |
+  | E375 memory curve | E356 "stores above 200k rows" | records live |
+  | E376 skip unchanged rows | not on the list: a reimport of the same rows rewrote everything (seen in E376's baseline) | records kept in sync with another system |
+  | E377 A/B harness | the owner's plan to compare against PostgreSQL only as a yardstick | records live |
+  | E378 passage index | E358 and E359 "search over files in `live`" | questions over files |
+  | E379 served index view | E377's slowest step (rows by a secondary index) and E371 "`--views` in the same run" | records live |
+  | E380 kept views | E379's 3 s first lookup after every start | records live |
+  | E381 view update cost | E380's 200 ms lookup after a 100-row change; E368 and E371 mixed traffic | records live |
+  | E382 one-pass search build | E375's 46 s and 3.8 GB first search of a 1M-row table | records live, questions over records |
+  | E383 bounded seed index | E375's 3 GB server after a 1M-row load, still growing | records live; one host for several projects (unconfirmed goal) |
+  | E384 streamed pack checkpoints | E383's profile: a server still grows 0.9 MB per 1,000 rows under a bound | records live; one host for several projects (unconfirmed goal) |
+
+  Left for later: the rest of E368 and E371 mixed traffic (E381 took the view side), E367's ledger skip, E365's line-level merge, and every Mac row (this night ran in the cloud only).
+- Journal: `loop_journal E374 E384 2026-11-22` on a scratch copy of main's docs with the eleven entries appended (each branch keeps its own entry; nothing merged): 11 experiments, 44 firings on `night/2026-11-22`, replay equal to the marking, each finish output equal to its log entry, fsck clean; a second run fired nothing new. A finish output cannot change once fired: when E383's entry gained its benchmark line after a run, the next run stopped with an idempotency conflict on that firing, so the journal was built again in a fresh store (and again after E383's review fix and E384). Eight wait for the owner (E374, E376, E378, E380, E381, E382, E383, E384: changes to merge) and three are closed (E375, E377, E379: measurements).
+- Verdict: **measured** (a plan; no code).
+- Run: `cargo run --release --example loop_gaps`, then `cargo run --release --example loop_journal -- E374 E384 2026-11-22 STORE_DIR` once the entries are on one branch.

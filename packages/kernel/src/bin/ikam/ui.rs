@@ -301,7 +301,7 @@ fn ask_page(live: &Mutex<Live>, q: &str, llm: bool) -> Result<Response, String> 
     let t = Instant::now();
     let (passages, allowed) = {
         let l = live.lock().unwrap();
-        (text::retrieve(&l.docs, q, 8), l.llm)
+        (l.retrieve(q, 8), l.llm)
     };
     let ms = t.elapsed().as_secs_f64() * 1e3;
     let mut body = String::new();
@@ -494,7 +494,7 @@ fn api(live: &Mutex<Live>, name: &str, req: &Request) -> Response {
                 let (passages, ms) = {
                     let l = live.lock().unwrap();
                     let t = Instant::now();
-                    let p = text::retrieve(&l.docs, &q, 8);
+                    let p = l.retrieve(&q, 8);
                     (p, t.elapsed().as_secs_f64() * 1e3)
                 };
                 let answer = if req.param("llm").is_some() && live.lock().unwrap().llm {
