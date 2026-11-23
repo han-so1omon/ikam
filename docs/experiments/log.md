@@ -6158,6 +6158,16 @@ Gates on the branch (E229 to E233): every kernel test suite passes (release); cl
 - Verdict: **kept** (preset change, each part still an option).
 - Not measured: the Mac; whether 20000 is the best N for other row sizes (E368 measured 100k, E371 20000).
 
+### E380 kept-views (`db serve --keep-views` reads served views back after a restart)
+
+- Question: E379 found that the index views `--views` serves (E361) are built again on the first lookup after every start, 3.0 to 3.6 s for 200k rows. Can they be kept on a ref, as `--keep-search` keeps search views (E369), so a restart reads them back?
+- Change: `Repo::views_save` and `Repo::views_load` (`src/views.rs`) keep a `ViewState` on a ref `views/NAME`: a commit whose tree holds the database entry the views are at, the rules (as text) and each view's root. `db serve --keep-views` (off; needs `--views FILE`) loads that state before the first build, brings it to the head with `views_update` and rewrites the ref after each build or update. Rules that differ from the kept ones, or a missing or unreadable root, build afresh as before; the ref keeps the views' roots from gc.
+- Checks: `kept_views_outlive_a_restart` covers a restart with no change (no rebuild), changes made while the option was off and a gc in between (same rows as a fresh build), other rules (built afresh), a damaged root (built afresh, same rows) and the option off (no ref); `kept_views_with_missing_chunks_are_built_again` covers a readable root whose chunks are gone (the first failed read builds afresh, once). `cargo test --release`: 361 pass; clippy clean.
+- Run (Linux cloud, 4 CPUs; the E379 harness `ab_bench.py ... "--live --keep-views" view` from PR #69, 200k indexed rows): load 12.9 s, store 92.8 MB, lookup p50 3.13 ms, same rows as PostgreSQL; first lookup after the restart 1.03 s against 3.1 to 3.6 s in E379 (the kept views were from before the harness changed 1% of the rows, so the restart applies that change).
+- Run (`experiments/kept-views/mixed_views.py`, a copy of that store, 100 rounds of 100 row changes and a lookup): first lookup after the start 3,313 ms without the option, 1.2 ms with it; lookup p50 202 against 205 ms, append p50 7.8 against 7.2 ms, total 21.9 against 21.7 s, store sizes alike.
+- Found on the way: a lookup after a 100-row change costs about 200 ms with or without the option (E361 measured about 50 ms after 20 rows), so the incremental update, not the save, is what mixed traffic pays.
+- Verdict: **kept** as an option (off by default).
+- Not measured: the Mac; more than 200k rows; several databases; what a restart costs when many more rows changed while the server was down.
 ### E378 passage-index (questions answered from an index of words, not a scan)
 
 - Branch / parent: exp/378-passage-index / main 021f129

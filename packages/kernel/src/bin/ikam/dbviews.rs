@@ -30,7 +30,12 @@
 //! the head from the `kv` diff (`Repo::views_update`), so a request pays for
 //! the rows changed since the last one. Appends do not wait for views. A
 //! restarted server builds again on its first view request; the graphs it
-//! writes are not referenced by a commit.
+//! writes are not referenced by a commit. With `keep` (`--keep-views`,
+//! E380, off) each database's views are kept on the ref `views/NAME`
+//! (`Repo::views_save`) after each build or update, with the rules they
+//! follow, so a restarted server reads them back and brings them to the
+//! head from the changes since; views kept for other rules, or that cannot
+//! be read, are built again.
 //!
 //! Routes, under `/db/NAME/`:
 //! - `GET views`: `[{"name":...,"kind":"group"|"index","prefix":...}]`.
@@ -42,7 +47,7 @@
 //!
 //! Add `format=json` for `[["key","value"],...]` (values must be UTF-8).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 
 use ikam_kernel::views::{GroupRule, MapRule, Mode, View, ViewGraph, ViewOp, ViewState};
@@ -226,6 +231,18 @@ pub struct Served {
     rules: Vec<Rule>,
     graph: ViewGraph,
     states: Mutex<HashMap<String, ViewState>>,
+    /// Keep each database's views on a ref across restarts (E380).
+    keep: bool,
+    /// Databases whose held views came from a ref and have not been
+    /// built since: their roots were checked, not every chunk under them.
+    from_ref: Mutex<HashSet<String>>,
+    /// Databases whose kept views failed a read: built afresh from now on.
+    no_ref: Mutex<HashSet<String>>,
+}
+
+/// The ref a database's kept views live on (E380).
+pub fn views_ref(name: &str) -> String {
+    format!("views/{name}")
 }
 
 impl Served {
@@ -245,7 +262,21 @@ impl Served {
             rules,
             graph,
             states: Mutex::new(HashMap::new()),
+            keep: false,
+            from_ref: Mutex::new(HashSet::new()),
+            no_ref: Mutex::new(HashSet::new()),
         })
+    }
+
+    pub fn keep(mut self, keep: bool) -> Served {
+        self.keep = keep;
+        self
+    }
+
+    /// The rules as kept views record them: views kept for other rules are
+    /// built again.
+    fn rules_text(&self) -> String {
+        format!("{:?}", self.rules)
     }
 
     pub fn list_json(&self) -> String {
@@ -265,24 +296,81 @@ impl Served {
         name: &str,
         db: &Db,
     ) -> Result<ViewState, Error> {
-        let kept = self.states.lock().unwrap().get(name).cloned();
+        let held = self.states.lock().unwrap().get(name).cloned();
+        let (kept, loaded) = match held {
+            Some(s) => (Some(s), false),
+            // Views kept by an earlier run; ones that cannot be read are
+            // built again.
+            None if self.keep && !self.no_ref.lock().unwrap().contains(name) => {
+                let s = writer
+                    .views_load(&views_ref(name), &self.rules_text())
+                    .ok()
+                    .flatten();
+                (s, true)
+            }
+            None => (None, false),
+        };
+        let checked = !loaded && !self.from_ref.lock().unwrap().contains(name);
+        if loaded && kept.is_some() {
+            self.from_ref.lock().unwrap().insert(name.to_string());
+        }
         let state = match kept {
-            Some(s) if s.db == *db => return Ok(s),
+            Some(s) if s.db == *db => {
+                self.states
+                    .lock()
+                    .unwrap()
+                    .insert(name.to_string(), s.clone());
+                return Ok(s);
+            }
             Some(s) => {
                 // The same changes either way (E249); it skips the chunks
                 // both heads share instead of listing every leaf of both.
                 let prune = std::mem::replace(&mut writer.prune_diff, true);
                 let out = writer.views_update(&self.graph, &s, db);
                 writer.prune_diff = prune;
-                out?
+                match out {
+                    Ok(st) => st,
+                    Err(_) if !checked => {
+                        self.from_ref.lock().unwrap().remove(name);
+                        writer.views_build(&self.graph, db)?
+                    }
+                    Err(e) => return Err(e),
+                }
             }
-            None => writer.views_build(&self.graph, db)?,
+            None => {
+                self.from_ref.lock().unwrap().remove(name);
+                writer.views_build(&self.graph, db)?
+            }
         };
+        // Views that cannot be kept are still served; the next restart
+        // builds them again.
+        if self.keep
+            && let Err(e) = writer.views_save(&views_ref(name), &self.rules_text(), &state)
+        {
+            eprintln!("{} keeping the views of {name}: {e}", crate::live::stamp());
+        }
         self.states
             .lock()
             .unwrap()
             .insert(name.to_string(), state.clone());
         Ok(state)
+    }
+
+    /// After a failed read of `name`'s views: true when they came from a
+    /// ref and were not built since, so the next `at` builds them afresh
+    /// (a kept root can name chunks that are gone or damaged).
+    pub fn forget(&self, name: &str) -> bool {
+        if !self.from_ref.lock().unwrap().remove(name) {
+            return false;
+        }
+        self.states.lock().unwrap().remove(name);
+        self.no_ref.lock().unwrap().insert(name.to_string());
+        true
+    }
+
+    #[cfg(test)]
+    pub fn graph_for_tests(spec: &str) -> ViewGraph {
+        Served::new(parse(spec).unwrap()).unwrap().graph
     }
 
     /// Rows of view `view` at `state` starting with `prefix`.
