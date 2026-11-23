@@ -1,5 +1,16 @@
 //! `ikam` CLI over a filesystem store.
 
+/// `eprintln!` that never panics (E374): a server whose stderr went away
+/// (the terminal closed, a pipe's reader quit) carries on instead of losing
+/// the thread that logged, which was a request (500s with `--log-requests`)
+/// or the stop watcher (SIGTERM no longer stopped it).
+macro_rules! say {
+    ($($t:tt)*) => {{
+        use std::io::Write as _;
+        let _ = writeln!(std::io::stderr(), $($t)*);
+    }};
+}
+
 mod ask;
 mod auth;
 mod corpus;
@@ -32,13 +43,15 @@ const USAGE: &str = "usage: ikam [--store DIR] [--short-records] [--slow-codec-m
   ls [REV[:PATH]] [-r]             list a directory of REV (default main)
   grep TEXT [REV]                  files of REV containing TEXT, with lines
   stats [REV]                      objects and bytes the store holds
-  db serve [--live] [--packs] [--plain-events] [--no-object-templates] [--concurrent-reads] [--edit-index] [--plain-writes] [--hnsw] [--keep-search] [--no-keep-search] [--shared-store] [--keep-counts N] [--defer-kv N] [--views FILE] [PORT]
+  db serve [--live] [--packs] [--plain-events] [--no-object-templates] [--concurrent-reads] [--edit-index] [--plain-writes] [--hnsw] [--keep-search] [--no-keep-search] [--shared-store] [--skip-unchanged] [--keep-counts N] [--defer-kv N] [--views FILE] [--keep-on-hangup] [PORT]
                                    the store's databases over HTTP, for programs
                                    (default port 8740, 127.0.0.1 only; dbserve.rs);
                                    --live turns on the options a live database
                                    wants (E356, E372: with --defer-kv 20000 and
                                    --keep-search; --defer-kv 0 or --no-keep-search
-                                   turns those off)
+                                   turns those off); --keep-on-hangup
+                                   ignores SIGHUP (E374); --skip-unchanged drops
+                                   upserts of a key's current value (E376, off)
   host --config FILE [PORT]        several separate projects in one process, each
                                    its own store, users and limits, chosen by Host
                                    name; crossing only through scoped shares (host.rs)
@@ -67,7 +80,7 @@ const USAGE: &str = "usage: ikam [--store DIR] [--short-records] [--slow-codec-m
   live [PORT] [--watch DIR[:PREFIX]]... [--llm] [--commit-after MS]
        [--allow-host NAME]... [--log-requests] [--public]
        [--max-body BYTES] [--max-store BYTES] [--max-conns N] [--gc-every N]
-       [--deferred-sync] [--no-object-templates]
+       [--deferred-sync] [--no-object-templates] [--keep-on-hangup]
                                    run REF (default main) as a live filesystem:
                                    WebDAV at http://127.0.0.1:PORT/dav/ (mount it
                                    in Finder: Go > Connect to Server), a web page
@@ -83,8 +96,10 @@ const USAGE: &str = "usage: ikam [--store DIR] [--short-records] [--slow-codec-m
                                    machine's Tailscale name behind Tailscale
                                    Serve); it still listens on 127.0.0.1 only. With
                                    IKAM_AUTH set (from passwd), every request needs
-                                   that user and password. SIGTERM or Ctrl-C
-                                   commits pending edits, then exits.
+                                   that user and password. SIGTERM, Ctrl-C or
+                                   SIGHUP (the terminal closed) commits pending
+                                   edits, logs which signal, then exits;
+                                   --keep-on-hangup ignores SIGHUP instead.
                                    --log-requests prints one line per request
                                    (time, method, path, status, ms, client).
                                    For a copy open to anyone: --max-body refuses
@@ -126,7 +141,7 @@ fn main() -> ExitCode {
         return match passwd(args.get(1).map(String::as_str)) {
             Ok(()) => ExitCode::SUCCESS,
             Err(msg) => {
-                eprintln!("{msg}");
+                say!("{msg}");
                 ExitCode::FAILURE
             }
         };
@@ -140,7 +155,7 @@ fn main() -> ExitCode {
                 ExitCode::SUCCESS
             }
             Err(msg) => {
-                eprintln!("{msg}");
+                say!("{msg}");
                 ExitCode::FAILURE
             }
         };
@@ -149,7 +164,7 @@ fn main() -> ExitCode {
         return match host::host_cmd(&args[1..]) {
             Ok(()) => ExitCode::SUCCESS,
             Err(msg) => {
-                eprintln!("{msg}");
+                say!("{msg}");
                 ExitCode::FAILURE
             }
         };
@@ -158,7 +173,7 @@ fn main() -> ExitCode {
         return match db_cmd(&store_dir, &args[1..]) {
             Ok(()) => ExitCode::SUCCESS,
             Err(msg) => {
-                eprintln!("{msg}");
+                say!("{msg}");
                 ExitCode::FAILURE
             }
         };
@@ -166,17 +181,17 @@ fn main() -> ExitCode {
     match run(&store_dir, &mut args) {
         Ok(()) => ExitCode::SUCCESS,
         Err(msg) => {
-            eprintln!("{msg}");
+            say!("{msg}");
             ExitCode::FAILURE
         }
     }
 }
 
 /// `ikam db serve [--live] [--packs] [--plain-events] [--no-object-templates]
-/// [--concurrent-reads] [--edit-index] [--plain-writes] [--hnsw] [--keep-search] [--no-keep-search] [--shared-store] [--keep-counts N] [--defer-kv N]
+/// [--concurrent-reads] [--edit-index] [--plain-writes] [--hnsw] [--keep-search] [--no-keep-search] [--shared-store] [--skip-unchanged] [--keep-counts N] [--defer-kv N]
 /// [--views FILE]
 /// [--allow-host NAME]...
-/// [--log-requests] [PORT]`:
+/// [--log-requests] [--keep-on-hangup] [PORT]`:
 /// the store's databases over HTTP (`dbserve.rs`), on 127.0.0.1:PORT (default
 /// 8740). With `--packs` the store is a pack store (E122), which keeps many
 /// small events in a few files; a store keeps the backend it was made with.
@@ -220,6 +235,14 @@ fn main() -> ExitCode {
 /// really is missing pays a listing of the store. Not for a pack store
 /// (`--packs`, `--live`), which one process opens.
 ///
+/// `--skip-unchanged` (E376, off) drops from each batch the upserts that
+/// would write a key's current value again, so importing the same rows
+/// again logs nothing (E376: re-sending 200k unchanged rows under `--live`
+/// grew the store 161 to 348 MB). A dropped event's idempotency key is not
+/// recorded. Keys written by deferred appends not yet folded are not
+/// checked, nor any key after a subtree or range removal in a batch, and
+/// nothing is skipped with `--shared-store`.
+///
 /// `--live` (E356) is the options a database kept by a running program
 /// wants, together: `--packs --plain-events --no-object-templates
 /// --concurrent-reads --edit-index`, and since E372 `--defer-kv 20000
@@ -231,12 +254,19 @@ fn main() -> ExitCode {
 /// `--defer-kv N` sets another N (0 folds every append at once) and
 /// `--no-keep-search` keeps search views in memory only. It implies
 /// `--packs`, so use it on a new store or a pack store.
+///
+/// SIGTERM, SIGINT and SIGHUP stop the server with a line naming the signal
+/// (E374: a SIGHUP, sent when the terminal that started it closes, used to
+/// end it with no line logged). `--keep-on-hangup` (off) ignores SIGHUP, as
+/// `nohup` would. Every answered append is committed, so a stop, or a kill,
+/// loses none (E374).
 fn db_cmd(store_dir: &str, args: &[String]) -> Result<(), String> {
     let mut args = args.to_vec();
     if args.first().map(String::as_str) != Some("serve") {
-        return Err("usage: ikam [--store DIR] db serve [--live] [--packs] [--plain-events] [--no-object-templates] [--concurrent-reads] [--edit-index] [--plain-writes] [--hnsw] [--keep-search] [--no-keep-search] [--shared-store] [--keep-counts N] [--defer-kv N] [--views FILE] [--allow-host NAME]... [--log-requests] [PORT]".into());
+        return Err("usage: ikam [--store DIR] db serve [--live] [--packs] [--plain-events] [--no-object-templates] [--concurrent-reads] [--edit-index] [--plain-writes] [--hnsw] [--keep-search] [--no-keep-search] [--shared-store] [--skip-unchanged] [--keep-counts N] [--defer-kv N] [--views FILE] [--allow-host NAME]... [--log-requests] [--keep-on-hangup] [PORT]".into());
     }
     args.remove(0);
+    let keep_on_hangup = take_switch(&mut args, "--keep-on-hangup");
     let mut allowed = Vec::new();
     while let Some(h) = take_flag(&mut args, "--allow-host") {
         allowed.push(h);
@@ -263,14 +293,14 @@ fn db_cmd(store_dir: &str, args: &[String]) -> Result<(), String> {
         );
     }
     let port: u16 = args.first().map_or(Ok(8740), |p| p.parse()).map_err(err)?;
-    auth::catch_stop_signals();
+    auth::catch_stop_signals(keep_on_hangup);
     std::thread::spawn(|| {
         // Every answered append is committed already, so a stop has
         // nothing to flush.
         loop {
             std::thread::sleep(Duration::from_millis(250));
             if auth::stopping() {
-                eprintln!("{} stopped", live::stamp());
+                say!("{} stopped ({})", live::stamp(), auth::stop_signal());
                 std::process::exit(0);
             }
         }
@@ -320,6 +350,7 @@ fn db_flags(
     let keep_search = !take("--no-keep-search") && keep_search;
     let defer_kv = defer_kv.unwrap_or(if live { LIVE_DEFER_KV } else { 0 });
     let shared_store = take("--shared-store");
+    let skip_unchanged = take("--skip-unchanged");
     let opts = DbServeOpts {
         concurrent_reads,
         edit_index,
@@ -331,6 +362,7 @@ fn db_flags(
         hnsw,
         keep_search,
         shared_store,
+        skip_unchanged,
     };
     (packs, log_requests, opts)
 }
@@ -351,6 +383,8 @@ struct DbServeOpts {
     hnsw: bool,
     keep_search: bool,
     shared_store: bool,
+    /// E376: drop upserts of a key's current value.
+    skip_unchanged: bool,
 }
 
 /// `db serve` on `store`; with `concurrent_reads` the store is shared, so
@@ -395,7 +429,7 @@ fn serve_db<S: ikam_kernel::Store + Send + Sync + 'static>(
         dbserve::serve(
             tune(Repo::new(shared), o),
             Some(make),
-            (o.keep_counts, o.defer_kv),
+            (o.keep_counts, o.defer_kv, o.skip_unchanged),
             (search(o), views),
             port,
             allowed,
@@ -405,7 +439,7 @@ fn serve_db<S: ikam_kernel::Store + Send + Sync + 'static>(
         dbserve::serve(
             tune(Repo::new(store), o),
             None,
-            (o.keep_counts, o.defer_kv),
+            (o.keep_counts, o.defer_kv, o.skip_unchanged),
             (search(o), views),
             port,
             allowed,
@@ -480,7 +514,7 @@ fn run(store_dir: &str, args: &mut Vec<String>) -> Result<(), String> {
             let input = std::fs::read(arg(1)?).map_err(err)?;
             let put = repo.put_content(&input).map_err(err)?;
             println!("{}", put.id);
-            eprintln!(
+            say!(
                 "form={:?} input_bytes={} new_bytes={}",
                 put.form,
                 input.len(),
@@ -498,7 +532,7 @@ fn run(store_dir: &str, args: &mut Vec<String>) -> Result<(), String> {
                 .map_err(err)?;
             let id = repo.commit(&refname, tree, &message).map_err(err)?;
             println!("{id}");
-            eprintln!("new_bytes={}", repo.bytes_written);
+            say!("new_bytes={}", repo.bytes_written);
         }
         Some("log") => {
             let start = repo
@@ -687,7 +721,7 @@ fn run(store_dir: &str, args: &mut Vec<String>) -> Result<(), String> {
                 Some(c) => println!("{c}"),
                 None => println!("no change"),
             }
-            eprintln!(
+            say!(
                 "new_bytes={} store_ms={:.1} tree_ms={:.1} total_ms={:.1}",
                 cost.new_bytes,
                 cost.store_ms,
@@ -712,7 +746,7 @@ fn run(store_dir: &str, args: &mut Vec<String>) -> Result<(), String> {
                     println!("  {n}: {line}");
                 }
             }
-            eprintln!("{total} file(s), {:.1} ms", t.elapsed().as_secs_f64() * 1e3);
+            say!("{total} file(s), {:.1} ms", t.elapsed().as_secs_f64() * 1e3);
         }
         Some("ask") => {
             let llm = args.iter().any(|a| a == "--llm");
@@ -780,9 +814,8 @@ fn live_cmd(
         }
         allowed.push(name);
     }
-    let before = args.len();
-    args.retain(|a| a != "--log-requests");
-    let log_requests = args.len() != before;
+    let log_requests = take_switch(&mut args, "--log-requests");
+    let keep_on_hangup = take_switch(&mut args, "--keep-on-hangup");
     let byte_flag = |args: &mut Vec<String>, flag: &str| {
         take_flag(args, flag)
             .map(|v| parse_bytes(&v).ok_or_else(|| format!("{flag} BYTES (such as 25M)")))
@@ -845,9 +878,9 @@ fn live_cmd(
     }
     l.llm = llm;
     if llm && !ask::key_available() {
-        eprintln!("--llm: ANTHROPIC_API_KEY is not set; questions will show sources only");
+        say!("--llm: ANTHROPIC_API_KEY is not set; questions will show sources only");
     }
-    auth::catch_stop_signals();
+    auth::catch_stop_signals(keep_on_hangup);
     l.index_all(true)?;
     let live = Arc::new(Mutex::new(l));
     {
@@ -862,21 +895,21 @@ fn live_cmd(
                     let code = match l.flush(true) {
                         Ok(_) => 0,
                         Err(e) => {
-                            eprintln!("{} commit on stop failed: {e}", live::stamp());
+                            say!("{} commit on stop failed: {e}", live::stamp());
                             1
                         }
                     };
-                    eprintln!("{} stopped", live::stamp());
+                    say!("{} stopped ({})", live::stamp(), auth::stop_signal());
                     std::process::exit(code);
                 }
                 if let Err(e) = live.lock().unwrap().flush(false) {
-                    eprintln!("{} commit failed: {e}", live::stamp());
+                    say!("{} commit failed: {e}", live::stamp());
                 }
             }
         });
     }
     for (dir, prefix) in watches {
-        eprintln!(
+        say!(
             "{} watching {} into /{prefix}",
             live::stamp(),
             dir.display()
@@ -916,7 +949,7 @@ fn live_cmd(
         let mut req = req;
         let resp = route(&mut req);
         if let Some(line) = line {
-            eprintln!(
+            say!(
                 "{} {line} -> {} {:.0}ms",
                 live::stamp(),
                 resp.status,
@@ -926,26 +959,24 @@ fn live_cmd(
         resp
     });
     let t = live::stamp();
-    eprintln!(
+    say!(
         "{t} live on http://127.0.0.1:{port}/ (WebDAV: http://127.0.0.1:{port}/dav/), ref {refname}"
     );
     for name in &allowed {
-        eprintln!("{t} also answering to {name}");
+        say!("{t} also answering to {name}");
     }
     if password {
-        eprintln!("{t} password required (IKAM_AUTH)");
+        say!("{t} password required (IKAM_AUTH)");
     }
     if log_requests {
-        eprintln!("{t} logging each request");
+        say!("{t} logging each request");
     }
     if public {
-        eprintln!(
-            "{t} public: guests may read; writes, admin and Claude answers need the password"
-        );
+        say!("{t} public: guests may read; writes, admin and Claude answers need the password");
     }
     let show = |n: Option<u64>| n.map_or("no limit".to_string(), |n| format!("{n} bytes"));
     if limits.max_body.is_some() || limits.max_conns.is_some() || max_store.is_some() || public {
-        eprintln!(
+        say!(
             "{t} limits: uploads {}, store {}, connections {}",
             show(limits.max_body.map(|n| n as u64)),
             show(max_store.or(public.then_some(PUBLIC_MAX_STORE))),
@@ -1016,6 +1047,13 @@ fn request_line(req: &http::Request) -> String {
         req.header("host").unwrap_or("-"),
         req.header("authorization").map_or(", no password", |_| "")
     )
+}
+
+/// Take a switch (a flag with no value) out of `args`: whether it was there.
+fn take_switch(args: &mut Vec<String>, flag: &str) -> bool {
+    let before = args.len();
+    args.retain(|a| a != flag);
+    args.len() != before
 }
 
 fn take_flag(args: &mut Vec<String>, flag: &str) -> Option<String> {
@@ -1101,6 +1139,16 @@ fn list(repo: &Repo<FsStore>, spec: &str, recursive: bool) -> Result<(), String>
 mod tests {
 
     #[test]
+    fn a_switch_is_taken_out_of_the_arguments() {
+        let mut a: Vec<String> = ["--keep-on-hangup", "--live", "8740"]
+            .map(String::from)
+            .to_vec();
+        assert!(take_switch(&mut a, "--keep-on-hangup"));
+        assert!(!take_switch(&mut a, "--keep-on-hangup"));
+        assert_eq!(a, ["--live", "8740"]);
+    }
+
+    #[test]
     fn db_live_turns_on_the_live_options() {
         let v = |a: &[&str]| a.iter().map(|s| s.to_string()).collect::<Vec<_>>();
         let all = DbServeOpts {
@@ -1114,6 +1162,7 @@ mod tests {
             hnsw: false,
             keep_search: true,
             shared_store: false,
+            skip_unchanged: false,
         };
         let mut a = v(&["--live", "8752"]);
         assert_eq!(db_flags(&mut a, 0, None), (true, false, all));
@@ -1146,6 +1195,7 @@ mod tests {
             hnsw: false,
             keep_search: false,
             shared_store: false,
+            skip_unchanged: false,
         };
         assert_eq!(db_flags(&mut a, 0, None), (false, false, off));
         // E357: `--plain-writes` is its own option, not part of `--live`.
@@ -1199,6 +1249,7 @@ mod tests {
         let mut a = v(&["--shared-store"]);
         let shared = DbServeOpts {
             shared_store: true,
+            skip_unchanged: false,
             ..off
         };
         assert_eq!(db_flags(&mut a, 0, None), (false, false, shared));

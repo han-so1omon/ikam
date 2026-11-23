@@ -40,10 +40,10 @@
 //! A password: `IKAM_AUTH` for every request, as in `ikam live`;
 //! `IKAM_READ_AUTH` (another `ikam passwd` line) may also read.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::sync::{Arc, Mutex};
 
-use ikam_kernel::{Db, Error, Event, Id, Repo, Store};
+use ikam_kernel::{Db, Error, Event, Id, Op, Repo, Store};
 
 use crate::auth::{Auth, Hosts};
 use crate::http::{self, Request, Response};
@@ -84,6 +84,23 @@ pub struct Server<S: Store> {
     /// Other processes write this store too (E370): appends commit only
     /// over the head they read, and read again on a conflict.
     shared: bool,
+    /// E376: drop upserts that would write a key's current value again.
+    skip_unchanged: bool,
+    /// E376: per database, the keys written since its kv view's position,
+    /// known while this process made every append since (see `Touched`).
+    touched: Mutex<HashMap<String, Touched>>,
+}
+
+/// E376: what a database's deferred appends wrote after its kv view's
+/// position `kv_at`, up to log position `head`: each key's latest value
+/// (by its id; `None` once removed). The kv view does not show these yet.
+/// Only appends this process made are known: a database whose view lags
+/// for another reason (a restart, a store written elsewhere) has no entry,
+/// and nothing is skipped until its view next folds.
+struct Touched {
+    kv_at: u64,
+    head: u64,
+    keys: HashMap<String, Option<Id>>,
 }
 
 fn refname(name: &str) -> String {
@@ -149,7 +166,127 @@ impl<S: Store> Server<S> {
             defer_kv: 0,
             views: None,
             shared: false,
+            skip_unchanged: false,
+            touched: Mutex::new(HashMap::new()),
         }
+    }
+
+    /// E376 (off by default): an upsert whose key holds those very bytes
+    /// already is dropped from its batch instead of logged, so importing
+    /// unchanged rows again writes nothing. Its idempotency key is then
+    /// not recorded, which a client that reuses idempotency keys for other
+    /// values could notice. Off with a shared store (other processes'
+    /// pending writes are not known).
+    pub fn skip_unchanged(mut self, skip: bool) -> Server<S> {
+        self.skip_unchanged = skip;
+        self
+    }
+
+    /// E376: `events` without the upserts that would write a key's current
+    /// value again, and how many were dropped. A key's current value is
+    /// the one a pending deferred append wrote, else the kv view's. A key
+    /// already written earlier in the batch is kept (that write may be a
+    /// retry the log skips), and a subtree or range removal leaves it and
+    /// every event after it as they are.
+    fn drop_unchanged(
+        &self,
+        repo: &Repo<S>,
+        name: &str,
+        db: &Db,
+        seq: u64,
+        events: &[Event],
+    ) -> Result<(Vec<Event>, usize), Error> {
+        let touched = self.touched.lock().unwrap();
+        let none = HashMap::new();
+        let pending = if db.kv_at == seq {
+            &none
+        } else {
+            match touched.get(name) {
+                Some(t) if t.kv_at == db.kv_at && t.head == seq => &t.keys,
+                _ => return Ok((events.to_vec(), 0)),
+            }
+        };
+        let simple = |e: &Event| matches!(e.op, Op::Upsert(_) | Op::Remove { subtree: false });
+        let lookup: BTreeSet<String> = events
+            .iter()
+            .take_while(|e| simple(e))
+            .filter(|e| matches!(e.op, Op::Upsert(_)) && !pending.contains_key(&e.key))
+            .map(|e| e.key.clone())
+            .collect();
+        let view: HashMap<String, Id> = repo
+            .db_get_many(db, &lookup)?
+            .into_iter()
+            .map(|(k, v)| (k, Id::of(&v)))
+            .collect();
+        let mut seen = std::collections::HashSet::new();
+        let mut kept = Vec::with_capacity(events.len());
+        for (i, e) in events.iter().enumerate() {
+            if !simple(e) {
+                kept.extend_from_slice(&events[i..]);
+                break;
+            }
+            let value = match &e.op {
+                Op::Upsert(v) => Some(Id::of(v)),
+                _ => None,
+            };
+            let current = match pending.get(&e.key) {
+                Some(v) => *v,
+                None => view.get(&e.key).copied(),
+            };
+            if seen.insert(e.key.as_str()) && value.is_some() && value == current {
+                continue;
+            }
+            kept.push(e.clone());
+        }
+        let dropped = events.len() - kept.len();
+        Ok((kept, dropped))
+    }
+
+    /// E376: record what an append from `db` (log at `seq`) to `new` wrote.
+    fn note_touched(&self, name: &str, db: &Db, seq: u64, new: &Db, events: &[Event]) {
+        let mut touched = self.touched.lock().unwrap();
+        if new.kv_at == new.ids_at {
+            touched.insert(
+                name.to_string(),
+                Touched {
+                    kv_at: new.kv_at,
+                    head: new.ids_at,
+                    keys: HashMap::new(),
+                },
+            );
+            return;
+        }
+        let known = db.kv_at == seq
+            || touched
+                .get(name)
+                .is_some_and(|t| t.kv_at == db.kv_at && t.head == seq);
+        let simple = events
+            .iter()
+            .all(|e| matches!(e.op, Op::Upsert(_) | Op::Remove { subtree: false }));
+        // Every event logged (none a retry), so each is the key's latest.
+        let all_logged = new.ids_at - seq == events.len() as u64;
+        if !known || !simple || !all_logged || new.kv_at != db.kv_at {
+            touched.remove(name);
+            return;
+        }
+        // A fold since the last append (a read's `settle`) starts a new
+        // interval: what the entry held is folded already.
+        if db.kv_at == seq {
+            touched.remove(name);
+        }
+        let t = touched.entry(name.to_string()).or_insert(Touched {
+            kv_at: db.kv_at,
+            head: seq,
+            keys: HashMap::new(),
+        });
+        for e in events {
+            let value = match &e.op {
+                Op::Upsert(v) => Some(Id::of(v)),
+                _ => None,
+            };
+            t.keys.insert(e.key.clone(), value);
+        }
+        t.head = new.ids_at;
     }
 
     /// E368: leave appends' kv folding until `events` wait (0: off).
@@ -660,6 +797,15 @@ fn append_once<S: Store>(
     {
         return Ok(Response::new(409).body("application/json", head_json(head, seq)));
     }
+    // E376: unchanged upserts dropped, with `--skip-unchanged`.
+    let (kept, skipped);
+    let events = if srv.skip_unchanged && !srv.shared {
+        (kept, skipped) = srv.drop_unchanged(repo, name, &db, seq, events)?;
+        &kept[..]
+    } else {
+        skipped = 0;
+        events
+    };
     // E368: with `--defer-kv` the kv view folds once enough events wait;
     // without it, a view left behind (a store written with it) folds first.
     let new = if srv.defer_kv > 0 {
@@ -673,13 +819,19 @@ fn append_once<S: Store>(
         let d = repo.db_catch_up(&db)?;
         repo.db_append(&d, events)?
     };
+    if srv.skip_unchanged && !srv.shared {
+        srv.note_touched(name, &db, seq, &new, events);
+    }
     if new == db {
-        // Every event was a retry and no view was folded: nothing to
+        // Every event was a retry (or unchanged) and no view was folded: nothing to
         // commit. (A batch of retries over a commit left behind by
         // `--defer-kv` still commits the folded view.)
         return Ok(Response::new(200).body("application/json", head_json(head, seq)));
     }
-    let msg = format!("db: {} event(s)", new.ids_at - seq);
+    let msg = match skipped {
+        0 => format!("db: {} event(s)", new.ids_at - seq),
+        n => format!("db: {} event(s), {n} unchanged skipped", new.ids_at - seq),
+    };
     let c = match head {
         Some(base) if srv.shared => repo.db_commit_at(&refname(name), base, &new, &msg)?,
         None if srv.shared => repo.db_commit_new(&refname(name), &new, &msg)?,
@@ -697,7 +849,7 @@ fn append_once<S: Store>(
 pub fn serve<S: Store + Send + 'static>(
     repo: Repo<S>,
     readers: Option<ReaderFactory<S>>,
-    (keep_counts, defer_kv): (u32, u64),
+    (keep_counts, defer_kv, skip_unchanged): (u32, u64, bool),
     (search, views): (crate::dbsearch::SearchOpts, Option<crate::dbviews::Served>),
     port: u16,
     allowed: Vec<String>,
@@ -718,6 +870,7 @@ pub fn serve<S: Store + Send + 'static>(
         Server::new(repo, readers)
             .keep_counts(keep_counts)
             .defer_kv(defer_kv)
+            .skip_unchanged(skip_unchanged)
             .vector_index(search.index)
             .keep_search(search.keep)
             .views(views)
@@ -739,7 +892,7 @@ pub fn serve<S: Store + Send + 'static>(
             }
         };
         if log_requests {
-            eprintln!(
+            say!(
                 "{} {} {} -> {} {:.0}ms",
                 crate::live::stamp(),
                 req.method,
@@ -751,9 +904,9 @@ pub fn serve<S: Store + Send + 'static>(
         resp
     });
     let t = crate::live::stamp();
-    eprintln!("{t} databases on http://127.0.0.1:{port}/db/");
+    say!("{t} databases on http://127.0.0.1:{port}/db/");
     if password {
-        eprintln!("{t} password required (IKAM_AUTH)");
+        say!("{t} password required (IKAM_AUTH)");
     }
     http::serve(port, handler, http::Limits::default())
 }
@@ -1205,6 +1358,93 @@ mod tests {
             v(&st, "/db/s/vsearch?prefix=w/", x(0.0, 1.0), false),
             ["w/b", "w/a"]
         );
+    }
+
+    /// E376: with `skip_unchanged`, upserts of a key's current value are
+    /// not logged, and the rows read the same as a server that logs all.
+    #[test]
+    fn unchanged_upserts_are_skipped_with_the_same_rows() {
+        for defer in [0, 3, 1000] {
+            let make = |skip: bool| {
+                Server::new(Repo::new(MemStore::default()), None)
+                    .defer_kv(defer)
+                    .skip_unchanged(skip)
+            };
+            let (plain, skip) = (make(false), make(true));
+            let ct = [("content-type", EVENTS)];
+            let head = |st: &Server<MemStore>| {
+                let r = handle(st, &req("GET", "/db/m/head", b"", &[]));
+                String::from_utf8(r.body).unwrap()
+            };
+            let rows = |run: &str, change: &[usize]| -> Vec<Event> {
+                (0..6)
+                    .map(|i| {
+                        let v = if change.contains(&i) {
+                            format!("{i}-new")
+                        } else {
+                            format!("{i}")
+                        };
+                        Event::upsert(&format!("t/r/{i}"), v.as_bytes(), &format!("{run}-{i}"))
+                    })
+                    .collect()
+            };
+            let batches: Vec<Vec<Event>> = vec![
+                rows("load", &[]),
+                rows("again", &[]),
+                rows("edit", &[2]),
+                // Back to the old value while the edit may still be
+                // pending: must be logged, not taken as unchanged.
+                rows("back", &[]),
+                vec![
+                    Event::upsert("t/r/1", b"x", "twice-a"),
+                    Event::upsert("t/r/1", b"1", "twice-b"),
+                ],
+                vec![Event::remove("t/r/0", false, "rm")],
+                // A retry of an old write, then that old value again: the
+                // retry is not applied, so the second write must be.
+                vec![Event::upsert("t/r/2", b"2-new", "edit-again")],
+                vec![
+                    Event::upsert("t/r/2", b"2", "back-2"),
+                    Event::upsert("t/r/2", b"2", "after-retry"),
+                ],
+                rows("last", &[5]),
+            ];
+            let mut skipped_any = false;
+            for b in &batches {
+                for st in [&plain, &skip] {
+                    let r = handle(st, &req("POST", "/db/m/append", &encode_events(b), &ct));
+                    assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
+                }
+                let scan = |st: &Server<MemStore>| {
+                    unframe(&handle(st, &req("GET", "/db/m/scan?prefix=t/", b"", &[])).body)
+                };
+                assert_eq!(scan(&plain), scan(&skip), "defer {defer}");
+                skipped_any |= head(&plain) != head(&skip);
+            }
+            assert!(skipped_any, "defer {defer}: nothing was skipped");
+            // The second load wrote nothing.
+            let st = make(true);
+            for b in &batches[..2] {
+                handle(&st, &req("POST", "/db/m/append", &encode_events(b), &ct));
+            }
+            assert!(head(&st).starts_with("{\"head\":6,"), "{}", head(&st));
+            // A read folds between appends: the next interval still skips.
+            let st = make(true);
+            handle(
+                &st,
+                &req("POST", "/db/m/append", &encode_events(&batches[0]), &ct),
+            );
+            handle(&st, &req("GET", "/db/m/scan?prefix=t/", b"", &[]));
+            for run in ["edit", "edit-same"] {
+                let b = rows(run, &[2]);
+                handle(&st, &req("POST", "/db/m/append", &encode_events(&b), &ct));
+            }
+            assert!(
+                head(&st).starts_with("{\"head\":7,"),
+                "defer {defer}: {}",
+                head(&st)
+            );
+        }
     }
 
     /// A server without `--defer-kv` over a commit whose kv view lags folds
