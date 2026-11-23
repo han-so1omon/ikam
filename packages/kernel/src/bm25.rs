@@ -535,6 +535,49 @@ impl<S: Store> Repo<S> {
         })
     }
 
+    /// The view of the rows under `prefix` at `db`, built in one pass
+    /// (E382): the same graph as `bm25_view_update` from an empty view
+    /// and an empty database, without a diff against nothing. Rows are
+    /// read in key order, a content once however many rows it holds, and
+    /// each term's postings are encoded as rows arrive (key order is
+    /// postings order); the graph is put whole rather than edited in.
+    pub fn bm25_view_build(&mut self, db: &Db, prefix: &str) -> Result<Bm25View, Error> {
+        let rows = self.node_values(self.graph_prefix(&db.kv, prefix)?)?;
+        let mut post: HashMap<String, Vec<u8>> = HashMap::new();
+        let mut row_terms: Vec<String> = Vec::new();
+        let (n, mut total) = (rows.len(), 0);
+        for (key, value) in &rows {
+            row_terms.clear();
+            row_terms.extend(terms(&String::from_utf8_lossy(value)));
+            let len = row_terms.len();
+            total += len;
+            row_terms.sort_unstable();
+            let mut i = 0;
+            while i < len {
+                let mut j = i + 1;
+                while j < len && row_terms[j] == row_terms[i] {
+                    j += 1;
+                }
+                let t = std::mem::take(&mut row_terms[i]);
+                let b = post.entry(t).or_default();
+                put_varint(b, key.len());
+                b.extend_from_slice(key.as_bytes());
+                put_varint(b, j - i);
+                put_varint(b, len);
+                i = j;
+            }
+        }
+        drop(rows);
+        let mut nodes = Vec::with_capacity(post.len() + 1);
+        for (t, b) in post {
+            nodes.push(self.bm25_node(term_label(&t), &b)?);
+        }
+        nodes.push(self.bm25_stats_node(n, total)?);
+        Ok(Bm25View {
+            root: self.put_graph_with(nodes, crate::Keys::Any)?,
+        })
+    }
+
     /// The `k` best rows for `query`, best first, ties by key; the same
     /// scores as `Bm25::search` over the same rows.
     pub fn bm25_view_search(
@@ -563,9 +606,7 @@ impl<S: Store> Repo<S> {
         prefix: &str,
         merge_rows: usize,
     ) -> Result<Bm25Live, Error> {
-        let empty_db = self.db_empty()?;
-        let blank = self.bm25_view_empty()?;
-        let base = self.bm25_view_update(&blank, &empty_db, db, prefix)?;
+        let base = self.bm25_view_build(db, prefix)?;
         let stats = self.bm25_stats(&base.root)?;
         let node = self.bm25_stats_node(stats.0, stats.1)?;
         Ok(Bm25Live {
