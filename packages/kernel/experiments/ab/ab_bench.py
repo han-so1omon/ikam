@@ -18,9 +18,11 @@ number and padding; one secondary index on the word) and the same steps:
 
 Then it checks that both hold the same rows (count, and every value of a
 sample of 1,000 keys). Each client keeps one connection open. PostgreSQL
-runs from its own data directory under WORK on a Unix socket only, as the
-`postgres` user, with its defaults (synchronous commit on). Nothing leaves
-the machine. Linux; needs psycopg2 and the PostgreSQL server binaries.
+runs from its own data directory under WORK on a Unix socket only, in a
+directory only its owner can enter (0700), with its defaults (synchronous
+commit on). Run as root, it runs PostgreSQL as the `postgres` user (runuser);
+run as anyone else, as that user. Nothing leaves the machine. Linux; needs
+psycopg2 and the PostgreSQL server binaries.
 
   python3 -I ab_bench.py IKAM_BIN PG_BIN_DIR WORK ROWS "IKAM FLAGS" """
 import base64, http.client, json, os, random, shutil, socket, struct, subprocess, sys, time
@@ -176,17 +178,23 @@ class Pg:
     def __init__(self, data):
         self.data, self.sock = data, os.path.dirname(data)
         os.makedirs(self.sock, exist_ok=True)
-        shutil.chown(self.sock, "postgres", "postgres")
+        # initdb's trust login is for whoever can reach the socket: keep its
+        # directory to its owner.
+        os.chmod(self.sock, 0o700)
+        if os.geteuid() == 0:  # PostgreSQL won't run as root
+            shutil.chown(self.sock, "postgres", "postgres")
         self.port = 5400 + rnd.randrange(500)
         self.su(["initdb", "-D", data, "-A", "trust", "-U", "postgres", "--no-instructions"])
 
     def su(self, cmd):
-        subprocess.run(["runuser", "-u", "postgres", "--", os.path.join(pg_bin, cmd[0])] + cmd[1:],
-                       check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        pre = ["runuser", "-u", "postgres", "--"] if os.geteuid() == 0 else []
+        subprocess.run(pre + [os.path.join(pg_bin, cmd[0])] + cmd[1:], check=True,
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
     def start(self):
         self.su(["pg_ctl", "-D", self.data, "-w", "-l", self.data + ".log", "-o",
-                 "-c listen_addresses='' -c unix_socket_directories=%s -p %d" % (self.sock, self.port),
+                 "-c listen_addresses='' -c unix_socket_directories=%s"
+                 " -c unix_socket_permissions=0700 -p %d" % (self.sock, self.port),
                  "start"])
         self.conn = psycopg2.connect(host=self.sock, port=self.port, user="postgres",
                                      dbname="postgres")
