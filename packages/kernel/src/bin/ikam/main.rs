@@ -67,7 +67,7 @@ const USAGE: &str = "usage: ikam [--store DIR] [--short-records] [--slow-codec-m
   live [PORT] [--watch DIR[:PREFIX]]... [--llm] [--commit-after MS]
        [--allow-host NAME]... [--log-requests] [--public]
        [--max-body BYTES] [--max-store BYTES] [--max-conns N] [--gc-every N]
-       [--deferred-sync] [--no-object-templates]
+       [--deferred-sync] [--no-object-templates] [--passage-index]
                                    run REF (default main) as a live filesystem:
                                    WebDAV at http://127.0.0.1:PORT/dav/ (mount it
                                    in Finder: Go > Connect to Server), a web page
@@ -102,6 +102,10 @@ const USAGE: &str = "usage: ikam [--store DIR] [--short-records] [--slow-codec-m
                                    after every N commits; POST /api/gc does it
                                    once. Each walks the whole store while edits
                                    wait, so it is off by default.
+                                   --passage-index answers questions (the page's
+                                   Ask, /api/ask, the passages tool) from an
+                                   index of words kept as files change: same
+                                   answers, more memory (E378, off).
   passwd USER                      read a password from stdin, print the
                                    IKAM_AUTH line for it
   token                            a new host token (E363): the config's
@@ -109,10 +113,14 @@ const USAGE: &str = "usage: ikam [--store DIR] [--short-records] [--slow-codec-m
   write PATH [FILE|-]              store FILE (or stdin) at PATH in REF, commit
   rm PATH | mkdir PATH             remove a file or folder / make a folder in REF
   mv FROM TO | cp FROM TO          rename or copy a file or folder in REF
-  mcp                              the store as tools for an AI agent: a Model
+  mcp [--passage-index]            the store as tools for an AI agent: a Model
                                    Context Protocol server on stdin/stdout (list,
                                    read, search, write, edit, commit with a
                                    message, diff, history, drafts) (E359)
+                                   --passage-index answers `passages` from an
+                                   index of words kept as files change, not a
+                                   scan of all text: same answers, more memory
+                                   (E378, off)
   search TEXT                      files of REF whose text contains TEXT (also the
                                    text inside docx, xlsx, pdf and tar members)
   ask QUESTION [--llm]             the passages of REF that answer QUESTION best;
@@ -651,7 +659,14 @@ fn run(store_dir: &str, args: &mut Vec<String>) -> Result<(), String> {
         Some("mcp") => {
             drop(repo);
             let stdin = std::io::stdin();
-            mcp::run(store_dir, &refname, stdin.lock(), std::io::stdout().lock())?;
+            let passage_index = args.iter().any(|a| a == "--passage-index");
+            mcp::run(
+                store_dir,
+                &refname,
+                passage_index,
+                stdin.lock(),
+                std::io::stdout().lock(),
+            )?;
         }
         Some("live") => {
             let needed_index = repo.needed_index;
@@ -728,7 +743,7 @@ fn run(store_dir: &str, args: &mut Vec<String>) -> Result<(), String> {
             drop(repo);
             let mut l = live::Live::open(store_dir, &refname)?;
             l.index_all(false)?;
-            let passages = text::retrieve(&l.docs, &q, 8);
+            let passages = l.retrieve(&q, 8);
             if llm {
                 println!("{}\n", ask::answer(&q, &passages)?);
             }
@@ -809,6 +824,9 @@ fn live_cmd(
     args.retain(|a| a != "--no-object-templates");
     let object_templates = args.len() == before;
     let before = args.len();
+    args.retain(|a| a != "--passage-index");
+    let passage_index = args.len() != before;
+    let before = args.len();
     args.retain(|a| a != "--public");
     let public = args.len() != before;
     let auth = auth::Auth::from_env()?;
@@ -849,6 +867,9 @@ fn live_cmd(
     }
     auth::catch_stop_signals();
     l.index_all(true)?;
+    if passage_index {
+        l.index_passages();
+    }
     let live = Arc::new(Mutex::new(l));
     {
         let live = live.clone();

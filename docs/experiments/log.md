@@ -6157,3 +6157,24 @@ Gates on the branch (E229 to E233): every kernel test suite passes (release); cl
 - Note for older runs: a bench that passes only `--live` (`restart_bench.py`, `search_bench.py`, `served_views.py`, `db_first_write.py`) now measures the new preset; `--live --defer-kv 0 --no-keep-search` is the E356 preset.
 - Verdict: **kept** (preset change, each part still an option).
 - Not measured: the Mac; whether 20000 is the best N for other row sizes (E368 measured 100k, E371 20000).
+
+### E378 passage-index (questions answered from an index of words, not a scan)
+
+- Branch / parent: exp/378-passage-index / main 021f129
+- Question: ikam's business case is a service that projects use to find and change files; questions (`ikam live`'s Ask, `/api/ask`, the agent tools' `passages`, `ikam mcp`) rank passages by scanning every extracted text for every term (E358, E359), so each costs time in proportion to all the text held. Does an index of words kept as files change give the same answers faster, and for how much memory?
+- Change: `text::PassageIndex` (src/bin/ikam/text.rs): for each lowercased word of ASCII letters, digits and `_`, the passages holding it and how often, kept by `Live`'s refresh as files are added, changed, renamed, copied and removed. `retrieve_indexed` reads the postings of every word a term begins (the scan's word-start match) and ranks with the scan's own BM25 (`rank`, shared), so scores are the same bit for bit; a question with a term that is not ASCII is answered by the scan. `--passage-index` (off) on `ikam live` and `ikam mcp`. `rank` also works out each path's boost once rather than per passage and orders only the best k (the same k as a full sort), for both paths.
+- Setup: Linux cloud container, 4 cores. A store of 216 files from the public corpora `realworld/fetch.py` downloads (four pandas sdists, click sdists, docx, pdf and pptx samples): 98 MB of extracted text. A second store with eight copies of the same tree (1,728 paths, 785 MB of text across paths; the copies share content, so the store is the same 33 MB). `experiments/passage-index/ask_bench.py`: `ikam live` with and without the flag, 20 questions 5 times each through `/api/ask` (sources only, no model), the server's own retrieval time, resident memory once serving, and the first answer's sources compared.
+- Results:
+
+  | store | flag | ready | memory | ask p50 | ask p95 | same answers |
+  | --- | --- | --- | --- | --- | --- | --- |
+  | 216 files, 98 MB text | scan (default) | 13.7 s | 310 MB | 38.1 ms | 94.8 ms | - |
+  | 216 files, 98 MB text | `--passage-index` | 18.3 s | 438 MB | 5.3 ms | 38.0 ms | 20/20 |
+  | 1,728 paths, 785 MB text | scan (default) | 14.1 s | 310 MB | 257 ms | 737 ms | - |
+  | 1,728 paths, 785 MB text | `--passage-index` | 52.0 s | 1,364 MB | 56.4 ms | 496 ms | 20/20 |
+
+  A first build without interned words held 602 MB and 2,475 MB; word numbers in place of a string per file and word cut that. Questions whose terms are common (a prefix that begins thousands of words) still read long postings, so the p95 gains less than the median.
+- Checks: `the_passage_index_answers_as_the_scan` (random files over a small vocabulary with non-ASCII and punctuation, 20 rounds of puts and removals, 14 questions at k 1, 5 and 50: same passages, lines, text and scores) and `the_passage_index_follows_edits` (put, overwrite, rename, copy, remove through `Live`). `cargo test --release`: 361 pass, 0 fail; clippy `-D warnings` clean.
+- Verdict: **kept** (option, off). Median 4 to 7 times faster at the same answers; costs memory in proportion to the text (about 1.3 MB per MB of text here) and a slower start (about 5 s per 100 MB of text to build).
+- Not measured: the Mac; a store of distinct text at 785 MB (the copies make every posting list eight times longer, which a real store of that size would not); edits while serving at that size (each changed file's words are taken out of their lists one by one).
+- Run: `python3 -I experiments/passage-index/ask_bench.py IKAM_BIN STORE 5 ";--passage-index"`.
