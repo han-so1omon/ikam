@@ -6176,4 +6176,3 @@ Gates on the branch (E229 to E233): every kernel test suite passes (release); cl
 - Run (the E379 harness, `--live` against `--live --plain-view-writes`, 200k rows): load 15.8 against 14.0 s, first lookup (the build) 3.7 against 2.8 s, first lookup after a restart 3.8 against 2.9 s, store 93.7 MB both, same rows as PostgreSQL. A build has no old chunks to plan against, so its store is the same size.
 - Verdict: **kept** as an option (off by default): about half the update time for 14 MB more store per 10,000 changed rows here; a store that runs `gc` or takes few changes may prefer it, one short of disk may not.
 - Not measured: the Mac; with `--keep-views` (E380, a separate branch) together; what `gc` gives back of the extra; the rest of the update (zstd and BLAKE3 on each rewritten chunk), which a smaller chunk target or a cheaper codec for view chunks might cut.
-
