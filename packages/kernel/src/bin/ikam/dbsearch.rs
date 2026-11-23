@@ -274,7 +274,7 @@ impl Kept {
         if self.keep
             && let Err(e) = w.bm25_live_save(&refname, db, &v)
         {
-            eprintln!(
+            say!(
                 "{} keeping the search view of {name}: {e}",
                 crate::live::stamp()
             );

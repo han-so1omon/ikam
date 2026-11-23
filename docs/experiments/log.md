@@ -6158,6 +6158,38 @@ Gates on the branch (E229 to E233): every kernel test suite passes (release); cl
 - Verdict: **kept** (preset change, each part still an option).
 - Not measured: the Mac; whether 20000 is the best N for other row sizes (E368 measured 100k, E371 20000).
 
+### E374 crash-safety (kills, stop signals and a server whose output went away)
+
+- Branch / parent: exp/374-crash-safety / main 021f129
+- Question: a project's live database must not lose an answered write when its process dies, and must not die without saying so. Does `ikam db serve` keep every append it answered through SIGKILL (an out-of-memory kill, a crash), and how do `db serve` and `ikam live` end on each stop signal, and when the terminal or pipe their log goes to is gone?
+- Setup: Linux cloud container, 4 cores. `experiments/crash-safety/kill_mid_append.py`: 20,000 indexed rows loaded, then a writer sends 2,000-row batches (own idempotency keys, a marker row each) while the server is killed with SIGKILL after a random 0.5-6 s; restarted on the same store and checked (every answered batch whole, any unanswered one whole or absent, `ikam fsck` after the kill and at the end, an append after the restart). 10 trials per flag set. `experiments/crash-safety/stop_signals.py`: each server sent SIGHUP or SIGTERM, with its stderr kept or closed (its reader gone), and for `live` a file written just before the signal (`--commit-after 60000`, so only a stop commits it).
+- Results, kills (SIGKILL mid-append):
+
+  | flags | trials | answered batches | lost | unanswered that landed | torn | fsck clean | restart max | first read max |
+  | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+  | `--live` | 10 | 190 | 0 | 0 of 10 | 0 | 10/10, 10/10 | 0.21 s | 492 ms |
+  | `--live --defer-kv 0 --no-keep-search` | 10 | 93 | 0 | 0 of 10 | 0 | 10/10, 10/10 | 0.25 s | 59 ms |
+  | `--plain-events --edit-index` (FsStore) | 10 | 3 | 0 | 0 of 10 | 0 | 10/10, 10/10 | 0.47 s | 406 ms |
+
+  Every append the server answered survived, every store passed fsck straight after the kill, and every restarted server took the next append. Under `--live` the first read after a restart pays the fold of deferred appends (E368), up to 0.5 s here.
+- Results, stop signals, main 021f129 (before this change):
+
+  | case | exits | logged | requests answered | file committed |
+  | --- | --- | --- | --- | --- |
+  | `db serve --live`, SIGHUP | killed by the signal | nothing | 5/5 | - |
+  | `db serve --live`, SIGTERM | 0 | `stopped` | 5/5 | - |
+  | `db serve --live`, stderr gone, SIGTERM | **never** (killed after 5 s) | - | 5/5 | - |
+  | `db serve --live --log-requests`, stderr gone | never | - | **0/5** (connection closed) | - |
+  | `live`, SIGHUP | killed by the signal | nothing | 5/5 | **no** (edit lost) |
+  | `live`, SIGTERM | 0 | `stopped` | 5/5 | yes |
+  | `live --log-requests`, stderr gone, SIGTERM | never | - | 0/5 | yes |
+
+  Causes: SIGHUP (sent when the terminal that started a server closes) was not caught, so it ended the process with no line and, for `live`, without committing pending edits. `eprintln!` panics when stderr is gone: in a request with `--log-requests` the request's thread died (the client saw a closed connection), and in the stop watcher the `stopped` line panicked before `exit`, so SIGTERM never stopped the server.
+- Change: servers write their log lines with `say!`, which ignores a write error instead of panicking (all `eprintln!` in `src/bin/ikam`). `auth::catch_stop_signals` also catches SIGHUP, as a stop like SIGTERM (`live` and `host` commit pending edits first), and the stop line names the signal (`stopped (SIGHUP)`). `--keep-on-hangup` (off by default; `db serve`, `live`, `host`) ignores SIGHUP instead, as `nohup` would, so a server started from a terminal outlives it.
+- Results, stop signals, this branch: SIGHUP and SIGTERM exit 0 with `stopped (SIGHUP)` / `stopped (SIGTERM)`; with `--keep-on-hangup` SIGHUP leaves `db serve` running; with stderr gone SIGTERM exits 0 and every request is answered (5/5, also with `--log-requests`); `live` commits the file on SIGHUP.
+- Checks: `cargo test --release`: 361 pass, 0 fail (new: `a_stop_names_its_signal`, `a_switch_is_taken_out_of_the_arguments`); clippy `-D warnings` clean.
+- Verdict: **kept**. Crash safety under SIGKILL: measured, no change needed. The logging fix and the SIGHUP stop are fixes (no trade-off); ignoring SIGHUP is an option, off.
+- Not measured: macOS (its signals are the same numbers; launchd sends SIGTERM); kills during `repack` or `gc`; a full disk; kills of `live` mid-commit; more than 10 trials a set; what ended a server elsewhere (a server killed by SIGKILL still logs nothing: only the supervisor, or the system log, can say).
 ### E373 night-gaps (the loop's gap list, and tonight's picks by business case)
 
 - Branch / parent: exp/373-night-log / main 021f129
