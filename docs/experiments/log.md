@@ -6179,3 +6179,60 @@ Gates on the branch (E229 to E233): every kernel test suite passes (release); cl
 - Next: where the 1.5 GB a running server holds beyond a restarted one goes (caches of chunks it wrote, the deferred-fold buffers); a BM25 view built in pieces as rows arrive, so no single query pays for a whole table.
 - Not measured: the Mac (18 GB); tables of longer text; `--defer-kv 0`.
 - Run: `python3 -I experiments/memory/rss_load.py IKAM_BIN WORK 1000000 250000 "--live"`.
+### E374 crash-safety (kills, stop signals and a server whose output went away)
+
+- Branch / parent: exp/374-crash-safety / main 021f129
+- Question: a project's live database must not lose an answered write when its process dies, and must not die without saying so. Does `ikam db serve` keep every append it answered through SIGKILL (an out-of-memory kill, a crash), and how do `db serve` and `ikam live` end on each stop signal, and when the terminal or pipe their log goes to is gone?
+- Setup: Linux cloud container, 4 cores. `experiments/crash-safety/kill_mid_append.py`: 20,000 indexed rows loaded, then a writer sends 2,000-row batches (own idempotency keys, a marker row each) while the server is killed with SIGKILL after a random 0.5-6 s; restarted on the same store and checked (every answered batch whole, any unanswered one whole or absent, `ikam fsck` after the kill and at the end, an append after the restart). 10 trials per flag set. `experiments/crash-safety/stop_signals.py`: each server sent SIGHUP or SIGTERM, with its stderr kept or closed (its reader gone), and for `live` a file written just before the signal (`--commit-after 60000`, so only a stop commits it).
+- Results, kills (SIGKILL mid-append):
+
+  | flags | trials | answered batches | lost | unanswered that landed | torn | fsck clean | restart max | first read max |
+  | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+  | `--live` | 10 | 190 | 0 | 0 of 10 | 0 | 10/10, 10/10 | 0.21 s | 492 ms |
+  | `--live --defer-kv 0 --no-keep-search` | 10 | 93 | 0 | 0 of 10 | 0 | 10/10, 10/10 | 0.25 s | 59 ms |
+  | `--plain-events --edit-index` (FsStore) | 10 | 3 | 0 | 0 of 10 | 0 | 10/10, 10/10 | 0.47 s | 406 ms |
+
+  Every append the server answered survived, every store passed fsck straight after the kill, and every restarted server took the next append. Under `--live` the first read after a restart pays the fold of deferred appends (E368), up to 0.5 s here.
+- Results, stop signals, main 021f129 (before this change):
+
+  | case | exits | logged | requests answered | file committed |
+  | --- | --- | --- | --- | --- |
+  | `db serve --live`, SIGHUP | killed by the signal | nothing | 5/5 | - |
+  | `db serve --live`, SIGTERM | 0 | `stopped` | 5/5 | - |
+  | `db serve --live`, stderr gone, SIGTERM | **never** (killed after 5 s) | - | 5/5 | - |
+  | `db serve --live --log-requests`, stderr gone | never | - | **0/5** (connection closed) | - |
+  | `live`, SIGHUP | killed by the signal | nothing | 5/5 | **no** (edit lost) |
+  | `live`, SIGTERM | 0 | `stopped` | 5/5 | yes |
+  | `live --log-requests`, stderr gone, SIGTERM | never | - | 0/5 | yes |
+
+  Causes: SIGHUP (sent when the terminal that started a server closes) was not caught, so it ended the process with no line and, for `live`, without committing pending edits. `eprintln!` panics when stderr is gone: in a request with `--log-requests` the request's thread died (the client saw a closed connection), and in the stop watcher the `stopped` line panicked before `exit`, so SIGTERM never stopped the server.
+- Change: servers write their log lines with `say!`, which ignores a write error instead of panicking (all `eprintln!` in `src/bin/ikam`). `auth::catch_stop_signals` also catches SIGHUP, as a stop like SIGTERM (`live` and `host` commit pending edits first), and the stop line names the signal (`stopped (SIGHUP)`). `--keep-on-hangup` (off by default; `db serve`, `live`, `host`) ignores SIGHUP instead, as `nohup` would, so a server started from a terminal outlives it.
+- Results, stop signals, this branch: SIGHUP and SIGTERM exit 0 with `stopped (SIGHUP)` / `stopped (SIGTERM)`; with `--keep-on-hangup` SIGHUP leaves `db serve` running; with stderr gone SIGTERM exits 0 and every request is answered (5/5, also with `--log-requests`); `live` commits the file on SIGHUP.
+- Checks: `cargo test --release`: 361 pass, 0 fail (new: `a_stop_names_its_signal`, `a_switch_is_taken_out_of_the_arguments`); clippy `-D warnings` clean.
+- Verdict: **kept**. Crash safety under SIGKILL: measured, no change needed. The logging fix and the SIGHUP stop are fixes (no trade-off); ignoring SIGHUP is an option, off.
+- Not measured: macOS (its signals are the same numbers; launchd sends SIGTERM); kills during `repack` or `gc`; a full disk; kills of `live` mid-commit; more than 10 trials a set; what ended a server elsewhere (a server killed by SIGKILL still logs nothing: only the supervisor, or the system log, can say).
+### E373 night-gaps (the loop's gap list, and tonight's picks by business case)
+
+- Branch / parent: exp/373-night-log / main 021f129
+- Question: which of the open gaps fit the business cases E354 and E355 scored (a program keeping its records in `db serve`; questions over a folder of files through `live` and `mcp`; one service holding several projects), and what should one night in the cloud run?
+- Setup: `cargo run --release --example loop_gaps` (E275, E290) on main: the registry, the log's "Not measured" lines, stale verdicts and open hypotheses. Then each gap that cites E354 to E372 was read against the scorecard's rows. Two of the business cases (records running live, one service for several projects) are goals the owner has not confirmed; where that shaped a pick it says so.
+- Result: 184 gaps (131 not measured, 43 stale, 10 open hypotheses; 55 touch a weighty mechanism), from 350 registry rows and 331 log entries. 17 cite E354 to E372. Tonight's picks, in the order run (eleven):
+
+  | pick | gap or source | business case |
+  | --- | --- | --- |
+  | E374 crash safety | not on the list: the scorecard's "runs unattended" row had no kill test | records live (unconfirmed goal) |
+  | E375 memory curve | E356 "stores above 200k rows" | records live |
+  | E376 skip unchanged rows | not on the list: a reimport of the same rows rewrote everything (seen in E376's baseline) | records kept in sync with another system |
+  | E377 A/B harness | the owner's plan to compare against PostgreSQL only as a yardstick | records live |
+  | E378 passage index | E358 and E359 "search over files in `live`" | questions over files |
+  | E379 served index view | E377's slowest step (rows by a secondary index) and E371 "`--views` in the same run" | records live |
+  | E380 kept views | E379's 3 s first lookup after every start | records live |
+  | E381 view update cost | E380's 200 ms lookup after a 100-row change; E368 and E371 mixed traffic | records live |
+  | E382 one-pass search build | E375's 46 s and 3.8 GB first search of a 1M-row table | records live, questions over records |
+  | E383 bounded seed index | E375's 3 GB server after a 1M-row load, still growing | records live; one host for several projects (unconfirmed goal) |
+  | E384 streamed pack checkpoints | E383's profile: a server still grows 0.9 MB per 1,000 rows under a bound | records live; one host for several projects (unconfirmed goal) |
+
+  Left for later: the rest of E368 and E371 mixed traffic (E381 took the view side), E367's ledger skip, E365's line-level merge, and every Mac row (this night ran in the cloud only).
+- Journal: `loop_journal E374 E384 2026-11-22` on a scratch copy of main's docs with the eleven entries appended (each branch keeps its own entry; nothing merged): 11 experiments, 44 firings on `night/2026-11-22`, replay equal to the marking, each finish output equal to its log entry, fsck clean; a second run fired nothing new. A finish output cannot change once fired: when E383's entry gained its benchmark line after a run, the next run stopped with an idempotency conflict on that firing, so the journal was built again in a fresh store (and again after E383's review fix and E384). Eight wait for the owner (E374, E376, E378, E380, E381, E382, E383, E384: changes to merge) and three are closed (E375, E377, E379: measurements).
+- Verdict: **measured** (a plan; no code).
+- Run: `cargo run --release --example loop_gaps`, then `cargo run --release --example loop_journal -- E374 E384 2026-11-22 STORE_DIR` once the entries are on one branch.
