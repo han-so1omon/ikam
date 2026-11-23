@@ -6157,3 +6157,28 @@ Gates on the branch (E229 to E233): every kernel test suite passes (release); cl
 - Note for older runs: a bench that passes only `--live` (`restart_bench.py`, `search_bench.py`, `served_views.py`, `db_first_write.py`) now measures the new preset; `--live --defer-kv 0 --no-keep-search` is the E356 preset.
 - Verdict: **kept** (preset change, each part still an option).
 - Not measured: the Mac; whether 20000 is the best N for other row sizes (E368 measured 100k, E371 20000).
+
+### E384 ckpt-stream (what still grows in a loading server, and pack checkpoints without a second index)
+- Branch / parent: exp/384-ckpt-stream / main 021f129
+- Question: with the seed index bounded (E383), a `db serve --live` server still grows about 0.9 MB per 1,000 rows loaded. What holds it?
+- Profile (valgrind massif, 200k rows with `--live --seed-index-max 50000`, one run, not committed; heap by owner at the last snapshots): of a 203 MB peak, 98 MB was a pack checkpoint in progress, 47 MB a fold of the deferred kv events (the content being planned), 28 MB the open pack's index of records since its last checkpoint, 19 MB the ledger (every derivation written, which grows with the store) and 8 MB the bounded seed index. A checkpoint (every 64 MB of records, E171's lazy checkpoints) read the last checkpoint into a hash map, copied the newer records' index into it, then sorted references to every entry and wrote them out: three copies of the open pack's whole index at once, growing until the pack is sealed at 512 MB; a seal did the same.
+- Change (no option: the same files): `PackStore::active_idx_bytes` (src/backends.rs) reads the last checkpoint, already sorted, in 1 MB blocks and merges it with the newer records, sorted (a newer record of an id wins, as the hash map's insert did), straight into the `.idx` layout; checkpoints and seals write that buffer (`write_ckpt_bytes`, `write_idx_bytes`), and their Bloom filters are built from it (`Filter::build_from_idx`). The old path stays for the test only.
+- Result:
+
+  | | main | E384 |
+  |---|---|---|
+  | 6M small objects through a lazy, filtered `PackStore`, a sync every 2,000 (`examples/pack_ckpt_mem.rs`): time | 32.3 s | 14.9 s |
+  | peak resident | 808 MB | 351 MB |
+  | slowest sync (a checkpoint) | 5,448 ms | 1,818 ms |
+  | 1M rows through `db serve --live` (E383's `load_mem.py`): load | 452.2 s | 417.3 s |
+  | resident after the load | 3,095 MB | 3,077 MB |
+  | 1M rows with E383's `--seed-index-max 250000` (both branches together, a scratch build): load | 439.0 s | 439.4 s |
+  | resident after that load | 990 MB | 985 MB |
+
+  The store's files are the same bytes. Through the server the change is within one run's noise (the 35 s at 1M rows without a bound did not repeat with one): a checkpoint's copies were freed between commits, so the server's resident memory, which the allocator rarely gives back, was set by the larger owners, and the checkpoints were a few seconds of a seven-minute load. The gain is a pack store's own: a checkpoint about three times faster and less than half the peak of a store that holds little else.
+- Checks: `merged_index_bytes_equal_a_full_copy` (backends tests: 30,000 objects, then three rounds of rewrites and deletes of ids the checkpoint holds and new ids on both sides of them, each followed by a checkpoint; then a seal and a reopen): at every step the merged bytes equal the full copy's, the checkpoint file and the sealed index are those bytes, the filter's bits are the same, and every object reads back as the model has it. It fails when an older record of an id wins over a newer one.
+- Fixed benchmark (AGENTS.md section 7), full run with all eleven cost corpora (history included) and the three north corpora, the same morning as main 021f129: bytes, proxy and read scores 5.7493, 3.8185 and 5.7140 and north score 0.3060, all as on main; every reconstruction exact and fsck clean, every non-timing field equal corpus by corpus; the north repack's peak 43.5 MB against 44.9 MB; cost score 0.2207 against 0.2069, its timing noise. `cargo test --release`: 360 pass; clippy clean.
+- Verdict: **kept** (no trade-off: the same files; a pack store's checkpoints about three times faster, its peak memory less than half). It does not explain the server's remaining growth: that is the fold and the ledger (Next).
+- Not measured: the Mac (APFS); a seal's peak on its own (the 1M-row load seals two packs, within the numbers above); the fold's 47 MB and the ledger, the next largest owners.
+- Next: the deferred kv fold plans each content whole; the ledger holds every derivation in memory for the life of the handle.
+- Run: `cargo run --release --example pack_ckpt_mem -- 6000000 DIR` on main and the branch; `python3 -I experiments/seed-index/load_mem.py IKAM_BIN WORK 1000000 250000 "--live"` (E383's script, on its branch).

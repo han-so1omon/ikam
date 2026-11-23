@@ -987,6 +987,24 @@ impl Filter {
         f
     }
 
+    /// `build` over the ids of an index in the `.idx` layout (E384).
+    fn build_from_idx(idx: &[u8]) -> Filter {
+        let body = &idx[IDX_HEAD as usize..];
+        let n = body.len() / IDX_ENTRY as usize;
+        let m = (n as u64 * 10).max(64);
+        let mut f = Filter {
+            m,
+            bits: vec![0; m.div_ceil(64) as usize],
+        };
+        for e in body.chunks_exact(IDX_ENTRY as usize) {
+            let id = Id::from_bytes(e[..32].try_into().unwrap());
+            for b in f.probes(&id) {
+                f.bits[(b / 64) as usize] |= 1 << (b % 64);
+            }
+        }
+        f
+    }
+
     fn probes(&self, id: &Id) -> impl Iterator<Item = u64> + use<> {
         let b = id.as_bytes();
         let h1 = u64::from_le_bytes(b[8..16].try_into().unwrap());
@@ -1391,8 +1409,8 @@ impl PackStore {
     /// Save the open pack's index, so the next open scans only what follows.
     fn checkpoint(&mut self) -> Result<(), Error> {
         let path = self.root.join(format!("packs/{:08}.ckpt", self.active_no));
-        let full = self.full_active_index()?;
-        write_ckpt(&path, &full, self.flushed, self.opts.lazy_checkpoint)?;
+        let bytes = self.active_idx_bytes()?;
+        write_ckpt_bytes(&path, &bytes, self.flushed, self.opts.lazy_checkpoint)?;
         self.ckpt_at = self.flushed;
         if self.opts.ref_log {
             write_snap(
@@ -1406,7 +1424,7 @@ impl PackStore {
             && let Some((idx, fanout, _)) = open_ckpt_lazy(&path, self.flushed)
         {
             let filter = if self.opts.filters {
-                let f = Filter::build(full.keys());
+                let f = Filter::build_from_idx(&bytes);
                 f.write(&path.with_extension("cflt"), fanout[255])?;
                 Some(Box::new(f))
             } else {
@@ -1426,6 +1444,7 @@ impl PackStore {
 
     /// The open pack's whole index: the lazily read checkpoint (E171), if
     /// any, under the records that followed it.
+    #[cfg(test)]
     fn full_active_index(&self) -> Result<PackIndex, Error> {
         let Some(b) = &self.base else {
             return Ok(self.active_index.clone());
@@ -1444,20 +1463,81 @@ impl PackStore {
         Ok(full)
     }
 
+    /// The open pack's whole index in the `.idx` layout, the bytes
+    /// `idx_bytes(&self.full_active_index()?)` gives (E384): the lazily read
+    /// checkpoint, already sorted, is read in blocks and merged with the
+    /// sorted records that followed it (a later record of an id wins), so no
+    /// second index of the pack is built in memory to write one.
+    fn active_idx_bytes(&self) -> Result<Vec<u8>, Error> {
+        let mut tail: Vec<(Id, (u64, u32))> =
+            self.active_index.iter().map(|(k, v)| (*k, *v)).collect();
+        tail.sort_unstable_by_key(|(id, _)| *id);
+        let n = self.base.as_ref().map_or(0, |b| b.fanout[255] as u64);
+        // The header is filled in once the entries are counted.
+        let mut entries: Vec<u8> = Vec::with_capacity(
+            IDX_HEAD as usize + ((n as usize) + tail.len()) * IDX_ENTRY as usize,
+        );
+        entries.resize(IDX_HEAD as usize, 0);
+        let mut fanout = [0u32; 256];
+        let mut push = |out: &mut Vec<u8>, id: &Id, off: u64, len: u32| {
+            fanout[id.as_bytes()[0] as usize] += 1;
+            out.extend_from_slice(id.as_bytes());
+            out.extend_from_slice(&off.to_le_bytes());
+            out.extend_from_slice(&len.to_le_bytes());
+        };
+        let mut t = tail.iter().peekable();
+        if let Some(b) = &self.base {
+            let per = (1u64 << 20) / IDX_ENTRY;
+            let mut block = Vec::new();
+            let mut i = 0;
+            while i < n {
+                let k = per.min(n - i);
+                block.resize((k * IDX_ENTRY) as usize, 0);
+                b.idx.read_exact_at(&mut block, IDX_HEAD + i * IDX_ENTRY)?;
+                for e in block.chunks_exact(IDX_ENTRY as usize) {
+                    let id = Id::from_bytes(e[..32].try_into().unwrap());
+                    while let Some((tid, (off, len))) = t.next_if(|(tid, _)| *tid < id) {
+                        push(&mut entries, tid, *off, *len);
+                    }
+                    if let Some((tid, (off, len))) = t.next_if(|(tid, _)| *tid == id) {
+                        push(&mut entries, tid, *off, *len);
+                    } else {
+                        let off = u64::from_le_bytes(e[32..40].try_into().unwrap());
+                        let len = u32::from_le_bytes(e[40..44].try_into().unwrap());
+                        push(&mut entries, &id, off, len);
+                    }
+                }
+                i += k;
+            }
+        }
+        for (tid, (off, len)) in t {
+            push(&mut entries, tid, *off, *len);
+        }
+        for i in 1..256 {
+            fanout[i] += fanout[i - 1];
+        }
+        entries[..8].copy_from_slice(IDX_MAGIC);
+        entries[8..16].copy_from_slice(&(fanout[255] as u64).to_le_bytes());
+        for (i, f) in fanout.iter().enumerate() {
+            entries[16 + 4 * i..20 + 4 * i].copy_from_slice(&f.to_le_bytes());
+        }
+        Ok(entries)
+    }
+
     fn seal(&mut self) -> Result<(), Error> {
         let n = self.active_no;
-        let full = self.full_active_index()?;
+        let idx = self.active_idx_bytes()?;
         if self.opts.ref_log {
             // Every ref so far, as of the start of the next pack.
             write_snap(&self.root.join("refs.snap"), n + 1, 0, &self.log_refs)?;
         }
-        write_idx(&self.root.join(format!("packs/{n:08}.idx")), &full)?;
+        write_idx_bytes(&self.root.join(format!("packs/{n:08}.idx")), &idx)?;
         self.base = None;
         let _ = fs::remove_file(self.root.join(format!("packs/{n:08}.ckpt")));
         let _ = fs::remove_file(self.root.join(format!("packs/{n:08}.cflt")));
         let mut sealed = open_sealed(&self.root, n)?;
         if self.opts.filters {
-            let f = Filter::build(full.keys());
+            let f = Filter::build_from_idx(&idx);
             f.write(
                 &self.root.join(format!("packs/{n:08}.flt")),
                 sealed.fanout[255],
@@ -1864,24 +1944,25 @@ fn scan_with(
 /// records before `covers`, then `covers` (u64) and a BLAKE3 hash of all of
 /// it. Open loads it and scans only what came after; a missing, torn or
 /// stale checkpoint only means a longer scan.
-fn write_ckpt(
-    path: &Path,
-    index: &HashMap<Id, (u64, u32)>,
-    covers: u64,
-    durable: bool,
-) -> Result<(), Error> {
-    let mut out = idx_bytes(index);
-    out.extend_from_slice(&covers.to_le_bytes());
-    let h = blake3::hash(&out);
-    out.extend_from_slice(h.as_bytes());
+/// A checkpoint from an index already in the `.idx` layout (E384).
+fn write_ckpt_bytes(path: &Path, idx: &[u8], covers: u64, durable: bool) -> Result<(), Error> {
+    let mut h = blake3::Hasher::new();
+    h.update(idx);
+    h.update(&covers.to_le_bytes());
+    let mut trailer = covers.to_le_bytes().to_vec();
+    trailer.extend_from_slice(h.finalize().as_bytes());
     let tmp = path.with_extension("ckpt.tmp");
     if durable {
         // E171: read lazily, unhashed, so written like a sealed index.
         let mut f = File::create(&tmp)?;
-        f.write_all(&out)?;
+        f.write_all(idx)?;
+        f.write_all(&trailer)?;
         f.sync_all()?;
     } else {
-        fs::write(&tmp, &out)?; // no fsync: losing it costs a scan, nothing more
+        // No fsync: losing it costs a scan, nothing more.
+        let mut f = File::create(&tmp)?;
+        f.write_all(idx)?;
+        f.write_all(&trailer)?;
     }
     fs::rename(&tmp, path)?;
     Ok(())
@@ -1972,10 +2053,13 @@ fn idx_bytes(index: &HashMap<Id, (u64, u32)>) -> Vec<u8> {
 }
 
 fn write_idx(path: &Path, index: &HashMap<Id, (u64, u32)>) -> Result<(), Error> {
-    let out = idx_bytes(index);
+    write_idx_bytes(path, &idx_bytes(index))
+}
+
+fn write_idx_bytes(path: &Path, out: &[u8]) -> Result<(), Error> {
     let tmp = path.with_extension("idx.tmp");
     let mut f = File::create(&tmp)?;
-    f.write_all(&out)?;
+    f.write_all(out)?;
     f.sync_all()?;
     fs::rename(&tmp, path)?;
     Ok(())
@@ -2675,6 +2759,77 @@ pub mod hybrid {
 #[cfg(test)]
 mod pack_index_tests {
     use super::*;
+
+    /// E384: a checkpoint and a seal written by merging the lazy checkpoint
+    /// with the records after it hold the bytes a full in-memory copy gave,
+    /// with rewritten and deleted ids, and the store reads the same after.
+    #[test]
+    fn merged_index_bytes_equal_a_full_copy() {
+        let dir = tempfile::tempdir().unwrap();
+        let opts = PackOptions {
+            lazy_checkpoint: true,
+            filters: true,
+            ..Default::default()
+        };
+        let mut st = PackStore::open_with(dir.path(), opts).unwrap();
+        let body = |n: u32, v: u32| format!("object {n} version {v}").into_bytes();
+        let id = |n: u32| Id::of(&n.to_le_bytes());
+        let check = |st: &PackStore| {
+            let old = idx_bytes(&st.full_active_index().unwrap());
+            assert_eq!(st.active_idx_bytes().unwrap(), old);
+            old
+        };
+        // Empty, then records only, then a checkpoint under new records.
+        check(&st);
+        let mut model: HashMap<u32, Option<Vec<u8>>> = HashMap::new();
+        for n in 0..30_000 {
+            st.write(id(n), &body(n, 0)).unwrap();
+            model.insert(n, Some(body(n, 0)));
+        }
+        check(&st);
+        let mut want = None;
+        for round in 1..4u32 {
+            st.flush().unwrap();
+            let full = check(&st);
+            st.checkpoint().unwrap();
+            let ckpt = fs::read(dir.path().join("packs/00000000.ckpt")).unwrap();
+            assert_eq!(&ckpt[..full.len()], &full[..], "round {round}");
+            let flt = Filter::build(st.full_active_index().unwrap().keys());
+            assert_eq!(Filter::build_from_idx(&full).bits, flt.bits);
+            // New ids on both sides of old ones, rewrites and deletes of
+            // ids the checkpoint holds.
+            for n in (0..40_000).step_by(3 + round as usize) {
+                if n % 7 == 0 {
+                    if model.get(&n).is_some_and(|v| v.is_some()) {
+                        st.delete(&id(n)).unwrap();
+                        model.insert(n, None);
+                    }
+                } else {
+                    st.replace(id(n), &body(n, round)).unwrap();
+                    model.insert(n, Some(body(n, round)));
+                }
+            }
+            want = Some(check(&st));
+        }
+        // A seal writes the same index.
+        st.flush().unwrap();
+        let full = want.take().unwrap();
+        assert_eq!(check(&st), full);
+        st.seal().unwrap();
+        assert_eq!(
+            fs::read(dir.path().join("packs/00000000.idx")).unwrap(),
+            full
+        );
+        st.sync().unwrap();
+        drop(st);
+        let st = PackStore::open_with(dir.path(), opts).unwrap();
+        for n in 0..40_000u32 {
+            match model.get(&n) {
+                Some(Some(b)) => assert_eq!(&st.read(&id(n)).unwrap(), b, "{n}"),
+                _ => assert!(st.read(&id(n)).is_err(), "{n} should be absent"),
+            }
+        }
+    }
 
     #[test]
     fn sealed_lookup_finds_every_id_and_no_other() {
