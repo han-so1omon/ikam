@@ -269,6 +269,11 @@ impl<S: Store> Server<S> {
             touched.remove(name);
             return;
         }
+        // A fold since the last append (a read's `settle`) starts a new
+        // interval: what the entry held is folded already.
+        if db.kv_at == seq {
+            touched.remove(name);
+        }
         let t = touched.entry(name.to_string()).or_insert(Touched {
             kv_at: db.kv_at,
             head: seq,
@@ -1423,6 +1428,22 @@ mod tests {
                 handle(&st, &req("POST", "/db/m/append", &encode_events(b), &ct));
             }
             assert!(head(&st).starts_with("{\"head\":6,"), "{}", head(&st));
+            // A read folds between appends: the next interval still skips.
+            let st = make(true);
+            handle(
+                &st,
+                &req("POST", "/db/m/append", &encode_events(&batches[0]), &ct),
+            );
+            handle(&st, &req("GET", "/db/m/scan?prefix=t/", b"", &[]));
+            for run in ["edit", "edit-same"] {
+                let b = rows(run, &[2]);
+                handle(&st, &req("POST", "/db/m/append", &encode_events(&b), &ct));
+            }
+            assert!(
+                head(&st).starts_with("{\"head\":7,"),
+                "defer {defer}: {}",
+                head(&st)
+            );
         }
     }
 
