@@ -6158,6 +6158,27 @@ Gates on the branch (E229 to E233): every kernel test suite passes (release); cl
 - Verdict: **kept** (preset change, each part still an option).
 - Not measured: the Mac; whether 20000 is the best N for other row sizes (E368 measured 100k, E371 20000).
 
+### E375 memory-curve (resident memory of `db serve --live` up to a million rows)
+
+- Branch / parent: exp/375-memory-curve / main 021f129
+- Question: a project's live database grows for months. How much memory does `ikam db serve --live` hold as a table grows past the 200k rows measured so far (E356 gap: stores above 200k rows), does a restart give it back, and what does the first ranked search of a large table cost?
+- Setup: Linux cloud container, 4 cores, 15 GB. `experiments/memory/rss_load.py`: 1,000,000 indexed rows (each row and one index entry, as E354) in 2,000-row batches; the server's resident memory (VmRSS) and peak (VmHWM) from /proc as it loads, after a restart and a full count, after the first BM25 search of the table, and after a second restart and the same search. Run twice (checks every 100k and every 250k rows): the figures agree within 5%.
+- Results:
+
+  | point | rows | elapsed | memory | peak |
+  | --- | --- | --- | --- | --- |
+  | loading | 200k | 29 s | 537 MB | 608 MB |
+  | loading | 500k | 135 s | 1,469 MB | 1,603 MB |
+  | loading | 1M | 362 s | 3,095 MB | 3,251 MB |
+  | restarted, counted | 1M | | 1,507-1,589 MB | 1,606-1,687 MB |
+  | first search ever (45.6-45.8 s) | 1M | | 5,339 MB | 5,645 MB |
+  | restarted again, same search (under 0.05 s) | 1M | | 1,647 MB | 1,647 MB |
+
+  Store 1,338 MB. Memory grows about 3 MB per thousand rows while loading, and about half of it is given back only by a restart. The first search of a table nobody searched builds its BM25 view from every row: 46 s and 3.8 GB more at its peak. With `--keep-search` (on under `--live`) the view is kept, so a later restart answers the same search at once.
+- Verdict: **measured**, no code change. Neither number is a failure at 1M rows on a machine with 16 GB, but both grow with the table: a long-running server's memory and the one-time cost of the first search are the two things to watch.
+- Next: where the 1.5 GB a running server holds beyond a restarted one goes (caches of chunks it wrote, the deferred-fold buffers); a BM25 view built in pieces as rows arrive, so no single query pays for a whole table.
+- Not measured: the Mac (18 GB); tables of longer text; `--defer-kv 0`.
+- Run: `python3 -I experiments/memory/rss_load.py IKAM_BIN WORK 1000000 250000 "--live"`.
 ### E374 crash-safety (kills, stop signals and a server whose output went away)
 
 - Branch / parent: exp/374-crash-safety / main 021f129
