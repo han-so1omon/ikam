@@ -6158,6 +6158,31 @@ Gates on the branch (E229 to E233): every kernel test suite passes (release); cl
 - Verdict: **kept** (preset change, each part still an option).
 - Not measured: the Mac; whether 20000 is the best N for other row sizes (E368 measured 100k, E371 20000).
 
+### E377 ab-harness (one workload against `db serve` and a throwaway PostgreSQL)
+
+- Branch / parent: exp/377-ab-harness / main 021f129
+- Question: the owner's plan is for ikam to be the real database, with PostgreSQL kept only as a yardstick in A/B tests. There was no harness that runs one workload against both and checks both hold the same rows. Where does `db serve --live` stand against PostgreSQL on the operations a program's records need?
+- Setup: Linux cloud container, 4 cores. `experiments/ab/ab_bench.py` (needs psycopg2 and the PostgreSQL server binaries): synthetic rows (a key, a date, a word of 5,000, a number, a few words of padding), one secondary index on the word; on ikam a row and an index entry per row, as E354; on PostgreSQL 16 a table with a primary key, a B-tree on the word and a GIN full-text index, run from its own data directory under WORK on a Unix socket only, with its defaults (synchronous commit on). Each side: 200,000 rows in 2,000-row batches, each committed before the next; 2,000 point reads; 300 lookups by word; 300 reads of 100 rows in key order; 20 counts; 1% of rows updated; 50 one-word ranked searches (ikam BM25, PostgreSQL `ts_rank`: not the same ranking); a restart and its first read and search; size on disk. One open connection per client. Both sides end with the same rows (count and 1,000 sampled values compared): yes.
+- Results, 200k rows (ikam `--live`; count also with `--keep-counts 3`):
+
+  | step | ikam `--live` | PostgreSQL |
+  | --- | --- | --- |
+  | load | 40.3 s (batch p50 147 ms, p99 2.3 s) | 11.2 s (61 ms, 295 ms) |
+  | point read p50 / p99 | 0.24 / 0.59 ms | 0.16 / 0.32 ms |
+  | rows by word (about 40) | 4.02 / 5.74 ms | 0.21 / 0.35 ms |
+  | 100 rows in key order | 1.31 / 1.74 ms | 0.30 / 0.42 ms |
+  | count of all rows | 181 ms; **0.16 ms** with `--keep-counts 3` | 11.7 ms |
+  | update 1% (2,000 rows) | 0.3 s | 0.1 s |
+  | ranked search, first | 10.0 s (builds the view) | 3.9 ms |
+  | ranked search p50 after | **0.52 ms** | 2.97 ms |
+  | restart; first read; first search | 0.39 s; 0.6 ms; 0.9 ms | 0.12 s; 1.8 ms; 8.6 ms |
+  | size on disk | **144 MB** | 277 MB (data directory with WAL) |
+
+- Findings: PostgreSQL loads 3.6x faster and answers the secondary-index lookup about 19x faster; ikam is smaller on disk, counts faster with kept counts, and answers ranked search 6x faster once its view exists (the first search pays 10 s, E375). The lookup by word is ikam's weakest step: a scan of the index prefix, then a second request for the rows, each reading the chunks its keys fall in.
+- Verdict: **measured**; the harness is kept as a tool (no kernel change). PostgreSQL is used only on its own throwaway data directory, as a comparison.
+- Next: rows by an index in one request (the server joining index and rows, or E361 views), and a cache of recently read view chunks; the load gap (where the 2.3 s p99 batches go: folds under `--defer-kv`).
+- Not measured: the Mac; concurrent clients; larger rows; PostgreSQL tuned (it ran with defaults).
+- Run: `python3 -I experiments/ab/ab_bench.py IKAM_BIN PG_BIN_DIR WORK 200000 "--live"`.
 ### E376 skip-unchanged (sending the same rows again writes nothing)
 
 - Branch / parent: exp/376-skip-unchanged / main 021f129
