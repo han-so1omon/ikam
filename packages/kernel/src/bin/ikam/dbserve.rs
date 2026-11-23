@@ -993,16 +993,22 @@ mod tests {
     #[test]
     fn views_follow_appends_and_match_a_build_at_the_head() {
         for shared in [false, true] {
-            viewed(shared);
+            // E381: plain view writes change how chunks are stored, not
+            // the views' rows.
+            for plain in [false, true] {
+                viewed(shared, plain);
+            }
         }
     }
 
-    fn viewed(shared: bool) {
+    fn viewed(shared: bool, plain: bool) {
         let spec = "by_status group t/o/ by=field:status sum=field:amount\n\
                     by_cust index t/o/ by=field:customer\n\
                     per_day group t/e/ by=seg:0\n";
-        let served =
-            || Some(crate::dbviews::Served::new(crate::dbviews::parse(spec).unwrap()).unwrap());
+        let served = || {
+            let v = crate::dbviews::Served::new(crate::dbviews::parse(spec).unwrap()).unwrap();
+            Some(v.plain_writes(plain))
+        };
         let store = ikam_kernel::SharedStore::new(MemStore::default());
         let make = || -> Option<ReaderFactory<_>> {
             shared.then(|| Box::new(|w: &Repo<_>| w.sibling()) as ReaderFactory<_>)

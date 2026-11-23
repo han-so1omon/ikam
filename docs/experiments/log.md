@@ -6158,6 +6158,25 @@ Gates on the branch (E229 to E233): every kernel test suite passes (release); cl
 - Verdict: **kept** (preset change, each part still an option).
 - Not measured: the Mac; whether 20000 is the best N for other row sizes (E368 measured 100k, E371 20000).
 
+### E381 plain-view-writes (what a served view's update after a change costs, and `--plain-view-writes`)
+
+- Question: E380 found that an index lookup after a 100-row change costs about 200 ms with `--views` (E361 measured about 50 ms after 20 rows). Where does that time go, and can mixed write and read traffic (E368, E371) pay less?
+- Profile (callgrind, 50k indexed rows, 5 rounds of 100 changed rows and a lookup, `--live`): rewriting the index graph's chunks (`graph_edit`) is about 79% of the update. Most of that is the write path: planning each rewritten chunk as slices of the chunk it replaces (reading and decompressing the old chunk, `matcher::plan`, rebuilding the result to check it, and the zlib container probe) is about half; zstd and BLAKE3 most of the rest. Reading the changed rows (`kv_delta`, 2 to 4 ms) and the view's own delta (under 1 ms) are small. Pack storage does not change it (`--live` already stores packs), so it is not fsync.
+- Change: `db serve --plain-view-writes` (off; needs `--views`) sets `Repo::plain_hot_writes` (E261) while the served views build or update, and restores it after, so the views' chunks are stored compressed as they are; the database's own writes keep their planning. `Served::plain_writes`. `views_follow_appends_and_match_a_build_at_the_head` now runs with the option off and on: same rows.
+- Run (Linux cloud, 4 CPUs; `experiments/view-writes/view_edit.py` on a 200k-row store from the E379 harness, 100 rounds of 100 changed rows, a point read, a lookup):
+
+  | rows changed a round | lookup p50 | lookup max | store grew | total |
+  | --- | --- | --- | --- | --- |
+  | 100 neighbours, planned | 126.9 ms | 173.8 ms | 20.8 MB | 14.4 s |
+  | 100 neighbours, plain | 59.0 ms | 92.0 ms | 35.2 MB | 7.5 s |
+  | 100 from 100 batches, planned | 159.7 ms | 233.6 ms | 31.2 MB | 23.3 s |
+  | 100 from 100 batches, plain | 104.2 ms | 177.8 ms | 45.0 MB | 16.7 s |
+
+  The point read that folds the changes (about 5 ms for neighbours, 50 ms spread) and appends (7 to 9 ms) are the same either way.
+- Run (the E379 harness, `--live` against `--live --plain-view-writes`, 200k rows): load 15.8 against 14.0 s, first lookup (the build) 3.7 against 2.8 s, first lookup after a restart 3.8 against 2.9 s, store 93.7 MB both, same rows as PostgreSQL. A build has no old chunks to plan against, so its store is the same size.
+- Fixed benchmark (AGENTS.md section 7): unchanged. The change is in the server binary only, and the option is off by default. The clone used here is shallow, so the four history corpora cannot be built; the other seven cost corpora and the three north corpora were run on this branch and on main 021f129 in the same session: bytes, proxy and read scores equal (6.5696, 4.3925, 6.5359), north score 0.3060 both, every reconstruction exact and fsck clean. The cost score was 0.2318 and 0.2390 here against 0.2319 and 0.2301 on main, which is its timing noise. The option itself is E261's `plain_hot_writes`, whose storage trade-off E261 measured.
+- Verdict: **kept** as an option (off by default): about half the update time for 14 MB more store per 10,000 changed rows here; a store that runs `gc` or takes few changes may prefer it, one short of disk may not.
+- Not measured: the Mac; with `--keep-views` (E380, a separate branch) together; what `gc` gives back of the extra; the rest of the update (zstd and BLAKE3 on each rewritten chunk), which a smaller chunk target or a cheaper codec for view chunks might cut.
 ### E380 kept-views (`db serve --keep-views` reads served views back after a restart)
 
 - Question: E379 found that the index views `--views` serves (E361) are built again on the first lookup after every start, 3.0 to 3.6 s for 200k rows. Can they be kept on a ref, as `--keep-search` keeps search views (E369), so a restart reads them back?

@@ -43,7 +43,7 @@ const USAGE: &str = "usage: ikam [--store DIR] [--short-records] [--slow-codec-m
   ls [REV[:PATH]] [-r]             list a directory of REV (default main)
   grep TEXT [REV]                  files of REV containing TEXT, with lines
   stats [REV]                      objects and bytes the store holds
-  db serve [--live] [--packs] [--plain-events] [--no-object-templates] [--concurrent-reads] [--edit-index] [--plain-writes] [--hnsw] [--keep-search] [--no-keep-search] [--shared-store] [--skip-unchanged] [--keep-counts N] [--defer-kv N] [--views FILE] [--keep-views] [--keep-on-hangup] [PORT]
+  db serve [--live] [--packs] [--plain-events] [--no-object-templates] [--concurrent-reads] [--edit-index] [--plain-writes] [--hnsw] [--keep-search] [--no-keep-search] [--shared-store] [--skip-unchanged] [--keep-counts N] [--defer-kv N] [--views FILE] [--plain-view-writes] [--keep-views] [--keep-on-hangup] [PORT]
                                    the store's databases over HTTP, for programs
                                    (default port 8740, 127.0.0.1 only; dbserve.rs);
                                    --live turns on the options a live database
@@ -197,7 +197,7 @@ fn main() -> ExitCode {
 
 /// `ikam db serve [--live] [--packs] [--plain-events] [--no-object-templates]
 /// [--concurrent-reads] [--edit-index] [--plain-writes] [--hnsw] [--keep-search] [--no-keep-search] [--shared-store] [--skip-unchanged] [--keep-counts N] [--defer-kv N]
-/// [--views FILE] [--keep-views]
+/// [--views FILE] [--plain-view-writes] [--keep-views]
 /// [--allow-host NAME]...
 /// [--log-requests] [--keep-on-hangup] [PORT]`:
 /// the store's databases over HTTP (`dbserve.rs`), on 127.0.0.1:PORT (default
@@ -237,6 +237,10 @@ fn main() -> ExitCode {
 /// of 200k rows); `--keep-views` (E380, off) keeps them on a ref, as
 /// `--keep-search` keeps search views, so a restarted server reads them back
 /// and brings them to the head from the changes since.
+/// `--plain-view-writes` (E381, off) stores the views' chunks as they
+/// are, not planned as slices of the chunks they replace: a view request
+/// after a change rewrites its chunks about twice as fast, for a larger
+/// store.
 ///
 /// `--shared-store` (E370, off) is for a store other processes write too
 /// (another server, `ikam mcp`, a script): each handle lists the store
@@ -275,7 +279,7 @@ fn main() -> ExitCode {
 fn db_cmd(store_dir: &str, args: &[String]) -> Result<(), String> {
     let mut args = args.to_vec();
     if args.first().map(String::as_str) != Some("serve") {
-        return Err("usage: ikam [--store DIR] db serve [--live] [--packs] [--plain-events] [--no-object-templates] [--concurrent-reads] [--edit-index] [--plain-writes] [--hnsw] [--keep-search] [--no-keep-search] [--shared-store] [--skip-unchanged] [--keep-counts N] [--defer-kv N] [--views FILE] [--keep-views] [--allow-host NAME]... [--log-requests] [--keep-on-hangup] [PORT]".into());
+        return Err("usage: ikam [--store DIR] db serve [--live] [--packs] [--plain-events] [--no-object-templates] [--concurrent-reads] [--edit-index] [--plain-writes] [--hnsw] [--keep-search] [--no-keep-search] [--shared-store] [--skip-unchanged] [--keep-counts N] [--defer-kv N] [--views FILE] [--plain-view-writes] [--keep-views] [--allow-host NAME]... [--log-requests] [--keep-on-hangup] [PORT]".into());
     }
     args.remove(0);
     let keep_on_hangup = take_switch(&mut args, "--keep-on-hangup");
@@ -296,12 +300,18 @@ fn db_cmd(store_dir: &str, args: &[String]) -> Result<(), String> {
         args.retain(|a| a != "--keep-views");
         args.len() != before
     };
+    let plain_views = {
+        let before = args.len();
+        args.retain(|a| a != "--plain-view-writes");
+        args.len() != before
+    };
     let views = match take_flag(&mut args, "--views") {
         Some(path) => {
             let text = std::fs::read_to_string(&path).map_err(err)?;
-            Some((dbviews::parse(&text)?, keep_views))
+            Some((dbviews::parse(&text)?, keep_views, plain_views))
         }
         None if keep_views => return Err("--keep-views needs --views FILE".into()),
+        None if plain_views => return Err("--plain-view-writes needs --views FILE".into()),
         None => None,
     };
     let (packs, log_requests, serve_opts) = db_flags(&mut args, keep_counts, defer_kv);
@@ -421,13 +431,15 @@ fn search(o: DbServeOpts) -> dbsearch::SearchOpts {
 fn serve_db<S: ikam_kernel::Store + Send + Sync + 'static>(
     store: S,
     o: DbServeOpts,
-    views: Option<(Vec<dbviews::Rule>, bool)>,
+    views: Option<(Vec<dbviews::Rule>, bool, bool)>,
     port: u16,
     allowed: Vec<String>,
     log_requests: bool,
 ) -> Result<(), String> {
     let views = views
-        .map(|(rules, keep)| dbviews::Served::new(rules).map(|v| v.keep(keep)))
+        .map(|(rules, keep, plain)| {
+            dbviews::Served::new(rules).map(|v| v.keep(keep).plain_writes(plain))
+        })
         .transpose()?;
     fn tune<T: ikam_kernel::Store>(mut r: Repo<T>, o: DbServeOpts) -> Repo<T> {
         r.plain_db_events = o.plain_events;

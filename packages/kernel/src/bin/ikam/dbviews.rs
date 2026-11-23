@@ -238,6 +238,9 @@ pub struct Served {
     from_ref: Mutex<HashSet<String>>,
     /// Databases whose kept views failed a read: built afresh from now on.
     no_ref: Mutex<HashSet<String>>,
+    /// E381: the views' chunks are stored as they are, not planned as
+    /// slices of the chunks they replace (`Repo::plain_hot_writes`).
+    plain: bool,
 }
 
 /// The ref a database's kept views live on (E380).
@@ -265,6 +268,7 @@ impl Served {
             keep: false,
             from_ref: Mutex::new(HashSet::new()),
             no_ref: Mutex::new(HashSet::new()),
+            plain: false,
         })
     }
 
@@ -277,6 +281,13 @@ impl Served {
     /// built again.
     fn rules_text(&self) -> String {
         format!("{:?}", self.rules)
+    }
+
+    /// Store the views' chunks plain (E381): a view update after a change
+    /// skips planning slices against the old chunks, for a larger store.
+    pub fn plain_writes(mut self, plain: bool) -> Served {
+        self.plain = plain;
+        self
     }
 
     pub fn list_json(&self) -> String {
@@ -314,8 +325,12 @@ impl Served {
         if loaded && kept.is_some() {
             self.from_ref.lock().unwrap().insert(name.to_string());
         }
+        // E381: the views' chunks stored plain, for the writes below only.
+        let plain = writer.plain_hot_writes;
+        writer.plain_hot_writes |= self.plain;
         let state = match kept {
             Some(s) if s.db == *db => {
+                writer.plain_hot_writes = plain;
                 self.states
                     .lock()
                     .unwrap()
@@ -329,19 +344,21 @@ impl Served {
                 let out = writer.views_update(&self.graph, &s, db);
                 writer.prune_diff = prune;
                 match out {
-                    Ok(st) => st,
+                    Ok(st) => Ok(st),
                     Err(_) if !checked => {
                         self.from_ref.lock().unwrap().remove(name);
-                        writer.views_build(&self.graph, db)?
+                        writer.views_build(&self.graph, db)
                     }
-                    Err(e) => return Err(e),
+                    Err(e) => Err(e),
                 }
             }
             None => {
                 self.from_ref.lock().unwrap().remove(name);
-                writer.views_build(&self.graph, db)?
+                writer.views_build(&self.graph, db)
             }
         };
+        writer.plain_hot_writes = plain;
+        let state = state?;
         // Views that cannot be kept are still served; the next restart
         // builds them again.
         if self.keep
