@@ -226,6 +226,9 @@ pub struct Served {
     rules: Vec<Rule>,
     graph: ViewGraph,
     states: Mutex<HashMap<String, ViewState>>,
+    /// E381: the views' chunks are stored as they are, not planned as
+    /// slices of the chunks they replace (`Repo::plain_hot_writes`).
+    plain: bool,
 }
 
 impl Served {
@@ -245,7 +248,15 @@ impl Served {
             rules,
             graph,
             states: Mutex::new(HashMap::new()),
+            plain: false,
         })
+    }
+
+    /// Store the views' chunks plain (E381): a view update after a change
+    /// skips planning slices against the old chunks, for a larger store.
+    pub fn plain_writes(mut self, plain: bool) -> Served {
+        self.plain = plain;
+        self
     }
 
     pub fn list_json(&self) -> String {
@@ -266,18 +277,26 @@ impl Served {
         db: &Db,
     ) -> Result<ViewState, Error> {
         let kept = self.states.lock().unwrap().get(name).cloned();
+        if let Some(s) = &kept
+            && s.db == *db
+        {
+            return Ok(s.clone());
+        }
+        let plain = writer.plain_hot_writes;
+        writer.plain_hot_writes |= self.plain;
         let state = match kept {
-            Some(s) if s.db == *db => return Ok(s),
             Some(s) => {
                 // The same changes either way (E249); it skips the chunks
                 // both heads share instead of listing every leaf of both.
                 let prune = std::mem::replace(&mut writer.prune_diff, true);
                 let out = writer.views_update(&self.graph, &s, db);
                 writer.prune_diff = prune;
-                out?
+                out
             }
-            None => writer.views_build(&self.graph, db)?,
+            None => writer.views_build(&self.graph, db),
         };
+        writer.plain_hot_writes = plain;
+        let state = state?;
         self.states
             .lock()
             .unwrap()
