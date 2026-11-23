@@ -1016,6 +1016,132 @@ mod tests {
     }
 
     #[test]
+    fn kept_views_outlive_a_restart() {
+        // E380: with `keep` a restarted server reads its views back
+        // (writing nothing when the rows have not changed) and brings them
+        // to the head from the rows changed since; rows match a fresh
+        // build, the ref keeps them through gc, and views kept for other
+        // rules or naming what is gone are built again.
+        let spec = "by_cust index t/o/ by=field:customer\nby_status group t/o/ by=field:status\n";
+        let store = ikam_kernel::SharedStore::new(MemStore::default());
+        let server = |spec: &str, keep: bool| {
+            let v = crate::dbviews::Served::new(crate::dbviews::parse(spec).unwrap()).unwrap();
+            Server::new(Repo::new(store.clone()), None).views(Some(v.keep(keep)))
+        };
+        let ct = [("content-type", EVENTS)];
+        let append = |st: &Server<_>, ev: &[Event]| {
+            let r = handle(st, &req("POST", "/db/v/append", &encode_events(ev), &ct));
+            assert_eq!(r.status, 200);
+        };
+        let o = |c: usize, s: &str| format!(r#"{{"customer":"c{c}","status":"{s}"}}"#);
+        let rows: Vec<Event> = (0..80)
+            .map(|i| {
+                Event::upsert(
+                    &format!("t/o/{i:03}"),
+                    o(i % 7, "open").as_bytes(),
+                    &format!("{i}"),
+                )
+            })
+            .collect();
+        let read = |st: &Server<_>| -> Vec<Vec<u8>> {
+            ["/db/v/view?name=by_cust&eq=c3", "/db/v/view?name=by_status"]
+                .iter()
+                .map(|q| {
+                    let r = handle(st, &req("GET", q, b"", &[]));
+                    assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
+                    r.body
+                })
+                .collect()
+        };
+        let st = server(spec, true);
+        append(&st, &rows);
+        let first = read(&st);
+        drop(st);
+        let refname = crate::dbviews::views_ref("v");
+        assert!(store.get_ref(&refname).unwrap().is_some());
+        // A restart with no change: read back, nothing written.
+        let before = store.ids().unwrap().len();
+        assert_eq!(read(&server(spec, true)), first);
+        assert_eq!(store.ids().unwrap().len(), before, "no rebuild");
+        // Changes while no server kept the views, then gc: read back and
+        // brought to the head, the same as a fresh build.
+        append(
+            &server(spec, false),
+            &[
+                Event::upsert("t/o/003", o(1, "paid").as_bytes(), "a"),
+                Event::remove("t/o/010", false, "b"),
+                Event::upsert("t/o/900", o(3, "paid").as_bytes(), "c"),
+            ],
+        );
+        assert!(Repo::new(store.clone()).gc().unwrap() > 0);
+        let kept = read(&server(spec, true));
+        let fresh = read(&server(spec, false));
+        assert_eq!(kept, fresh);
+        assert_ne!(kept, first);
+        let before = store.ids().unwrap().len();
+        assert_eq!(
+            read(&server(spec, true)),
+            fresh,
+            "read back after the update"
+        );
+        assert_eq!(
+            store.ids().unwrap().len(),
+            before,
+            "no rebuild after the update"
+        );
+        // Other rules: built again for them, with their own rows.
+        let other = "by_cust index t/o/ by=field:status\nby_status group t/o/ by=field:status\n";
+        let mut w = Repo::new(store.clone());
+        let kept_for = format!("{:?}", crate::dbviews::parse(other).unwrap());
+        assert!(w.views_load(&refname, &kept_for).unwrap().is_none());
+        drop(w);
+        let r = handle(
+            &server(other, true),
+            &req(
+                "GET",
+                "/db/v/view?name=by_cust&eq=paid&keys=1&format=json",
+                b"",
+                &[],
+            ),
+        );
+        assert_eq!(r.status, 200);
+        assert_eq!(pairs_of(&r).len(), 2);
+        // A ref naming what is gone is built again.
+        let rules = format!("{:?}", crate::dbviews::parse(spec).unwrap());
+        let mut w = Repo::new(store.clone());
+        let mut state = match w.views_load(&refname, &rules).unwrap() {
+            Some(st) => st,
+            None => w
+                .views_load(&refname, &kept_for)
+                .unwrap()
+                .expect("kept for the other rules"),
+        };
+        state.roots.insert(
+            "by_cust".into(),
+            ikam_kernel::Id::of_content(b"never stored"),
+        );
+        w.views_save(&refname, &rules, &state).unwrap();
+        assert!(w.views_load(&refname, &rules).is_err());
+        drop(w);
+        assert_eq!(read(&server(spec, true)), fresh);
+        assert!(
+            Repo::new(store.clone())
+                .views_load(&refname, &rules)
+                .unwrap()
+                .is_some()
+        );
+        // Without the option nothing is kept.
+        let off = server(spec, false);
+        handle(&off, &req("GET", "/db/w/view?name=by_status", b"", &[]));
+        assert!(
+            store
+                .get_ref(&crate::dbviews::views_ref("w"))
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
     fn shared_store_servers_see_each_others_writes() {
         // E370: two servers with their own handles on one store, as two
         // processes would be. By default the first cannot read what the

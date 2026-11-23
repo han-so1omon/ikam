@@ -30,7 +30,12 @@
 //! the head from the `kv` diff (`Repo::views_update`), so a request pays for
 //! the rows changed since the last one. Appends do not wait for views. A
 //! restarted server builds again on its first view request; the graphs it
-//! writes are not referenced by a commit.
+//! writes are not referenced by a commit. With `keep` (`--keep-views`,
+//! E380, off) each database's views are kept on the ref `views/NAME`
+//! (`Repo::views_save`) after each build or update, with the rules they
+//! follow, so a restarted server reads them back and brings them to the
+//! head from the changes since; views kept for other rules, or that cannot
+//! be read, are built again.
 //!
 //! Routes, under `/db/NAME/`:
 //! - `GET views`: `[{"name":...,"kind":"group"|"index","prefix":...}]`.
@@ -226,6 +231,13 @@ pub struct Served {
     rules: Vec<Rule>,
     graph: ViewGraph,
     states: Mutex<HashMap<String, ViewState>>,
+    /// Keep each database's views on a ref across restarts (E380).
+    keep: bool,
+}
+
+/// The ref a database's kept views live on (E380).
+pub fn views_ref(name: &str) -> String {
+    format!("views/{name}")
 }
 
 impl Served {
@@ -245,7 +257,19 @@ impl Served {
             rules,
             graph,
             states: Mutex::new(HashMap::new()),
+            keep: false,
         })
+    }
+
+    pub fn keep(mut self, keep: bool) -> Served {
+        self.keep = keep;
+        self
+    }
+
+    /// The rules as kept views record them: views kept for other rules are
+    /// built again.
+    fn rules_text(&self) -> String {
+        format!("{:?}", self.rules)
     }
 
     pub fn list_json(&self) -> String {
@@ -265,19 +289,49 @@ impl Served {
         name: &str,
         db: &Db,
     ) -> Result<ViewState, Error> {
-        let kept = self.states.lock().unwrap().get(name).cloned();
+        let held = self.states.lock().unwrap().get(name).cloned();
+        let (kept, loaded) = match held {
+            Some(s) => (Some(s), false),
+            // Views kept by an earlier run; ones that cannot be read are
+            // built again.
+            None if self.keep => {
+                let s = writer
+                    .views_load(&views_ref(name), &self.rules_text())
+                    .ok()
+                    .flatten();
+                (s, true)
+            }
+            None => (None, false),
+        };
         let state = match kept {
-            Some(s) if s.db == *db => return Ok(s),
+            Some(s) if s.db == *db => {
+                self.states
+                    .lock()
+                    .unwrap()
+                    .insert(name.to_string(), s.clone());
+                return Ok(s);
+            }
             Some(s) => {
                 // The same changes either way (E249); it skips the chunks
                 // both heads share instead of listing every leaf of both.
                 let prune = std::mem::replace(&mut writer.prune_diff, true);
                 let out = writer.views_update(&self.graph, &s, db);
                 writer.prune_diff = prune;
-                out?
+                match out {
+                    Ok(st) => st,
+                    Err(_) if loaded => writer.views_build(&self.graph, db)?,
+                    Err(e) => return Err(e),
+                }
             }
             None => writer.views_build(&self.graph, db)?,
         };
+        // Views that cannot be kept are still served; the next restart
+        // builds them again.
+        if self.keep
+            && let Err(e) = writer.views_save(&views_ref(name), &self.rules_text(), &state)
+        {
+            eprintln!("{} keeping the views of {name}: {e}", crate::live::stamp());
+        }
         self.states
             .lock()
             .unwrap()
