@@ -167,3 +167,69 @@ fn hints_let_a_narrow_scope_store_what_the_whole_store_does() {
 fn hints_do_nothing_without_a_scope() {
     assert_eq!(run(None, true), run(None, false));
 }
+
+/// Forty edits of the view on one handle with a scope and hints, bounded
+/// at `max` seed entries (0: unbounded); the view, the most entries seen
+/// after an edit, and bytes written.
+fn many(max: usize) -> (Id, usize, usize) {
+    let (store, mut view, _, blob) = base();
+    let mut repo = Repo::new(store);
+    repo.read_memo = true;
+    repo.replace_hints = true;
+    repo.seed_index_max = max;
+    repo.set_seed_scope(Some(vec![]));
+    let (mut most, before) = (0, repo.bytes_written);
+    for round in 0..40 {
+        let id = repo
+            .put_content(format!("round {round} file").as_bytes())
+            .unwrap()
+            .id;
+        let ed: BTreeMap<String, Option<Node>> = (0..30)
+            .map(|i| node(3000 + round * 30 + i, blob))
+            .chain([round * 61 % 3000, round * 97 % 3000].map(|i| node(i, id)))
+            .map(|n| (n.label.clone(), Some(n)))
+            .collect();
+        view = repo.graph_edit_with(&view, ed, Keys::Any).unwrap();
+        most = most.max(repo.seed_index_entries());
+    }
+    assert!(repo.fsck().unwrap().is_empty());
+    (view, most, repo.bytes_written - before)
+}
+
+#[test]
+fn a_bounded_index_stays_bounded_and_writes_the_same_view() {
+    let free = many(0);
+    for bound in [200, 1000, 4000] {
+        let capped = many(bound);
+        eprintln!(
+            "E383 bound {bound}: most {} entries, {} bytes; unbounded {} entries, {} bytes",
+            capped.1, capped.2, free.1, free.2
+        );
+        assert_eq!(
+            capped.0, free.0,
+            "the view differs under a bound of {bound}"
+        );
+        assert!(
+            capped.1 < free.1,
+            "{} entries bounded, {} unbounded",
+            capped.1,
+            free.1
+        );
+        // One edit's reads and writes may go past the bound before the next
+        // edit drops the index.
+        assert!(
+            capped.1 <= bound * 4,
+            "{} entries for a bound of {bound}",
+            capped.1
+        );
+        // A dropped index takes back what the edit in hand read, so each
+        // edit still slices against the chunks it read; only contents
+        // written earlier and not read again are lost.
+        assert!(
+            capped.2 * 10 <= free.2 * 11,
+            "{} bytes bounded, {} unbounded",
+            capped.2,
+            free.2
+        );
+    }
+}
