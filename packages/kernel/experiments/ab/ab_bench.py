@@ -22,13 +22,19 @@ runs from its own data directory under WORK on a Unix socket only, as the
 `postgres` user, with its defaults (synchronous commit on). Nothing leaves
 the machine. Linux; needs psycopg2 and the PostgreSQL server binaries.
 
-  python3 -I ab_bench.py IKAM_BIN PG_BIN_DIR WORK ROWS "IKAM FLAGS" """
+  python3 -I ab_bench.py IKAM_BIN PG_BIN_DIR WORK ROWS "IKAM FLAGS" [view]
+
+With `view` (E379) ikam keeps no index entries of its own: rows are JSON
+objects, `db serve` is started with `--views` and an index on the word
+(E361), and a lookup by word is one `view?name=by_word&eq=W` request. The
+first lookup builds the view; its time is reported apart. """
 import base64, http.client, json, os, random, shutil, socket, struct, subprocess, sys, time
 
 import psycopg2
 
 binary, pg_bin, work, rows, flags = (sys.argv[1], sys.argv[2], sys.argv[3], int(sys.argv[4]),
                                      sys.argv[5].split())
+VIEW = sys.argv[6:7] == ["view"]
 BATCH = 2000
 PW = "e377-test"
 WORDS = 5000
@@ -80,10 +86,16 @@ class Ikam:
         self.auth = line.split("=", 1)[1]
         self.hdr = {"Authorization": "Basic " + base64.b64encode(("u:" + PW).encode()).decode()}
         self.seq = 0
+        self.extra = []
+        if VIEW:
+            vf = store + ".views"
+            os.makedirs(os.path.dirname(vf), exist_ok=True)
+            open(vf, "w").write("by_word index t/r/ by=field:word\n")
+            self.extra = ["--views", vf]
 
     def start(self):
         self.log = open(self.store + ".log", "ab")
-        self.proc = subprocess.Popen([binary, "--store", self.store, "db", "serve", *flags,
+        self.proc = subprocess.Popen([binary, "--store", self.store, "db", "serve", *flags, *self.extra,
                                       str(self.port)], env=dict(os.environ, IKAM_AUTH=self.auth),
                                      stdout=self.log, stderr=self.log)
         for _ in range(600):
@@ -117,13 +129,30 @@ class Ikam:
             out.append(b"\x00" + pack(("t/r/" + pk).encode(), b"e%d" % self.seq, val))
         self.call("POST", "/db/t/append", b"".join(out))
 
+    @staticmethod
+    def value(date, word, num, pad):
+        if VIEW:
+            return json.dumps({"date": date, "word": word, "num": num, "pad": pad}).encode()
+        return json.dumps([date, word, num, pad]).encode()
+
+    @staticmethod
+    def plain(v):
+        # A row's value as the PostgreSQL side gives it, for the check.
+        if v is None or not VIEW:
+            return v
+        o = json.loads(v)
+        return json.dumps([o["date"], o["word"], o["num"], o["pad"]]).encode()
+
     def load(self, rs):
-        # Rows and their index entries, as a client of a key-value store does.
+        # Rows and their index entries, as a client of a key-value store does
+        # (with `view`, the server keeps the index).
         out = []
         for pk, date, word, num, pad in rs:
             self.seq += 1
-            val = json.dumps([date, word, num, pad]).encode()
+            val = self.value(date, word, num, pad)
             out.append(b"\x00" + pack(("t/r/" + pk).encode(), b"e%d" % self.seq, val))
+            if VIEW:
+                continue
             out.append(b"\x00" + pack(("i/w/%s/%s" % (word, pk)).encode(), b"i%d" % self.seq, b""))
         self.call("POST", "/db/t/append", b"".join(out))
 
@@ -131,18 +160,21 @@ class Ikam:
         out = []
         for (pk, date, word, num, pad), old in zip(rs, old_words):
             self.seq += 1
-            val = json.dumps([date, word, num, pad]).encode()
+            val = self.value(date, word, num, pad)
             out.append(b"\x00" + pack(("t/r/" + pk).encode(), b"e%d" % self.seq, val))
-            if old != word:
+            if old != word and not VIEW:
                 out.append(b"\x01" + pack(("i/w/%s/%s" % (old, pk)).encode(), b"d%d" % self.seq))
                 out.append(b"\x00" + pack(("i/w/%s/%s" % (word, pk)).encode(), b"i%d" % self.seq, b""))
         self.call("POST", "/db/t/append", b"".join(out))
 
     def get(self, pk):
         st, v = self.call("GET", "/db/t/get?key=t/r/" + pk)
-        return v if st == 200 else None
+        return self.plain(v) if st == 200 else None
 
     def by_word(self, word):
+        if VIEW:
+            _, b = self.call("GET", "/db/t/view?name=by_word&eq=" + word)
+            return [v for _, v in unframe(b)]
         _, b = self.call("GET", "/db/t/scan?prefix=i/w/%s/" % word)
         keys = ["t/r/" + k.rsplit("/", 1)[1] for k, _ in unframe(b)]
         if not keys:
@@ -264,8 +296,14 @@ def run(side):
     res["load"] = dict(s=round(time.time() - t0, 1), **ms_stats(lat))
     r = random.Random(1)
     res["get"] = ms_stats(timed(side.get, [(row(r.randrange(rows))[0],) for _ in range(2000)]))
-    res["by_word"] = ms_stats(timed(side.by_word, [("word%d" % r.randrange(WORDS),)
-                                                   for _ in range(300)]))
+    lat = timed(side.by_word, [("word%d" % r.randrange(WORDS),) for _ in range(301)])
+    res["by_word"] = dict(first_ms=round(lat[0] * 1e3, 1), **ms_stats(lat[1:]))
+    if isinstance(side, Ikam) and VIEW:
+        # The index alone (keys, no row values), to split the lookup's time;
+        # its own random words, so both sides still update the same rows.
+        res["by_word_keys_only"] = ms_stats(timed(side.call, [
+            ("GET", "/db/t/view?name=by_word&keys=1&eq=word%d" % k.randrange(WORDS))
+            for k in [random.Random(3)] for _ in range(300)]))
     res["range"] = ms_stats(timed(side.range, [(row(r.randrange(rows))[0], 100)
                                                for _ in range(300)]))
     res["count"] = ms_stats(timed(side.count, [()] * 20))
@@ -282,6 +320,8 @@ def run(side):
     t = time.time(); side.start(); res["restart_s"] = round(time.time() - t, 2)
     res["first_get_ms"] = round(timed(side.get, [(row(5)[0],)])[0] * 1e3, 1)
     res["first_search_ms"] = round(timed(side.search, [("w7",)])[0] * 1e3, 1)
+    res["first_by_word_ms"] = round(timed(side.by_word, [("word7",)])[0] * 1e3, 1)
+    res["by_word_rows"] = [len(side.by_word("word%d" % w)) for w in (7, 42, 4999)]
     res["size_mb"] = round(side.size() / 1e6, 1)
     sample = [row(i)[0] for i in random.Random(2).sample(range(rows), 1000)]
     res["_check"] = (side.count(), [side.get(pk) for pk in sample])
@@ -298,5 +338,6 @@ b = run(Pg(os.path.join(work, "pg", "data")))
 ca, cb = a.pop("_check"), b.pop("_check")
 norm = lambda v: v and json.loads(v)
 same = ca[0] == cb[0] and all(norm(x) == norm(y) for x, y in zip(ca[1], cb[1]))
-print(json.dumps({"rows": rows, "ikam_flags": " ".join(flags), "same_rows": same,
+same = same and a["by_word_rows"] == b["by_word_rows"]
+print(json.dumps({"rows": rows, "ikam_flags": " ".join(flags), "view": VIEW, "same_rows": same,
                   "count": [ca[0], cb[0]], "ikam": a, "postgres": b}), flush=True)
