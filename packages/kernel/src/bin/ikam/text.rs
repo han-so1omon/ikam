@@ -6,9 +6,12 @@
 //! content streams, decoded as a reader sees them, so words split across
 //! PDF kerning pieces are found); for a tar or tar.gz archive, each text
 //! member, by its path inside the archive. Search is exact and
-//! case-insensitive over that text; questions rank passages with BM25.
+//! case-insensitive over that text; questions rank passages with BM25,
+//! by a scan of every file's text or, with `--passage-index` (E378, off by
+//! default), from an index of words kept as files change, which gives the
+//! same passages and scores.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::io::Read;
 use std::sync::Arc;
 
@@ -344,33 +347,61 @@ pub fn retrieve(docs: &HashMap<String, Arc<Doc>>, question: &str, k: usize) -> V
             }
         }
     }
+    rank(docs, &terms, tf, &df, n_passages, k)
+}
+
+/// Score passages by BM25 from their term counts `tf`, each term's passage
+/// count `df` and the number of passages, and return the best `k`
+/// (shared by the scan and the index, so both rank alike).
+fn rank(
+    docs: &HashMap<String, Arc<Doc>>,
+    terms: &[String],
+    tf: HashMap<(&String, usize, usize), Vec<u32>>,
+    df: &[usize],
+    n_passages: usize,
+    k: usize,
+) -> Vec<Passage> {
     let n = n_passages.max(1) as f64;
     let idf: Vec<f64> = df
         .iter()
         .map(|&d| ((n - d as f64 + 0.5) / (d as f64 + 0.5) + 1.0).ln())
         .collect();
     let k1 = 1.2;
+    // A path's boost, worked out once per path rather than per passage.
+    let mut boost: HashMap<&String, f64> = HashMap::new();
     let mut scored: Vec<((&String, usize, usize), f64)> = tf
         .into_iter()
         .map(|(key, f)| {
-            let path_lower = key.0.to_ascii_lowercase();
             let mut s: f64 = f
                 .iter()
                 .zip(&idf)
                 .map(|(&c, w)| w * (c as f64 * (k1 + 1.0)) / (c as f64 + k1))
                 .sum();
-            let in_path = terms
-                .iter()
-                .filter(|t| path_lower.contains(t.as_str()))
-                .count();
-            s *= 1.0 + 0.2 * in_path as f64;
+            s *= *boost.entry(key.0).or_insert_with(|| {
+                let path_lower = key.0.to_ascii_lowercase();
+                let in_path = terms
+                    .iter()
+                    .filter(|t| path_lower.contains(t.as_str()))
+                    .count();
+                1.0 + 0.2 * in_path as f64
+            });
             (key, s)
         })
         .collect();
-    scored.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    let order = |a: &((&String, usize, usize), f64), b: &((&String, usize, usize), f64)| {
+        b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0))
+    };
+    // Only the best `k` are put in order (the same `k` a full sort gives).
+    if k == 0 {
+        return Vec::new();
+    }
+    if scored.len() > k {
+        scored.select_nth_unstable_by(k - 1, order);
+        scored.truncate(k);
+    }
+    scored.sort_by(order);
     scored
         .into_iter()
-        .take(k)
         .map(|((path, pi, p), score)| {
             let part = &docs[path].parts[pi];
             let first = p * PASSAGE_LINES + 1;
@@ -395,6 +426,194 @@ pub fn retrieve(docs: &HashMap<String, Arc<Doc>>, question: &str, k: usize) -> V
         .collect()
 }
 
+/// E378: the words of every passage, kept as files change, so a question
+/// reads the postings of its terms instead of scanning all text. It answers
+/// as `retrieve` does: a word here is a run of ASCII letters, digits and
+/// `_` in the lowercased text (a term matches a word it begins, as the
+/// scan's word-start match), postings count a passage's words per word, and
+/// scoring is the same `rank`. A question with a term that is not ASCII is
+/// answered by the scan.
+#[derive(Default)]
+pub struct PassageIndex {
+    /// Word -> its number in `postings`.
+    words: BTreeMap<String, u32>,
+    /// By word number: (file slot, part, passage, times in it) for each
+    /// passage holding the word.
+    postings: Vec<Vec<[u32; 4]>>,
+    /// Path -> its slot, the numbers of the words it holds and its passage
+    /// count.
+    files: HashMap<String, (u32, Vec<u32>, usize)>,
+    /// Slot -> path (freed slots are `None` until reused).
+    slots: Vec<Option<String>>,
+    free: Vec<u32>,
+    passages: usize,
+    /// Word numbers with no postings left, not yet dropped from `words`.
+    empty: usize,
+    /// Dropped word numbers, reused before new ones.
+    free_words: Vec<u32>,
+}
+
+fn is_word_byte(b: u8) -> bool {
+    b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_'
+}
+
+fn doc_passages(doc: &Doc) -> usize {
+    doc.parts
+        .iter()
+        .map(|p| p.lines.len().div_ceil(PASSAGE_LINES))
+        .sum()
+}
+
+impl PassageIndex {
+    /// An index of `docs`.
+    pub fn build(docs: &HashMap<String, Arc<Doc>>) -> PassageIndex {
+        let mut idx = PassageIndex::default();
+        for (path, doc) in docs {
+            idx.insert(path, doc);
+        }
+        for p in &mut idx.postings {
+            p.shrink_to_fit();
+        }
+        idx
+    }
+
+    /// Index `doc` as `path`, in place of what `path` held.
+    pub fn insert(&mut self, path: &str, doc: &Doc) {
+        self.remove(path);
+        let slot = self.free.pop().unwrap_or_else(|| {
+            self.slots.push(None);
+            self.slots.len() as u32 - 1
+        });
+        self.slots[slot as usize] = Some(path.to_string());
+        let mut counts: HashMap<(&str, u32, u32), u32> = HashMap::new();
+        for (pi, part) in doc.parts.iter().enumerate() {
+            let b = part.lower.as_bytes();
+            let mut i = 0;
+            while i < b.len() {
+                if !is_word_byte(b[i]) {
+                    i += 1;
+                    continue;
+                }
+                let start = i;
+                while i < b.len() && is_word_byte(b[i]) {
+                    i += 1;
+                }
+                if i - start >= 2 {
+                    let p = ((part.line_of(start) - 1) / PASSAGE_LINES) as u32;
+                    *counts
+                        .entry((&part.lower[start..i], pi as u32, p))
+                        .or_default() += 1;
+                }
+            }
+        }
+        let mut held = Vec::with_capacity(counts.len());
+        for ((word, part, passage), n) in counts {
+            let w = match self.words.get(word) {
+                Some(&w) => w,
+                None => {
+                    let w = self.free_words.pop().unwrap_or_else(|| {
+                        self.postings.push(Vec::new());
+                        self.postings.len() as u32 - 1
+                    });
+                    self.words.insert(word.to_string(), w);
+                    w
+                }
+            };
+            self.postings[w as usize].push([slot, part, passage, n]);
+            held.push(w);
+        }
+        held.sort_unstable();
+        held.dedup();
+        held.shrink_to_fit();
+        let passages = doc_passages(doc);
+        self.passages += passages;
+        self.files.insert(path.to_string(), (slot, held, passages));
+    }
+
+    /// Drop `path`'s postings.
+    pub fn remove(&mut self, path: &str) {
+        let Some((slot, held, passages)) = self.files.remove(path) else {
+            return;
+        };
+        self.passages -= passages;
+        for w in held {
+            let p = &mut self.postings[w as usize];
+            p.retain(|q| q[0] != slot);
+            if p.is_empty() {
+                self.empty += 1;
+            }
+            if p.capacity() > 2 * p.len() + 4 {
+                p.shrink_to_fit();
+            }
+        }
+        self.slots[slot as usize] = None;
+        self.free.push(slot);
+        // Words no file holds any more are dropped once they are over half
+        // the vocabulary, so files that come and go don't grow it forever.
+        if self.empty > 1024 && self.empty * 2 > self.words.len() {
+            let (postings, free) = (&self.postings, &mut self.free_words);
+            self.words.retain(|_, w| {
+                let keep = !postings[*w as usize].is_empty();
+                if !keep {
+                    free.push(*w);
+                }
+                keep
+            });
+            self.empty = 0;
+        }
+    }
+
+    /// Files indexed, distinct words and postings (for logs and benches).
+    pub fn size(&self) -> (usize, usize, usize) {
+        let postings = self.postings.iter().map(Vec::len).sum();
+        let words = self.postings.iter().filter(|p| !p.is_empty()).count();
+        (self.files.len(), words, postings)
+    }
+}
+
+/// `retrieve` answered from `idx`, an index of `docs`; `None` when a term
+/// is not ASCII (the caller scans).
+pub fn retrieve_indexed(
+    idx: &PassageIndex,
+    docs: &HashMap<String, Arc<Doc>>,
+    question: &str,
+    k: usize,
+) -> Option<Vec<Passage>> {
+    let terms = terms(question);
+    if terms.is_empty() {
+        return Some(Vec::new());
+    }
+    if !terms.iter().all(|t| t.bytes().all(is_word_byte)) {
+        return None;
+    }
+    let mut tf: HashMap<(&String, usize, usize), Vec<u32>> = HashMap::new();
+    let mut df = vec![0usize; terms.len()];
+    for (ti, t) in terms.iter().enumerate() {
+        let mut hits: HashMap<[u32; 3], u32> = HashMap::new();
+        let from = (
+            std::ops::Bound::Included(t.as_str()),
+            std::ops::Bound::Unbounded,
+        );
+        for (_, &w) in idx
+            .words
+            .range::<str, _>(from)
+            .take_while(|(w, _)| w.starts_with(t.as_str()))
+        {
+            for q in &idx.postings[w as usize] {
+                *hits.entry([q[0], q[1], q[2]]).or_default() += q[3];
+            }
+        }
+        df[ti] = hits.len();
+        for ([slot, part, passage], n) in hits {
+            let path = idx.slots[slot as usize].as_ref()?;
+            let (path, _) = docs.get_key_value(path)?;
+            tf.entry((path, part as usize, passage as usize))
+                .or_insert_with(|| vec![0; terms.len()])[ti] = n;
+        }
+    }
+    Some(rank(docs, &terms, tf, &df, idx.passages, k))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -411,6 +630,133 @@ mod tests {
                 )
             })
             .collect()
+    }
+
+    fn same(a: &[Passage], b: &[Passage]) -> bool {
+        a.len() == b.len()
+            && a.iter().zip(b).all(|(x, y)| {
+                x.path == y.path
+                    && x.part == y.part
+                    && x.first_line == y.first_line
+                    && x.text == y.text
+                    && x.score == y.score
+            })
+    }
+
+    #[test]
+    fn the_passage_index_answers_as_the_scan() {
+        // Random files over a small vocabulary, then edits and removals;
+        // every question must get the same passages and scores both ways.
+        let vocab = [
+            "alpha",
+            "alphabet",
+            "Beta",
+            "beta_max",
+            "gamma",
+            "gam",
+            "delta9",
+            "x",
+            "Ünïcode",
+            "café",
+            "zeta-ray",
+            "eta.eta",
+            "th",
+            "the",
+            "quota",
+            "QUOTE",
+        ];
+        let mut seed = 0x9e3779b97f4a7c15u64;
+        let mut rnd = move |n: usize| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            (seed % n as u64) as usize
+        };
+        let file = |rnd: &mut dyn FnMut(usize) -> usize| {
+            let mut t = String::new();
+            for _ in 0..rnd(200) {
+                t.push_str(vocab[rnd(vocab.len())]);
+                t.push_str([" ", "\n", ", ", "\n\n", "_", "("][rnd(6)]);
+            }
+            Arc::new(Doc {
+                parts: vec![
+                    Part::new(String::new(), t.clone()),
+                    Part::new("part 2".into(), t.chars().rev().collect()),
+                ],
+            })
+        };
+        let questions = [
+            "alpha",
+            "alp beta",
+            "gamma delta9",
+            "quot",
+            "café",
+            "unicode",
+            "zeta ray",
+            "eta",
+            "th",
+            "beta_m",
+            "x",
+            "nothing here",
+            "alpha alpha gamma",
+            "the",
+        ];
+        let mut d: HashMap<String, Arc<Doc>> = HashMap::new();
+        for i in 0..30 {
+            d.insert(format!("dir{}/f{i}.txt", i % 3), file(&mut rnd));
+        }
+        let mut idx = PassageIndex::build(&d);
+        for round in 0..20 {
+            for q in questions {
+                for k in [1, 5, 50] {
+                    let scan = retrieve(&d, q, k);
+                    match retrieve_indexed(&idx, &d, q, k) {
+                        Some(got) => assert!(same(&scan, &got), "round {round}, {q:?}, k {k}"),
+                        None => assert!(q.bytes().any(|b| !b.is_ascii())),
+                    }
+                }
+            }
+            for _ in 0..5 {
+                let path = format!("dir{}/f{}.txt", rnd(3), rnd(40));
+                if rnd(3) == 0 {
+                    d.remove(&path);
+                    idx.remove(&path);
+                } else {
+                    let doc = file(&mut rnd);
+                    idx.insert(&path, &doc);
+                    d.insert(path, doc);
+                }
+            }
+        }
+        assert_eq!(idx.size().0, d.len());
+    }
+
+    #[test]
+    fn passage_index_vocabulary_stays_bounded() {
+        // Files that come and go, each with its own words: the dropped
+        // words' numbers are reused, and answers still match a scan.
+        let mut d: HashMap<String, Arc<Doc>> = HashMap::new();
+        let mut idx = PassageIndex::default();
+        let doc = |i: usize| {
+            let words: Vec<String> = (0..20).map(|j| format!("w{i}x{j} common")).collect();
+            Arc::new(Doc {
+                parts: vec![Part::new(String::new(), words.join("\n"))],
+            })
+        };
+        for i in 0..2000 {
+            let path = format!("f{}.txt", i % 10);
+            let doc = doc(i);
+            idx.insert(&path, &doc);
+            d.insert(path, doc);
+        }
+        assert!(idx.words.len() < 3000, "{} words", idx.words.len());
+        assert!(idx.postings.len() < 3000, "{} numbers", idx.postings.len());
+        for q in ["common", "w1999x3", "w5x1", "w1995x19 common"] {
+            for k in [1, 5, 50] {
+                let got = retrieve_indexed(&idx, &d, q, k).unwrap();
+                assert!(same(&retrieve(&d, q, k), &got), "{q:?}, k {k}");
+            }
+        }
     }
 
     #[test]
