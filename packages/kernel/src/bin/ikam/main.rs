@@ -32,13 +32,14 @@ const USAGE: &str = "usage: ikam [--store DIR] [--short-records] [--slow-codec-m
   ls [REV[:PATH]] [-r]             list a directory of REV (default main)
   grep TEXT [REV]                  files of REV containing TEXT, with lines
   stats [REV]                      objects and bytes the store holds
-  db serve [--live] [--packs] [--plain-events] [--no-object-templates] [--concurrent-reads] [--edit-index] [--plain-writes] [--hnsw] [--keep-search] [--no-keep-search] [--shared-store] [--keep-counts N] [--defer-kv N] [--views FILE] [PORT]
+  db serve [--live] [--packs] [--plain-events] [--no-object-templates] [--concurrent-reads] [--edit-index] [--plain-writes] [--hnsw] [--keep-search] [--no-keep-search] [--shared-store] [--skip-unchanged] [--keep-counts N] [--defer-kv N] [--views FILE] [PORT]
                                    the store's databases over HTTP, for programs
                                    (default port 8740, 127.0.0.1 only; dbserve.rs);
                                    --live turns on the options a live database
                                    wants (E356, E372: with --defer-kv 20000 and
                                    --keep-search; --defer-kv 0 or --no-keep-search
-                                   turns those off)
+                                   turns those off); --skip-unchanged drops
+                                   upserts of a key's current value (E376, off)
   host --config FILE [PORT]        several separate projects in one process, each
                                    its own store, users and limits, chosen by Host
                                    name; crossing only through scoped shares (host.rs)
@@ -173,7 +174,7 @@ fn main() -> ExitCode {
 }
 
 /// `ikam db serve [--live] [--packs] [--plain-events] [--no-object-templates]
-/// [--concurrent-reads] [--edit-index] [--plain-writes] [--hnsw] [--keep-search] [--no-keep-search] [--shared-store] [--keep-counts N] [--defer-kv N]
+/// [--concurrent-reads] [--edit-index] [--plain-writes] [--hnsw] [--keep-search] [--no-keep-search] [--shared-store] [--skip-unchanged] [--keep-counts N] [--defer-kv N]
 /// [--views FILE]
 /// [--allow-host NAME]...
 /// [--log-requests] [PORT]`:
@@ -220,6 +221,14 @@ fn main() -> ExitCode {
 /// really is missing pays a listing of the store. Not for a pack store
 /// (`--packs`, `--live`), which one process opens.
 ///
+/// `--skip-unchanged` (E376, off) drops from each batch the upserts that
+/// would write a key's current value again, so importing the same rows
+/// again logs nothing (E376: re-sending 200k unchanged rows under `--live`
+/// grew the store 161 to 348 MB). A dropped event's idempotency key is not
+/// recorded. Keys written by deferred appends not yet folded are not
+/// checked, nor any key after a subtree or range removal in a batch, and
+/// nothing is skipped with `--shared-store`.
+///
 /// `--live` (E356) is the options a database kept by a running program
 /// wants, together: `--packs --plain-events --no-object-templates
 /// --concurrent-reads --edit-index`, and since E372 `--defer-kv 20000
@@ -234,7 +243,7 @@ fn main() -> ExitCode {
 fn db_cmd(store_dir: &str, args: &[String]) -> Result<(), String> {
     let mut args = args.to_vec();
     if args.first().map(String::as_str) != Some("serve") {
-        return Err("usage: ikam [--store DIR] db serve [--live] [--packs] [--plain-events] [--no-object-templates] [--concurrent-reads] [--edit-index] [--plain-writes] [--hnsw] [--keep-search] [--no-keep-search] [--shared-store] [--keep-counts N] [--defer-kv N] [--views FILE] [--allow-host NAME]... [--log-requests] [PORT]".into());
+        return Err("usage: ikam [--store DIR] db serve [--live] [--packs] [--plain-events] [--no-object-templates] [--concurrent-reads] [--edit-index] [--plain-writes] [--hnsw] [--keep-search] [--no-keep-search] [--shared-store] [--skip-unchanged] [--keep-counts N] [--defer-kv N] [--views FILE] [--allow-host NAME]... [--log-requests] [PORT]".into());
     }
     args.remove(0);
     let mut allowed = Vec::new();
@@ -320,6 +329,7 @@ fn db_flags(
     let keep_search = !take("--no-keep-search") && keep_search;
     let defer_kv = defer_kv.unwrap_or(if live { LIVE_DEFER_KV } else { 0 });
     let shared_store = take("--shared-store");
+    let skip_unchanged = take("--skip-unchanged");
     let opts = DbServeOpts {
         concurrent_reads,
         edit_index,
@@ -331,6 +341,7 @@ fn db_flags(
         hnsw,
         keep_search,
         shared_store,
+        skip_unchanged,
     };
     (packs, log_requests, opts)
 }
@@ -351,6 +362,8 @@ struct DbServeOpts {
     hnsw: bool,
     keep_search: bool,
     shared_store: bool,
+    /// E376: drop upserts of a key's current value.
+    skip_unchanged: bool,
 }
 
 /// `db serve` on `store`; with `concurrent_reads` the store is shared, so
@@ -395,7 +408,7 @@ fn serve_db<S: ikam_kernel::Store + Send + Sync + 'static>(
         dbserve::serve(
             tune(Repo::new(shared), o),
             Some(make),
-            (o.keep_counts, o.defer_kv),
+            (o.keep_counts, o.defer_kv, o.skip_unchanged),
             (search(o), views),
             port,
             allowed,
@@ -405,7 +418,7 @@ fn serve_db<S: ikam_kernel::Store + Send + Sync + 'static>(
         dbserve::serve(
             tune(Repo::new(store), o),
             None,
-            (o.keep_counts, o.defer_kv),
+            (o.keep_counts, o.defer_kv, o.skip_unchanged),
             (search(o), views),
             port,
             allowed,
@@ -1114,6 +1127,7 @@ mod tests {
             hnsw: false,
             keep_search: true,
             shared_store: false,
+            skip_unchanged: false,
         };
         let mut a = v(&["--live", "8752"]);
         assert_eq!(db_flags(&mut a, 0, None), (true, false, all));
@@ -1146,6 +1160,7 @@ mod tests {
             hnsw: false,
             keep_search: false,
             shared_store: false,
+            skip_unchanged: false,
         };
         assert_eq!(db_flags(&mut a, 0, None), (false, false, off));
         // E357: `--plain-writes` is its own option, not part of `--live`.
@@ -1199,6 +1214,7 @@ mod tests {
         let mut a = v(&["--shared-store"]);
         let shared = DbServeOpts {
             shared_store: true,
+            skip_unchanged: false,
             ..off
         };
         assert_eq!(db_flags(&mut a, 0, None), (false, false, shared));

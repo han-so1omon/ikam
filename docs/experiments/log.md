@@ -6157,3 +6157,30 @@ Gates on the branch (E229 to E233): every kernel test suite passes (release); cl
 - Note for older runs: a bench that passes only `--live` (`restart_bench.py`, `search_bench.py`, `served_views.py`, `db_first_write.py`) now measures the new preset; `--live --defer-kv 0 --no-keep-search` is the E356 preset.
 - Verdict: **kept** (preset change, each part still an option).
 - Not measured: the Mac; whether 20000 is the best N for other row sizes (E368 measured 100k, E371 20000).
+
+### E376 skip-unchanged (sending the same rows again writes nothing)
+
+- Branch / parent: exp/376-skip-unchanged / main 021f129
+- Question: a program that keeps its records in ikam often sends a whole table again when little changed (a collector polling its source, an import run again after a fix). What does that cost under `db serve --live`, and can the server leave out rows that would write a key's current value?
+- Setup: Linux cloud container, 4 cores. `experiments/reimport/reimport_unchanged.py`: 200,000 indexed rows (a row and an index entry each) loaded in 2,000-row batches, then sent twice more with new idempotency keys, once unchanged and once with 1% of rows given a new value; time of each pass, store size and log length after it. Both flag sets with this branch's build, one after the other on an otherwise idle machine.
+- Results, main's behaviour (the option off):
+
+  | flags | load | same rows again | 1% changed |
+  | --- | --- | --- | --- |
+  | `--live` | 32.7 s, 161 MB, log 400k | 52.2 s, **348 MB**, log 800k | 52.9 s, **533 MB**, log 1.2M |
+  | `--live --defer-kv 0 --no-keep-search` | 75.2 s, 276 MB | 103.0 s, 601 MB | 104.2 s, 929 MB |
+
+  Every unchanged row was logged again, its value stored again and its view chunk rewritten: the store grows by more than the first load each time.
+- Change: `--skip-unchanged` (off) on `db serve`. Before an append the server reads the batch's keys from the kv view and drops each upsert whose bytes equal the key's current value. Under `--defer-kv` the kv view lags, so the server keeps the latest value (by id) of every key its own deferred appends wrote since the view's position and compares against that; a database whose view lags for any other reason (a restart, another writer) is checked only from its next fold. A key already written earlier in the same batch is never dropped (that write may be a retry the log ignores), nor is anything after a subtree or range removal in a batch, and nothing is skipped with `--shared-store`. A dropped event's idempotency key is not recorded. The commit message counts what was skipped.
+- Results, the option on:
+
+  | flags | load | same rows again | 1% changed |
+  | --- | --- | --- | --- |
+  | `--live --skip-unchanged` | 42.5 s, 161 MB | 23.1 s, **161 MB**, log 400k | 24.4 s, **163 MB**, log 402k |
+  | `--live --defer-kv 0 --no-keep-search --skip-unchanged` | 94.5 s, 276 MB | 21.6 s, 276 MB | 23.4 s, 278 MB |
+
+  (The second row ran while other work used the machine; its times are rough.) Sending the same table again takes 2.3x less time and leaves the store as it was; the 1% change logs only its 2,000 events. The cost is on new rows: the check reads the view for every key, which made the first load 30% slower (append p50 124 to 247 ms).
+- Checks: `unchanged_upserts_are_skipped_with_the_same_rows` (with the kv view folded every append, every 3 events and lazily: the same rows as a server without the option after loads, edits, a value set back while its edit is still unfolded, a key written twice in one batch, a removal, and a retry of an old write followed by that value again; a second identical load logs nothing). `cargo test --release`: 360 pass, 0 fail; clippy `-D warnings` clean.
+- Verdict: **kept** (option, off). It fits a database fed by repeated imports; a program that only appends new rows should leave it off.
+- Not measured: the Mac; batches with removals; a restart between the two passes (nothing is skipped until the view folds, up to 20,000 events under `--live`).
+- Run: `python3 -I experiments/reimport/reimport_unchanged.py IKAM_BIN WORK 200000 1 "--live;--live --skip-unchanged"`.
