@@ -6157,3 +6157,24 @@ Gates on the branch (E229 to E233): every kernel test suite passes (release); cl
 - Note for older runs: a bench that passes only `--live` (`restart_bench.py`, `search_bench.py`, `served_views.py`, `db_first_write.py`) now measures the new preset; `--live --defer-kv 0 --no-keep-search` is the E356 preset.
 - Verdict: **kept** (preset change, each part still an option).
 - Not measured: the Mac; whether 20000 is the best N for other row sizes (E368 measured 100k, E371 20000).
+
+### E373 night-gaps (the loop's gap list, and tonight's picks by business case)
+
+- Branch / parent: exp/373-night-log / main 021f129
+- Question: which of the open gaps fit the business cases E354 and E355 scored (a program keeping its records in `db serve`; questions over a folder of files through `live` and `mcp`; one service holding several projects), and what should one night in the cloud run?
+- Setup: `cargo run --release --example loop_gaps` (E275, E290) on main: the registry, the log's "Not measured" lines, stale verdicts and open hypotheses. Then each gap that cites E354 to E372 was read against the scorecard's rows. Two of the business cases (records running live, one service for several projects) are goals the owner has not confirmed; where that shaped a pick it says so.
+- Result: 184 gaps (131 not measured, 43 stale, 10 open hypotheses; 55 touch a weighty mechanism), from 350 registry rows and 331 log entries. 17 cite E354 to E372. Tonight's picks, in the order run:
+
+  | pick | gap or source | business case |
+  | --- | --- | --- |
+  | E374 crash safety | not on the list: the scorecard's "runs unattended" row had no kill test | records live (unconfirmed goal) |
+  | E375 memory curve | E356 "stores above 200k rows" | records live |
+  | E376 skip unchanged rows | not on the list: a reimport of the same rows rewrote everything (seen in E376's baseline) | records kept in sync with another system |
+  | E377 A/B harness | the owner's plan to compare against PostgreSQL only as a yardstick | records live |
+  | E378 passage index | E358 and E359 "search over files in `live`" | questions over files |
+  | E379 served index view | E377's slowest step (rows by a secondary index) and E371 "`--views` in the same run" | records live |
+
+  Left for later: E368 and E371 mixed read and write traffic, E367's ledger skip, E365's line-level merge, and every Mac row (this night ran in the cloud only).
+- Journal: `loop_journal E374 E379 2026-11-22` on a scratch copy of main's docs with the six entries appended (each branch keeps its own entry; nothing merged): 6 experiments, 24 firings on `night/2026-11-22`, replay equal to the marking, each finish output equal to its log entry, fsck clean; a second run fired nothing new. Three wait for the owner (E374, E376, E378: options to merge) and three are closed (E375, E377, E379: measurements).
+- Verdict: **measured** (a plan; no code).
+- Run: `cargo run --release --example loop_gaps`, then `cargo run --release --example loop_journal -- E374 E379 2026-11-22 STORE_DIR` once the entries are on one branch.
