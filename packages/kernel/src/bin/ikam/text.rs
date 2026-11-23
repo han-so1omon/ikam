@@ -447,6 +447,10 @@ pub struct PassageIndex {
     slots: Vec<Option<String>>,
     free: Vec<u32>,
     passages: usize,
+    /// Word numbers with no postings left, not yet dropped from `words`.
+    empty: usize,
+    /// Dropped word numbers, reused before new ones.
+    free_words: Vec<u32>,
 }
 
 fn is_word_byte(b: u8) -> bool {
@@ -507,8 +511,10 @@ impl PassageIndex {
             let w = match self.words.get(word) {
                 Some(&w) => w,
                 None => {
-                    let w = self.postings.len() as u32;
-                    self.postings.push(Vec::new());
+                    let w = self.free_words.pop().unwrap_or_else(|| {
+                        self.postings.push(Vec::new());
+                        self.postings.len() as u32 - 1
+                    });
                     self.words.insert(word.to_string(), w);
                     w
                 }
@@ -530,16 +536,31 @@ impl PassageIndex {
             return;
         };
         self.passages -= passages;
-        // A word no file holds any more keeps its (empty) number.
         for w in held {
             let p = &mut self.postings[w as usize];
             p.retain(|q| q[0] != slot);
+            if p.is_empty() {
+                self.empty += 1;
+            }
             if p.capacity() > 2 * p.len() + 4 {
                 p.shrink_to_fit();
             }
         }
         self.slots[slot as usize] = None;
         self.free.push(slot);
+        // Words no file holds any more are dropped once they are over half
+        // the vocabulary, so files that come and go don't grow it forever.
+        if self.empty > 1024 && self.empty * 2 > self.words.len() {
+            let (postings, free) = (&self.postings, &mut self.free_words);
+            self.words.retain(|_, w| {
+                let keep = !postings[*w as usize].is_empty();
+                if !keep {
+                    free.push(*w);
+                }
+                keep
+            });
+            self.empty = 0;
+        }
     }
 
     /// Files indexed, distinct words and postings (for logs and benches).
@@ -708,6 +729,34 @@ mod tests {
             }
         }
         assert_eq!(idx.size().0, d.len());
+    }
+
+    #[test]
+    fn passage_index_vocabulary_stays_bounded() {
+        // Files that come and go, each with its own words: the dropped
+        // words' numbers are reused, and answers still match a scan.
+        let mut d: HashMap<String, Arc<Doc>> = HashMap::new();
+        let mut idx = PassageIndex::default();
+        let doc = |i: usize| {
+            let words: Vec<String> = (0..20).map(|j| format!("w{i}x{j} common")).collect();
+            Arc::new(Doc {
+                parts: vec![Part::new(String::new(), words.join("\n"))],
+            })
+        };
+        for i in 0..2000 {
+            let path = format!("f{}.txt", i % 10);
+            let doc = doc(i);
+            idx.insert(&path, &doc);
+            d.insert(path, doc);
+        }
+        assert!(idx.words.len() < 3000, "{} words", idx.words.len());
+        assert!(idx.postings.len() < 3000, "{} numbers", idx.postings.len());
+        for q in ["common", "w1999x3", "w5x1", "w1995x19 common"] {
+            for k in [1, 5, 50] {
+                let got = retrieve_indexed(&idx, &d, q, k).unwrap();
+                assert!(same(&retrieve(&d, q, k), &got), "{q:?}, k {k}");
+            }
+        }
     }
 
     #[test]
