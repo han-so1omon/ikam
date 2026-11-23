@@ -70,6 +70,7 @@ pub(crate) fn seed_key(window: &[u8]) -> u64 {
 #[derive(Default)]
 pub struct Index {
     seeds: HashMap<u64, Vec<(Id, usize)>>,
+    entries: usize,
 }
 
 impl Index {
@@ -78,8 +79,14 @@ impl Index {
             let slot = self.seeds.entry(seed_key(&bytes[p..p + SEED])).or_default();
             if slot.len() < MAX_CANDIDATES && !slot.iter().any(|(i, _)| *i == id) {
                 slot.push((id, p));
+                self.entries += 1;
             }
         }
+    }
+
+    /// Seed entries held (each about 40 bytes, plus its slot's share).
+    pub fn entries(&self) -> usize {
+        self.entries
     }
 }
 

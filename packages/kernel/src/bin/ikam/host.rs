@@ -463,7 +463,7 @@ impl Host {
         match catch_unwind(AssertUnwindSafe(|| self.route(p, role, &req))) {
             Ok(r) => r,
             Err(_) => {
-                eprintln!("{} {}: request failed", live::stamp(), p.name);
+                say!("{} {}: request failed", live::stamp(), p.name);
                 Response::text(500, "this project failed to answer")
             }
         }
@@ -834,21 +834,23 @@ fn parse_scope(l: &mut Live, s: &str) -> Result<Scope, String> {
     })
 }
 
-/// `ikam host --config FILE [PORT]`: serve until stopped.
+/// `ikam host --config FILE [--keep-on-hangup] [PORT]`: serve until stopped
+/// (SIGTERM, SIGINT or SIGHUP; `--keep-on-hangup` ignores SIGHUP, E374).
 pub fn host_cmd(args: &[String]) -> Result<(), String> {
     let mut args = args.to_vec();
     if args.iter().any(|a| a == "--public") {
         return Err("ikam host has no --public: every request needs a project's user".into());
     }
-    let file =
-        crate::take_flag(&mut args, "--config").ok_or("usage: ikam host --config FILE [PORT]")?;
+    let keep_on_hangup = crate::take_switch(&mut args, "--keep-on-hangup");
+    let file = crate::take_flag(&mut args, "--config")
+        .ok_or("usage: ikam host --config FILE [--keep-on-hangup] [PORT]")?;
     let text = std::fs::read_to_string(&file).map_err(|e| format!("{file}: {e}"))?;
     let mut config = Config::parse(&text)?;
     if let Some(p) = args.first() {
         config.port = p.parse().map_err(|_| "PORT must be a number")?;
     }
     let host = Arc::new(Host::open(config)?);
-    auth::catch_stop_signals();
+    auth::catch_stop_signals(keep_on_hangup);
     {
         let host = host.clone();
         std::thread::spawn(move || {
@@ -859,12 +861,12 @@ pub fn host_cmd(args: &[String]) -> Result<(), String> {
                 for p in host.projects.values() {
                     let Ok(mut l) = p.live.lock() else { continue };
                     if let Err(e) = l.flush(stopping) {
-                        eprintln!("{} {}: commit failed: {e}", live::stamp(), p.name);
+                        say!("{} {}: commit failed: {e}", live::stamp(), p.name);
                         failed = true;
                     }
                 }
                 if stopping {
-                    eprintln!("{} stopped", live::stamp());
+                    say!("{} stopped ({})", live::stamp(), auth::stop_signal());
                     std::process::exit(failed as i32);
                 }
             }
@@ -872,9 +874,9 @@ pub fn host_cmd(args: &[String]) -> Result<(), String> {
     }
     let t = live::stamp();
     for p in host.projects.values() {
-        eprintln!("{t} project {}: {}", p.name, p.hosts.join(", "));
+        say!("{t} project {}: {}", p.name, p.hosts.join(", "));
     }
-    eprintln!("{t} host on 127.0.0.1:{}", host.port);
+    say!("{t} host on 127.0.0.1:{}", host.port);
     // Each project's body limit applies before its body is read: the
     // server asks for the limit of the project the Host header names. An
     // unknown host gets no body at all; its answer is 404 either way.

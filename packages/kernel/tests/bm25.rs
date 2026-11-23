@@ -2,7 +2,7 @@
 //! stored index, and rank as expected on a small case.
 
 use ikam_kernel::bm25::{B, K1, terms};
-use ikam_kernel::{Event, MemStore, Repo};
+use ikam_kernel::{Event, MemStore, Repo, Store};
 
 struct Lcg(u64);
 impl Lcg {
@@ -224,6 +224,8 @@ fn view_kept_by_updates_equals_the_formula() {
     // The kept view is the same graph as one built at the end.
     let rebuilt = repo.bm25_view_update(&blank, &empty, &db, "doc/").unwrap();
     assert_eq!(view, rebuilt);
+    // E382: and the same graph as the one-pass build.
+    assert_eq!(repo.bm25_view_build(&db, "doc/").unwrap(), view);
     // The merging view merged along the way.
     assert!(merges >= 2, "{merges}");
 }
@@ -289,4 +291,78 @@ fn weights_change_scores_only_when_set() {
     let gap = |h: &[(String, f32)]| h[0].1 - h[1].1;
     assert_eq!(full.search("alpha", 10)[0].0, "t/short");
     assert!(gap(&full.search("alpha", 10)) > gap(&plain.search("alpha", 10)));
+}
+
+/// E382: the one-pass build is the same graph, and writes the same
+/// contents, as an update from an empty view and an empty database, in a
+/// store that holds none of them yet: rows with no terms, repeated terms,
+/// non-ASCII text, rows that share their postings, rows outside the
+/// prefix and an empty prefix.
+#[test]
+fn one_pass_build_equals_an_update_from_nothing() {
+    let mut rng = Lcg(29);
+    let mut events = Vec::new();
+    for i in 0..3000 {
+        let v = match i % 7 {
+            0 => String::new(),
+            1 => "-- ... !!".to_string(),
+            2 => "Ünïcode ünïcode ÜNÏCODE".to_string(),
+            _ => format!(
+                "[{i}, \"w{}\", \"w{}\", {}.{}]",
+                rng.next() % 50,
+                rng.next() % 50,
+                rng.next() % 1000,
+                rng.next()
+            ),
+        };
+        events.push(Event::upsert(
+            &format!("t/a/{i:06}"),
+            v.as_bytes(),
+            &format!("e{i}"),
+        ));
+        if i % 10 == 0 {
+            events.push(Event::upsert(
+                &format!("t/b/{i:06}"),
+                b"w1 elsewhere",
+                &format!("b{i}"),
+            ));
+        }
+    }
+    let build = |prefix: &str, one_pass: bool| {
+        let mut repo = Repo::new(MemStore::default());
+        let empty = repo.db_empty().unwrap();
+        let db = repo.db_append(&empty, &events).unwrap();
+        let before: std::collections::BTreeSet<_> =
+            repo.store().ids().unwrap().into_iter().collect();
+        let view = match one_pass {
+            true => repo.bm25_view_build(&db, prefix).unwrap(),
+            false => {
+                let blank = repo.bm25_view_empty().unwrap();
+                repo.bm25_view_update(&blank, &empty, &db, prefix).unwrap()
+            }
+        };
+        let written: std::collections::BTreeMap<_, _> = repo
+            .store()
+            .ids()
+            .unwrap()
+            .into_iter()
+            .filter(|id| !before.contains(id))
+            .map(|id| (id, repo.store().read(&id).unwrap()))
+            .collect();
+        (view, written)
+    };
+    for prefix in ["t/a/", "t/", "", "t/none/"] {
+        let (got, got_written) = build(prefix, true);
+        let (want, want_written) = build(prefix, false);
+        assert_eq!(got, want, "{prefix}");
+        // The update path also writes the empty view's graph.
+        let extra: Vec<_> = want_written
+            .keys()
+            .filter(|k| !got_written.contains_key(*k))
+            .collect();
+        assert!(extra.len() <= 1, "{prefix}: {} more", extra.len());
+        for (id, bytes) in &got_written {
+            assert_eq!(want_written.get(id), Some(bytes), "{prefix} {id}");
+        }
+    }
 }
