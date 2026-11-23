@@ -55,6 +55,9 @@ pub struct Live {
     /// Current files (path -> content id) and their text.
     pub files: BTreeMap<String, Id>,
     pub docs: HashMap<String, Arc<Doc>>,
+    /// `--passage-index` (E378, off): the words of `docs`, kept as files
+    /// change, so questions read postings instead of scanning the text.
+    pub passages: Option<text::PassageIndex>,
     extracted: HashMap<Id, Arc<Doc>>,
     /// Edit times by path (the store records none); start time otherwise.
     mtimes: HashMap<String, SystemTime>,
@@ -157,6 +160,7 @@ impl Live {
             bytes_held: 0,
             files: BTreeMap::new(),
             docs: HashMap::new(),
+            passages: None,
             extracted: HashMap::new(),
             mtimes: HashMap::new(),
             started: SystemTime::now(),
@@ -433,6 +437,29 @@ impl Live {
         Ok(cost)
     }
 
+    /// Keep a passage index of the current files from now on (E378).
+    pub fn index_passages(&mut self) {
+        if self.passages.is_none() {
+            let t = Instant::now();
+            let idx = text::PassageIndex::build(&self.docs);
+            let (files, words, postings) = idx.size();
+            self.passages = Some(idx);
+            self.log(format!(
+                "passage index: {files} files, {words} words, {postings} postings in {:.0} ms",
+                t.elapsed().as_secs_f64() * 1e3
+            ));
+        }
+    }
+
+    /// The `k` passages that best answer `question`: from the passage index
+    /// when one is kept (same answers), else by scanning the text.
+    pub fn retrieve(&self, question: &str, k: usize) -> Vec<text::Passage> {
+        self.passages
+            .as_ref()
+            .and_then(|idx| text::retrieve_indexed(idx, &self.docs, question, k))
+            .unwrap_or_else(|| text::retrieve(&self.docs, question, k))
+    }
+
     /// Rebuild the path view and text index from the current tree. Only
     /// files whose content changed are extracted again.
     fn refresh(&mut self) -> Result<(), String> {
@@ -447,6 +474,9 @@ impl Live {
             .collect();
         for p in gone {
             self.docs.remove(&p);
+            if let Some(idx) = &mut self.passages {
+                idx.remove(&p);
+            }
         }
         // Contents not yet extracted: many at startup, so in parallel.
         let todo: Vec<(&String, &Id)> = {
@@ -491,6 +521,9 @@ impl Live {
                     d
                 }
             };
+            if let Some(idx) = &mut self.passages {
+                idx.insert(path, &doc);
+            }
             self.docs.insert(path.clone(), doc);
         }
         // Extracted text of contents no longer in the tree is let go.
@@ -957,6 +990,47 @@ mod tests {
             .unwrap();
         l.flush(true).unwrap().expect("a commit");
         assert!(l.repo.fsck_deep().unwrap().is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_passage_index_follows_edits() {
+        // E378: the index kept by `--passage-index` answers as the scan
+        // after puts, overwrites, renames, copies and removals.
+        let dir = std::env::temp_dir().join(format!("ikam-live-passages-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut l = Live::open(dir.to_str().unwrap(), "main").unwrap();
+        l.apply(vec![Op::Put("a.txt".into(), b"alpha beta\ngamma".to_vec())])
+            .unwrap();
+        l.index_passages();
+        let check = |l: &Live| {
+            for q in ["alpha", "beta gamma", "delta", "notes alpha"] {
+                let scan = text::retrieve(&l.docs, q, 10);
+                let got = l.retrieve(q, 10);
+                let key = |p: &[text::Passage]| {
+                    p.iter()
+                        .map(|p| (p.path.clone(), p.first_line, p.score.to_bits()))
+                        .collect::<Vec<_>>()
+                };
+                assert_eq!(key(&scan), key(&got), "{q:?}");
+            }
+        };
+        check(&l);
+        l.apply(vec![
+            Op::Put("notes/b.txt".into(), b"delta alpha alpha".to_vec()),
+            Op::Put("a.txt".into(), b"beta only".to_vec()),
+        ])
+        .unwrap();
+        check(&l);
+        l.apply(vec![Op::Rename("notes/b.txt".into(), "c.txt".into())])
+            .unwrap();
+        l.apply(vec![Op::Copy("c.txt".into(), "notes/d.txt".into())])
+            .unwrap();
+        check(&l);
+        l.apply(vec![Op::Remove("a.txt".into())]).unwrap();
+        l.flush(true).unwrap();
+        check(&l);
+        assert_eq!(l.passages.as_ref().unwrap().size().0, l.docs.len());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
