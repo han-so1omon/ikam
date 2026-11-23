@@ -6158,6 +6158,28 @@ Gates on the branch (E229 to E233): every kernel test suite passes (release); cl
 - Verdict: **kept** (preset change, each part still an option).
 - Not measured: the Mac; whether 20000 is the best N for other row sizes (E368 measured 100k, E371 20000).
 
+### E382 one-pass-search-build (what a table's first search costs, and building its BM25 view in one pass)
+- Branch / parent: exp/382-search-build / main 021f129
+- Question: E375 found that the first ranked search of a 1M-row table takes 46 s and takes the server from 1.5 to 5.6 GB at its peak (E356 gap: stores above 200k rows). Where do the time and the memory go, and can the same view be built for less? (Plan: E375's "Next".)
+- Profile (`examples/bm25_build.rs`, 200k rows like E375's, MemStore, one run; phases timed by temporary prints, not committed): the build was an update from an empty view and an empty database. Of 7.8 s, the diff against nothing and each row's terms took 2.4 s (each row read on its own, a sorted map of its terms, every row key copied once for each of its terms), the 405,119 postings contents 3.1 s, editing them into an empty graph 1.2 s. The peak was every term's postings held twice, as lists of copied keys and again as sorted maps, before any was written.
+- Change (no option: the same view): `Repo::bm25_view_build` (src/bm25.rs) reads the rows under the prefix in key order, each stored content once however many rows it holds (`node_values`), and appends each row to its terms' encoded postings as it goes; key order is postings order, so each list is already the bytes `bm25_view_update` writes. Then each list is one content as before (`put_derived`'s encoding), and the graph is put whole. `bm25_live_build` uses it. Updates, kept views (E369) and searches are unchanged.
+- Result:
+
+  | | before | one pass |
+  |---|---|---|
+  | 200k rows, `bm25_build` example: build | 7.75 s | 5.10 s |
+  | 200k rows: process peak during the build, above its peak before | +973 MB | +192 MB |
+  | 1M rows through `db serve --live` (E375's `rss_load.py`): first search | 49.6 s | 29.2 s |
+  | 1M rows: server peak during that search | 5,646 MB | 2,319 MB |
+  | 1M rows: server memory after it | 5,341 MB | 1,940 MB |
+
+  The view is the same graph (the same root id) and writes the same contents. Load, restart and the kept view's search after a second restart are unchanged (3.1 GB loaded, 1.5 GB restarted, store 1,338 MB, under 0.05 s). Of the 5.1 s left at 200k rows: reading rows 1.1 s, terms 0.8 s, writing 405k postings contents 1.8 s, the graph 1.2 s. Compressing the postings on four threads did not help (5.3 s; dropped): the contents are small and their cost is not zstd.
+- Checks: `one_pass_build_equals_an_update_from_nothing` (3,000 rows with no terms, repeated and non-ASCII terms, rows sharing postings, rows outside the prefix; prefixes `t/a/`, `t/`, empty and one with no rows; each in a fresh store): the same root and the same stored bytes for every content written. `view_kept_by_updates_equals_the_formula` also checks the one-pass build against the view kept by six rounds of edits. Both fail when a posting's length is written one too high.
+- Fixed benchmark: unchanged (it builds no BM25 view). From this shallow clone the four history corpora cannot be built; the other seven cost corpora and the three north corpora: bytes, proxy and read scores 6.5696, 4.3925 and 6.5359 as on main 021f129, north score 0.3060 both, every reconstruction exact and fsck clean; cost score 0.2336, 0.2287 and 0.2508 here against 0.2319 and 0.2301 on main the same morning, its timing noise. `cargo test --release`: 360 pass; clippy clean.
+- Verdict: **kept** (no trade-off: the same view, 1.5 to 1.7 times faster, a fifth of the extra memory).
+- Not measured: the Mac; text longer than these rows; a table whose terms repeat more (here most rows add two terms no other row has: their number and the float's digits, so 405k terms for 200k rows).
+- Next: the 405k postings are one content each; a table of numbers and ids pays a content per distinct value. Postings packed several to a content would change the view's format (an option, and kept views would build again).
+- Run: `cargo run --release --example bm25_build -- 200000 update` and `... 200000 build`; `python3 -I experiments/memory/rss_load.py IKAM_BIN WORK 1000000 250000 "--live"` (E375's script, on its branch) with the main and branch binaries.
 ### E381 plain-view-writes (what a served view's update after a change costs, and `--plain-view-writes`)
 
 - Question: E380 found that an index lookup after a 100-row change costs about 200 ms with `--views` (E361 measured about 50 ms after 20 rows). Where does that time go, and can mixed write and read traffic (E368, E371) pay less?
