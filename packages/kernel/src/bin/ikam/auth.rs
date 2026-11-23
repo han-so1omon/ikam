@@ -1,13 +1,14 @@
 //! What `ikam live` needs to be reached from other machines safely: names it
 //! answers to besides 127.0.0.1 (`--allow-host`), an optional password on
 //! every request (HTTP basic auth, which Finder's WebDAV client can send), and
-//! a clean stop on SIGTERM or SIGINT that commits pending edits first.
+//! a clean stop on SIGTERM, SIGINT or SIGHUP that commits pending edits
+//! first and says which signal stopped it.
 //!
 //! The password is kept as `IKAM_AUTH=user:salt:hash`, made by `ikam passwd`,
 //! where hash is BLAKE3 over salt and the password. BLAKE3 is fast, so the
 //! line should stay in a file only its owner can read.
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 
 use crate::http::{Request, Response};
 
@@ -167,24 +168,49 @@ fn base64(s: &str) -> Option<Vec<u8>> {
 }
 
 static STOP: AtomicBool = AtomicBool::new(false);
+static SIGNAL: AtomicI32 = AtomicI32::new(0);
 
-/// Ask for SIGTERM (what launchd and systemd send) and SIGINT (Ctrl-C) to set
-/// a flag instead of killing the process; `stopping` reads it.
-pub fn catch_stop_signals() {
+/// Ask for SIGTERM (what launchd and systemd send), SIGINT (Ctrl-C) and
+/// SIGHUP (the terminal that started the server closed) to set a flag
+/// instead of killing the process; `stopping` reads it and `stop_signal`
+/// names the signal. Before E374 a SIGHUP ended a server at once with no
+/// line logged and, for `live`, without committing pending edits. With
+/// `keep_on_hangup` (E374, off by default: `--keep-on-hangup`) SIGHUP is
+/// ignored instead, as `nohup` would, so a server started from a terminal
+/// outlives it.
+pub fn catch_stop_signals(keep_on_hangup: bool) {
     #[cfg(unix)]
     {
         unsafe extern "C" {
             fn signal(signum: i32, handler: usize) -> usize;
         }
-        extern "C" fn on_signal(_: i32) {
+        extern "C" fn on_signal(sig: i32) {
+            SIGNAL.store(sig, Ordering::SeqCst);
             STOP.store(true, Ordering::SeqCst);
         }
-        // SIGINT and SIGTERM are 2 and 15 on Linux and macOS alike.
-        for sig in [2, 15] {
+        // SIGHUP, SIGINT and SIGTERM are 1, 2 and 15 on Linux and macOS
+        // alike; SIG_IGN is 1.
+        for sig in [1, 2, 15] {
+            let handler = match sig == 1 && keep_on_hangup {
+                true => 1,
+                false => on_signal as extern "C" fn(i32) as usize,
+            };
             unsafe {
-                signal(sig, on_signal as extern "C" fn(i32) as usize);
+                signal(sig, handler);
             }
         }
+    }
+    #[cfg(not(unix))]
+    let _ = keep_on_hangup;
+}
+
+/// The name of the signal that asked for a stop, if one did.
+pub fn stop_signal() -> &'static str {
+    match SIGNAL.load(Ordering::SeqCst) {
+        1 => "SIGHUP",
+        2 => "SIGINT",
+        15 => "SIGTERM",
+        _ => "a signal",
     }
 }
 
@@ -206,6 +232,20 @@ mod tests {
                 .unwrap_or_default(),
             body: Vec::new(),
         }
+    }
+
+    #[test]
+    fn a_stop_names_its_signal() {
+        for (sig, name) in [
+            (1, "SIGHUP"),
+            (2, "SIGINT"),
+            (15, "SIGTERM"),
+            (0, "a signal"),
+        ] {
+            SIGNAL.store(sig, Ordering::SeqCst);
+            assert_eq!(stop_signal(), name);
+        }
+        SIGNAL.store(0, Ordering::SeqCst);
     }
 
     #[test]

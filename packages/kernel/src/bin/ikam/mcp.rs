@@ -41,10 +41,14 @@ pub struct Session<L: DerefMut<Target = Live> = Box<Live>> {
 pub fn run(
     store_dir: &str,
     refname: &str,
+    passage_index: bool,
     input: impl BufRead,
     mut output: impl Write,
 ) -> Result<(), String> {
     let mut s = Session::open(store_dir, refname)?;
+    if passage_index {
+        s.live.index_passages();
+    }
     for line in input.lines() {
         let line = line.map_err(err)?;
         if line.trim().is_empty() {
@@ -59,7 +63,7 @@ pub fn run(
     if n > 0 {
         let msg = format!("mcp: {n} change(s) left at exit");
         if let Some(c) = s.live.flush_with(true, Some(&msg))? {
-            eprintln!("{msg}: committed as {c}");
+            say!("{msg}: committed as {c}");
         }
     }
     Ok(())
@@ -350,7 +354,7 @@ impl<L: DerefMut<Target = Live>> Session<L> {
     }
 
     fn passages(&mut self, question: &str, k: usize) -> String {
-        let found = text::retrieve(&self.live.docs, question, k);
+        let found = self.live.retrieve(question, k);
         if found.is_empty() {
             return "no passage shares a word with the question".into();
         }

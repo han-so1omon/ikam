@@ -169,7 +169,7 @@ pub fn serve(port: u16, handler: Arc<Handler>, limits: Limits) -> Result<(), Str
                         | std::io::ErrorKind::TimedOut
                 )
             {
-                eprintln!("{} connection: {e}", crate::live::stamp());
+                say!("{} connection: {e}", crate::live::stamp());
             }
         });
     }
