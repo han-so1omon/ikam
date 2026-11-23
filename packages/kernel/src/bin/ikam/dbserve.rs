@@ -892,7 +892,7 @@ pub fn serve<S: Store + Send + 'static>(
             }
         };
         if log_requests {
-            eprintln!(
+            say!(
                 "{} {} {} -> {} {:.0}ms",
                 crate::live::stamp(),
                 req.method,
@@ -904,9 +904,9 @@ pub fn serve<S: Store + Send + 'static>(
         resp
     });
     let t = crate::live::stamp();
-    eprintln!("{t} databases on http://127.0.0.1:{port}/db/");
+    say!("{t} databases on http://127.0.0.1:{port}/db/");
     if password {
-        eprintln!("{t} password required (IKAM_AUTH)");
+        say!("{t} password required (IKAM_AUTH)");
     }
     http::serve(port, handler, http::Limits::default())
 }
