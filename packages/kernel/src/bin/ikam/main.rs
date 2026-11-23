@@ -47,9 +47,10 @@ const USAGE: &str = "usage: ikam [--store DIR] [--short-records] [--slow-codec-m
                                    the store's databases over HTTP, for programs
                                    (default port 8740, 127.0.0.1 only; dbserve.rs);
                                    --live turns on the options a live database
-                                   wants (E356, E372: with --defer-kv 20000 and
-                                   --keep-search; --defer-kv 0 or --no-keep-search
-                                   turns those off); --keep-on-hangup
+                                   wants (E356, E372, E385: with --defer-kv 20000,
+                                   --keep-search and --seed-index-max 250000;
+                                   --defer-kv 0, --no-keep-search or
+                                   --seed-index-max 0 turns those off); --keep-on-hangup
                                    ignores SIGHUP (E374); --skip-unchanged drops
                                    upserts of a key's current value (E376, off)
   host --config FILE [PORT]        several separate projects in one process, each
@@ -210,7 +211,8 @@ fn main() -> ExitCode {
 /// on a shared store, so they wait neither for an append nor for each other;
 /// `--edit-index` (E232, off) plans each write against the chunks it read
 /// instead of an index of the whole store, which a restarted server builds
-/// on its first write. `--seed-index-max N` (E383, off) drops that index
+/// on its first write. `--seed-index-max N` (E383, off; 250000 under
+/// `--live`, E385) drops that index
 /// once it holds N seed entries, so a long load keeps a bounded index; a
 /// later write may then store a chunk it could have sliced.
 /// `--plain-writes` (E357, off) stores the view chunks
@@ -317,15 +319,15 @@ fn db_cmd(store_dir: &str, args: &[String]) -> Result<(), String> {
         None if plain_views => return Err("--plain-view-writes needs --views FILE".into()),
         None => None,
     };
-    let seed_index_max: usize = match take_flag(&mut args, "--seed-index-max") {
-        Some(n) => n.parse().map_err(err)?,
-        None => 0,
+    let seed_index_max: Option<usize> = match take_flag(&mut args, "--seed-index-max") {
+        Some(n) => Some(n.parse().map_err(err)?),
+        None => None,
     };
-    let (packs, log_requests, mut serve_opts) = db_flags(&mut args, keep_counts, defer_kv);
-    if seed_index_max > 0 && !serve_opts.edit_index {
+    let (packs, log_requests, serve_opts) =
+        db_flags(&mut args, keep_counts, defer_kv, seed_index_max);
+    if serve_opts.seed_index_max > 0 && !serve_opts.edit_index {
         return Err("--seed-index-max needs --edit-index (or --live)".into());
     }
-    serve_opts.seed_index_max = seed_index_max;
     if packs && serve_opts.shared_store {
         return Err(
             "--shared-store is for a store on disk (FsStore), not --packs or --live".into(),
@@ -362,14 +364,17 @@ fn db_cmd(store_dir: &str, args: &[String]) -> Result<(), String> {
 /// store, whether to log requests, and the serving options. `--live` turns
 /// on `--packs`, `--plain-events`, `--no-object-templates`,
 /// `--concurrent-reads` and `--edit-index` (E356), and `--keep-search` and
-/// `--defer-kv` [`LIVE_DEFER_KV`] (E372); naming any of them as well
-/// changes nothing. `defer_kv` is the `--defer-kv` value, if one was given:
-/// it wins over the preset's, so `--defer-kv 0` turns deferring off, and
-/// `--no-keep-search` turns kept search views off.
+/// `--defer-kv` [`LIVE_DEFER_KV`] (E372), and `--seed-index-max`
+/// [`LIVE_SEED_INDEX_MAX`] (E385); naming any of them as well changes
+/// nothing. `defer_kv` and `seed_index_max` are the `--defer-kv` and
+/// `--seed-index-max` values, if given: each wins over the preset's, so
+/// `--defer-kv 0` turns deferring off and `--seed-index-max 0` leaves the
+/// seed index unbounded, and `--no-keep-search` turns kept search views off.
 fn db_flags(
     args: &mut Vec<String>,
     keep_counts: u32,
     defer_kv: Option<u64>,
+    seed_index_max: Option<usize>,
 ) -> (bool, bool, DbServeOpts) {
     let mut take = |name: &str| {
         let before = args.len();
@@ -388,6 +393,7 @@ fn db_flags(
     let keep_search = take("--keep-search") || live;
     let keep_search = !take("--no-keep-search") && keep_search;
     let defer_kv = defer_kv.unwrap_or(if live { LIVE_DEFER_KV } else { 0 });
+    let seed_index_max = seed_index_max.unwrap_or(if live { LIVE_SEED_INDEX_MAX } else { 0 });
     let shared_store = take("--shared-store");
     let skip_unchanged = take("--skip-unchanged");
     let opts = DbServeOpts {
@@ -402,13 +408,16 @@ fn db_flags(
         keep_search,
         shared_store,
         skip_unchanged,
-        seed_index_max: 0,
+        seed_index_max,
     };
     (packs, log_requests, opts)
 }
 
 /// `--defer-kv` under `--live` (E372): the N measured in E371.
 const LIVE_DEFER_KV: u64 = 20_000;
+
+/// `--seed-index-max` under `--live` (E385): the N measured in E383.
+const LIVE_SEED_INDEX_MAX: usize = 250_000;
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct DbServeOpts {
@@ -1223,10 +1232,10 @@ mod tests {
             keep_search: true,
             shared_store: false,
             skip_unchanged: false,
-            seed_index_max: 0,
+            seed_index_max: LIVE_SEED_INDEX_MAX,
         };
         let mut a = v(&["--live", "8752"]);
-        assert_eq!(db_flags(&mut a, 0, None), (true, false, all));
+        assert_eq!(db_flags(&mut a, 0, None, None), (true, false, all));
         assert_eq!(a, v(&["8752"]));
         let mut a = v(&[
             "--packs",
@@ -1236,13 +1245,16 @@ mod tests {
             "--edit-index",
             "--keep-search",
         ]);
-        assert_eq!(db_flags(&mut a, 0, Some(LIVE_DEFER_KV)), (true, false, all));
+        assert_eq!(
+            db_flags(&mut a, 0, Some(LIVE_DEFER_KV), Some(LIVE_SEED_INDEX_MAX)),
+            (true, false, all)
+        );
         let mut a = v(&["--live", "--edit-index", "--log-requests"]);
         let counted = DbServeOpts {
             keep_counts: 3,
             ..all
         };
-        assert_eq!(db_flags(&mut a, 3, None), (true, true, counted));
+        assert_eq!(db_flags(&mut a, 3, None, None), (true, true, counted));
         assert!(a.is_empty());
         let mut a = v(&["8740"]);
         let off = DbServeOpts {
@@ -1259,54 +1271,60 @@ mod tests {
             skip_unchanged: false,
             seed_index_max: 0,
         };
-        assert_eq!(db_flags(&mut a, 0, None), (false, false, off));
+        assert_eq!(db_flags(&mut a, 0, None, None), (false, false, off));
         // E357: `--plain-writes` is its own option, not part of `--live`.
         let mut a = v(&["--live", "--plain-writes"]);
         let plain = DbServeOpts {
             plain_writes: true,
             ..all
         };
-        assert_eq!(db_flags(&mut a, 0, None), (true, false, plain));
+        assert_eq!(db_flags(&mut a, 0, None, None), (true, false, plain));
         assert!(a.is_empty());
         // E358: `--hnsw` is its own option too.
         let mut a = v(&["--live", "--hnsw"]);
         let graph = DbServeOpts { hnsw: true, ..all };
-        assert_eq!(db_flags(&mut a, 0, None), (true, false, graph));
+        assert_eq!(db_flags(&mut a, 0, None, None), (true, false, graph));
         assert!(a.is_empty());
         // E372: `--live` keeps search views and defers kv folds; each can
         // be turned off or set on its own.
         let mut a = v(&["--live", "--keep-search"]);
-        assert_eq!(db_flags(&mut a, 0, None), (true, false, all));
+        assert_eq!(db_flags(&mut a, 0, None, None), (true, false, all));
         assert!(a.is_empty());
         let mut a = v(&["--live", "--no-keep-search"]);
         let unkept = DbServeOpts {
             keep_search: false,
             ..all
         };
-        assert_eq!(db_flags(&mut a, 0, None), (true, false, unkept));
+        assert_eq!(db_flags(&mut a, 0, None, None), (true, false, unkept));
         assert!(a.is_empty());
         let mut a = v(&["--live"]);
         let folded = DbServeOpts { defer_kv: 0, ..all };
-        assert_eq!(db_flags(&mut a, 0, Some(0)), (true, false, folded));
+        assert_eq!(db_flags(&mut a, 0, Some(0), None), (true, false, folded));
         let mut a = v(&["--live"]);
         let more = DbServeOpts {
             defer_kv: 100_000,
             ..all
         };
-        assert_eq!(db_flags(&mut a, 0, Some(100_000)), (true, false, more));
+        assert_eq!(
+            db_flags(&mut a, 0, Some(100_000), None),
+            (true, false, more)
+        );
         // Without `--live` neither is on.
         let mut a = v(&["--keep-search"]);
         let keep = DbServeOpts {
             keep_search: true,
             ..off
         };
-        assert_eq!(db_flags(&mut a, 0, None), (false, false, keep));
+        assert_eq!(db_flags(&mut a, 0, None, None), (false, false, keep));
         let mut a = v(&[]);
         let deferred = DbServeOpts {
             defer_kv: 500,
             ..off
         };
-        assert_eq!(db_flags(&mut a, 0, Some(500)), (false, false, deferred));
+        assert_eq!(
+            db_flags(&mut a, 0, Some(500), None),
+            (false, false, deferred)
+        );
         // E370: `--shared-store` too.
         let mut a = v(&["--shared-store"]);
         let shared = DbServeOpts {
@@ -1314,7 +1332,35 @@ mod tests {
             skip_unchanged: false,
             ..off
         };
-        assert_eq!(db_flags(&mut a, 0, None), (false, false, shared));
+        assert_eq!(db_flags(&mut a, 0, None, None), (false, false, shared));
+        // E385: `--live` bounds the seed index; `--seed-index-max 0` leaves
+        // it unbounded there, another N sets it, and without `--live` it
+        // stays off unless given.
+        let mut a = v(&["--live"]);
+        let unbounded = DbServeOpts {
+            seed_index_max: 0,
+            ..all
+        };
+        assert_eq!(db_flags(&mut a, 0, None, Some(0)), (true, false, unbounded));
+        let mut a = v(&["--live"]);
+        let tighter = DbServeOpts {
+            seed_index_max: 50_000,
+            ..all
+        };
+        assert_eq!(
+            db_flags(&mut a, 0, None, Some(50_000)),
+            (true, false, tighter)
+        );
+        let mut a = v(&["--edit-index"]);
+        let bounded = DbServeOpts {
+            edit_index: true,
+            seed_index_max: 1_000,
+            ..off
+        };
+        assert_eq!(
+            db_flags(&mut a, 0, None, Some(1_000)),
+            (false, false, bounded)
+        );
     }
     use super::*;
 
