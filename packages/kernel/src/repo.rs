@@ -256,6 +256,15 @@ pub struct Repo<S: Store> {
     /// a full repack, the only pass that finds slices and templates.
     /// Plans a caller proposes (hints) are still tried.
     pub plain_hot_writes: bool,
+    /// With a `seed_scope`, the most seed entries the index may hold
+    /// before it is dropped (E383); 0, the default, keeps every content
+    /// written for the life of the handle. With a scope the index holds
+    /// only what this handle wrote and what its edits read (E133, E141),
+    /// so a dropped index starts again empty, as after a restart, and the
+    /// next edit adds the chunks it reads (`replace_hints`). Without a
+    /// scope it is ignored: that index is every stored object, read again
+    /// in full when built.
+    pub seed_index_max: usize,
     pub(crate) writing_object: bool,
 }
 
@@ -319,6 +328,7 @@ impl<S: Store> Repo<S> {
             object_templates: true,
             plain_db_events: false,
             plain_hot_writes: false,
+            seed_index_max: 0,
             writing_object: false,
             hints: Default::default(),
         }
@@ -352,6 +362,20 @@ impl<S: Store> Repo<S> {
 
     /// Index the contents noted since the last call, in the order read.
     fn index_hints(&mut self) -> Result<(), Error> {
+        // E383: past its bound the index starts again, before this edit's
+        // reads go in, so they are always indexed for its plan.
+        if self.seed_index_max > 0
+            && self.seed_scope.is_some()
+            && self
+                .index
+                .as_ref()
+                .is_some_and(|i| i.entries() > self.seed_index_max)
+        {
+            self.index = None;
+            if let Some(h) = self.hints.lock().unwrap().as_mut() {
+                h.added.clear();
+            }
+        }
         let pending = match self.hints.lock().unwrap().as_mut() {
             Some(h) => std::mem::take(&mut h.pending),
             None => return Ok(()),
@@ -662,6 +686,11 @@ impl<S: Store> Repo<S> {
     /// Change `seed_scope`, dropping the seed index so the next write builds
     /// it for the new scope (E133: one handle serving goals in different
     /// folders).
+    /// Seed entries the index holds now; 0 when none is built (E383).
+    pub fn seed_index_entries(&self) -> usize {
+        self.index.as_ref().map_or(0, |i| i.entries())
+    }
+
     pub fn set_seed_scope(&mut self, scope: Option<Vec<Id>>) {
         self.seed_scope = scope;
         self.index = None;

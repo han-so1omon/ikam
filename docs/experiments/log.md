@@ -6157,3 +6157,27 @@ Gates on the branch (E229 to E233): every kernel test suite passes (release); cl
 - Note for older runs: a bench that passes only `--live` (`restart_bench.py`, `search_bench.py`, `served_views.py`, `db_first_write.py`) now measures the new preset; `--live --defer-kv 0 --no-keep-search` is the E356 preset.
 - Verdict: **kept** (preset change, each part still an option).
 - Not measured: the Mac; whether 20000 is the best N for other row sizes (E368 measured 100k, E371 20000).
+
+### E383 seed-index-cap (what a loading server's memory is, and bounding the seed index)
+- Branch / parent: exp/383-seed-index-cap / main 021f129
+- Question: E375 found a `db serve --live` server holding about 3 GB after loading 1M rows, growing with every batch and never giving it back (E356 gap: stores above 200k rows). What holds it, and can it be bounded without a bigger store?
+- Profile (valgrind massif on a 200k-row `--live` load, one run, not committed): the largest frame was the seed index (`matcher::Index`, its seeds and slots). With `--edit-index` and a seed scope the index holds what the handle wrote and what its edits read (E133, E141), so a long-running server adds every content it writes and keeps it for its life.
+- Change (an option, off by default): `Repo::seed_index_max` (src/repo.rs) and `db serve --seed-index-max N` (needs `--edit-index`, which `--live` implies). With a scope, `index_hints` drops the index once it holds more than N entries (`Index::entries`), before the edit's reads go in, so every edit is still planned against the chunks it read; the next write starts an empty index, as after a restart. Without a scope it does nothing (that index is the whole store, read again when built). 0 keeps today's behaviour.
+- Result (`experiments/seed-index/load_mem.py`, E354's rows, 1M rows in 2,000-row batches, one run each on this 4-core cloud machine; resident memory from /proc):
+
+  | | `--live` | `--seed-index-max 250000` | `--seed-index-max 50000` |
+  |---|---|---|---|
+  | resident at 250k / 500k / 750k / 1M rows | 689 / 1,468 / 2,167 / 3,095 MB | 249 / 500 / 738 / 990 MB | 183 / 429 / 693 / 939 MB |
+  | after a full count | 3,095 MB | 990 MB | 962 MB |
+  | load time | 452.2 s | 439.0 s | 398.9 s |
+  | store | 1,125.2 MB | 1,124.7 MB | 1,123.9 MB |
+  | count after a restart | 1,000,000 | 1,000,000 | 1,000,000 |
+
+  Two thirds of a loading server's memory was the seed index; bounded, the store is no bigger for these rows (appends rarely slice against contents written long before). Memory still grows about 0.9 MB per 1,000 rows with either bound: the rest is something else, not yet traced.
+- Cost: an edit that would slice against contents written before the drop, and does not read them, stores them again. `a_bounded_index_stays_bounded_and_writes_the_same_view` (tests/hints.rs: 40 view edits on one handle, each adding nodes and repointing old ones): the same view root under every bound; at most 257 entries with a bound of 200, 993 with 1,000, 3,890 with 4,000, against 6,683 unbounded; bytes written 169,178, 137,822 and 118,568 against 121,694. A small bound costs bytes; one near the number of contents an edit touches costs nothing here.
+- Checks: that test (it fails if the bound is ignored, and asserts the view and fsck are the same), the E141 hints tests unchanged; `--seed-index-max` without `--edit-index` is refused.
+- Fixed benchmark (AGENTS.md section 7): unchanged; the option is off by default and the bench never sets it. From this shallow clone the four history corpora cannot be built; the other seven cost corpora and the three north corpora: bytes, proxy and read scores 6.5696, 4.3925 and 6.5359 as on main 021f129, north score 0.3060 as on main, every reconstruction exact and fsck clean; cost score 0.2371 and 0.2282 here against 0.2319 and 0.2301 on main the same morning, its timing noise. `cargo test --release`: 360 pass; clippy clean.
+- Verdict: **kept** as an option (off by default): a third of the memory for a long load at the same store size on these rows; a bound too small for the edits stores more. Whether `--live` should turn it on (at 250,000, say) is the owner's call.
+- Not measured: the Mac; edits that rewrite old rows across a long-running server (the test's case, at scale); what holds the remaining 0.9 MB per 1,000 rows.
+- Next: trace the remaining growth with massif at 1M rows under a bound; measure a mixed load (appends and edits of old rows) at bounds of 50k and 250k.
+- Run: `python3 -I experiments/seed-index/load_mem.py IKAM_BIN WORK 1000000 250000 "--live;--live --seed-index-max 250000;--live --seed-index-max 50000"`; `cargo test --release --test hints`.

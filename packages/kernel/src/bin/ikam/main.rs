@@ -32,7 +32,7 @@ const USAGE: &str = "usage: ikam [--store DIR] [--short-records] [--slow-codec-m
   ls [REV[:PATH]] [-r]             list a directory of REV (default main)
   grep TEXT [REV]                  files of REV containing TEXT, with lines
   stats [REV]                      objects and bytes the store holds
-  db serve [--live] [--packs] [--plain-events] [--no-object-templates] [--concurrent-reads] [--edit-index] [--plain-writes] [--hnsw] [--keep-search] [--no-keep-search] [--shared-store] [--keep-counts N] [--defer-kv N] [--views FILE] [PORT]
+  db serve [--live] [--packs] [--plain-events] [--no-object-templates] [--concurrent-reads] [--edit-index] [--plain-writes] [--hnsw] [--keep-search] [--no-keep-search] [--shared-store] [--keep-counts N] [--defer-kv N] [--seed-index-max N] [--views FILE] [PORT]
                                    the store's databases over HTTP, for programs
                                    (default port 8740, 127.0.0.1 only; dbserve.rs);
                                    --live turns on the options a live database
@@ -173,7 +173,7 @@ fn main() -> ExitCode {
 }
 
 /// `ikam db serve [--live] [--packs] [--plain-events] [--no-object-templates]
-/// [--concurrent-reads] [--edit-index] [--plain-writes] [--hnsw] [--keep-search] [--no-keep-search] [--shared-store] [--keep-counts N] [--defer-kv N]
+/// [--concurrent-reads] [--edit-index] [--seed-index-max N] [--plain-writes] [--hnsw] [--keep-search] [--no-keep-search] [--shared-store] [--keep-counts N] [--defer-kv N]
 /// [--views FILE]
 /// [--allow-host NAME]...
 /// [--log-requests] [PORT]`:
@@ -187,7 +187,10 @@ fn main() -> ExitCode {
 /// on a shared store, so they wait neither for an append nor for each other;
 /// `--edit-index` (E232, off) plans each write against the chunks it read
 /// instead of an index of the whole store, which a restarted server builds
-/// on its first write. `--plain-writes` (E357, off) stores the view chunks
+/// on its first write. `--seed-index-max N` (E383, off) drops that index
+/// once it holds N seed entries, so a long load keeps a bounded index; a
+/// later write may then store a chunk it could have sliced.
+/// `--plain-writes` (E357, off) stores the view chunks
 /// an append rewrites compressed as they are, without the plan search
 /// (`Repo::plain_hot_writes`, E261): appends to a table with keys spread
 /// over it (a secondary index) are 3 to 5 times faster, and the store grows
@@ -234,7 +237,7 @@ fn main() -> ExitCode {
 fn db_cmd(store_dir: &str, args: &[String]) -> Result<(), String> {
     let mut args = args.to_vec();
     if args.first().map(String::as_str) != Some("serve") {
-        return Err("usage: ikam [--store DIR] db serve [--live] [--packs] [--plain-events] [--no-object-templates] [--concurrent-reads] [--edit-index] [--plain-writes] [--hnsw] [--keep-search] [--no-keep-search] [--shared-store] [--keep-counts N] [--defer-kv N] [--views FILE] [--allow-host NAME]... [--log-requests] [PORT]".into());
+        return Err("usage: ikam [--store DIR] db serve [--live] [--packs] [--plain-events] [--no-object-templates] [--concurrent-reads] [--edit-index] [--plain-writes] [--hnsw] [--keep-search] [--no-keep-search] [--shared-store] [--keep-counts N] [--defer-kv N] [--seed-index-max N] [--views FILE] [--allow-host NAME]... [--log-requests] [PORT]".into());
     }
     args.remove(0);
     let mut allowed = Vec::new();
@@ -256,7 +259,15 @@ fn db_cmd(store_dir: &str, args: &[String]) -> Result<(), String> {
         }
         None => None,
     };
-    let (packs, log_requests, serve_opts) = db_flags(&mut args, keep_counts, defer_kv);
+    let seed_index_max: usize = match take_flag(&mut args, "--seed-index-max") {
+        Some(n) => n.parse().map_err(err)?,
+        None => 0,
+    };
+    let (packs, log_requests, mut serve_opts) = db_flags(&mut args, keep_counts, defer_kv);
+    if seed_index_max > 0 && !serve_opts.edit_index {
+        return Err("--seed-index-max needs --edit-index (or --live)".into());
+    }
+    serve_opts.seed_index_max = seed_index_max;
     if packs && serve_opts.shared_store {
         return Err(
             "--shared-store is for a store on disk (FsStore), not --packs or --live".into(),
@@ -331,6 +342,7 @@ fn db_flags(
         hnsw,
         keep_search,
         shared_store,
+        seed_index_max: 0,
     };
     (packs, log_requests, opts)
 }
@@ -351,6 +363,8 @@ struct DbServeOpts {
     hnsw: bool,
     keep_search: bool,
     shared_store: bool,
+    /// E383: drop the seed index past this many entries (0: never).
+    seed_index_max: usize,
 }
 
 /// `db serve` on `store`; with `concurrent_reads` the store is shared, so
@@ -379,6 +393,7 @@ fn serve_db<S: ikam_kernel::Store + Send + Sync + 'static>(
         r.plain_db_events = o.plain_events;
         r.object_templates = o.object_templates;
         r.plain_hot_writes = o.plain_writes;
+        r.seed_index_max = o.seed_index_max;
         r.refresh_ledger = o.shared_store;
         if o.edit_index {
             // E232: plan against what each edit reads (E133's scope and
@@ -1114,6 +1129,7 @@ mod tests {
             hnsw: false,
             keep_search: true,
             shared_store: false,
+            seed_index_max: 0,
         };
         let mut a = v(&["--live", "8752"]);
         assert_eq!(db_flags(&mut a, 0, None), (true, false, all));
@@ -1146,6 +1162,7 @@ mod tests {
             hnsw: false,
             keep_search: false,
             shared_store: false,
+            seed_index_max: 0,
         };
         assert_eq!(db_flags(&mut a, 0, None), (false, false, off));
         // E357: `--plain-writes` is its own option, not part of `--live`.
