@@ -273,6 +273,8 @@ pub struct Repo<S: Store> {
 pub(crate) struct Hints {
     pending: Vec<Id>,
     added: HashSet<Id>,
+    /// The index was dropped once during this edit (E383).
+    reset: bool,
 }
 
 /// Contents read during one edit with `read_memo` on.
@@ -363,17 +365,26 @@ impl<S: Store> Repo<S> {
     /// Index the contents noted since the last call, in the order read.
     fn index_hints(&mut self) -> Result<(), Error> {
         // E383: past its bound the index starts again, before this edit's
-        // reads go in, so they are always indexed for its plan.
+        // reads go in, so they are always indexed for its plan. The chunks
+        // this edit read before the drop go in again, so a later chunk of
+        // the same edit can still slice against them; an edit drops the
+        // index at most once, so one larger than the bound is not indexed
+        // over and over.
         if self.seed_index_max > 0
             && self.seed_scope.is_some()
             && self
                 .index
                 .as_ref()
                 .is_some_and(|i| i.entries() > self.seed_index_max)
+            && !self.hints.lock().unwrap().as_ref().is_some_and(|h| h.reset)
         {
             self.index = None;
             if let Some(h) = self.hints.lock().unwrap().as_mut() {
-                h.added.clear();
+                let mut again: Vec<Id> = h.added.drain().collect();
+                again.sort();
+                again.append(&mut h.pending);
+                h.pending = again;
+                h.reset = true;
             }
         }
         let pending = match self.hints.lock().unwrap().as_mut() {

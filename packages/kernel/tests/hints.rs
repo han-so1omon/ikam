@@ -222,10 +222,11 @@ fn a_bounded_index_stays_bounded_and_writes_the_same_view() {
             "{} entries for a bound of {bound}",
             capped.1
         );
-        // A dropped index loses what earlier edits wrote, so a later edit
-        // may store a chunk it could have sliced: the bound costs bytes.
+        // A dropped index takes back what the edit in hand read, so each
+        // edit still slices against the chunks it read; only contents
+        // written earlier and not read again are lost.
         assert!(
-            capped.2 <= free.2 * 2,
+            capped.2 * 10 <= free.2 * 11,
             "{} bytes bounded, {} unbounded",
             capped.2,
             free.2
