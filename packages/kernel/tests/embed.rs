@@ -97,5 +97,9 @@ fn the_vector_id_changes_with_anything_that_changes_a_vector() {
     let mut t = std::fs::read_to_string(&tok).unwrap();
     t.push('\n');
     std::fs::write(&tok, t).unwrap();
-    assert_ne!(Embedder::open(dir.path(), None, 512).unwrap().id, a.id, "tokenizer");
+    assert_ne!(
+        Embedder::open(dir.path(), None, 512).unwrap().id,
+        a.id,
+        "tokenizer"
+    );
 }
