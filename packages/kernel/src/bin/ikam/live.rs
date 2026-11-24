@@ -20,6 +20,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 
+use ikam_kernel::bm25::Bm25Mem;
 use ikam_kernel::{Edit, FsStore, Id, Kind, Object, Repo, Store, TreeEntry, snapshot};
 
 use crate::corpus::err;
@@ -27,6 +28,39 @@ use crate::text::{self, Doc};
 
 /// Bytes of recently read content kept in memory.
 const BYTE_CACHE: usize = 256 << 20;
+
+/// E388: how `rank_files` fuses its keyword and vector lists.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Fuse {
+    Convex(f32),
+    Rrf,
+}
+
+/// How deep each list is read before fusing, as `db serve` reads it.
+pub const FUSE_DEPTH: usize = 100;
+
+/// E388: the file ranker `--rank-files` keeps.
+pub struct FileRanker {
+    pub bm25: Bm25Mem,
+    /// Vectors by content id, all of `dim` numbers (0: none yet).
+    pub vectors: HashMap<Id, Vec<f32>>,
+    pub dim: usize,
+}
+
+/// A file's text as the ranker reads it: its parts in order, one line
+/// apart (a plain text file's own text).
+pub fn doc_text(doc: &Doc) -> std::borrow::Cow<'_, str> {
+    match doc.parts.as_slice() {
+        [one] => std::borrow::Cow::Borrowed(one.text.as_str()),
+        parts => std::borrow::Cow::Owned(
+            parts
+                .iter()
+                .map(|p| p.text.as_str())
+                .collect::<Vec<_>>()
+                .join("\n"),
+        ),
+    }
+}
 
 pub struct Live {
     pub repo: Repo<FsStore>,
@@ -58,6 +92,10 @@ pub struct Live {
     /// `--passage-index` (E378, off): the words of `docs`, kept as files
     /// change, so questions read postings instead of scanning the text.
     pub passages: Option<text::PassageIndex>,
+    /// `--rank-files` (E388, off): BM25 over each file's whole text, kept
+    /// as files change, and vectors supplied by content, for ranked and
+    /// hybrid file search (the `rank` tool). Built on first use otherwise.
+    pub ranker: Option<FileRanker>,
     extracted: HashMap<Id, Arc<Doc>>,
     /// Edit times by path (the store records none); start time otherwise.
     mtimes: HashMap<String, SystemTime>,
@@ -161,6 +199,7 @@ impl Live {
             files: BTreeMap::new(),
             docs: HashMap::new(),
             passages: None,
+            ranker: None,
             extracted: HashMap::new(),
             mtimes: HashMap::new(),
             started: SystemTime::now(),
@@ -451,6 +490,128 @@ impl Live {
         }
     }
 
+    /// Keep the file ranker from now on (E388): BM25 over every current
+    /// file's text.
+    pub fn index_files(&mut self) {
+        if self.ranker.is_none() {
+            let t = Instant::now();
+            let mut bm25 = Bm25Mem::new();
+            for (path, doc) in &self.docs {
+                bm25.put(path, &doc_text(doc));
+            }
+            let (terms, postings) = bm25.size();
+            self.log(format!(
+                "file ranker: {} files, {terms} terms, {postings} postings in {:.0} ms",
+                bm25.len(),
+                t.elapsed().as_secs_f64() * 1e3
+            ));
+            self.ranker = Some(FileRanker {
+                bm25,
+                vectors: HashMap::new(),
+                dim: 0,
+            });
+        }
+    }
+
+    /// Read vectors for files from `PREFIX.paths` (one path a line) and
+    /// `PREFIX.f32` (little-endian f32, one vector a path, in that order),
+    /// kept by the content each path holds now: a file whose content
+    /// changes loses its vector, and a copy of it shares it. Paths not in
+    /// the tree are skipped. Returns how many were kept.
+    pub fn load_file_vectors(&mut self, prefix: &str) -> Result<usize, String> {
+        self.index_files();
+        let paths = std::fs::read_to_string(format!("{prefix}.paths")).map_err(err)?;
+        let paths: Vec<&str> = paths.lines().filter(|l| !l.is_empty()).collect();
+        let flat =
+            ikam_kernel::vectors::to_f32s(&std::fs::read(format!("{prefix}.f32")).map_err(err)?);
+        if paths.is_empty() || !flat.len().is_multiple_of(paths.len()) {
+            return Err(format!(
+                "{prefix}: {} numbers do not split into {} vectors",
+                flat.len(),
+                paths.len()
+            ));
+        }
+        let dim = flat.len() / paths.len();
+        let r = self.ranker.as_mut().expect("ranker");
+        if r.dim != 0 && r.dim != dim {
+            return Err(format!(
+                "{prefix}: vectors of {dim}, earlier ones {}",
+                r.dim
+            ));
+        }
+        r.dim = dim;
+        let mut kept = 0;
+        for (p, v) in paths.iter().zip(flat.chunks_exact(dim)) {
+            if let Some(id) = self.files.get(&norm(p)) {
+                r.vectors.insert(*id, v.to_vec());
+                kept += 1;
+            }
+        }
+        self.log(format!(
+            "file vectors: {kept} of {} kept, {dim} dims",
+            paths.len()
+        ));
+        Ok(kept)
+    }
+
+    /// The `k` best files for `query`, best first: BM25 over whole files;
+    /// with a query vector and file vectors, fused with the files nearest
+    /// it (exact dot product) as `db serve`'s search route fuses (E312:
+    /// convex with `alpha` on the keyword list, or reciprocal rank fusion).
+    pub fn rank_files(
+        &mut self,
+        query: &str,
+        vector: Option<&[f32]>,
+        k: usize,
+        fuse: Fuse,
+    ) -> Result<Vec<(String, f32)>, String> {
+        self.index_files();
+        let r = self.ranker.as_ref().expect("ranker");
+        let Some(q) = vector.filter(|_| r.dim > 0) else {
+            return Ok(r.bm25.search(query, k));
+        };
+        if q.len() != r.dim {
+            return Err(format!(
+                "the query vector has {} numbers, files {}",
+                q.len(),
+                r.dim
+            ));
+        }
+        let depth = FUSE_DEPTH.max(k);
+        let keyword = r.bm25.search(query, depth);
+        let mut near: Vec<(f32, &String)> = self
+            .files
+            .iter()
+            .filter_map(|(p, id)| Some((ikam_kernel::vectors::dot_lanes(q, r.vectors.get(id)?), p)))
+            .collect();
+        let by =
+            |a: &(f32, &String), b: &(f32, &String)| b.0.total_cmp(&a.0).then_with(|| a.1.cmp(b.1));
+        if near.len() > depth {
+            near.select_nth_unstable_by(depth - 1, by);
+            near.truncate(depth);
+        }
+        near.sort_by(by);
+        let near: Vec<(String, f32)> = near.into_iter().map(|(s, p)| (p.clone(), s)).collect();
+        let mut fused = match fuse {
+            Fuse::Convex(alpha) => ikam_kernel::fusion::convex(&keyword, &near, alpha),
+            Fuse::Rrf => {
+                let keys = |l: &[(String, f32)]| l.iter().map(|x| x.0.clone()).collect();
+                ikam_kernel::fusion::rrf(&[keys(&keyword), keys(&near)], 60.0)
+            }
+        };
+        fused.truncate(k);
+        Ok(fused)
+    }
+
+    /// The `n` passages of `path` that best answer `query`.
+    pub fn passages_in(&self, path: &str, query: &str, n: usize) -> Vec<text::Passage> {
+        let Some(doc) = self.docs.get(path) else {
+            return Vec::new();
+        };
+        let one: HashMap<String, Arc<Doc>> = [(path.to_string(), doc.clone())].into();
+        text::retrieve(&one, query, n)
+    }
+
     /// The `k` passages that best answer `question`: from the passage index
     /// when one is kept (same answers), else by scanning the text.
     pub fn retrieve(&self, question: &str, k: usize) -> Vec<text::Passage> {
@@ -476,6 +637,9 @@ impl Live {
             self.docs.remove(&p);
             if let Some(idx) = &mut self.passages {
                 idx.remove(&p);
+            }
+            if let Some(r) = &mut self.ranker {
+                r.bm25.remove(&p);
             }
         }
         // Contents not yet extracted: many at startup, so in parallel.
@@ -523,6 +687,9 @@ impl Live {
             };
             if let Some(idx) = &mut self.passages {
                 idx.insert(path, &doc);
+            }
+            if let Some(r) = &mut self.ranker {
+                r.bm25.put(path, &doc_text(&doc));
             }
             self.docs.insert(path.clone(), doc);
         }
