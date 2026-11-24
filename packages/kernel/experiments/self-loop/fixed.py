@@ -25,7 +25,9 @@ BUDGET_SHARE = 0.5  # a policy is judged on the first half of a pool's test time
 PROTECTED = [
     "packages/kernel/tests/*", "packages/kernel/examples/bench.rs",
     "packages/kernel/examples/common/*", "packages/kernel/experiments/self-loop/fixed.py",
-    "packages/kernel/experiments/self-loop/catalog.tsv", "packages/kernel/Cargo.toml",
+    "packages/kernel/experiments/self-loop/catalog.tsv",
+    "packages/kernel/experiments/self-loop/guard_test.py", "packages/kernel/experiments/self-loop/seed.tsv",
+    "packages/kernel/Cargo.toml",
     "packages/kernel/Cargo.lock", ".github/*", "docs/experiments/README.md",
 ]
 BRANCH = re.compile(r"^exp/400-(self-loop|cand-[a-z0-9-]+)$")

@@ -6440,3 +6440,26 @@ Gates on the branch (E229 to E233): every kernel test suite passes (release); cl
 - Note for older runs: a bench that passes only `--live` now measures the bounded seed index; `--live --seed-index-max 0` is the E372 preset.
 - Verdict: **kept** (preset change, still an option).
 - Not measured: the Mac; whether 250000 is the best N for other row sizes; a write after a drop can store a chunk it could have sliced (E383: under 1% of store bytes at 1M rows).
+
+### E400 self-loop (a self-improvement loop run on IKAM, first round)
+
+- Branch / parent: exp/400-self-loop / main 0a6f0eb. (E391 and up are taken by the trip-week nights, so this takes 400.)
+- Question: can IKAM run a loop that improves IKAM, with the loop's state and history in IKAM, and does a ranking the loop learns for itself find kept changes per test-hour faster than the fixed ranking E322 used?
+- Design: `docs/plans/2026-11-24-self-loop.md`. Two levels on one Petri net (`examples/self_loop.rs`, ref `loop/self` on an FsStore). Level 0: a candidate is one catalog constant changed by one line, committed on its own branch `exp/400-cand-*`, measured north first and kept or closed by the README rule. Level 1: the order candidates are tried in is a policy (weights over seven features of the loop's own history); after a round a meta step proposes 64 variants, judges them leave-one-round-out with `fixed.kept_per_hour` and adopts one only if it beats the current by more than 0.01; it widens its own search radius after an adoption and narrows it after a rejection. Every step is a firing; the loop keeps no other state.
+- Guards (`experiments/self-loop/fixed.py`, which the loop imports and never writes; `guard_test.py`, 11 checks, all pass): the scoring, tolerances and keep rule; the evaluator; a candidate diff must be exactly its catalog line with only the value changed; tests, the bench and its common code, the catalog, `fixed.py`, the guard tests, the seed history, `Cargo.toml`, the lock file, `.github` and the experiments README are hashed at the start of a round and checked before every verdict; the loop may only write `exp/400-*` branches; a policy may hold only weights, a radius and a seed; `merge` is a human transition the net refuses to fire.
+- Seed: 22 results transcribed from E322, E347 and E348 (`seed.tsv`, test time modelled). Policy p0 from the zero policy: held-out area 0.380 -> 0.450, adopted.
+- Round r1 (this cloud workspace, 4 cores, the full run without the four history corpora as in E322): base north 0.30603, cost median 0.2315 (0.2287, 0.2315, 0.2325), cost tolerance 2%. 28 candidates over 17 constants, 1.05 test-hours, about 130 s each.
+
+  | | kept | test-hours in the first half of the pool | kept per test-hour | area |
+  | --- | --- | --- | --- | --- |
+  | policy p0 | 0 | 0.495 | 0 | 0 |
+  | fixed ranking | 0 | 0.496 | 0 | 0 |
+  | random (2,000 orders) | 0 | 0.506 | 0 | 0 |
+
+  Nothing was kept: 8 candidates made north worse beyond 0.5% (worst `GROUP_SIZE` 128 KiB, +6.95%; `HOLE_COST`, `MEASURE_LEVEL`, `SEED` 28, `MATCH_CANDIDATES` 5, `GROUP_SHORTLIST` 4) and 20 held; 12 of the 20 moved north by exactly 0.00% (the dict shortlist, star candidates, neighbours, search and graph chunk sizes, seed positions, related-min 1024), so they do not touch the north corpora at all. None reached the full runs, so the cost score was never needed.
+- Meta step after r1: p1 adopted (held-out 0.379 -> 0.461, radius 1.25 -> 1.56). r1 had no keep, so it adds history but cannot be a held-out round; p1 is still fitted to two rounds. p1 puts the constants that moved north most first, including the ones r1 just found worse: with no keep in r1 there is nothing to tell it which way.
+- Store check: `self_loop STORE check`: 209 firings, replay equal to the marking, every output readable, fsck clean, no merge firing, one policy in use. The 8 `waiting` tokens are the seed history's keeps, already on main.
+- Verdict: **measured**. The loop runs and its guards hold; the number it was built to raise is 0 for every ordering, because the one-constant catalog is used up at main 0a6f0eb (E322, E347 and E348 already took its keeps). A policy cannot be told apart from the fixed ranking on a pool with no keeps.
+- Next: candidates the catalog does not hold. An agent-written change would enter as a `propose` firing with its diff as output, through the same guards with a path rule instead of the one-line rule; a round should also skip a constant and value already measured on the same base commit, so a policy is not paid to retest them.
+- Not measured: a second round; the Mac; agent-written candidates; the cost score on any candidate; the history corpora.
+- Run: `python3 -I experiments/self-loop/loop.py seed STORE`, then `round STORE WORKTREE r1`, `score STORE r1`, `meta STORE`, and `cargo run --release --example self_loop -- STORE check`.

@@ -74,7 +74,10 @@ fn main() {
     match cmd {
         "fire" => {
             let (t, tok) = (&args[2], &args[3]);
-            assert!(t != "merge", "merge is a human transition: the loop never fires it");
+            assert!(
+                t != "merge",
+                "merge is a human transition: the loop never fires it"
+            );
             let out = args.get(4).map(|f| std::fs::read(f).unwrap());
             let key = format!("{t}-{tok}");
             let r = match &out {
@@ -82,7 +85,10 @@ fn main() {
                 None => repo.net_fire(&db, &net, t, Some(tok), &key),
             };
             let db = r.unwrap_or_else(|e| panic!("{key}: {e:?}")).0;
-            let at = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
+            let at = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_secs();
             let c = repo.db_commit(REF, &db, &format!("{key} at {at}")).unwrap();
             println!("{key} -> {}", &c.to_string()[..12]);
         }
@@ -118,7 +124,9 @@ fn check(repo: &Repo<FsStore>, db: &Db, net: &Net) {
     }
     let held = |p: &str| m.get(p).map_or(0, |t| t.values().sum::<u64>());
     assert!(held("policy") <= 1, "more than one policy in use");
-    let places = ["queued", "running", "waiting", "closed", "policy", "retired"];
+    let places = [
+        "queued", "running", "waiting", "closed", "policy", "retired",
+    ];
     let counts: Vec<String> = places.iter().map(|p| format!("{p} {}", held(p))).collect();
     println!(
         "{REF}: {} firings, replay equal, outputs readable, fsck clean; {}",
