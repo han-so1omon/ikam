@@ -4,7 +4,10 @@
 //! The net is `loop_journal`'s night net. Each call opens the store, fires
 //! one transition, commits to the ref `night/<LABEL>` and exits, so a killed
 //! runner loses nothing it reported: the next call starts from the stored
-//! marking. The agent asks the net what to do next instead of choosing:
+//! marking. A call commits only on the head it read (`db_commit_at`,
+//! E292): of two calls on one label at once, the later is refused, writes
+//! nothing and is run again. The agent asks the net what to do next
+//! instead of choosing:
 //!
 //!   cargo run --release --example loop_drive -- STORE LABEL plan E386 E387 ...
 //!   cargo run --release --example loop_drive -- STORE LABEL next
@@ -93,9 +96,11 @@ fn main() {
     let net = Net::parse(NIGHT).unwrap();
     let refname = format!("night/{label}");
     let mut repo = Repo::new(FsStore::open(&dir).unwrap());
-    let mut db = match repo.resolve(&refname) {
-        Ok(c) => repo.db_at(&c).unwrap(),
-        Err(_) => {
+    // The head this call read: its commit is made on it, or refused.
+    let head = repo.resolve(&refname).ok();
+    let mut db = match head {
+        Some(c) => repo.db_at(&c).unwrap(),
+        None => {
             let db = repo.db_empty().unwrap();
             repo.net_init_sum(&db, &net).unwrap()
         }
@@ -127,7 +132,13 @@ fn main() {
         _ => panic!("unknown command {cmd}"),
     }
     let msg = format!("{cmd} {} at {}", rest.join(" "), now());
-    let c = repo.db_commit(&refname, &db, &msg).unwrap();
+    // Two calls on one label at once: the second is refused and writes no
+    // ref (it reports nothing, so nothing it reported is lost; run it again).
+    let c = match head {
+        Some(h) => repo.db_commit_at(&refname, h, &db, &msg),
+        None => repo.db_commit_new(&refname, &db, &msg),
+    }
+    .unwrap_or_else(|e| panic!("{refname} moved while this call ran ({e:?}); run it again"));
     println!("{msg} -> {}", &c.to_string()[..12]);
 }
 
