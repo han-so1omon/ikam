@@ -11,7 +11,7 @@ import hashlib, math, random
 
 import fixed
 
-FEATURES = ["moves", "better", "worse", "toward", "step", "untested", "hours"]
+FEATURES = ["moves", "better", "worse", "toward", "step", "untested", "hours", "parent"]
 
 
 def num(s):
@@ -33,6 +33,8 @@ def features(c, hist):
         "step": abs(math.log2(v / b)) if b > 0 and v > 0 else 1.0,
         "untested": float(not h),
         "hours": (sum(own) / len(own)) / 3600,
+        # E401: how much the candidate's parent improved north (0 on the base)
+        "parent": -float(c.get("parent_dn") or 0.0) / 0.01,
     }
 
 

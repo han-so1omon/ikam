@@ -66,6 +66,38 @@ def main():
                    and fixed.protected("packages/kernel/experiments/self-loop/catalog.tsv")))
     checks.append(("a catalog row on a protected path is refused",
                    refused(fixed.check_diff, root, base, {"file": "../kernel/tests/t.rs", "line": "assert!(true);", "value": "true"}, "false")))
+    rows = [dict(ROW, name="gap-diff", tries=["256", "4096"]), {"name": "hole-cost", "file": "src/template.rs",
+            "line": "const HOLE_COST: usize = 8;", "value": "8", "tries": ["4", "16"]}]
+    git(root, "checkout", "-q", "--", ".")
+    git(root, "checkout", "-q", "-b", "p1")
+    edit("packages/kernel/src/template.rs", "= 1024;", "= 256;")
+    git(root, "-c", "user.name=t", "-c", "user.email=t@example.com", "commit", "-qam", "p1")
+    p1 = subprocess.run(["git", "rev-parse", "HEAD"], cwd=root, capture_output=True, text=True).stdout.strip()
+    checks.append(("a parent of catalog lines is accepted", not refused(fixed.check_chain, root, base, p1, rows)))
+    edit("packages/kernel/src/template.rs", "= 8;", "= 7;")
+    git(root, "-c", "user.name=t", "-c", "user.email=t@example.com", "commit", "-qam", "p2")
+    p2 = subprocess.run(["git", "rev-parse", "HEAD"], cwd=root, capture_output=True, text=True).stdout.strip()
+    checks.append(("a parent with a value the catalog does not try is refused", refused(fixed.check_chain, root, base, p2, rows)))
+    git(root, "checkout", "-q", "p1")
+    edit("packages/kernel/tests/t.rs", "true", "false")
+    git(root, "-c", "user.name=t", "-c", "user.email=t@example.com", "commit", "-qam", "p3")
+    p3 = subprocess.run(["git", "rev-parse", "HEAD"], cwd=root, capture_output=True, text=True).stdout.strip()
+    checks.append(("a parent that edits a test is refused", refused(fixed.check_chain, root, base, p3, rows)))
+    checks.append(("a config cannot name a scoring step",
+                   refused(fixed.check_config, {"steps": {"measure": "mine"}})
+                   and refused(fixed.check_config, {"steps": {}, "tolerance": 0.1})))
+    checks.append(("a config of the four step kinds passes",
+                   not refused(fixed.check_config, {"steps": {"candidates": "catalog", "parents": "archive",
+                                                              "novelty": "exact", "rank": "policy"}})))
+    checks.append(("the net file, the config and the mechanism test are protected",
+                   fixed.protected("packages/kernel/experiments/self-loop/self.net")
+                   and fixed.protected("packages/kernel/experiments/self-loop/loop.json")
+                   and fixed.protected("packages/kernel/experiments/self-loop/loop_test.py")))
+    keep = {"name": "gap-diff", "base": "1024", "value": "256", "verdict": "keep"}
+    checks.append(("a kept revert contradicts a keep",
+                   fixed.contradicts(keep, {"name": "gap-diff", "base": "256", "value": "1024", "verdict": "keep"})))
+    checks.append(("a held revert does not",
+                   not fixed.contradicts(keep, {"name": "gap-diff", "base": "256", "value": "1024", "verdict": "hold"})))
     for name, ok in checks:
         print(f"{'ok  ' if ok else 'FAIL'} {name}")
     sys.exit(0 if all(ok for _, ok in checks) else 1)

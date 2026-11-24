@@ -26,12 +26,16 @@ PROTECTED = [
     "packages/kernel/tests/*", "packages/kernel/examples/bench.rs",
     "packages/kernel/examples/common/*", "packages/kernel/experiments/self-loop/fixed.py",
     "packages/kernel/experiments/self-loop/catalog.tsv",
-    "packages/kernel/experiments/self-loop/guard_test.py", "packages/kernel/experiments/self-loop/seed.tsv",
+    "packages/kernel/experiments/self-loop/guard_test.py",
+    "packages/kernel/experiments/self-loop/loop_test.py", "packages/kernel/experiments/self-loop/seed.tsv",
+    "packages/kernel/experiments/self-loop/self.net", "packages/kernel/experiments/self-loop/loop.json",
     "packages/kernel/Cargo.toml",
     "packages/kernel/Cargo.lock", ".github/*", "docs/experiments/README.md",
 ]
 BRANCH = re.compile(r"^exp/400-(self-loop|cand-[a-z0-9-]+)$")
 POLICY_KEYS = {"weights", "sigma", "seed"}
+# The steps a loop config may name; scoring is not among them (E401).
+STEP_KINDS = {"candidates", "parents", "novelty", "rank"}
 
 
 def protected(path):
@@ -71,6 +75,41 @@ def check_diff(root, base, catalog_row, new_value):
 def check_policy(p):
     if set(p) != POLICY_KEYS or not all(isinstance(v, (int, float)) for v in p["weights"].values()):
         raise SystemExit("guard: a policy is weights, sigma and seed, all numbers")
+
+
+def check_config(cfg):
+    """A loop config names pluggable steps; the measure, the keep rule and
+    the evaluator are this file's and cannot be named or replaced."""
+    if set(cfg.get("steps", {})) - STEP_KINDS:
+        raise SystemExit(f"guard: a config may name only {sorted(STEP_KINDS)} steps")
+    if any(k in cfg for k in ("measure", "score", "verdict", "tolerance", "keep")):
+        raise SystemExit("guard: the scoring is not configurable")
+
+
+def check_chain(root, base, commit, rows):
+    """A parent other than base (E401, stepping-stone parents) must differ
+    from base only by catalog lines, each with only its value changed to a
+    value the catalog tries."""
+    out = subprocess.run(["git", "diff", "--unified=0", base, commit, "--"], cwd=root,
+                         capture_output=True, text=True, check=True).stdout
+    files = set(re.findall(r"^\+\+\+ b/(.*)$", out, re.M))
+    minus = [l[1:] for l in out.splitlines() if l.startswith("-") and not l.startswith("---")]
+    plus = [l[1:] for l in out.splitlines() if l.startswith("+") and not l.startswith("+++")]
+    lines_ok = {r["line"] for r in rows}
+    tried = {r["line"].replace(f"= {r['value']};", f"= {v};") for r in rows for v in r["tries"]}
+    ok = (all(not protected(f) for f in files) and all(m in lines_ok for m in minus)
+          and all(p in tried for p in plus) and len(minus) == len(plus))
+    if not ok:
+        raise SystemExit(f"guard: parent {commit[:12]} is not base plus catalog lines")
+
+
+def contradicts(keep, later):
+    """A later finding contradicts a kept one when it reverts the kept
+    change (same constant, back to the keep's old value) on a base that
+    holds the keep, and the revert itself passes the keep rule (E401,
+    reopen instead of edit)."""
+    return (later["name"] == keep["name"] and str(later["value"]) == str(keep["base"])
+            and str(later["base"]) == str(keep["value"]) and later["verdict"] == "keep")
 
 
 def lines(text):

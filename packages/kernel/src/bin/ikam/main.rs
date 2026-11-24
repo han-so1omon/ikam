@@ -23,6 +23,7 @@ mod http;
 mod json;
 mod live;
 mod mcp;
+mod netcmd;
 mod serve;
 mod text;
 mod tokens;
@@ -55,6 +56,11 @@ const USAGE: &str = "usage: ikam [--store DIR] [--short-records] [--slow-codec-m
                                    upserts of a key's current value (E376, off);
                                    --hnsw-threads N links --hnsw's first build on
                                    N threads (E389, off)
+  net NETFILE [--ref REF] fire T TOKEN [OUTFILE] | history | marking | enabled | check
+                                   run any Petri net from a net file on the store,
+                                   one firing a call, history on REF (default
+                                   net/NAME); human transitions are never fired
+                                   (netcmd.rs, E401)
   host --config FILE [PORT]        several separate projects in one process, each
                                    its own store, users and limits, chosen by Host
                                    name; crossing only through scoped shares (host.rs)
@@ -181,6 +187,15 @@ fn main() -> ExitCode {
     }
     if args.first().map(String::as_str) == Some("host") {
         return match host::host_cmd(&args[1..]) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(msg) => {
+                say!("{msg}");
+                ExitCode::FAILURE
+            }
+        };
+    }
+    if args.first().map(String::as_str) == Some("net") {
+        return match netcmd::net_cmd(&store_dir, &args[1..]) {
             Ok(()) => ExitCode::SUCCESS,
             Err(msg) => {
                 say!("{msg}");

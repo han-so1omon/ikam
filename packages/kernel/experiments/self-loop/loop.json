@@ -1,0 +1,13 @@
+{
+ "ref": "loop/self",
+ "steps": {
+  "candidates": "catalog",
+  "parents": "archive",
+  "novelty": "exact+hints",
+  "rank": "policy"
+ },
+ "replan": "news",
+ "budget_hours": 1.0,
+ "seed": 401,
+ "novelty": {"threshold": 0.95, "model": null, "embed_cmd": null}
+}
