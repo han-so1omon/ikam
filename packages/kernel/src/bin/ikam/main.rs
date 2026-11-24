@@ -43,7 +43,7 @@ const USAGE: &str = "usage: ikam [--store DIR] [--short-records] [--slow-codec-m
   ls [REV[:PATH]] [-r]             list a directory of REV (default main)
   grep TEXT [REV]                  files of REV containing TEXT, with lines
   stats [REV]                      objects and bytes the store holds
-  db serve [--live] [--packs] [--plain-events] [--no-object-templates] [--concurrent-reads] [--edit-index] [--plain-writes] [--hnsw] [--keep-search] [--no-keep-search] [--shared-store] [--skip-unchanged] [--keep-counts N] [--defer-kv N] [--seed-index-max N] [--views FILE] [--plain-view-writes] [--keep-views] [--keep-on-hangup] [PORT]
+  db serve [--live] [--packs] [--plain-events] [--no-object-templates] [--concurrent-reads] [--edit-index] [--plain-writes] [--hnsw] [--hnsw-threads N] [--keep-search] [--no-keep-search] [--shared-store] [--skip-unchanged] [--keep-counts N] [--defer-kv N] [--seed-index-max N] [--views FILE] [--plain-view-writes] [--keep-views] [--keep-on-hangup] [PORT]
                                    the store's databases over HTTP, for programs
                                    (default port 8740, 127.0.0.1 only; dbserve.rs);
                                    --live turns on the options a live database
@@ -52,7 +52,9 @@ const USAGE: &str = "usage: ikam [--store DIR] [--short-records] [--slow-codec-m
                                    --defer-kv 0, --no-keep-search or
                                    --seed-index-max 0 turns those off); --keep-on-hangup
                                    ignores SIGHUP (E374); --skip-unchanged drops
-                                   upserts of a key's current value (E376, off)
+                                   upserts of a key's current value (E376, off);
+                                   --hnsw-threads N links --hnsw's first build on
+                                   N threads (E389, off)
   host --config FILE [PORT]        several separate projects in one process, each
                                    its own store, users and limits, chosen by Host
                                    name; crossing only through scoped shares (host.rs)
@@ -197,7 +199,7 @@ fn main() -> ExitCode {
 }
 
 /// `ikam db serve [--live] [--packs] [--plain-events] [--no-object-templates]
-/// [--concurrent-reads] [--edit-index] [--seed-index-max N] [--plain-writes] [--hnsw] [--keep-search] [--no-keep-search] [--shared-store] [--skip-unchanged] [--keep-counts N] [--defer-kv N]
+/// [--concurrent-reads] [--edit-index] [--seed-index-max N] [--plain-writes] [--hnsw] [--hnsw-threads N] [--keep-search] [--no-keep-search] [--shared-store] [--skip-unchanged] [--keep-counts N] [--defer-kv N]
 /// [--views FILE] [--plain-view-writes] [--keep-views]
 /// [--allow-host NAME]...
 /// [--log-requests] [--keep-on-hangup] [PORT]`:
@@ -230,7 +232,9 @@ fn main() -> ExitCode {
 /// `search` and `vsearch` (E358) rank rows by BM25, by a vector the client
 /// sends, or both fused; their indexes are built on a prefix's first query
 /// and kept in memory. Vectors are scored exactly unless `--hnsw` (off)
-/// searches them with a graph (E332: about 0.93 of the exact top 10).
+/// searches them with a graph (E332: about 0.93 of the exact top 10);
+/// `--hnsw-threads N` (E389, off) links the graph's first build on N
+/// threads, a slightly different graph (E332's `with_threads`).
 /// `--keep-search` (E369, off; on under `--live`) keeps each BM25 view on a ref, so a
 /// restarted server reads it back instead of building it on the first
 /// query (E358: 8.6 s for 64 MB of text); the ref keeps the view's data
@@ -284,7 +288,7 @@ fn main() -> ExitCode {
 fn db_cmd(store_dir: &str, args: &[String]) -> Result<(), String> {
     let mut args = args.to_vec();
     if args.first().map(String::as_str) != Some("serve") {
-        return Err("usage: ikam [--store DIR] db serve [--live] [--packs] [--plain-events] [--no-object-templates] [--concurrent-reads] [--edit-index] [--plain-writes] [--hnsw] [--keep-search] [--no-keep-search] [--shared-store] [--skip-unchanged] [--keep-counts N] [--defer-kv N] [--seed-index-max N] [--views FILE] [--plain-view-writes] [--keep-views] [--allow-host NAME]... [--log-requests] [--keep-on-hangup] [PORT]".into());
+        return Err("usage: ikam [--store DIR] db serve [--live] [--packs] [--plain-events] [--no-object-templates] [--concurrent-reads] [--edit-index] [--plain-writes] [--hnsw] [--hnsw-threads N] [--keep-search] [--no-keep-search] [--shared-store] [--skip-unchanged] [--keep-counts N] [--defer-kv N] [--seed-index-max N] [--views FILE] [--plain-view-writes] [--keep-views] [--allow-host NAME]... [--log-requests] [--keep-on-hangup] [PORT]".into());
     }
     args.remove(0);
     let keep_on_hangup = take_switch(&mut args, "--keep-on-hangup");
@@ -323,8 +327,18 @@ fn db_cmd(store_dir: &str, args: &[String]) -> Result<(), String> {
         Some(n) => Some(n.parse().map_err(err)?),
         None => None,
     };
-    let (packs, log_requests, serve_opts) =
+    let hnsw_threads: Option<usize> = match take_flag(&mut args, "--hnsw-threads") {
+        Some(n) => Some(n.parse().map_err(err)?),
+        None => None,
+    };
+    let (packs, log_requests, mut serve_opts) =
         db_flags(&mut args, keep_counts, defer_kv, seed_index_max);
+    if let Some(n) = hnsw_threads {
+        if !serve_opts.hnsw {
+            return Err("--hnsw-threads needs --hnsw".into());
+        }
+        serve_opts.hnsw_threads = n.max(1);
+    }
     if serve_opts.seed_index_max > 0 && !serve_opts.edit_index {
         return Err("--seed-index-max needs --edit-index (or --live)".into());
     }
@@ -409,6 +423,7 @@ fn db_flags(
         shared_store,
         skip_unchanged,
         seed_index_max,
+        hnsw_threads: 1,
     };
     (packs, log_requests, opts)
 }
@@ -436,6 +451,8 @@ struct DbServeOpts {
     skip_unchanged: bool,
     /// E383: drop the seed index past this many entries (0: never).
     seed_index_max: usize,
+    /// E389: threads linking a graph's first build (1: one at a time).
+    hnsw_threads: usize,
 }
 
 /// `db serve` on `store`; with `concurrent_reads` the store is shared, so
@@ -448,6 +465,7 @@ fn search(o: DbServeOpts) -> dbsearch::SearchOpts {
     dbsearch::SearchOpts {
         index,
         keep: o.keep_search,
+        threads: o.hnsw_threads,
     }
 }
 
@@ -1233,6 +1251,7 @@ mod tests {
             shared_store: false,
             skip_unchanged: false,
             seed_index_max: LIVE_SEED_INDEX_MAX,
+            hnsw_threads: 1,
         };
         let mut a = v(&["--live", "8752"]);
         assert_eq!(db_flags(&mut a, 0, None, None), (true, false, all));
@@ -1270,6 +1289,7 @@ mod tests {
             shared_store: false,
             skip_unchanged: false,
             seed_index_max: 0,
+            hnsw_threads: 1,
         };
         assert_eq!(db_flags(&mut a, 0, None, None), (false, false, off));
         // E357: `--plain-writes` is its own option, not part of `--live`.

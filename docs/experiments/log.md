@@ -6440,3 +6440,45 @@ Gates on the branch (E229 to E233): every kernel test suite passes (release); cl
 - Note for older runs: a bench that passes only `--live` now measures the bounded seed index; `--live --seed-index-max 0` is the E372 preset.
 - Verdict: **kept** (preset change, still an option).
 - Not measured: the Mac; whether 250000 is the best N for other row sizes; a write after a drop can store a chunk it could have sliced (E383: under 1% of store bytes at 1M rows).
+
+### E389 vectors-1m (vector search through `db serve` up to a million rows)
+
+- Branch / parent: exp/389-vectors-1m / main 0a6f0eb
+- Question: semantic search in `db serve` (E358) was measured to 200k rows at most (E356's gap: stores above 200k rows), and E375 found a 1M-row table's first ranked search took the server to 5.6 GB. What do vector search's first build, memory and query time look like from 100k to 1M rows, exact and as a graph (`--hnsw`, E332), and is there a memory cliff to fix before semantic search over a large store is planned? (Night 1 of the trip-week plan; business cases: records live and questions over records.)
+- Setup: `experiments/vectors-1m/vec_1m.py`. Rows `v/0000000`... of 384 f32s (bge-small's width), unit vectors in 1,000 clusters (a centroid plus noise, cosine about 0.7 to it), loaded in 2,000-row appends with one server to 100k, 250k, 500k and 1M rows; at each, a fresh server per mode asked 200 queries on `POST vsearch?prefix=v/&k=10` (the first one builds the index; vector indexes are not kept, so every start builds again). Recall@10 against an exact top 10 computed with numpy. Linux cloud, 4 CPUs, 15 GB, one run each.
+- Found on main: a first build read every row of the prefix in one call (`db_prefix(.., usize::MAX)`) and built the index after, so the server held all the values and the index together, and kept most of it: 868 MB resident after the first query at 100k rows and **8,690 MB at 1M** (raw vectors are 1,536 MB).
+- Change:
+  - Fix: the first build reads rows 4,096 at a time (`db_range` pages) and adds each page to the index before the next, with the same rows in the same order. The same index, same answers.
+  - Option: `db serve --hnsw --hnsw-threads N` (off: 1; needs `--hnsw`) links the graph's first build on N threads (`HnswIndex::with_threads` and `extend`, batches of 1,024 rows). The graph is not the same as one built row by row (a batch's rows link against the graph before the batch), so it is an option.
+- Results (memory after the first query, which is also its peak, VmHWM; query times one at a time over HTTP after the build):
+
+  | rows | store | mode | first query (build) | resident | p50 / p99 | recall@10 |
+  | --- | --- | --- | --- | --- | --- | --- |
+  | 100k | 163 MB | exact, main | 2.0 s | 868 MB | 14.8 / 21.1 ms | 1.0 |
+  | 100k | | exact, branch | 1.4 s | 204 MB | 19.6 / 26.0 ms | 1.0 |
+  | 100k | | `--hnsw` | 71.4 s | 223 MB | 0.95 / 1.43 ms | 1.0 |
+  | 100k | | `--hnsw --hnsw-threads 4` | 32.5 s | 227 MB | 0.82 / 2.52 ms | 1.0 |
+  | 250k | 408 MB | exact, main | 5.3 s | 2,163 MB | 43.3 / 68.4 ms | 1.0 |
+  | 250k | | exact, branch | 4.1 s | 468 MB | 47.4 / 64.9 ms | 1.0 |
+  | 250k | | `--hnsw` | 162.1 s | 516 MB | 0.72 / 1.20 ms | 0.984 |
+  | 250k | | 4 threads | 80.2 s | 524 MB | 0.81 / 1.34 ms | 0.980 |
+  | 500k | 816 MB | exact, main | 11.6 s | 4,317 MB | 85.5 / 106.2 ms | 1.0 |
+  | 500k | | exact, branch | 7.8 s | 890 MB | 93.1 / 123.2 ms | 1.0 |
+  | 500k | | `--hnsw` | 326.6 s | 984 MB | 1.02 / 1.70 ms | 0.938 |
+  | 500k | | 4 threads | 172.8 s | 997 MB | 0.86 / 1.48 ms | 0.973 |
+  | 1M | 1,632 MB | exact, main | 31.3 s | 8,690 MB | 189.4 / 220.5 ms | 1.0 |
+  | 1M | | exact, branch | 15.7 s | **1,741 MB** | 186.0 / 214.9 ms | 1.0 |
+  | 1M | | `--hnsw`, main | 941.4 s | 8,715 MB | 1.31 / 2.46 ms | 0.842 |
+  | 1M | | `--hnsw`, branch | 796.8 s | **1,928 MB** | 1.08 / 2.08 ms | 0.842 |
+  | 1M | | 4 threads | **399.7 s** | 1,955 MB | 1.14 / 2.15 ms | 0.913 |
+
+  Loading took 74, 129, 226 and 536 s cumulative (1M rows in about 9 minutes, 2,000-row appends, default flags).
+- Reading the curve:
+  - Memory is now linear and near the vectors' own size: about 1.75 GB per million 384-wide rows exact, 1.95 GB with the graph, against 8.7 GB on main (the cliff). A 15 GB host holds about 7M such rows; an 18 GB laptop about 8M with room for the rest.
+  - Exact search costs about 0.19 ms per 1,000 rows a query (186 ms at 1M): fine to about 250k rows for interactive use, too slow beyond.
+  - The graph answers in about 1 ms at every size, but its first build is slow (13 minutes at 1M on one thread, 6.7 on four) and its recall falls with size at the fixed search width (`ef` 80): 0.84 at 1M on these tight clusters. The threaded build had better recall at 500k and 1M (0.973, 0.913), not worse.
+  - Every restart pays the build again, so a graph over a large table wants to be kept (as E369 keeps BM25 views) before it is a default.
+- Checks: `first_vector_build_reads_pages_and_answers_as_a_scan` (8,199 rows across page edges, a duplicate value, a key just past a page's last, exact on one thread and the graph on one and four threads, each answering as a scan does). `cargo test --release`: 371 pass, 0 fail; clippy `-D warnings` clean.
+- Verdict: **kept** (a fix, the paged first build, with no trade-off; `--hnsw-threads` an option, off).
+- Not measured: the Mac; real embeddings (clustered synthetic vectors stand in; recall on real text vectors may differ either way); a wider `ef` (a constant here: 80), which would trade query time for recall at 1M; keeping the graph across restarts; vectors changing while serving at 1M; more than one run each (build times on a shared cloud host move by tens of percent).
+- Run: `python3 -I experiments/vectors-1m/vec_1m.py WORK OUT.jsonl 100000,250000,500000,1000000 "exact=BRANCH:;exact-main=MAIN:;hnsw=BRANCH:--hnsw;hnsw4=BRANCH:--hnsw --hnsw-threads 4;hnsw-main@1000000=MAIN:--hnsw" 200`.

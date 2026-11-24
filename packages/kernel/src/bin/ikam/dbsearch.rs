@@ -52,6 +52,9 @@ const HNSW_M: usize = 16;
 const HNSW_EF_BUILD: usize = 100;
 const HNSW_EF: usize = 80;
 
+/// E389: rows read at a time while a vector index is first built.
+const BUILD_PAGE: usize = 4096;
+
 /// How vector rows are searched.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum VectorIndex {
@@ -90,6 +93,8 @@ pub struct Kept {
     pub index: VectorIndex,
     /// Keep BM25 views on refs across restarts (E369).
     pub keep: bool,
+    /// E389 (off: 1): threads that link a graph's first build.
+    pub threads: usize,
 }
 
 /// How a server searches: its vector index and whether it keeps BM25
@@ -98,6 +103,8 @@ pub struct Kept {
 pub struct SearchOpts {
     pub index: VectorIndex,
     pub keep: bool,
+    /// E389: `--hnsw-threads N` (off: 1).
+    pub threads: usize,
 }
 
 /// The ref a kept BM25 view of `prefix` in `name` lives on: `p` and the
@@ -123,7 +130,7 @@ fn f32s(b: &[u8]) -> Option<Vec<f32>> {
 }
 
 impl Vecs {
-    fn new(index: VectorIndex, dim: usize) -> Vecs {
+    fn new(index: VectorIndex, dim: usize, threads: usize) -> Vecs {
         match index {
             VectorIndex::Exact => Vecs::Exact {
                 keys: Vec::new(),
@@ -131,8 +138,23 @@ impl Vecs {
                 pos: HashMap::new(),
             },
             VectorIndex::Hnsw => Vecs::Hnsw(Box::new(
-                HnswIndex::new(dim, HNSW_M, HNSW_EF_BUILD).with_lanes(true),
+                HnswIndex::new(dim, HNSW_M, HNSW_EF_BUILD)
+                    .with_lanes(true)
+                    .with_threads(threads.max(1)),
             )),
+        }
+    }
+
+    /// The first build's rows, in key order: as `set` one at a time, or
+    /// for the graph as `HnswIndex::extend` (batches on its threads).
+    fn extend(&mut self, rows: Vec<(String, Vec<f32>)>, dim: usize) {
+        match self {
+            Vecs::Hnsw(h) => h.extend(rows),
+            _ => {
+                for (k, v) in rows {
+                    self.set(k, &v, dim);
+                }
+            }
         }
     }
 
@@ -302,14 +324,32 @@ impl Kept {
         let slot = match slot {
             Some(s) => s,
             None => {
-                let rows = r.db_prefix(db, prefix, usize::MAX, false).map_err(fail)?;
+                // E389: the rows are read a page at a time, so the build
+                // holds one page of values beside the index (the index was
+                // the same when every value was read first).
+                let end = ikam_kernel::prefix_end(prefix);
+                let page = |from: &str| {
+                    r.db_range(db, from, end.as_deref(), BUILD_PAGE, false)
+                        .map_err(fail)
+                };
+                let mut rows = page(prefix)?;
                 let dim = rows.first().map_or(0, |(_, v)| v.len() / 4);
-                let mut vecs = Vecs::new(self.index, dim);
-                for (k, v) in rows {
-                    let v = f32s(&v).filter(|v| v.len() == dim).ok_or_else(|| {
-                        Response::text(422, format!("{k:?} is not a vector of {dim}"))
-                    })?;
-                    vecs.set(k, &v, dim);
+                let mut vecs = Vecs::new(self.index, dim, self.threads);
+                while !rows.is_empty() {
+                    let next = rows.last().map(|(k, _)| format!("{k}\0"));
+                    let full = rows.len() == BUILD_PAGE;
+                    let mut page_vecs = Vec::with_capacity(rows.len());
+                    for (k, v) in rows {
+                        let v = f32s(&v).filter(|v| v.len() == dim).ok_or_else(|| {
+                            Response::text(422, format!("{k:?} is not a vector of {dim}"))
+                        })?;
+                        page_vecs.push((k, v));
+                    }
+                    vecs.extend(page_vecs, dim);
+                    rows = match (full, next) {
+                        (true, Some(n)) => page(&n)?,
+                        _ => Vec::new(),
+                    };
                 }
                 let s = Arc::new(Mutex::new(KeptVecs { at: *db, dim, vecs }));
                 self.vecs.lock().unwrap().insert(key, s.clone());
