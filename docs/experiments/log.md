@@ -6441,6 +6441,38 @@ Gates on the branch (E229 to E233): every kernel test suite passes (release); cl
 - Verdict: **kept** (preset change, still an option).
 - Not measured: the Mac; whether 250000 is the best N for other row sizes; a write after a drop can store a chunk it could have sliced (E383: under 1% of store bytes at 1M rows).
 
+### E386 loop-drive (the night's loop net fired as the work happens, not journaled after it)
+
+- Branch / parent: exp/386-loop-drive / main 0a6f0eb
+- Question: E373's night was recorded in the loop net after it was done (`loop_journal` rebuilt it from the finished log entries, three times as they changed). Can the same net drive a night instead: the agent asks the net what to do next, each firing is committed as it happens, and a runner killed at any point loses nothing it reported?
+- Change (an example, no kernel change): `examples/loop_drive.rs` over `loop_journal`'s night net. `plan` fires `propose` for each planned id; `next` prints the first firing the net enables (`net_enabled_limit`, E280, human transitions left out): the lowest queued id's `start` while the cpu token is free, else the running one's `finish`; `start`, `finish` (the log entry as the firing's output, E271), `keep` and `close` fire one transition each. Every call opens the store, fires, commits to `night/<LABEL>` with the time in the commit message and exits. `check` reads the store alone: replay equal to the marking, fsck clean, each finish output against the log (an entry edited after its finish is reported, not a failure) and the night's order from the ref's commits.
+- Kill test (`experiments/loop-drive/kill_runner.py`, Linux cloud, 600 calls each proposing one id, each killed with SIGKILL after a random 0 to 40 ms): 26 calls acknowledged (exit 0 and printed their commit), 574 killed. Every acknowledged id was in the night's commits (0 lost); 6 killed calls had committed before they could print (the work is in the store, the caller did not hear of it, and a retry with the same key changes nothing). Replay equal, fsck clean. An acknowledged call took 11 to 29 ms (opening the store dominates).
+- Use: the night of 2026-11-23 (E386 to E389) was driven by it on an FsStore: `plan E386 E387 E388 E389`, then `next` before each step.
+- Verdict: **kept** (a tool for the loop; no kernel change).
+- Not measured: two agents firing one night (E292 measured two writers on one net); a ranking other than id order for `next` (the plan lists picks in rank order and numbers them that way).
+- Run: `cargo run --release --example loop_drive -- STORE LABEL plan|next|start|finish|keep|close|check ...`; `python3 -I packages/kernel/experiments/loop-drive/kill_runner.py LOOP_DRIVE_BIN STORE 600 40`.
+
+### E387 embedder (bge-small-class sentence vectors in the kernel, behind a feature)
+
+- Branch / parent: exp/387-embedder / main 0a6f0eb
+- Question: semantic search in ikam has needed vectors from outside the kernel: E306 and E312 measured bge-small-en-v1.5 (the strongest embedder tried for fused search, ahead of or within 0.010 of the best on 5 of 5 sets) through a Python pipeline, and E326, E330 and E352 could not run a transformer here. Can the kernel embed text itself, as an option, with the weights fixed so stored vectors always come from the same model, and what does one embedding cost on a cloud CPU? (Planned as E364 in E355; the owner chose bge-small-en-v1.5.)
+- Change (an option, off by default): a cargo feature `embed` (candle 0.11 for the model, tokenizers 0.22 with its pure-Rust regex; nothing is added to the default build). `ikam_kernel::embed::Embedder::open(dir, pin, max_tokens)` reads a model folder as the model's release ships it (`config.json`, `tokenizer.json`, `model.safetensors`), computes the weights' BLAKE3 (`weights`, the model's id for stored vectors, as `embeds` keys them, E255) and refuses other weights when a pin is given. `embed(texts)` returns one unit vector a text: the first token's last hidden state (bge's CLS pooling), L2-normalised, at most 512 tokens, a batch padded to its longest text and masked; `embed_query` adds bge's query instruction. Weights are never bundled or downloaded by the kernel. `examples/embed_corpus.rs`: `corpus MODEL DIR [PIN]` writes `hybrid_kernel`'s vector files from the kernel's own embedder (keeping earlier vectors as `.before` and printing the cosine to them), `bench WORK` times a model of bge-small's shape.
+- Weights: the model's release host was refused by this machine's network policy, so the real weights were not fetched, pinned or scored here. Quality on real text (nDCG@10 against E306's Python vectors and against BM25 alone, 0.805 in E326) and the pin itself are the first Mac run: `embed_corpus corpus` on the downloaded folder prints the weights' BLAKE3 to pin and the cosine to E306's vectors.
+- Checks (`tests/embed.rs`, `--features embed`, a random 2-layer BERT and a word-piece tokenizer built in the test): vectors are unit length and deterministic; each text's vector alone and inside a padded batch of three agree to a cosine above 0.99999; a text of 600 words is truncated and still embeds; an empty call returns nothing; a query vector differs from its text's (the prefix); a pin in either case is accepted and another hash refused. Review fix: vectors are stored under `Embedder::id`, a BLAKE3 of the weights, `tokenizer.json`, `config.json`, `max_tokens` and the pooling, so the same weights opened with another token limit or tokenizer get another id and their vectors are never reused (`the_vector_id_changes_with_anything_that_changes_a_vector`); `weights` is still what a pin checks.
+- Speed (`embed_corpus bench`, random weights in bge-small-en-v1.5's shape: 12 layers, 384 wide, 12 heads, 1,536 inner, 30,522 words; Linux cloud, 4 CPUs, one run; a forward pass costs the same whatever the weights' values):
+
+  | tokens a text | alone: ms a text | batch of 32: ms a text | peak resident |
+  | --- | --- | --- | --- |
+  | 64 | 64.8 | 30.4 | 259 MB |
+  | 128 | 109.2 | 65.4 | 327 MB |
+  | 256 | 251.1 | 220.7 | 724 MB |
+  | 510 | 702.3 | 596.0 | 2,246 MB |
+
+  Opening the model took 206 ms and 259 MB. So a query (tens of tokens) costs about 65 ms here, and a corpus of whole READMEs (most reach the 512-token limit) about 0.6 s a document on 4 CPUs: 10,000 documents in about 100 minutes. Embedding is the ingest cost of semantic search on a CPU; `embeds` (E255) already embeds each distinct fragment once, so a change re-embeds only what changed. Long texts in batches of 32 need over 2 GB (the attention scores); batches of a few long texts keep the peak near a few hundred MB.
+- Verdict: **kept** as an option (a capability behind a feature; nothing changes without it). Quality, the pin and the Mac's speed not yet measured.
+- Not measured: the real weights (above); the Mac (candle has an Accelerate backend, not tried); smaller batches of long texts; embedding fragments (paragraphs, E330) rather than whole documents; int8 weights.
+- Run: `cargo test --release --features embed --test embed`; `cargo run --release --features embed --example embed_corpus -- bench WORK`; on a machine with the model: `... -- corpus MODEL_DIR DATA_DIR`, then `cargo run --release --example hybrid_kernel -- DATA_DIR`.
+
 ### E388 ranked-files (`ikam mcp`'s `rank` tool: files best first, with their passages)
 
 - Branch / parent: exp/388-ranked-files / main 0a6f0eb

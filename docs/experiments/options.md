@@ -377,3 +377,9 @@ One setting for every corpus tried (E216): `columns`, `numbers`, `siblings`, `ne
 | `--shared-store` | off (refused with `--packs`, `--live`) | for a store other processes write too: `Repo::refresh_ledger` (E298) on every handle, so a miss lists the store and reads what another process stored, and appends commit with `db_commit_at` over the head they read, applying the events again on a conflict | E370: two servers on one store, 40 batches of 50 rows each, concurrently: off, one server fails every request after its first batch (117 failures) and 2,000 of 6,000 rows are lost; on, 0 failures and every row; appends 25-28 to 63-68 ms at the median while both write; with one writer no measurable cost (38-47 against 42 ms) |
 | `--keep-on-hangup` | off (`db serve`, `live`, `host`) | ignores SIGHUP, as `nohup` would, so a server started from a terminal outlives it; without it SIGHUP stops the server like SIGTERM (a logged stop; `live` and `host` commit pending edits first) | E374: before, SIGHUP ended `db serve` and `live` with no line logged and `live` lost an uncommitted edit; with the switch the server keeps running |
 | `--allow-host NAME`, `--log-requests` | none, off | as for `ikam live` | not scored |
+
+## Text embeddings in the kernel (E387)
+
+| Setting | Default | Trade | Measured |
+|---|---|---|---|
+| cargo feature `embed`, `embed::Embedder::open(dir, pin, max_tokens)` | off (not built) | vectors made in the kernel from a BERT-class model folder (bge-small-en-v1.5), `Embedder::id` (a BLAKE3 of weights, tokenizer, config, token limit and pooling) as the stored vectors' id and an optional pin on the weights; adds candle and tokenizers to the build; embedding is the ingest cost of semantic search on a CPU | E387: bge-small's shape on 4 cloud CPUs, 30-65 ms a 64-token text, 0.6-0.7 s a 510-token one, up to 2.2 GB for 32 long texts at once; quality on real weights not yet measured |
