@@ -1,0 +1,19 @@
+# E400 catalog: the constants a candidate may change, one line each (fixed.check_diff).
+# Row order is the fixed ranking the loop is compared against: E322's drive.py order, new constants after.
+# name	file	line	value	try
+measure-level	src/dict.rs	pub(crate) const MEASURE_LEVEL: i32 = 3;	3	2,4
+store-level	src/dict.rs	pub(crate) const STORE_LEVEL: i32 = 19;	19	17,21
+star-candidates	src/repack.rs	const STAR_CANDIDATES: usize = 64;	64	32,128
+gap-diff	src/template.rs	const GAP_DIFF: usize = 1024;	1024	256,4096
+dict-shortlist	src/repack.rs	const DICT_SHORTLIST: usize = 1;	1	2
+seed	src/matcher.rs	pub(crate) const SEED: usize = 32;	32	24,28
+match-candidates	src/matcher.rs	const MAX_CANDIDATES: usize = 4;	4	3,5
+group-size	src/group.rs	pub const GROUP_SIZE: usize = 64 * 1024;	64 * 1024	128 * 1024
+group-shortlist	src/group.rs	const SHORTLIST: usize = 8;	8	4,16
+neighbors	src/ingest.rs	const NEIGHBORS: usize = 3;	3	2,5
+search-max-chunk	src/search.rs	const MAX_CHUNK: usize = 8192;	8192	4096,16384
+graph-min-chunk	src/graph.rs	const MIN_CHUNK: usize = 4096;	4096	8192
+graph-max-chunk	src/graph.rs	const MAX_CHUNK: usize = 32768;	32768	65536
+related-min	src/repack.rs	const RELATED_MIN: usize = 2048;	2048	1024,4096
+hole-cost	src/template.rs	const HOLE_COST: usize = 8;	8	4,16
+seed-positions	src/template.rs	const SEED_POSITIONS: usize = 8;	8	4,16

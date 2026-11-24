@@ -1,0 +1,24 @@
+net self 2
+place cpu 1
+place queued colored
+place running colored
+place measured colored
+place waiting colored
+place closed colored
+place reopened colored
+place plans colored
+place policy colored
+place trial colored
+place retired colored
+transition plan agent plan: -> plans
+transition propose agent propose: -> queued
+transition start cmd bench: queued, cpu -> running
+transition finish pure: running -> measured, cpu
+transition keep pure: measured -> waiting
+transition close pure: measured -> closed
+transition merge human: waiting ->
+transition reopen agent reopen: waiting -> reopened
+transition variant agent rank: -> trial
+transition adopt pure: trial -> policy
+transition reject pure: trial -> retired
+transition retire pure: policy -> retired
