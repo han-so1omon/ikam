@@ -6441,6 +6441,17 @@ Gates on the branch (E229 to E233): every kernel test suite passes (release); cl
 - Verdict: **kept** (preset change, still an option).
 - Not measured: the Mac; whether 250000 is the best N for other row sizes; a write after a drop can store a chunk it could have sliced (E383: under 1% of store bytes at 1M rows).
 
+### E386 loop-drive (the night's loop net fired as the work happens, not journaled after it)
+
+- Branch / parent: exp/386-loop-drive / main 0a6f0eb
+- Question: E373's night was recorded in the loop net after it was done (`loop_journal` rebuilt it from the finished log entries, three times as they changed). Can the same net drive a night instead: the agent asks the net what to do next, each firing is committed as it happens, and a runner killed at any point loses nothing it reported?
+- Change (an example, no kernel change): `examples/loop_drive.rs` over `loop_journal`'s night net. `plan` fires `propose` for each planned id; `next` prints the first firing the net enables (`net_enabled_limit`, E280, human transitions left out): the lowest queued id's `start` while the cpu token is free, else the running one's `finish`; `start`, `finish` (the log entry as the firing's output, E271), `keep` and `close` fire one transition each. Every call opens the store, fires, commits to `night/<LABEL>` with the time in the commit message and exits. `check` reads the store alone: replay equal to the marking, fsck clean, each finish output against the log (an entry edited after its finish is reported, not a failure) and the night's order from the ref's commits.
+- Kill test (`experiments/loop-drive/kill_runner.py`, Linux cloud, 600 calls each proposing one id, each killed with SIGKILL after a random 0 to 40 ms): 26 calls acknowledged (exit 0 and printed their commit), 574 killed. Every acknowledged id was in the night's commits (0 lost); 6 killed calls had committed before they could print (the work is in the store, the caller did not hear of it, and a retry with the same key changes nothing). Replay equal, fsck clean. An acknowledged call took 11 to 29 ms (opening the store dominates).
+- Use: the night of 2026-11-23 (E386 to E389) was driven by it on an FsStore: `plan E386 E387 E388 E389`, then `next` before each step.
+- Verdict: **kept** (a tool for the loop; no kernel change).
+- Not measured: two agents firing one night (E292 measured two writers on one net); a ranking other than id order for `next` (the plan lists picks in rank order and numbers them that way).
+- Run: `cargo run --release --example loop_drive -- STORE LABEL plan|next|start|finish|keep|close|check ...`; `python3 -I packages/kernel/experiments/loop-drive/kill_runner.py LOOP_DRIVE_BIN STORE 600 40`.
+
 ### E387 embedder (bge-small-class sentence vectors in the kernel, behind a feature)
 
 - Branch / parent: exp/387-embedder / main 0a6f0eb
