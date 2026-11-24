@@ -25,6 +25,9 @@
 //! E349: `Bm25::with_weights` scores a loaded index with other `k1` and `b`
 //! (off by default; the views keep `K1` and `B`).
 //!
+//! E388: `Bm25Mem` keeps the same scores over keyed texts in memory, for
+//! callers whose texts are not rows of a database.
+//!
 //! Opt-in: nothing in the kernel builds or reads it unless a caller asks.
 
 use std::collections::{BTreeMap, HashMap};
@@ -773,6 +776,153 @@ impl<S: Store> Repo<S> {
             }
         }
         Ok(ranked(score, k))
+    }
+}
+
+/// E388: BM25 over keyed texts held in memory and kept up by `put` and
+/// `remove`, for callers whose texts are not rows of a database (the files
+/// `ikam live` serves). It scores as `bm25_live_search` does over rows with
+/// the same keys and values: the same terms (plain), `K1` and `B`, the same
+/// `N` and average length, and the query's distinct terms summed in sorted
+/// order, so the same floats and the same ranks. Opt-in, as the rest.
+#[derive(Default)]
+pub struct Bm25Mem {
+    ids: HashMap<String, u32>,
+    keys: Vec<String>,
+    /// Per key ordinal: length in terms and its distinct terms (term ids).
+    docs: Vec<Option<(u32, Vec<u32>)>>,
+    terms: HashMap<String, u32>,
+    /// Per term id: `(key ordinal, tf)` in ordinal order.
+    postings: Vec<Vec<(u32, u32)>>,
+    /// Ordinals of removed keys, for the next new key: the index holds
+    /// about as many slots as keys, however many edits it has seen.
+    free: Vec<u32>,
+    rows: usize,
+    total: usize,
+}
+
+impl Bm25Mem {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Set `key`'s text, in place of any earlier one.
+    pub fn put(&mut self, key: &str, text: &str) {
+        let old = self.ids.get(key).copied();
+        self.remove(key);
+        let mut tf: BTreeMap<String, u32> = BTreeMap::new();
+        let mut len = 0u32;
+        for t in terms(text) {
+            *tf.entry(t).or_default() += 1;
+            len += 1;
+        }
+        // The key's own slot again, else a freed one, else a new one;
+        // postings are kept in ordinal order by inserting in place.
+        let id = match old {
+            Some(id) => {
+                self.free.retain(|&f| f != id);
+                id
+            }
+            None => self.free.pop().unwrap_or_else(|| {
+                self.keys.push(String::new());
+                self.docs.push(None);
+                (self.docs.len() - 1) as u32
+            }),
+        };
+        self.keys[id as usize] = key.to_string();
+        self.ids.insert(key.to_string(), id);
+        let mut own = Vec::with_capacity(tf.len());
+        for (t, n) in tf {
+            let next = self.postings.len() as u32;
+            let tid = *self.terms.entry(t).or_insert(next);
+            if tid == next {
+                self.postings.push(Vec::new());
+            }
+            let p = &mut self.postings[tid as usize];
+            let at = p.partition_point(|x| x.0 < id);
+            p.insert(at, (id, n));
+            own.push(tid);
+        }
+        self.docs[id as usize] = Some((len, own));
+        self.rows += 1;
+        self.total += len as usize;
+    }
+
+    /// Drop `key`; true if it was held.
+    pub fn remove(&mut self, key: &str) -> bool {
+        let Some(id) = self.ids.remove(key) else {
+            return false;
+        };
+        let (len, own) = self.docs[id as usize].take().expect("held key");
+        for tid in own {
+            let p = &mut self.postings[tid as usize];
+            if let Ok(at) = p.binary_search_by_key(&id, |x| x.0) {
+                p.remove(at);
+            }
+        }
+        self.keys[id as usize] = String::new();
+        self.free.push(id);
+        self.rows -= 1;
+        self.total -= len as usize;
+        true
+    }
+
+    pub fn len(&self) -> usize {
+        self.rows
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.rows == 0
+    }
+
+    /// Key slots held (live keys and freed slots).
+    pub fn slots(&self) -> usize {
+        self.docs.len()
+    }
+
+    /// Distinct terms ever seen and postings held, for sizing.
+    pub fn size(&self) -> (usize, usize) {
+        (self.terms.len(), self.postings.iter().map(Vec::len).sum())
+    }
+
+    /// The `k` best keys for `query`, best first, ties by key: the scores
+    /// `bm25_live_search` gives over the same rows.
+    pub fn search(&self, query: &str, k: usize) -> Vec<(String, f32)> {
+        let (n, avg) = (
+            self.rows as f32,
+            self.total as f32 / self.rows.max(1) as f32,
+        );
+        let q: std::collections::BTreeSet<String> = terms(query).collect();
+        let mut score: HashMap<u32, f32> = HashMap::new();
+        for t in &q {
+            let Some(p) = self.terms.get(t).map(|&tid| &self.postings[tid as usize]) else {
+                continue;
+            };
+            if p.is_empty() {
+                continue;
+            }
+            let df = p.len() as f32;
+            let idf = (1.0 + (n - df + 0.5) / (df + 0.5)).ln();
+            for &(id, tf) in p {
+                let dl = self.docs[id as usize].as_ref().expect("posted key").0 as f32;
+                let tf = tf as f32;
+                let norm = K1 * (1.0 - B + B * dl / avg.max(1.0));
+                *score.entry(id).or_default() += idf * tf * (K1 + 1.0) / (tf + norm);
+            }
+        }
+        let mut out: Vec<(u32, f32)> = score.into_iter().collect();
+        let order = |a: &(u32, f32), b: &(u32, f32)| {
+            b.1.total_cmp(&a.1)
+                .then_with(|| self.keys[a.0 as usize].cmp(&self.keys[b.0 as usize]))
+        };
+        if out.len() > k && k > 0 {
+            out.select_nth_unstable_by(k - 1, order);
+        }
+        out.truncate(k);
+        out.sort_by(order);
+        out.into_iter()
+            .map(|(id, s)| (self.keys[id as usize].clone(), s))
+            .collect()
     }
 }
 

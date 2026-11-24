@@ -82,6 +82,7 @@ const USAGE: &str = "usage: ikam [--store DIR] [--short-records] [--slow-codec-m
        [--allow-host NAME]... [--log-requests] [--public]
        [--max-body BYTES] [--max-store BYTES] [--max-conns N] [--gc-every N]
        [--deferred-sync] [--no-object-templates] [--passage-index] [--keep-on-hangup]
+       [--rank-files] [--file-vectors PREFIX]
                                    run REF (default main) as a live filesystem:
                                    WebDAV at http://127.0.0.1:PORT/dav/ (mount it
                                    in Finder: Go > Connect to Server), a web page
@@ -129,7 +130,8 @@ const USAGE: &str = "usage: ikam [--store DIR] [--short-records] [--slow-codec-m
   write PATH [FILE|-]              store FILE (or stdin) at PATH in REF, commit
   rm PATH | mkdir PATH             remove a file or folder / make a folder in REF
   mv FROM TO | cp FROM TO          rename or copy a file or folder in REF
-  mcp [--passage-index]            the store as tools for an AI agent: a Model
+  mcp [--passage-index] [--rank-files] [--file-vectors PREFIX]
+                                   the store as tools for an AI agent: a Model
                                    Context Protocol server on stdin/stdout (list,
                                    read, search, write, edit, commit with a
                                    message, diff, history, drafts) (E359)
@@ -137,6 +139,12 @@ const USAGE: &str = "usage: ikam [--store DIR] [--short-records] [--slow-codec-m
                                    index of words kept as files change, not a
                                    scan of all text: same answers, more memory
                                    (E378, off)
+                                   `rank` ranks whole files by BM25, with their
+                                   best passages, fused with vectors when the
+                                   call gives a query vector and the files have
+                                   them; --rank-files builds its index at start
+                                   (else on first use); --file-vectors PREFIX
+                                   reads PREFIX.paths and PREFIX.f32 (E388, off)
   search TEXT                      files of REF whose text contains TEXT (also the
                                    text inside docx, xlsx, pdf and tar members)
   ask QUESTION [--llm]             the passages of REF that answer QUESTION best;
@@ -742,10 +750,13 @@ fn run(store_dir: &str, args: &mut Vec<String>) -> Result<(), String> {
             drop(repo);
             let stdin = std::io::stdin();
             let passage_index = args.iter().any(|a| a == "--passage-index");
+            let mut rest = args.to_vec();
+            let rank = mcp::RankFlags::take(&mut rest)?;
             mcp::run(
                 store_dir,
                 &refname,
                 passage_index,
+                &rank,
                 stdin.lock(),
                 std::io::stdout().lock(),
             )?;
@@ -907,6 +918,7 @@ fn live_cmd(
     let before = args.len();
     args.retain(|a| a != "--passage-index");
     let passage_index = args.len() != before;
+    let rank = mcp::RankFlags::take(&mut args)?;
     let before = args.len();
     args.retain(|a| a != "--public");
     let public = args.len() != before;
@@ -951,6 +963,7 @@ fn live_cmd(
     if passage_index {
         l.index_passages();
     }
+    rank.apply(&mut l)?;
     let live = Arc::new(Mutex::new(l));
     {
         let live = live.clone();

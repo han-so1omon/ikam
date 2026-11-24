@@ -140,6 +140,7 @@ The live filesystem stores each edit as it comes and leaves re-planning to
 | `--max-conns N` (E114) | none (32 with `--public`) | threads stay bounded against a busy client (Finder opens several) waiting on 503 | not scored |
 | `--gc-every N` (E116) | off | the store keeps only what commits need (edits leave a working tree per edit and files replaced before a commit) against a pause after every N commits while gc walks the whole store; `POST /api/gc` does it once | test copy: about 70% of each self-test run's bytes freed |
 | `--passage-index` (E378; also `ikam mcp`) | off | questions (Ask, `/api/ask`, the `passages` tool) read an index of words kept as files change instead of scanning all text, with the same answers, against memory (about 1.3 MB per MB of text) and a slower start (about 5 s per 100 MB of text) | 98 MB of text: ask p50 38.1 to 5.3 ms, p95 94.8 to 38.0 ms, 310 to 438 MB |
+| `--rank-files` (E388; `ikam live` and `ikam mcp`), with `--file-vectors PREFIX` | off | the `rank` tool: files best first by BM25 with their best passages, the same ranks as `db serve` search, fused with caller vectors when given, against memory for a term list per file and a slower start | 1,656 paths: p50 50.7 ms, 424 MB, start 26.5 s; 6,854 READMEs: 300/300 same top 10 as `db serve` |
 | `IKAM_AUTH` (E111) | unset | a password on every request against one more thing to keep secret; the hash is fast (BLAKE3), so the line belongs in a file only its owner reads | not scored |
 
 **Not yet a setting**: an incremental repack that re-plans only what was
