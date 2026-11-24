@@ -82,3 +82,20 @@ fn a_pinned_model_refuses_other_weights() {
         Err(EmbedError::Pin { .. })
     ));
 }
+
+#[test]
+fn the_vector_id_changes_with_anything_that_changes_a_vector() {
+    let dir = tempfile::tempdir().unwrap();
+    tiny_model(dir.path());
+    let a = Embedder::open(dir.path(), None, 512).unwrap();
+    assert_eq!(a.id, Embedder::open(dir.path(), None, 512).unwrap().id);
+    assert_ne!(a.id, a.weights);
+    let short = Embedder::open(dir.path(), None, 16).unwrap();
+    assert_eq!(short.weights, a.weights);
+    assert_ne!(short.id, a.id, "max_tokens");
+    let tok = dir.path().join("tokenizer.json");
+    let mut t = std::fs::read_to_string(&tok).unwrap();
+    t.push('\n');
+    std::fs::write(&tok, t).unwrap();
+    assert_ne!(Embedder::open(dir.path(), None, 512).unwrap().id, a.id, "tokenizer");
+}

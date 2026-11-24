@@ -6,9 +6,11 @@
 //! A model is a folder with `config.json`, `tokenizer.json` and
 //! `model.safetensors`, as the model's own release ships them; weights are
 //! never bundled or downloaded here. `Embedder::open` reads the folder and,
-//! given a pinned BLAKE3 of the weights, refuses any other file, so vectors
-//! stored under a model id (`embeds`, E255) always come from the same
-//! weights. A vector is the first token's last hidden state (the model's
+//! given a pinned BLAKE3 of the weights, refuses any other file. Vectors
+//! are stored under `Embedder::id` (`embeds`, E255), a BLAKE3 of the
+//! weights, the tokenizer, the config, `max_tokens` and the pooling: a
+//! model opened with any of them changed gets another id, so its vectors
+//! are never mixed with the old ones. A vector is the first token's last hidden state (the model's
 //! CLS pooling), L2-normalised, from at most `max_tokens` tokens; texts in
 //! one call are padded to the longest and masked, so a text's vector does
 //! not depend on what else is in its batch (to float rounding).
@@ -40,8 +42,12 @@ pub enum EmbedError {
 pub struct Embedder {
     model: BertModel,
     tokenizer: Tokenizer,
-    /// BLAKE3 of `model.safetensors`, hex: the model's id for stored vectors.
+    /// BLAKE3 of `model.safetensors`, hex (what `open` pins).
     pub weights: String,
+    /// The id for stored vectors, hex: a BLAKE3 of everything that decides
+    /// a vector (weights, `tokenizer.json`, `config.json`, `max_tokens`,
+    /// pooling).
+    pub id: String,
     pub dims: usize,
     pub max_tokens: usize,
 }
@@ -63,9 +69,18 @@ impl Embedder {
             serde_json::from_str(&cfg).map_err(|e| EmbedError::Config(e.to_string()))?;
         let vb = VarBuilder::from_buffered_safetensors(bytes, DType::F32, &Device::Cpu)?;
         let model = BertModel::load(vb, &config)?;
-        let mut tokenizer = Tokenizer::from_file(dir.join("tokenizer.json"))
-            .map_err(|e| EmbedError::Tokenizer(e.to_string()))?;
+        let tok = std::fs::read(dir.join("tokenizer.json"))?;
+        let mut tokenizer =
+            Tokenizer::from_bytes(&tok).map_err(|e| EmbedError::Tokenizer(e.to_string()))?;
         let max_tokens = max_tokens.min(config.max_position_embeddings);
+        let mut h = blake3::Hasher::new();
+        h.update(b"ikam-embed/1 cls-l2\0");
+        for part in [weights.as_bytes(), &tok, cfg.as_bytes()] {
+            h.update(&(part.len() as u64).to_le_bytes());
+            h.update(part);
+        }
+        h.update(&(max_tokens as u64).to_le_bytes());
+        let id = h.finalize().to_hex().to_string();
         tokenizer
             .with_truncation(Some(TruncationParams {
                 max_length: max_tokens,
@@ -77,6 +92,7 @@ impl Embedder {
             model,
             tokenizer,
             weights,
+            id,
             dims: config.hidden_size,
             max_tokens,
         })
