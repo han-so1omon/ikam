@@ -355,6 +355,13 @@ impl<S: Store> Server<S> {
         self
     }
 
+    /// Link a graph's first build on `n` threads (E389; off by default: 1).
+    /// The graph differs a little from one linked a row at a time (E332).
+    pub fn vector_threads(mut self, n: usize) -> Server<S> {
+        self.search.threads = n;
+        self
+    }
+
     /// Keep BM25 views on refs across restarts (E369; off by default).
     pub fn keep_search(mut self, keep: bool) -> Server<S> {
         self.search.keep = keep;
@@ -876,6 +883,7 @@ pub fn serve<S: Store + Send + 'static>(
             .defer_kv(defer_kv)
             .skip_unchanged(skip_unchanged)
             .vector_index(search.index)
+            .vector_threads(search.threads)
             .keep_search(search.keep)
             .views(views)
             .shared_store(shared),
@@ -1478,6 +1486,68 @@ mod tests {
                     searched(shared, index, defer);
                 }
             }
+        }
+    }
+
+    #[test]
+    fn first_vector_build_reads_pages_and_answers_as_a_scan() {
+        // E389: more rows than one build page (4,096), and keys a page
+        // boundary splits by one byte; the index answers as a scan does,
+        // exactly or (graph, any thread count) for the nearest row itself.
+        use crate::dbsearch::VectorIndex;
+        let n = 4096 * 2 + 7;
+        let v = |i: usize| {
+            // Angles up to 5.7 radians: no two rows point the same way.
+            let a = (i as f32) * 0.0007;
+            vec_body(&[a.cos(), a.sin(), 0.0])
+        };
+        let mut ev: Vec<Event> = (0..n)
+            .map(|i| Event::upsert(&format!("v/{i:05}"), &v(i), &format!("e{i}")))
+            .collect();
+        ev.push(Event::upsert("v/04095", &v(4095), "dup"));
+        let up = vec_body(&[0.0, 0.0, 1.0]);
+        ev.push(Event::upsert("v/04095\u{1}", &up, "edge"));
+        ev.push(Event::upsert("w/x", &v(1), "other"));
+        let body = encode_events(&ev);
+        let ct = [("content-type", EVENTS)];
+        for (index, threads) in [
+            (VectorIndex::Exact, 1),
+            (VectorIndex::Hnsw, 1),
+            (VectorIndex::Hnsw, 4),
+        ] {
+            let st = Server::new(Repo::new(MemStore::default()), None)
+                .vector_index(index)
+                .vector_threads(threads);
+            assert_eq!(
+                handle(&st, &req("POST", "/db/s/append", &body, &ct)).status,
+                200
+            );
+            for q in [10usize, 4095, 4096, 8198] {
+                let r = handle(&st, &req("POST", "/db/s/vsearch?prefix=v/&k=3", &v(q), &[]));
+                assert_eq!(r.status, 200);
+                let keys = keys_of(&r);
+                // Neighbours 0.0007 radians apart tie in f32: the row is
+                // among the best three.
+                assert!(
+                    keys.contains(&format!("v/{q:05}")),
+                    "{index:?} {threads} {q} {keys:?}"
+                );
+                if index == VectorIndex::Exact {
+                    assert_eq!(keys.len(), 3);
+                }
+            }
+            // The key one byte past a page's last is read (a scan finds it;
+            // a graph need not reach a row orthogonal to all the others).
+            if index == VectorIndex::Exact {
+                let r = handle(&st, &req("POST", "/db/s/vsearch?prefix=v/&k=1", &up, &[]));
+                assert_eq!(keys_of(&r), ["v/04095\u{1}"]);
+            }
+            let r = handle(&st, &req("GET", "/db/s/count?prefix=v/", b"", &[]));
+            assert!(
+                String::from_utf8(r.body)
+                    .unwrap()
+                    .contains(&format!("{}", n + 1))
+            );
         }
     }
 

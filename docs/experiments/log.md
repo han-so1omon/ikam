@@ -6441,6 +6441,102 @@ Gates on the branch (E229 to E233): every kernel test suite passes (release); cl
 - Verdict: **kept** (preset change, still an option).
 - Not measured: the Mac; whether 250000 is the best N for other row sizes; a write after a drop can store a chunk it could have sliced (E383: under 1% of store bytes at 1M rows).
 
+### E386 loop-drive (the night's loop net fired as the work happens, not journaled after it)
+
+- Branch / parent: exp/386-loop-drive / main 0a6f0eb
+- Question: E373's night was recorded in the loop net after it was done (`loop_journal` rebuilt it from the finished log entries, three times as they changed). Can the same net drive a night instead: the agent asks the net what to do next, each firing is committed as it happens, and a runner killed at any point loses nothing it reported?
+- Change (an example, no kernel change): `examples/loop_drive.rs` over `loop_journal`'s night net. `plan` fires `propose` for each planned id; `next` prints the first firing the net enables (`net_enabled_limit`, E280, human transitions left out): the lowest queued id's `start` while the cpu token is free, else the running one's `finish`; `start`, `finish` (the log entry as the firing's output, E271), `keep` and `close` fire one transition each. Every call opens the store, fires, commits to `night/<LABEL>` with the time in the commit message and exits. `check` reads the store alone: replay equal to the marking, fsck clean, each finish output against the log (an entry edited after its finish is reported, not a failure) and the night's order from the ref's commits.
+- Kill test (`experiments/loop-drive/kill_runner.py`, Linux cloud, 600 calls each proposing one id, each killed with SIGKILL after a random 0 to 40 ms): 26 calls acknowledged (exit 0 and printed their commit), 574 killed. Every acknowledged id was in the night's commits (0 lost); 6 killed calls had committed before they could print (the work is in the store, the caller did not hear of it, and a retry with the same key changes nothing). Replay equal, fsck clean. An acknowledged call took 11 to 29 ms (opening the store dominates).
+- Use: the night of 2026-11-23 (E386 to E389) was driven by it on an FsStore: `plan E386 E387 E388 E389`, then `next` before each step.
+- Verdict: **kept** (a tool for the loop; no kernel change).
+- Not measured: two agents firing one night (E292 measured two writers on one net); a ranking other than id order for `next` (the plan lists picks in rank order and numbers them that way).
+- Run: `cargo run --release --example loop_drive -- STORE LABEL plan|next|start|finish|keep|close|check ...`; `python3 -I packages/kernel/experiments/loop-drive/kill_runner.py LOOP_DRIVE_BIN STORE 600 40`.
+
+### E387 embedder (bge-small-class sentence vectors in the kernel, behind a feature)
+
+- Branch / parent: exp/387-embedder / main 0a6f0eb
+- Question: semantic search in ikam has needed vectors from outside the kernel: E306 and E312 measured bge-small-en-v1.5 (the strongest embedder tried for fused search, ahead of or within 0.010 of the best on 5 of 5 sets) through a Python pipeline, and E326, E330 and E352 could not run a transformer here. Can the kernel embed text itself, as an option, with the weights fixed so stored vectors always come from the same model, and what does one embedding cost on a cloud CPU? (Planned as E364 in E355; the owner chose bge-small-en-v1.5.)
+- Change (an option, off by default): a cargo feature `embed` (candle 0.11 for the model, tokenizers 0.22 with its pure-Rust regex; nothing is added to the default build). `ikam_kernel::embed::Embedder::open(dir, pin, max_tokens)` reads a model folder as the model's release ships it (`config.json`, `tokenizer.json`, `model.safetensors`), computes the weights' BLAKE3 (`weights`, the model's id for stored vectors, as `embeds` keys them, E255) and refuses other weights when a pin is given. `embed(texts)` returns one unit vector a text: the first token's last hidden state (bge's CLS pooling), L2-normalised, at most 512 tokens, a batch padded to its longest text and masked; `embed_query` adds bge's query instruction. Weights are never bundled or downloaded by the kernel. `examples/embed_corpus.rs`: `corpus MODEL DIR [PIN]` writes `hybrid_kernel`'s vector files from the kernel's own embedder (keeping earlier vectors as `.before` and printing the cosine to them), `bench WORK` times a model of bge-small's shape.
+- Weights: the model's release host was refused by this machine's network policy, so the real weights were not fetched, pinned or scored here. Quality on real text (nDCG@10 against E306's Python vectors and against BM25 alone, 0.805 in E326) and the pin itself are the first Mac run: `embed_corpus corpus` on the downloaded folder prints the weights' BLAKE3 to pin and the cosine to E306's vectors.
+- Checks (`tests/embed.rs`, `--features embed`, a random 2-layer BERT and a word-piece tokenizer built in the test): vectors are unit length and deterministic; each text's vector alone and inside a padded batch of three agree to a cosine above 0.99999; a text of 600 words is truncated and still embeds; an empty call returns nothing; a query vector differs from its text's (the prefix); a pin in either case is accepted and another hash refused. Review fix: vectors are stored under `Embedder::id`, a BLAKE3 of the weights, `tokenizer.json`, `config.json`, `max_tokens` and the pooling, so the same weights opened with another token limit or tokenizer get another id and their vectors are never reused (`the_vector_id_changes_with_anything_that_changes_a_vector`); `weights` is still what a pin checks.
+- Speed (`embed_corpus bench`, random weights in bge-small-en-v1.5's shape: 12 layers, 384 wide, 12 heads, 1,536 inner, 30,522 words; Linux cloud, 4 CPUs, one run; a forward pass costs the same whatever the weights' values):
+
+  | tokens a text | alone: ms a text | batch of 32: ms a text | peak resident |
+  | --- | --- | --- | --- |
+  | 64 | 64.8 | 30.4 | 259 MB |
+  | 128 | 109.2 | 65.4 | 327 MB |
+  | 256 | 251.1 | 220.7 | 724 MB |
+  | 510 | 702.3 | 596.0 | 2,246 MB |
+
+  Opening the model took 206 ms and 259 MB. So a query (tens of tokens) costs about 65 ms here, and a corpus of whole READMEs (most reach the 512-token limit) about 0.6 s a document on 4 CPUs: 10,000 documents in about 100 minutes. Embedding is the ingest cost of semantic search on a CPU; `embeds` (E255) already embeds each distinct fragment once, so a change re-embeds only what changed. Long texts in batches of 32 need over 2 GB (the attention scores); batches of a few long texts keep the peak near a few hundred MB.
+- Verdict: **kept** as an option (a capability behind a feature; nothing changes without it). Quality, the pin and the Mac's speed not yet measured.
+- Not measured: the real weights (above); the Mac (candle has an Accelerate backend, not tried); smaller batches of long texts; embedding fragments (paragraphs, E330) rather than whole documents; int8 weights.
+- Run: `cargo test --release --features embed --test embed`; `cargo run --release --features embed --example embed_corpus -- bench WORK`; on a machine with the model: `... -- corpus MODEL_DIR DATA_DIR`, then `cargo run --release --example hybrid_kernel -- DATA_DIR`.
+
+### E388 ranked-files (`ikam mcp`'s `rank` tool: files best first, with their passages)
+
+- Branch / parent: exp/388-ranked-files / main 0a6f0eb
+- Question: `ikam mcp`'s `search` finds files that contain words and `passages` (E378) returns paragraphs, but nothing ranks whole files the way `db serve`'s search route ranks rows (BM25, E324, fused with vectors, E358). Can a folder served by `live` or `mcp` answer "which files, best first, and where in them" with the same ranks `db serve` gives the same texts, fast enough on E378's large store (p50 under 60 ms)? (Night 1 of the trip-week plan; business case: questions over a folder of files.)
+- Change, all off by default:
+  - `bm25::Bm25Mem`: the kernel's BM25 (`K1` 0.9, `B` 0.4, the same formula and the same order of summing a query's terms as `Bm25Live`) over keyed texts held in memory and edited in place (`put`, `remove`), for callers that keep their texts in memory already.
+  - `ikam mcp --rank-files` and `ikam live --rank-files`: a ranker of the tree's files, built at start and kept up as files change (each changed file is taken out and put back). New read tool `rank`: `query`, `k` (10), `passages` per file (2), and an optional query `vector` with `fuse` (convex, `alpha` 0.5 as in `fusion::DEFAULT_ALPHA`, or rrf). It prints the files best first with their scores, each with its best passages and their line numbers.
+  - `--file-vectors PREFIX`: vectors for files from `PREFIX.paths` and `PREFIX.f32` (the caller's own embedder, as `db serve` takes vectors from its client), kept by each file's content so an edited file loses its vector and copies share one. The kernel embedder (E387, PR 78) is not wired in here; that waits for it to merge.
+  - Fusion is `db serve`'s: both lists to depth `max(100, k)`, vectors scored exactly.
+- Parity, the README corpus (`experiments/ranked-files/rank_bench.py`; 6,854 PyPI project READMEs from `exp/259`'s fetch, each the file `t/SLUG` of a store and the row `t/SLUG` of a `db serve` database; a hashed bag-of-words vector of 256 numbers per text on both sides, a stand-in for an embedder; 300 project summaries as known-item queries): top 10 keys and scores (to 1e-5) the same as `GET search` **300/300** keyword-only, and the same as `POST search ...&vectors=v/` **300/300** fused. `rank` p50 0.85 ms (p95 1.48) keyword-only and 1.9 ms (2.71) fused through stdio; `db serve` over HTTP 3.73 and 4.35 ms. With 2 passages a file, 0.99 ms. Start 1.7 s, 158 MB.
+- Speed on a large store (`rank_bench.py --time`, 20 questions 5 times, keyword-only, Linux cloud, 4 CPUs, one run): E378's layout, eight copies of a tree of pandas, click and requests releases and docx, pdf and pptx samples (this run's fetch got 207 of E378's 216 files: 1,656 paths, 18 MB store):
+
+  | store | start | resident | `rank` p50 / p95 | with 2 passages a file |
+  | --- | --- | --- | --- | --- |
+  | 207 files | 13.5 s | 447 MB | 28.8 / 66.3 ms | 31.0 / 62.5 ms |
+  | 1,656 paths (eight copies) | 26.5 s | 424 MB | **50.7** / 143.2 ms | 51.2 / 164.4 ms |
+
+  Under the 60 ms p50 line. E378's `--passage-index` answered the same store's questions in 56.4 ms p50 at 1,364 MB; the ranker holds term ids per file, not postings per paragraph.
+- Checks: `in_memory_index_scores_as_the_live_view` (150 rows, 8 rounds of 20 edits: `Bm25Mem` scores bit-equal to `bm25_live_search` at k of 1, 3, 10 and 1,000; review fix: a re-put key keeps its slot and a removed key's slot is reused, so the index holds about as many slots as keys however many edits it sees, checked in the same test), `rank_orders_files_follows_edits_and_fuses_vectors` (order, an edit moving a file, a deleted file leaving, passages, fused order with vectors, errors). `cargo test --release`: 372 pass, 0 fail; clippy `-D warnings` clean.
+- Verdict: **kept** (an option, off; the default `search` and `passages` tools are as they were).
+- Not measured: the Mac; real embeddings (the vectors here only test that fusion matches; ranking quality with bge-small is E387's open line); a store of 785 MB of distinct text (as E378, the copies make every posting list eight times longer); edits under load at that size; the start cost on `live` with `--passage-index` too (both indexes are built).
+- Run: `python3 -I experiments/ranked-files/rank_bench.py IKAM_BIN PYPI_JSONL WORK 300`; `python3 -I experiments/ranked-files/rank_bench.py IKAM_BIN --time STORE WORK`.
+
+### E389 vectors-1m (vector search through `db serve` up to a million rows)
+
+- Branch / parent: exp/389-vectors-1m / main 0a6f0eb
+- Question: semantic search in `db serve` (E358) was measured to 200k rows at most (E356's gap: stores above 200k rows), and E375 found a 1M-row table's first ranked search took the server to 5.6 GB. What do vector search's first build, memory and query time look like from 100k to 1M rows, exact and as a graph (`--hnsw`, E332), and is there a memory cliff to fix before semantic search over a large store is planned? (Night 1 of the trip-week plan; business cases: records live and questions over records.)
+- Setup: `experiments/vectors-1m/vec_1m.py`. Rows `v/0000000`... of 384 f32s (bge-small's width), unit vectors in 1,000 clusters (a centroid plus noise, cosine about 0.7 to it), loaded in 2,000-row appends with one server to 100k, 250k, 500k and 1M rows; at each, a fresh server per mode asked 200 queries on `POST vsearch?prefix=v/&k=10` (the first one builds the index; vector indexes are not kept, so every start builds again). Recall@10 against an exact top 10 computed with numpy. Linux cloud, 4 CPUs, 15 GB, one run each.
+- Found on main: a first build read every row of the prefix in one call (`db_prefix(.., usize::MAX)`) and built the index after, so the server held all the values and the index together, and kept most of it: 868 MB resident after the first query at 100k rows and **8,690 MB at 1M** (raw vectors are 1,536 MB).
+- Change:
+  - Fix: the first build reads rows 4,096 at a time (`db_range` pages) and adds each page to the index before the next, with the same rows in the same order. The same index, same answers.
+  - Option: `db serve --hnsw --hnsw-threads N` (off: 1; needs `--hnsw`) links the graph's first build on N threads (`HnswIndex::with_threads` and `extend`, batches of 1,024 rows). The graph is not the same as one built row by row (a batch's rows link against the graph before the batch), so it is an option.
+- Results (memory after the first query, which is also its peak, VmHWM; query times one at a time over HTTP after the build):
+
+  | rows | store | mode | first query (build) | resident | p50 / p99 | recall@10 |
+  | --- | --- | --- | --- | --- | --- | --- |
+  | 100k | 163 MB | exact, main | 2.0 s | 868 MB | 14.8 / 21.1 ms | 1.0 |
+  | 100k | | exact, branch | 1.4 s | 204 MB | 19.6 / 26.0 ms | 1.0 |
+  | 100k | | `--hnsw` | 71.4 s | 223 MB | 0.95 / 1.43 ms | 1.0 |
+  | 100k | | `--hnsw --hnsw-threads 4` | 32.5 s | 227 MB | 0.82 / 2.52 ms | 1.0 |
+  | 250k | 408 MB | exact, main | 5.3 s | 2,163 MB | 43.3 / 68.4 ms | 1.0 |
+  | 250k | | exact, branch | 4.1 s | 468 MB | 47.4 / 64.9 ms | 1.0 |
+  | 250k | | `--hnsw` | 162.1 s | 516 MB | 0.72 / 1.20 ms | 0.984 |
+  | 250k | | 4 threads | 80.2 s | 524 MB | 0.81 / 1.34 ms | 0.980 |
+  | 500k | 816 MB | exact, main | 11.6 s | 4,317 MB | 85.5 / 106.2 ms | 1.0 |
+  | 500k | | exact, branch | 7.8 s | 890 MB | 93.1 / 123.2 ms | 1.0 |
+  | 500k | | `--hnsw` | 326.6 s | 984 MB | 1.02 / 1.70 ms | 0.938 |
+  | 500k | | 4 threads | 172.8 s | 997 MB | 0.86 / 1.48 ms | 0.973 |
+  | 1M | 1,632 MB | exact, main | 31.3 s | 8,690 MB | 189.4 / 220.5 ms | 1.0 |
+  | 1M | | exact, branch | 15.7 s | **1,741 MB** | 186.0 / 214.9 ms | 1.0 |
+  | 1M | | `--hnsw`, main | 941.4 s | 8,715 MB | 1.31 / 2.46 ms | 0.842 |
+  | 1M | | `--hnsw`, branch | 796.8 s | **1,928 MB** | 1.08 / 2.08 ms | 0.842 |
+  | 1M | | 4 threads | **399.7 s** | 1,955 MB | 1.14 / 2.15 ms | 0.913 |
+
+  Loading took 74, 129, 226 and 536 s cumulative (1M rows in about 9 minutes, 2,000-row appends, default flags).
+- Reading the curve:
+  - Memory is now linear and near the vectors' own size: about 1.75 GB per million 384-wide rows exact, 1.95 GB with the graph, against 8.7 GB on main (the cliff). A 15 GB host holds about 7M such rows; an 18 GB laptop about 8M with room for the rest.
+  - Exact search costs about 0.19 ms per 1,000 rows a query (186 ms at 1M): fine to about 250k rows for interactive use, too slow beyond.
+  - The graph answers in about 1 ms at every size, but its first build is slow (13 minutes at 1M on one thread, 6.7 on four) and its recall falls with size at the fixed search width (`ef` 80): 0.84 at 1M on these tight clusters. The threaded build had better recall at 500k and 1M (0.973, 0.913), not worse.
+  - Every restart pays the build again, so a graph over a large table wants to be kept (as E369 keeps BM25 views) before it is a default.
+- Checks: `first_vector_build_reads_pages_and_answers_as_a_scan` (8,199 rows across page edges, a duplicate value, a key just past a page's last, exact on one thread and the graph on one and four threads, each answering as a scan does). `cargo test --release`: 371 pass, 0 fail; clippy `-D warnings` clean.
+- Verdict: **kept** (a fix, the paged first build, with no trade-off; `--hnsw-threads` an option, off).
+- Not measured: the Mac; real embeddings (clustered synthetic vectors stand in; recall on real text vectors may differ either way); a wider `ef` (a constant here: 80), which would trade query time for recall at 1M; keeping the graph across restarts; vectors changing while serving at 1M; more than one run each (build times on a shared cloud host move by tens of percent).
+- Run: `python3 -I experiments/vectors-1m/vec_1m.py WORK OUT.jsonl 100000,250000,500000,1000000 "exact=BRANCH:;exact-main=MAIN:;hnsw=BRANCH:--hnsw;hnsw4=BRANCH:--hnsw --hnsw-threads 4;hnsw-main@1000000=MAIN:--hnsw" 200`.
 ### E400 self-loop (a self-improvement loop run on IKAM, first round)
 
 - Branch / parent: exp/400-self-loop / main 0a6f0eb. (E391 and up are taken by the trip-week nights, so this takes 400.)

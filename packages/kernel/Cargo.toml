@@ -27,6 +27,16 @@ redb = { version = "4.5.0", optional = true }
 rocksdb = { version = "0.25.0", optional = true, default-features = false, features = ["lz4", "zstd"] }
 rusqlite = { version = "0.41.1", optional = true, features = ["bundled"] }
 
+# E387: an in-kernel text embedder (bge-small-en-v1.5 class BERT models),
+# off by default. Pure Rust: candle for the model, tokenizers with its
+# pure-Rust regex. Weights are never bundled; `Embedder::open` reads a
+# model folder and checks its weights against a pinned BLAKE3 when given.
+candle-core = { version = "0.11.1", optional = true, default-features = false }
+candle-nn = { version = "0.11.1", optional = true, default-features = false }
+candle-transformers = { version = "0.11.1", optional = true, default-features = false }
+tokenizers = { version = "0.22.2", optional = true, default-features = false, features = ["fancy-regex"] }
+serde_json = { version = "1.0.154", optional = true }
+
 # E227: one syncfs on Linux, and a plain fsync on Apple systems (where
 # std's sync_all is F_FULLFSYNC), for FsStore::open_deferred.
 [target.'cfg(any(target_os = "linux", target_vendor = "apple"))'.dependencies]
@@ -38,9 +48,11 @@ store-lmdb = ["dep:heed"]
 store-redb = ["dep:redb"]
 store-rocksdb = ["dep:rocksdb"]
 store-sqlite = ["dep:rusqlite"]
+embed = ["dep:candle-core", "dep:candle-nn", "dep:candle-transformers", "dep:tokenizers", "dep:serde_json"]
 stores = ["store-fjall", "store-lmdb", "store-redb", "store-rocksdb", "store-sqlite"]
 
 [dev-dependencies]
+serde_json = "1.0.154"
 libc = "=0.2.189"
 proptest = "1.11.0"
 tempfile = "3.27.0"
@@ -61,6 +73,10 @@ opt-level = 2
 # builds already run wasmi without them.
 [profile.dev.package.wasmi]
 debug-assertions = false
+
+[[example]]
+name = "embed_corpus"
+required-features = ["embed"]
 
 [[example]]
 name = "stores"

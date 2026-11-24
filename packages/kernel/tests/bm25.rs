@@ -366,3 +366,91 @@ fn one_pass_build_equals_an_update_from_nothing() {
         }
     }
 }
+
+/// E388: `Bm25Mem`, kept up by puts and removes in memory, gives the same
+/// keys and the same score bits as `bm25_live_search` over the same rows,
+/// through rounds of edits, at every k.
+#[test]
+fn in_memory_index_scores_as_the_live_view() {
+    use ikam_kernel::bm25::Bm25Mem;
+    let words = [
+        "vector",
+        "index",
+        "graph",
+        "Store",
+        "row",
+        "query",
+        "fusion",
+        "the",
+        "a",
+        "café",
+        "rare",
+        "x1",
+        "Ünïcode",
+    ];
+    let mut rng = Lcg(388);
+    let text = |rng: &mut Lcg| {
+        let n = rng.next() % 40;
+        (0..n)
+            .map(|_| words[(rng.next() % 13) as usize])
+            .collect::<Vec<_>>()
+            .join(if rng.next().is_multiple_of(2) {
+                " "
+            } else {
+                ", "
+            })
+    };
+    let mut repo = Repo::new(MemStore::default());
+    let empty = repo.db_empty().unwrap();
+    let mut mem = Bm25Mem::new();
+    let mut events = Vec::new();
+    for i in 0..150 {
+        let (k, v) = (format!("doc/{i:04}"), text(&mut rng));
+        mem.put(&k, &v);
+        events.push(Event::upsert(&k, v.as_bytes(), &k));
+    }
+    let mut db = repo.db_append(&empty, &events).unwrap();
+    let mut live = repo.bm25_live_build(&db, "doc/", 20).unwrap();
+    let bits = |v: &[(String, f32)]| -> Vec<(String, u32)> {
+        v.iter().map(|(s, f)| (s.clone(), f.to_bits())).collect()
+    };
+    for round in 0..8 {
+        assert_eq!(mem.len(), repo.db_scan(&db).unwrap().len());
+        // Slots are reused: never more than the 190 keys ever used.
+        assert!(mem.slots() <= 190, "{} slots", mem.slots());
+        for query in [
+            "vector",
+            "graph store GRAPH",
+            "rare x1",
+            "CAFÉ query ünïcode",
+            "missing",
+            "the a row index fusion",
+            "",
+        ] {
+            for k in [1, 3, 10, 1000] {
+                let want = repo.bm25_live_search(&live, query, k).unwrap();
+                assert_eq!(
+                    bits(&mem.search(query, k)),
+                    bits(&want),
+                    "{round} {query} {k}"
+                );
+            }
+        }
+        let mut edits = Vec::new();
+        for j in 0..20 {
+            let key = format!("doc/{:04}", rng.next() % 190);
+            if j % 3 == 0 {
+                mem.remove(&key);
+                edits.push(Event::remove(&key, false, &format!("r{round}{j}")));
+            } else {
+                let t = text(&mut rng);
+                mem.put(&key, &t);
+                edits.push(Event::upsert(&key, t.as_bytes(), &format!("u{round}{j}")));
+            }
+        }
+        let next = repo.db_append(&db, &edits).unwrap();
+        live = repo.bm25_live_update(&live, &db, &next, "doc/").unwrap();
+        db = next;
+    }
+    assert!(!mem.remove("doc/none"));
+}
