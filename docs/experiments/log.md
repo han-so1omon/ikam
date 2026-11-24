@@ -6440,3 +6440,26 @@ Gates on the branch (E229 to E233): every kernel test suite passes (release); cl
 - Note for older runs: a bench that passes only `--live` now measures the bounded seed index; `--live --seed-index-max 0` is the E372 preset.
 - Verdict: **kept** (preset change, still an option).
 - Not measured: the Mac; whether 250000 is the best N for other row sizes; a write after a drop can store a chunk it could have sliced (E383: under 1% of store bytes at 1M rows).
+
+### E388 ranked-files (`ikam mcp`'s `rank` tool: files best first, with their passages)
+
+- Branch / parent: exp/388-ranked-files / main 0a6f0eb
+- Question: `ikam mcp`'s `search` finds files that contain words and `passages` (E378) returns paragraphs, but nothing ranks whole files the way `db serve`'s search route ranks rows (BM25, E324, fused with vectors, E358). Can a folder served by `live` or `mcp` answer "which files, best first, and where in them" with the same ranks `db serve` gives the same texts, fast enough on E378's large store (p50 under 60 ms)? (Night 1 of the trip-week plan; business case: questions over a folder of files.)
+- Change, all off by default:
+  - `bm25::Bm25Mem`: the kernel's BM25 (`K1` 0.9, `B` 0.4, the same formula and the same order of summing a query's terms as `Bm25Live`) over keyed texts held in memory and edited in place (`put`, `remove`), for callers that keep their texts in memory already.
+  - `ikam mcp --rank-files` and `ikam live --rank-files`: a ranker of the tree's files, built at start and kept up as files change (each changed file is taken out and put back). New read tool `rank`: `query`, `k` (10), `passages` per file (2), and an optional query `vector` with `fuse` (convex, `alpha` 0.5 as in `fusion::DEFAULT_ALPHA`, or rrf). It prints the files best first with their scores, each with its best passages and their line numbers.
+  - `--file-vectors PREFIX`: vectors for files from `PREFIX.paths` and `PREFIX.f32` (the caller's own embedder, as `db serve` takes vectors from its client), kept by each file's content so an edited file loses its vector and copies share one. The kernel embedder (E387, PR 78) is not wired in here; that waits for it to merge.
+  - Fusion is `db serve`'s: both lists to depth `max(100, k)`, vectors scored exactly.
+- Parity, the README corpus (`experiments/ranked-files/rank_bench.py`; 6,854 PyPI project READMEs from `exp/259`'s fetch, each the file `t/SLUG` of a store and the row `t/SLUG` of a `db serve` database; a hashed bag-of-words vector of 256 numbers per text on both sides, a stand-in for an embedder; 300 project summaries as known-item queries): top 10 keys and scores (to 1e-5) the same as `GET search` **300/300** keyword-only, and the same as `POST search ...&vectors=v/` **300/300** fused. `rank` p50 0.85 ms (p95 1.48) keyword-only and 1.9 ms (2.71) fused through stdio; `db serve` over HTTP 3.73 and 4.35 ms. With 2 passages a file, 0.99 ms. Start 1.7 s, 158 MB.
+- Speed on a large store (`rank_bench.py --time`, 20 questions 5 times, keyword-only, Linux cloud, 4 CPUs, one run): E378's layout, eight copies of a tree of pandas, click and requests releases and docx, pdf and pptx samples (this run's fetch got 207 of E378's 216 files: 1,656 paths, 18 MB store):
+
+  | store | start | resident | `rank` p50 / p95 | with 2 passages a file |
+  | --- | --- | --- | --- | --- |
+  | 207 files | 13.5 s | 447 MB | 28.8 / 66.3 ms | 31.0 / 62.5 ms |
+  | 1,656 paths (eight copies) | 26.5 s | 424 MB | **50.7** / 143.2 ms | 51.2 / 164.4 ms |
+
+  Under the 60 ms p50 line. E378's `--passage-index` answered the same store's questions in 56.4 ms p50 at 1,364 MB; the ranker holds term ids per file, not postings per paragraph.
+- Checks: `in_memory_index_scores_as_the_live_view` (150 rows, 8 rounds of 20 edits: `Bm25Mem` scores bit-equal to `bm25_live_search` at k of 1, 3, 10 and 1,000), `rank_orders_files_follows_edits_and_fuses_vectors` (order, an edit moving a file, a deleted file leaving, passages, fused order with vectors, errors). `cargo test --release`: 372 pass, 0 fail; clippy `-D warnings` clean.
+- Verdict: **kept** (an option, off; the default `search` and `passages` tools are as they were).
+- Not measured: the Mac; real embeddings (the vectors here only test that fusion matches; ranking quality with bge-small is E387's open line); a store of 785 MB of distinct text (as E378, the copies make every posting list eight times longer); edits under load at that size; the start cost on `live` with `--passage-index` too (both indexes are built).
+- Run: `python3 -I experiments/ranked-files/rank_bench.py IKAM_BIN PYPI_JSONL WORK 300`; `python3 -I experiments/ranked-files/rank_bench.py IKAM_BIN --time STORE WORK`.

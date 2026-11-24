@@ -37,11 +37,52 @@ pub struct Session<L: DerefMut<Target = Live> = Box<Live>> {
     pub live: L,
 }
 
+/// E388 (off): `--rank-files` builds the file ranker at start rather than
+/// on the first `rank`; `--file-vectors PREFIX` loads vectors for files.
+#[derive(Default)]
+pub struct RankFlags {
+    pub rank_files: bool,
+    pub file_vectors: Option<String>,
+}
+
+impl RankFlags {
+    /// Take the flags out of `args`.
+    pub fn take(args: &mut Vec<String>) -> Result<RankFlags, String> {
+        let before = args.len();
+        args.retain(|a| a != "--rank-files");
+        let rank_files = args.len() != before;
+        let file_vectors = match args.iter().position(|a| a == "--file-vectors") {
+            Some(i) if i + 1 < args.len() => {
+                let v = args.remove(i + 1);
+                args.remove(i);
+                Some(v)
+            }
+            Some(_) => return Err("--file-vectors PREFIX".into()),
+            None => None,
+        };
+        Ok(RankFlags {
+            rank_files,
+            file_vectors,
+        })
+    }
+
+    pub fn apply(&self, live: &mut Live) -> Result<(), String> {
+        if self.rank_files {
+            live.index_files();
+        }
+        if let Some(p) = &self.file_vectors {
+            live.load_file_vectors(p)?;
+        }
+        Ok(())
+    }
+}
+
 /// Serve one client on `input`/`output` until `input` closes.
 pub fn run(
     store_dir: &str,
     refname: &str,
     passage_index: bool,
+    rank: &RankFlags,
     input: impl BufRead,
     mut output: impl Write,
 ) -> Result<(), String> {
@@ -49,6 +90,7 @@ pub fn run(
     if passage_index {
         s.live.index_passages();
     }
+    rank.apply(&mut s.live)?;
     for line in input.lines() {
         let line = line.map_err(err)?;
         if line.trim().is_empty() {
@@ -85,7 +127,7 @@ impl Session {
 pub const HOLD: std::time::Duration = std::time::Duration::from_secs(600);
 
 pub const READ_TOOLS: &[&str] = &[
-    "list", "read", "search", "passages", "status", "history", "diff", "drafts",
+    "list", "read", "search", "passages", "rank", "status", "history", "diff", "drafts",
 ];
 
 /// The tool list with its schemas, as `tools/list` gives it.
@@ -150,6 +192,7 @@ impl<L: DerefMut<Target = Live>> Session<L> {
             ),
             "search" => Ok(self.search(&req(a, "query")?, num(a, "limit").unwrap_or(50))),
             "passages" => Ok(self.passages(&req(a, "question")?, num(a, "k").unwrap_or(8))),
+            "rank" => self.rank(&req(a, "query")?, a),
             "write" => {
                 let path = req(a, "path")?;
                 let content = req(a, "content")?;
@@ -371,6 +414,62 @@ impl<L: DerefMut<Target = Live>> Session<L> {
             ));
         }
         out
+    }
+
+    /// E388: files ranked for `query`, each with its best passages.
+    fn rank(&mut self, query: &str, a: &Json) -> Result<String, String> {
+        let k = num(a, "k").unwrap_or(10).clamp(1, 1000);
+        let per = num(a, "passages").unwrap_or(2).min(20);
+        let vector: Option<Vec<f32>> = match a.get("vector") {
+            None | Some(Json::Null) => None,
+            Some(Json::Arr(v)) => Some(
+                v.iter()
+                    .map(|x| match x {
+                        Json::Num(n) => Ok(*n as f32),
+                        _ => Err("vector holds numbers only".to_string()),
+                    })
+                    .collect::<Result<_, _>>()?,
+            ),
+            Some(_) => return Err("vector is an array of numbers".into()),
+        };
+        let fuse = match opt(a, "fuse").as_deref() {
+            Some("rrf") => live::Fuse::Rrf,
+            Some("convex") | None => match a.get("alpha") {
+                None => live::Fuse::Convex(ikam_kernel::fusion::DEFAULT_ALPHA),
+                Some(Json::Num(x)) if (0.0..=1.0).contains(x) => live::Fuse::Convex(*x as f32),
+                Some(_) => return Err("alpha is a number from 0 to 1".into()),
+            },
+            Some(_) => return Err("fuse is convex or rrf".into()),
+        };
+        let ranked = self.live.rank_files(query, vector.as_deref(), k, fuse)?;
+        let hybrid = vector.is_some() && self.live.ranker.as_ref().is_some_and(|r| r.dim > 0);
+        if ranked.is_empty() {
+            return Ok("no file shares a word with the query".into());
+        }
+        let mut out = format!(
+            "{} file(s), best first ({})\n",
+            ranked.len(),
+            if hybrid {
+                "keywords and vectors"
+            } else {
+                "keywords"
+            }
+        );
+        for (i, (path, score)) in ranked.iter().enumerate() {
+            out.push_str(&format!("{}. {path} (score {score:.6})\n", i + 1));
+            for p in self.live.passages_in(path, query, per) {
+                let part = if p.part.is_empty() {
+                    String::new()
+                } else {
+                    format!(" ({})", p.part)
+                };
+                out.push_str(&format!("   line {}{part}:\n", p.first_line));
+                for line in p.text.lines().take(6) {
+                    out.push_str(&format!("     {line}\n"));
+                }
+            }
+        }
+        Ok(out)
     }
 
     fn apply(&mut self, op: Op, done: &str) -> Result<String, String> {
@@ -676,6 +775,23 @@ fn tools() -> Vec<Json> {
             &["question"],
         ),
         tool(
+            "rank",
+            "Files ranked by how well their words match a query (BM25 over each whole file), each with its best passages. With vector (the query's embedding) and file vectors loaded, keyword and vector ranks are fused.",
+            &[
+                ("query", "string", "question or keywords"),
+                ("k", "integer", "files (10)"),
+                ("passages", "integer", "passages a file (2)"),
+                (
+                    "vector",
+                    "array",
+                    "query vector, as many numbers as the file vectors",
+                ),
+                ("fuse", "string", "convex (default) or rrf"),
+                ("alpha", "number", "convex weight on keywords, 0 to 1 (0.5)"),
+            ],
+            &["query"],
+        ),
+        tool(
             "write",
             "Create or replace a file with text content. Pending until commit.",
             &[
@@ -766,7 +882,15 @@ fn tool(name: &str, description: &str, props: &[(&str, &str, &str)], required: &
         .map(|(k, t, d)| {
             (
                 k.to_string(),
-                obj(vec![("type", s(t)), ("description", s(d))]),
+                if *t == "array" {
+                    obj(vec![
+                        ("type", s(t)),
+                        ("items", obj(vec![("type", s("number"))])),
+                        ("description", s(d)),
+                    ])
+                } else {
+                    obj(vec![("type", s(t)), ("description", s(d))])
+                },
             )
         })
         .collect();
@@ -879,7 +1003,7 @@ mod tests {
                 .unwrap()
                 .as_arr()
                 .len(),
-            16
+            17
         );
         let r = s
             .handle(r#"{"jsonrpc":"2.0","id":2,"method":"nope"}"#)
@@ -1067,6 +1191,89 @@ mod tests {
             r.len() <= MAX_TEXT && r.contains("read on with start_line="),
             "{}",
             r.len()
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+    #[test]
+    fn rank_orders_files_follows_edits_and_fuses_vectors() {
+        // E388: whole files ranked by BM25, kept as files change, with
+        // their best passages; vectors by content join the ranking only
+        // when the call gives a query vector.
+        let (dir, mut s) = session("rank");
+        let files = [
+            (
+                "a.md",
+                "vector search in a graph store\nvector vector index",
+            ),
+            ("b.md", "graph store notes"),
+            ("c.md", "nothing alike here"),
+        ];
+        for (p, t) in files {
+            call(
+                &mut s,
+                "write",
+                &format!(r#"{{"path":"{p}","content":"{}"}}"#, t.replace('\n', "\\n")),
+            )
+            .unwrap();
+        }
+        let r = call(&mut s, "rank", r#"{"query":"vector store"}"#).unwrap();
+        assert!(r.starts_with("2 file(s), best first (keywords)"), "{r}");
+        let order: Vec<&str> = r.lines().filter(|l| l.contains(". ")).collect();
+        assert!(
+            order[0].starts_with("1. a.md") && order[1].starts_with("2. b.md"),
+            "{r}"
+        );
+        assert!(r.contains("     vector search in a graph store"), "{r}");
+        // An edit moves the ranking; a removal drops the file.
+        call(
+            &mut s,
+            "write",
+            r#"{"path":"b.md","content":"vector vector vector store store"}"#,
+        )
+        .unwrap();
+        let r = call(&mut s, "rank", r#"{"query":"vector store","k":1}"#).unwrap();
+        assert!(r.contains("1. b.md"), "{r}");
+        call(&mut s, "remove", r#"{"path":"b.md"}"#).unwrap();
+        let r = call(&mut s, "rank", r#"{"query":"store"}"#).unwrap();
+        assert!(r.starts_with("1 file(s)") && r.contains("1. a.md"), "{r}");
+        // Vectors: c.md points the way the query does.
+        let pre = dir.join("vecs");
+        std::fs::write(pre.with_extension("paths"), "a.md\nc.md\nmissing.md\n").unwrap();
+        let flat: Vec<f32> = vec![1.0, 0.0, 0.0, 1.0, 0.5, 0.5];
+        std::fs::write(
+            pre.with_extension("f32"),
+            ikam_kernel::vectors::from_f32s(&flat),
+        )
+        .unwrap();
+        assert_eq!(s.live.load_file_vectors(pre.to_str().unwrap()).unwrap(), 2);
+        let r = call(&mut s, "rank", r#"{"query":"store","vector":[0,1]}"#).unwrap();
+        assert!(
+            r.starts_with("2 file(s), best first (keywords and vectors)"),
+            "{r}"
+        );
+        let r = call(
+            &mut s,
+            "rank",
+            r#"{"query":"store","vector":[0,1],"alpha":0.2,"k":1}"#,
+        )
+        .unwrap();
+        assert!(r.contains("1. c.md"), "{r}");
+        let r = call(
+            &mut s,
+            "rank",
+            r#"{"query":"store","vector":[0,1],"fuse":"rrf"}"#,
+        )
+        .unwrap();
+        assert!(r.contains("a.md") && r.contains("c.md"), "{r}");
+        assert!(call(&mut s, "rank", r#"{"query":"store","vector":[1]}"#).is_err());
+        assert!(call(&mut s, "rank", r#"{"query":"store","alpha":2}"#).is_err());
+        // A changed file loses its vector: c.md is now found by neither list.
+        call(&mut s, "write", r#"{"path":"c.md","content":"changed"}"#).unwrap();
+        let r = call(&mut s, "rank", r#"{"query":"store","vector":[0,1]}"#).unwrap();
+        assert!(r.starts_with("1 file(s)") && !r.contains("c.md"), "{r}");
+        assert_eq!(
+            call(&mut s, "rank", r#"{"query":"absent"}"#).unwrap(),
+            "no file shares a word with the query"
         );
         let _ = std::fs::remove_dir_all(dir);
     }
