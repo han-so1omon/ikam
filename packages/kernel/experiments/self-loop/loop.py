@@ -181,33 +181,63 @@ def measure(wt, row, value, base_commit, base, tol_c, pins):
 
 
 def round_(store, wt, rnd):
+    """Measure round rnd. A round that was killed resumes from the store:
+    every step already fired is read back instead of measured again, so its
+    firing is not repeated with other output (net_fire_output refuses that)."""
     tok, p = current(store)
     assert p, "run seed first"
-    hist = [x for xs in records(store).values() for x in xs]
+    h = history(store)
+    fired = {f["key"] for f in h}
+    out = {(f["transition"], f["token"]): f["output"] for f in h if f["output"]}
+    started = [json.loads(f["output"]).get("policy") for f in h if f["transition"] == "propose"
+               and f["token"].startswith(f"{rnd}-") and f["output"] and json.loads(f["output"]).get("round") == rnd]
+    started = [x for x in started if x]
+    if started and started[0] != tok:  # a resumed round keeps the policy it started with
+        tok, p = started[0], json.loads(out[("variant", started[0])])["next"]
+
+    def once(t, token, o=None):
+        if f"{t}-{token}" not in fired:
+            fire(store, t, token, o)
+
+    hist = [x for r, xs in records(store).items() if r != rnd for x in xs]
     pins = {"wt": fixed.manifest(wt), "loop": fixed.manifest(ROOT)}
-    base_commit = sh(["git", "rev-parse", "HEAD"], wt).stdout.strip()
     k = os.path.join(wt, "packages/kernel")
-    sh("cargo build --release --example bench", k)
-    _, (_, north), _ = bench(wt, fixed.NORTH)
-    costs = [bench(wt, fixed.FULL)[1][0] for _ in range(3)]
-    base = {"north": north, "cost": st.median(costs), "costs": costs}
-    tol_c = fixed.cost_tol(costs)
-    fire(store, "propose", f"{rnd}-base", {"round": rnd, "name": "base", "commit": base_commit})
-    fire(store, "start", f"{rnd}-base")
-    fire(store, "finish", f"{rnd}-base", dict(base, round=rnd, name="base", tol_c=tol_c, pins=pins))
-    fire(store, "close", f"{rnd}-base")
+    b = f"{rnd}-base"
+    if ("finish", b) in out:
+        base_commit = json.loads(out[("propose", b)])["commit"]
+        base = json.loads(out[("finish", b)])
+        tol_c = base["tol_c"]
+        if base["pins"] != pins:
+            raise SystemExit("guard: protected files differ from the round's start")
+        sh(["git", "checkout", "-q", "--detach", base_commit], wt)
+        print(f"{b}: resumed from the store", flush=True)
+    else:
+        base_commit = sh(["git", "rev-parse", "HEAD"], wt).stdout.strip()
+        sh("cargo build --release --example bench", k)
+        _, (_, north), _ = bench(wt, fixed.NORTH)
+        costs = [bench(wt, fixed.FULL)[1][0] for _ in range(3)]
+        base = {"north": north, "cost": st.median(costs), "costs": costs}
+        tol_c = fixed.cost_tol(costs)
+        once("propose", b, {"round": rnd, "name": "base", "commit": base_commit, "policy": tok})
+        once("start", b)
+        fire(store, "finish", b, dict(base, round=rnd, name="base", tol_c=tol_c, pins=pins))
+    once("close", b)
     pool = [dict(name=r["name"], base=r["value"], value=v, row=r) for r in catalog() for v in r["tries"]]
     fixed_order = [f"{c['name']}={c['value']}" for c in pool]
     order = policy.rank(pool, hist, p)
     for i, c in enumerate(order):
         t = f"{rnd}-{c['name']}-{policy.num(c['value'])}"
-        fire(store, "propose", t, {"round": rnd, "name": c["name"], "base": c["base"], "value": c["value"],
-                                   "policy": tok, "policy_rank": i, "fixed_rank": fixed_order.index(f"{c['name']}={c['value']}")})
-        fire(store, "start", t)
-        rec = measure(wt, c["row"], c["value"], base_commit, base, tol_c, pins)
-        rec.update(round=rnd, policy_rank=i, fixed_rank=fixed_order.index(f"{c['name']}={c['value']}"))
-        fire(store, "finish", t, rec)
-        fire(store, "keep" if rec["verdict"] == "keep" else "close", t)
+        fr = fixed_order.index(f"{c['name']}={c['value']}")
+        once("propose", t, {"round": rnd, "name": c["name"], "base": c["base"], "value": c["value"],
+                            "policy": tok, "policy_rank": i, "fixed_rank": fr})
+        once("start", t)
+        if ("finish", t) in out:
+            rec = json.loads(out[("finish", t)])
+        else:
+            rec = measure(wt, c["row"], c["value"], base_commit, base, tol_c, pins)
+            rec.update(round=rnd, policy_rank=i, fixed_rank=fr)
+            fire(store, "finish", t, rec)
+        once("keep" if rec["verdict"] == "keep" else "close", t)
         print(f"{t}: north {100 * (rec['dn'] or 0):+.2f}% {rec['verdict']} ({rec['secs']} s)", flush=True)
     sh(["git", "checkout", "-q", "--detach", base_commit], wt)
 
