@@ -14,6 +14,8 @@ mod coldpass;
 mod container;
 mod db;
 mod dict;
+#[cfg(feature = "embed")]
+pub mod embed;
 pub mod drafts;
 pub mod embeds;
 mod exec;

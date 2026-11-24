@@ -6440,3 +6440,24 @@ Gates on the branch (E229 to E233): every kernel test suite passes (release); cl
 - Note for older runs: a bench that passes only `--live` now measures the bounded seed index; `--live --seed-index-max 0` is the E372 preset.
 - Verdict: **kept** (preset change, still an option).
 - Not measured: the Mac; whether 250000 is the best N for other row sizes; a write after a drop can store a chunk it could have sliced (E383: under 1% of store bytes at 1M rows).
+
+### E387 embedder (bge-small-class sentence vectors in the kernel, behind a feature)
+
+- Branch / parent: exp/387-embedder / main 0a6f0eb
+- Question: semantic search in ikam has needed vectors from outside the kernel: E306 and E312 measured bge-small-en-v1.5 (the strongest embedder tried for fused search, ahead of or within 0.010 of the best on 5 of 5 sets) through a Python pipeline, and E326, E330 and E352 could not run a transformer here. Can the kernel embed text itself, as an option, with the weights fixed so stored vectors always come from the same model, and what does one embedding cost on a cloud CPU? (Planned as E364 in E355; the owner chose bge-small-en-v1.5.)
+- Change (an option, off by default): a cargo feature `embed` (candle 0.11 for the model, tokenizers 0.22 with its pure-Rust regex; nothing is added to the default build). `ikam_kernel::embed::Embedder::open(dir, pin, max_tokens)` reads a model folder as the model's release ships it (`config.json`, `tokenizer.json`, `model.safetensors`), computes the weights' BLAKE3 (`weights`, the model's id for stored vectors, as `embeds` keys them, E255) and refuses other weights when a pin is given. `embed(texts)` returns one unit vector a text: the first token's last hidden state (bge's CLS pooling), L2-normalised, at most 512 tokens, a batch padded to its longest text and masked; `embed_query` adds bge's query instruction. Weights are never bundled or downloaded by the kernel. `examples/embed_corpus.rs`: `corpus MODEL DIR [PIN]` writes `hybrid_kernel`'s vector files from the kernel's own embedder (keeping earlier vectors as `.before` and printing the cosine to them), `bench WORK` times a model of bge-small's shape.
+- Weights: the model's release host was refused by this machine's network policy, so the real weights were not fetched, pinned or scored here. Quality on real text (nDCG@10 against E306's Python vectors and against BM25 alone, 0.805 in E326) and the pin itself are the first Mac run: `embed_corpus corpus` on the downloaded folder prints the weights' BLAKE3 to pin and the cosine to E306's vectors.
+- Checks (`tests/embed.rs`, `--features embed`, a random 2-layer BERT and a word-piece tokenizer built in the test): vectors are unit length and deterministic; each text's vector alone and inside a padded batch of three agree to a cosine above 0.99999; a text of 600 words is truncated and still embeds; an empty call returns nothing; a query vector differs from its text's (the prefix); a pin in either case is accepted and another hash refused.
+- Speed (`embed_corpus bench`, random weights in bge-small-en-v1.5's shape: 12 layers, 384 wide, 12 heads, 1,536 inner, 30,522 words; Linux cloud, 4 CPUs, one run; a forward pass costs the same whatever the weights' values):
+
+  | tokens a text | alone: ms a text | batch of 32: ms a text | peak resident |
+  | --- | --- | --- | --- |
+  | 64 | 64.8 | 30.4 | 259 MB |
+  | 128 | 109.2 | 65.4 | 327 MB |
+  | 256 | 251.1 | 220.7 | 724 MB |
+  | 510 | 702.3 | 596.0 | 2,246 MB |
+
+  Opening the model took 206 ms and 259 MB. So a query (tens of tokens) costs about 65 ms here, and a corpus of whole READMEs (most reach the 512-token limit) about 0.6 s a document on 4 CPUs: 10,000 documents in about 100 minutes. Embedding is the ingest cost of semantic search on a CPU; `embeds` (E255) already embeds each distinct fragment once, so a change re-embeds only what changed. Long texts in batches of 32 need over 2 GB (the attention scores); batches of a few long texts keep the peak near a few hundred MB.
+- Verdict: **kept** as an option (a capability behind a feature; nothing changes without it). Quality, the pin and the Mac's speed not yet measured.
+- Not measured: the real weights (above); the Mac (candle has an Accelerate backend, not tried); smaller batches of long texts; embedding fragments (paragraphs, E330) rather than whole documents; int8 weights.
+- Run: `cargo test --release --features embed --test embed`; `cargo run --release --features embed --example embed_corpus -- bench WORK`; on a machine with the model: `... -- corpus MODEL_DIR DATA_DIR`, then `cargo run --release --example hybrid_kernel -- DATA_DIR`.
