@@ -794,6 +794,9 @@ pub struct Bm25Mem {
     terms: HashMap<String, u32>,
     /// Per term id: `(key ordinal, tf)` in ordinal order.
     postings: Vec<Vec<(u32, u32)>>,
+    /// Ordinals of removed keys, for the next new key: the index holds
+    /// about as many slots as keys, however many edits it has seen.
+    free: Vec<u32>,
     rows: usize,
     total: usize,
 }
@@ -805,6 +808,7 @@ impl Bm25Mem {
 
     /// Set `key`'s text, in place of any earlier one.
     pub fn put(&mut self, key: &str, text: &str) {
+        let old = self.ids.get(key).copied();
         self.remove(key);
         let mut tf: BTreeMap<String, u32> = BTreeMap::new();
         let mut len = 0u32;
@@ -812,9 +816,20 @@ impl Bm25Mem {
             *tf.entry(t).or_default() += 1;
             len += 1;
         }
-        // A new ordinal every time, so postings stay in ordinal order.
-        let id = self.docs.len() as u32;
-        self.keys.push(key.to_string());
+        // The key's own slot again, else a freed one, else a new one;
+        // postings are kept in ordinal order by inserting in place.
+        let id = match old {
+            Some(id) => {
+                self.free.retain(|&f| f != id);
+                id
+            }
+            None => self.free.pop().unwrap_or_else(|| {
+                self.keys.push(String::new());
+                self.docs.push(None);
+                (self.docs.len() - 1) as u32
+            }),
+        };
+        self.keys[id as usize] = key.to_string();
         self.ids.insert(key.to_string(), id);
         let mut own = Vec::with_capacity(tf.len());
         for (t, n) in tf {
@@ -823,10 +838,12 @@ impl Bm25Mem {
             if tid == next {
                 self.postings.push(Vec::new());
             }
-            self.postings[tid as usize].push((id, n));
+            let p = &mut self.postings[tid as usize];
+            let at = p.partition_point(|x| x.0 < id);
+            p.insert(at, (id, n));
             own.push(tid);
         }
-        self.docs.push(Some((len, own)));
+        self.docs[id as usize] = Some((len, own));
         self.rows += 1;
         self.total += len as usize;
     }
@@ -844,6 +861,7 @@ impl Bm25Mem {
             }
         }
         self.keys[id as usize] = String::new();
+        self.free.push(id);
         self.rows -= 1;
         self.total -= len as usize;
         true
@@ -855,6 +873,11 @@ impl Bm25Mem {
 
     pub fn is_empty(&self) -> bool {
         self.rows == 0
+    }
+
+    /// Key slots held (live keys and freed slots).
+    pub fn slots(&self) -> usize {
+        self.docs.len()
     }
 
     /// Distinct terms ever seen and postings held, for sizing.

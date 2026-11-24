@@ -416,6 +416,8 @@ fn in_memory_index_scores_as_the_live_view() {
     };
     for round in 0..8 {
         assert_eq!(mem.len(), repo.db_scan(&db).unwrap().len());
+        // Slots are reused: never more than the 190 keys ever used.
+        assert!(mem.slots() <= 190, "{} slots", mem.slots());
         for query in [
             "vector",
             "graph store GRAPH",
