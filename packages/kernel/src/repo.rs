@@ -73,10 +73,14 @@ impl Ledger {
         self.by_key
             .insert(Derivation::key(&d.func, &d.args), d.output);
         if self.lean {
-            let rs = self.records.entry(d.output).or_default();
+            // Most outputs have one record: start at one slot (not the
+            // four a first push gives) and let later pushes grow as usual.
+            let rs = self
+                .records
+                .entry(d.output)
+                .or_insert_with(|| Vec::with_capacity(1));
             if !rs.contains(&record) {
                 rs.push(record);
-                rs.shrink_to_fit();
             }
             return;
         }
