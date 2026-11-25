@@ -69,7 +69,8 @@ def one(binary, work, rows, mix, flags):
     s.start()
     t0 = time.time()
     for start in range(0, rows, BATCH):
-        assert s.append(d.events(b"big", start, BATCH, b"load"), 1800)[1]
+        n = min(BATCH, rows - start)
+        assert s.append(d.events(b"big", start, n, b"load"), 1800)[1]
     load_s = time.time() - t0
     t1 = time.time()
     s.req("GET", "/db/t/search?q=word7&prefix=t/big/&k=10", None, 1800)
