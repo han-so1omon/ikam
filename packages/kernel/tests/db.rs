@@ -876,8 +876,8 @@ fn deferred_kv_catches_up_across_pages() {
         let caught = repo.db_catch_up(&late).unwrap();
         assert_eq!(caught, now, "span {span}");
         assert_eq!(caught.kv_at, span as u64);
-        // Written early every 1,000 or 2,048 events: the same view.
-        for flush in [1000u64, 2048] {
+        // Written early every 7 (inside a page), 1,000 or 2,048 events: the same view.
+        for flush in [7u64, 1000, 2048] {
             repo.catch_up_flush = flush;
             assert_eq!(
                 repo.db_catch_up(&late).unwrap(),

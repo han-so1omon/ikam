@@ -451,9 +451,11 @@ impl<S: Store> Repo<S> {
                 let bytes = self.read_content(&a.id())?;
                 let e = Event::decode(&bytes)?.0;
                 self.db_fold_one(&cur, &mut fold, &e, &bytes, a.id())?;
-            }
-            if self.catch_up_flush > 0 && fold.events >= self.catch_up_flush {
-                cur = self.db_fold_finish(&cur, std::mem::take(&mut fold))?;
+                // Write as soon as the limit is reached, so a limit below
+                // a page's 1,024 events still bounds what is held.
+                if self.catch_up_flush > 0 && fold.events >= self.catch_up_flush {
+                    cur = self.db_fold_finish(&cur, std::mem::take(&mut fold))?;
+                }
             }
             match (full, next) {
                 (true, Some(n)) => from = n,
