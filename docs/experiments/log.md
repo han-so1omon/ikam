@@ -6537,3 +6537,40 @@ Gates on the branch (E229 to E233): every kernel test suite passes (release); cl
 - Verdict: **kept** (a fix, the paged first build, with no trade-off; `--hnsw-threads` an option, off).
 - Not measured: the Mac; real embeddings (clustered synthetic vectors stand in; recall on real text vectors may differ either way); a wider `ef` (a constant here: 80), which would trade query time for recall at 1M; keeping the graph across restarts; vectors changing while serving at 1M; more than one run each (build times on a shared cloud host move by tens of percent).
 - Run: `python3 -I experiments/vectors-1m/vec_1m.py WORK OUT.jsonl 100000,250000,500000,1000000 "exact=BRANCH:;exact-main=MAIN:;hnsw=BRANCH:--hnsw;hnsw4=BRANCH:--hnsw --hnsw-threads 4;hnsw-main@1000000=MAIN:--hnsw" 200`.
+
+### E390 enwik-speed (why a wiki dump's page tree ingests far slower than zstd or xz compress it)
+
+- Branch / parent: exp/390-enwik-roundtrip / main 437aef6
+- Question: enwik8 split into one file per `<page>` round-tripped byte-exact through `ikam ingest`, but the ingest took minutes where `zstd -19` and `xz -9` take a second or two a megabyte, and enwik9 was slower still. Where does an ingest of a wiki-shaped tree spend its time, and what can be cut without changing the stored bytes?
+- Setup: `experiments/enwik-speed/`. The enwik files themselves were not reachable from the cloud host, so `genwiki.py` writes a MediaWiki-export-shaped stand-in (Markov prose from any large English text, Zipf-popular `[[links]]` and piped links, infoboxes, categories, interwiki lines, 25% redirects, enwik's XML layout) and `splitwiki.py` cuts it into one file per page, in order, so the files concatenate back to the input. 5, 20 and 100 MB (18,497 pages at 100 MB). `ikam --store S ingest PAGES -m t` (commit, repack, verify) with each binary; wall time, user time and peak RSS from `time`; phase times from timers added locally and not committed. Linux cloud, 4 CPUs, 15 GB, one run each.
+- References on the same 100 MB file: `zstd -3` 31.4 MB in 0.6 s; `zstd -19 --long=27` 19.0 MB in 119 s; `xz -9e` 17.1 MB in 153 s; `ikam put` of the single file 0.5 s (one plain blob).
+- Found on main:
+  - Repack is 95% of an ingest (commit about 4%, verify 1%), about 7 s a MB at 20 MB and 9 s a MB at 100 MB.
+  - Repack trains a dictionary, builds three alternative whole-store plans in parallel (`read_weight` under 2: dictionary without and with induced bases, and no dictionary), then recompresses: cheapest plain encodings, then one thread over every 64 KiB group trying block frames (4 and 16 KiB) and context frames (one or two related contents), each built at level 19 and kept only if cheaper.
+  - Most of those trials never win. At 5 MB: block frames 80 tried, 0 kept, 7.3 s; context frames 644 tried, 1 kept, 7.2 s, out of an 18.7 s recompress. At 100 MB: context frames 9,339 tried, 388 kept, 293 s; block frames 2,076 tried, 3 kept, 41 s.
+  - A block frame with a dictionary built a new level-19 compressor for every 4 KiB chunk, which indexes the whole dictionary each time (`ZSTD_updateTree` was 28% of samples in `perf`).
+  - Peak memory is about 14 times the input (1.39 GB at 100 MB): the store and the three plans are all held. At that rate enwik9 needs about 14 GB, close to an 18 GB laptop's memory.
+- Change:
+  - Fix (default): `zstd_frame` with a dictionary keeps the last compressor per thread and reuses it while the same dictionary (by BLAKE3) and level come back. zstd writes the same frames with a reused compressor, so the store is byte-identical.
+  - Option: `Repo::screen_trials`, `ikam --screen-trials` (off). Before a block or context trial is built at level 19, it is built at the measuring level (3) and scaled by the group's own level-19/level-3 size ratio; the trial goes on only if that estimate is within 5% (`SCREEN_MARGIN`) of the current cost. A trial whose estimate is wrong by more than 5% can be skipped though it would have won, so a store can come out slightly larger. The option is part of the repack fingerprint.
+- Results (stored bytes include every object; fsck clean and every file read back exact in all runs):
+
+  | input | binary | wall | repack | peak RSS | stored bytes |
+  | --- | --- | --- | --- | --- | --- |
+  | 5 MB | main | | 29.3 s | | 1,490,192 |
+  | | fix | | 20.4 s | | 1,490,192 |
+  | | fix + `--screen-trials` | | 15.1 s | | 1,490,192 |
+  | 20 MB | main | 149.1 s | 141.9 s | 380 MB | 5,944,876 |
+  | | fix | 111.2 s | 101.7 s | 381 MB | 5,944,876 |
+  | | fix + `--screen-trials` | **78.0 s** | 69.1 s | 339 MB | 5,945,123 (+0.004%) |
+  | 100 MB | main | 946.5 s | 895.8 s | 1,394 MB | 29,396,239 |
+  | | fix | 723.1 s | 673.0 s | 1,459 MB | 29,396,239 |
+  | | fix + `--screen-trials` | **478.3 s** | 428.7 s | 1,458 MB | 29,396,239 |
+
+  At 100 MB with screening, context frames tried fell from 9,339 to 533 with the same 388 kept; the sequential loop went from 373 to 133 s.
+- What is left (100 MB, screened): the three whole-store plans about 220 s, the loop 133 s (block trials about 49 s of it, for 3 wins), training and plain encodings the rest. Ingest is still about 4 times `zstd -19 --long`'s time and its store 55% larger: every page stays its own object, readable alone and shared by content, where a stream compressor sees one 128 MB window. Next to try: plan on a sample past a size instead of three whole-store plans; skip 4 KiB block trials where reads are rare; stream the plans so memory stops growing with the store.
+- Checks: `a_reused_dictionary_compressor_writes_the_same_frames` (a reused compressor's frames equal a fresh one's for 4 KiB chunks at both levels, and after switching dictionaries), `screened_trials_repack_to_an_exact_store` (300 wiki-like pages repacked with and without screening: every file exact, fsck clean, fingerprints differ). `cargo test --release`: 375 pass, 0 fail; clippy `-D warnings` clean.
+- Fixed benchmark (AGENTS.md section 7), this branch against main 437aef6 in the same session: stored bytes equal on every corpus; bytes, proxy and read scores equal (5.7493, 3.8185, 5.7140); north score 0.3060 both; every reconstruction exact and fsck clean. North repack CPU 65.9 s on main, 50.3 s here (wall 86.4 to 63.0 s). Cost score 0.2394 here, 0.2389 on main, within its timing noise.
+- Verdict: **kept** (a fix with no trade-off, the same bytes; `--screen-trials` an option, off).
+- Not measured: real enwik8 and enwik9 (the Mac has them; this corpus compresses further than real enwik8 and may have fewer context-frame wins); whether enwik9's ingest ran out of memory and swapped on the Mac (the likely reason it was slower than linear); more than one run each.
+- Run: `python3 -I experiments/enwik-speed/genwiki.py SEED.txt OUT.xml 100000000 1`; `python3 -I experiments/enwik-speed/splitwiki.py OUT.xml PAGES`; `ikam --store S [--screen-trials] ingest PAGES -m t`.

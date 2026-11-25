@@ -22,7 +22,7 @@ use std::cmp::Reverse;
 use std::collections::{BTreeSet, HashMap, HashSet};
 
 use crate::dict::{
-    DICT_REF, DICT_REF_LEN, MEASURE_LEVEL, STORE_LEVEL, block_frames, framer, is_plain, object_tag,
+    DICT_REF, DICT_REF_LEN, MEASURE_LEVEL, STORE_LEVEL, block_frames, block_frames_at, framer, is_plain, object_tag,
     tree_content, zstd_frame,
 };
 use crate::group::{GROUP_REF_LEN, member_span};
@@ -129,6 +129,9 @@ impl<S: Store + Sync> Repo<S> {
         if self.group_size != crate::group::GROUP_SIZE {
             h.update(b"group_size")
                 .update(&(self.group_size as u64).to_le_bytes());
+        }
+        if self.screen_trials {
+            h.update(b"screen_trials");
         }
         Ok(Id::from_bytes(*h.finalize().as_bytes()))
     }
@@ -369,6 +372,7 @@ impl<S: Store + Sync> Repo<S> {
         fresh.markup_layers = self.markup_layers;
         fresh.slow_codec_max = self.slow_codec_max;
         fresh.group_size = self.group_size;
+        fresh.screen_trials = self.screen_trials;
         fresh.deflate_memo = self.deflate_memo.clone();
         fresh.proposed_order = self.proposed_order.clone();
         if let Some(dict) = dict {
@@ -558,6 +562,21 @@ impl<S: Store + Sync> Repo<S> {
                         },
                     };
                     let mut cost = self.cost(&encoded, reads);
+                    // E390: with `screen_trials`, a trial is built at the
+                    // store level only if its fast estimate, scaled by this
+                    // content's own fast-to-store ratio, could win.
+                    let ratio = match self.screen_trials {
+                        true => {
+                            let dict = self.dictionary().map_or(&[][..], |(_, d)| d.as_slice());
+                            zstd_frame(&bytes, dict, MEASURE_LEVEL)
+                                .map(|z| encoded.len() as f64 / z.len().max(1) as f64)
+                        }
+                        false => None,
+                    };
+                    let hopeless = |fast: Option<usize>, extra: f64, cost: f64| {
+                        matches!((ratio, fast), (Some(r), Some(f))
+                            if f as f64 * r + extra >= cost * (1.0 + SCREEN_MARGIN))
+                    };
                     // A group may instead be stored as blocks, each its own
                     // frame with the dictionary: a member read decodes only
                     // the blocks it overlaps.
@@ -568,6 +587,12 @@ impl<S: Store + Sync> Repo<S> {
                             let floor = self.read_weight
                                 * model.block_reads(&id, bytes.len(), block) as f64;
                             if floor >= cost {
+                                continue;
+                            }
+                            let fast = || block_frames_at(&bytes, dict_bytes, block, MEASURE_LEVEL);
+                            if ratio.is_some()
+                                && hopeless(fast().map(|b| b.len() + 1 + DICT_REF_LEN), floor, cost)
+                            {
                                 continue;
                             }
                             let Some(body) = block_frames(&bytes, dict_bytes, block) else {
@@ -604,6 +629,14 @@ impl<S: Store + Sync> Repo<S> {
                                 continue;
                             }
                             let context: Vec<u8> = refs.iter().flat_map(|b| b.1.clone()).collect();
+                            let extra = self.read_weight
+                                * (reads + model.events(&id) * context.len()) as f64;
+                            if ratio.is_some() {
+                                let fast = zstd_frame(&bytes, &context, MEASURE_LEVEL);
+                                if hopeless(fast.map(|z| z.len() + 1 + 32 * refs.len()), extra, cost) {
+                                    continue;
+                                }
+                            }
                             let Some(z) = zstd_frame(&bytes, &context, STORE_LEVEL) else {
                                 continue;
                             };
@@ -1167,6 +1200,9 @@ fn shingles(bytes: &[u8]) -> HashSet<u64> {
 
 /// Block sizes a group may be stored in (see `dict::block_frames`).
 const BLOCKS: [usize; 2] = [4 * 1024, 16 * 1024];
+/// How far a trial's fast estimate may miss the best encoding so far and
+/// still be built at the store level (`Repo::screen_trials`, E390).
+const SCREEN_MARGIN: f64 = 0.05;
 
 impl ReadModel {
     pub(crate) fn times(&self, id: &Id) -> usize {
@@ -1331,6 +1367,46 @@ mod tests {
             assert!(size(&repo, id) <= b);
         }
         assert_eq!(repo.level, MEASURE_LEVEL);
+    }
+
+    /// E390: screened trials still repack to a store that reads back
+    /// exactly and passes fsck, and it is marked apart from an unscreened one.
+    #[test]
+    fn screened_trials_repack_to_an_exact_store() {
+        let page = |i: usize| {
+            format!(
+                "<page><title>Page {i}</title><text>{} [[Page {}]] {}</text></page>\n",
+                "shared wiki prose about rivers and towns ".repeat(3 + i % 11),
+                i / 3,
+                (0..i % 40).map(|k| format!("w{}", k * i % 97)).collect::<Vec<_>>().join(" ")
+            )
+            .into_bytes()
+        };
+        let pages: Vec<Vec<u8>> = (0..300).map(page).collect();
+        let mut fingerprints = Vec::new();
+        for screen in [false, true] {
+            let mut repo = Repo::new(MemStore::default());
+            repo.screen_trials = screen;
+            let ids: Vec<Id> = (pages.iter())
+                .map(|p| repo.put_content(p).unwrap().id)
+                .collect();
+            let entries = (ids.iter().enumerate())
+                .map(|(i, id)| crate::TreeEntry {
+                    name: format!("{i:04}.xml"),
+                    kind: crate::Kind::File,
+                    id: *id,
+                })
+                .collect();
+            let tree = repo.put(&Object::tree(entries).unwrap()).unwrap();
+            repo.commit("main", tree, "pages").unwrap();
+            fingerprints.push(repo.repack_fingerprint().unwrap());
+            repo.repack().unwrap();
+            for (id, p) in ids.iter().zip(&pages) {
+                assert_eq!(&repo.read_content(id).unwrap(), p);
+            }
+            assert!(repo.fsck().unwrap().is_empty());
+        }
+        assert_ne!(fingerprints[0], fingerprints[1]);
     }
 
     /// Ingest is greedy, so pair templates may overfit; induction finds one
