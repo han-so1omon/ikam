@@ -6598,9 +6598,24 @@ Gates on the branch (E229 to E233): every kernel test suite passes (release); cl
   | 200k | before | 316.1 s | 138.0 s | 1,416 MB |
   | | packed | 261.9 s | 114.8 s | 290 MB |
 
-  The store written at 25k pages is identical file for file. At that rate the index for enwik9 would take about 3.3 GB before and under 1 GB packed; whether that was what made the Mac swap is to be checked there.
+  The store written at 25k pages is identical file for file. The packed index saves memory, but it is not why enwik9's commit was slow (next bullet).
+- Third follow-up: what is slow in enwik9's commit. On the Mac, enwik9 with this branch and `--screen-trials` took 32,062 s (8.9 h; 33,116 s on main): commit about 6.6 h, repack 6,788 s (8,327 s on main), verify 947 s; 284,774,148 stored bytes (+15,023 from screening), fsck clean, rebuilt sha256 equal. During the commit ikam stayed under about 0.5 GB with no swap-outs, so memory does not explain it; the machine swapped in repack instead (peak RSS 6.39 GB, about 19 GB paged out; a VM also held about 2 GB).
+  - A stand-in for the bot-written pages that make up much of enwik9 after enwik8 (one census-stub template, names and numbers varying: `towns.py`) does reproduce it: commit time more than doubles when the page count doubles.
+  - Cause: when a new page's plan supersedes an older page's stored copy (a template shared with its neighbour, say), `apply_candidate` asks `is_needed` whether any stored encoding names that copy. With `needed_index` off, the default, that lists the store and reads every object, each time, so a commit of n near-identical pages reads O(n^2) objects. `perf`: `Store::read` 39% and `Store::ids` 7% of a 5,000-page commit, all under `apply_candidate`.
+  - The fix already exists as an option: `needed_index` (E129, `--needed-index`) keeps that set in memory. It assumes the handle is the store's only writer while open, so it stays off by default; a one-off `ikam ingest` or `commit` with nothing else writing the store fits that.
+
+  | town pages | `--needed-index` | commit wall | user | sys | peak RSS |
+  | --- | --- | --- | --- | --- | --- |
+  | 5,000 | off | 18.0 s | 5.2 s | 4.4 s | 15 MB |
+  | | on | 11.0 s | 3.0 s | 1.7 s | 15 MB |
+  | 10,000 | off | 40.7 s | 12.3 s | 10.8 s | 21 MB |
+  | | on | 24.7 s | 6.0 s | 5.9 s | 21 MB |
+  | 20,000 | off | 93.8 s | 33.2 s | 31.2 s | 31 MB |
+  | | on | 47.2 s | 12.6 s | 9.8 s | 31 MB |
+
+  Off, user time grows 2.4 and 2.7 times per doubling; on, 2.0 and 2.1 times. The 20,000-page stores are identical file for file. What is left on is mostly writing one file per object (wall is still about twice user time here). Not yet measured: enwik9's commit with `--needed-index` on the Mac.
 - Checks: `a_reused_dictionary_compressor_writes_the_same_frames` (a reused compressor's frames equal a fresh one's for 4 KiB chunks at both levels, and after switching dictionaries), `screened_trials_repack_to_an_exact_store` (300 wiki-like pages repacked with and without screening: every file exact, fsck clean, fingerprints differ), `parallel_trials_store_the_same_bytes` (400 pages, screening off and on: every stored object equal with 0 and 4 trial threads, every file exact, fsck clean, the same number of trial log lines), `the_packed_index_keeps_the_candidates_a_plain_map_would` (40 overlapping blobs, some added twice: every seed's candidates equal a plain map of vectors', in order, with full slots). `cargo test --release`: 377 pass, 0 fail (376 before the packed index); clippy `-D warnings` clean.
 - Fixed benchmark (AGENTS.md section 7), this branch against main 437aef6 in the same session: stored bytes equal on every corpus; bytes, proxy and read scores equal (5.7493, 3.8185, 5.7140); north score 0.3060 both; every reconstruction exact and fsck clean. North repack CPU 65.9 s on main, 50.3 s here (wall 86.4 to 63.0 s). Cost score 0.2394 here, 0.2389 on main, within its timing noise. Run again after the follow-up (the trial code moved into `Repo::trials`, options off): the same bytes on every corpus, north 0.3060, cost score 0.2435 (timing; its total time was the lowest of the three runs).
 - Verdict: **kept** (two fixes with no trade-off, the same bytes: the reused compressor and the packed seed index; `--screen-trials`, `--trial-threads` and `--trial-log` options, off; `--trial-threads` stores the same bytes and could become the default once measured on the Mac).
-- Not measured: real enwik8 and enwik9 (the Mac has them; this corpus compresses further than real enwik8 and may have fewer context-frame wins); whether enwik9's ingest ran out of memory and swapped on the Mac (the likely reason it was slower than linear); more than one run each.
-- Run: `python3 -I experiments/enwik-speed/genwiki.py SEED.txt OUT.xml 100000000 1`; `python3 -I experiments/enwik-speed/splitwiki.py OUT.xml PAGES`; `ikam --store S [--screen-trials] [--trial-threads 4] [--trial-log trials.tsv] ingest PAGES -m t`.
+- Not measured: enwik9's commit with `--needed-index`; repack's memory on enwik9 (it swapped); this stand-in compresses further than real enwik8 and may have fewer context-frame wins; more than one run each.
+- Run: `python3 -I experiments/enwik-speed/genwiki.py SEED.txt OUT.xml 100000000 1`; `python3 -I experiments/enwik-speed/splitwiki.py OUT.xml PAGES`; `python3 -I experiments/enwik-speed/towns.py PAGES 20000`; `ikam --store S [--screen-trials] [--trial-threads 4] [--trial-log trials.tsv] ingest PAGES -m t`.
