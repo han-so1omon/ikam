@@ -6537,3 +6537,46 @@ Gates on the branch (E229 to E233): every kernel test suite passes (release); cl
 - Verdict: **kept** (a fix, the paged first build, with no trade-off; `--hnsw-threads` an option, off).
 - Not measured: the Mac; real embeddings (clustered synthetic vectors stand in; recall on real text vectors may differ either way); a wider `ef` (a constant here: 80), which would trade query time for recall at 1M; keeping the graph across restarts; vectors changing while serving at 1M; more than one run each (build times on a shared cloud host move by tens of percent).
 - Run: `python3 -I experiments/vectors-1m/vec_1m.py WORK OUT.jsonl 100000,250000,500000,1000000 "exact=BRANCH:;exact-main=MAIN:;hnsw=BRANCH:--hnsw;hnsw4=BRANCH:--hnsw --hnsw-threads 4;hnsw-main@1000000=MAIN:--hnsw" 200`.
+
+### E393 mixed-load (db serve at 1M rows with appends, edits, reads and searches at once)
+- Branch / parent: exp/393-mixed-load / main 437aef6
+- Question: E383 and E385 bounded a loading server's seed index and E368 deferred its kv folds, each measured on a load alone. Does `db serve --live` hold up at 1M rows when appends, edits of old rows, point reads and ranked searches arrive together, and does the seed-index bound (50k, 250k, off) change memory, latency or store bytes there?
+- Harness (`experiments/mixed-load/mixed_load.py`): loads 1M of E354's indexed rows in 2,000-row batches, warms the BM25 view with one search, then for 300 s runs four clients at once: an appender (2,000 new rows a batch), an editor (500 upserts a batch, each a near-copy of an old row it replaces), a reader (point gets of random old rows) and a searcher (one ranked search a second; its pause is not timed). Resident memory every 10 s; after a restart a full count against the rows sent, then `ikam fsck`. One run each, 4-core cloud machine, nothing else running. The binary is E391's branch, so `--lean-ledger` can run beside the others; with it off the branch is main.
+- Results:
+
+  | 300 s mix at 1M rows | `--live --seed-index-max 50000` | `--live` (250k) | `--live --seed-index-max 0` | `--live --lean-ledger` |
+  |---|---|---|---|---|
+  | rows after a restart / sent | 1,106,000 / 1,106,000 | 1,100,000 / same | 1,102,000 / same | 1,098,000 / same |
+  | `fsck` | ok | ok | ok | ok |
+  | failed requests | 0 | 0 | 0 | 0 |
+  | append p50 / p99 | 5.18 / 33.8 s | 2.76 / 32.1 s | 2.01 / 33.4 s | 2.30 / 33.7 s |
+  | edit p50 / p99 | 5.17 / 33.8 s | 2.34 / 32.1 s | 2.01 / 33.4 s | 2.31 / 33.8 s |
+  | get p50 / p99 | 0.9 ms / 9.8 s | 1.0 ms / 10.2 s | 0.9 ms / 9.2 s | 1.0 ms / 10.8 s |
+  | search p50 / p99 | 8.8 / 34.4 s | 9.9 / 32.7 s | 9.4 / 34.0 s | 9.7 / 34.3 s |
+  | resident at the start / end of the mix | 1,688 / 4,320 MB | 1,702 / 3,689 MB | 3,966 / 6,296 MB | 1,011 / 3,491 MB |
+  | store per row | 1,516.1 B | 1,513.6 B | 1,516.4 B | 1,511.5 B |
+
+- What it shows:
+  - Nothing is lost: every acknowledged row is there after a restart and `fsck` is clean in every run.
+  - The seed-index bound costs no store bytes here, even with edits that are near-copies of rows written long before the bound dropped their seeds: 50k, 250k and unbounded store within 0.2% of each other per row. Unbounded costs 2.3 GB more memory for nothing. The 250k default in `--live` stays right; 50k saves no memory once the search view is built (the view dominates).
+  - The latency is the BM25 live view's (E329/E369), not the bound's. Each search brings the view to the head under the writer's lock, so appends and edits wait behind it (p50 2 to 5 s against about 0.1 s alone, E394's run). Every 50,000 changed rows (`merge_rows`, a twentieth of the table) the delta is folded into the base (`bm25_live_update` then `bm25_view_update`), about 33 s under the lock; that is every p99 above, in all four columns, and each fold adds 1.1 to 1.3 GB of resident memory that stays (the steps in the curves at about 120 s and 250 s). Point gets run on readers, yet their p99 is 9 to 11 s too; most likely they wait when a new reader has to be made from the locked writer (not traced).
+  - `--lean-ledger` (E391) starts the mix 0.7 GB lower and grows the same way.
+- Win line (steady p99s, no growth over the run, fsck clean): only fsck clean is met. The cause is one place, named below.
+- Verdict: **measured** (a harness and a finding; no kernel change).
+- Next: fold the BM25 delta into the base outside the writer's lock and swap it in (the lock would then cover only the changes since the fold began; E394 showed a full build off the lock is too slow, a fold of 50,000 rows is not a build); keep the delta's mark count in its stats node instead of listing every mark on each update (`graph_prefix(&delta, "k…")` in `bm25_live_update` reads all marked rows each second); find what holds the 1.1 to 1.3 GB after each fold. Until then, a table searched while it is written heavily pays a stall of about the first build's length every `merge_rows` changed rows.
+- Not measured: the Mac; more than one run each; a longer mix (only two or three folds per run); searches less often than once a second; `--views` beside the search view.
+- Run: `python3 -I experiments/mixed-load/mixed_load.py IKAM_BIN WORK 1000000 300 "--live --seed-index-max 50000;--live;--live --seed-index-max 0;--live --lean-ledger"`.
+
+### E395 sealed-seeds (a seed sidecar for sealed packs), not built
+- Branch / parent: none (reported in E393's PR) / main 437aef6
+- Question: past the seed-index bound (E383, E385), writes that would slice against older contents store them again. Would a sidecar of sorted seeds for each sealed pack, read by interpolation search, recover those bytes at the bound's memory?
+- Plan's win line: store bytes within 1% of unbounded at no more than the bounded memory.
+- Finding (E393, 1M rows with edits that near-copy old rows): the bound already stores within 0.2% of unbounded per row (1,516.1 B at 50k, 1,513.6 B at 250k, 1,516.4 B unbounded). There is nothing for a sidecar to recover on this workload, so it was not built. E383 found the same on a load alone (bounds wrote 2 to 4% fewer bytes in a test of 40 view edits).
+- Verdict: **not-applicable** (no headroom).
+- Where it could matter: large files edited in place or copied with small changes long after they were written (documents, not 150-byte rows), where a slice against old content saves kilobytes per write. That needs a corpus of its own before a sidecar is worth building.
+
+### E396 hash-anchors (seed anchors chosen by hash), not built
+- Branch / parent: none (reported in E393's PR) / main 437aef6
+- Question: on E395's sidecar, keep an anchor when its hash mod K is 0 instead of every K-th, so copies of the same bytes anywhere pick the same anchors.
+- Finding: it stacks on E395, which was not built for want of headroom (above).
+- Verdict: **not-applicable** (depends on E395). It belongs with E395 if a document-sized corpus shows headroom.
