@@ -95,18 +95,6 @@ pub struct Kept {
     pub keep: bool,
     /// E389 (off: 1): threads that link a graph's first build.
     pub threads: usize,
-    /// E394 (off): build a prefix's first BM25 view on a reader, outside
-    /// the writer's lock (`build_off_lock` in dbserve.rs).
-    pub off_lock: bool,
-    /// E394: one build at a time per database and prefix.
-    building: Mutex<HashMap<Key, Arc<Mutex<()>>>>,
-}
-
-/// A fresh BM25 view of `prefix` at `db`, merged into its base once its
-/// delta marks a twentieth of the rows (at least 1,000).
-pub fn bm25_build<S: Store>(r: &mut Repo<S>, db: &Db, prefix: &str) -> Result<Bm25Live, Error> {
-    let rows = r.db_count_prefix(db, prefix)?;
-    r.bm25_live_build(db, prefix, (rows / 20).max(1000))
 }
 
 /// How a server searches: its vector index and whether it keeps BM25
@@ -117,8 +105,6 @@ pub struct SearchOpts {
     pub keep: bool,
     /// E389: `--hnsw-threads N` (off: 1).
     pub threads: usize,
-    /// E394: `--build-off-lock` (off).
-    pub off_lock: bool,
 }
 
 /// The ref a kept BM25 view of `prefix` in `name` lives on: `p` and the
@@ -275,50 +261,6 @@ fn hits(list: &[(String, f32)], k: usize) -> Response {
 }
 
 impl Kept {
-    /// E394: whether a BM25 view of `prefix` in `name` is held, in memory
-    /// or on its kept ref (then read into memory). The caller holds the
-    /// writer's lock as `w`.
-    pub fn bm25_held<S: Store>(&self, w: &mut Repo<S>, name: &str, prefix: &str) -> bool {
-        let key = (name.to_string(), prefix.to_string());
-        let mut kept = self.bm25.lock().unwrap();
-        if kept.contains_key(&key) {
-            return true;
-        }
-        if self.keep
-            && let Ok(Some(held)) = w.bm25_live_load(&bm25_ref(name, prefix))
-        {
-            kept.insert(key, held);
-            return true;
-        }
-        false
-    }
-
-    /// E394: hold `v`, a view built at `db` off the writer's lock, unless
-    /// one is held already; the next `bm25_at` brings it to its head.
-    pub fn bm25_put(&self, name: &str, prefix: &str, db: Db, v: Bm25Live) {
-        let key = (name.to_string(), prefix.to_string());
-        self.bm25.lock().unwrap().entry(key).or_insert((db, v));
-    }
-
-    /// The BM25 view held for `prefix` in `name` and the database it is at.
-    #[cfg(test)]
-    pub fn bm25_held_view(&self, name: &str, prefix: &str) -> Option<(Db, Bm25Live)> {
-        let key = (name.to_string(), prefix.to_string());
-        self.bm25.lock().unwrap().get(&key).copied()
-    }
-
-    /// E394: the lock a build of `prefix` in `name` holds, so a second
-    /// search of a prefix being built waits for that build.
-    pub fn build_gate(&self, name: &str, prefix: &str) -> Arc<Mutex<()>> {
-        let key = (name.to_string(), prefix.to_string());
-        self.building
-            .lock()
-            .unwrap()
-            .entry(key)
-            .or_default()
-            .clone()
-    }
-
     /// The BM25 view of `prefix` in `name`, at `db` (built or updated under
     /// the writer's lock, which the caller holds as `w`).
     pub fn bm25_at<S: Store>(
@@ -344,7 +286,10 @@ impl Kept {
                 return Ok(v);
             }
             Some((at, v)) => w.bm25_live_update(&v, &at, db, prefix)?,
-            None => bm25_build(w, db, prefix)?,
+            None => {
+                let rows = w.db_count_prefix(db, prefix)?;
+                w.bm25_live_build(db, prefix, (rows / 20).max(1000))?
+            }
         };
         // A view that cannot be kept is still served; the next restart
         // builds it again.

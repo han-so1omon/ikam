@@ -362,13 +362,6 @@ impl<S: Store> Server<S> {
         self
     }
 
-    /// Build a prefix's first BM25 view off the writer's lock (E394; off
-    /// by default; needs readers, `--concurrent-reads`).
-    pub fn build_off_lock(mut self, on: bool) -> Server<S> {
-        self.search.off_lock = on;
-        self
-    }
-
     /// Keep BM25 views on refs across restarts (E369; off by default).
     pub fn keep_search(mut self, keep: bool) -> Server<S> {
         self.search.keep = keep;
@@ -683,13 +676,6 @@ fn search<S: Store>(srv: &Server<S>, name: &str, req: &Request) -> Response {
         Ok(q) => q,
         Err(r) => return r,
     };
-    if let Some(p) = q.keyword_prefix()
-        && srv.search.off_lock
-        && srv.readers.is_some()
-        && let Err(e) = build_off_lock(srv, name, p)
-    {
-        return fail(e);
-    }
     let (db, bm25) = {
         let mut w = srv.writer.lock().unwrap();
         let db = match open(&srv.heads, &mut w, name) {
@@ -705,27 +691,6 @@ fn search<S: Store>(srv: &Server<S>, name: &str, req: &Request) -> Response {
         }
     };
     srv.read(|r| srv.search.answer(r, name, &db, bm25, &q, req))
-}
-
-/// E394 (`--build-off-lock`, off): a prefix's first BM25 view is built on a
-/// reader at the head it saw, outside the writer's lock, so appends and
-/// other reads go on while it builds; `bm25_at` then brings it to the
-/// head under the lock (`bm25_live_update`, E369's path), as it does a
-/// view kept from an earlier run. The view is the same one; only the
-/// lock is held for less time.
-fn build_off_lock<S: Store>(srv: &Server<S>, name: &str, prefix: &str) -> Result<(), Error> {
-    let gate = srv.search.build_gate(name, prefix);
-    let _one = gate.lock().unwrap();
-    let db = {
-        let mut w = srv.writer.lock().unwrap();
-        if srv.search.bm25_held(&mut w, name, prefix) {
-            return Ok(());
-        }
-        open(&srv.heads, &mut w, name)?.1
-    };
-    let v = srv.read(|r| crate::dbsearch::bm25_build(r, &db, prefix))?;
-    srv.search.bm25_put(name, prefix, db, v);
-    Ok(())
 }
 
 /// `GET views` and `GET view` (E361): the views are brought to the head
@@ -920,7 +885,6 @@ pub fn serve<S: Store + Send + 'static>(
             .vector_index(search.index)
             .vector_threads(search.threads)
             .keep_search(search.keep)
-            .build_off_lock(search.off_lock)
             .views(views)
             .shared_store(shared),
     );
@@ -1522,71 +1486,6 @@ mod tests {
                     searched(shared, index, defer);
                 }
             }
-        }
-    }
-
-    #[test]
-    fn a_search_view_built_off_the_lock_is_the_same_view() {
-        // E394: a server that builds a prefix's first view on a reader, at
-        // the head it saw, holds the same view as one that builds it under
-        // the writer's lock, whether or not appends land between the build
-        // and the search, and answers the same.
-        let words = ["json", "parser", "images", "schema", "quick", "files"];
-        let rows = |from: usize, n: usize, tag: &str| {
-            let ev: Vec<Event> = (from..from + n)
-                .map(|i| {
-                    let text = format!(
-                        "{} {} {} row {i}",
-                        words[i % 6],
-                        words[(i / 6) % 6],
-                        words[(i * 7) % 6]
-                    );
-                    Event::upsert(&format!("t/{i:05}"), text.as_bytes(), &format!("{tag}{i}"))
-                })
-                .collect();
-            encode_events(&ev)
-        };
-        let ct = [("content-type", EVENTS)];
-        let server = |off: bool| {
-            let store = ikam_kernel::SharedStore::new(MemStore::default());
-            let make: ReaderFactory<_> = Box::new(|w: &Repo<_>| w.sibling());
-            Server::new(Repo::new(store), Some(make)).build_off_lock(off)
-        };
-        let q = "/db/s/search?q=json+schema&prefix=t/&k=20";
-        for moved in [false, true] {
-            let (on, off) = (server(false), server(true));
-            for st in [&on, &off] {
-                assert_eq!(
-                    handle(st, &req("POST", "/db/s/append", &rows(0, 3000, "a"), &ct)).status,
-                    200
-                );
-            }
-            if moved {
-                // Each builds at the head before the second batch: the
-                // locked one by a search, the other off the lock, as when
-                // appends land while it builds.
-                assert_eq!(handle(&on, &req("GET", q, b"", &[])).status, 200);
-                build_off_lock(&off, "s", "t/").unwrap();
-                for st in [&on, &off] {
-                    let more = rows(2500, 1200, "b");
-                    assert_eq!(
-                        handle(st, &req("POST", "/db/s/append", &more, &ct)).status,
-                        200
-                    );
-                }
-            }
-            let (a, b) = (
-                handle(&on, &req("GET", q, b"", &[])),
-                handle(&off, &req("GET", q, b"", &[])),
-            );
-            assert_eq!((a.status, b.status), (200, 200));
-            assert_eq!(a.body, b.body, "moved {moved}");
-            assert_eq!(keys_of(&a).len(), 20);
-            assert_eq!(
-                on.search.bm25_held_view("s", "t/"),
-                off.search.bm25_held_view("s", "t/"),
-                "moved {moved}"
-            );
         }
     }
 

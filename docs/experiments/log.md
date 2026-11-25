@@ -6537,3 +6537,22 @@ Gates on the branch (E229 to E233): every kernel test suite passes (release); cl
 - Verdict: **kept** (a fix, the paged first build, with no trade-off; `--hnsw-threads` an option, off).
 - Not measured: the Mac; real embeddings (clustered synthetic vectors stand in; recall on real text vectors may differ either way); a wider `ef` (a constant here: 80), which would trade query time for recall at 1M; keeping the graph across restarts; vectors changing while serving at 1M; more than one run each (build times on a shared cloud host move by tens of percent).
 - Run: `python3 -I experiments/vectors-1m/vec_1m.py WORK OUT.jsonl 100000,250000,500000,1000000 "exact=BRANCH:;exact-main=MAIN:;hnsw=BRANCH:--hnsw;hnsw4=BRANCH:--hnsw --hnsw-threads 4;hnsw-main@1000000=MAIN:--hnsw" 200`.
+
+### E394 search-off-lock (a first ranked search over a large table, and appends)
+- Branch / parent: exp/394-search-off-lock / main 437aef6
+- Question: a table's first ranked search builds its BM25 view under the writer's lock (`bm25_at`), so appends wait for the whole build. Can the build run on a reader, outside the lock, and keep appends going?
+- Change (option, on the branch only): `db serve --build-off-lock` (off; needs `--concurrent-reads`, which `--live` implies). The first search of a prefix builds the view on a reader at the head it saw (`bm25_build`, factored out of `bm25_at`), outside the lock, one build per prefix at a time (`build_gate`); `bm25_at` then brings it to the head under the lock with `bm25_live_update` (E369's path), as for a view kept from an earlier run, and saves it (`--keep-search`, in `--live`). Test: `a_search_view_built_off_the_lock_is_the_same_view`.
+- Results (`experiments/search-off-lock/off_lock.py`: 1M E354 rows, a restart, then a writer sending 2,000-row batches and a head reader every 0.2 s for 60 s, the first ranked search, and 60 s more; one run each, 4-core cloud machine; peak is VmHWM):
+
+  | 1M rows | `--live` | `--live --build-off-lock` |
+  |---|---|---|
+  | first search | 36.7 s | 147.0 s |
+  | appends while it ran | 1 (it waited 34.7 s) | 81 (p50 157 ms), one waited 51.8 s |
+  | head reads while it ran, p99 | 13 ms | 210 ms |
+  | rows appended over the run | 264,000 | 390,000 |
+  | peak memory | 4,164 MB | 7,453 MB |
+
+  Appends go on while the view is built, but the build takes four times as long with the writer running beside it, and bringing the view from the head it was built at to the head after 80 more batches (about 160,000 rows, then the save) takes longer under the lock than the whole locked build did. The longest stall of an append grew from 35 to 52 s, the search waited four times as long and peak memory rose by 3.3 GB (the reader's build and the writer's caches at once).
+- Verdict: **discarded** (the code stays on the branch, not in the PR). Moving the build alone moves the stall to the update. What could work: bring the view forward outside the lock in rounds until the gap is small, and save it outside the lock, so the lock covers only the last few batches; and an incremental update that costs less per row than a build (here 160,000 changed rows took longer than building 1M).
+- Not measured: the Mac; more than one run; the split of the 52 s between `bm25_live_update` and the save; a smaller table, where the build is short either way.
+- Run: `python3 -I experiments/search-off-lock/off_lock.py IKAM_BIN WORK 1000000 60 60 "--live;--live --build-off-lock"` on the branch's binary.
