@@ -45,18 +45,24 @@ def one(binary, work, rows, pre, post, flags):
     s = d.Server(binary, os.path.join(w, "store"), flags.split())
     s.start()
     for start in range(0, rows, BATCH):
-        assert s.append(d.events(b"big", start, BATCH, b"load"), 1800)[1]
+        n = min(BATCH, rows - start)
+        assert s.append(d.events(b"big", start, n, b"load"), 1800)[1]
     s.stop()
     s.start()
     appends, heads, done = [], [], [False]
-    nxt = [rows]
+    nxt, failed = [rows], []
 
     def writer():
+        # Counts only batches the server accepted; a failure stops the run.
         while not done[0]:
             start = nxt[0]
-            nxt[0] += BATCH
             t = time.time()
-            s.req("POST", "/db/t/append", d.events(b"big", start, BATCH, b"w"), 1800)
+            try:
+                s.req("POST", "/db/t/append", d.events(b"big", start, BATCH, b"w"), 1800)
+            except Exception as e:
+                failed.append(repr(e))
+                return
+            nxt[0] += BATCH
             appends.append((t, time.time() - t))
 
     def header():
@@ -77,6 +83,9 @@ def one(binary, work, rows, pre, post, flags):
     done[0] = True
     for t in ts:
         t.join()
+    if failed:
+        s.stop()
+        raise RuntimeError("an append failed: %s" % failed[0])
     again = s.req("GET", Q, None, 1800)
     hwm = status(s.proc.pid, "VmHWM")
     s.stop()
