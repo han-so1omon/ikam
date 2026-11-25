@@ -6537,3 +6537,24 @@ Gates on the branch (E229 to E233): every kernel test suite passes (release); cl
 - Verdict: **kept** (a fix, the paged first build, with no trade-off; `--hnsw-threads` an option, off).
 - Not measured: the Mac; real embeddings (clustered synthetic vectors stand in; recall on real text vectors may differ either way); a wider `ef` (a constant here: 80), which would trade query time for recall at 1M; keeping the graph across restarts; vectors changing while serving at 1M; more than one run each (build times on a shared cloud host move by tens of percent).
 - Run: `python3 -I experiments/vectors-1m/vec_1m.py WORK OUT.jsonl 100000,250000,500000,1000000 "exact=BRANCH:;exact-main=MAIN:;hnsw=BRANCH:--hnsw;hnsw4=BRANCH:--hnsw --hnsw-threads 4;hnsw-main@1000000=MAIN:--hnsw" 200`.
+
+### E391 lean-ledger (a loading server's ledger of derivations)
+- Branch / parent: exp/391-lean-ledger / main 437aef6
+- Question: with the seed index bounded (E383, `--seed-index-max`), a 1M-row load through `db serve --live` still grows about 1 MB every 1,000 rows. What holds it, and can it stop growing with the same store?
+- Profile (valgrind massif, 400k rows with `--live --seed-index-max 50000`; one run, not committed): of a 380 MB heap, 170 MB was the arguments of every derivation the ledger keeps decoded in memory (`Vec<Arg>` in `Ledger::by_output`); the ledger is a cache of records already in the store.
+- Change (option): `Repo::lean_ledger` and `db serve --lean-ledger` (off; not part of `--live`). The ledger keeps, for each output, the ids of the records that derive it, not the decoded derivations; a lookup reads those records from the store (`read_derivations`, `each_derivations`). `has_output` and `outputs_from` answer from the ids alone. Repack and the library walk derivations through `each_derivations`, so they work with either ledger.
+- Results (`experiments/seed-index/load_mem.py`: E354's indexed rows in 2,000-row batches; one run each, 4-core cloud machine, with other runs sharing it; resident is VmRSS):
+
+  | 1M rows | `--live --seed-index-max 50000` | + `--lean-ledger` | `--live` (250k bound) | + `--lean-ledger` |
+  |---|---|---|---|---|
+  | resident at 1M | 1,026 MB | **293 MB** | 1,036 MB | **299 MB** |
+  | growth, 500k to 1M rows | 0.98 MB per 1,000 | 0.10 MB per 1,000 | 1.07 MB per 1,000 | 0.15 MB per 1,000 |
+  | load time | 330 s | 355 s | 365 s | 379 s |
+  | store | 1,123.5 MB | same bytes | 1,124.1 MB | same bytes |
+  | count after a restart | 1,000,000 | 1,000,000 | 1,000,000 | 1,000,000 |
+
+  Point reads (`experiments/lean-ledger/read_lat.py`: 200k rows, a restart, then 3,000 random gets, two runs each): p50 0.80 against 0.79 ms, p99 1.55 and 1.76 against 1.29 and 2.22 ms (noise both ways), the same bytes read, resident 100 against 74 MB. The fixed benchmark: bytes, proxy, read and north scores equal to main (5.7493, 3.8185, 5.7140, 0.3060); only timing fields differ.
+- Checks (380 kernel tests pass, release with `--features embed`; clippy `-D warnings` clean; new in tests/lean_ledger.rs): reads and every derivation the same with either ledger; a lean ledger through repack and `gc`, with reads and `fsck` after; a full one the same; a lean handle refreshing derivations another handle wrote. `db_live` checks `--lean-ledger` is not implied by `--live`.
+- Verdict: **kept** (an option, off: memory that stops growing with the load, for a store read on each derivation lookup and a 4 to 8% slower load here).
+- Not measured: the Mac; a workload heavy in derivation lookups (repack of a large store, the library's walks), where each lookup now reads records; more than one load run each; a mixed read and write load (E393).
+- Run: `python3 -I experiments/seed-index/load_mem.py IKAM_BIN WORK 1000000 100000 "--live --seed-index-max 50000;--live --seed-index-max 50000 --lean-ledger;--live;--live --lean-ledger"`, and `python3 -I experiments/lean-ledger/read_lat.py IKAM_BIN WORK 200000 3000 "--live;--live --lean-ledger"`.

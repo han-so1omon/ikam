@@ -43,7 +43,7 @@ const USAGE: &str = "usage: ikam [--store DIR] [--short-records] [--slow-codec-m
   ls [REV[:PATH]] [-r]             list a directory of REV (default main)
   grep TEXT [REV]                  files of REV containing TEXT, with lines
   stats [REV]                      objects and bytes the store holds
-  db serve [--live] [--packs] [--plain-events] [--no-object-templates] [--concurrent-reads] [--edit-index] [--plain-writes] [--hnsw] [--hnsw-threads N] [--keep-search] [--no-keep-search] [--shared-store] [--skip-unchanged] [--keep-counts N] [--defer-kv N] [--seed-index-max N] [--views FILE] [--plain-view-writes] [--keep-views] [--keep-on-hangup] [PORT]
+  db serve [--live] [--packs] [--plain-events] [--no-object-templates] [--concurrent-reads] [--edit-index] [--plain-writes] [--hnsw] [--hnsw-threads N] [--lean-ledger] [--keep-search] [--no-keep-search] [--shared-store] [--skip-unchanged] [--keep-counts N] [--defer-kv N] [--seed-index-max N] [--views FILE] [--plain-view-writes] [--keep-views] [--keep-on-hangup] [PORT]
                                    the store's databases over HTTP, for programs
                                    (default port 8740, 127.0.0.1 only; dbserve.rs);
                                    --live turns on the options a live database
@@ -54,7 +54,8 @@ const USAGE: &str = "usage: ikam [--store DIR] [--short-records] [--slow-codec-m
                                    ignores SIGHUP (E374); --skip-unchanged drops
                                    upserts of a key's current value (E376, off);
                                    --hnsw-threads N links --hnsw's first build on
-                                   N threads (E389, off)
+                                   N threads (E389, off); --lean-ledger keeps
+                                   record ids in memory, not derivations (E391, off)
   host --config FILE [PORT]        several separate projects in one process, each
                                    its own store, users and limits, chosen by Host
                                    name; crossing only through scoped shares (host.rs)
@@ -207,7 +208,7 @@ fn main() -> ExitCode {
 }
 
 /// `ikam db serve [--live] [--packs] [--plain-events] [--no-object-templates]
-/// [--concurrent-reads] [--edit-index] [--seed-index-max N] [--plain-writes] [--hnsw] [--hnsw-threads N] [--keep-search] [--no-keep-search] [--shared-store] [--skip-unchanged] [--keep-counts N] [--defer-kv N]
+/// [--concurrent-reads] [--edit-index] [--seed-index-max N] [--plain-writes] [--hnsw] [--hnsw-threads N] [--lean-ledger] [--keep-search] [--no-keep-search] [--shared-store] [--skip-unchanged] [--keep-counts N] [--defer-kv N]
 /// [--views FILE] [--plain-view-writes] [--keep-views]
 /// [--allow-host NAME]...
 /// [--log-requests] [--keep-on-hangup] [PORT]`:
@@ -243,6 +244,10 @@ fn main() -> ExitCode {
 /// searches them with a graph (E332: about 0.93 of the exact top 10);
 /// `--hnsw-threads N` (E389, off) links the graph's first build on N
 /// threads, a slightly different graph (E332's `with_threads`).
+/// `--lean-ledger` (E391, off; not under `--live`) keeps only the record ids
+/// of each content's derivations in memory and reads the records from the
+/// store when a content is rebuilt, so a long-running server grows less
+/// per row at the cost of a read and decode per rebuild.
 /// `--keep-search` (E369, off; on under `--live`) keeps each BM25 view on a ref, so a
 /// restarted server reads it back instead of building it on the first
 /// query (E358: 8.6 s for 64 MB of text); the ref keeps the view's data
@@ -296,7 +301,7 @@ fn main() -> ExitCode {
 fn db_cmd(store_dir: &str, args: &[String]) -> Result<(), String> {
     let mut args = args.to_vec();
     if args.first().map(String::as_str) != Some("serve") {
-        return Err("usage: ikam [--store DIR] db serve [--live] [--packs] [--plain-events] [--no-object-templates] [--concurrent-reads] [--edit-index] [--plain-writes] [--hnsw] [--hnsw-threads N] [--keep-search] [--no-keep-search] [--shared-store] [--skip-unchanged] [--keep-counts N] [--defer-kv N] [--seed-index-max N] [--views FILE] [--plain-view-writes] [--keep-views] [--allow-host NAME]... [--log-requests] [--keep-on-hangup] [PORT]".into());
+        return Err("usage: ikam [--store DIR] db serve [--live] [--packs] [--plain-events] [--no-object-templates] [--concurrent-reads] [--edit-index] [--plain-writes] [--hnsw] [--hnsw-threads N] [--lean-ledger] [--keep-search] [--no-keep-search] [--shared-store] [--skip-unchanged] [--keep-counts N] [--defer-kv N] [--seed-index-max N] [--views FILE] [--plain-view-writes] [--keep-views] [--allow-host NAME]... [--log-requests] [--keep-on-hangup] [PORT]".into());
     }
     args.remove(0);
     let keep_on_hangup = take_switch(&mut args, "--keep-on-hangup");
@@ -418,6 +423,7 @@ fn db_flags(
     let seed_index_max = seed_index_max.unwrap_or(if live { LIVE_SEED_INDEX_MAX } else { 0 });
     let shared_store = take("--shared-store");
     let skip_unchanged = take("--skip-unchanged");
+    let lean_ledger = take("--lean-ledger");
     let opts = DbServeOpts {
         concurrent_reads,
         edit_index,
@@ -432,6 +438,7 @@ fn db_flags(
         skip_unchanged,
         seed_index_max,
         hnsw_threads: 1,
+        lean_ledger,
     };
     (packs, log_requests, opts)
 }
@@ -461,6 +468,8 @@ struct DbServeOpts {
     seed_index_max: usize,
     /// E389: threads linking a graph's first build (1: one at a time).
     hnsw_threads: usize,
+    /// E391: the ledger keeps record ids, not decoded derivations.
+    lean_ledger: bool,
 }
 
 /// `db serve` on `store`; with `concurrent_reads` the store is shared, so
@@ -496,6 +505,7 @@ fn serve_db<S: ikam_kernel::Store + Send + Sync + 'static>(
         r.plain_hot_writes = o.plain_writes;
         r.seed_index_max = o.seed_index_max;
         r.refresh_ledger = o.shared_store;
+        r.lean_ledger = o.lean_ledger;
         if o.edit_index {
             // E232: plan against what each edit reads (E133's scope and
             // hints), not an index of every stored object built on the
@@ -1265,6 +1275,7 @@ mod tests {
             skip_unchanged: false,
             seed_index_max: LIVE_SEED_INDEX_MAX,
             hnsw_threads: 1,
+            lean_ledger: false,
         };
         let mut a = v(&["--live", "8752"]);
         assert_eq!(db_flags(&mut a, 0, None, None), (true, false, all));
@@ -1287,6 +1298,14 @@ mod tests {
             ..all
         };
         assert_eq!(db_flags(&mut a, 3, None, None), (true, true, counted));
+        // E391: --lean-ledger is its own switch, not part of --live.
+        let mut a = v(&["--live", "--lean-ledger"]);
+        let lean = DbServeOpts {
+            lean_ledger: true,
+            ..all
+        };
+        assert_eq!(db_flags(&mut a, 0, None, None), (true, false, lean));
+        assert!(a.is_empty());
         assert!(a.is_empty());
         let mut a = v(&["8740"]);
         let off = DbServeOpts {
@@ -1303,6 +1322,7 @@ mod tests {
             skip_unchanged: false,
             seed_index_max: 0,
             hnsw_threads: 1,
+            lean_ledger: false,
         };
         assert_eq!(db_flags(&mut a, 0, None, None), (false, false, off));
         // E357: `--plain-writes` is its own option, not part of `--live`.
