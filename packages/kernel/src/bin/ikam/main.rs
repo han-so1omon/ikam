@@ -38,7 +38,7 @@ use ikam_kernel::{Arg, FsStore, Id, Object, Repo, snapshot};
 
 use corpus::{err, lookup};
 
-const USAGE: &str = "usage: ikam [--store DIR] [--short-records] [--slow-codec-max BYTES] [--group-size BYTES] [--needed-index] [--read-memo] [--screen-trials] <command>
+const USAGE: &str = "usage: ikam [--store DIR] [--short-records] [--slow-codec-max BYTES] [--group-size BYTES] [--needed-index] [--read-memo] [--screen-trials] [--trial-threads N|all] [--trial-log FILE] <command>
   ingest DIR [-m MSG] [--ref REF]  commit DIR, repack, verify; print what it cost
   ls [REV[:PATH]] [-r]             list a directory of REV (default main)
   grep TEXT [REV]                  files of REV containing TEXT, with lines
@@ -578,6 +578,15 @@ fn run(store_dir: &str, args: &mut Vec<String>) -> Result<(), String> {
     if let Some(i) = args.iter().position(|a| a == "--screen-trials") {
         args.remove(i);
         repo.screen_trials = true;
+    }
+    if let Some(n) = take_flag(args, "--trial-threads") {
+        repo.trial_threads = match n.as_str() {
+            "all" => std::thread::available_parallelism().map_or(1, |n| n.get()),
+            n => n.parse().map_err(|_| "--trial-threads N|all".to_string())?,
+        };
+    }
+    if let Some(path) = take_flag(args, "--trial-log") {
+        repo.trial_log = Some(path.into());
     }
     if let Some(n) = take_flag(args, "--slow-codec-max") {
         repo.slow_codec_max = n
