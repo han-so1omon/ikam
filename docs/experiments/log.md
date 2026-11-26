@@ -6537,3 +6537,23 @@ Gates on the branch (E229 to E233): every kernel test suite passes (release); cl
 - Verdict: **kept** (a fix, the paged first build, with no trade-off; `--hnsw-threads` an option, off).
 - Not measured: the Mac; real embeddings (clustered synthetic vectors stand in; recall on real text vectors may differ either way); a wider `ef` (a constant here: 80), which would trade query time for recall at 1M; keeping the graph across restarts; vectors changing while serving at 1M; more than one run each (build times on a shared cloud host move by tens of percent).
 - Run: `python3 -I experiments/vectors-1m/vec_1m.py WORK OUT.jsonl 100000,250000,500000,1000000 "exact=BRANCH:;exact-main=MAIN:;hnsw=BRANCH:--hnsw;hnsw4=BRANCH:--hnsw --hnsw-threads 4;hnsw-main@1000000=MAIN:--hnsw" 200`.
+### E404 disk-guard (`--disk-guard`: refuse what will not fit, and free what a full disk left)
+
+- Branch / parent: exp/404-disk-guard / main 437aef6
+- Question: Kumo's disk manager checks for space before an ingest, marks finished builds and evicts orphans on start. What does ikam do when the disk fills, does anything half-built get read after a kill, and would a check before large writes help? (Night 3 of the trip-week plan, from the Kumo ideas, M4; pairs with E398.)
+- On main (Linux cloud, a 48 MB tmpfs as the store's disk): ingesting 58 MB failed with only `No space left on device (os error 28)`. The ref stayed where it was and fsck passed, but the disk was left 100% full of objects no ref reaches until `ikam gc` removed them (332 and 321 objects in two runs, 1,656 for 3,000 small files). A repack on the full disk did nothing (`applied=false`).
+- Nothing half-built is read: objects are named by their content, and a ref moves only after all it reaches is written, so an interrupted command leaves only unreachable objects. Checked with `experiments/disk-guard/kill_build.py`: `db serve --live` on E399's 200k-row store was killed with SIGKILL 0.5, 1.5 and 2.4 s into a table's first search, which builds the BM25 view and keeps it on a ref (a full build takes 3.0 to 3.3 s here). In 6 of 6 kills the search ref was not there afterwards, the search after a restart built afresh and gave the same hits as an uninterrupted build, and fsck was clean. So the completion markers Kumo needs are not needed here; the gap is the disk left full.
+- Change: `--disk-guard` (off), `src/bin/ikam/diskguard.rs`. Before `ingest`, `commit DIR` and `repack`, the store disk's free space (statvfs) is compared with an estimate. Input counts at least one filesystem block per file. An ingest is estimated at twice its input plus the store (its objects, then repack's rewrite), a commit at its input, a repack at the store's size. Short of the estimate plus a tenth (1 to 64 MiB), the command refuses before writing, saying what it needs and what is free. If a guarded command still runs out of space, the store's `gc` removes what it wrote, and the message says nothing was committed, every ref is as it was, and how many objects were removed. Like `ikam gc`, that is only safe while the command is the store's only writer (an FsStore has no store-wide lock); the module documents it. Test `the_guard_refuses_what_does_not_fit_and_passes_what_does`.
+- Run (same 48 MB disk, the branch binary):
+
+  | case | main | `--disk-guard` |
+  | --- | --- | --- |
+  | ingest 58 MB | os error 28 after writing; disk 100% full | refused before writing (needs 121.5 MB, 48.8 MB free); disk unchanged |
+  | ingest 1.5 MB | works | works (repack applied, fsck clean) |
+  | commit of 3,000 files of 100 bytes (12 MB as 4 KiB blocks), 6.6 MB free | os error 28; disk 100% full until `gc` | refused before writing (needs 12.3 MB) |
+  | the same before the per-file block was counted, so the estimate passed | | os error 28, then 1,656 objects removed; disk back to 87%; ref and fsck as before |
+
+- Checks: `cargo test --release --features embed`: 377 pass, 0 fail; clippy `-D warnings` clean.
+- Fixed benchmark (AGENTS.md section 7): unchanged. The change is in the CLI binary only and off by default.
+- Verdict: **kept** as an option (off by default). The kill check needs no change, since nothing half-built is reachable.
+- Not measured: the Mac, and its SanDisk drive; a 1M-row view build (200k here); `db serve`'s own writes on a full disk (an append fails and its leftovers wait for `gc`); a store-wide lock, so gc could run beside other writers.

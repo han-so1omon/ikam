@@ -18,6 +18,7 @@ mod dav;
 mod dbsearch;
 mod dbserve;
 mod dbviews;
+mod diskguard;
 mod host;
 mod http;
 mod json;
@@ -38,7 +39,7 @@ use ikam_kernel::{Arg, FsStore, Id, Object, Repo, snapshot};
 
 use corpus::{err, lookup};
 
-const USAGE: &str = "usage: ikam [--store DIR] [--short-records] [--slow-codec-max BYTES] [--group-size BYTES] [--needed-index] [--read-memo] <command>
+const USAGE: &str = "usage: ikam [--store DIR] [--disk-guard] [--short-records] [--slow-codec-max BYTES] [--group-size BYTES] [--needed-index] [--read-memo] <command>
   ingest DIR [-m MSG] [--ref REF]  commit DIR, repack, verify; print what it cost
   ls [REV[:PATH]] [-r]             list a directory of REV (default main)
   grep TEXT [REV]                  files of REV containing TEXT, with lines
@@ -197,8 +198,32 @@ fn main() -> ExitCode {
             }
         };
     }
-    match run(&store_dir, &mut args) {
+    // E404: off unless asked.
+    let disk_guard = match args.iter().position(|a| a == "--disk-guard") {
+        Some(i) => {
+            args.remove(i);
+            true
+        }
+        None => false,
+    };
+    match run(&store_dir, &mut args, disk_guard) {
         Ok(()) => ExitCode::SUCCESS,
+        Err(msg) if disk_guard && diskguard::out_of_space(&msg) => {
+            // The command stopped part way: only objects no ref reaches were
+            // written. Free them now rather than leave the disk full.
+            let freed = FsStore::open(&store_dir)
+                .map_err(err)
+                .and_then(|s| Repo::new(s).gc().map_err(err));
+            match freed {
+                Ok(n) => say!(
+                    "{msg}\nthe store's disk filled up; nothing was committed and every ref is as it was; removed the {n} objects it had written (gc)"
+                ),
+                Err(e) => say!(
+                    "{msg}\nthe store's disk filled up; nothing was committed; gc of what it wrote failed too ({e}), run ikam gc once there is room"
+                ),
+            }
+            ExitCode::FAILURE
+        }
         Err(msg) => {
             say!("{msg}");
             ExitCode::FAILURE
@@ -561,7 +586,7 @@ fn quiet_on_closed_stdout() {
     }));
 }
 
-fn run(store_dir: &str, args: &mut Vec<String>) -> Result<(), String> {
+fn run(store_dir: &str, args: &mut Vec<String>, disk_guard: bool) -> Result<(), String> {
     let mut repo = Repo::new(FsStore::open(store_dir).map_err(err)?);
     if let Some(i) = args.iter().position(|a| a == "--short-records") {
         args.remove(i);
@@ -590,6 +615,13 @@ fn run(store_dir: &str, args: &mut Vec<String>) -> Result<(), String> {
     let message = take_flag(args, "-m").unwrap_or_default();
     let refname = take_flag(args, "--ref").unwrap_or_else(|| "main".into());
     let by = take_flag(args, "--by");
+    if disk_guard
+        && let Some(cmd) = args.first()
+        && let Some((need, what)) =
+            diskguard::estimate(cmd, args.get(1).map(String::as_str), Path::new(store_dir))
+    {
+        diskguard::check(Path::new(store_dir), need, &what)?;
+    }
     let arg = |i: usize| args.get(i).cloned().ok_or_else(|| USAGE.to_string());
     match args.first().map(String::as_str) {
         Some("put") => {
