@@ -35,6 +35,10 @@ const VERSIONS: &[&str] = &["2024-11-05", "2025-03-26", "2025-06-18", "2025-11-2
 /// `ikam live` and `host` serve (E360), so the same handlers answer both.
 pub struct Session<L: DerefMut<Target = Live> = Box<Live>> {
     pub live: L,
+    /// E407 (`--skills [PATH]`, off): serve skills; `Some(None)` is the
+    /// built-in skill only, `Some(Some(PATH))` adds each skill folder under
+    /// PATH at the session's ref head.
+    pub skills: Option<Option<String>>,
 }
 
 /// E388 (off): `--rank-files` builds the file ranker at start rather than
@@ -83,10 +87,12 @@ pub fn run(
     refname: &str,
     passage_index: bool,
     rank: &RankFlags,
+    skills: Option<Option<String>>,
     input: impl BufRead,
     mut output: impl Write,
 ) -> Result<(), String> {
     let mut s = Session::open(store_dir, refname)?;
+    s.skills = skills;
     if passage_index {
         s.live.index_passages();
     }
@@ -117,6 +123,7 @@ impl Session {
         live.index_all(false)?;
         Ok(Session {
             live: Box::new(live),
+            skills: None,
         })
     }
 }
@@ -162,11 +169,28 @@ impl<L: DerefMut<Target = Live>> Session<L> {
             Err((code, message, data)) => return Some(error_data(id, code, &message, data)),
         }
         let result = match method {
-            "initialize" => initialize(&params),
+            "initialize" => initialize(&params, self.skills.is_some()),
             "ping" => Json::Obj(Vec::new()),
             "tools/list" => obj(vec![("tools", Json::Arr(tools()))]),
             "tools/call" => self.tools_call(&params),
-            _ => return Some(error(id, -32601, &format!("method not found: {method}"))),
+            _ => match self.skills_method(method, &params) {
+                Some(Ok(mut r)) => {
+                    // The extension's own results carry its cache fields
+                    // in either era.
+                    if matches!(
+                        method,
+                        "skills/list" | "skills/get" | "resources/directory/read"
+                    ) && let Json::Obj(f) = &mut r
+                    {
+                        f.push(("resultType".into(), s("complete")));
+                        f.push(("ttlMs".into(), Json::Num(0.0)));
+                        f.push(("cacheScope".into(), s("private")));
+                    }
+                    r
+                }
+                Some(Err((code, m))) => return Some(error(id, code, &m)),
+                None => return Some(error(id, -32601, &format!("method not found: {method}"))),
+            },
         };
         Some(obj(vec![
             ("jsonrpc", s("2.0")),
@@ -177,15 +201,23 @@ impl<L: DerefMut<Target = Live>> Session<L> {
 
     /// A 2026-07-28 request, already checked by `modern_request`.
     fn handle_modern(&mut self, id: Json, method: &str, params: &Json) -> Json {
-        let (mut result, cacheable) = match method {
-            "server/discover" => (obj(discover_fields()), true),
-            "tools/list" => (obj(vec![("tools", Json::Arr(tools()))]), true),
-            "tools/call" => (self.tools_call(params), false),
+        let (mut result, ttl) = match method {
+            "server/discover" => (
+                obj(discover_fields(self.skills.is_some())),
+                Some(LIST_TTL_MS),
+            ),
+            "tools/list" => (obj(vec![("tools", Json::Arr(tools()))]), Some(LIST_TTL_MS)),
+            "tools/call" => (self.tools_call(params), None),
             // `initialize` and `ping` are gone from this era; every other
             // method is unknown to both.
-            _ => return error(id, -32601, &format!("method not found: {method}")),
+            _ => match self.skills_method(method, params) {
+                // Skills change with a commit: cacheable, but stale at once.
+                Some(Ok(r)) => (r, Some(0)),
+                Some(Err((code, m))) => return error(id, code, &m),
+                None => return error(id, -32601, &format!("method not found: {method}")),
+            },
         };
-        modern_result(&mut result, cacheable);
+        modern_result(&mut result, ttl);
         obj(vec![("jsonrpc", s("2.0")), ("id", id), ("result", result)])
     }
 
@@ -734,6 +766,10 @@ pub const LIST_TTL_MS: u64 = 3_600_000;
 const INSTRUCTIONS: &str = "A versioned file store. Edits wait in the working tree until commit, which takes your message. \
                Revisions (at, from, to) are a commit id or prefix, a ref, or work (the working tree, the default).";
 
+/// E407: with `--skills`, the instructions point to the built-in skill.
+const SKILL_INSTRUCTIONS: &str = "A versioned file store: edits wait until commit, which takes your message.\n\
+               How to use it: skill://ikam-store/SKILL.md (a skill, or read it as a resource).";
+
 /// Whether a request is in the 2026-07-28 envelope (`true`), the handshake
 /// era (`false`), or a malformed or unsupported modern request (`Err`: code,
 /// message, data). Only the version key marks a request as modern, so a
@@ -774,11 +810,29 @@ fn modern_request(method: &str, params: &Json) -> Result<bool, (i64, String, Opt
     }
 }
 
-fn capabilities() -> Json {
-    obj(vec![(
-        "tools",
-        obj(vec![("listChanged", Json::Bool(false))]),
-    )])
+fn capabilities(skills: bool) -> Json {
+    let mut c = vec![("tools", obj(vec![("listChanged", Json::Bool(false))]))];
+    if skills {
+        // E407: skills ride on resources; the extension is declared in
+        // `extensions`, which is listed only when an extension is on.
+        c.push(("resources", Json::Obj(Vec::new())));
+        c.push((
+            "extensions",
+            obj(vec![(
+                SKILLS_EXT,
+                obj(vec![("directoryRead", Json::Bool(true))]),
+            )]),
+        ));
+    }
+    obj(c)
+}
+
+fn instructions(skills: bool) -> &'static str {
+    if skills {
+        SKILL_INSTRUCTIONS
+    } else {
+        INSTRUCTIONS
+    }
 }
 
 fn server_info() -> Json {
@@ -789,7 +843,7 @@ fn server_info() -> Json {
 }
 
 /// `server/discover`'s fields, before `modern_result` adds the era's own.
-fn discover_fields() -> Vec<(&'static str, Json)> {
+fn discover_fields(skills: bool) -> Vec<(&'static str, Json)> {
     let versions = VERSIONS
         .iter()
         .chain(MODERN_VERSIONS)
@@ -797,26 +851,29 @@ fn discover_fields() -> Vec<(&'static str, Json)> {
         .collect();
     vec![
         ("supportedVersions", Json::Arr(versions)),
-        ("capabilities", capabilities()),
-        ("instructions", s(INSTRUCTIONS)),
+        ("capabilities", capabilities(skills)),
+        ("instructions", s(instructions(skills))),
     ]
 }
 
 /// What every 2026-07-28 result carries: `resultType`, the server's info in
-/// `_meta`, and for the cacheable lists a time to keep them (`private`:
+/// `_meta`, and for a cacheable result a time to keep it (`private`:
 /// a store's server is one person's).
-fn modern_result(result: &mut Json, cacheable: bool) {
+fn modern_result(result: &mut Json, ttl_ms: Option<u64>) {
     if let Json::Obj(f) = result {
         f.push(("resultType".into(), s("complete")));
-        if cacheable {
-            f.push(("ttlMs".into(), Json::Num(LIST_TTL_MS as f64)));
+        if let Some(ttl) = ttl_ms {
+            f.push(("ttlMs".into(), Json::Num(ttl as f64)));
             f.push(("cacheScope".into(), s("private")));
         }
-        f.push(("_meta".into(), obj(vec![(SERVER_INFO, server_info())])));
+        match f.iter_mut().find(|(k, _)| k == "_meta") {
+            Some((_, Json::Obj(m))) => m.push((SERVER_INFO.into(), server_info())),
+            _ => f.push(("_meta".into(), obj(vec![(SERVER_INFO, server_info())]))),
+        }
     }
 }
 
-fn initialize(params: &Json) -> Json {
+fn initialize(params: &Json, skills: bool) -> Json {
     let asked = params
         .get("protocolVersion")
         .and_then(Json::as_str)
@@ -828,10 +885,500 @@ fn initialize(params: &Json) -> Json {
     };
     obj(vec![
         ("protocolVersion", s(version)),
-        ("capabilities", capabilities()),
+        ("capabilities", capabilities(skills)),
         ("serverInfo", server_info()),
-        ("instructions", s(INSTRUCTIONS)),
+        ("instructions", s(instructions(skills))),
     ])
+}
+
+// ---- E407: skills (`--skills [PATH]`) --------------------------------------
+
+const SKILLS_EXT: &str = "io.modelcontextprotocol/skills";
+
+/// Skills a `skills/list` page holds.
+pub const SKILLS_PAGE: usize = 50;
+/// The extension's limits on one skill: refused above them, never cut.
+pub const SKILL_MAX_FILES: usize = 512;
+pub const SKILL_MAX_BYTES: u64 = 16 << 20;
+
+const BUILTIN: &str = "ikam-store";
+const BUILTIN_SKILL_MD: &[u8] = include_bytes!("skills/ikam-store/SKILL.md");
+
+/// `--skills [PATH]` out of `args`: `None` when absent; a following
+/// argument that is not a flag is PATH.
+pub fn take_skills(args: &mut Vec<String>) -> Option<Option<String>> {
+    let i = args.iter().position(|a| a == "--skills")?;
+    args.remove(i);
+    if i < args.len() && !args[i].starts_with("--") {
+        Some(Some(args.remove(i)))
+    } else {
+        Some(None)
+    }
+}
+
+/// One skill: its folder's files, `SKILL.md` first, the rest by path.
+struct Skill {
+    name: String,
+    description: String,
+    /// The frontmatter's other top-level keys with a value on their line,
+    /// passed through as the extension asks (`true`/`false` as booleans,
+    /// the rest as strings). Keys whose value is nested are left out.
+    other: Vec<(String, Json)>,
+    files: Vec<(String, Vec<u8>)>,
+}
+
+type Front = (String, String, Vec<(String, Json)>);
+
+/// `name`, `description` and the other top-level keys from a `SKILL.md`'s
+/// frontmatter.
+fn frontmatter(md: &[u8]) -> Result<Front, String> {
+    let text = std::str::from_utf8(md).map_err(|_| "SKILL.md is not UTF-8".to_string())?;
+    let mut lines = text.lines();
+    if lines.next().map(str::trim) != Some("---") {
+        return Err("SKILL.md has no frontmatter".into());
+    }
+    let (mut name, mut description, mut other) = (None, None, Vec::new());
+    for l in lines {
+        if l.trim() == "---" {
+            break;
+        }
+        // Top-level keys only: an indented or list line belongs to a key
+        // above it.
+        if l.starts_with([' ', '\t', '-', '#']) {
+            continue;
+        }
+        if let Some((k, v)) = l.split_once(':') {
+            let v = v.trim().trim_matches('"').trim_matches('\'').to_string();
+            match k.trim() {
+                "name" => name = Some(v),
+                "description" => description = Some(v),
+                _ if v.is_empty() => {}
+                k if !other.iter().any(|(o, _)| o == k) => other.push((
+                    k.to_string(),
+                    match v.as_str() {
+                        "true" => Json::Bool(true),
+                        "false" => Json::Bool(false),
+                        _ => s(&v),
+                    },
+                )),
+                _ => {}
+            }
+        }
+    }
+    match (name, description) {
+        (Some(n), Some(d)) if !n.is_empty() && !d.is_empty() => Ok((n, d, other)),
+        _ => Err("SKILL.md frontmatter needs name and description".into()),
+    }
+}
+
+/// A skill entry as the extension defines it: the `SKILL.md` uri, the
+/// frontmatter, and every file once (`SKILL.md` first) with its digest and
+/// size.
+fn manifest(k: &Skill) -> Json {
+    let resources = k
+        .files
+        .iter()
+        .map(|(path, bytes)| {
+            obj(vec![
+                ("uri", s(&format!("skill://{}/{path}", k.name))),
+                ("digest", s(&format!("sha256:{}", hex(&sha256(bytes))))),
+                ("size", Json::Num(bytes.len() as f64)),
+            ])
+        })
+        .collect();
+    let mut front = vec![
+        ("name".to_string(), s(&k.name)),
+        ("description".to_string(), s(&k.description)),
+    ];
+    front.extend(k.other.iter().cloned());
+    obj(vec![
+        ("uri", s(&format!("skill://{}/SKILL.md", k.name))),
+        ("frontmatter", Json::Obj(front)),
+        ("resources", Json::Arr(resources)),
+    ])
+}
+
+/// `skill://NAME/REST` as (NAME, REST); REST may be empty.
+fn skill_uri(uri: &str) -> Result<(&str, &str), (i64, String)> {
+    let rest = uri
+        .strip_prefix("skill://")
+        .ok_or_else(|| (-32602, format!("not a skill:// uri: {uri}")))?;
+    let (name, path) = rest.split_once('/').unwrap_or((rest, ""));
+    if name.is_empty() || path.split('/').any(|p| p == "..") {
+        return Err((-32602, format!("bad skill uri: {uri}")));
+    }
+    Ok((name, path.trim_end_matches('/')))
+}
+
+fn mime(path: &str, text: bool) -> &'static str {
+    match (path.rsplit('.').next(), text) {
+        (Some("md"), true) => "text/markdown",
+        (_, true) => "text/plain",
+        _ => "application/octet-stream",
+    }
+}
+
+impl<L: DerefMut<Target = Live>> Session<L> {
+    /// A skills or resources method's result, `None` when skills are off or
+    /// the method is not one of theirs.
+    #[allow(clippy::type_complexity)]
+    fn skills_method(
+        &mut self,
+        method: &str,
+        params: &Json,
+    ) -> Option<Result<Json, (i64, String)>> {
+        self.skills.as_ref()?;
+        let uri = || {
+            params
+                .get("uri")
+                .and_then(Json::as_str)
+                .map(String::from)
+                .ok_or_else(|| (-32602, "missing uri".to_string()))
+        };
+        Some(match method {
+            "skills/list" => self.skills_list(params.get("cursor").and_then(Json::as_str)),
+            "skills/get" => uri().and_then(|u| {
+                let (name, _) = skill_uri(&u)?;
+                Ok(obj(vec![("skill", manifest(&self.skill(name)?))]))
+            }),
+            "resources/list" => self.skills_resources(),
+            "resources/read" => uri().and_then(|u| self.skill_read(&u)),
+            "resources/directory/read" => uri().and_then(|u| self.skill_dir(&u)),
+            _ => return None,
+        })
+    }
+
+    /// Every skill: the built-in first, then the store's by name, and the
+    /// folders refused with their reasons.
+    fn all_skills(&mut self) -> (Vec<Skill>, Vec<(String, String)>) {
+        let (name, description, other) = frontmatter(BUILTIN_SKILL_MD).expect("built-in skill");
+        let mut skills = vec![Skill {
+            name,
+            description,
+            other,
+            files: vec![("SKILL.md".into(), BUILTIN_SKILL_MD.to_vec())],
+        }];
+        let mut refused = Vec::new();
+        if let Some(Some(root)) = self.skills.clone() {
+            match self.store_skills(&root) {
+                Ok(found) => {
+                    for (folder, k) in found {
+                        match k {
+                            Ok(k) if k.name == BUILTIN => {
+                                refused.push((folder, "the built-in skill has this name".into()))
+                            }
+                            Ok(k) => skills.push(k),
+                            Err(why) => refused.push((folder, why)),
+                        }
+                    }
+                }
+                Err(why) => refused.push((root, why)),
+            }
+        }
+        for (folder, why) in &refused {
+            say!("skills: {folder} not listed: {why}");
+        }
+        (skills, refused)
+    }
+
+    /// The skill folders under `root` at the session's ref head (never
+    /// pending edits): each folder with a `SKILL.md`, read whole or refused.
+    #[allow(clippy::type_complexity)]
+    fn store_skills(&mut self, root: &str) -> Result<Vec<(String, Result<Skill, String>)>, String> {
+        let head = self.live.refname.clone();
+        let Ok(tree) = self.tree_at(Some(&head)) else {
+            return Ok(Vec::new()); // no commit on the ref yet
+        };
+        let root = live::norm(root);
+        let Some((Kind::Tree, dir)) = self.stat_in(tree, &root)? else {
+            return Err(format!("{root}: not a folder at the head of {head}"));
+        };
+        let mut out = Vec::new();
+        for e in self.live.entries(&dir)?.iter() {
+            if e.kind != Kind::Tree {
+                continue;
+            }
+            let has_md = self
+                .live
+                .entries(&e.id)?
+                .iter()
+                .any(|f| f.name == "SKILL.md" && f.kind == Kind::File);
+            if !has_md {
+                continue;
+            }
+            let folder = format!("{root}/{}", e.name)
+                .trim_start_matches('/')
+                .to_string();
+            out.push((folder, self.read_skill(&e.name, e.id)));
+        }
+        Ok(out)
+    }
+
+    fn read_skill(&mut self, folder: &str, dir: Id) -> Result<Skill, String> {
+        // Count and size every file before reading any, so a refused skill
+        // costs only its listing.
+        let mut paths = Vec::new();
+        let mut stack = vec![(String::new(), dir)];
+        let mut total = 0u64;
+        while let Some((prefix, id)) = stack.pop() {
+            for e in self.live.entries(&id)?.iter() {
+                let path = format!("{prefix}{}", e.name);
+                match e.kind {
+                    Kind::Tree => stack.push((format!("{path}/"), e.id)),
+                    Kind::File => {
+                        total += self.live.size(&e.id)?;
+                        paths.push((path, e.id));
+                    }
+                    Kind::Graph => {}
+                }
+            }
+            if paths.len() > SKILL_MAX_FILES {
+                return Err(format!(
+                    "more than {SKILL_MAX_FILES} files (the extension's limit)"
+                ));
+            }
+            if total > SKILL_MAX_BYTES {
+                return Err(format!(
+                    "{total} bytes or more, over {SKILL_MAX_BYTES} (the extension's limit)"
+                ));
+            }
+        }
+        paths.sort_by(|a, b| (a.0 != "SKILL.md", &a.0).cmp(&(b.0 != "SKILL.md", &b.0)));
+        let mut files = Vec::with_capacity(paths.len());
+        for (path, id) in paths {
+            files.push((path, self.live.read(&id)?.to_vec()));
+        }
+        let (name, description, other) = frontmatter(&files[0].1)?;
+        if name != folder {
+            return Err(format!("its SKILL.md names it {name}, not {folder}"));
+        }
+        Ok(Skill {
+            name,
+            description,
+            other,
+            files,
+        })
+    }
+
+    fn skill(&mut self, name: &str) -> Result<Skill, (i64, String)> {
+        let (skills, refused) = self.all_skills();
+        if let Some(k) = skills.into_iter().find(|k| k.name == name) {
+            return Ok(k);
+        }
+        match refused
+            .iter()
+            .find(|(f, _)| f.rsplit('/').next() == Some(name))
+        {
+            Some((f, why)) => Err((-32602, format!("skill {name} refused ({f}): {why}"))),
+            None => Err((-32602, format!("no skill {name}"))),
+        }
+    }
+
+    fn skills_list(&mut self, cursor: Option<&str>) -> Result<Json, (i64, String)> {
+        let start = match cursor {
+            None => 0,
+            Some(c) => c
+                .parse::<usize>()
+                .map_err(|_| (-32602, format!("bad cursor: {c}")))?,
+        };
+        let (skills, refused) = self.all_skills();
+        let page: Vec<Json> = skills
+            .iter()
+            .skip(start)
+            .take(SKILLS_PAGE)
+            .map(manifest)
+            .collect();
+        let mut f = vec![("skills", Json::Arr(page))];
+        if start + SKILLS_PAGE < skills.len() {
+            f.push(("nextCursor", s(&(start + SKILLS_PAGE).to_string())));
+        }
+        if !refused.is_empty() {
+            let r = refused
+                .iter()
+                .map(|(folder, why)| obj(vec![("folder", s(folder)), ("reason", s(why))]))
+                .collect();
+            f.push(("_meta", obj(vec![("ikam/refused", Json::Arr(r))])));
+        }
+        Ok(obj(f))
+    }
+
+    /// Each skill's `SKILL.md` as a resource, for a client without skills.
+    fn skills_resources(&mut self) -> Result<Json, (i64, String)> {
+        let (skills, _) = self.all_skills();
+        let r = skills
+            .iter()
+            .map(|k| {
+                obj(vec![
+                    ("uri", s(&format!("skill://{}/SKILL.md", k.name))),
+                    ("name", s(&k.name)),
+                    ("description", s(&k.description)),
+                    ("mimeType", s("text/markdown")),
+                ])
+            })
+            .collect();
+        Ok(obj(vec![("resources", Json::Arr(r))]))
+    }
+
+    fn skill_read(&mut self, uri: &str) -> Result<Json, (i64, String)> {
+        let (name, path) = skill_uri(uri)?;
+        let k = self.skill(name)?;
+        let path = if path.is_empty() { "SKILL.md" } else { path };
+        let Some((_, bytes)) = k.files.iter().find(|(p, _)| p == path) else {
+            return Err((-32602, format!("no file {path} in skill {name}")));
+        };
+        let uri = format!("skill://{name}/{path}");
+        let content = match std::str::from_utf8(bytes) {
+            Ok(text) => obj(vec![
+                ("uri", s(&uri)),
+                ("mimeType", s(mime(path, true))),
+                ("text", s(text)),
+            ]),
+            Err(_) => obj(vec![
+                ("uri", s(&uri)),
+                ("mimeType", s(mime(path, false))),
+                ("blob", s(&base64(bytes))),
+            ]),
+        };
+        Ok(obj(vec![("contents", Json::Arr(vec![content]))]))
+    }
+
+    /// A skill folder's direct children as the extension's `resources`:
+    /// folders as `inode/directory` (no trailing `/`), files with their
+    /// type.
+    fn skill_dir(&mut self, uri: &str) -> Result<Json, (i64, String)> {
+        let (name, dir) = skill_uri(uri)?;
+        let k = self.skill(name)?;
+        let prefix = if dir.is_empty() {
+            String::new()
+        } else {
+            format!("{dir}/")
+        };
+        let mut entries: Vec<Json> = Vec::new();
+        let mut seen = std::collections::BTreeSet::new();
+        for (path, bytes) in &k.files {
+            let Some(rest) = path.strip_prefix(&prefix) else {
+                continue;
+            };
+            match rest.split_once('/') {
+                Some((sub, _)) => {
+                    if seen.insert(sub.to_string()) {
+                        entries.push(obj(vec![
+                            ("uri", s(&format!("skill://{name}/{prefix}{sub}"))),
+                            ("name", s(sub)),
+                            ("mimeType", s("inode/directory")),
+                        ]));
+                    }
+                }
+                None => entries.push(obj(vec![
+                    ("uri", s(&format!("skill://{name}/{path}"))),
+                    ("name", s(rest)),
+                    (
+                        "mimeType",
+                        s(mime(path, std::str::from_utf8(bytes).is_ok())),
+                    ),
+                ])),
+            }
+        }
+        if entries.is_empty() {
+            return Err((-32602, format!("no folder {dir} in skill {name}")));
+        }
+        Ok(obj(vec![("resources", Json::Arr(entries))]))
+    }
+}
+
+/// SHA-256 (FIPS 180-4), for the extension's `sha256:` digests. A short
+/// local implementation rather than a crate: the kernel pins its
+/// dependencies, and digests here cover at most 16 MiB a skill.
+pub fn sha256(data: &[u8]) -> [u8; 32] {
+    const K: [u32; 64] = [
+        0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4,
+        0xab1c5ed5, 0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe,
+        0x9bdc06a7, 0xc19bf174, 0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f,
+        0x4a7484aa, 0x5cb0a9dc, 0x76f988da, 0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7,
+        0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967, 0x27b70a85, 0x2e1b2138, 0x4d2c6dfc,
+        0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85, 0xa2bfe8a1, 0xa81a664b,
+        0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070, 0x19a4c116,
+        0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
+        0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7,
+        0xc67178f2,
+    ];
+    let mut h: [u32; 8] = [
+        0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab,
+        0x5be0cd19,
+    ];
+    let mut msg = data.to_vec();
+    let bits = (data.len() as u64).wrapping_mul(8);
+    msg.push(0x80);
+    while msg.len() % 64 != 56 {
+        msg.push(0);
+    }
+    msg.extend_from_slice(&bits.to_be_bytes());
+    for block in msg.chunks_exact(64) {
+        let mut w = [0u32; 64];
+        for (i, c) in block.chunks_exact(4).enumerate() {
+            w[i] = u32::from_be_bytes([c[0], c[1], c[2], c[3]]);
+        }
+        for i in 16..64 {
+            let s0 = w[i - 15].rotate_right(7) ^ w[i - 15].rotate_right(18) ^ (w[i - 15] >> 3);
+            let s1 = w[i - 2].rotate_right(17) ^ w[i - 2].rotate_right(19) ^ (w[i - 2] >> 10);
+            w[i] = w[i - 16]
+                .wrapping_add(s0)
+                .wrapping_add(w[i - 7])
+                .wrapping_add(s1);
+        }
+        let [mut a, mut b, mut c, mut d, mut e, mut f, mut g, mut hh] = h;
+        for i in 0..64 {
+            let s1 = e.rotate_right(6) ^ e.rotate_right(11) ^ e.rotate_right(25);
+            let ch = (e & f) ^ (!e & g);
+            let t1 = hh
+                .wrapping_add(s1)
+                .wrapping_add(ch)
+                .wrapping_add(K[i])
+                .wrapping_add(w[i]);
+            let s0 = a.rotate_right(2) ^ a.rotate_right(13) ^ a.rotate_right(22);
+            let maj = (a & b) ^ (a & c) ^ (b & c);
+            let t2 = s0.wrapping_add(maj);
+            hh = g;
+            g = f;
+            f = e;
+            e = d.wrapping_add(t1);
+            d = c;
+            c = b;
+            b = a;
+            a = t1.wrapping_add(t2);
+        }
+        for (x, y) in h.iter_mut().zip([a, b, c, d, e, f, g, hh]) {
+            *x = x.wrapping_add(y);
+        }
+    }
+    let mut out = [0u8; 32];
+    for (i, v) in h.iter().enumerate() {
+        out[i * 4..i * 4 + 4].copy_from_slice(&v.to_be_bytes());
+    }
+    out
+}
+
+fn hex(b: &[u8]) -> String {
+    b.iter().map(|x| format!("{x:02x}")).collect()
+}
+
+/// Standard base64 with padding, for a binary skill file's `blob`.
+fn base64(b: &[u8]) -> String {
+    const A: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(b.len().div_ceil(3) * 4);
+    for c in b.chunks(3) {
+        let n = (c[0] as u32) << 16
+            | (*c.get(1).unwrap_or(&0) as u32) << 8
+            | *c.get(2).unwrap_or(&0) as u32;
+        for i in 0..4 {
+            if i <= c.len() {
+                out.push(A[(n >> (18 - 6 * i) & 63) as usize] as char);
+            } else {
+                out.push('=');
+            }
+        }
+    }
+    out
 }
 
 fn tools() -> Vec<Json> {
@@ -1208,6 +1755,365 @@ mod tests {
             .handle(r#"{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{"_meta":{"progressToken":1}}}"#)
             .unwrap();
         assert_eq!(p.encode(), legacy_list.encode());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn sha256_and_base64_match_known_vectors() {
+        let h = |d: &[u8]| hex(&sha256(d));
+        assert_eq!(
+            h(b""),
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        );
+        assert_eq!(
+            h(b"abc"),
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+        assert_eq!(
+            h(b"abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq"),
+            "248d6a61d20638b8e5c026930c3e6039a33ce45964ff2167f6ecedd419db06c1"
+        );
+        assert_eq!(
+            h(&vec![b'a'; 1_000_000]),
+            "cdc76e5c9914fb9281a1c7e284d73e67f1809a48a497200e046d39ccc7112cd0"
+        );
+        // Lengths at the padding edges (55, 56, 63, 64 bytes) against each
+        // other's prefix property is not a check; compare with known digests.
+        assert_eq!(
+            h(&[b'a'; 64]),
+            "ffe054fe7ae0cb6dc65c3af9b61d5209f439851db43d0ba5997337df154668eb"
+        );
+        assert_eq!(base64(b""), "");
+        assert_eq!(base64(b"f"), "Zg==");
+        assert_eq!(base64(b"fo"), "Zm8=");
+        assert_eq!(base64(b"foobar"), "Zm9vYmFy");
+        assert_eq!(base64(&[0xff, 0xfe, 0x00]), "//4A");
+    }
+
+    fn rpc(s: &mut Session, id: u32, method: &str, params: &str) -> Json {
+        s.handle(&format!(
+            r#"{{"jsonrpc":"2.0","id":{id},"method":"{method}","params":{params}}}"#
+        ))
+        .unwrap()
+    }
+
+    fn result(r: &Json) -> &Json {
+        r.get("result").unwrap_or_else(|| panic!("{}", r.encode()))
+    }
+
+    /// name -> (digest, size) for every file of every listed skill, after
+    /// checking each against the bytes `resources/read` serves.
+    fn listed(s: &mut Session) -> Vec<(String, String, f64)> {
+        let mut out = Vec::new();
+        let r = rpc(s, 1, "skills/list", "{}");
+        // The extension's cache fields, in this (handshake) era too.
+        for f in ["resultType", "ttlMs", "cacheScope"] {
+            assert!(result(&r).get(f).is_some(), "{f}");
+        }
+        for k in result(&r).get("skills").unwrap().as_arr() {
+            // The entry's shape: uri, frontmatter and resources, nothing
+            // named at the top.
+            assert!(k.get("name").is_none() && k.get("files").is_none());
+            let front = k.get("frontmatter").unwrap();
+            let name = front.get("name").unwrap().as_str().unwrap();
+            assert!(front.get("description").is_some());
+            assert_eq!(
+                k.get("uri").unwrap().as_str().unwrap(),
+                format!("skill://{name}/SKILL.md")
+            );
+            let res = k.get("resources").unwrap().as_arr();
+            assert_eq!(res[0].get("uri"), k.get("uri"), "SKILL.md first");
+            for f in res {
+                let uri = f.get("uri").unwrap().as_str().unwrap().to_string();
+                let read = rpc(s, 2, "resources/read", &format!(r#"{{"uri":"{uri}"}}"#));
+                let c = &result(&read).get("contents").unwrap().as_arr()[0];
+                let bytes = c.get("text").unwrap().as_str().unwrap().as_bytes().to_vec();
+                let digest = f.get("digest").unwrap().as_str().unwrap().to_string();
+                assert_eq!(digest, format!("sha256:{}", hex(&sha256(&bytes))), "{uri}");
+                let size = match f.get("size") {
+                    Some(Json::Num(n)) => *n,
+                    _ => panic!(),
+                };
+                assert_eq!(size, bytes.len() as f64);
+                out.push((uri, digest, size));
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn frontmatter_passes_other_top_level_keys_through() {
+        let md = b"---\nname: a\ndescription: b\nlicense: MIT\ndisable-model-invocation: true\nmetadata:\n  owner: x\n- y\n---\nbody\n";
+        let (n, d, other) = frontmatter(md).unwrap();
+        assert_eq!((n.as_str(), d.as_str()), ("a", "b"));
+        assert_eq!(
+            other,
+            [
+                ("license".to_string(), s("MIT")),
+                ("disable-model-invocation".to_string(), Json::Bool(true)),
+            ]
+        );
+        let k = Skill {
+            name: n,
+            description: d,
+            other,
+            files: vec![("SKILL.md".into(), md.to_vec())],
+        };
+        let m = manifest(&k);
+        let f = m.get("frontmatter").unwrap();
+        assert_eq!(f.get("license").unwrap().as_str(), Some("MIT"));
+        assert!(f.get("metadata").is_none() && f.get("owner").is_none());
+    }
+
+    #[test]
+    fn skills_follow_commits_and_refuse_over_limits() {
+        let (dir, mut s) = session("skills");
+        // Off: the methods are unknown and the handshake is as before.
+        let off_init = initialize(
+            &json::parse(r#"{"protocolVersion":"2025-11-25"}"#).unwrap(),
+            false,
+        );
+        assert!(rpc(&mut s, 1, "skills/list", "{}").get("error").is_some());
+        s.skills = Some(Some("skills".into()));
+        let on_init = initialize(
+            &json::parse(r#"{"protocolVersion":"2025-11-25"}"#).unwrap(),
+            true,
+        );
+        assert!(
+            off_init
+                .get("capabilities")
+                .unwrap()
+                .get("extensions")
+                .is_none()
+        );
+        let ext = on_init
+            .get("capabilities")
+            .unwrap()
+            .get("extensions")
+            .unwrap();
+        assert!(ext.get(SKILLS_EXT).is_some());
+        // The built-in skill, before the store has any.
+        let l = listed(&mut s);
+        assert_eq!(l.len(), 1);
+        assert_eq!(l[0].0, "skill://ikam-store/SKILL.md");
+        // A skill written but not committed is not listed.
+        call(&mut s, "write", r#"{"path":"skills/demo/SKILL.md","content":"---\nname: demo\ndescription: a demo\n---\nfirst\n"}"#).unwrap();
+        call(
+            &mut s,
+            "write",
+            r#"{"path":"skills/demo/ref/notes.txt","content":"notes\n"}"#,
+        )
+        .unwrap();
+        assert_eq!(listed(&mut s).len(), 1);
+        let c1 = call(&mut s, "commit", r#"{"message":"demo skill"}"#).unwrap();
+        let c1 = c1.split_whitespace().nth(1).unwrap().to_string();
+        let l = listed(&mut s);
+        assert_eq!(
+            l.iter().map(|f| f.0.as_str()).collect::<Vec<_>>(),
+            [
+                "skill://ikam-store/SKILL.md",
+                "skill://demo/SKILL.md",
+                "skill://demo/ref/notes.txt"
+            ]
+        );
+        let old_digest = l[1].1.clone();
+        // Folders, one level at a time.
+        let d = rpc(
+            &mut s,
+            3,
+            "resources/directory/read",
+            r#"{"uri":"skill://demo/"}"#,
+        );
+        let names: Vec<_> = result(&d)
+            .get("resources")
+            .unwrap()
+            .as_arr()
+            .iter()
+            .map(|e| {
+                [
+                    e.get("uri").unwrap().as_str().unwrap().to_string(),
+                    e.get("name").unwrap().as_str().unwrap().to_string(),
+                    e.get("mimeType").unwrap().as_str().unwrap().to_string(),
+                ]
+            })
+            .collect();
+        assert_eq!(
+            names,
+            [
+                ["skill://demo/SKILL.md", "SKILL.md", "text/markdown"],
+                ["skill://demo/ref", "ref", "inode/directory"]
+            ]
+        );
+        assert!(result(&d).get("cacheScope").is_some());
+        let d = rpc(
+            &mut s,
+            3,
+            "resources/directory/read",
+            r#"{"uri":"skill://demo/ref"}"#,
+        );
+        assert_eq!(
+            result(&d).get("resources").unwrap().as_arr()[0]
+                .get("mimeType")
+                .unwrap()
+                .as_str(),
+            Some("text/plain")
+        );
+        // Edited and committed: the new digest at once; the old bytes at
+        // the old commit.
+        call(
+            &mut s,
+            "edit",
+            r#"{"path":"skills/demo/SKILL.md","old":"first","new":"second"}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            listed(&mut s)[1].1,
+            old_digest,
+            "pending edits are not listed"
+        );
+        call(&mut s, "commit", r#"{"message":"demo v2"}"#).unwrap();
+        let l = listed(&mut s);
+        assert_ne!(l[1].1, old_digest);
+        let old = call(
+            &mut s,
+            "read",
+            &format!(r#"{{"path":"skills/demo/SKILL.md","at":"{c1}"}}"#),
+        )
+        .unwrap();
+        assert!(old.contains("first"), "{old}");
+        // A folder whose name differs from its frontmatter's is not listed,
+        // and the list says why.
+        call(&mut s, "write", r#"{"path":"skills/wrong/SKILL.md","content":"---\nname: other\ndescription: x\n---\n"}"#).unwrap();
+        // Over the file limit: refused with the reason, never cut.
+        call(
+            &mut s,
+            "write",
+            r#"{"path":"skills/big/SKILL.md","content":"---\nname: big\ndescription: x\n---\n"}"#,
+        )
+        .unwrap();
+        for i in 0..SKILL_MAX_FILES {
+            call(
+                &mut s,
+                "write",
+                &format!(r#"{{"path":"skills/big/f/{i}.txt","content":"{i}"}}"#),
+            )
+            .unwrap();
+        }
+        call(&mut s, "commit", r#"{"message":"two bad skills"}"#).unwrap();
+        let r = rpc(&mut s, 4, "skills/list", "{}");
+        let names: Vec<_> = result(&r)
+            .get("skills")
+            .unwrap()
+            .as_arr()
+            .iter()
+            .map(|k| {
+                k.get("frontmatter")
+                    .unwrap()
+                    .get("name")
+                    .unwrap()
+                    .as_str()
+                    .unwrap()
+                    .to_string()
+            })
+            .collect();
+        assert_eq!(names, ["ikam-store", "demo"]);
+        let why = result(&r)
+            .get("_meta")
+            .unwrap()
+            .get("ikam/refused")
+            .unwrap()
+            .encode();
+        assert!(
+            why.contains("skills/wrong") && why.contains("names it other"),
+            "{why}"
+        );
+        assert!(
+            why.contains("skills/big") && why.contains("more than 512 files"),
+            "{why}"
+        );
+        let g = rpc(&mut s, 5, "skills/get", r#"{"uri":"skill://big/SKILL.md"}"#);
+        let m = g
+            .get("error")
+            .unwrap()
+            .get("message")
+            .unwrap()
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert!(m.contains("refused") && m.contains("512"), "{m}");
+        let g = rpc(&mut s, 6, "skills/get", r#"{"uri":"skill://demo"}"#);
+        assert_eq!(
+            result(&g)
+                .get("skill")
+                .unwrap()
+                .get("resources")
+                .unwrap()
+                .as_arr()
+                .len(),
+            2
+        );
+        assert!(
+            rpc(
+                &mut s,
+                7,
+                "resources/read",
+                r#"{"uri":"skill://demo/../x"}"#
+            )
+            .get("error")
+            .is_some()
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn skills_page_with_a_cursor_and_ride_the_modern_envelope() {
+        let (dir, mut s) = session("skillpage");
+        s.skills = Some(Some("sk".into()));
+        for i in 0..60 {
+            call(&mut s, "write", &format!(r#"{{"path":"sk/s{i:02}/SKILL.md","content":"---\nname: s{i:02}\ndescription: skill {i}\n---\n"}}"#)).unwrap();
+        }
+        call(&mut s, "commit", r#"{"message":"60 skills"}"#).unwrap();
+        let r = rpc(&mut s, 1, "skills/list", "{}");
+        assert_eq!(
+            result(&r).get("skills").unwrap().as_arr().len(),
+            SKILLS_PAGE
+        );
+        let next = result(&r)
+            .get("nextCursor")
+            .unwrap()
+            .as_str()
+            .unwrap()
+            .to_string();
+        let r = rpc(
+            &mut s,
+            2,
+            "skills/list",
+            &format!(r#"{{"cursor":"{next}"}}"#),
+        );
+        assert_eq!(
+            result(&r).get("skills").unwrap().as_arr().len(),
+            61 - SKILLS_PAGE
+        );
+        assert!(result(&r).get("nextCursor").is_none());
+        let meta = r#""_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28","io.modelcontextprotocol/clientCapabilities":{}}"#;
+        let r = rpc(&mut s, 3, "skills/list", &format!("{{{meta}}}"));
+        assert_eq!(
+            result(&r).get("resultType").unwrap().as_str(),
+            Some("complete")
+        );
+        let d = rpc(&mut s, 4, "server/discover", &format!("{{{meta}}}"));
+        let c = result(&d).get("capabilities").unwrap();
+        assert!(
+            c.get("resources").is_some() && c.get("extensions").unwrap().get(SKILLS_EXT).is_some()
+        );
+        assert!(
+            result(&d)
+                .get("instructions")
+                .unwrap()
+                .as_str()
+                .unwrap()
+                .contains("skill://ikam-store/SKILL.md")
+        );
         let _ = std::fs::remove_dir_all(dir);
     }
 

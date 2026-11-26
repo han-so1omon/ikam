@@ -151,6 +151,11 @@ start it as a local server.
   2025-11-25) and MCP 2026-07-28 (no handshake; `server/discover`, the
   version and capabilities in each request's `_meta`) over the same tools,
   in one process, in either order. Handshake-era answers are as before.
+- `--skills [PATH]` (E407, off): MCP skills. The built-in `ikam-store`
+  skill is the server's how-to; with PATH, each folder under PATH with a
+  `SKILL.md` at the ref's head is a skill too (committed files only), each
+  file with its SHA-256. A client without skills reads them as resources at
+  `skill://NAME/FILE`.
 - The same tools over HTTP (E360), in `ikam live` and `host`: `GET
   /api/tools` lists them; `GET /api/tool/NAME?arg=...` runs a tool that
   changes nothing; `POST /api/tool/NAME` with a JSON object of arguments
