@@ -133,6 +133,11 @@ pub fn estimate(cmd: &str, dir: Option<&str>, store: &Path) -> Option<(u64, Stri
     }
 }
 
+/// The commands the guard checks before they run, and cleans up after.
+pub fn guarded(cmd: &str) -> bool {
+    matches!(cmd, "ingest" | "commit" | "repack")
+}
+
 /// Refuse when the store's disk has less free than `need` + `SLACK`.
 pub fn check(store: &Path, need: u64, what: &str) -> Result<(), String> {
     let Some(free) = free_bytes(store) else {
@@ -183,6 +188,7 @@ mod tests {
         let (need, _) = estimate("ingest", dir.path().to_str(), &dir.path().join("store")).unwrap();
         assert!(need >= 2 * files * block + 500);
         assert!(estimate("log", None, dir.path()).is_none());
+        assert!(guarded("ingest") && guarded("repack") && !guarded("log"));
         assert!(out_of_space("No space left on device (os error 28)"));
         assert!(!out_of_space("not found"));
     }

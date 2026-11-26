@@ -206,20 +206,41 @@ fn main() -> ExitCode {
         }
         None => false,
     };
+    // Only the commands the guard checks write the store this way; any
+    // other command that fails for a full disk is left as it is.
+    let guarded = disk_guard && args.first().is_some_and(|c| diskguard::guarded(c));
+    let refs = |dir: &str| {
+        use ikam_kernel::Store;
+        FsStore::open(dir).ok().and_then(|s| s.refs().ok())
+    };
+    let refs_before = if guarded { refs(&store_dir) } else { None };
     match run(&store_dir, &mut args, disk_guard) {
         Ok(()) => ExitCode::SUCCESS,
-        Err(msg) if disk_guard && diskguard::out_of_space(&msg) => {
-            // The command stopped part way: only objects no ref reaches were
-            // written. Free them now rather than leave the disk full.
+        Err(msg) if guarded && diskguard::out_of_space(&msg) => {
+            // The command stopped part way. An ingest can fill the disk in
+            // its repack, after its commit moved the ref, so say which.
+            let moved = match (&refs_before, refs(&store_dir)) {
+                (Some(a), Some(b)) => Some(*a != b),
+                _ => None,
+            };
+            let what = match moved {
+                Some(false) => "nothing was committed and every ref is as it was",
+                Some(true) => {
+                    "a ref moved before it filled: the commit was made, a later step was not"
+                }
+                None => "the refs could not be read to say whether a commit was made",
+            };
+            // Only objects no ref reaches are removed: free them now rather
+            // than leave the disk full.
             let freed = FsStore::open(&store_dir)
                 .map_err(err)
                 .and_then(|s| Repo::new(s).gc().map_err(err));
             match freed {
                 Ok(n) => say!(
-                    "{msg}\nthe store's disk filled up; nothing was committed and every ref is as it was; removed the {n} objects it had written (gc)"
+                    "{msg}\nthe store's disk filled up; {what}; removed {n} objects no ref reaches (gc)"
                 ),
                 Err(e) => say!(
-                    "{msg}\nthe store's disk filled up; nothing was committed; gc of what it wrote failed too ({e}), run ikam gc once there is room"
+                    "{msg}\nthe store's disk filled up; {what}; gc failed too ({e}), run ikam gc once there is room"
                 ),
             }
             ExitCode::FAILURE
