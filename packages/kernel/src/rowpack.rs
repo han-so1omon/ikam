@@ -388,11 +388,18 @@ impl Context {
 
     pub fn from_bytes(b: &[u8]) -> Result<Context, Error> {
         let mut at = b.strip_prefix(MAGIC).map(|_| MAGIC.len()).ok_or_else(bad)?;
-        let num = |at: &mut usize| varint(b, at).map(|n| n as usize).ok_or_else(bad);
+        let num = |at: &mut usize| {
+            varint(b, at)
+                .and_then(|n| usize::try_from(n).ok())
+                .ok_or_else(bad)
+        };
+        // A length from the bytes is checked before it is added: a corrupt
+        // or hostile context answers an error, never an overflow.
         let bytes = |at: &mut usize| -> Result<Vec<u8>, Error> {
-            let n = varint(b, at).ok_or_else(bad)? as usize;
-            let v = b.get(*at..*at + n).ok_or_else(bad)?.to_vec();
-            *at += n;
+            let n = num(at)?;
+            let end = at.checked_add(n).ok_or_else(bad)?;
+            let v = b.get(*at..end).ok_or_else(bad)?.to_vec();
+            *at = end;
             Ok(v)
         };
         let mut shapes = Vec::new();
@@ -612,5 +619,16 @@ mod tests {
         let e = ctx.encode(&rows[0]).unwrap();
         assert!(ctx.decode(&e[..e.len() - 1]).is_err());
         assert!(ctx.decode(&[e.clone(), vec![0]].concat()).is_err());
+        // A context whose length would overflow is an error, not a panic.
+        let mut bad = MAGIC.to_vec();
+        put_varint(&mut bad, 1); // one shape
+        put_varint(&mut bad, 0); // no columns
+        put_varint(&mut bad, u64::MAX); // its one literal's length
+        assert!(Context::from_bytes(&bad).is_err());
+        // And every cut of a real context fails cleanly.
+        let whole = ctx.to_bytes();
+        for n in 0..whole.len() {
+            assert!(Context::from_bytes(&whole[..n]).is_err());
+        }
     }
 }
