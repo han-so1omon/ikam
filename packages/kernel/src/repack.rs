@@ -130,6 +130,9 @@ impl<S: Store + Sync> Repo<S> {
             h.update(b"group_size")
                 .update(&(self.group_size as u64).to_le_bytes());
         }
+        if self.float_planes {
+            h.update(b"float_planes");
+        }
         Ok(Id::from_bytes(*h.finalize().as_bytes()))
     }
 
