@@ -16,8 +16,8 @@ const MAX_LINE: usize = 16 << 10;
 const MAX_HEADERS: usize = 100;
 
 /// The body limit for a request, from its Host header ("" when it has
-/// none); none for no limit.
-pub type BodyLimit = dyn Fn(&str) -> Option<usize> + Send + Sync;
+/// none) and its path (still percent-encoded); none for no limit.
+pub type BodyLimit = dyn Fn(&str, &str) -> Option<usize> + Send + Sync;
 
 #[derive(Clone, Copy)]
 pub struct Limits {
@@ -325,7 +325,10 @@ fn connection(
             }
         };
         let max_body = match limits.body_limit {
-            Some(f) => f(get("host").as_deref().unwrap_or("")),
+            Some(f) => f(
+                get("host").as_deref().unwrap_or(""),
+                target.split('?').next().unwrap_or(""),
+            ),
             None => limits.max_body,
         };
         let too_large = |n: usize| max_body.is_some_and(|max| n > max);
@@ -523,7 +526,7 @@ mod tests {
 
     #[test]
     fn a_body_limit_per_host_applies_before_the_body_is_read() {
-        let limit: &'static BodyLimit = Box::leak(Box::new(|h: &str| match h {
+        let limit: &'static BodyLimit = Box::leak(Box::new(|h: &str, _: &str| match h {
             "small" => Some(4),
             "open" => None,
             _ => Some(0),
