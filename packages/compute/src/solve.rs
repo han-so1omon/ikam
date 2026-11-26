@@ -20,11 +20,14 @@ pub struct Options {
     pub tol: f64,
     pub max_iter: usize,
     pub max_cg: usize,
+    /// Return the iterate after `max_iter` steps instead of an error: a
+    /// step budget, as in a control tick that warm-starts from the last.
+    pub budget: bool,
 }
 
 impl Default for Options {
     fn default() -> Self {
-        Options { tol: 1e-10, max_iter: 100, max_cg: 1000 }
+        Options { tol: 1e-10, max_iter: 100, max_cg: 1000, budget: false }
     }
 }
 
@@ -62,7 +65,7 @@ impl Minimizer {
         let mut env = env.clone();
         let mut x = x0;
         let mut rep = Report::default();
-        for it in 0..opt.max_iter {
+        for it in 0..=opt.max_iter {
             env.insert(self.var.clone(), x.clone());
             let out = eval(&self.gradient, &env)?;
             rep.evals += 1;
@@ -71,8 +74,11 @@ impl Minimizer {
             rep.iterations = it;
             rep.energy = f;
             rep.grad_norm = gn;
-            if gn < opt.tol {
+            if gn < opt.tol || (opt.budget && it == opt.max_iter) {
                 return Ok((x, rep));
+            }
+            if it == opt.max_iter {
+                break;
             }
             let p = self.cg(&env, &g, opt, &mut rep)?;
             let slope = dot(&g.data, &p);
@@ -187,7 +193,8 @@ impl PlannedMinimizer {
     }
 
     /// Minimize from `x` in place, at most `opt.max_iter` Newton steps
-    /// (a tick may take one or two, warm-started from the last tick).
+    /// (with `opt.budget`, a tick takes one or two from the last tick's
+    /// solution and returns).
     pub fn minimize(&mut self, x: &mut [f64], opt: &Options) -> Result<Report, Error> {
         let mut rep = Report::default();
         for it in 0..=opt.max_iter {
@@ -200,8 +207,11 @@ impl PlannedMinimizer {
             rep.iterations = it;
             rep.energy = f;
             rep.grad_norm = gn;
-            if gn < opt.tol || it == opt.max_iter {
+            if gn < opt.tol || (opt.budget && it == opt.max_iter) {
                 return Ok(rep);
+            }
+            if it == opt.max_iter {
+                break;
             }
             self.hessian_vec.set(&self.var, x)?;
             self.cg(opt, &mut rep)?;
@@ -223,7 +233,7 @@ impl PlannedMinimizer {
                 step *= 0.5;
             }
         }
-        Ok(rep)
+        Err(Error::NoConvergence(format!("{} iterations, |g| {:.3e}", opt.max_iter, rep.grad_norm)))
     }
 
     fn cg(&mut self, opt: &Options, rep: &mut Report) -> Result<(), Error> {
