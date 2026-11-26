@@ -173,6 +173,36 @@ impl<S: Store> Repo<S> {
         Ok((content, records))
     }
 
+    /// E414: point every ref whose name starts with `prefix` at a commit of
+    /// its current tree, with the same message and no parent, so what only
+    /// its earlier commits reach (a database's earlier view chunks, E412)
+    /// is left for `gc`. History before the head is given up; the head's
+    /// tree, and so everything read from it, is the same. A ref that names
+    /// no commit, or a commit with no parent, is left as it is. Returns each
+    /// ref moved, with its commit before and after.
+    pub fn squash_refs(&mut self, prefix: &str) -> Result<Vec<(String, Id, Id)>, Error> {
+        let mut moved = Vec::new();
+        for (name, head) in self.store.refs()? {
+            if !name.starts_with(prefix) {
+                continue;
+            }
+            let Ok(Object::Commit(c)) = self.get(&head) else {
+                continue;
+            };
+            if c.parents.is_empty() {
+                continue;
+            }
+            let squashed = self.put(&Object::Commit(Commit {
+                tree: c.tree,
+                parents: Vec::new(),
+                message: c.message,
+            }))?;
+            self.store.set_ref(&name, Some(head), squashed)?;
+            moved.push((name, head, squashed));
+        }
+        Ok(moved)
+    }
+
     /// Delete every object that no ref needs. Every derivation of live
     /// content is kept along with its inputs, so live content stays
     /// reconstructible and keeps its provenance; claims are kept while both
