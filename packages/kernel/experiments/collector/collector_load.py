@@ -156,7 +156,9 @@ for fl in sets:
                 s.req("GET", "/db/t/scan?start=i/obs/by_time/%010d&end=i/obs/by_time/%010d&limit=500"
                       % (ts - 3 * TICK, ts + 1), None, 600)
                 rd_scan.append(time.time() - t0)
-                if len(rows) != items or iso(ts) not in got.decode():
+                # every item's latest row must be this poll's
+                stale = sum(1 for _, v in rows if json.loads(v)["observed_at"] != iso(ts))
+                if len(rows) != items or stale:
                     missing += 1
         out["days"].append({
             "day": day + 1, "wall_s": round(time.time() - t_day, 1),
