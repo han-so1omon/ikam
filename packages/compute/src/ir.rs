@@ -204,14 +204,17 @@ impl Graph {
         self.push(Op::Concat, parts)
     }
 
+    /// Each input name once, in first-use order.
     pub fn input_names(&self) -> Vec<String> {
-        self.nodes
-            .iter()
-            .filter_map(|n| match &n.op {
-                Op::Input(name) => Some(name.clone()),
-                _ => None,
-            })
-            .collect()
+        let mut names: Vec<String> = Vec::new();
+        for n in &self.nodes {
+            if let Op::Input(name) = &n.op
+                && !names.contains(name)
+            {
+                names.push(name.clone());
+            }
+        }
+        names
     }
 
     pub fn input_node(&self, name: &str) -> Option<V> {
