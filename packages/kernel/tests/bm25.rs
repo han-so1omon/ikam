@@ -454,3 +454,104 @@ fn in_memory_index_scores_as_the_live_view() {
     }
     assert!(!mem.remove("doc/none"));
 }
+
+/// E408: with `bm25_pack` set, a built view's term lists are ranges of
+/// shared packs; it writes fewer contents and ranks every query with the
+/// same keys and score bits as the view built without it, before and after
+/// updates, live or not, at pack targets from one byte up.
+#[test]
+fn packed_views_rank_as_unpacked() {
+    let mut rng = Lcg(31);
+    let mut events = Vec::new();
+    for i in 0..2000 {
+        let v = match i % 9 {
+            0 => String::new(),
+            1 => "Ünïcode ünïcode ÜNÏCODE".to_string(),
+            _ => format!(
+                "[{i}, \"w{}\", \"w{}\", {}.{}]",
+                rng.next() % 40,
+                rng.next() % 40,
+                rng.next() % 1000,
+                rng.next()
+            ),
+        };
+        events.push(Event::upsert(
+            &format!("t/a/{i:06}"),
+            v.as_bytes(),
+            &format!("e{i}"),
+        ));
+    }
+    let mut edits = Vec::new();
+    for i in (0..2000).step_by(37) {
+        edits.push(Event::upsert(
+            &format!("t/a/{i:06}"),
+            format!("w{} new{} w3", i % 40, i % 5).as_bytes(),
+            &format!("u{i}"),
+        ));
+    }
+    for i in (5..2000).step_by(53) {
+        edits.push(Event::remove(
+            &format!("t/a/{i:06}"),
+            false,
+            &format!("d{i}"),
+        ));
+    }
+    let mut queries: Vec<String> = (0..40).map(|w| format!("w{w}")).collect();
+    queries.extend(
+        [
+            "ünïcode",
+            "w1 w2",
+            "w7 new3",
+            "new0",
+            "17",
+            "1999",
+            "absent",
+            "w3 w3 w9",
+            "",
+        ]
+        .map(String::from),
+    );
+    let run = |pack: usize| {
+        let mut repo = Repo::new(MemStore::default());
+        repo.bm25_pack = pack;
+        let empty = repo.db_empty().unwrap();
+        let db = repo.db_append(&empty, &events).unwrap();
+        let before = repo.store().ids().unwrap().len();
+        let view = repo.bm25_view_build(&db, "t/a/").unwrap();
+        let written = repo.store().ids().unwrap().len() - before;
+        let live = repo.bm25_live_build(&db, "t/a/", 30).unwrap();
+        let db2 = repo.db_append(&db, &edits).unwrap();
+        let view2 = repo.bm25_view_update(&view, &db, &db2, "t/a/").unwrap();
+        let live2 = repo.bm25_live_update(&live, &db, &db2, "t/a/").unwrap();
+        let mut out = Vec::new();
+        for q in &queries {
+            for k in [1, 10, 5000] {
+                for hits in [
+                    repo.bm25_view_search(&view, q, k).unwrap(),
+                    repo.bm25_view_search(&view2, q, k).unwrap(),
+                    repo.bm25_live_search(&live, q, k).unwrap(),
+                    repo.bm25_live_search(&live2, q, k).unwrap(),
+                ] {
+                    out.push(
+                        hits.into_iter()
+                            .map(|(key, s)| (key, s.to_bits()))
+                            .collect::<Vec<_>>(),
+                    );
+                }
+            }
+        }
+        (out, written)
+    };
+    let (want, unpacked) = run(0);
+    assert!(want.iter().any(|h| h.len() > 100));
+    for pack in [1, 40, 4096, 65536] {
+        let (got, written) = run(pack);
+        assert_eq!(got, want, "pack {pack}");
+        if pack >= 4096 {
+            assert!(
+                written * 20 < unpacked,
+                "pack {pack}: {written} of {unpacked}"
+            );
+        }
+    }
+}

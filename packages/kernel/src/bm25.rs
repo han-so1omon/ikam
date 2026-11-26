@@ -453,8 +453,8 @@ impl<S: Store> Repo<S> {
     ) -> Result<BTreeMap<String, Vec<u8>>, Error> {
         let labels = terms.map(|t| term_label(t)).collect();
         let mut out = BTreeMap::new();
-        for n in self.graph_nodes_in(root, &labels)? {
-            out.insert(n.label[2..].to_string(), self.node_value(&n)?);
+        for (label, v) in self.node_values(self.graph_nodes_in(root, &labels)?)? {
+            out.insert(label[2..].to_string(), v);
         }
         Ok(out)
     }
@@ -572,13 +572,66 @@ impl<S: Store> Repo<S> {
         }
         drop(rows);
         let mut nodes = Vec::with_capacity(post.len() + 1);
-        for (t, b) in post {
-            nodes.push(self.bm25_node(term_label(&t), &b)?);
+        if self.bm25_pack == 0 {
+            for (t, b) in post {
+                nodes.push(self.bm25_node(term_label(&t), &b)?);
+            }
+        } else {
+            self.bm25_packed(post, &mut nodes)?;
         }
         nodes.push(self.bm25_stats_node(n, total)?);
         Ok(Bm25View {
             root: self.put_graph_with(nodes, crate::Keys::Any)?,
         })
+    }
+
+    /// Term nodes for `post` with the lists packed (E408): in term order,
+    /// lists are appended to a pack until the next would take it past
+    /// `bm25_pack` bytes, and each term's node is its range of the pack.
+    /// A list of `bm25_pack` bytes or more is a content of its own.
+    fn bm25_packed(
+        &mut self,
+        post: HashMap<String, Vec<u8>>,
+        nodes: &mut Vec<crate::Node>,
+    ) -> Result<(), Error> {
+        let target = self.bm25_pack;
+        let mut post: Vec<(String, Vec<u8>)> = post.into_iter().collect();
+        post.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+        let mut pack: Vec<u8> = Vec::new();
+        let mut members: Vec<(String, u64, u64)> = Vec::new();
+        for (t, b) in post {
+            if b.len() >= target {
+                nodes.push(self.bm25_node(term_label(&t), &b)?);
+                continue;
+            }
+            if pack.len() + b.len() > target {
+                self.bm25_pack_flush(&mut pack, &mut members, nodes)?;
+            }
+            members.push((t, pack.len() as u64, b.len() as u64));
+            pack.extend_from_slice(&b);
+        }
+        self.bm25_pack_flush(&mut pack, &mut members, nodes)
+    }
+
+    fn bm25_pack_flush(
+        &mut self,
+        pack: &mut Vec<u8>,
+        members: &mut Vec<(String, u64, u64)>,
+        nodes: &mut Vec<crate::Node>,
+    ) -> Result<(), Error> {
+        if members.is_empty() {
+            return Ok(());
+        }
+        let id = self.put_derived(pack)?;
+        for (t, start, len) in members.drain(..) {
+            nodes.push(crate::Node {
+                label: term_label(&t),
+                target: crate::Target::Content(crate::Arg::Range { id, start, len }),
+                edges: Vec::new(),
+            });
+        }
+        pack.clear();
+        Ok(())
     }
 
     /// The `k` best rows for `query`, best first, ties by key; the same
