@@ -147,6 +147,10 @@ start it as a local server.
   at exit". A tool returns at most 64 KiB of text and says where to read on.
 - One process owns the store, as `live` does. Running both on one store at
   once is not tested.
+- Protocol eras (E406): the `initialize` handshake (2024-11-05 to
+  2025-11-25) and MCP 2026-07-28 (no handshake; `server/discover`, the
+  version and capabilities in each request's `_meta`) over the same tools,
+  in one process, in either order. Handshake-era answers are as before.
 - The same tools over HTTP (E360), in `ikam live` and `host`: `GET
   /api/tools` lists them; `GET /api/tool/NAME?arg=...` runs a tool that
   changes nothing; `POST /api/tool/NAME` with a JSON object of arguments

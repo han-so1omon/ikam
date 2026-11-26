@@ -142,6 +142,12 @@ pub fn capped(text: String) -> String {
 
 impl<L: DerefMut<Target = Live>> Session<L> {
     /// The reply to one JSON-RPC message, or `None` for a notification.
+    ///
+    /// E406: two protocol eras over the same handlers. A request whose
+    /// `params._meta` names `io.modelcontextprotocol/protocolVersion` is a
+    /// 2026-07-28 request (stateless: no handshake, the client's version and
+    /// capabilities on every request) and gets that era's answer; any other
+    /// request is answered as before, byte for byte.
     pub fn handle(&mut self, line: &str) -> Option<Json> {
         let msg = match json::parse(line) {
             Ok(m) => m,
@@ -150,26 +156,16 @@ impl<L: DerefMut<Target = Live>> Session<L> {
         let id = msg.get("id").cloned()?;
         let method = msg.get("method").and_then(Json::as_str).unwrap_or("");
         let params = msg.get("params").cloned().unwrap_or(Json::Obj(Vec::new()));
+        match modern_request(method, &params) {
+            Ok(false) => {}
+            Ok(true) => return Some(self.handle_modern(id, method, &params)),
+            Err((code, message, data)) => return Some(error_data(id, code, &message, data)),
+        }
         let result = match method {
             "initialize" => initialize(&params),
             "ping" => Json::Obj(Vec::new()),
             "tools/list" => obj(vec![("tools", Json::Arr(tools()))]),
-            "tools/call" => {
-                let name = params.get("name").and_then(Json::as_str).unwrap_or("");
-                let args = params
-                    .get("arguments")
-                    .cloned()
-                    .unwrap_or(Json::Obj(Vec::new()));
-                let (text, is_error) = match self.call(name, &args) {
-                    Ok(t) => (t, false),
-                    Err(e) => (e, true),
-                };
-                let content = obj(vec![("type", s("text")), ("text", s(&cap(text)))]);
-                obj(vec![
-                    ("content", Json::Arr(vec![content])),
-                    ("isError", Json::Bool(is_error)),
-                ])
-            }
+            "tools/call" => self.tools_call(&params),
             _ => return Some(error(id, -32601, &format!("method not found: {method}"))),
         };
         Some(obj(vec![
@@ -177,6 +173,38 @@ impl<L: DerefMut<Target = Live>> Session<L> {
             ("id", id),
             ("result", result),
         ]))
+    }
+
+    /// A 2026-07-28 request, already checked by `modern_request`.
+    fn handle_modern(&mut self, id: Json, method: &str, params: &Json) -> Json {
+        let (mut result, cacheable) = match method {
+            "server/discover" => (obj(discover_fields()), true),
+            "tools/list" => (obj(vec![("tools", Json::Arr(tools()))]), true),
+            "tools/call" => (self.tools_call(params), false),
+            // `initialize` and `ping` are gone from this era; every other
+            // method is unknown to both.
+            _ => return error(id, -32601, &format!("method not found: {method}")),
+        };
+        modern_result(&mut result, cacheable);
+        obj(vec![("jsonrpc", s("2.0")), ("id", id), ("result", result)])
+    }
+
+    /// `tools/call`'s result, the same in both eras.
+    fn tools_call(&mut self, params: &Json) -> Json {
+        let name = params.get("name").and_then(Json::as_str).unwrap_or("");
+        let args = params
+            .get("arguments")
+            .cloned()
+            .unwrap_or(Json::Obj(Vec::new()));
+        let (text, is_error) = match self.call(name, &args) {
+            Ok(t) => (t, false),
+            Err(e) => (e, true),
+        };
+        let content = obj(vec![("type", s("text")), ("text", s(&cap(text)))]);
+        obj(vec![
+            ("content", Json::Arr(vec![content])),
+            ("isError", Json::Bool(is_error)),
+        ])
     }
 
     /// Run tool `name`; `Err` is a tool error the agent reads, not a protocol one.
@@ -691,6 +719,103 @@ impl<L: DerefMut<Target = Live>> Session<L> {
     }
 }
 
+/// E406: the per-request envelope's protocol versions; the handshake's are
+/// `VERSIONS`.
+pub const MODERN_VERSIONS: &[&str] = &["2026-07-28"];
+
+const PROTOCOL_VERSION: &str = "io.modelcontextprotocol/protocolVersion";
+const CLIENT_CAPABILITIES: &str = "io.modelcontextprotocol/clientCapabilities";
+const SERVER_INFO: &str = "io.modelcontextprotocol/serverInfo";
+
+/// E406: how long a client may keep `server/discover` and `tools/list`:
+/// both are fixed for the life of this binary.
+pub const LIST_TTL_MS: u64 = 3_600_000;
+
+const INSTRUCTIONS: &str = "A versioned file store. Edits wait in the working tree until commit, which takes your message. \
+               Revisions (at, from, to) are a commit id or prefix, a ref, or work (the working tree, the default).";
+
+/// Whether a request is in the 2026-07-28 envelope (`true`), the handshake
+/// era (`false`), or a malformed or unsupported modern request (`Err`: code,
+/// message, data). Only the version key marks a request as modern, so a
+/// handshake-era client's own `_meta` (a progress token) changes nothing.
+fn modern_request(method: &str, params: &Json) -> Result<bool, (i64, String, Option<Json>)> {
+    let meta = params.get("_meta");
+    let version = meta.and_then(|m| m.get(PROTOCOL_VERSION));
+    let version = match version {
+        None if method == "server/discover" => {
+            return Err((
+                -32602,
+                format!("server/discover needs _meta.{PROTOCOL_VERSION}"),
+                None,
+            ));
+        }
+        None => return Ok(false),
+        Some(v) => v.as_str().unwrap_or(""),
+    };
+    if !MODERN_VERSIONS.contains(&version) {
+        let supported = VERSIONS
+            .iter()
+            .chain(MODERN_VERSIONS)
+            .map(|v| s(v))
+            .collect();
+        let data = obj(vec![
+            ("requested", s(version)),
+            ("supported", Json::Arr(supported)),
+        ]);
+        return Err((
+            -32022,
+            format!("unsupported protocol version: {version}"),
+            Some(data),
+        ));
+    }
+    match meta.and_then(|m| m.get(CLIENT_CAPABILITIES)) {
+        Some(Json::Obj(_)) => Ok(true),
+        _ => Err((-32602, format!("missing _meta.{CLIENT_CAPABILITIES}"), None)),
+    }
+}
+
+fn capabilities() -> Json {
+    obj(vec![(
+        "tools",
+        obj(vec![("listChanged", Json::Bool(false))]),
+    )])
+}
+
+fn server_info() -> Json {
+    obj(vec![
+        ("name", s("ikam")),
+        ("version", s(env!("CARGO_PKG_VERSION"))),
+    ])
+}
+
+/// `server/discover`'s fields, before `modern_result` adds the era's own.
+fn discover_fields() -> Vec<(&'static str, Json)> {
+    let versions = VERSIONS
+        .iter()
+        .chain(MODERN_VERSIONS)
+        .map(|v| s(v))
+        .collect();
+    vec![
+        ("supportedVersions", Json::Arr(versions)),
+        ("capabilities", capabilities()),
+        ("instructions", s(INSTRUCTIONS)),
+    ]
+}
+
+/// What every 2026-07-28 result carries: `resultType`, the server's info in
+/// `_meta`, and for the cacheable lists a time to keep them (`private`:
+/// a store's server is one person's).
+fn modern_result(result: &mut Json, cacheable: bool) {
+    if let Json::Obj(f) = result {
+        f.push(("resultType".into(), s("complete")));
+        if cacheable {
+            f.push(("ttlMs".into(), Json::Num(LIST_TTL_MS as f64)));
+            f.push(("cacheScope".into(), s("private")));
+        }
+        f.push(("_meta".into(), obj(vec![(SERVER_INFO, server_info())])));
+    }
+}
+
 fn initialize(params: &Json) -> Json {
     let asked = params
         .get("protocolVersion")
@@ -703,27 +828,9 @@ fn initialize(params: &Json) -> Json {
     };
     obj(vec![
         ("protocolVersion", s(version)),
-        (
-            "capabilities",
-            obj(vec![(
-                "tools",
-                obj(vec![("listChanged", Json::Bool(false))]),
-            )]),
-        ),
-        (
-            "serverInfo",
-            obj(vec![
-                ("name", s("ikam")),
-                ("version", s(env!("CARGO_PKG_VERSION"))),
-            ]),
-        ),
-        (
-            "instructions",
-            s(
-                "A versioned file store. Edits wait in the working tree until commit, which takes your message. \
-               Revisions (at, from, to) are a commit id or prefix, a ref, or work (the working tree, the default).",
-            ),
-        ),
+        ("capabilities", capabilities()),
+        ("serverInfo", server_info()),
+        ("instructions", s(INSTRUCTIONS)),
     ])
 }
 
@@ -910,11 +1017,15 @@ fn tool(name: &str, description: &str, props: &[(&str, &str, &str)], required: &
 }
 
 fn error(id: Json, code: i64, message: &str) -> Json {
-    let e = obj(vec![
-        ("code", Json::Num(code as f64)),
-        ("message", s(message)),
-    ]);
-    obj(vec![("jsonrpc", s("2.0")), ("id", id), ("error", e)])
+    error_data(id, code, message, None)
+}
+
+fn error_data(id: Json, code: i64, message: &str, data: Option<Json>) -> Json {
+    let mut e = vec![("code", Json::Num(code as f64)), ("message", s(message))];
+    if let Some(d) = data {
+        e.push(("data", d));
+    }
+    obj(vec![("jsonrpc", s("2.0")), ("id", id), ("error", obj(e))])
 }
 
 fn obj(fields: Vec<(&str, Json)>) -> Json {
@@ -1015,6 +1126,88 @@ mod tests {
             r.get("result").unwrap().get("isError"),
             Some(&Json::Bool(true))
         );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn two_eras_over_one_session() {
+        let (dir, mut ss) = session("eras");
+        let meta = r#""_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28","io.modelcontextprotocol/clientCapabilities":{}}"#;
+        let legacy_list = ss
+            .handle(r#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#)
+            .unwrap();
+        let d = ss
+            .handle(&format!(
+                r#"{{"jsonrpc":"2.0","id":2,"method":"server/discover","params":{{{meta}}}}}"#
+            ))
+            .unwrap();
+        let d = d.get("result").unwrap();
+        assert_eq!(d.get("resultType").unwrap().as_str(), Some("complete"));
+        assert!(
+            d.get("supportedVersions")
+                .unwrap()
+                .as_arr()
+                .contains(&s("2026-07-28"))
+        );
+        assert!(d.get("_meta").unwrap().get(SERVER_INFO).is_some());
+        // The same tools in both eras; the modern list adds only its own fields.
+        let m = ss
+            .handle(&format!(
+                r#"{{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{{{meta}}}}}"#
+            ))
+            .unwrap();
+        let mut m = m;
+        if let Json::Obj(f) = &mut m
+            && let Some((_, Json::Obj(r))) = f.iter_mut().find(|(k, _)| k == "result")
+        {
+            r.retain(|(k, _)| {
+                !["resultType", "ttlMs", "cacheScope", "_meta"].contains(&k.as_str())
+            });
+        }
+        assert_eq!(m.encode(), legacy_list.encode());
+        let w = ss.handle(&format!(r#"{{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{{"name":"write","arguments":{{"path":"a.txt","content":"x"}},{meta}}}}}"#)).unwrap();
+        assert_eq!(
+            w.get("result").unwrap().get("isError"),
+            Some(&Json::Bool(false))
+        );
+        // A handshake-era read sees the modern write: one store, one session.
+        let r = ss.handle(r#"{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"read","arguments":{"path":"a.txt"}}}"#).unwrap();
+        assert!(r.encode().contains(r"lines 1-1 of 1\nx"), "{}", r.encode());
+        assert!(r.get("result").unwrap().get("resultType").is_none());
+        // Errors: an unknown version names the supported ones; capabilities
+        // are required; ping and initialize are not in the modern era.
+        let e = ss.handle(r#"{"jsonrpc":"2.0","id":5,"method":"tools/list","params":{"_meta":{"io.modelcontextprotocol/protocolVersion":"2099-01-01","io.modelcontextprotocol/clientCapabilities":{}}}}"#).unwrap();
+        let e = e.get("error").unwrap();
+        assert_eq!(e.get("code"), Some(&Json::Num(-32022.0)));
+        assert!(
+            e.get("data")
+                .unwrap()
+                .get("supported")
+                .unwrap()
+                .as_arr()
+                .contains(&s("2025-11-25"))
+        );
+        let e = ss.handle(r#"{"jsonrpc":"2.0","id":6,"method":"tools/list","params":{"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28"}}}"#).unwrap();
+        assert_eq!(
+            e.get("error").unwrap().get("code"),
+            Some(&Json::Num(-32602.0))
+        );
+        for m in ["ping", "initialize"] {
+            let e = ss
+                .handle(&format!(
+                    r#"{{"jsonrpc":"2.0","id":7,"method":"{m}","params":{{{meta}}}}}"#
+                ))
+                .unwrap();
+            assert_eq!(
+                e.get("error").unwrap().get("code"),
+                Some(&Json::Num(-32601.0))
+            );
+        }
+        // A handshake-era client's own _meta leaves its answer as it was.
+        let p = ss
+            .handle(r#"{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{"_meta":{"progressToken":1}}}"#)
+            .unwrap();
+        assert_eq!(p.encode(), legacy_list.encode());
         let _ = std::fs::remove_dir_all(dir);
     }
 
