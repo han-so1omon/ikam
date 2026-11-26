@@ -419,6 +419,7 @@ fn tool(live: &Mutex<Live>, name: &str, req: &Request) -> Response {
     };
     let mut session = mcp::Session {
         live: live.lock().unwrap(),
+        skills: None,
     };
     let (status, text, error) = match session.call(name, &args) {
         Ok(t) => (200, t, false),

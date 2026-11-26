@@ -6561,3 +6561,36 @@ Gates on the branch (E229 to E233): every kernel test suite passes (release); cl
 - Verdict: **kept** (H1 confirmed with the official client; no option is needed because handshake-era answers are byte-equal).
 - Not measured: Claude Code (which era it picks for a stdio server, and whether it reads `ttlMs`) waits for the Mac after Nov 29; the extensions map in `capabilities` (none is on here; M2 adds the first, and the handshake's `initialize` lists `extensions` only when one is); HTTP (`/api` is not MCP; `MCP-Protocol-Version` header checks apply only to MCP over HTTP, M5).
 - Run: `python3 experiments/agent-tools/mcp_check.py TAPPED_IKAM WORK CORPUS 1` (a wrapper that tees the `mcp` process's stdin and stdout), then `python3 experiments/agent-tools/mcp_era_check.py IKAM_BIN WORK CORPUS TAP.in` (needs `TAP.out` beside it).
+
+### E407 mcp-skills (`ikam mcp --skills`: ikam's how-to, and a project's own skills, over MCP)
+
+- Branch / parent: exp/407-mcp-skills / exp/406-dual-era dbe21fb (stacks on E406, PR 87)
+- Question: M2 of `docs/plans/2026-11-24-mcp-skills-tasks-elicitation.md`. MCP's skills extension lets a server ship skills that a client loads only when needed (`docs/research/mcp-2026-07-28.md`). Can `ikam mcp` serve its usage guidance as one built-in skill, and a project's own skills as versioned files in its store, with digests that match the bytes served?
+- Hypothesis H2: (a) moving the usage guidance into a skill cuts the bytes every session pays at start; (b) skills read from the store change with a commit, read back at an old commit, and are never listed half-written. (Sources: the skills extension; E359's characters per task.)
+- Change, `ikam mcp --skills [PATH]` (off; code in `src/bin/ikam/mcp.rs`, the usage line in `main.rs`, one field in `ui.rs`):
+  - Declares `resources` and `extensions` with `io.modelcontextprotocol/skills` and `directoryRead: true`, in `initialize` and in `server/discover`. With the option off neither is listed.
+  - Methods, in both protocol eras: `skills/list` (50 a page, `cursor`), `skills/get` (by `skill://NAME/...` uri), `resources/list` (each skill's `SKILL.md`, so a client without skills can still find them), `resources/read` and `resources/directory/read` over `skill://NAME/FILE`. In the 2026-07-28 era they are cacheable with `ttlMs` 0: a commit can change them.
+  - Built-in skill `ikam-store`: `src/bin/ikam/skills/ikam-store/SKILL.md` (2,514 bytes), compiled in and reviewed like code. It covers revisions, paging with `start_char`, when to use `search`, `passages` or `rank`, edits waiting for `commit`, commit messages, drafts and discarding, and tool errors.
+  - With PATH, each folder under PATH at the head of the session's ref that has a `SKILL.md` at its root is a skill. The head is read, not the working tree, so pending edits are never listed.
+  - Each manifest lists every file once with `sha256:` and 64 hex digits and its size. SHA-256 is a 68-line local implementation (`mcp::sha256`, FIPS 180-4) rather than the `sha2` crate: the kernel pins its dependencies, `sha2` is not in the lock file and would bring `digest`, `block-buffer` and `cpufeatures` with it, and the digests cover at most 16 MiB a skill.
+  - Refused, never cut: a skill over 512 files or 16 MiB (counted from the tree before any file is read), a folder whose `SKILL.md` names another skill, a `SKILL.md` without `name` and `description`, a store skill named `ikam-store`. A refused skill is left out of `skills/list`, which names it with its reason under `_meta` (`ikam/refused`); `skills/get` and reads of it answer -32602 with the reason; the server also logs the reason to stderr.
+  - The instructions shrink to two lines that point to `skill://ikam-store/SKILL.md`.
+  - Not done: `host` (it serves `/api`, not MCP; a project there lists only its own skills once MCP over HTTP exists, M5); shrinking the tool descriptions (they are already one line each, and changing them is not measurable without a real agent).
+- Client: no skills client in the official Python SDK 2.3.0, so `experiments/agent-tools/mcp_skills_check.py` drives the methods as JSON-RPC, using the field names in the research note. The extension's own current text was not reachable from this machine (the host was refused), so its exact wire names are unchecked. The SDK's client checks the parts it knows: `resources/list` and `resources/read` of the built-in skill validate in both eras.
+- Results (4-core cloud machine, one run; deterministic):
+  - Digests: a project with two skills (one with a template in a subfolder, one with a 1,024-byte binary file served as base64), plus the built-in: 5 files, 3,776 bytes. Every listed digest and size equals Python's `hashlib.sha256` and the length of the bytes `resources/read` served; every `skills/get` equals its `skills/list` entry.
+  - Commits: an edit to `release-notes/SKILL.md` left every digest as it was until the commit, then changed that file's digest and no other; `read` at the commit before it still gave the old text.
+  - Limits: `huge` (513 files) "more than 512 files (the extension's limit)"; `heavy` (16 MiB plus its `SKILL.md`) "16777264 bytes or more, over 16777216"; `misnamed` "its SKILL.md names it other-name, not misnamed". None listed; the other skills' digests still matched.
+  - Option off: E359's `mcp_check.py`, tapped as in E406, byte-equal to main's answers (63 requests, 62 answers, 470,203 bytes, commit ids named by order); E406's `mcp_era_check.py` still 61/61 in all four orders.
+  - Start bytes (`initialize` plus `tools/list`; `server/discover` plus `tools/list`):
+
+    | | handshake era | 2026-07-28 |
+    | --- | --- | --- |
+    | off | 373 + 5,343 = 5,716 | 526 + 5,487 = 6,013 |
+    | on | 420 + 5,343 = 5,763 | 573 + 5,487 = 6,060 |
+
+    The option costs 47 bytes at start: the instructions shrink from 194 to 154 characters, and the capability ad adds 87. H2(a) is refuted at today's sizes: the guidance that every session pays for is already short (194 characters and 17 one-line descriptions), so there was little to move. What the skill does is offer 2,514 bytes of guidance that no session got before, read only when a client loads it.
+- Checks: `sha256_and_base64_match_known_vectors` (FIPS vectors: empty, abc, the 448-bit message, a million a's, 64 a's; base64 edges), `skills_follow_commits_and_refuse_over_limits` (off is -32601 and lists no extensions; pending skills unlisted; digests against the served bytes; directory entries; new digest after commit, old text at the old commit; wrong name and 513 files refused with reasons; get of a refused skill; `..` refused), `skills_page_with_a_cursor_and_ride_the_modern_envelope` (61 skills over two pages; `resultType`; discover's capabilities and instructions). `cargo test --release --features embed`: 380 pass, 0 fail; clippy `-D warnings` clean.
+- Verdict: **kept** as an option, off. H2(b) confirmed; H2(a) refuted at start (+47 bytes), and the guidance on demand is new.
+- Not measured: Claude Code (whether it lists `ikam-store`, loads it when asked to edit, and E359's rename task with and without it) waits for the Mac after Nov 29; the extension's current wire names; skills in `host`.
+- Run: `python3 experiments/agent-tools/mcp_skills_check.py IKAM_BIN WORK`; option off as in E406.
