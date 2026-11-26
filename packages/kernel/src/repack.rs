@@ -368,6 +368,7 @@ impl<S: Store + Sync> Repo<S> {
         fresh.short_records = self.short_records;
         fresh.markup_layers = self.markup_layers;
         fresh.slow_codec_max = self.slow_codec_max;
+        fresh.float_planes = self.float_planes;
         fresh.group_size = self.group_size;
         fresh.deflate_memo = self.deflate_memo.clone();
         fresh.proposed_order = self.proposed_order.clone();

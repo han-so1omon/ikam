@@ -72,7 +72,7 @@ type DictRef = [u8; DICT_REF_LEN];
 pub(crate) fn is_plain(encoded: &[u8]) -> bool {
     matches!(
         encoded.first(),
-        Some(b'B' | b'W' | b'Z' | b'Y' | b'X' | b'R' | b'P' | b'K' | b'S' | b'Q' | b'M')
+        Some(b'B' | b'W' | b'Z' | b'Y' | b'X' | b'R' | b'P' | b'K' | b'S' | b'Q' | b'M' | b'V')
     )
 }
 
@@ -100,7 +100,7 @@ fn unchecked_raw(body: &[u8]) -> Option<&[u8]> {
 /// read need not hash it again (E075: reads of these hashed it twice). "W"
 /// checks its CRC (E074); the others check the bytes against the id while
 /// decoding (to pick among dictionaries or bases, or a group member's own
-/// id). Only "B" and "Z" come back unverified.
+/// id). Only "B", "Z" and "V" come back unverified.
 pub(crate) fn self_verified(encoded: &[u8]) -> bool {
     matches!(
         encoded.first(),
@@ -426,6 +426,9 @@ fn decode_basic(id: &Id, encoded: &[u8]) -> Result<Vec<u8>, Error> {
             Ok(bytes.to_vec())
         }
         Some((b'Z', z)) => unzstd_frame(z, &[]).ok_or(Error::Corrupt(*id)),
+        Some((b'V', z)) => unzstd_frame(z, &[])
+            .map(|p| crate::planes::join(&p))
+            .ok_or(Error::Corrupt(*id)),
         _ => Err(Error::WrongKind(*id)),
     }
 }
@@ -493,6 +496,17 @@ impl<S: Store> Repo<S> {
             let plain = self.encode_plain(bytes);
             if self.cost(&plain, reads) < self.cost(&best, reads) {
                 best = plain;
+            }
+            // E410: float content as byte planes, where the predictor
+            // picks it.
+            if self.float_planes
+                && crate::planes::predict(bytes)
+                && let Some(z) = zstd_frame(&crate::planes::split(bytes), &[], self.level)
+            {
+                let v = [&b"V"[..], &z].concat();
+                if self.cost(&v, reads) < self.cost(&best, reads) {
+                    best = v;
+                }
             }
         }
         let slow = bytes.len() <= self.slow_codec_max;
@@ -680,6 +694,13 @@ impl<S: Store> Repo<S> {
                 bytes[..limit.min(bytes.len())].to_vec()
             }),
             Some((b'Z', z)) => unzstd_prefix(z, &[], limit),
+            // The planes hold every value's first byte before any second
+            // byte, so a prefix needs the whole frame.
+            Some((b'V', z)) => unzstd_frame(z, &[]).map(|p| {
+                let mut b = crate::planes::join(&p);
+                b.truncate(limit);
+                b
+            }),
             Some((b'X', x)) => codec::unxz_prefix(x, limit),
             Some((b'R', r)) => codec::unbrotli_prefix(r, limit),
             Some((b'P', p)) => codec::unppmd_prefix(p, limit),

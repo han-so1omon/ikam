@@ -236,6 +236,12 @@ pub struct Repo<S: Store> {
     /// still scanned. Off, every candidate is decoded and scanned, so
     /// results never rest on the index alone.
     pub exact_short_search: bool,
+    /// Let repack store float content as byte planes (E410, Xet's BG4):
+    /// a content of 4 KiB or more whose 4 byte positions the predictor
+    /// finds distributed differently (`planes::predict`) is also tried as
+    /// a zstd frame of its planes ("V"), kept if cheaper. Off by default.
+    /// Reading accepts "V" at any setting.
+    pub float_planes: bool,
     pub(crate) hints: std::sync::Mutex<Option<Hints>>,
     /// Whether a stored tree or graph chunk may be planned as a fill of a
     /// template (E144). On by default. Off, its plans are only slices of
@@ -327,6 +333,7 @@ impl<S: Store> Repo<S> {
             cache: Default::default(),
             replace_hints: false,
             exact_short_search: false,
+            float_planes: false,
             object_templates: true,
             plain_db_events: false,
             plain_hot_writes: false,
@@ -691,6 +698,7 @@ impl<S: Store> Repo<S> {
         r.plain_db_events = self.plain_db_events;
         r.plain_hot_writes = self.plain_hot_writes;
         r.exact_short_search = self.exact_short_search;
+        r.float_planes = self.float_planes;
         r
     }
 
