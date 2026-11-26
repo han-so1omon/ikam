@@ -220,6 +220,24 @@ impl<S: Store> Repo<S> {
         bytes: &[u8],
         depth: usize,
     ) -> Result<Option<Candidate>, Error> {
+        // E411: a safetensors file cut at its tensors, each tensor a
+        // content, the file their concatenation.
+        if self.tensor_cuts
+            && let Some(pieces) = crate::tensors::cuts(bytes)
+        {
+            let mut args = Vec::with_capacity(pieces.len());
+            for p in pieces {
+                args.push(Arg::Whole(self.put_content_with(p, depth + 1, &[])?.id));
+            }
+            let d = Derivation {
+                output: Id::of_content(bytes),
+                func: func::concat(),
+                args,
+            };
+            return Ok(self
+                .verify(&d, bytes, &HashMap::new())
+                .map(|work| Candidate::single(d, vec![], work)));
+        }
         let zip = match self.markup_layers {
             true => container::plan_zip_layered(bytes),
             false => container::plan_zip(bytes),
