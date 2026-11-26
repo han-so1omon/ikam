@@ -91,7 +91,11 @@ nothing of theirs is in this one.
   clients.
 - E435 pinned-float applied functions: a function kind whose ops are the
   pinned set, so a recorded step is a derivation in the ledger, checked by
-  re-running.
+  re-running. E409 (measured on 11 builds, open as its own PR) gives the
+  rules: native code in a fixed order matched everywhere but NaN bits,
+  which `ikT1` already makes canonical; no fused multiply-add and no
+  lane-split sums; a shipped `exp` (the pinned set uses `libm`), not the
+  host's.
 - E436 recorded steps under Petri nets: a transition whose firing is a
   recorded compute step, its output in the firing record, replayable.
 - E437 records shares with content: an option to carry the content a
