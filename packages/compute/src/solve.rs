@@ -266,3 +266,100 @@ impl PlannedMinimizer {
         Ok(())
     }
 }
+
+impl Minimizer {
+    /// Derivatives of an objective at an equilibrium with respect to
+    /// parameters, by the adjoint of the equilibrium (implicit
+    /// differentiation): at a minimum x*(p) of E(x, p), for J(x, p),
+    /// dJ/dp = dJ/dp - lambda . d(dE/dx)/dp with H lambda = dJ/dx. One
+    /// Hessian solve gives the derivative for every parameter, which is
+    /// what inverse kinematics, design optimization and identification
+    /// need. `shapes` covers the energy's and the objective's inputs.
+    pub fn sensitivity(
+        &self,
+        shapes: &BTreeMap<String, Vec<usize>>,
+        env: &Env,
+        x: &Tensor,
+        objective: &Graph,
+        of: V,
+        params: &[&str],
+        opt: &Options,
+    ) -> Result<(f64, Vec<Tensor>), Error> {
+        let mut env = env.clone();
+        env.insert(self.var.clone(), x.clone());
+        let zeros = |name: &str| Tensor::zeros(&shapes[name]);
+        // dJ/dx and the direct dJ/dp.
+        let present = objective.input_names();
+        let wrt: Vec<&str> = std::iter::once(self.var.as_str())
+            .chain(params.iter().copied())
+            .filter(|p| present.iter().any(|n| n == p))
+            .collect();
+        let jg = grad(objective, shapes, of, &wrt)?;
+        let jo = eval(&jg, &env)?;
+        let value = jo[0].item();
+        let by_name: BTreeMap<&str, &Tensor> = wrt.iter().copied().zip(jo[1..].iter()).collect();
+        let jx = by_name.get(self.var.as_str()).map(|t| (*t).clone()).unwrap_or_else(|| zeros(&self.var));
+        // H lambda = dJ/dx.
+        let lam = self.solve_h(&env, &jx, opt)?;
+        // d(lambda . dE/dx)/dp.
+        let mut mg = self.gradient.clone();
+        let lname = format!("lam:{}", self.var);
+        let l = mg.input(&lname);
+        let gx = mg.outputs[1];
+        let prod = mg.mul(gx, l);
+        let s = mg.sum(prod);
+        let mut s2 = shapes.clone();
+        s2.insert(lname.clone(), shapes[&self.var].clone());
+        let epresent = mg.input_names();
+        let mp: Vec<&str> = params.iter().copied().filter(|p| epresent.iter().any(|n| n == p)).collect();
+        let mut mixed: BTreeMap<&str, Tensor> = BTreeMap::new();
+        if !mp.is_empty() {
+            let mgg = grad(&mg, &s2, s, &mp)?;
+            env.insert(lname, lam);
+            let out = eval(&mgg, &env)?;
+            for (p, t) in mp.iter().zip(out.into_iter().skip(1)) {
+                mixed.insert(p, t);
+            }
+        }
+        let mut res = Vec::new();
+        for p in params {
+            let mut d = by_name.get(p).map(|t| (*t).clone()).unwrap_or_else(|| zeros(p));
+            if let Some(m) = mixed.get(p) {
+                for (a, b) in d.data.iter_mut().zip(&m.data) {
+                    *a -= b;
+                }
+            }
+            res.push(d);
+        }
+        Ok((value, res))
+    }
+
+    /// Solve H y = b by conjugate gradients to a relative residual of 1e-12.
+    fn solve_h(&self, env: &Env, b: &Tensor, opt: &Options) -> Result<Tensor, Error> {
+        let n = b.data.len();
+        let mut env = env.clone();
+        let mut y = vec![0.0; n];
+        let mut r = b.data.clone();
+        let mut d = r.clone();
+        let mut rr = dot(&r, &r);
+        let stop = 1e-12 * rr.sqrt();
+        for _ in 0..opt.max_cg.max(2 * n) {
+            if rr.sqrt() <= stop {
+                break;
+            }
+            env.insert(format!("v:{}", self.var), Tensor { shape: b.shape.clone(), data: d.clone() });
+            let hd = eval(&self.hessian_vec, &env)?.remove(0).data;
+            let curv = dot(&d, &hd);
+            if curv <= 0.0 {
+                return Err(Error::NoConvergence("the Hessian is not positive definite here".into()));
+            }
+            let alpha = rr / curv;
+            y = axpy(&y, alpha, &d);
+            r = axpy(&r, -alpha, &hd);
+            let rr2 = dot(&r, &r);
+            d = axpy(&r, rr2 / rr, &d);
+            rr = rr2;
+        }
+        Ok(Tensor { shape: b.shape.clone(), data: y })
+    }
+}

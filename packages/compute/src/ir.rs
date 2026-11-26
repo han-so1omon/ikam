@@ -47,6 +47,8 @@ pub enum Op {
     MatMul,
     /// Rank 2.
     Transpose,
+    /// The same values in another shape of the same size.
+    Reshape { shape: Vec<usize> },
 }
 
 impl Op {
@@ -77,6 +79,7 @@ impl Op {
             Op::Fill { shape } => ("fill", shape.iter().map(|d| *d as u64).collect()),
             Op::MatMul => ("matmul", vec![]),
             Op::Transpose => ("transpose", vec![]),
+            Op::Reshape { shape } => ("reshape", shape.iter().map(|d| *d as u64).collect()),
         };
         let mut out = name.as_bytes().to_vec();
         for p in params {
@@ -121,6 +124,7 @@ impl Op {
             ("fill", shape) => Op::Fill { shape: shape.to_vec() },
             ("matmul", []) => Op::MatMul,
             ("transpose", []) => Op::Transpose,
+            ("reshape", shape) => Op::Reshape { shape: shape.to_vec() },
             _ => return Err(bad()),
         })
     }
@@ -260,6 +264,12 @@ impl Graph {
                 Op::Fill { shape } => {
                     if !s[0].is_empty() {
                         return Err(bad("fill takes a scalar"));
+                    }
+                    shape.clone()
+                }
+                Op::Reshape { shape } => {
+                    if s[0].iter().product::<usize>() != shape.iter().product::<usize>() {
+                        return Err(bad("reshape size"));
                     }
                     shape.clone()
                 }

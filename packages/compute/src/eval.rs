@@ -113,6 +113,7 @@ pub fn apply(op: &Op, a: &[&Tensor], env: &Env) -> Result<Tensor, Error> {
             }
             Tensor { shape: shape.clone(), data: vec![a[0].data[0]; shape.iter().product()] }
         }
+        Op::Reshape { shape } => Tensor::new(shape.clone(), a[0].data.clone())?,
         Op::MatMul => matmul(a[0], a[1])?,
         Op::Transpose => {
             let (r, c) = dims2(a[0])?;

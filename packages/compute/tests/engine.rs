@@ -55,7 +55,13 @@ fn mixed() -> (Graph, V, BTreeMap<String, Vec<usize>>, Env) {
     let pad = g.push(Op::Pad { start: 2, total: 10 }, &[z]);
     let neg = g.neg(pad);
     let s2 = g.sum(neg);
+    let col = g.push(Op::Reshape { shape: vec![5, 1] }, &[u]);
+    let row = g.push(Op::Transpose, &[col]);
+    let outer = g.push(Op::MatMul, &[col, row]);
+    let o2 = g.mul(outer, outer);
+    let s3 = g.sum(o2);
     let f = g.add(s1, s2);
+    let f = g.add(f, s3);
     let shapes = BTreeMap::from([
         ("w".into(), vec![2, 3]),
         ("x".into(), vec![3, 1]),
@@ -404,4 +410,62 @@ fn planned_newton_cg_takes_the_same_steps() {
         assert_eq!((r.iterations, r.cg_steps), (wr.iterations, wr.cg_steps));
         assert!(Tensor::vector(x.clone()).bits_eq(&want), "load {p}");
     }
+}
+
+#[test]
+fn adjoint_sensitivities_match_resolving() {
+    // Tip height of a rod under an end load and an end moment, and its
+    // derivative with respect to both, against finite differences of
+    // full solves.
+    let (len, ei, n) = (1.0, 1.0, 40);
+    let h = len / n as f64;
+    let mut g = Graph::new();
+    let phi = g.input("phi");
+    let load = g.input("load");
+    let moment = g.input("moment");
+    let zero = g.konst(Tensor::vector(vec![0.0]));
+    let prev = g.slice(phi, 0, n - 1);
+    let sh = g.concat(&[zero, prev]);
+    let d = g.sub(phi, sh);
+    let mut w = vec![ei / (2.0 * h); n];
+    w[0] = ei / h;
+    let w = g.konst(Tensor::vector(w));
+    let dd = g.mul(d, d);
+    let wd = g.mul(w, dd);
+    let bend = g.sum(wd);
+    let s = g.unary(Op::Sin, phi);
+    let ys = g.sum(s);
+    let hh = g.scalar(h);
+    let tip_y = g.mul(hh, ys);
+    let wp = g.mul(load, tip_y);
+    let last = g.slice(phi, n - 1, 1);
+    let ta = g.sum(last);
+    let wm = g.mul(moment, ta);
+    let e = g.sub(bend, wp);
+    let e = g.sub(e, wm);
+    let mut obj = Graph::new();
+    let p2 = obj.input("phi");
+    let s2 = obj.unary(Op::Sin, p2);
+    let y2 = obj.sum(s2);
+    let hh2 = obj.scalar(h);
+    let tip = obj.mul(hh2, y2);
+    obj.outputs = vec![tip];
+    let shapes = BTreeMap::from([("phi".into(), vec![n]), ("load".into(), vec![]), ("moment".into(), vec![])]);
+    let solver = Minimizer::new(&g, e, "phi", &shapes).unwrap();
+    let opt = Options { tol: 1e-12, ..Options::default() };
+    let solve = |p: f64, m: f64| {
+        let env = Env::from([("load".into(), Tensor::scalar(p)), ("moment".into(), Tensor::scalar(m))]);
+        let (x, _) = solver.minimize(&env, Tensor::zeros(&[n]), &opt).unwrap();
+        (env, x)
+    };
+    let tip_of = |x: &Tensor| eval(&obj, &Env::from([("phi".into(), x.clone())])).unwrap()[0].item();
+    let (p0, m0) = (1.2, 0.4);
+    let (env, x) = solve(p0, m0);
+    let (value, ds) = solver.sensitivity(&shapes, &env, &x, &obj, tip, &["load", "moment"], &opt).unwrap();
+    assert!((value - tip_of(&x)).abs() < 1e-15);
+    let step = 1e-5;
+    let fd_p = (tip_of(&solve(p0 + step, m0).1) - tip_of(&solve(p0 - step, m0).1)) / (2.0 * step);
+    let fd_m = (tip_of(&solve(p0, m0 + step).1) - tip_of(&solve(p0, m0 - step).1)) / (2.0 * step);
+    assert!((ds[0].item() - fd_p).abs() < 1e-7, "{} vs {fd_p}", ds[0].item());
+    assert!((ds[1].item() - fd_m).abs() < 1e-7, "{} vs {fd_m}", ds[1].item());
 }

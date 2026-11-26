@@ -153,6 +153,7 @@ fn vjp(
             vec![(0, ga), (1, gb)]
         }
         Op::Transpose => vec![(0, h.push(Op::Transpose, &[gy]))],
+        Op::Reshape { .. } => vec![(0, h.push(Op::Reshape { shape: sa(0) }, &[gy]))],
     })
 }
 
