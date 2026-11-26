@@ -1,0 +1,42 @@
+# E409: the float portability check on GitHub's hosted runners. It runs only
+# on pushes to the experiment's own branch (and by hand), never on main or
+# on pull requests. It uses no secrets and prints only the check's own
+# output: hashes of float results, NaN bit patterns and timings.
+name: float-portability
+on:
+  push:
+    branches: [exp/409-float-portability]
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  floats:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, ubuntu-24.04-arm, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        shell: bash
+        working-directory: packages/kernel/experiments/float-portability
+    steps:
+      - uses: actions/checkout@v4
+      - name: Toolchain
+        run: rustup toolchain install stable --profile minimal && rustup default stable
+      - name: Run, NaN canonical (the kernel's wasmi features)
+        run: cargo run --release --locked -q -- default > out.jsonl
+      - name: Run, wasmi without NaN canonicalization
+        run: cargo run --release --locked -q --no-default-features -- default >> out.jsonl
+      - name: Run, x86-64 instruction-set levels
+        if: runner.arch == 'X64'
+        run: |
+          for level in x86-64 x86-64-v3; do
+            RUSTFLAGS="-C target-cpu=$level" cargo run --release --locked -q --target-dir target-$level -- $level >> out.jsonl
+          done
+      - name: Print results (the log is readable where the artifact is not)
+        run: cat out.jsonl
+      - uses: actions/upload-artifact@v4
+        with:
+          name: floats-${{ matrix.os }}
+          path: packages/kernel/experiments/float-portability/out.jsonl

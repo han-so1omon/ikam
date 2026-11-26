@@ -1,0 +1,23 @@
+[package]
+name = "float_portability"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+# E409: its own crate, so the runners build only this and not the kernel.
+[workspace]
+
+[dependencies]
+# The kernel's interpreter, with the kernel's features (wasm.rs runs it with
+# floats off; here they are on). `deterministic` canonicalizes NaN results.
+wasmi = { version = "=2.0.0", features = ["auto-dispatch"] }
+wat = "1.260.0"
+libm = "=0.2.16"
+
+[features]
+# The kernel builds wasmi with `deterministic`: every NaN result canonical.
+default = ["canonical"]
+canonical = ["wasmi/deterministic"]
+
+[profile.release]
+debug = false
