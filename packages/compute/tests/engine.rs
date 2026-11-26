@@ -469,3 +469,53 @@ fn adjoint_sensitivities_match_resolving() {
     assert!((ds[0].item() - fd_p).abs() < 1e-7, "{} vs {fd_p}", ds[0].item());
     assert!((ds[1].item() - fd_m).abs() < 1e-7, "{} vs {fd_m}", ds[1].item());
 }
+
+#[test]
+fn inlined_graphs_compute_the_same() {
+    let (g, f, _, env) = mixed();
+    let mut h = Graph::new();
+    let mut bind = BTreeMap::new();
+    for name in ["w", "x", "u", "k"] {
+        bind.insert(name.to_string(), h.input(&format!("outer:{name}")));
+    }
+    let mut g1 = g.clone();
+    g1.outputs = vec![f];
+    let out = h.inline(&g1, &bind).unwrap();
+    let two = h.scalar(2.0);
+    let y = h.mul(two, out[0]);
+    h.outputs = vec![y];
+    let outer: Env = env.iter().map(|(k, v)| (format!("outer:{k}"), v.clone())).collect();
+    let want = eval_all(&g, &env).unwrap()[f].item() * 2.0;
+    assert_eq!(eval(&h, &outer).unwrap()[0].item().to_bits(), want.to_bits());
+}
+
+#[test]
+fn a_committed_graph_crosses_projects_by_a_graph_share() {
+    use ikam_kernel::share::{Right, Scope, Share, import_share};
+    let (g, f, shapes, env) = mixed();
+    let gg = grad(&g, &shapes, f, &["u"]).unwrap();
+    let mut src = Repo::new(MemStore::default());
+    let (_, commit) = gg.commit_at(&mut src, "main", "models/mixed-grad", "the model").unwrap();
+    // A database on the same ref keeps the graph entry.
+    let db = src.db_empty().unwrap();
+    let db = src.db_append(&db, &[Event::upsert("note", b"x", "note")]).unwrap();
+    let c2 = src.db_commit("main", &db, "a record").unwrap();
+    assert!(Graph::load_at(&src, &c2.to_hex(), "models/mixed-grad").is_ok());
+    let share = Share {
+        name: "model".into(),
+        from: "source".into(),
+        to: "receiver".into(),
+        commit,
+        scope: Scope::Graph { path: "models/mixed-grad".into(), prefix: String::new() },
+        right: Right::Merge,
+        expires: u64::MAX,
+    };
+    let key = [7u8; 32];
+    let tag = src.share_issue(&share, &key).unwrap();
+    src.share_check(&share, &tag, &key, "receiver", Right::Merge, 0).unwrap();
+    let mut dst = Repo::new(MemStore::default());
+    import_share(&mut src, &share, &mut dst, "main", "import the model").unwrap();
+    let got = Graph::load_at(&dst, "main", "models/mixed-grad").unwrap();
+    let (a, b) = (eval(&gg, &env).unwrap(), eval(&got, &env).unwrap());
+    assert!(a.iter().zip(&b).all(|(x, y)| x.bits_eq(y)));
+}

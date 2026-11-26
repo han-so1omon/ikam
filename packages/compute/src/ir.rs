@@ -5,7 +5,7 @@
 
 use std::collections::BTreeMap;
 
-use ikam_kernel::{Arg, Edge, Id, Node, Repo, Store, Target, node_key};
+use ikam_kernel::{Arg, Edge, Id, Kind, Node, Object, Repo, Store, Target, TreeEntry, node_key};
 
 use crate::{Error, Tensor};
 
@@ -347,4 +347,90 @@ impl Graph {
 
 fn label(i: usize) -> String {
     format!("n{i:06}")
+}
+
+impl Graph {
+    /// Copy `other`'s nodes into this graph, its inputs bound to nodes
+    /// here; returns the nodes of its outputs. A shared model (a section
+    /// law, a contact law) becomes a term of a larger energy this way.
+    pub fn inline(&mut self, other: &Graph, bind: &BTreeMap<String, V>) -> Result<Vec<V>, Error> {
+        let mut map: Vec<V> = Vec::with_capacity(other.nodes.len());
+        for n in &other.nodes {
+            let v = match &n.op {
+                Op::Input(name) => *bind.get(name).ok_or_else(|| Error::MissingInput(name.clone()))?,
+                op => {
+                    let args: Vec<V> = n.args.iter().map(|a| map[*a]).collect();
+                    self.push(op.clone(), &args)
+                }
+            };
+            map.push(v);
+        }
+        Ok(other.outputs.iter().map(|o| map[*o]).collect())
+    }
+
+    /// Store the graph and commit it at `path` in the tree of `refname`
+    /// (keeping every other entry, a database's included), so it is
+    /// versioned with the project and can be shared by a `Graph` scope.
+    /// Returns the graph's id and the commit.
+    pub fn commit_at<S: Store>(
+        &self,
+        repo: &mut Repo<S>,
+        refname: &str,
+        path: &str,
+        message: &str,
+    ) -> Result<(Id, Id), Error> {
+        let gid = self.put(repo)?;
+        let root = match repo.store().get_ref(refname)? {
+            Some(c) => match repo.get(&c)? {
+                Object::Commit(c) => c.tree,
+                _ => return Err(Error::Decode("ref is not a commit")),
+            },
+            None => repo.edit_tree(None, &[])?,
+        };
+        let parts: Vec<&str> = path.split('/').filter(|p| !p.is_empty()).collect();
+        if parts.is_empty() {
+            return Err(Error::Decode("empty graph path"));
+        }
+        let tree = put_entry(repo, root, &parts, gid)?;
+        Ok((gid, repo.commit(refname, tree, message)?))
+    }
+
+    /// The graph committed at `path` in revision `rev`.
+    pub fn load_at<S: Store>(repo: &Repo<S>, rev: &str, path: &str) -> Result<Graph, Error> {
+        let Object::Commit(c) = repo.get(&repo.resolve(rev)?)? else {
+            return Err(Error::Decode("not a commit"));
+        };
+        let mut id = c.tree;
+        let mut kind = Kind::Tree;
+        for part in path.split('/').filter(|p| !p.is_empty()) {
+            let Object::Tree(entries) = repo.get(&id)? else {
+                return Err(Error::Decode("graph path"));
+            };
+            let e = entries.into_iter().find(|e| e.name == part).ok_or(Error::Decode("graph path"))?;
+            (kind, id) = (e.kind, e.id);
+        }
+        if kind != Kind::Graph {
+            return Err(Error::Decode("not a graph"));
+        }
+        Graph::load(repo, &id)
+    }
+}
+
+fn put_entry<S: Store>(repo: &mut Repo<S>, root: Id, parts: &[&str], graph: Id) -> Result<Id, Error> {
+    let Object::Tree(mut entries) = repo.get(&root)? else {
+        return Err(Error::Decode("not a tree"));
+    };
+    let (name, rest) = (parts[0], &parts[1..]);
+    let (kind, id) = if rest.is_empty() {
+        (Kind::Graph, graph)
+    } else {
+        let sub = match entries.iter().find(|e| e.name == name) {
+            Some(e) if e.kind == Kind::Tree => e.id,
+            _ => repo.edit_tree(None, &[])?,
+        };
+        (Kind::Tree, put_entry(repo, sub, rest, graph)?)
+    };
+    entries.retain(|e| e.name != name);
+    entries.push(TreeEntry { name: name.to_string(), kind, id });
+    Ok(repo.put(&Object::tree(entries)?)?)
 }
