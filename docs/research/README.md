@@ -27,3 +27,4 @@ A paper's claim stays *unverified for this kernel* until an experiment reproduce
 - `store-backends.md`: store backends (git packs, Dolt, LSM and key/value separation, COW B-trees, SQLite, journaling, R2) and access paths (sections, queries, permissions) for E122 to E127.
 - `latent-reasoning.md`: latent chain-of-thought (Coconut, CODI, CoLaR, VQ reasoning codes, looped depth) and where it can act as a proposer for grouping, claims, program writing and filtering. It is never stored truth.
 - `experiment-loop.md`: running the experiment loop with little input on IKAM itself: a gap queue from the records, ranking, a Petri net of experiment states, and execution modes for it (E275 on).
+- `mcp-2026-07-28.md`: MCP's 2026-07-28 revision (stateless requests, `server/discover`) and its skills, tasks and elicitation extensions, for `ikam mcp` (E406 on).
