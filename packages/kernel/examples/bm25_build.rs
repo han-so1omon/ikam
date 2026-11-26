@@ -6,6 +6,12 @@
 //! in the same pass, keeps them as a derived content, and compares them with
 //! an exact second pass over the same values (one JSON line on stdout).
 //!
+//! `zones` (E405) is `stats` with zone maps of ZONE rows (a fourth
+//! argument, 4096 by default): it compares them with an exact pass over each
+//! zone's values, and times four filtered reads (a range of row numbers, a
+//! range of the float, one word, one date) over the whole table and over
+//! only the zones the maps say can match, which must find the same rows.
+//!
 //! `build` (the default) is `bm25_live_build`; `update` builds the same
 //! view the way it was built before, as an update from an empty view and
 //! an empty database. Each prints the view's root, which must be equal,
@@ -71,10 +77,15 @@ fn main() {
     eprintln!("load {:.1} s", t.elapsed().as_secs_f64());
     let before = peak_mb();
     let t = Instant::now();
-    let mut stats = ikam_kernel::colstats::TableStats::default();
+    let zone_rows: u64 = std::env::args().nth(3).map_or(4096, |a| a.parse().unwrap());
+    let mut stats = if mode == "zones" {
+        ikam_kernel::colstats::TableStats::with_zones(zone_rows)
+    } else {
+        ikam_kernel::colstats::TableStats::default()
+    };
     let root = match mode.as_str() {
         "plain" => repo.bm25_view_build(&db, "t/big/").unwrap().root,
-        "stats" => {
+        "stats" | "zones" => {
             let v = repo
                 .bm25_view_build_with_stats(&db, "t/big/", &mut stats)
                 .unwrap();
@@ -97,6 +108,13 @@ fn main() {
     let build = t.elapsed().as_secs_f64();
     let exact = if mode == "stats" {
         compare(&mut stats, &values)
+    } else if mode == "zones" {
+        let zones = compare_zones(&stats, &values);
+        format!(
+            "{{\"zones\":{zones},\"reads\":{},\"kept_bytes\":{}}}",
+            filtered_reads(&repo, &db, &stats),
+            stats.to_json().len()
+        )
     } else {
         "null".into()
     };
@@ -172,4 +190,127 @@ fn compare(stats: &mut ikam_kernel::colstats::TableStats, values: &[String]) -> 
         stats.rows == values.len() as u64,
         out.join(",")
     )
+}
+
+/// A row's field `col` as text, quotes taken off a string.
+fn field(v: &[u8], col: usize) -> &str {
+    let s = std::str::from_utf8(v).unwrap();
+    s.trim_matches(['[', ']'])
+        .split(", ")
+        .nth(col)
+        .unwrap()
+        .trim_matches('"')
+}
+
+/// E405: each zone's maps against an exact pass over its own rows (the
+/// rows' keys sort as their numbers, so zone `n` holds rows `n*Z..`).
+fn compare_zones(stats: &ikam_kernel::colstats::TableStats, values: &[String]) -> String {
+    let z = stats.zones.as_ref().unwrap();
+    let zr = z.zone_rows as usize;
+    let mut equal = z.zones.len() == values.len().div_ceil(zr);
+    for (n, zone) in z.zones.iter().enumerate() {
+        let part = &values[n * zr..((n + 1) * zr).min(values.len())];
+        for col in 0..5 {
+            let c = &zone.columns[stats.columns[&col.to_string()].idx()];
+            equal &= c.count == part.len() as u64 && c.nulls == 0;
+            if col == 0 || col == 3 {
+                let xs: Vec<f64> = part
+                    .iter()
+                    .map(|v| field(v.as_bytes(), col).parse().unwrap())
+                    .collect();
+                let lo = xs.iter().copied().fold(f64::INFINITY, f64::min);
+                let hi = xs.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+                equal &= c.num == Some((lo, hi)) && c.str.is_none();
+            } else {
+                let lo = part.iter().map(|v| field(v.as_bytes(), col)).min().unwrap();
+                let hi = part.iter().map(|v| field(v.as_bytes(), col)).max().unwrap();
+                equal &= c.str == Some((lo.as_bytes().to_vec(), hi.as_bytes().to_vec()));
+            }
+        }
+    }
+    format!(
+        "{{\"zones\":{},\"zone_rows\":{zr},\"equal_exact\":{equal}}}",
+        z.zones.len()
+    )
+}
+
+type Keep = Box<dyn Fn(&str) -> bool>;
+
+/// E405: four filters read over the whole table and over only the zones
+/// that can match; the rows found, the zones read and each read's p50 of 5.
+fn filtered_reads(
+    repo: &Repo<MemStore>,
+    db: &ikam_kernel::Db,
+    stats: &ikam_kernel::colstats::TableStats,
+) -> String {
+    use ikam_kernel::colstats::Filter;
+    let z = stats.zones.as_ref().unwrap();
+    let filters: [(&str, usize, Filter, Keep); 4] = [
+        (
+            "row_range",
+            0,
+            Filter::Range(100_000.0, 100_999.0),
+            Box::new(|t| (100_000.0..=100_999.0).contains(&t.parse::<f64>().unwrap())),
+        ),
+        (
+            "float_range",
+            3,
+            Filter::Range(500.0, 500.999),
+            Box::new(|t| (500.0..=500.999).contains(&t.parse::<f64>().unwrap())),
+        ),
+        (
+            "word",
+            2,
+            Filter::Eq(b"word42"),
+            Box::new(|t| t == "word42"),
+        ),
+        (
+            "date",
+            1,
+            Filter::Eq(b"2026-01-05"),
+            Box::new(|t| t == "2026-01-05"),
+        ),
+    ];
+    let p50 = |f: &mut dyn FnMut() -> usize| {
+        let mut ts = Vec::new();
+        let mut found = 0;
+        for _ in 0..5 {
+            let t = Instant::now();
+            found = f();
+            ts.push(t.elapsed().as_secs_f64() * 1e3);
+        }
+        ts.sort_by(f64::total_cmp);
+        (ts[2], found)
+    };
+    let mut out = Vec::new();
+    for (name, col, filter, keep) in &filters {
+        let (full_ms, full) = p50(&mut || {
+            repo.db_prefix(db, "t/big/", usize::MAX, false)
+                .unwrap()
+                .iter()
+                .filter(|(_, v)| keep(field(v, *col)))
+                .count()
+        });
+        let read = stats.zones_to_read(&col.to_string(), filter);
+        let (zoned_ms, zoned) = p50(&mut || {
+            read.iter()
+                .map(|&i| {
+                    let start = z.zones[i].first_key.as_deref().unwrap();
+                    let end = z.zones.get(i + 1).and_then(|n| n.first_key.as_deref());
+                    repo.db_range(db, start, end.or(Some("t/big0")), usize::MAX, false)
+                        .unwrap()
+                        .iter()
+                        .filter(|(_, v)| keep(field(v, *col)))
+                        .count()
+                })
+                .sum()
+        });
+        out.push(format!(
+            "\"{name}\":{{\"rows\":{full},\"same_rows\":{},\"zones_read\":{},\"zones\":{},\"full_ms\":{full_ms:.1},\"zoned_ms\":{zoned_ms:.1}}}",
+            full == zoned,
+            read.len(),
+            z.zones.len()
+        ));
+    }
+    format!("{{{}}}", out.join(","))
 }

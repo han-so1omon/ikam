@@ -6554,3 +6554,31 @@ Gates on the branch (E229 to E233): every kernel test suite passes (release); cl
 - Fixed benchmark (AGENTS.md section 7): unchanged. The bench builds no BM25 view, and the view the build writes is the same root with or without stats.
 - Verdict: **kept** as an option (a library call, off unless asked): one pass gives the stats for about 3% of a view build, equal to an exact pass within each sketch's error.
 - Not measured: the Mac; `db serve` serving the stats (the endpoint and keeping them up to date with `bm25_view_update` are next); rows with deeper nesting; more than 200k rows.
+### E405 zone-maps (min, max and nulls per zone of rows, from the same pass as E403's stats)
+
+- Branch / parent: exp/405-zone-maps / exp/403-column-stats 66b892f (stacked on E403)
+- Question: Kumo-style zone maps keep, per block of rows, each column's min, max and null count, so a filtered read can skip blocks that cannot match. Can they come from the BM25 view build's pass (E403) for no more than 5% of E403's build time, equal an exact per-zone pass, and how many zones does a filtered read skip? (Night 3 of the trip-week plan, item 7.)
+- Change: `src/colstats.rs`. `TableStats::with_zones(rows)` (off unless asked for; `TableStats::default()` keeps none) adds a zone for each so many rows in the order observed. Per zone it keeps the first and last key and, per field, the rows that have it, its nulls, and the min and max of its numbers and of its strings (as stored, escapes included, compared bytewise). `observe_at(key, row)` is `observe` that also notes the key; the BM25 build now calls it, which changes nothing when there are no zones. `zones_to_read(field, Filter::Range(lo, hi) | Filter::Eq(bytes))` names the zones a matching row can be in. `to_json` adds a `zones` part only when zones are kept, so E403's stats JSON is byte for byte the same without them. Test `zone_maps_match_an_exact_pass_and_skip_what_cannot_match` covers 10 zones of 1,000 rows with nulls and checks keys, counts, nulls and ranges against the rows, and that a row-number range reads one zone, a word outside every range reads none, and an unknown field reads all. `cargo test --release --features embed`: 378 pass, 0 fail; clippy `-D warnings` clean.
+- `db serve` has no range or filter query (its routes are append, search, vsearch, view (eq), head, get, scan, count and span), so there is none to measure. The example measures one in the library instead: a filter read over the whole table (`db_prefix`) against `db_range` over only the zones `zones_to_read` names, which must find the same rows.
+- Run (Linux cloud, 4 CPUs; `examples/bm25_build.rs 200000 zones 4096`, 49 zones of 4,096 rows; keys sort as row numbers):
+
+  | | runs | build p50 | build mean | view root |
+  | --- | --- | --- | --- | --- |
+  | `stats` (E403) | 4 | 5.01 s | 4.96 s | same |
+  | `zones` | 4 | 4.94 s | 4.95 s | same |
+
+  The zones add nothing measurable to the build (the two are within run-to-run noise on this shared host, here with another build running). The stats JSON kept grows to 27.9 KB with the zones.
+
+  | filter | rows found | zones read | whole table p50 | zones only p50 |
+  | --- | --- | --- | --- | --- |
+  | row number 100,000 to 100,999 | 1,000 | 1 of 49 | 1,059 ms | **21 ms** |
+  | float 500 to 500.999 | 185 | 49 of 49 | 1,107 ms | 1,096 ms |
+  | word = word42 | 43 | 49 of 49 | 1,121 ms | 1,128 ms |
+  | date = 2026-01-05 | 7,143 | 49 of 49 | 1,178 ms | 1,132 ms |
+
+  Same rows found each way, in every run. Zone maps pay only on a field that follows key order: the row number (here the key's own order) skips 48 of 49 zones, about 50 times faster. The random float, the word and the date are spread over every zone, so every zone's range covers the filter and nothing is skipped, as zone maps predict.
+- Zones against the exact pass: all 49 zones, all 5 fields, counts, nulls and min and max equal, in all 4 runs.
+- Peak memory 628 MB (`stats`) against 715 MB (`zones`): the difference is the filtered reads after the build (`db_prefix` holds all 200k rows), not the zones.
+- Fixed benchmark (AGENTS.md section 7): unchanged; nothing in the store's write path changes and the view root is the same.
+- Verdict: **kept** as an option (a library call, off unless asked): zone maps exact and free from the same pass, and a 50-fold faster read for a filter that follows key order; no gain for fields spread across keys.
+- Not measured: the Mac; `db serve` using the zones (it would need a filter route first); sorting or clustering rows on a field so its zones narrow; zone sizes other than 4,096; more than 200k rows.
