@@ -461,7 +461,7 @@ fn adjoint_sensitivities_match_resolving() {
     let tip_of = |x: &Tensor| eval(&obj, &Env::from([("phi".into(), x.clone())])).unwrap()[0].item();
     let (p0, m0) = (1.2, 0.4);
     let (env, x) = solve(p0, m0);
-    let (value, ds) = solver.sensitivity(&shapes, &env, &x, &obj, tip, &["load", "moment"], &opt).unwrap();
+    let (value, ds) = solver.sensitivity(&shapes, &env, &x, (&obj, tip), &["load", "moment"], &opt).unwrap();
     assert!((value - tip_of(&x)).abs() < 1e-15);
     let step = 1e-5;
     let fd_p = (tip_of(&solve(p0 + step, m0).1) - tip_of(&solve(p0 - step, m0).1)) / (2.0 * step);

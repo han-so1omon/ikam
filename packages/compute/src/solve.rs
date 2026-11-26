@@ -280,11 +280,11 @@ impl Minimizer {
         shapes: &BTreeMap<String, Vec<usize>>,
         env: &Env,
         x: &Tensor,
-        objective: &Graph,
-        of: V,
+        objective: (&Graph, V),
         params: &[&str],
         opt: &Options,
     ) -> Result<(f64, Vec<Tensor>), Error> {
+        let (objective, of) = objective;
         let mut env = env.clone();
         env.insert(self.var.clone(), x.clone());
         let zeros = |name: &str| Tensor::zeros(&shapes[name]);
