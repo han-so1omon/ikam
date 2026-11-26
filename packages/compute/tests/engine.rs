@@ -366,3 +366,42 @@ fn runs_are_recorded_versioned_and_deduplicated() {
     let k = format!("{}/state", ikam_compute::run::step_key("ramp", 0));
     assert_eq!(repo.db_get(&db, &k).unwrap().unwrap(), ia.as_bytes().to_vec());
 }
+
+#[test]
+fn planned_newton_cg_takes_the_same_steps() {
+    let (len, ei, n) = (1.0, 1.0, 64);
+    let mut g = Graph::new();
+    // The end load as an input, so one planned solver serves every load.
+    let phi = g.input("phi");
+    let load = g.input("load");
+    let h = len / n as f64;
+    let zero = g.konst(Tensor::vector(vec![0.0]));
+    let prev = g.slice(phi, 0, n - 1);
+    let sh = g.concat(&[zero, prev]);
+    let d = g.sub(phi, sh);
+    let mut w = vec![ei / (2.0 * h); n];
+    w[0] = ei / h;
+    let w = g.konst(Tensor::vector(w));
+    let dd = g.mul(d, d);
+    let wd = g.mul(w, dd);
+    let bend = g.sum(wd);
+    let s = g.unary(Op::Sin, phi);
+    let ys = g.sum(s);
+    let hh = g.scalar(h);
+    let lh = g.mul(load, hh);
+    let wp = g.mul(lh, ys);
+    let e = g.sub(bend, wp);
+    let shapes = BTreeMap::from([("phi".into(), vec![n]), ("load".into(), vec![])]);
+    let solver = Minimizer::new(&g, e, "phi", &shapes).unwrap();
+    let mut planned = solver.plan(&shapes).unwrap();
+    let opt = Options::default();
+    let mut x = vec![0.0; n];
+    for p in [0.5, 1.0, 2.0] {
+        let env = Env::from([("load".into(), Tensor::scalar(p))]);
+        let (want, wr) = solver.minimize(&env, Tensor::vector(x.clone()), &opt).unwrap();
+        planned.set("load", &[p]).unwrap();
+        let r = planned.minimize(&mut x, &opt).unwrap();
+        assert_eq!((r.iterations, r.cg_steps), (wr.iterations, wr.cg_steps));
+        assert!(Tensor::vector(x.clone()).bits_eq(&want), "load {p}");
+    }
+}

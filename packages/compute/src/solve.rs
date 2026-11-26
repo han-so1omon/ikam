@@ -12,6 +12,7 @@ use std::collections::BTreeMap;
 use crate::eval::{Env, eval};
 use crate::grad::{grad, hvp};
 use crate::ir::{Graph, V};
+use crate::plan::Plan;
 use crate::{Error, Tensor};
 
 #[derive(Clone, Debug)]
@@ -136,4 +137,132 @@ fn dot(a: &[f64], b: &[f64]) -> f64 {
 
 fn axpy(x: &[f64], a: f64, y: &[f64]) -> Vec<f64> {
     x.iter().zip(y).map(|(x, y)| x + a * y).collect()
+}
+
+/// The same Newton-CG over planned programs, for solves inside a loop that
+/// keeps a period (a quasi-static model stepped every control tick): the
+/// energy, gradient and Hessian-vector graphs are lowered once, every work
+/// vector is allocated once, and a solve allocates nothing. It takes the
+/// same steps as `Minimizer::minimize` with the same bits.
+pub struct PlannedMinimizer {
+    energy: Plan,
+    gradient: Plan,
+    hessian_vec: Plan,
+    var: String,
+    vname: String,
+    g: Vec<f64>,
+    p: Vec<f64>,
+    r: Vec<f64>,
+    d: Vec<f64>,
+    trial: Vec<f64>,
+}
+
+impl Minimizer {
+    pub fn plan(&self, shapes: &BTreeMap<String, Vec<usize>>) -> Result<PlannedMinimizer, Error> {
+        let n: usize = shapes.get(&self.var).ok_or_else(|| Error::MissingInput(self.var.clone()))?.iter().product();
+        let vname = format!("v:{}", self.var);
+        let mut s2 = shapes.clone();
+        s2.insert(vname.clone(), shapes[&self.var].clone());
+        Ok(PlannedMinimizer {
+            energy: Plan::new(&self.energy, shapes)?,
+            gradient: Plan::new(&self.gradient, shapes)?,
+            hessian_vec: Plan::new(&self.hessian_vec, &s2)?,
+            var: self.var.clone(),
+            vname,
+            g: vec![0.0; n],
+            p: vec![0.0; n],
+            r: vec![0.0; n],
+            d: vec![0.0; n],
+            trial: vec![0.0; n],
+        })
+    }
+}
+
+impl PlannedMinimizer {
+    /// Set a parameter input (a load, a tension) in every program.
+    pub fn set(&mut self, name: &str, values: &[f64]) -> Result<(), Error> {
+        self.energy.set(name, values)?;
+        self.gradient.set(name, values)?;
+        self.hessian_vec.set(name, values)
+    }
+
+    /// Minimize from `x` in place, at most `opt.max_iter` Newton steps
+    /// (a tick may take one or two, warm-started from the last tick).
+    pub fn minimize(&mut self, x: &mut [f64], opt: &Options) -> Result<Report, Error> {
+        let mut rep = Report::default();
+        for it in 0..=opt.max_iter {
+            self.gradient.set(&self.var, x)?;
+            self.gradient.run();
+            rep.evals += 1;
+            let f = self.gradient.output(0)[0];
+            self.g.copy_from_slice(self.gradient.output(1));
+            let gn = self.g.iter().fold(0.0f64, |m, v| m.max(v.abs()));
+            rep.iterations = it;
+            rep.energy = f;
+            rep.grad_norm = gn;
+            if gn < opt.tol || it == opt.max_iter {
+                return Ok(rep);
+            }
+            self.hessian_vec.set(&self.var, x)?;
+            self.cg(opt, &mut rep)?;
+            let slope = dot(&self.g, &self.p);
+            let mut step = 1.0;
+            loop {
+                for ((t, xi), pi) in self.trial.iter_mut().zip(x.iter()).zip(&self.p) {
+                    *t = xi + step * pi;
+                }
+                self.energy.set(&self.var, &self.trial)?;
+                self.energy.run();
+                rep.evals += 1;
+                let ft = self.energy.output(0)[0];
+                let slack = 16.0 * f64::EPSILON * (f.abs() + ft.abs());
+                if ft <= f + 1e-4 * step * slope + slack || step < 1e-12 {
+                    x.copy_from_slice(&self.trial);
+                    break;
+                }
+                step *= 0.5;
+            }
+        }
+        Ok(rep)
+    }
+
+    fn cg(&mut self, opt: &Options, rep: &mut Report) -> Result<(), Error> {
+        self.p.fill(0.0);
+        for (r, g) in self.r.iter_mut().zip(&self.g) {
+            *r = -g;
+        }
+        self.d.copy_from_slice(&self.r);
+        let mut rr = dot(&self.r, &self.r);
+        let gn = rr.sqrt();
+        let stop = gn.sqrt().min(0.5) * gn;
+        for k in 0..opt.max_cg {
+            self.hessian_vec.set(&self.vname, &self.d)?;
+            self.hessian_vec.run();
+            rep.evals += 1;
+            rep.cg_steps += 1;
+            let hd = self.hessian_vec.output(0);
+            let curv = dot(&self.d, hd);
+            if curv <= 0.0 {
+                if k == 0 {
+                    self.p.copy_from_slice(&self.r);
+                }
+                return Ok(());
+            }
+            let alpha = rr / curv;
+            for ((p, r), (d, h)) in self.p.iter_mut().zip(self.r.iter_mut()).zip(self.d.iter().zip(hd)) {
+                *p += alpha * d;
+                *r -= alpha * h;
+            }
+            let rr2 = dot(&self.r, &self.r);
+            if rr2.sqrt() < stop {
+                break;
+            }
+            let beta = rr2 / rr;
+            for (d, r) in self.d.iter_mut().zip(&self.r) {
+                *d = r + beta * *d;
+            }
+            rr = rr2;
+        }
+        Ok(())
+    }
 }
