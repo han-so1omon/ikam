@@ -34,6 +34,8 @@ jobs:
           for level in x86-64 x86-64-v3; do
             RUSTFLAGS="-C target-cpu=$level" cargo run --release --locked -q --target-dir target-$level -- $level >> out.jsonl
           done
+      - name: Print results (the log is readable where the artifact is not)
+        run: cat out.jsonl
       - uses: actions/upload-artifact@v4
         with:
           name: floats-${{ matrix.os }}
