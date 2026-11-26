@@ -174,7 +174,20 @@ impl<L: DerefMut<Target = Live>> Session<L> {
             "tools/list" => obj(vec![("tools", Json::Arr(tools()))]),
             "tools/call" => self.tools_call(&params),
             _ => match self.skills_method(method, &params) {
-                Some(Ok(r)) => r,
+                Some(Ok(mut r)) => {
+                    // The extension's own results carry its cache fields
+                    // in either era.
+                    if matches!(
+                        method,
+                        "skills/list" | "skills/get" | "resources/directory/read"
+                    ) && let Json::Obj(f) = &mut r
+                    {
+                        f.push(("resultType".into(), s("complete")));
+                        f.push(("ttlMs".into(), Json::Num(0.0)));
+                        f.push(("cacheScope".into(), s("private")));
+                    }
+                    r
+                }
                 Some(Err((code, m))) => return Some(error(id, code, &m)),
                 None => return Some(error(id, -32601, &format!("method not found: {method}"))),
             },
@@ -907,54 +920,81 @@ pub fn take_skills(args: &mut Vec<String>) -> Option<Option<String>> {
 struct Skill {
     name: String,
     description: String,
+    /// The frontmatter's other top-level keys with a value on their line,
+    /// passed through as the extension asks (`true`/`false` as booleans,
+    /// the rest as strings). Keys whose value is nested are left out.
+    other: Vec<(String, Json)>,
     files: Vec<(String, Vec<u8>)>,
 }
 
-/// `name` and `description` from a `SKILL.md`'s frontmatter.
-fn frontmatter(md: &[u8]) -> Result<(String, String), String> {
+type Front = (String, String, Vec<(String, Json)>);
+
+/// `name`, `description` and the other top-level keys from a `SKILL.md`'s
+/// frontmatter.
+fn frontmatter(md: &[u8]) -> Result<Front, String> {
     let text = std::str::from_utf8(md).map_err(|_| "SKILL.md is not UTF-8".to_string())?;
     let mut lines = text.lines();
     if lines.next().map(str::trim) != Some("---") {
         return Err("SKILL.md has no frontmatter".into());
     }
-    let (mut name, mut description) = (None, None);
+    let (mut name, mut description, mut other) = (None, None, Vec::new());
     for l in lines {
         if l.trim() == "---" {
             break;
+        }
+        // Top-level keys only: an indented or list line belongs to a key
+        // above it.
+        if l.starts_with([' ', '\t', '-', '#']) {
+            continue;
         }
         if let Some((k, v)) = l.split_once(':') {
             let v = v.trim().trim_matches('"').trim_matches('\'').to_string();
             match k.trim() {
                 "name" => name = Some(v),
                 "description" => description = Some(v),
+                _ if v.is_empty() => {}
+                k if !other.iter().any(|(o, _)| o == k) => other.push((
+                    k.to_string(),
+                    match v.as_str() {
+                        "true" => Json::Bool(true),
+                        "false" => Json::Bool(false),
+                        _ => s(&v),
+                    },
+                )),
                 _ => {}
             }
         }
     }
     match (name, description) {
-        (Some(n), Some(d)) if !n.is_empty() && !d.is_empty() => Ok((n, d)),
+        (Some(n), Some(d)) if !n.is_empty() && !d.is_empty() => Ok((n, d, other)),
         _ => Err("SKILL.md frontmatter needs name and description".into()),
     }
 }
 
+/// A skill entry as the extension defines it: the `SKILL.md` uri, the
+/// frontmatter, and every file once (`SKILL.md` first) with its digest and
+/// size.
 fn manifest(k: &Skill) -> Json {
-    let files = k
+    let resources = k
         .files
         .iter()
         .map(|(path, bytes)| {
             obj(vec![
-                ("path", s(path)),
                 ("uri", s(&format!("skill://{}/{path}", k.name))),
                 ("digest", s(&format!("sha256:{}", hex(&sha256(bytes))))),
                 ("size", Json::Num(bytes.len() as f64)),
             ])
         })
         .collect();
+    let mut front = vec![
+        ("name".to_string(), s(&k.name)),
+        ("description".to_string(), s(&k.description)),
+    ];
+    front.extend(k.other.iter().cloned());
     obj(vec![
-        ("name", s(&k.name)),
-        ("description", s(&k.description)),
         ("uri", s(&format!("skill://{}/SKILL.md", k.name))),
-        ("files", Json::Arr(files)),
+        ("frontmatter", Json::Obj(front)),
+        ("resources", Json::Arr(resources)),
     ])
 }
 
@@ -1011,10 +1051,11 @@ impl<L: DerefMut<Target = Live>> Session<L> {
     /// Every skill: the built-in first, then the store's by name, and the
     /// folders refused with their reasons.
     fn all_skills(&mut self) -> (Vec<Skill>, Vec<(String, String)>) {
-        let (name, description) = frontmatter(BUILTIN_SKILL_MD).expect("built-in skill");
+        let (name, description, other) = frontmatter(BUILTIN_SKILL_MD).expect("built-in skill");
         let mut skills = vec![Skill {
             name,
             description,
+            other,
             files: vec![("SKILL.md".into(), BUILTIN_SKILL_MD.to_vec())],
         }];
         let mut refused = Vec::new();
@@ -1107,13 +1148,14 @@ impl<L: DerefMut<Target = Live>> Session<L> {
         for (path, id) in paths {
             files.push((path, self.live.read(&id)?.to_vec()));
         }
-        let (name, description) = frontmatter(&files[0].1)?;
+        let (name, description, other) = frontmatter(&files[0].1)?;
         if name != folder {
             return Err(format!("its SKILL.md names it {name}, not {folder}"));
         }
         Ok(Skill {
             name,
             description,
+            other,
             files,
         })
     }
@@ -1200,8 +1242,9 @@ impl<L: DerefMut<Target = Live>> Session<L> {
         Ok(obj(vec![("contents", Json::Arr(vec![content]))]))
     }
 
-    /// A skill folder's entries one level down: files with their size,
-    /// folders ending in `/`.
+    /// A skill folder's direct children as the extension's `resources`:
+    /// folders as `inode/directory` (no trailing `/`), files with their
+    /// type.
     fn skill_dir(&mut self, uri: &str) -> Result<Json, (i64, String)> {
         let (name, dir) = skill_uri(uri)?;
         let k = self.skill(name)?;
@@ -1220,24 +1263,26 @@ impl<L: DerefMut<Target = Live>> Session<L> {
                 Some((sub, _)) => {
                     if seen.insert(sub.to_string()) {
                         entries.push(obj(vec![
-                            ("uri", s(&format!("skill://{name}/{prefix}{sub}/"))),
-                            ("name", s(&format!("{sub}/"))),
-                            ("type", s("directory")),
+                            ("uri", s(&format!("skill://{name}/{prefix}{sub}"))),
+                            ("name", s(sub)),
+                            ("mimeType", s("inode/directory")),
                         ]));
                     }
                 }
                 None => entries.push(obj(vec![
                     ("uri", s(&format!("skill://{name}/{path}"))),
                     ("name", s(rest)),
-                    ("type", s("file")),
-                    ("size", Json::Num(bytes.len() as f64)),
+                    (
+                        "mimeType",
+                        s(mime(path, std::str::from_utf8(bytes).is_ok())),
+                    ),
                 ])),
             }
         }
         if entries.is_empty() {
             return Err((-32602, format!("no folder {dir} in skill {name}")));
         }
-        Ok(obj(vec![("entries", Json::Arr(entries))]))
+        Ok(obj(vec![("resources", Json::Arr(entries))]))
     }
 }
 
@@ -1761,8 +1806,24 @@ mod tests {
     fn listed(s: &mut Session) -> Vec<(String, String, f64)> {
         let mut out = Vec::new();
         let r = rpc(s, 1, "skills/list", "{}");
+        // The extension's cache fields, in this (handshake) era too.
+        for f in ["resultType", "ttlMs", "cacheScope"] {
+            assert!(result(&r).get(f).is_some(), "{f}");
+        }
         for k in result(&r).get("skills").unwrap().as_arr() {
-            for f in k.get("files").unwrap().as_arr() {
+            // The entry's shape: uri, frontmatter and resources, nothing
+            // named at the top.
+            assert!(k.get("name").is_none() && k.get("files").is_none());
+            let front = k.get("frontmatter").unwrap();
+            let name = front.get("name").unwrap().as_str().unwrap();
+            assert!(front.get("description").is_some());
+            assert_eq!(
+                k.get("uri").unwrap().as_str().unwrap(),
+                format!("skill://{name}/SKILL.md")
+            );
+            let res = k.get("resources").unwrap().as_arr();
+            assert_eq!(res[0].get("uri"), k.get("uri"), "SKILL.md first");
+            for f in res {
                 let uri = f.get("uri").unwrap().as_str().unwrap().to_string();
                 let read = rpc(s, 2, "resources/read", &format!(r#"{{"uri":"{uri}"}}"#));
                 let c = &result(&read).get("contents").unwrap().as_arr()[0];
@@ -1778,6 +1839,30 @@ mod tests {
             }
         }
         out
+    }
+
+    #[test]
+    fn frontmatter_passes_other_top_level_keys_through() {
+        let md = b"---\nname: a\ndescription: b\nlicense: MIT\ndisable-model-invocation: true\nmetadata:\n  owner: x\n- y\n---\nbody\n";
+        let (n, d, other) = frontmatter(md).unwrap();
+        assert_eq!((n.as_str(), d.as_str()), ("a", "b"));
+        assert_eq!(
+            other,
+            [
+                ("license".to_string(), s("MIT")),
+                ("disable-model-invocation".to_string(), Json::Bool(true)),
+            ]
+        );
+        let k = Skill {
+            name: n,
+            description: d,
+            other,
+            files: vec![("SKILL.md".into(), md.to_vec())],
+        };
+        let m = manifest(&k);
+        let f = m.get("frontmatter").unwrap();
+        assert_eq!(f.get("license").unwrap().as_str(), Some("MIT"));
+        assert!(f.get("metadata").is_none() && f.get("owner").is_none());
     }
 
     #[test]
@@ -1840,13 +1925,39 @@ mod tests {
             r#"{"uri":"skill://demo/"}"#,
         );
         let names: Vec<_> = result(&d)
-            .get("entries")
+            .get("resources")
             .unwrap()
             .as_arr()
             .iter()
-            .map(|e| e.get("name").unwrap().as_str().unwrap().to_string())
+            .map(|e| {
+                [
+                    e.get("uri").unwrap().as_str().unwrap().to_string(),
+                    e.get("name").unwrap().as_str().unwrap().to_string(),
+                    e.get("mimeType").unwrap().as_str().unwrap().to_string(),
+                ]
+            })
             .collect();
-        assert_eq!(names, ["SKILL.md", "ref/"]);
+        assert_eq!(
+            names,
+            [
+                ["skill://demo/SKILL.md", "SKILL.md", "text/markdown"],
+                ["skill://demo/ref", "ref", "inode/directory"]
+            ]
+        );
+        assert!(result(&d).get("cacheScope").is_some());
+        let d = rpc(
+            &mut s,
+            3,
+            "resources/directory/read",
+            r#"{"uri":"skill://demo/ref"}"#,
+        );
+        assert_eq!(
+            result(&d).get("resources").unwrap().as_arr()[0]
+                .get("mimeType")
+                .unwrap()
+                .as_str(),
+            Some("text/plain")
+        );
         // Edited and committed: the new digest at once; the old bytes at
         // the old commit.
         call(
@@ -1895,7 +2006,15 @@ mod tests {
             .unwrap()
             .as_arr()
             .iter()
-            .map(|k| k.get("name").unwrap().as_str().unwrap().to_string())
+            .map(|k| {
+                k.get("frontmatter")
+                    .unwrap()
+                    .get("name")
+                    .unwrap()
+                    .as_str()
+                    .unwrap()
+                    .to_string()
+            })
             .collect();
         assert_eq!(names, ["ikam-store", "demo"]);
         let why = result(&r)
@@ -1927,7 +2046,7 @@ mod tests {
             result(&g)
                 .get("skill")
                 .unwrap()
-                .get("files")
+                .get("resources")
                 .unwrap()
                 .as_arr()
                 .len(),

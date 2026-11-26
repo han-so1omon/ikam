@@ -71,10 +71,16 @@ def check_all(s):
     while True:
         r, e = s.rpc("skills/list", {"cursor": cursor} if cursor else {})
         assert e is None, e
+        # The extension's wire shapes: cache fields on the result; each entry
+        # is uri, frontmatter and resources (SKILL.md first), nothing else.
+        assert all(f in r for f in ("resultType", "ttlMs", "cacheScope")), sorted(r)
         for k in r["skills"]:
+            assert set(k) <= {"uri", "frontmatter", "resources", "_meta"}, sorted(k)
+            name = k["frontmatter"]["name"]
+            assert k["uri"] == f"skill://{name}/SKILL.md" and k["resources"][0]["uri"] == k["uri"], k["uri"]
             got, e = s.rpc("skills/get", {"uri": k["uri"]})
-            assert e is None and got["skill"] == k, (k["name"], e)
-            for f in k["files"]:
+            assert e is None and got["skill"] == k, (name, e)
+            for f in k["resources"]:
                 c, e = s.rpc("resources/read", {"uri": f["uri"]})
                 assert e is None, e
                 c = c["contents"][0]
