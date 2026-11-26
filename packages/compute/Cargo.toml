@@ -1,0 +1,23 @@
+[package]
+name = "ikam-compute"
+version = "0.1.0"
+edition = "2024"
+description = "Graph computation on the ikam kernel: tensors as content, op graphs as graph objects, memoized evaluation, reverse-mode autodiff, Newton solvers and fixed-rate loops."
+
+[dependencies]
+ikam-kernel = { path = "../kernel" }
+blake3 = "1.8.7"
+# Pure-Rust math functions compiled into the program, never the host's libm
+# (E409: shipped functions give the same bits on every platform tried).
+libm = "=0.2.16"
+thiserror = "2.0.21"
+
+[dev-dependencies]
+tempfile = "3.27.0"
+
+# The kernel's dependencies (wasmi, zlib, zstd) are slow unoptimized.
+[profile.dev.package."*"]
+opt-level = 2
+
+[profile.dev.package.wasmi]
+debug-assertions = false

@@ -1,0 +1,139 @@
+//! Minimization with Newton-CG over op graphs: the gradient and the
+//! Hessian-vector product are graphs derived from the energy's graph
+//! (`grad`, `hvp`), so a nonlinear static problem (a rod's equilibrium, a
+//! section's strain state) is an energy written once as a graph.
+//!
+//! Each iteration solves `H p = -g` by conjugate gradients, stopping at
+//! negative curvature (truncated Newton, Nocedal and Wright ch. 7), then
+//! backtracks along `p` until the energy falls enough (Armijo).
+
+use std::collections::BTreeMap;
+
+use crate::eval::{Env, eval};
+use crate::grad::{grad, hvp};
+use crate::ir::{Graph, V};
+use crate::{Error, Tensor};
+
+#[derive(Clone, Debug)]
+pub struct Options {
+    pub tol: f64,
+    pub max_iter: usize,
+    pub max_cg: usize,
+}
+
+impl Default for Options {
+    fn default() -> Self {
+        Options { tol: 1e-10, max_iter: 100, max_cg: 1000 }
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct Report {
+    pub iterations: usize,
+    pub cg_steps: usize,
+    pub evals: usize,
+    pub energy: f64,
+    pub grad_norm: f64,
+}
+
+/// The energy's derived graphs, built once and reused for every solve.
+pub struct Minimizer {
+    pub energy: Graph,
+    pub gradient: Graph,
+    pub hessian_vec: Graph,
+    pub var: String,
+}
+
+impl Minimizer {
+    /// `energy` returns a scalar at node `of`; `var` is the input varied.
+    pub fn new(energy: &Graph, of: V, var: &str, shapes: &BTreeMap<String, Vec<usize>>) -> Result<Minimizer, Error> {
+        let mut e = energy.clone();
+        e.outputs = vec![of];
+        Ok(Minimizer {
+            gradient: grad(energy, shapes, of, &[var])?,
+            hessian_vec: hvp(energy, shapes, of, &[var])?,
+            energy: e,
+            var: var.to_string(),
+        })
+    }
+
+    pub fn minimize(&self, env: &Env, x0: Tensor, opt: &Options) -> Result<(Tensor, Report), Error> {
+        let mut env = env.clone();
+        let mut x = x0;
+        let mut rep = Report::default();
+        for it in 0..opt.max_iter {
+            env.insert(self.var.clone(), x.clone());
+            let out = eval(&self.gradient, &env)?;
+            rep.evals += 1;
+            let (f, g) = (out[0].item(), out[1].clone());
+            let gn = g.data.iter().fold(0.0f64, |m, v| m.max(v.abs()));
+            rep.iterations = it;
+            rep.energy = f;
+            rep.grad_norm = gn;
+            if gn < opt.tol {
+                return Ok((x, rep));
+            }
+            let p = self.cg(&env, &g, opt, &mut rep)?;
+            let slope = dot(&g.data, &p);
+            let mut step = 1.0;
+            loop {
+                let trial = Tensor { shape: x.shape.clone(), data: axpy(&x.data, step, &p) };
+                env.insert(self.var.clone(), trial.clone());
+                let ft = eval(&self.energy, &env)?[0].item();
+                rep.evals += 1;
+                // Near a minimum the predicted decrease is below the
+                // energy's rounding, so allow that much slack; otherwise a
+                // good Newton step is halved away and the solve stalls.
+                let slack = 16.0 * f64::EPSILON * (f.abs() + ft.abs());
+                if ft <= f + 1e-4 * step * slope + slack || step < 1e-12 {
+                    x = trial;
+                    break;
+                }
+                step *= 0.5;
+            }
+        }
+        Err(Error::NoConvergence(format!("{} iterations, |g| {:.3e}", opt.max_iter, rep.grad_norm)))
+    }
+
+    /// Solve H p = -g by conjugate gradients from p = 0.
+    fn cg(&self, env: &Env, g: &Tensor, opt: &Options, rep: &mut Report) -> Result<Vec<f64>, Error> {
+        let n = g.data.len();
+        let mut p = vec![0.0; n];
+        let mut r: Vec<f64> = g.data.iter().map(|v| -v).collect();
+        let mut d = r.clone();
+        let mut rr = dot(&r, &r);
+        let gn = rr.sqrt();
+        let stop = gn.sqrt().min(0.5) * gn;
+        let mut env = env.clone();
+        for k in 0..opt.max_cg {
+            env.insert(format!("v:{}", self.var), Tensor { shape: g.shape.clone(), data: d.clone() });
+            let hd = eval(&self.hessian_vec, &env)?.remove(0).data;
+            rep.evals += 1;
+            rep.cg_steps += 1;
+            let curv = dot(&d, &hd);
+            if curv <= 0.0 {
+                // Negative curvature: the steepest descent direction on the
+                // first step, else what was found so far.
+                return Ok(if k == 0 { r } else { p });
+            }
+            let alpha = rr / curv;
+            p = axpy(&p, alpha, &d);
+            r = axpy(&r, -alpha, &hd);
+            let rr2 = dot(&r, &r);
+            if rr2.sqrt() < stop {
+                break;
+            }
+            d = axpy(&r, rr2 / rr, &d);
+            rr = rr2;
+        }
+        Ok(p)
+    }
+}
+
+fn dot(a: &[f64], b: &[f64]) -> f64 {
+    a.iter().zip(b).map(|(x, y)| x * y).sum()
+}
+
+fn axpy(x: &[f64], a: f64, y: &[f64]) -> Vec<f64> {
+    x.iter().zip(y).map(|(x, y)| x + a * y).collect()
+}
