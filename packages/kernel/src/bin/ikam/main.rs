@@ -385,6 +385,11 @@ fn db_cmd(store_dir: &str, args: &[String]) -> Result<(), String> {
         let store = ikam_kernel::backends::PackStore::open_with(store_dir, opts).map_err(err)?;
         serve_db(store, serve_opts, views, port, allowed, log_requests)
     } else {
+        if is_pack_store(store_dir) {
+            return Err(format!(
+                "{store_dir} is a pack store (made by `db serve --packs` or `--live`): serve it with `--packs` or `--live`"
+            ));
+        }
         let store = FsStore::open(store_dir).map_err(err)?;
         serve_db(store, serve_opts, views, port, allowed, log_requests)
     }
@@ -1164,10 +1169,9 @@ fn request_line(req: &http::Request) -> String {
     )
 }
 
-/// Take a switch (a flag with no value) out of `args`: whether it was there.
 /// Whether `dir` holds a pack store (E122): a `packs` folder with a pack
 /// in it. A store on disk (`FsStore`) has none.
-fn is_pack_store(dir: &str) -> bool {
+pub(crate) fn is_pack_store(dir: &str) -> bool {
     std::fs::read_dir(Path::new(dir).join("packs"))
         .map(|mut d| d.next().is_some())
         .unwrap_or(false)
@@ -1271,6 +1275,7 @@ fn db_squash(store_dir: &str, args: &[String]) -> Result<(), String> {
     Ok(())
 }
 
+/// Take a switch (a flag with no value) out of `args`: whether it was there.
 fn take_switch(args: &mut Vec<String>, flag: &str) -> bool {
     let before = args.len();
     args.retain(|a| a != flag);
@@ -1400,6 +1405,11 @@ mod tests {
         assert!(is_pack_store(&s));
         let refused = run(&s, &mut vec!["gc".to_string()]).unwrap_err();
         assert!(refused.contains("is a pack store"), "{refused}");
+        // `db serve` without `--packs` and a project's `Live` refuse it too.
+        let serve = db_cmd(&s, &["serve".to_string()]).unwrap_err();
+        assert!(serve.contains("is a pack store"), "{serve}");
+        let live = live::Live::open(&s, "main").err().unwrap();
+        assert!(live.contains("is a pack store"), "{live}");
         assert!(!dir.path().join("objects").exists());
         // A store a server holds is refused.
         let held = PackStore::open_with(&s, opts).unwrap();
