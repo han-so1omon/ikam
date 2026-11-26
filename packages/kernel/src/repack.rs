@@ -22,7 +22,7 @@ use std::cmp::Reverse;
 use std::collections::{BTreeSet, HashMap, HashSet};
 
 use crate::dict::{
-    DICT_REF, DICT_REF_LEN, MEASURE_LEVEL, STORE_LEVEL, block_frames, framer, is_plain, object_tag,
+    DICT_REF, DICT_REF_LEN, MEASURE_LEVEL, STORE_LEVEL, block_frames, block_frames_at, framer, is_plain, object_tag,
     tree_content, zstd_frame,
 };
 use crate::group::{GROUP_REF_LEN, member_span};
@@ -129,6 +129,9 @@ impl<S: Store + Sync> Repo<S> {
         if self.group_size != crate::group::GROUP_SIZE {
             h.update(b"group_size")
                 .update(&(self.group_size as u64).to_le_bytes());
+        }
+        if self.screen_trials {
+            h.update(b"screen_trials");
         }
         Ok(Id::from_bytes(*h.finalize().as_bytes()))
     }
@@ -369,6 +372,9 @@ impl<S: Store + Sync> Repo<S> {
         fresh.markup_layers = self.markup_layers;
         fresh.slow_codec_max = self.slow_codec_max;
         fresh.group_size = self.group_size;
+        fresh.screen_trials = self.screen_trials;
+        fresh.trial_threads = self.trial_threads;
+        fresh.trial_log = self.trial_log.clone();
         fresh.deflate_memo = self.deflate_memo.clone();
         fresh.proposed_order = self.proposed_order.clone();
         if let Some(dict) = dict {
@@ -539,6 +545,12 @@ impl<S: Store + Sync> Repo<S> {
         ids.retain(|id| !keep.contains(id));
         let mut cheapest = self.cheapest_encodings(&ids, dict, &model)?;
         let (mut used, mut related) = (HashSet::new(), HashSet::new());
+        let lens = TrialLens::default();
+        let log = self.trial_log.as_ref().map(|_| std::sync::Mutex::new(Vec::new()));
+        let cx = TrialCx { model: &model, bases: &bases, dict, lens: &lens, log: log.as_ref() };
+        if self.trial_threads > 1 {
+            self.speculate_trials(&ids, &cheapest, &cx)?;
+        }
         for id in ids {
             let stored = self.store.read(&id)?;
             let encoded = match stored.first() {
@@ -548,7 +560,7 @@ impl<S: Store + Sync> Repo<S> {
                         return Err(Error::Corrupt(id));
                     }
                     let reads = model.reads(&id, bytes.len());
-                    let mut encoded = match Some(id) == dict {
+                    let encoded = match Some(id) == dict {
                         // A dictionary is never encoded against a dictionary.
                         true => zstd_frame(&bytes, &[], STORE_LEVEL)
                             .map_or(stored.clone(), |z| [&b"Z"[..], &z].concat()),
@@ -557,72 +569,11 @@ impl<S: Store + Sync> Repo<S> {
                             None => self.encode_cheapest(&bytes, reads),
                         },
                     };
-                    let mut cost = self.cost(&encoded, reads);
-                    // A group may instead be stored as blocks, each its own
-                    // frame with the dictionary: a member read decodes only
-                    // the blocks it overlaps.
-                    if model.is_group(&id)
-                        && let Some((dict_id, dict_bytes)) = self.dictionary()
-                    {
-                        for block in BLOCKS.into_iter().filter(|&b| b < bytes.len()) {
-                            let floor = self.read_weight
-                                * model.block_reads(&id, bytes.len(), block) as f64;
-                            if floor >= cost {
-                                continue;
-                            }
-                            let Some(body) = block_frames(&bytes, dict_bytes, block) else {
-                                continue;
-                            };
-                            let k =
-                                [&b"K"[..], &dict_id.as_bytes()[..DICT_REF_LEN], &body].concat();
-                            let k_cost = k.len() as f64
-                                + self.read_weight
-                                    * model.block_reads(&id, bytes.len(), block) as f64;
-                            if k_cost < cost {
-                                (encoded, cost) = (k, k_cost);
-                            }
-                        }
-                    }
-                    // Or with related stored content as the frame's context
-                    // (E057), or two complementary contents (E084): read
-                    // costs their decoding too.
-                    // A context's read cost alone can rule it out: then no
-                    // frame is built (most contents when reads are heavy).
-                    let floor = |context: usize| {
-                        self.read_weight * (reads + model.events(&id) * context) as f64
-                    };
-                    if Some(id) != dict
-                        && !used.contains(&id)
-                        && let Some(first) = bases.most_related(&id, &bytes, &related)
-                        && floor(first.1.len()) < cost
-                    {
-                        let second = bases.complement(&id, &bytes, &related, first);
-                        let options = [Some(vec![first]), second.map(|s| vec![first, s])];
-                        let mut chosen = None;
-                        for refs in options.into_iter().flatten() {
-                            if floor(refs.iter().map(|b| b.1.len()).sum()) >= cost {
-                                continue;
-                            }
-                            let context: Vec<u8> = refs.iter().flat_map(|b| b.1.clone()).collect();
-                            let Some(z) = zstd_frame(&bytes, &context, STORE_LEVEL) else {
-                                continue;
-                            };
-                            let mut q = vec![if refs.len() == 1 { b'Q' } else { b'M' }];
-                            refs.iter()
-                                .for_each(|b| q.extend_from_slice(b.0.as_bytes()));
-                            q.extend_from_slice(&z);
-                            let q_cost = q.len() as f64
-                                + self.read_weight
-                                    * (reads + model.events(&id) * context.len()) as f64;
-                            if q_cost < cost {
-                                (encoded, cost) = (q, q_cost);
-                                chosen = Some(refs.iter().map(|b| b.0).collect::<Vec<_>>());
-                            }
-                        }
-                        if let Some(refs) = chosen {
-                            used.extend(refs);
-                            related.insert(id);
-                        }
+                    let (encoded, cost, chosen) =
+                        self.trials(&id, &bytes, encoded, reads, &related, &used, &cx, false);
+                    if let Some(refs) = chosen {
+                        used.extend(refs);
+                        related.insert(id);
                     }
                     if cost < self.cost(&stored, reads) {
                         self.store.replace(id, &encoded)?;
@@ -642,9 +593,201 @@ impl<S: Store + Sync> Repo<S> {
                 self.note_needs(&encoded);
             }
         }
+        if let (Some(path), Some(log)) = (&self.trial_log, log) {
+            write_trial_log(path, &log.into_inner().expect("trial log"))?;
+        }
         self.level = MEASURE_LEVEL;
         self.reset_projections();
         Ok(())
+    }
+
+    /// The cheapest of `encoded` and the costly trial encodings of plain
+    /// content `id`: blocks for a group, or a frame with one or two related
+    /// contents as its context. Returns the encoding, its cost and the
+    /// contexts it uses. A store-level trial whose length a pass ahead
+    /// (`speculate_trials`) recorded is not built again unless it wins;
+    /// zstd's frames are deterministic, so the choices are the same either
+    /// way. With `speculate` (that pass), nothing is logged.
+    #[allow(clippy::too_many_arguments)]
+    fn trials(
+        &self,
+        id: &Id,
+        bytes: &[u8],
+        mut encoded: Vec<u8>,
+        reads: usize,
+        related: &HashSet<Id>,
+        used: &HashSet<Id>,
+        cx: &TrialCx,
+        speculate: bool,
+    ) -> (Vec<u8>, f64, Option<Vec<Id>>) {
+        let (model, bases, dict) = (cx.model, cx.bases, cx.dict);
+        let mut cost = self.cost(&encoded, reads);
+        let cheapest = encoded.len();
+        // E390: with `screen_trials`, a trial is built at the store level
+        // only if its fast estimate, scaled by this content's own
+        // fast-to-store ratio, could win.
+        let ratio = match self.screen_trials {
+            true => {
+                let dict = self.dictionary().map_or(&[][..], |(_, d)| d.as_slice());
+                zstd_frame(bytes, dict, MEASURE_LEVEL).map(|z| encoded.len() as f64 / z.len().max(1) as f64)
+            }
+            false => None,
+        };
+        let hopeless = |fast: Option<usize>, extra: f64, cost: f64| {
+            matches!((ratio, fast), (Some(r), Some(f))
+                if f as f64 * r + extra >= cost * (1.0 + SCREEN_MARGIN))
+        };
+        // A store-level trial's body length and build time: recorded by a
+        // pass ahead, or built now (the body kept too). `None`: zstd failed.
+        let trial = |key: TrialKey, build: &dyn Fn() -> Option<Vec<u8>>| {
+            if let Some(&(len, nanos)) = cx.lens.lock().expect("trial lens").get(&key) {
+                return len.map(|l| (l, None, nanos));
+            }
+            let t = std::time::Instant::now();
+            let body = build();
+            let nanos = t.elapsed().as_nanos() as u64;
+            cx.lens.lock().expect("trial lens").insert(key, (body.as_ref().map(Vec::len), nanos));
+            body.map(|b| (b.len(), Some(b), nanos))
+        };
+        let log = |kind: &'static str, context: usize, refs: usize, best: f64, fast: Option<usize>,
+                   built: Option<(usize, f64, u64)>| {
+            if let (false, Some(log)) = (speculate, cx.log) {
+                log.lock().expect("trial log").push(TrialRow {
+                    kind,
+                    len: bytes.len(),
+                    cheapest,
+                    reads,
+                    events: model.events(id),
+                    context,
+                    refs,
+                    best,
+                    fast,
+                    built,
+                });
+            }
+        };
+        // A group may instead be stored as blocks, each its own frame with
+        // the dictionary: a member read decodes only the blocks it overlaps.
+        if model.is_group(id)
+            && let Some((dict_id, dict_bytes)) = self.dictionary()
+        {
+            for block in BLOCKS.into_iter().filter(|&b| b < bytes.len()) {
+                let floor = self.read_weight * model.block_reads(id, bytes.len(), block) as f64;
+                if floor >= cost {
+                    continue;
+                }
+                let prefix = 1 + DICT_REF_LEN;
+                let kind = if block == BLOCKS[0] { "block-4k" } else { "block-16k" };
+                let fast = ratio.and_then(|_| block_frames_at(bytes, dict_bytes, block, MEASURE_LEVEL))
+                    .map(|b| b.len() + prefix);
+                if hopeless(fast, floor, cost) {
+                    log(kind, 0, 0, cost, fast, None);
+                    continue;
+                }
+                let build = || block_frames(bytes, dict_bytes, block);
+                let Some((len, body, nanos)) = trial((*id, TrialKind::Block(block)), &build) else {
+                    continue;
+                };
+                let k_cost = (prefix + len) as f64 + floor;
+                log(kind, 0, 0, cost, fast, Some((prefix + len, k_cost, nanos)));
+                if k_cost < cost
+                    && let Some(body) = body.or_else(build)
+                {
+                    encoded = [&b"K"[..], &dict_id.as_bytes()[..DICT_REF_LEN], &body].concat();
+                    cost = k_cost;
+                }
+            }
+        }
+        // Or with related stored content as the frame's context (E057), or
+        // two complementary contents (E084): read costs their decoding too.
+        // A context's read cost alone can rule it out: then no frame is
+        // built (most contents when reads are heavy).
+        let floor = |context: usize| self.read_weight * (reads + model.events(id) * context) as f64;
+        let mut chosen = None;
+        if Some(*id) != dict
+            && !used.contains(id)
+            && let Some(first) = bases.most_related(id, bytes, related)
+            && floor(first.1.len()) < cost
+        {
+            let second = bases.complement(id, bytes, related, first);
+            let options = [Some(vec![first]), second.map(|s| vec![first, s])];
+            for refs in options.into_iter().flatten() {
+                if floor(refs.iter().map(|b| b.1.len()).sum()) >= cost {
+                    continue;
+                }
+                let context: Vec<u8> = refs.iter().flat_map(|b| b.1.clone()).collect();
+                let extra = self.read_weight * (reads + model.events(id) * context.len()) as f64;
+                let prefix = 1 + 32 * refs.len();
+                let fast = ratio.and_then(|_| zstd_frame(bytes, &context, MEASURE_LEVEL))
+                    .map(|z| z.len() + prefix);
+                if hopeless(fast, extra, cost) {
+                    log("context", context.len(), refs.len(), cost, fast, None);
+                    continue;
+                }
+                let build = || zstd_frame(bytes, &context, STORE_LEVEL);
+                let key = (*id, TrialKind::Context(refs.iter().map(|b| b.0).collect()));
+                let Some((len, body, nanos)) = trial(key, &build) else {
+                    continue;
+                };
+                let q_cost = (prefix + len) as f64 + extra;
+                log("context", context.len(), refs.len(), cost, fast, Some((prefix + len, q_cost, nanos)));
+                if q_cost < cost
+                    && let Some(z) = body.or_else(build)
+                {
+                    let mut q = vec![if refs.len() == 1 { b'Q' } else { b'M' }];
+                    refs.iter().for_each(|b| q.extend_from_slice(b.0.as_bytes()));
+                    q.extend_from_slice(&z);
+                    (encoded, cost) = (q, q_cost);
+                    chosen = Some(refs.iter().map(|b| b.0).collect::<Vec<_>>());
+                }
+            }
+        }
+        (encoded, cost, chosen)
+    }
+
+    /// The pass ahead of `recompress_only`'s with `trial_threads` (E390):
+    /// every plain content's trials, on that many threads, largest first,
+    /// each as if no content were yet encoded against another. It keeps only
+    /// each trial's length (in `cx.lens`): the real pass that follows builds
+    /// a frame again only to keep it, and builds what this pass guessed
+    /// differently (a context taken by a content before it).
+    fn speculate_trials(
+        &self,
+        ids: &[Id],
+        cheapest: &HashMap<Id, Vec<u8>>,
+        cx: &TrialCx,
+    ) -> Result<(), Error> {
+        let mut plain = Vec::new();
+        for id in ids.iter().filter(|&&id| Some(id) != cx.dict) {
+            if let Some(encoded) = cheapest.get(id) {
+                plain.push((Reverse(encoded.len()), *id));
+            }
+        }
+        plain.sort();
+        let next = std::sync::atomic::AtomicUsize::new(0);
+        let none = HashSet::new();
+        let parts: Vec<Result<(), Error>> = std::thread::scope(|scope| {
+            let workers: Vec<_> = (0..self.trial_threads.min(plain.len()))
+                .map(|_| {
+                    let (plain, next, none) = (&plain, &next, &none);
+                    scope.spawn(move || {
+                        while let Some((_, id)) =
+                            plain.get(next.fetch_add(1, std::sync::atomic::Ordering::Relaxed))
+                        {
+                            let bytes = self.decode_plain(id, &self.store.read(id)?)?;
+                            let reads = cx.model.reads(id, bytes.len());
+                            self.trials(id, &bytes, cheapest[id].clone(), reads, none, none, cx, true);
+                        }
+                        Ok(())
+                    })
+                })
+                .collect();
+            workers
+                .into_iter()
+                .map(|w| w.join().expect("trial worker panicked"))
+                .collect()
+        });
+        parts.into_iter().collect()
     }
 
     /// `encode_cheapest` of every plain content but the dictionary, computed
@@ -1165,8 +1308,81 @@ fn shingles(bytes: &[u8]) -> HashSet<u64> {
         .collect()
 }
 
+/// Which store-level trial of a content (`TrialLens`): blocks of a size, or
+/// a frame against these contexts.
+#[derive(Clone, PartialEq, Eq, Hash)]
+enum TrialKind {
+    Block(usize),
+    Context(Vec<Id>),
+}
+
+type TrialKey = (Id, TrialKind);
+
+/// Store-level trial lengths (`None`: zstd failed) and build times, recorded
+/// by `speculate_trials` and reused by `recompress_only`'s pass (E390).
+type TrialLens = std::sync::Mutex<HashMap<TrialKey, (Option<usize>, u64)>>;
+
+/// What `Repo::trials` reads besides the content itself.
+struct TrialCx<'a> {
+    model: &'a ReadModel,
+    bases: &'a Bases,
+    dict: Option<Id>,
+    lens: &'a TrialLens,
+    log: Option<&'a std::sync::Mutex<Vec<TrialRow>>>,
+}
+
+/// One trial of `recompress_only`, for `Repo::trial_log` (E390): the
+/// content's length, its cheapest plain encoding's, how many bytes reading
+/// every file once decodes from it and in how many reads, the context's
+/// length and contents, the best cost before the trial, its fast estimate
+/// when screened, and, when built, its length, cost and build time.
+struct TrialRow {
+    kind: &'static str,
+    len: usize,
+    cheapest: usize,
+    reads: usize,
+    events: usize,
+    context: usize,
+    refs: usize,
+    best: f64,
+    fast: Option<usize>,
+    built: Option<(usize, f64, u64)>,
+}
+
+/// Append `rows` to the tab-separated trial log at `path`, with a header
+/// line when the file is new.
+fn write_trial_log(path: &std::path::Path, rows: &[TrialRow]) -> Result<(), Error> {
+    use std::io::Write;
+    let fresh = std::fs::metadata(path).map_or(true, |m| m.len() == 0);
+    let mut out = String::new();
+    if fresh {
+        out.push_str("kind\tlen\tcheapest\treads\tevents\tcontext\trefs\tbest\tfast\tbuilt\tcost\twon\tnanos\n");
+    }
+    let opt = |v: Option<String>| v.unwrap_or_default();
+    for r in rows {
+        let (built, cost, won, nanos) = match r.built {
+            Some((len, cost, nanos)) => (len.to_string(), format!("{cost:.1}"), (cost < r.best) as u8, nanos.to_string()),
+            None => (String::new(), String::new(), 0, String::new()),
+        };
+        out.push_str(&format!(
+            "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{:.1}\t{}\t{}\t{}\t{}\t{}\n",
+            r.kind, r.len, r.cheapest, r.reads, r.events, r.context, r.refs, r.best,
+            opt(r.fast.map(|f| f.to_string())), built, cost, won, nanos
+        ));
+    }
+    std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .and_then(|mut f| f.write_all(out.as_bytes()))
+        .map_err(Error::from)
+}
+
 /// Block sizes a group may be stored in (see `dict::block_frames`).
 const BLOCKS: [usize; 2] = [4 * 1024, 16 * 1024];
+/// How far a trial's fast estimate may miss the best encoding so far and
+/// still be built at the store level (`Repo::screen_trials`, E390).
+const SCREEN_MARGIN: f64 = 0.05;
 
 impl ReadModel {
     pub(crate) fn times(&self, id: &Id) -> usize {
@@ -1331,6 +1547,102 @@ mod tests {
             assert!(size(&repo, id) <= b);
         }
         assert_eq!(repo.level, MEASURE_LEVEL);
+    }
+
+    /// E390: screened trials still repack to a store that reads back
+    /// exactly and passes fsck, and it is marked apart from an unscreened one.
+    #[test]
+    fn screened_trials_repack_to_an_exact_store() {
+        let page = |i: usize| {
+            format!(
+                "<page><title>Page {i}</title><text>{} [[Page {}]] {}</text></page>\n",
+                "shared wiki prose about rivers and towns ".repeat(3 + i % 11),
+                i / 3,
+                (0..i % 40).map(|k| format!("w{}", k * i % 97)).collect::<Vec<_>>().join(" ")
+            )
+            .into_bytes()
+        };
+        let pages: Vec<Vec<u8>> = (0..300).map(page).collect();
+        let mut fingerprints = Vec::new();
+        for screen in [false, true] {
+            let mut repo = Repo::new(MemStore::default());
+            repo.screen_trials = screen;
+            let ids: Vec<Id> = (pages.iter())
+                .map(|p| repo.put_content(p).unwrap().id)
+                .collect();
+            let entries = (ids.iter().enumerate())
+                .map(|(i, id)| crate::TreeEntry {
+                    name: format!("{i:04}.xml"),
+                    kind: crate::Kind::File,
+                    id: *id,
+                })
+                .collect();
+            let tree = repo.put(&Object::tree(entries).unwrap()).unwrap();
+            repo.commit("main", tree, "pages").unwrap();
+            fingerprints.push(repo.repack_fingerprint().unwrap());
+            repo.repack().unwrap();
+            for (id, p) in ids.iter().zip(&pages) {
+                assert_eq!(&repo.read_content(id).unwrap(), p);
+            }
+            assert!(repo.fsck().unwrap().is_empty());
+        }
+        assert_ne!(fingerprints[0], fingerprints[1]);
+    }
+
+    /// E390: trials run ahead on several threads leave every stored object
+    /// as the sequential pass does, with screening off and on, and the trial
+    /// log gets a line per trial.
+    #[test]
+    fn parallel_trials_store_the_same_bytes() {
+        let page = |i: usize| {
+            format!(
+                "<page><title>Page {i}</title><text>{} [[Page {}]] {}</text></page>\n",
+                "shared wiki prose about rivers and towns ".repeat(40 + i % 29),
+                i / 3,
+                (0..i % 60).map(|k| format!("w{}", k * i % 97)).collect::<Vec<_>>().join(" ")
+            )
+            .into_bytes()
+        };
+        let pages: Vec<Vec<u8>> = (0..400).map(page).collect();
+        let dir = std::env::temp_dir().join(format!("ikam-trial-log-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        for screen in [false, true] {
+            let mut stores = Vec::new();
+            for threads in [0, 4] {
+                let mut repo = Repo::new(MemStore::default());
+                repo.screen_trials = screen;
+                repo.trial_threads = threads;
+                let log = dir.join(format!("{screen}-{threads}.tsv"));
+                let _ = std::fs::remove_file(&log);
+                repo.trial_log = Some(log.clone());
+                let ids: Vec<Id> = (pages.iter())
+                    .map(|p| repo.put_content(p).unwrap().id)
+                    .collect();
+                let entries = (ids.iter().enumerate())
+                    .map(|(i, id)| crate::TreeEntry {
+                        name: format!("{i:04}.xml"),
+                        kind: crate::Kind::File,
+                        id: *id,
+                    })
+                    .collect();
+                let tree = repo.put(&Object::tree(entries).unwrap()).unwrap();
+                repo.commit("main", tree, "pages").unwrap();
+                repo.repack().unwrap();
+                for (id, p) in ids.iter().zip(&pages) {
+                    assert_eq!(&repo.read_content(id).unwrap(), p);
+                }
+                assert!(repo.fsck().unwrap().is_empty());
+                let mut objects: Vec<(Id, Vec<u8>)> = (repo.store.ids().unwrap().into_iter())
+                    .map(|id| (id, repo.store.read(&id).unwrap()))
+                    .collect();
+                objects.sort();
+                let lines = std::fs::read_to_string(&log).unwrap().lines().count();
+                assert!(lines > 1, "a header and at least one trial");
+                stores.push((objects, lines));
+            }
+            assert_eq!(stores[0], stores[1]);
+        }
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     /// Ingest is greedy, so pair templates may overfit; induction finds one

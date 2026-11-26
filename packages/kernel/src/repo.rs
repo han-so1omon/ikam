@@ -194,6 +194,26 @@ pub struct Repo<S: Store> {
     /// checked against their id are kept, and evaluation work is counted
     /// as before, so the bytes written are the same either way.
     pub read_memo: bool,
+    /// E390: repack tries each costly encoding (blocks, a frame with related
+    /// content as its context) at the fast level first, and builds it at the
+    /// store level only if that estimate, scaled by the content's own fast to
+    /// store ratio, comes within `SCREEN_MARGIN` of the best so far. Off by
+    /// default. On a wiki-shaped corpus nearly every such trial lost, and
+    /// they were most of a repack's time; on, an encoding that would have won
+    /// by less than its estimate's error can be missed, so a store can come
+    /// out slightly larger.
+    pub screen_trials: bool,
+    /// E390: repack runs every content's store-level trials ahead of its
+    /// sequential pass on this many threads (0 or 1: off), keeping only
+    /// their lengths; the pass then builds a frame again only to keep it.
+    /// The same encodings either way, at more cores and the threads' zstd
+    /// state in memory.
+    pub trial_threads: usize,
+    /// E390: repack appends one tab-separated line per trial (its kind, the
+    /// content's sizes and reads, the best cost before it, its fast estimate
+    /// when screened, its size, cost, whether it won and its build time) to
+    /// this file. Off by default; the store is the same either way.
+    pub trial_log: Option<std::path::PathBuf>,
     /// E249: `graph_diff` walks both graphs level by level and skips the
     /// subtrees both share (same id), instead of listing every leaf of
     /// both. The same changes either way; off by default.
@@ -320,6 +340,9 @@ impl<S: Store> Repo<S> {
             level: crate::dict::MEASURE_LEVEL,
             deflate_memo: None,
             read_memo: false,
+            screen_trials: false,
+            trial_threads: 0,
+            trial_log: None,
             prune_diff: false,
             memo: Default::default(),
             read_cache: 0,

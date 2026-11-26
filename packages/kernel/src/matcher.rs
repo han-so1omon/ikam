@@ -67,26 +67,95 @@ pub(crate) fn seed_key(window: &[u8]) -> u64 {
 }
 
 /// Seed index over stored blobs. A projection: rebuildable from the blobs.
+///
+/// E390: packed. Each seed's candidates are a chain through one arena of
+/// 16-byte entries (blob number, position, next), in the order they were
+/// added, and each blob's id is held once. A map from seed to its own
+/// small vector of (id, position) took about 210 bytes an entry, mostly
+/// the vector's allocation, and was nearly all of a commit's memory (about
+/// 3x the input on a wiki dump); this takes about a quarter of that and
+/// finds the same candidates in the same order.
 #[derive(Default)]
 pub struct Index {
-    seeds: HashMap<u64, Vec<(Id, usize)>>,
+    /// Seed key to (first, last) entry of its chain.
+    seeds: HashMap<u64, (u32, u32)>,
+    arena: Vec<Entry>,
+    ids: Vec<Id>,
+    numbers: HashMap<Id, u32>,
     entries: usize,
 }
 
+#[derive(Clone, Copy)]
+struct Entry {
+    blob: u32,
+    next: u32,
+    pos: u64,
+}
+
+/// No next entry.
+const END: u32 = u32::MAX;
+
 impl Index {
     pub fn add(&mut self, id: Id, bytes: &[u8]) {
+        let mut blob = None;
         for p in anchors(bytes) {
-            let slot = self.seeds.entry(seed_key(&bytes[p..p + SEED])).or_default();
-            if slot.len() < MAX_CANDIDATES && !slot.iter().any(|(i, _)| *i == id) {
-                slot.push((id, p));
-                self.entries += 1;
+            let key = seed_key(&bytes[p..p + SEED]);
+            if let Some(&(first, _)) = self.seeds.get(&key) {
+                let (mut n, mut at, mut same) = (0, first, false);
+                while at != END {
+                    let e = self.arena[at as usize];
+                    same |= self.ids[e.blob as usize] == id;
+                    n += 1;
+                    at = e.next;
+                }
+                if n >= MAX_CANDIDATES || same {
+                    continue;
+                }
             }
+            if self.arena.len() >= END as usize {
+                return; // past 4G entries: index no more (same as a full slot)
+            }
+            let b = *blob.get_or_insert_with(|| {
+                *self.numbers.entry(id).or_insert_with(|| {
+                    self.ids.push(id);
+                    (self.ids.len() - 1) as u32
+                })
+            });
+            let at = self.arena.len() as u32;
+            self.arena.push(Entry {
+                blob: b,
+                next: END,
+                pos: p as u64,
+            });
+            match self.seeds.get_mut(&key) {
+                Some(chain) => {
+                    self.arena[chain.1 as usize].next = at;
+                    chain.1 = at;
+                }
+                None => {
+                    self.seeds.insert(key, (at, at));
+                }
+            }
+            self.entries += 1;
         }
     }
 
-    /// Seed entries held (each about 40 bytes, plus its slot's share).
+    /// Seed entries held (each about 16 bytes, plus its seed's share of
+    /// the map).
     pub fn entries(&self) -> usize {
         self.entries
+    }
+
+    /// The blobs and positions indexed under seed `key`, oldest first.
+    fn candidates(&self, key: u64) -> impl Iterator<Item = (Id, usize)> + '_ {
+        let mut at = self.seeds.get(&key).map_or(END, |c| c.0);
+        std::iter::from_fn(move || {
+            (at != END).then(|| {
+                let e = self.arena[at as usize];
+                at = e.next;
+                (self.ids[e.blob as usize], e.pos as usize)
+            })
+        })
     }
 }
 
@@ -99,13 +168,8 @@ pub fn neighbors(input: &[u8], index: &Index, k: usize) -> (Vec<(Id, usize)>, us
     let (mut hits, mut seeds) = (HashMap::<Id, usize>::new(), 0);
     for q in anchors(input) {
         seeds += 1;
-        for (id, _) in index
-            .seeds
-            .get(&seed_key(&input[q..q + SEED]))
-            .into_iter()
-            .flatten()
-        {
-            *hits.entry(*id).or_default() += 1;
+        for (id, _) in index.candidates(seed_key(&input[q..q + SEED])) {
+            *hits.entry(id).or_default() += 1;
         }
     }
     let mut ranked: Vec<(Id, usize)> = hits.into_iter().collect();
@@ -122,11 +186,8 @@ pub fn plan(input: &[u8], index: &Index, load: impl Fn(&Id) -> Option<Vec<u8>>) 
         if q < cursor {
             continue;
         }
-        let Some(candidates) = index.seeds.get(&seed_key(&input[q..q + SEED])) else {
-            continue;
-        };
         let mut best: Option<(usize, Id, usize, usize)> = None;
-        for &(src, p) in candidates {
+        for (src, p) in index.candidates(seed_key(&input[q..q + SEED])) {
             let Some(s) = cache.entry(src).or_insert_with(|| load(&src)) else {
                 continue;
             };
@@ -163,4 +224,53 @@ pub(crate) fn common_suffix(a: &[u8], b: &[u8]) -> usize {
         .zip(b.iter().rev())
         .take_while(|(x, y)| x == y)
         .count()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// E390: the packed index keeps, per seed, the same candidates in the
+    /// same order as a plain map of vectors: up to `MAX_CANDIDATES`, one
+    /// per blob, oldest first.
+    #[test]
+    fn the_packed_index_keeps_the_candidates_a_plain_map_would() {
+        let mut state = 7u64;
+        let mut byte = || {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (state >> 56) as u8
+        };
+        // Overlapping windows of one base, plus bytes of their own, so most
+        // seeds recur in many blobs and fill their slots.
+        let base: Vec<u8> = (0..20_000).map(|_| byte()).collect();
+        let blobs: Vec<Vec<u8>> = (0..40)
+            .map(|i| {
+                let at = (i * 311) % 12_000;
+                let mut b = base[at..at + 6000].to_vec();
+                b.extend((0..500).map(|_| byte()));
+                b
+            })
+            .collect();
+        let (mut packed, mut plain) = (Index::default(), HashMap::<u64, Vec<(Id, usize)>>::new());
+        let mut entries = 0;
+        for b in blobs.iter().chain(&blobs[..5]) {
+            let id = Id::of_content(b);
+            packed.add(id, b);
+            for p in anchors(b) {
+                let slot = plain.entry(seed_key(&b[p..p + SEED])).or_default();
+                if slot.len() < MAX_CANDIDATES && !slot.iter().any(|(i, _)| *i == id) {
+                    slot.push((id, p));
+                    entries += 1;
+                }
+            }
+        }
+        assert_eq!(packed.entries(), entries);
+        assert!(plain.values().any(|s| s.len() == MAX_CANDIDATES));
+        for (key, slot) in &plain {
+            assert_eq!(&packed.candidates(*key).collect::<Vec<_>>(), slot);
+        }
+        assert_eq!(packed.candidates(0x1234).count(), 0);
+    }
 }
