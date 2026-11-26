@@ -170,6 +170,20 @@ fn softmax(a: &[f64], m: Mode, c: &[f64; 14]) -> Vec<f64> {
     e.iter().map(|x| x / s).collect()
 }
 
+/// `exp` of each value on its own, so the arguments reach the overflow,
+/// underflow and subnormal-result boundaries that softmax (which subtracts
+/// the largest value first) never gives it.
+fn exps(a: &[f64], m: Mode, c: &[f64; 14]) -> Vec<f64> {
+    a.iter()
+        .map(|&x| match m {
+            Mode::StdExp => x.exp(),
+            Mode::LibmExp => libm::exp(x),
+            Mode::Fma => shipped_exp(x, c, true),
+            _ => shipped_exp(x, c, false),
+        })
+        .collect()
+}
+
 fn matmul(a: &[f64], b: &[f64], m: Mode) -> Vec<f64> {
     let mut c = vec![0.0; DIM * DIM];
     for i in 0..DIM {
@@ -275,6 +289,13 @@ fn wat(c: &[f64; 14]) -> String {
       (f64.store {oi} (f64.div (f64.load {oi}) (local.get $s)))
       (local.set $i (i32.add (local.get $i) (i32.const 1)))
       (br $l))))
+  (func (export "exps") (param $a i32) (param $n i32) (param $o i32)
+    (local $i i32)
+    (block $done (loop $l
+      (br_if $done (i32.ge_u (local.get $i) (local.get $n)))
+      (f64.store {oi} (call $exp (f64.load {ai})))
+      (local.set $i (i32.add (local.get $i) (i32.const 1)))
+      (br $l))))
   (func (export "matmul") (param $a i32) (param $b i32) (param $o i32)
     (local $i i32) (local $j i32) (local $k i32) (local $s f64)
     (block $di (loop $li
@@ -323,6 +344,7 @@ struct Wasm {
     dot: TypedFunc<(i32, i32, i32), f64>,
     mean_var: TypedFunc<(i32, i32, i32), ()>,
     softmax: TypedFunc<(i32, i32, i32), ()>,
+    exps: TypedFunc<(i32, i32, i32), ()>,
     matmul: TypedFunc<(i32, i32, i32), ()>,
 }
 
@@ -340,6 +362,7 @@ impl Wasm {
             dot: inst.get_typed_func(&store, "dot").unwrap(),
             mean_var: inst.get_typed_func(&store, "mean_var").unwrap(),
             softmax: inst.get_typed_func(&store, "softmax").unwrap(),
+            exps: inst.get_typed_func(&store, "exps").unwrap(),
             matmul: inst.get_typed_func(&store, "matmul").unwrap(),
             store,
         }
@@ -369,6 +392,12 @@ impl Wasm {
             }
             "softmax" => {
                 self.softmax
+                    .call(&mut self.store, (pa, SOFT as i32, po))
+                    .unwrap();
+                self.get(PO, SOFT)
+            }
+            "exp" => {
+                self.exps
                     .call(&mut self.store, (pa, SOFT as i32, po))
                     .unwrap();
                 self.get(PO, SOFT)
@@ -412,9 +441,21 @@ fn inputs(name: &str) -> (Vec<f64>, Vec<f64>) {
             }
         }
         "subnormal" => a.iter_mut().for_each(|x| *x *= 1e-310),
-        // Wide enough that exp overflows, underflows and lands on
-        // subnormals.
+        // A wide spread: softmax's exp arguments reach about -1,570, so
+        // many of its terms underflow to zero.
         "wide" => a.iter_mut().for_each(|x| *x *= 80.0),
+        // exp's boundaries: 40 arguments across the subnormal results
+        // (-745.2 to -708.3), 8 around overflow (709.5 to 710.0) and 16
+        // near zero.
+        "edges" => {
+            for (i, x) in a.iter_mut().take(SOFT).enumerate() {
+                *x = match i {
+                    0..40 => -745.2 + 36.9 * i as f64 / 39.0,
+                    40..48 => 709.5 + 0.5 * (i - 40) as f64 / 7.0,
+                    _ => *x * 1e-3,
+                };
+            }
+        }
         _ => {
             a[3] = f64::from_bits(0x7ff8_0000_0000_1234); // a quiet NaN with a payload
             a[10] = f64::INFINITY;
@@ -481,13 +522,14 @@ fn main() {
     let c = coeffs();
     let mut wasm = Wasm::new(&c);
     let wasm_mode = if canonical { "wasm" } else { "wasm-raw" };
-    for input in ["plain", "cancel", "subnormal", "wide", "special"] {
+    for input in ["plain", "cancel", "subnormal", "wide", "edges", "special"] {
         let (a, b) = inputs(input);
-        for func in ["dot", "mean_var", "softmax", "matmul"] {
+        for func in ["dot", "mean_var", "softmax", "exp", "matmul"] {
             let native = |m: Mode| match func {
                 "dot" => dot(&a, &b, m),
                 "mean_var" => mean_var(&a, m),
                 "softmax" => softmax(&a[..SOFT], m, &c),
+                "exp" => exps(&a[..SOFT], m, &c),
                 _ => matmul(&a[..DIM * DIM], &b[..DIM * DIM], m),
             };
             let base = native(Mode::Scalar);
@@ -496,7 +538,7 @@ fn main() {
                 ("fma", Some(Mode::Fma)),
                 ("lanes8", Some(Mode::Lanes8)),
             ];
-            if func == "softmax" {
+            if func == "softmax" || func == "exp" {
                 modes.push(("std-exp", Some(Mode::StdExp)));
                 modes.push(("libm-exp", Some(Mode::LibmExp)));
             }
