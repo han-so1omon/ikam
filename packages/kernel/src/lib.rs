@@ -10,6 +10,7 @@ pub mod bm25;
 mod claims;
 mod codec;
 pub mod colblock;
+pub mod rowpack;
 mod coldpass;
 mod container;
 mod db;
