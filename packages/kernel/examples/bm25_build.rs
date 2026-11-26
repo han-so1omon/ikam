@@ -102,7 +102,9 @@ fn main() {
     let v = ikam_kernel::bm25::Bm25View { root };
     // First searches: a common word, a rare number, three terms at once.
     let mut first = Vec::new();
-    for q in ["word42", "12345", "word7 77 2026"] {
+    // The rare number is one the rows hold at any row count.
+    let rare = format!("{}", 12345 % rows);
+    for q in ["word42", rare.as_str(), "word7 77 2026"] {
         let t = Instant::now();
         let hits = repo.bm25_view_search(&v, q, 10).unwrap();
         first.push(format!("{:.2}", t.elapsed().as_secs_f64() * 1e3));
