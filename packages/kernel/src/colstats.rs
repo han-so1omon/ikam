@@ -290,6 +290,65 @@ fn value_end(b: &[u8], i: usize) -> Option<usize> {
     }
 }
 
+/// A JSON string's contents (between its quotes) with escapes decoded into
+/// `out`, so that `"\u0041"` and `"A"` count as one value. False for a
+/// malformed escape (`out` then holds a part): the raw bytes are used.
+fn unescape(s: &[u8], out: &mut Vec<u8>) -> bool {
+    out.clear();
+    let hex4 = |b: &[u8]| -> Option<u32> {
+        let h = std::str::from_utf8(b.get(..4)?).ok()?;
+        u32::from_str_radix(h, 16).ok()
+    };
+    let mut i = 0;
+    while i < s.len() {
+        if s[i] != b'\\' {
+            out.push(s[i]);
+            i += 1;
+            continue;
+        }
+        let Some(&c) = s.get(i + 1) else {
+            return false;
+        };
+        i += 2;
+        let ch = match c {
+            b'"' => '"',
+            b'\\' => '\\',
+            b'/' => '/',
+            b'b' => '\u{8}',
+            b'f' => '\u{c}',
+            b'n' => '\n',
+            b'r' => '\r',
+            b't' => '\t',
+            b'u' => {
+                let Some(hi) = hex4(&s[i..]) else {
+                    return false;
+                };
+                i += 4;
+                let code = if (0xd800..0xdc00).contains(&hi) {
+                    // A surrogate pair: the low half must follow.
+                    match (s.get(i..i + 2), hex4(s.get(i + 2..).unwrap_or(&[]))) {
+                        (Some(b"\\u"), Some(lo)) if (0xdc00..0xe000).contains(&lo) => {
+                            i += 6;
+                            0x10000 + ((hi - 0xd800) << 10) + (lo - 0xdc00)
+                        }
+                        _ => return false,
+                    }
+                } else {
+                    hi
+                };
+                match char::from_u32(code) {
+                    Some(ch) => ch,
+                    None => return false,
+                }
+            }
+            _ => return false,
+        };
+        let mut b = [0; 4];
+        out.extend_from_slice(ch.encode_utf8(&mut b).as_bytes());
+    }
+    true
+}
+
 fn classify(t: &[u8]) -> Val<'_> {
     match t {
         b"null" => Val::Null,
@@ -318,6 +377,7 @@ impl TableStats {
         };
         i += 1;
         let mut pos = 0usize;
+        let mut buf = Vec::new();
         loop {
             i = skip_ws(row, i);
             if row.get(i) == Some(&close) {
@@ -327,7 +387,12 @@ impl TableStats {
                 let Some(end) = value_end(row, i).filter(|_| row[i] == b'"') else {
                     return;
                 };
-                let name = String::from_utf8_lossy(&row[i + 1..end - 1]).into_owned();
+                let raw = &row[i + 1..end - 1];
+                let name = if raw.contains(&b'\\') && unescape(raw, &mut buf) {
+                    String::from_utf8_lossy(&buf).into_owned()
+                } else {
+                    String::from_utf8_lossy(raw).into_owned()
+                };
                 i = skip_ws(row, end);
                 if row.get(i) != Some(&b':') {
                     return;
@@ -348,7 +413,12 @@ impl TableStats {
                     ..ColumnStats::default()
                 }),
             };
-            col.add(classify(&row[i..end]));
+            match classify(&row[i..end]) {
+                Val::Str(s) if s.contains(&b'\\') && unescape(s, &mut buf) => {
+                    col.add(Val::Str(&buf))
+                }
+                v => col.add(v),
+            }
             i = skip_ws(row, end);
             match row.get(i) {
                 Some(b',') => i += 1,
@@ -423,6 +493,31 @@ impl TableStats {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn escaped_strings_count_as_the_value_they_spell() {
+        let mut s = TableStats::default();
+        for row in [
+            r#"{"w":"A","k\u0065y":1}"#,
+            r#"{"w":"\u0041","key":2}"#,
+            r#"{"w":"a\"b","key":3}"#,
+            r#"{"w":"\ud83d\ude00","key":4}"#,
+            r#"{"w":"\ud83d","key":5}"#, // a lone surrogate: kept raw
+        ] {
+            s.observe(row.as_bytes());
+        }
+        assert_eq!(
+            s.columns["key"].count, 5,
+            "the escaped key is the same column"
+        );
+        let v = s.columns["w"].values.as_ref().unwrap();
+        assert_eq!(v[&b"A"[..].to_vec()], 2);
+        assert_eq!(v[&b"a\"b"[..].to_vec()], 1);
+        assert_eq!(v["\u{1f600}".as_bytes()], 1);
+        assert_eq!(v[&br"\ud83d"[..].to_vec()], 1);
+        let mut out = Vec::new();
+        assert!(!unescape(br"\x", &mut out) && !unescape(br"\u12", &mut out));
+    }
 
     #[test]
     fn stats_match_an_exact_pass() {
