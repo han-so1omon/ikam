@@ -256,6 +256,12 @@ pub struct Repo<S: Store> {
     /// a full repack, the only pass that finds slices and templates.
     /// Plans a caller proposes (hints) are still tried.
     pub plain_hot_writes: bool,
+    /// Graph chunk bounds in encoded bytes: no chunk ends before the first,
+    /// every chunk ends by the second (`graph::GRAPH_CHUNK`, 4 and 32 KiB,
+    /// by default). A graph edited with other bounds than it was built with
+    /// stays correct but re-cuts more of itself (E399: smaller chunks for
+    /// served views, which a change rewrites in part, as an option).
+    pub graph_cut: (usize, usize),
     /// With a `seed_scope`, the most seed entries the index may hold
     /// before it is dropped (E383); 0, the default, keeps every content
     /// written for the life of the handle. With a scope the index holds
@@ -330,6 +336,7 @@ impl<S: Store> Repo<S> {
             object_templates: true,
             plain_db_events: false,
             plain_hot_writes: false,
+            graph_cut: crate::graph::GRAPH_CHUNK,
             seed_index_max: 0,
             writing_object: false,
             hints: Default::default(),
@@ -690,6 +697,7 @@ impl<S: Store> Repo<S> {
         r.object_templates = self.object_templates;
         r.plain_db_events = self.plain_db_events;
         r.plain_hot_writes = self.plain_hot_writes;
+        r.graph_cut = self.graph_cut;
         r.exact_short_search = self.exact_short_search;
         r
     }

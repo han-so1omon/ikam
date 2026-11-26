@@ -1003,19 +1003,24 @@ mod tests {
         for shared in [false, true] {
             // E381: plain view writes change how chunks are stored, not
             // the views' rows.
-            for plain in [false, true] {
-                viewed(shared, plain);
+            for (plain, chunk) in [
+                (false, None),
+                (true, None),
+                (false, Some(1024)),
+                (true, Some(2048)),
+            ] {
+                viewed(shared, plain, chunk);
             }
         }
     }
 
-    fn viewed(shared: bool, plain: bool) {
+    fn viewed(shared: bool, plain: bool, chunk: Option<usize>) {
         let spec = "by_status group t/o/ by=field:status sum=field:amount\n\
                     by_cust index t/o/ by=field:customer\n\
                     per_day group t/e/ by=seg:0\n";
         let served = || {
             let v = crate::dbviews::Served::new(crate::dbviews::parse(spec).unwrap()).unwrap();
-            Some(v.plain_writes(plain))
+            Some(v.plain_writes(plain).chunk(chunk))
         };
         let store = ikam_kernel::SharedStore::new(MemStore::default());
         let make = || -> Option<ReaderFactory<_>> {
