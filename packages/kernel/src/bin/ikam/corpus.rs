@@ -382,6 +382,7 @@ fn kind_name(tag: Option<&u8>) -> String {
         Some(b'G') => "graph",
         Some(b'B' | b'W') => "content: raw",
         Some(b'Z') => "content: zstd",
+        Some(b'V') => "content: zstd, byte planes",
         Some(b'Y') => "content: zstd+dict",
         Some(b'Q' | b'M') => "content: zstd+related",
         Some(b'X') => "content: xz",
