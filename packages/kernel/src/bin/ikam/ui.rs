@@ -67,10 +67,10 @@ pub fn handle(live: &Mutex<Live>, req: &Request) -> Response {
 
 fn page(title: &str, body: &str) -> Vec<u8> {
     format!(
-        "<!doctype html><meta charset=utf-8><meta name=viewport content=\"width=device-width\"><title>{t}</title><style>{}{EXTRA}</style>\
-<nav><a href=\"/\">files</a> · <a href=\"/log\">changes</a> · <a href=\"/stats\">store</a>\
-<form action=\"/search\"><input name=q placeholder=\"search text\"></form>\
-<form action=\"/ask\"><input name=q placeholder=\"ask a question\" size=30></form></nav><h1>{t}</h1>{body}<script>{SCRIPT}</script>",
+        "<!doctype html><meta charset=utf-8><base href=\"/\"><meta name=viewport content=\"width=device-width\"><title>{t}</title><style>{}{EXTRA}</style>\
+<nav><a href=\"./\">files</a> · <a href=\"log\">changes</a> · <a href=\"stats\">store</a>\
+<form action=\"search\"><input name=q placeholder=\"search text\"></form>\
+<form action=\"ask\"><input name=q placeholder=\"ask a question\" size=30></form></nav><h1>{t}</h1>{body}<script>{SCRIPT}</script>",
         serve::STYLE,
         t = esc(title),
     )
@@ -89,13 +89,13 @@ button{font:inherit}textarea{width:100%;font:13px/1.4 ui-monospace,monospace}.ev
 /// cross-site form cannot send.
 const SCRIPT: &str = r#"
 async function dav(method, path, body, headers) {
-  const r = await fetch('/dav/' + path.split('/').map(encodeURIComponent).join('/'),
+  const r = await fetch('dav/' + path.split('/').map(encodeURIComponent).join('/'),
     {method, body, headers: Object.assign({'X-Ikam': '1'}, headers || {})});
   if (!r.ok) { alert(method + ' ' + path + ': ' + r.status); throw r.status; }
   return r;
 }
 async function api(name) {
-  const r = await fetch('/api/' + name, {method: 'POST', headers: {'X-Ikam': '1'}});
+  const r = await fetch('api/' + name, {method: 'POST', headers: {'X-Ikam': '1'}});
   const t = await r.text(); alert(t); location.reload();
 }
 async function upload(dir, input) {
@@ -105,7 +105,7 @@ async function upload(dir, input) {
 async function newfile(dir) {
   const n = prompt('New file name'); if (!n) return;
   const p = (dir ? dir + '/' : '') + n;
-  await dav('PUT', p, ''); location = '/edit?path=' + encodeURIComponent(p);
+  await dav('PUT', p, ''); location = 'edit?path=' + encodeURIComponent(p);
 }
 async function newdir(dir) {
   const n = prompt('New folder name'); if (!n) return;
@@ -114,12 +114,12 @@ async function newdir(dir) {
 async function rm(p) { if (confirm('Delete ' + p + '?')) { await dav('DELETE', p); location.reload(); } }
 async function mv(p) {
   const to = prompt('Move or rename to', p); if (!to || to == p) return;
-  await dav('MOVE', p, null, {Destination: '/dav/' + to.split('/').map(encodeURIComponent).join('/')});
+  await dav('MOVE', p, null, {Destination: new URL('dav/' + to.split('/').map(encodeURIComponent).join('/'), document.baseURI).pathname});
   location.reload();
 }
 async function save(p) {
   await dav('PUT', p, document.getElementById('body').value);
-  location = '/file?path=' + encodeURIComponent(p);
+  location = 'file?path=' + encodeURIComponent(p);
 }
 "#;
 
@@ -142,11 +142,11 @@ fn dir_page(l: &mut Live, dir: &str) -> Result<Response, String> {
         _ => return Err(format!("no folder {dir}")),
     };
     let entries = l.entries(&tree)?;
-    let mut crumbs = "<a href=\"/\">/</a>".to_string();
+    let mut crumbs = "<a href=\"./\">/</a>".to_string();
     let mut acc = String::new();
     for part in dir.split('/').filter(|p| !p.is_empty()) {
         acc = join(&acc, part);
-        crumbs += &format!(" <a href=\"/?dir={}\">{}</a> /", enc(&acc), esc(part));
+        crumbs += &format!(" <a href=\"?dir={}\">{}</a> /", enc(&acc), esc(part));
     }
     let mut body = format!(
         "<p>{crumbs}</p><div class=bar><label><button onclick=\"this.nextElementSibling.click()\">Upload</button><input type=file multiple hidden onchange='upload({d},this)'></label>\
@@ -164,7 +164,7 @@ fn dir_page(l: &mut Live, dir: &str) -> Result<Response, String> {
         match e.kind {
             Kind::Tree => {
                 body += &format!(
-                    "<tr><td><a href=\"/?dir={}\">{}/</a></td><td></td><td></td><td>{actions}</td></tr>",
+                    "<tr><td><a href=\"?dir={}\">{}/</a></td><td></td><td></td><td>{actions}</td></tr>",
                     enc(&path),
                     esc(&e.name)
                 )
@@ -172,7 +172,7 @@ fn dir_page(l: &mut Live, dir: &str) -> Result<Response, String> {
             Kind::File => {
                 let size = l.size(&e.id)?;
                 body += &format!(
-                    "<tr><td><a href=\"/file?path={}\">{}</a></td><td class=n>{size}</td><td class=s>{}</td><td>{actions}</td></tr>",
+                    "<tr><td><a href=\"file?path={}\">{}</a></td><td class=n>{size}</td><td class=s>{}</td><td>{actions}</td></tr>",
                     enc(&path),
                     esc(&e.name),
                     humantime(l.mtime(&path))
@@ -193,7 +193,7 @@ fn file_page(l: &mut Live, path: Option<&str>, id: Id) -> Result<Response, Strin
     let mut body = String::new();
     if let Some(path) = path {
         body += &format!(
-            "<p class=bar>{} bytes · <a href=\"/dav/{p}\">download</a> · <a href=\"/edit?path={p}\">edit</a> \
+            "<p class=bar>{} bytes · <a href=\"dav/{p}\">download</a> · <a href=\"edit?path={p}\">edit</a> \
 <button onclick='mv({j})'>move</button> <button onclick='rm({j})'>delete</button></p>",
             bytes.len(),
             p = enc(path),
@@ -208,7 +208,7 @@ fn file_page(l: &mut Live, path: Option<&str>, id: Id) -> Result<Response, Strin
             for (commit, msg, at) in versions {
                 let what = match at {
                     Some(v) => format!(
-                        "<a href=\"/file/{v}\"><code>{}</code></a>",
+                        "<a href=\"file/{v}\"><code>{}</code></a>",
                         &v.to_hex()[..10]
                     ),
                     None => "deleted".into(),
@@ -281,7 +281,7 @@ fn search_page(l: &Live, q: &str) -> Result<Response, String> {
             format!(" <span class=s>({})</span>", esc(&h.part))
         };
         body += &format!(
-            "<p><a href=\"/file?path={}\">{}</a>{member}</p>",
+            "<p><a href=\"file?path={}\">{}</a>{member}</p>",
             enc(&h.path),
             esc(&h.path)
         );
@@ -313,7 +313,7 @@ fn ask_page(live: &Mutex<Live>, q: &str, llm: bool) -> Result<Response, String> 
         }
     } else if allowed {
         body += &format!(
-            "<p><a href=\"/ask?q={}&llm=1\">Write an answer from these sources with Claude</a></p>",
+            "<p><a href=\"ask?q={}&llm=1\">Write an answer from these sources with Claude</a></p>",
             enc(q)
         );
     }
@@ -323,7 +323,7 @@ fn ask_page(live: &Mutex<Live>, q: &str, llm: bool) -> Result<Response, String> 
     );
     for (i, p) in passages.iter().enumerate() {
         body += &format!(
-            "<p><a href=\"/file?path={}\">{}</a> <span class=s>score {:.2}</span></p><pre>{}</pre>",
+            "<p><a href=\"file?path={}\">{}</a> <span class=s>score {:.2}</span></p><pre>{}</pre>",
             enc(&p.path),
             esc(&ask::source_label(i + 1, p)),
             p.score,

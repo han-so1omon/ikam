@@ -18,6 +18,7 @@ mod dav;
 mod dbsearch;
 mod dbserve;
 mod dbviews;
+mod explorer;
 mod host;
 mod http;
 mod json;
@@ -57,7 +58,9 @@ const USAGE: &str = "usage: ikam [--store DIR] [--short-records] [--slow-codec-m
                                    N threads (E389, off)
   host --config FILE [PORT]        several separate projects in one process, each
                                    its own store, users and limits, chosen by Host
-                                   name; crossing only through scoped shares (host.rs)
+                                   name; crossing only through scoped shares (host.rs);
+                                   `explorer HOSTNAME` lists them at / with their
+                                   `link` lines and serves each at /p/NAME/ (E440)
   serve [PORT]                     browse, read and search in a local web page
                                    (default port 8737, 127.0.0.1 only)
   REV, ID and PATH arguments take a ref, a hex id or unique prefix, or REV:PATH.
