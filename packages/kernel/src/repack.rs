@@ -130,6 +130,9 @@ impl<S: Store + Sync> Repo<S> {
             h.update(b"group_size")
                 .update(&(self.group_size as u64).to_le_bytes());
         }
+        if self.tensor_cuts {
+            h.update(b"tensor_cuts");
+        }
         Ok(Id::from_bytes(*h.finalize().as_bytes()))
     }
 
