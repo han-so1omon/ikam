@@ -460,8 +460,10 @@ impl Live {
         }
         cost.store_ms = t.elapsed().as_secs_f64() * 1e3 - cost.index_ms;
         let t = Instant::now();
-        self.work = self.repo.edit_tree(Some(self.work), &edits).map_err(err)?;
+        // The work tree moves only once the journal holds the edits.
+        let work = self.repo.edit_tree(Some(self.work), &edits).map_err(err)?;
         self.journal_edits(&edits)?;
+        self.work = work;
         self.pending.extend(edits);
         cost.tree_ms = t.elapsed().as_secs_f64() * 1e3;
         self.last_edit = Instant::now();
@@ -783,13 +785,25 @@ impl Live {
     /// `--deferred-sync`), since a record names its content by id.
     pub fn open_journal(&mut self) -> Result<usize, String> {
         let path = self.store_dir.join(JOURNAL);
-        let text = std::fs::read(&path).unwrap_or_default();
+        // Only a missing journal is an empty one: any other read error
+        // stops the start rather than truncating edits it could not read.
+        let (text, existed) = match std::fs::read(&path) {
+            Ok(t) => (t, true),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => (Vec::new(), false),
+            Err(e) => return Err(format!("edit journal {}: {e}", path.display())),
+        };
         let (refname, base, edits) = parse_journal(&text)?;
         let file = std::fs::OpenOptions::new()
             .create(true)
             .append(true)
             .open(&path)
             .map_err(err)?;
+        if !existed {
+            // A new file's name is durable only once its folder is synced.
+            std::fs::File::open(&self.store_dir)
+                .and_then(|d| d.sync_all())
+                .map_err(err)?;
+        }
         let n = edits.len();
         if n > 0 {
             let home = self.refname.clone();
@@ -843,8 +857,14 @@ impl Live {
         for e in edits {
             out.push_str(&journal_line(e));
         }
-        f.write_all(out.as_bytes()).map_err(err)?;
-        f.sync_data().map_err(err)
+        // A failed append is cut back off, so a later record never follows
+        // a torn one and a restart never replays edits nobody was told of.
+        let len = f.metadata().map_err(err)?.len();
+        if let Err(e) = f.write_all(out.as_bytes()).and_then(|_| f.sync_data()) {
+            let _ = f.set_len(len).and_then(|_| f.sync_data());
+            return Err(format!("edit journal: {e}"));
+        }
+        Ok(())
     }
 
     /// Empty the journal: its edits are committed or dropped.
@@ -1392,6 +1412,16 @@ mod tests {
             assert_eq!(read(&mut l, "f.txt").as_deref(), Some(&b"three"[..]));
         }
         assert_eq!(std::fs::metadata(dir.join(JOURNAL)).unwrap().len(), 0);
+        // A journal that exists but cannot be read stops the start; it is
+        // never taken as empty and truncated.
+        std::fs::remove_file(dir.join(JOURNAL)).unwrap();
+        std::fs::create_dir(dir.join(JOURNAL)).unwrap();
+        {
+            let mut l = Live::open(d, "main").unwrap();
+            let e = l.open_journal().unwrap_err();
+            assert!(e.contains("edit journal"), "{e}");
+        }
+        assert!(dir.join(JOURNAL).is_dir());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
