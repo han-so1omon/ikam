@@ -6623,3 +6623,108 @@ Gates on the branch (E229 to E233): every kernel test suite passes (release); cl
 - Checks: `tests/net_files.rs`, 8 tests (a net read back at each commit; a hand-written file is its canonical version; a tree with three nets and a non-net file; three nets interleaved with an edit mid-run, each replaying to its own marking while the first version alone cannot; a retry under another version refused; an untracked record keeps its 4 lines; tracking starts only from the initialized version before any firing; tracking with a sum hash and outputs).
 - Verdict: **kept** (option, off by default).
 - Not measured or not done: a net's version kept live by gc only through the commit that holds its file or the database that names it (a database is not a gc root); a three-way merge of two edits to one net file (text merge works, the merged net is checked on parse); replay that reads only one net's records instead of the whole log.
+
+### E427 sampler-trainer (a neighborhood sampler over the fragment graph, and an outside trainer whose run is a recorded step)
+
+- Branch / parent: exp/427-sampler-trainer / exp/422-net-artifacts (bcbe338, on exp/441-float-steps)
+- Question: can the kernel hand an outside neural-net program (candle here) fixed-fanout neighborhoods of its own fragment graph, streamed as batches, without depending on any ML library, and record the training run so that from a weights id a walk names everything needed to reproduce it: the run, its program, its batches and the commit they were sampled from? Is a batch a pure derivation `sample(commit, seed, fanout)`? Does a rerun from the same ids give the same weights bit for bit, on one thread and on several? (Idea note T3, "a neighborhood sampler that streams batches from the fragment graph".)
+- Found before building:
+  - The fragment DAG under a commit is not a function of the commit alone. Which render a file is read through is ledger state (`fragments_of` takes the first `render` derivation of a file), and the ledger can gain derivations for the same content later. So `sample(commit, ...)` cannot be a pure derivation: a builtin sees only its arguments' bytes, and a commit names no ledger. It splits in two: a *view* of the commit's fragment graph, kept as a recorded step, and `sample(view, spec)`, which is pure.
+  - A recorded step (E441) has one output, so the loss log is a second `Run` with the same program and inputs as the weights.
+  - Every id a `Run` names must be content (repack reads each one as content), so the program is a content (a render of its sources), not a tree.
+  - A net's database is not a gc root (noted in E422). The run commits it with `db_commit`, and the outputs as files.
+- Change (all options; nothing in the default paths calls them; no new dependency in the kernel):
+  - `sampler.rs` (new):
+    - `View`: every node of the fragment graph in id order with integer features (kind: file, fragment or render; file type; length) and the whole adjacency as offsets and ordinals, nothing truncated. `Repo::fragment_view(commit)` builds it.
+    - `Repo::view_pin(commit)` is a small text naming the commit and its tree. `Repo::record_fragment_view` keeps the view as the recorded step `fragment-view(pin)`. `Repo::check_fragment_view` rebuilds a view from the commit its bytes name and compares.
+    - `Spec`: canonical text with seed, fanout, hops, batch size, index and targets.
+    - `Sampler::sample(spec)`: integers only. Roots are positions of a seeded Feistel permutation of the targets, a new order each epoch, costing O(batch). Each layer's frontier is sorted and deduplicated, so a hub reached from many parents is read and sampled once a layer. A node with more than `fanout` neighbors gets `fanout` distinct ones by Floyd's algorithm. Every random choice is keyed by counters (seed, index, hop, node), never by the order work is done in.
+    - `Sampler::stream(specs, capacity)`: a producer thread and a `sync_channel` of `capacity` batches.
+  - `func.rs`: two builtins, appended (stored records keep their indices). `sample/1(view, spec)` is a pure derivation recorded by `Repo::apply_sample` (`apply`): repack may drop a batch and rebuild it, and fsck re-evaluates it. Its work counts the view's bytes. `fragment-view/1` is refused when evaluated, as `recorded/1` is.
+  - `step.rs`: `Repo::lineage(id)` walks back to a fixed point through recorded steps (function, arguments, check), pure derivations other than storage plans, and view pins (the commit). It finds `Run` records with one scan of the store, and returns every content reached with the steps that made it, the commits and anything missing.
+  - `experiments/sampler-trainer` (its own crate with its own Cargo.lock, candle-core and candle-nn 0.11.1, CPU):
+    - Reads frames on stdin: the config, the seed, then every batch.
+    - Trains a two-layer MLP predicting a node's class (its file type, or fragment) from its sampled 2-hop neighborhood, with the node's own class hidden.
+    - Weights are drawn from the seed with an integer generator, and AdamW runs one step a batch.
+    - Writes `weights.f64` (every parameter as an f64, so `within-f64` can judge it) and `loss.log`.
+    - One thread unless `RAYON_NUM_THREADS` says otherwise.
+- Method (`examples/e427_sampler.rs`, on an `FsStore`; Linux cloud, 4 CPUs, one run):
+  - `run`:
+    1. The bench's three north corpora go into one commit, each file stored with `put_fragmented`, where blocks shared by two or more files stand alone (E157).
+    2. The view is built.
+    3. Sampling: 2 hops, fanout 10, 256 roots a batch, measured direct and streamed. A synthetic graph of 1.44 M nodes (200,000 files of 8 fragments, two of them from a skewed shared pool) gives the scale.
+    4. A net `trainer`, stored at `nets/trainer.net` with versions tracked (E422), fires `pick` (human), `view` (cmd, the view as a recorded step), and `train` (cmd, through `net_fire_step`). For `train`, the program is a content holding Cargo.toml, Cargo.lock and src/main.rs as fragments plus the built binary's BLAKE3. The inputs are the config, the seed and 136 batches (8 epochs), each a pure `sample` derivation. The output is the weights, with a `within-f64 rel=1e-6` check. The loss log is a second `Run`.
+    5. Outputs and the database are committed. Repack at the archive read weight, then fsck and gc.
+  - `reproduce`, in a new process, from the weights id alone:
+    1. The lineage walk.
+    2. The view rebuilt from its commit.
+    3. Every input read back by id (batches rebuilt by their derivations), and the binary checked against the program's hash.
+    4. The trainer rerun seven times with thread counts and core pinnings; `rerun` compares each output with the output of record.
+    5. Net version 2 adds `reproduce` (pure: `within-f64 ulp=0` of the output of record and a rerun).
+    6. `net_replay_versions`, `net_verify_steps` and fsck.
+  - The program's sources were also written out of the store and rebuilt in another directory with another target directory.
+- Results:
+  - The graph (north corpora, one commit): 1,032 files, 8.9 MB.
+
+    | nodes | files / fragments | edges | max degree | nodes over fanout | view |
+    | --- | --- | --- | --- | --- | --- |
+    | 4,332 | 966 / 3,366 | 8,040 | 354 | 200 | 0.27 MB, 11 file types, built in 0.6 s |
+
+    The ledger holds 8,040 distinct render edges, and the view holds all of them: nothing is truncated in storage, and fanout applies only when sampling.
+  - Sampling, 2 hops, fanout 10, 256 roots (one thread for direct; one producer thread for streamed):
+
+    | graph | mode | batches | batches/s | roots/s | sampled edges/s | peak heap | batch (mean) |
+    | --- | --- | --- | --- | --- | --- | --- | --- |
+    | north | direct | 850 | 5,508 | 1.40 M | 11.0 M | 0.6 MB | 33.3 KB |
+    | north | streamed, channel 1 | 850 | 5,834 | 1.49 M | 11.7 M | 0.2 MB | |
+    | north | streamed, channel 8 | 850 | 6,052 | 1.54 M | 12.1 M | 0.7 MB | |
+    | synthetic, 1.44 M nodes | direct | 2,000 | 4,065 | 1.04 M | 13.7 M | 115.9 MB | 67.3 KB |
+    | synthetic | streamed, channel 1 | 2,000 | 2,894 | 0.74 M | 9.8 M | 0.6 MB | |
+    | synthetic | streamed, channel 8 | 2,000 | 3,183 | 0.81 M | 10.8 M | 1.4 MB | |
+
+    - Peak heap above the view: the direct row's peak includes parsing the view (an 80.5 MB view parses to about 116 MB). A streamed row's peak covers only the batches in flight, which is what the channel bounds.
+    - The sorted frontier reads 1 adjacency list for every 4.41 parent-to-node occurrences (north) and 4.58 (synthetic).
+    - Edge checks: 271,624 sampled edges were checked against the ledger's own render records, read from the derivations and not from the view, and 0 were missing. Every sampled node is present in the store.
+    - The first version shuffled every target for each batch, which ran at 204 batches/s on the synthetic graph. The permutation replaced it.
+  - Recording: the view as a recorded step took 12 ms. The 136 batches as `apply`s took 578 ms (4.5 MB). Training took 312 ms (12,301 weights, 136 steps, train accuracy 0.913, last loss 0.154), and recording it 63 ms. Repack (100 s on the `FsStore`) cut stored bytes from 4.1 to 1.7 MB and dropped all 136 batches' bytes, since they are pure and rebuilt. The weights, the loss log and the view kept their bytes. fsck was clean, and gc deleted nothing live.
+  - The walk from the weights id (new process, 400 ms, 286 contents, none missing):
+
+    | names | found |
+    | --- | --- |
+    | the run | the `Run` of the weights, with its `within-f64` check |
+    | its program | one content: Cargo.lock, Cargo.toml, src/main.rs as fragments of a render (7 pieces), the binary's BLAKE3 |
+    | its inputs | the config, the seed, 136 of 136 batches, each `sample(view, spec)` |
+    | the view | a recorded step `fragment-view(pin)`; rebuilt from its commit, equal to the view of record |
+    | the commit | the commit the batches were sampled from (the one committed in `run`) |
+
+    All 138 inputs read back from their ids (136 rebuilt by their derivations), and every id matched. The binary matched the program's hash. The sources written out of the store equal the crate's files, and rebuilt in another directory with `--locked --offline` they give a byte-identical binary (same toolchain, 1.97.0, and the same machine).
+  - Reruns from the same ids:
+
+    | rerun | threads | cores | trainer ms | trainer CPU ms | weights | loss log |
+    | --- | --- | --- | --- | --- | --- | --- |
+    | 0 | 1 (of record) | any | 292 | 253 | bit-identical | bit-identical |
+    | 1 | 1 | any | 252 | 243 | bit-identical | bit-identical |
+    | 2 | 4 | any | 2,934 | 3,470 | bit-identical | bit-identical |
+    | 3 | 2 | any | 1,753 | 1,727 | bit-identical | bit-identical |
+    | 4 | 1 | core 3 | 279 | 257 | bit-identical | bit-identical |
+    | 5 | 4 | cores 0-3 | 2,930 | 3,547 | bit-identical | bit-identical |
+    | 6 | 4 | core 0 | 3,828 | 3,727 | bit-identical | bit-identical |
+
+    candle's thread pool was used (CPU time over wall time with 4 threads), and the weights did not change: candle's CPU matmul splits work over output blocks, not along the reduction. On this model, 4 threads are 10 times slower than one. Net version 2's `reproduce` firing gave `same`. The net replays by versions to its marking (pick, view and train under version 1, reproduce under version 2). `net_verify_steps` passes 3 of 3, and fsck is clean.
+  - Fixed bench: bytes 5.7493, proxy 3.8185, read 5.7140, north 0.3060, sharing_kernel 0.9496; every corpus exact and fsck clean, the same as the parent and main.
+- Findings:
+  1. A batch is a pure derivation of a view, and a view is not one of a commit: the fragment graph is ledger state. The kernel needed a pin (a content naming the commit) to put the commit in a recorded step's arguments, because arguments must be contents. Like E441's design A head, the pin's commit is not kept live by gc through the pin. Here the ref's history keeps it.
+  2. Sorting the frontier matters on a hub-heavy graph: 4.4 to 4.6 parent-to-node occurrences per adjacency read. Roots from a seeded permutation, rather than a shuffle, are what make throughput independent of graph size (204 to 4,065 batches/s at 1.44 M nodes).
+  3. A recorded step needs one output per `Run`, so a program with two outputs records two `Run`s with the same function and arguments. A firing names one of them (the weights). The loss log is found as the run with the same program and inputs.
+  4. Reproducibility on one machine was complete here: the same weights from the same ids at 1, 2 and 4 threads and under pinning, and the same binary rebuilt from the stored sources. This holds by construction for the batches (integers, counter-keyed choices) and as a measurement for the trainer.
+- Checks: `tests/sampler.rs`, 7 tests (a view holds every render edge with a hub's whole adjacency; batches are pure, seeded, cover every node once an epoch, keep to the fanout, and every edge is a render in the ledger; batches rebuild after a repack at the archive weight while the view and a recorded output keep their bytes; evaluating a view step is refused; specs are canonical; a stream hands over every batch in order; a recorded run walks back to the commit through its batches and view). `cargo test --release --features embed`: 399 pass, 0 fail; clippy `-D warnings` clean.
+- Verdict: **kept** (options, off by default; no kernel dependency on candle).
+- Not done / Next:
+  - A second machine or platform (the bit-identical result is one machine's). The toolchain version is not yet in the program content, and it should be.
+  - Weighted and most-recent sampling, which graph-learning samplers commonly offer (uniform only here).
+  - A view kept up to date incrementally (it is rebuilt per commit, 0.6 s here, mostly reading every node's length).
+  - `lineage` and `step_records` scan the store for runs; a projection from output to runs is the next thing when they get hot (E441 said the same).
+  - The loss log is not named by the firing record, only by a sibling `Run`.
+  - Arrow or another standard batch format (it would be a dependency).
+  - The 100 s repack on an `FsStore` is the store's cost, not the sampler's.
+- Run: `cargo run --release --example e427_sampler -- run <trainer binary> experiments/sampler-trainer <dir> 8`, then `-- reproduce <trainer binary> <dir>`; the trainer is built with `cargo build --release` in `experiments/sampler-trainer`.
