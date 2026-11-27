@@ -44,6 +44,7 @@ mod range;
 mod repack;
 mod repo;
 mod search;
+pub mod semantic;
 pub mod share;
 pub mod snapshot;
 pub mod stem;
