@@ -6579,3 +6579,98 @@ Gates on the branch (E229 to E233): every kernel test suite passes (release); cl
   - No public tree edit puts a graph at a path; `ikam-compute` carries its own (E438).
   - Loading a yielding model by a moment past its limit point stalls Newton; prescribed displacements and continuation are needed (E439).
 - Verdict: kept (capability in `ikam-compute`: `Graph::inline`, `commit_at`, `load_at`; findings planned as E434 to E439).
+
+### E442 float-bounds (bounds on nondeterminism as nodes of the op graph)
+
+- Branch / parent: exp/442-float-bounds / exp/430-compute-graph eb2518e
+- Question: the owner asked for optional bound checks on the nondeterminism of float steps in the graph computation chain, as part of the ikam graph flow rather than a separate hard-coded operation. Can a tolerance be declared in the op graph itself, so that a rerun with other arithmetic (another platform or build) is reported as within or outside the bound instead of only same or different? How far do results move between arithmetics in E409's functions, an elastica Newton solve and 10,000-step loops, and should bounds be put per step or one on the end result?
+- Change (`ikam-compute`, all optional; nothing changes for a graph without bounds):
+  - `Op::Within { ulp, abs, rel, local }` (`ir.rs`, builder `Graph::within`): the identity in value, shape and gradient (`grad` passes the adjoint through, `Plan` copies). An element pair (recorded r, now x) is within when `ulp_distance(r, x) <= ulp`, or `|r - x| <= abs`, or `|r - x| <= rel * |r|`; NaN matches only NaN, an infinity only itself. It encodes as a new op name, `within:<ulp>:<abs bits>:<rel bits>:<0|1>`, so every other op encodes as before and graphs without bounds keep their ids (checked against ids taken on the parent commit). With `local`, a check carries on past the node from the value of record (a per-step bound); without it the rerun's own value carries on and differences accumulate through it (a propagated bound).
+  - `eval::Arith { Pinned, Host }`, `eval_all_with`, `eval_with`, `apply_with`: `Host` stands in for another platform or build, E409's modes at once: `exp`, `ln`, `sin`, `cos`, `tanh`, `sqrt` from the host's library (`f64` methods: glibc here), every multiply-add in a matrix product fused (one chain under 16 terms, 8 lanes of chains from 16), sums in 8 lanes added pairwise (`sum_lanes8`, `dot_host`). `eval` and `eval_all` stay pinned; `Env` and every existing signature are unchanged. `Minimizer::minimize_with(.., arith)` runs Newton-CG with it (the solver's dot products and updates fused too); `minimize` is `minimize_with(.., Pinned)`.
+  - `memo::check_bounded(repo, db, g, env, arith) -> bounds::Report` beside `eval_stored`: evaluates again in memory and compares every node with its record, found under the first run's key (the op over the recorded argument ids), so a value that moved upstream does not make lookups downstream miss. A node whose bits differ must be covered by a Within node (`bounds::coverage`: itself, or one on every path to a graph output), or the check fails with `Error::Nondeterministic` as the exact check does. Each Within node gets a verdict (same, within, outside) with its max ULP, max abs and max rel. It takes the repository shared and computes ids without storing (`Id::of_content`): no memo record and no content is written, so the first run stays the one of record. `memo::check_graph_bounded` does the same against a whole-graph record (`eval_graph_stored`): only outputs were kept, so the bounds are the Within nodes among the outputs. New error `Error::NotRecorded` for a key with no record.
+  - `bounds::predict(g, env, input_err)`: a running error analysis (first order): each basic op adds half an ULP of its result (`U * |v|`, U = 2^-53) to the input errors it propagates through the absolute values of its partial derivatives, a library function one ULP, sums and matrix products the larger of the pinned order's and the host orders' running bounds. Two runs differ by at most twice it (`predicted_difference`). A local Within restarts from zero, as the check does. `bounds::fill_from_prediction(g, env, input_err, factor)` writes each Within's `abs` from it, so the stored graph carries the bound it is checked with; `bounds::insert_within(g, at, bound)` puts a bound after chosen nodes and routes their uses through it.
+- Result (`examples/float_bounds.rs`, Linux x86-64, glibc 2.39, 4 CPUs, Rust 1.97, one run; the differences are deterministic, two runs gave the same tables):
+  - E409's five functions as graphs over its six inputs (its generator, copied), recorded pinned, rerun host. Predicted abs is the predicted difference between two runs. Rows with the same bits (8 of 30: subnormal mean_var, softmax, exp, matmul; cancel softmax; special dot, mean_var, softmax) left out:
+
+    | function | input | elements differing | max ULP | max abs | max rel | predicted abs | tightest passing |
+    | --- | --- | --- | --- | --- | --- | --- | --- |
+    | dot | plain | 1 of 1 | 11 | 1.25e-12 | 1.62e-15 | 1.79e-10 | ulp 64 |
+    | mean_var | plain | 2 of 2 | 6 | 4.26e-14 | 1.25e-15 | 4.01e-12 | ulp 64 |
+    | softmax | plain | 62 of 64 | 3 | 5.55e-17 | 4.57e-16 | 6.83e-15 | ulp 4 |
+    | exp | plain | 8 of 64 | 1 | 5.68e-14 | 1.58e-16 | 8.81e-12 | ulp 1 |
+    | matmul | plain | 38 of 64 | 37 | 5.68e-14 | 6.23e-15 | 2.61e-13 | ulp 64 |
+    | dot | cancel | 1 of 1 | 43 | 3.44e2 | 4.83e-15 | 1.06e5 | ulp 64 |
+    | mean_var | cancel | 2 of 2 | 70,726 | 9.01e15 | 1.19e-11 | 6.47e18 | rel 1e-9 |
+    | exp | cancel | 1 of 64 | 1 | 2.22e-16 | 1.40e-16 | 8.81e-12 | ulp 1 |
+    | matmul | cancel | 43 of 64 | 11 | 3.20e1 | 1.85e-15 | 2.55e2 | ulp 64 |
+    | dot | subnormal | 1 of 1 | 1 | 9.88e-324 | 1.28e-16 | 3.79e-320 | ulp 1 |
+    | dot | wide | 1 of 1 | 5 | 3.64e-11 | 5.89e-16 | 1.43e-8 | ulp 64 |
+    | mean_var | wide | 2 of 2 | 29 | 8.73e-11 | 3.86e-15 | 2.57e-8 | ulp 64 |
+    | softmax | wide | 3 of 64 | 1 | 8.47e-22 | 1.73e-16 | 1.41e-12 | ulp 1 |
+    | exp | wide | 6 of 64 | 1 | 3.84e258 | 1.89e-16 | 8.32e283 | ulp 1 |
+    | matmul | wide | 33 of 64 | 53 | 3.64e-12 | 7.14e-15 | 2.09e-11 | ulp 64 |
+    | dot | edges | 1 of 1 | 8 | 5.82e-11 | 1.73e-15 | 7.50e-9 | ulp 64 |
+    | mean_var | edges | 2 of 2 | 8 | 2.91e-11 | 1.21e-15 | 5.88e-9 | ulp 64 |
+    | softmax | edges | 1 of 64 | 1 | 4.94e-324 | 7.01e-15 | 2.01e-13 | ulp 1 |
+    | exp | edges | 1 of 64 | 1 | 2.00e292 | 1.28e-16 | 7.46e292 | ulp 1 |
+    | matmul | edges | 38 of 64 | 20 | 3.64e-12 | 2.33e-15 | 2.09e-11 | ulp 64 |
+    | exp | special | 8 of 64 | 1 | 5.68e-14 | 1.58e-16 | 8.81e-12 | ulp 1 |
+    | matmul | special | 13 of 64 | 37 | 1.42e-14 | 6.23e-15 | 1.20e293 | ulp 64 |
+
+    Of the 30 pairs, a tolerance of ulp 1 passes 16, ulp 4 17, ulp 64 29, rel 1e-15 17, rel 1e-12 29, rel 1e-9 30. The library functions move by at most 1 ULP (glibc against libm); sums and products move by up to 64 ULP, and a sum that cancels (mean_var on cancel) by 70,726 ULP, rel 1.2e-11. Stored with `Within { ulp: 4, rel: 1e-12 }` on each output and checked on the store: 8 same, 21 within, 1 outside (mean_var cancel). The prediction covered every measured difference; it was 4x (matmul) to about 700x (mean_var cancel) above it, typically 100x.
+  - Elastica Newton-CG, pinned against host (the solve's graphs and its own dot products):
+
+    | case | Newton steps | CG steps | tip pinned vs host | max angle difference | tip error vs exact arc |
+    | --- | --- | --- | --- | --- | --- |
+    | end moment 120 degrees, 100 segments | 1 and 1 | 100 and 100 | 0 | 0 (same bits) | 1.51e-5 L |
+    | end load PL^2/EI = 1, 200 segments | 5 and 5 | 817 and 817 | 0 (tip y 0.301724312264 L both) | 5.55e-17 (1 ULP) | (published 0.30172 L) |
+
+    The end-moment solve gave the same bits: its gradient graph has no sum feeding the gradient vector, and conjugate gradients from a unit end load on this chain keeps every residual to one nonzero element, so every dot product has one term. Along the end-load solve's Newton steps the iterates differ by 2.9e-13 (5,244 ULP) after step 1, then 3.0e-15, 2.3e-15, 1.1e-16 and 5.6e-17 (1 ULP) after steps 2 to 5: Newton contracts the difference as it converges. Against the discretization error (1.5e-5 L at 100 segments) rounding is ten orders of magnitude smaller.
+  - Loops at 1 kHz, 10,000 steps, interpreted (`eval_with`): a chain of 8 masses (stiffness as a matrix product, tanh softening, semi-implicit Euler, dt 1 ms), damped (5 /s) and forced at 3 Hz (contracting), or undamped and free (neutral); the Lorenz system, explicit Euler, 0.005 a tick (chaotic). Chained: each arithmetic carries its own state. Per step: one host step from the pinned state (what a local bound checks). Predicted chained: the bound carried from step to step (`input_err`); predicted per step: from zero each step.
+
+    | system | step | chained max abs | per-step max abs (all steps so far) | predicted chained | predicted per step |
+    | --- | --- | --- | --- | --- | --- |
+    | damped chain | 10 | 1.78e-15 | 1.78e-15 | 1.00e-13 | 4.79e-15 |
+    | | 100 | 3.55e-15 | 1.78e-15 | 5.98e-6 | 4.79e-15 |
+    | | 1,000 | 7.22e-16 | 1.78e-15 | 3.27e72 | 4.79e-15 |
+    | | 10,000 | 3.33e-16 (largest 7.55e-15) | 1.78e-15 | inf | 4.79e-15 |
+    | undamped chain | 100 | 3.55e-15 | 1.78e-15 | 4.83e-6 | 5.58e-15 |
+    | | 1,000 | 1.42e-14 | 1.78e-15 | 3.44e71 | 6.90e-15 |
+    | | 5,000 | 5.06e-14 | 1.78e-15 | inf | 7.24e-15 |
+    | | 10,000 | 7.37e-14 (largest 1.14e-13) | 1.78e-15 | inf | 7.24e-15 |
+    | Lorenz | 100 | 2.22e-16 | 1.78e-15 | 7.70e-9 | 1.20e-14 |
+    | | 1,000 | 3.20e-14 | 1.78e-15 | inf | 1.20e-14 |
+    | | 2,000 | 3.17e-12 | 1.78e-15 | inf | 1.20e-14 |
+    | | 5,000 | 5.58e-6 | 1.78e-15 | inf | 1.20e-14 |
+    | | 10,000 | 1.36e1 (the attractor's size) | 1.78e-15 | inf | 1.20e-14 |
+
+    The difference carried through the loop stays bounded when the dynamics contract (largest 7.6e-15 over 10,000 steps), grows slowly when they are neutral (largest so far 8.0e-15, 3.4e-14 and 1.1e-13 at 100, 1,000 and 10,000 steps: about 4x for ten times the steps, near a random walk's square root), and grows exponentially when they are chaotic (about 100x per 1,000 steps, until by step 10,000 it is the size of the attractor). The per-step difference is the same small number in all three (1.78e-15, at most 32 ULP in Lorenz; in the chain it reaches 262,144 ULP on elements near zero while the abs difference stays 1.8e-15, so ULP tolerances fail near zero and abs works). The per-step prediction is 2.7x (chain) to 6.7x (Lorenz) above the measured per-step difference; the carried prediction explodes even for the contracting chain (3e72 at step 1,000), because absolute values cannot follow the sign changes of an oscillation.
+  - A rod (24 segments, end load) re-solved every tick by two warm-started Newton steps (`Options { max_iter: 2, budget: true }`, E432's pattern) as its end moment varies at 1 Hz, 2,000 ticks: the carried difference was 5.7e-14 after tick 1 and 0 (same bits) at ticks 10, 100, 1,000 and 2,000; the largest per-tick difference was 2.9e-13 (20,462 ULP, near-zero angles). The iterate after each tick is up to 4e-11 from a full solve from zero (|g| about 1e-14): the solver's own convergence error is 100x the rounding difference. Newton contracts differences away, as in the static solve.
+  - Checks on the store, each loop unrolled 1,000 steps into one graph (about 24,000 and 17,000 nodes), recorded pinned with `eval_stored`, checked with host arithmetic:
+
+    | system | bounds | largest abs tolerance | exact check | bounded check, pinned | bounded check, host | differing nodes | same / within / outside |
+    | --- | --- | --- | --- | --- | --- | --- | --- |
+    | damped chain | none | - | 1,125 ms | 1,117 ms | 2 ms | - | refused (`Nondeterministic`) |
+    | damped chain | local on each step, predicted x 1 | 2.38e-15 | 1,162 ms | 1,141 ms | 1,179 ms | 10,188 | 217 / 783 / 0 |
+    | damped chain | final only, predicted x 1 | 1.88e72 | 1,273 ms | 1,276 ms | 1,213 ms | 16,963 | 0 / 1 / 0 |
+    | damped chain | final only, abs 1e-12 | 1e-12 | 1,159 ms | 1,136 ms | 1,130 ms | 16,963 | 0 / 1 / 0 (moved 8.3e-16) |
+    | Lorenz | none | - | 829 ms | 858 ms | 3 ms | - | refused (`Nondeterministic`) |
+    | Lorenz | local on each step, predicted x 1 | 1.20e-14 | 943 ms | 885 ms | 850 ms | 2,635 | 989 / 11 / 0 |
+    | Lorenz | final only, predicted x 1 | inf | 903 ms | 813 ms | 869 ms | 8,672 | 0 / 1 / 0 |
+    | Lorenz | final only, abs 1e-12 | 1e-12 | 811 ms | 787 ms | 813 ms | 8,672 | 0 / 1 / 0 (moved 3.2e-14) |
+
+    Without a bound a host rerun is refused at the first differing node, as before. A local bound on each step, its tolerance written from the prediction, passes every step; a bound written from the carried prediction is useless (1.9e72, infinite). Plain evaluation of the same graphs takes 1 to 4 ms; recording takes 625 to 1,330 ms.
+  - Time: the bounded check costs what the exact check costs (within the run-to-run noise of about 10%; about 45 us a node, the database lookup per node dominates), and the same for a whole-graph record (one record: exact 3 ms, bounded 4 ms). A Within node adds one node and one record to a check.
+- Design choice:
+  - Why a node: the bound is a statement about the computation, so it belongs with the graph: stored with it, versioned and diffed with it, carried by graph shares, inlined with a model, and the same graph id names the same check. A tolerance passed to the check (an argument of `check_bounded`) would be a separate, hard-coded operation the stored graph knows nothing of, which is what the owner asked to avoid. As the identity it costs nothing in `eval`, `grad` and `Plan`, and a graph without it is the graph it was.
+  - Why `local` is in the node: where the bound restarts is the per-step against propagated choice, and it is a property of the model (a loop's state is checked per step, a closed-form result end to end), so the graph says it.
+  - Why coverage: a difference is allowed only where a bound declares it (itself or downstream on every path to an output); anything else is still `Nondeterministic`, so adding one bound cannot silently excuse a whole graph's other outputs.
+  - Why `Host` as one mode: E409 found fused multiply-add, reordered sums and the host's math library are the three ways bits move; one mode with all three is their union, and a check with it exercises every path; a real platform or build takes some of them.
+  - Considered: a check-time tolerance argument (rejected above); a bound stored as a separate database record beside the memo (not versioned with the graph); a new eval mode that resyncs every node from its record (that is a local bound on every node; with bounds as nodes the graph chooses where); interval or affine arithmetic in place of the running bound (tighter for loops, much more work; see Next).
+- Answer, per step or propagated: per step for anything iterated (time loops, unrolled chains, fixed-point iterations). The per-step difference is the same few ULP whatever the dynamics (1.78e-15 in contracting, neutral and chaotic loops), its prediction is 3x to 7x above it, and it checks what portability asks (each step computed correctly from its recorded input). One bound on the end result works only where the dynamics contract, and its tolerance has to come from measurement: the carried prediction explodes within 100 steps even for a contracting loop, and in a chaotic loop the honest end bound after 10,000 steps is the size of the attractor. Propagated (end-to-end) bounds are for short feed-forward computations (E409's functions, a solve's output), where the prediction is finite and about 100x the measured difference. A converging solver (Newton) needs neither inside it: it erases differences as it converges, so bound its output with a tolerance at the solver's own convergence scale.
+- Checks: `tests/bounds.rs` (8): Within round-trips through its encoding and through `Graph::put` and `load`; graphs without bounds keep the ids they had on the parent commit (a graph using every op, and its gradient graph); a bound is the identity in value, gradient and `Plan`; coverage; the exact check unchanged and an uncovered difference still refused, a graph never recorded `NotRecorded`; within and outside by ulp, abs and rel, and nothing written (the store holds the same objects, a plain rerun has 0 misses); a local bound restarts from the record (each step's distance equals one host step from the pinned state); the prediction covers the measured difference and a bound filled from it passes. `tests/engine.rs` (13) unchanged and passing. `cargo test --release`: 21 pass, 0 fail; clippy `--all-targets -D warnings` clean.
+- Fixed benchmark: not run, kernel untouched.
+- Verdict: **kept** (an option, off by default: a graph without Within nodes, `eval`, `eval_stored`, `eval_graph_stored` and `minimize` behave exactly as before).
+- Not measured: a real second platform (ARM64, macOS, Windows; `Host` stands in for them: E409 measured that their bits differ only through these three paths); `Plan` with host arithmetic (planned loops here are checked through the interpreter; `Plan` copies a Within node); a tolerance relative to a tensor's scale (rel is per element, which fails near zero, so the loops needed abs); bounds inside a solver's iteration (Newton contracts differences, so none were needed); the cost of a bounded check through a disk store; more than one run.
+- Next: a `rel` against the tensor's largest element (one option on Within) so a state with near-zero elements needs no abs; running bounds with signs (affine arithmetic) for loops, where absolute values explode; when E435 puts pinned-float functions in the ledger, the same Within node as a check on a recorded derivation.
+- Run: `cargo run --release --example float_bounds`; `cargo test --release` (in `packages/compute`).
