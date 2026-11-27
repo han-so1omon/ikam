@@ -49,6 +49,8 @@ struct Source {
     outside: Vec<Id>,
     /// A named id that is not in the store.
     missing: Id,
+    /// A tree a record names.
+    tree: Id,
 }
 
 fn source() -> Source {
@@ -109,6 +111,7 @@ fn source() -> Source {
         named: vec![(small_id, small), (big_id, big), (hex_id, hexed)],
         outside: vec![out_id, private_id],
         missing,
+        tree: t,
     }
 }
 
@@ -234,7 +237,7 @@ fn with_content_every_named_content_resolves_and_nothing_else_comes() {
         src.repo.share_content(&s, &src.named[1].0).unwrap(),
         src.named[1].1
     );
-    for id in src.outside.iter().chain([&src.missing]) {
+    for id in src.outside.iter().chain([&src.missing, &src.tree]) {
         assert_eq!(src.repo.share_content(&s, id), Err(Refused::Outside));
     }
     // A merge's size counts the content.

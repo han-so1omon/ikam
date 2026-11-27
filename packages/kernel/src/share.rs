@@ -607,11 +607,24 @@ impl<S: Store> Repo<S> {
 
     /// The bytes of content `id` through a `Records` share with `content`,
     /// only if one of its records names it (E437).
+    /// Only the records are scanned: no other named content is read.
     pub fn share_content(&mut self, share: &Share, id: &Id) -> Result<Vec<u8>, Refused> {
-        if self.share_named_content(share)?.binary_search(id).is_err() {
+        let Scope::Records { content: true, .. } = &share.scope else {
+            return Err(Refused::Outside);
+        };
+        let named = self
+            .share_records(share, "", None)?
+            .iter()
+            .any(|(_, v)| named_content(v).as_ref() == Some(id));
+        if !named || !self.has_content(id)? {
             return Err(Refused::Outside);
         }
-        Ok(self.read_content(id)?)
+        match self.read_content(id) {
+            Ok(bytes) => Ok(bytes),
+            // A tree or graph a record names is not content: as if absent.
+            Err(Error::WrongKind(_)) => Err(Refused::Outside),
+            Err(e) => Err(e.into()),
+        }
     }
 
     /// Graph nodes whose labels start with `prefix`, clipped to a `Graph`
