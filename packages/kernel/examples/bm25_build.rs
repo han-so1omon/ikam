@@ -106,6 +106,8 @@ fn main() {
         }
     };
     let build = t.elapsed().as_secs_f64();
+    // The build's peak, read before the exact pass below allocates its own.
+    let peak = peak_mb();
     let exact = if mode == "stats" {
         compare(&mut stats, &values)
     } else if mode == "zones" {
@@ -121,8 +123,7 @@ fn main() {
     let v = ikam_kernel::bm25::Bm25View { root };
     let hits = repo.bm25_view_search(&v, "word42", 10).unwrap();
     println!(
-        "{{\"mode\":\"{mode}\",\"rows\":{rows},\"build_s\":{build:.2},\"peak_mb_before\":{before},\"peak_mb\":{},\"hits\":{},\"root\":\"{root}\",\"stats\":{exact}}}",
-        peak_mb(),
+        "{{\"mode\":\"{mode}\",\"rows\":{rows},\"build_s\":{build:.2},\"peak_mb_before\":{before},\"peak_mb\":{peak},\"hits\":{},\"root\":\"{root}\",\"stats\":{exact}}}",
         hits.len(),
     );
 }

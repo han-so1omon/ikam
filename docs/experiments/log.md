@@ -6549,7 +6549,7 @@ Gates on the branch (E229 to E233): every kernel test suite passes (release); cl
   | `plain` | 8 | 4.63 s | 4.61 s | same |
   | `stats` | 8 | 4.75 s | 4.74 s | same |
 
-  The stats cost about 3% of the build (p50 and mean), and 21 MB more peak memory (607 to 628 MB).
+  The stats cost about 3% of the build (p50 and mean) and no peak memory: 607 MB either way, read right after the build in two more runs of each. The first runs read the peak after the exact pass too, and showed 628 MB, the exact pass's own 21 MB (review fix).
 - Stats against the exact pass (200k rows; columns: row number, date, one of 5,000 words, a float, a run of x's): row count equal. Both number columns: min and max equal, mean and variance within 1e-13 of a two-pass sum, every quantile from 1% to 99% within 0.08% of its rank (56 and 70 centroids). Distinct estimates are off by -1.45%, +0.34%, +0.16%, -0.09% and +1.49% (200,000, 28, 5,000, 199,993 and 120 distinct), inside HyperLogLog's 1.6% standard error. The date column's 28 value counts are exact. The words column (5,000 distinct) is past the 256 kept, so it has no value counts, by design.
 - Fixed benchmark (AGENTS.md section 7): unchanged. The bench builds no BM25 view, and the view the build writes is the same root with or without stats.
 - Verdict: **kept** as an option (a library call, off unless asked): one pass gives the stats for about 3% of a view build, equal to an exact pass within each sketch's error.
