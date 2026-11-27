@@ -48,6 +48,16 @@ pub struct Minimizer {
     pub var: String,
 }
 
+/// The largest gradient component, or an error when the energy or any
+/// component is not finite: `f64::max` skips a NaN, so a NaN gradient
+/// would otherwise fold to 0 and read as converged.
+fn grad_norm(f: f64, g: &[f64]) -> Result<f64, Error> {
+    if !f.is_finite() || g.iter().any(|v| !v.is_finite()) {
+        return Err(Error::NoConvergence("the energy or its gradient is not finite here".into()));
+    }
+    Ok(g.iter().fold(0.0f64, |m, v| m.max(v.abs())))
+}
+
 impl Minimizer {
     /// `energy` returns a scalar at node `of`; `var` is the input varied.
     pub fn new(energy: &Graph, of: V, var: &str, shapes: &BTreeMap<String, Vec<usize>>) -> Result<Minimizer, Error> {
@@ -70,7 +80,7 @@ impl Minimizer {
             let out = eval(&self.gradient, &env)?;
             rep.evals += 1;
             let (f, g) = (out[0].item(), out[1].clone());
-            let gn = g.data.iter().fold(0.0f64, |m, v| m.max(v.abs()));
+            let gn = grad_norm(f, &g.data)?;
             rep.iterations = it;
             rep.energy = f;
             rep.grad_norm = gn;
@@ -203,7 +213,7 @@ impl PlannedMinimizer {
             rep.evals += 1;
             let f = self.gradient.output(0)[0];
             self.g.copy_from_slice(self.gradient.output(1));
-            let gn = self.g.iter().fold(0.0f64, |m, v| m.max(v.abs()));
+            let gn = grad_norm(f, &self.g)?;
             rep.iterations = it;
             rep.energy = f;
             rep.grad_norm = gn;

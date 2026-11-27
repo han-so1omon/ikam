@@ -170,8 +170,12 @@ pub fn eval_graph_stored<S: Store>(
         (b.len() == 32 * g.outputs.len())
             .then(|| b.chunks(32).map(|c| Id::from_bytes(c.try_into().unwrap())).collect())
     });
+    // A record can arrive without the content it names (a records share
+    // carries record bytes only), so reuse it only when every output's
+    // content is here; otherwise compute again.
     if let Some(ids) = &recorded
         && !check
+        && ids.iter().map(|i| repo.has_content(i)).collect::<Result<Vec<_>, _>>()?.into_iter().all(|h| h)
     {
         return Ok((ids.clone(), *db, true));
     }

@@ -42,11 +42,21 @@ impl Plan {
 
     /// Copy an input's values in (its length is fixed by the plan).
     pub fn set(&mut self, name: &str, values: &[f64]) -> Result<(), Error> {
-        let i = self.inputs.iter().find(|(n, _)| n == name).ok_or_else(|| Error::MissingInput(name.into()))?.1;
-        if values.len() != self.bufs[i].len() {
-            return Err(Error::Shape(format!("{name}: {} values for {:?}", values.len(), self.shapes[i])));
+        // A graph may read one input from several nodes; all take the value.
+        let mut found = false;
+        for &(ref n, i) in &self.inputs {
+            if n != name {
+                continue;
+            }
+            if values.len() != self.bufs[i].len() {
+                return Err(Error::Shape(format!("{name}: {} values for {:?}", values.len(), self.shapes[i])));
+            }
+            self.bufs[i].copy_from_slice(values);
+            found = true;
         }
-        self.bufs[i].copy_from_slice(values);
+        if !found {
+            return Err(Error::MissingInput(name.into()));
+        }
         Ok(())
     }
 
