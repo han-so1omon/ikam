@@ -519,3 +519,69 @@ fn a_committed_graph_crosses_projects_by_a_graph_share() {
     let (a, b) = (eval(&gg, &env).unwrap(), eval(&got, &env).unwrap());
     assert!(a.iter().zip(&b).all(|(x, y)| x.bits_eq(y)));
 }
+
+#[test]
+fn an_input_read_by_two_nodes_differentiates_and_plans_as_one() {
+    // x * x built from two nodes that both read input "x".
+    let mut g = Graph::new();
+    let a = g.input("x");
+    let b = g.input("x");
+    let y = g.mul(a, b);
+    let shapes = BTreeMap::from([("x".into(), vec![])]);
+    let gg = grad(&g, &shapes, y, &["x"]).unwrap();
+    let env = Env::from([("x".into(), Tensor::scalar(3.0))]);
+    let out = eval(&gg, &env).unwrap();
+    assert_eq!(out[0].item(), 9.0);
+    assert_eq!(out[1].item(), 6.0);
+    let mut p = Plan::new(&gg, &shapes).unwrap();
+    p.set("x", &[3.0]).unwrap();
+    p.run();
+    assert_eq!(p.output(0), &[9.0]);
+    assert_eq!(p.output(1), &[6.0]);
+    assert_eq!(g.input_names(), vec!["x".to_string()]);
+}
+
+#[test]
+fn a_non_finite_gradient_is_not_convergence() {
+    // sqrt of a negative state: the energy and gradient are NaN.
+    let mut g = Graph::new();
+    let x = g.input("x");
+    let r = g.unary(Op::Sqrt, x);
+    let f = g.sum(r);
+    let shapes = BTreeMap::from([("x".into(), vec![2])]);
+    let m = Minimizer::new(&g, f, "x", &shapes).unwrap();
+    let x0 = Tensor::vector(vec![-1.0, -1.0]);
+    assert!(matches!(m.minimize(&Env::new(), x0, &Options::default()), Err(Error::NoConvergence(_))));
+    let mut pm = m.plan(&shapes).unwrap();
+    let mut xs = vec![-1.0, -1.0];
+    assert!(matches!(pm.minimize(&mut xs, &Options::default()), Err(Error::NoConvergence(_))));
+}
+
+#[test]
+fn whole_graph_records_without_their_content_are_computed_again() {
+    let (g, f, shapes, env) = mixed();
+    let gg = grad(&g, &shapes, f, &["w", "u"]).unwrap();
+    let mut a = Repo::new(MemStore::default());
+    let gid = gg.put(&mut a).unwrap();
+    let db = a.db_empty().unwrap();
+    let (ids, _, _) = eval_graph_stored(&mut a, &db, &gg, &gid, &env, false).unwrap();
+    // Another repo gets the record (as a records share would bring it)
+    // and the inputs, but not the output content.
+    let mut b = Repo::new(MemStore::default());
+    assert_eq!(gg.put(&mut b).unwrap(), gid);
+    let mut inputs = Vec::new();
+    for name in gg.input_names() {
+        inputs.push((name.clone(), b.put_content(&env[&name].encode()).unwrap().id));
+    }
+    let k = memo::graph_key(&gid, &inputs);
+    let bytes: Vec<u8> = ids.iter().flat_map(|i| i.as_bytes().to_vec()).collect();
+    let empty = b.db_empty().unwrap();
+    let db_b = b.db_append(&empty, &[Event::upsert(&k, &bytes, &k)]).unwrap();
+    assert!(!b.has_content(&ids[0]).unwrap());
+    let (ids_b, _, _) = eval_graph_stored(&mut b, &db_b, &gg, &gid, &env, false).unwrap();
+    assert_eq!(ids_b, ids);
+    let mut cache = std::collections::HashMap::new();
+    for id in &ids_b {
+        memo::get(&b, id, &mut cache).unwrap();
+    }
+}

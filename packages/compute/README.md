@@ -5,9 +5,13 @@ kernel): tensors as content, op graphs as ikam graph objects, reverse-mode
 gradients and Hessian-vector products as graph transforms, pinned float
 ops, stored evaluation in a database, Newton-CG with adjoint
 sensitivities, planned programs for fixed-period loops, and runs committed
-as streams. See `docs/plans/2026-11-26-math-engine.md`.
+as streams. E439 adds, opt-in: prescribed values with reactions
+(`path::Linear`, `Minimizer::minimize_constrained`), arc-length
+continuation through limit points (`path::Continuation`) and explicit time
+stepping (`dynamics`). See `docs/plans/2026-11-26-math-engine.md`.
 
 ```
 cargo test
 cargo run --release --example engine_numbers
+cargo run --release --example e439_paths
 ```

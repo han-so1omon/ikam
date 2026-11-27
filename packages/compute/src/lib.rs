@@ -13,13 +13,18 @@
 //!   static problems; [`run`] records a sequence of states (load steps or
 //!   time steps) as a stream; [`plan`] lowers a graph to a fixed program
 //!   for loops that must keep a period.
+//! - [`path`] (E439, opt-in) adds equality constraints to Newton-CG and
+//!   follows equilibrium paths through limit points by arc-length;
+//!   [`dynamics`] steps `M x'' = -dE/dx` explicitly (velocity Verlet).
 //!
 //! See docs/plans/2026-11-26-math-engine.md.
 
+pub mod dynamics;
 pub mod eval;
 pub mod grad;
 pub mod ir;
 pub mod memo;
+pub mod path;
 pub mod pinned;
 pub mod plan;
 pub mod run;

@@ -39,9 +39,22 @@ pub fn grad(
     }
     let mut outputs = vec![of];
     for name in wrt {
-        let x = g.input_node(name).ok_or_else(|| Error::MissingInput(name.to_string()))?;
-        let gx = match adj.get(&x) {
-            Some(&v) => v,
+        // Every node reading this input is bound to the same value, so the
+        // derivative is the sum of their adjoints.
+        let nodes: Vec<V> =
+            (0..g.nodes.len()).filter(|&i| matches!(&g.nodes[i].op, Op::Input(m) if m == name)).collect();
+        let x = *nodes.first().ok_or_else(|| Error::MissingInput(name.to_string()))?;
+        let mut gx = None;
+        for n in &nodes {
+            if let Some(&a) = adj.get(n) {
+                gx = Some(match gx {
+                    Some(prev) => h.add(prev, a),
+                    None => a,
+                });
+            }
+        }
+        let gx = match gx {
+            Some(v) => v,
             None => {
                 let z = h.scalar(0.0);
                 h.push(Op::Fill { shape: shape[x].clone() }, &[z])
