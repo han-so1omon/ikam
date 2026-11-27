@@ -343,6 +343,10 @@ impl Live {
         };
         let e = Arc::new(entries);
         if let Some(max) = self.tree_cache_max {
+            // A tree larger than the whole cap is read, never kept.
+            if e.len() > max {
+                return Ok(e);
+            }
             if self.tree_entries + e.len() > max {
                 self.trees.clear();
                 self.tree_entries = 0;
@@ -1236,11 +1240,12 @@ mod tests {
     }
 
     /// E418: with `tree_cache_max`, the tree cache stays under its bound
-    /// through many edits, and every file still reads back; without it,
-    /// every root tree version stays cached.
+    /// through many edits, even below one directory's size (`d` reaches 40
+    /// entries), and every file still reads back; without it, every root
+    /// tree version stays cached.
     #[test]
     fn tree_cache_max_bounds_the_cached_trees() {
-        for max in [None, Some(50)] {
+        for max in [None, Some(50), Some(10)] {
             let (dir, mut l) = store(&format!("trees-{}", max.unwrap_or(0)));
             l.tree_cache_max = max;
             for i in 0..40 {
