@@ -7706,3 +7706,37 @@ Gates on the branch (E229 to E233): every kernel test suite passes (release); cl
 - Not measured: a real second platform (ARM64, macOS, Windows; `Host` stands in for them: E409 measured that their bits differ only through these three paths); `Plan` with host arithmetic (planned loops here are checked through the interpreter; `Plan` copies a Within node); a tolerance relative to a tensor's scale (rel is per element, which fails near zero, so the loops needed abs); bounds inside a solver's iteration (Newton contracts differences, so none were needed); the cost of a bounded check through a disk store; more than one run.
 - Next: a `rel` against the tensor's largest element (one option on Within) so a state with near-zero elements needs no abs; running bounds with signs (affine arithmetic) for loops, where absolute values explode; when E435 puts pinned-float functions in the ledger, the same Within node as a check on a recorded derivation.
 - Run: `cargo run --release --example float_bounds`; `cargo test --release` (in `packages/compute`).
+
+### E422 net-files (nets as files, firings that name the version they ran under)
+
+- Branch / parent: exp/422-net-artifacts / exp/441-float-steps (PR 117)
+- Question: a net is an artifact like any other: it should sit at a path in a commit's tree, be versioned, diffed and fragmented like other content, and a graph should be able to hold many. Each firing should name the version of the net it fired under, so the net can be edited while it runs and every earlier firing still replays against the version it ran on. What does that take, and what does it cost?
+- Found before building: a net already had a text form (E270, `Net::parse`, `Net::to_text`) and a graph form (`put_net`, `net_at`), but its marking and firings were keyed by the net's name alone and a firing record did not say which net it ran under. Replay took one `Net` from the caller, so a run whose net changed could not be replayed by any single version.
+- Change (all options; an untracked net records and replays as before):
+  - `Net::version_id`: the content id of the net's canonical text. A hand-written file with comments and its canonical form are the same version.
+  - `Repo::put_net_file(root, path, net)` stores the canonical text as an ordinary file at `path` (an `edit_tree` put) and returns the tree and the version id. `net_file(rev, path)` reads the net a commit or tree holds there (hand-written files parse too); `net_files(rev)` lists every `.net` file in a tree; `net_version(id)` reads a version back by its id.
+  - `Repo::net_track_versions(db, net)`, called once after init with the version that was initialized and before the first firing, turns tracking on for that net (one key, `net/<name>/ver`). From then on every firing, through `net_fire`, `net_fire_output` or `net_fire_step` and with or without a sum hash, keeps the text of the net it was given and adds one last line to its record, `net <version id>`. A retry of a key under another version is refused like any other mismatch.
+  - `Repo::net_replay_versions(db, name)` replays from the first version's initial marking, each firing against the version it names, checking every before and after hash. An edited version fires on the same marking: new places start empty, and initial tokens count only at init.
+  - `Firing` gains a public field `net: Option<Id>` (as `step` did in E441), so code that builds a `Firing` literal must add it.
+- Run (`cargo run --release --example e422_net_files -- 2000`): three nets in one graph (night, train, small) fired interleaved for 2,000 candidates, 13,800 firings; the night net edited nine times, each edit committed as a file, each version renaming its check transition so that no single version holds every transition fired.
+
+  | nets | fire µs each | record bytes each | replay |
+  | --- | --- | --- | --- |
+  | untracked | 10,540 | 141.0 | fails: no one version holds every transition fired |
+  | tracked | 10,805 | 210.0 | equal marking, 6.7 s |
+  | untracked, sum hash | 9,944 | 141.0 | fails, as above |
+  | tracked, sum hash | 9,861 | 210.0 | equal marking, 6.3 s |
+
+  - Tracking costs one key read and one stored-content check a firing, inside the run's noise (−1% to +3%); the firing time itself is the database append on a 13,800-firing log. A record grows by 69 bytes (the version line). Replay reads the whole event log once per net, which is most of its 0.46 ms a firing.
+  - History: 10 commits, the night net read back at each one equal to the version committed (10/10); night firings by the version they name: 600 under version 1, 800 under each of versions 2 to 10; `net_files` on the last commit lists the three nets; fsck_deep clean.
+  - A net as a file (text) against a net as a graph object (`put_net`), ten versions:
+
+    | form | bytes v1 | bytes an edit adds | read µs |
+    | --- | --- | --- | --- |
+    | file | 214 | 235 | 8.1 |
+    | graph | 515 | 396 | 19.7 |
+
+    A text diff from version 1 to 2 is 4 lines of 10. The file is under half the bytes and reads in under half the time, and it diffs and merges as text with the tools that already handle files, so the file is the form the API stores; the graph form stays for walking a net's structure.
+- Checks: `tests/net_files.rs`, 8 tests (a net read back at each commit; a hand-written file is its canonical version; a tree with three nets and a non-net file; three nets interleaved with an edit mid-run, each replaying to its own marking while the first version alone cannot; a retry under another version refused; an untracked record keeps its 4 lines; tracking starts only from the initialized version before any firing; tracking with a sum hash and outputs).
+- Verdict: **kept** (option, off by default).
+- Not measured or not done: a net's version kept live by gc only through the commit that holds its file or the database that names it (a database is not a gc root); a three-way merge of two edits to one net file (text merge works, the merged net is checked on parse); replay that reads only one net's records instead of the whole log.
