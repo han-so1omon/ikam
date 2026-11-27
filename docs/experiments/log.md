@@ -7473,3 +7473,32 @@ Gates on the branch (E229 to E233): every kernel test suite passes (release); cl
 - Verdict: **kept** (capability, opt-in, `ikam-compute` only).
 - Not measured: a stencil op for cellular automata and lattice solvers (a 1-D stencil can be written now with `Pad`/`Slice` shifts; no dedicated op); nonlinear constraints; sparse or matrix-free bordered solves (the arc-length solve is dense, for up to a few hundred unknowns); localization on a softening rod (only a single softening section); a shallow arch; planned (no-allocation) versions of the new solvers.
 - Run: `cargo run --release --example e439_paths` in `packages/compute`; `cargo test --release` (22 tests, 6 new in `tests/paths.rs`).
+
+### E434 records-base64 (record values that are not UTF-8, read over HTTP byte-exact)
+
+- Branch / parent: exp/434-records-base64 / main 437aef6
+- Question: a records share read over HTTP (`ikam host`, `/from/SOURCE/SHARE/records`) answers JSON pairs and turned a value that is not UTF-8 into replacement characters, so binary records (a content id's 32 bytes, a float array) arrived garbled while a store-to-store merge of the same share is exact. Can every value be read back byte-exact over HTTP, with the answers for UTF-8 values unchanged? (Planned in docs/plans/2026-11-26-math-engine.md on exp/430; business case: the math engine, whose runs record states as content ids.)
+- Found on main: two different behaviours.
+  - `ikam host` `/from/.../records`: lossy. A binary value comes back as text with U+FFFD in it; the bytes cannot be recovered, and nothing in the answer says so.
+  - `db serve` `format=json` (scan, `GET get`, `POST get`, views): not lossy but refused: one value that is not UTF-8 makes the whole answer 415. The default frames (`application/x-ikam-kv`) and `GET get` without `format=json` were exact already.
+- Change:
+  - One value form (`json::value`): a UTF-8 value is a JSON string, as before; any other value is `{"base64":"..."}` (standard alphabet, padded). A string is never an object, so a UTF-8 value whose text looks like a marker stays a string. `json::value_bytes` is the reader's side (used by the tests; the run script's client does the same in Python).
+  - `ikam host` records: this form **by default**. The old answer was plainly broken for binary values (silent, unrecoverable corruption), so no client can depend on it; answers for UTF-8 values are byte-identical.
+  - `db serve` `format=json`: this form only with `binary=base64` (**option, off**). Without it the answer is as on main, 415 included, because a refusal is a documented answer a client may depend on (to fall back to frames), not a broken one.
+- Setup: `experiments/records-base64/records_b64.py`: 18 records, 12 not UTF-8 (16 and 65,536 random bytes, 4,096 f32s and 512 f64s as bytes, 32 random bytes as a content id would be, a lone 0xff, a lone continuation byte, an overlong form, an encoded surrogate, a truncated sequence, invalid bytes inside text, NUL and high bytes) and 6 UTF-8 (empty, ASCII, accents and CJK and emoji, control characters and quotes, text that reads `{"base64":"AAEC"}`, JSON). Written once as binary events through a real `db serve` process, read back through `db serve` with this branch's and main's binary, then through a real `ikam host` process (projects a and b, a read share `records:..` of a's database) with each binary. Linux cloud, one run.
+- Results (values read back byte-exact out of 18):
+
+  | route | main | this branch |
+  | --- | --- | --- |
+  | `db serve` frames, `GET get` | 18, 18 | 18, 18 |
+  | `db serve` `format=json` | 415 | 415 (default kept) |
+  | `db serve` `format=json&binary=base64` | 415 (option unknown) | **18** scan, 18 `GET get`, 18 `POST get` |
+  | `ikam host` `/from/a/rec/records` | **6** (12 values garbled with U+FFFD) | **18** |
+  | answer size, all 18 records | 201,506 bytes (garbled) | 115,447 bytes |
+  | answer for the 6 UTF-8 values (both routes) | 221 bytes | the same 221 bytes |
+
+- Checks: `json_answers_binary_values_as_base64_when_asked` (dbserve: default 415 and UTF-8 answer pinned as text, the option's UTF-8 answer the same bytes, every value back exact on scan, get and POST get, the marker's exact form) and `records_shares_answer_binary_values_exactly` (host: every value back exact through a share, the UTF-8 answer pinned as main's text). `cargo test --release --features embed`: 378 pass, 0 fail (`--no-fail-fast`); clippy `--all-targets -D warnings` clean.
+- Fixed benchmark: not run. Only the server binary's JSON answers change; no store, object or encoding is touched, and the bench runs the kernel library.
+- Verdict: **kept** (the host route a fix, by default; `db serve`'s `binary=base64` an option, off).
+- Not measured: clients outside this repo (none in it read these JSON answers but the tests); the cost of base64 on large binary scans (4/3 of the bytes against frames, which stay the way to read many binary values); `db serve` search hits (keys only, no values).
+- Run: `python3 -I experiments/records-base64/records_b64.py IKAM_BIN MAIN_BIN WORK`.

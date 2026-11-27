@@ -45,7 +45,8 @@
 //!   the row's key and value (read at the same head); `keys=1` leaves the
 //!   values out (empty), `limit=N`.
 //!
-//! Add `format=json` for `[["key","value"],...]` (values must be UTF-8).
+//! Add `format=json` for `[["key","value"],...]` (values must be UTF-8,
+//! or with `binary=base64` as `{"base64":"..."}`, E434).
 
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};

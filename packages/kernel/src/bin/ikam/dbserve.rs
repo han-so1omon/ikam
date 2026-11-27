@@ -29,7 +29,9 @@
 //!   fusion: ranked and vector search (E358, `dbsearch.rs`).
 //!
 //! `GET /db/` lists the databases. Add `format=json` to a scan or a get for
-//! `[["key","value"],...]` (values must be UTF-8).
+//! `[["key","value"],...]` (values must be UTF-8: another value is refused
+//! with 415, unless `binary=base64` (E434, off by default) answers it as
+//! `["key",{"base64":"..."}]`).
 //!
 //! Frames (`application/x-ikam-kv`): for each pair, key length (u32, big
 //! endian), key, value length, value. Events (`application/x-ikam-events`):
@@ -527,12 +529,15 @@ fn frames(pairs: &[(String, Vec<u8>)]) -> Vec<u8> {
 
 fn pairs_response(req: &Request, pairs: Vec<(String, Vec<u8>)>) -> Response {
     if req.param("format").as_deref() == Some("json") {
+        let base64 = req.param("binary").as_deref() == Some("base64");
         let mut items = Vec::with_capacity(pairs.len());
         for (k, v) in pairs {
-            let Ok(v) = String::from_utf8(v) else {
-                return Response::text(415, format!("value of {k:?} is not UTF-8"));
+            let v = match String::from_utf8(v) {
+                Ok(v) => quote(&v),
+                Err(e) if base64 => crate::json::value(e.as_bytes()).encode(),
+                Err(_) => return Response::text(415, format!("value of {k:?} is not UTF-8")),
             };
-            items.push(format!("[{},{}]", quote(&k), quote(&v)));
+            items.push(format!("[{},{}]", quote(&k), v));
         }
         Response::new(200).body("application/json", format!("[{}]", items.join(",")))
     } else {
@@ -992,7 +997,7 @@ pub fn serve<S: Store + Send + 'static>(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use ikam_kernel::MemStore;
 
@@ -1024,6 +1029,106 @@ mod tests {
             out.push((k, v));
         }
         out
+    }
+
+    /// Values that are not UTF-8, and UTF-8 ones that look like markers.
+    pub(crate) fn binary_values() -> Vec<(String, Vec<u8>)> {
+        let mut s = 0x2545f4914f6cdd1du64;
+        let random: Vec<u8> = (0..4096)
+            .map(|_| {
+                s ^= s << 13;
+                s ^= s >> 7;
+                s ^= s << 17;
+                s as u8
+            })
+            .collect();
+        let floats: Vec<u8> = (0..256)
+            .flat_map(|i| (i as f32 * 0.37 - 20.0).sin().to_le_bytes())
+            .collect();
+        vec![
+            ("b/floats".into(), floats),
+            (
+                "b/invalid".into(),
+                b"ok \xff\xfe then \xc0\xaf and \xed\xa0\x80".to_vec(),
+            ),
+            ("b/lone".into(), vec![0x80]),
+            ("b/random".into(), random),
+            ("b/truncated".into(), "caf\u{e9}".as_bytes()[..4].to_vec()),
+            ("u/empty".into(), Vec::new()),
+            ("u/marker".into(), br#"{"base64":"AAEC"}"#.to_vec()),
+            (
+                "u/text".into(),
+                "plain \u{e9}t\u{e9} \u{1f600} \"q\"\n".as_bytes().to_vec(),
+            ),
+        ]
+    }
+
+    #[test]
+    fn json_answers_binary_values_as_base64_when_asked() {
+        let st = Server::new(Repo::new(MemStore::default()), None);
+        let rows = binary_values();
+        let events: Vec<Event> = rows.iter().map(|(k, v)| Event::upsert(k, v, k)).collect();
+        let ct = [("content-type", EVENTS)];
+        let a = handle(
+            &st,
+            &req("POST", "/db/m/append", &encode_events(&events), &ct),
+        );
+        assert_eq!(a.status, 200);
+        let h = |q: &str| handle(&st, &req("GET", q, b"", &[]));
+        // Frames are exact already.
+        let frames = h("/db/m/scan?prefix=").body;
+        assert_eq!(frames, super::frames(&rows));
+        // Default JSON: UTF-8 values answer as before, others are refused.
+        assert_eq!(h("/db/m/scan?prefix=b/&format=json").status, 415);
+        let utf8 = h("/db/m/scan?prefix=u/&format=json");
+        assert_eq!(
+            String::from_utf8(utf8.body.clone()).unwrap(),
+            r#"[["u/empty",""],["u/marker","{\"base64\":\"AAEC\"}"],["u/text","plain été 😀 \"q\"\n"]]"#
+        );
+        // With binary=base64 the UTF-8 answer is the same bytes and every
+        // value reads back exact, on scan, get and POST get.
+        assert_eq!(
+            h("/db/m/scan?prefix=u/&format=json&binary=base64").body,
+            utf8.body
+        );
+        let back = |r: Response| -> Vec<(String, Vec<u8>)> {
+            assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
+            let j = crate::json::parse(std::str::from_utf8(&r.body).unwrap()).unwrap();
+            j.as_arr()
+                .iter()
+                .map(|p| {
+                    let p = p.as_arr();
+                    (
+                        p[0].as_str().unwrap().to_string(),
+                        crate::json::value_bytes(&p[1]).unwrap(),
+                    )
+                })
+                .collect()
+        };
+        assert_eq!(
+            back(h("/db/m/scan?prefix=&format=json&binary=base64")),
+            rows
+        );
+        for (k, v) in &rows {
+            let one = back(h(&format!("/db/m/get?key={k}&format=json&binary=base64")));
+            assert_eq!(one, vec![(k.clone(), v.clone())]);
+            assert_eq!(h(&format!("/db/m/get?key={k}")).body, *v);
+        }
+        let keys: String = rows.iter().map(|(k, _)| format!("{k}\n")).collect();
+        let post = handle(
+            &st,
+            &req(
+                "POST",
+                "/db/m/get?format=json&binary=base64",
+                keys.as_bytes(),
+                &[],
+            ),
+        );
+        assert_eq!(back(post), rows);
+        // A marker is an object, a UTF-8 value a string: never confused.
+        let raw =
+            String::from_utf8(h("/db/m/get?key=b/lone&format=json&binary=base64").body).unwrap();
+        assert_eq!(raw, r#"[["b/lone",{"base64":"gA=="}]]"#);
     }
 
     #[test]
