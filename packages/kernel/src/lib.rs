@@ -53,6 +53,7 @@ pub mod stem;
 mod store;
 pub mod temperature;
 mod template;
+pub mod tensors;
 pub mod vectors;
 pub mod views;
 mod wasm;

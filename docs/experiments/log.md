@@ -7125,3 +7125,27 @@ Gates on the branch (E229 to E233): every kernel test suite passes (release); cl
 - Not measured: real checkpoints (bf16 and fp16, where Xet reports most of its gain, and trained rather than synthetic weights); a store on disk; content added after the repack (writes stay zstd until the next repack); `db serve` (no flag yet); the Mac.
 - Next: a flag for `db serve`; then brotli or 8 planes as further "V" variants if real checkpoints show the gaps above; bf16 tensors with 2 planes.
 - Run: `cargo run --release --example float_planes`.
+
+### E411 tensor-cuts (safetensors checkpoints cut at tensor boundaries, as an option)
+- Branch / parent: exp/411-tensor-cuts / main 437aef6
+- Question: Night 6 item 5. Training writes a checkpoint after each step or epoch, and a frozen layer or a fine-tune leaves most tensors unchanged. Xet stores checkpoints so unchanged tensors are shared. Does cutting a safetensors file at its tensors, each tensor a content of its own, make ikam store a series of checkpoints in fewer bytes, or write or repack it faster?
+- Change (option, off): `Repo::tensor_cuts` (false by default; copied by `sibling` and into repack's re-plan). `tensors::cuts` parses a safetensors file of 64 KiB or more (an 8-byte length, a JSON header read as JSON, field by field, with `__metadata__` skipped whatever it holds, `data_offsets` for at most 4,096 tensors, no overlaps, every offset inside the data) and returns the header and the data cut at every tensor boundary, gaps kept as pieces, so the pieces concatenated are the file. With the option on, ingest's container step plans such a file as `concat` of its pieces, each put as content, verified before it counts like any candidate. Anything that is not a valid safetensors file goes the usual way.
+- Result (`examples/tensor_cuts.rs`, MemStore, Linux cloud, 4 CPUs; 20 checkpoints of a model of eight float32 tensors, about 1M parameters, 3.94 MB a file, 78.8 MB in all; one run each, so times are rough):
+
+  | training between checkpoints | cuts | stored after writes | after repack | write | repack | read all | objects |
+  |---|---|---|---|---|---|---|---|
+  | every weight changes | off | 73.05 MB | 72.22 MB | 4.1 s | 77.8 s | 0.90 s | 24 |
+  | | on | 73.02 MB | 72.22 MB | 3.0 s | 37.4 s | 0.91 s | 185 |
+  | first four tensors frozen | off | 31.43 MB | 31.41 MB | 2.1 s | 38.6 s | 0.19 s | 46 |
+  | | on | 31.43 MB | 31.10 MB | 2.4 s | 27.2 s | 0.54 s | 109 |
+  | fine-tune (5% of embedding rows, last layer) | off | 13.90 MB | 13.81 MB | 2.4 s | 43.0 s | 0.30 s | 44 |
+  | | on | 13.90 MB | 13.77 MB | 2.4 s | 44.4 s | 0.27 s | 109 |
+
+  Cutting saves no bytes: 0 to 1% after repack. Ingest already shares unchanged tensors without it: its slice planner matches the runs of bytes a new checkpoint shares with the stored ones (frozen layers: 31.4 of 78.8 MB stored either way; fine-tune: 13.9 MB). Repack was faster with cuts in two of the three (37 against 78 s, 27 against 39 s), likely because it re-plans many small contents in place of 20 large ones; that was one run each. Reading every file back was slower with cuts and frozen layers (0.54 against 0.19 s), and the store holds 2 to 8 times more objects. Every file read back exact.
+- Checks: `tensors` unit tests (pieces concatenate to the file with and without gaps between tensors, and an empty tensor; short files, a header length past the end, offsets past the data, random bytes and text are not cut; metadata whose text holds `"data_offsets":[0,4]` and brackets is not taken for a tensor); `checkpoints_cut_at_tensors_read_back_exact` (two checkpoints sharing two tensors and a file with a broken header: every file and a 5,000-byte range from its middle read back exact before and after two repacks, deep fsck clean, more objects with cuts than without). `cargo test --release --features embed`: 379 pass; clippy clean.
+- Fixed benchmark (`cargo run --release --example bench -- --json`, on the branch with the review fixes below, the option off as by default): bytes 5.7493, proxy 3.8185, read 5.7140, north 0.3060, the same as main's (E391); every corpus exact, fsck clean.
+- Verdict: **measured**. The option stays on the branch, off, but is not worth turning on for checkpoints like these: ingest's existing matching already gets the sharing. The faster repack is the one lead, and it needs repeat runs before it counts.
+- Not measured: real checkpoints, with tensors of tens of megabytes (where the slice planner's matching may cost more than a cut), bf16 and fp16, and optimizer state; a store on disk; combined with E410's byte planes (each cut tensor is float content that planes compress); the Mac.
+- Next: rerun the repack times three times each; then cuts plus E410's `float_planes` on a real model's checkpoints, if one can be fetched in the cloud.
+- Review (Codex): the header was first found by a substring scan, so a `__metadata__` string holding the text `"data_offsets":[0,4]` could be taken for a tensor; the plan is checked to rebuild the file before it counts, so such a file was only stored whole. Now read as JSON. `tensor_cuts` is also hashed into the repack fingerprint when set, so a store repacked without it is re-planned when it is turned on.
+- Run: `cargo run --release --example tensor_cuts`.

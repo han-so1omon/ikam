@@ -136,6 +136,9 @@ impl<S: Store + Sync> Repo<S> {
         if self.float_planes {
             h.update(b"float_planes");
         }
+        if self.tensor_cuts {
+            h.update(b"tensor_cuts");
+        }
         Ok(Id::from_bytes(*h.finalize().as_bytes()))
     }
 
@@ -375,6 +378,7 @@ impl<S: Store + Sync> Repo<S> {
         fresh.markup_layers = self.markup_layers;
         fresh.slow_codec_max = self.slow_codec_max;
         fresh.float_planes = self.float_planes;
+        fresh.tensor_cuts = self.tensor_cuts;
         fresh.group_size = self.group_size;
         fresh.screen_trials = self.screen_trials;
         fresh.trial_threads = self.trial_threads;

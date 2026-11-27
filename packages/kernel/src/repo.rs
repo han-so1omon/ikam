@@ -312,6 +312,12 @@ pub struct Repo<S: Store> {
     /// a zstd frame of its planes ("V"), kept if cheaper. Off by default.
     /// Reading accepts "V" at any setting.
     pub float_planes: bool,
+    /// Cut a safetensors file at its tensors when it is written (E411):
+    /// each tensor (and the header) is a content of its own and the file a
+    /// concatenation of them, so a checkpoint stores only the tensors that
+    /// changed since one already stored. Off by default. Reading needs
+    /// nothing new: the file is a `concat` record.
+    pub tensor_cuts: bool,
     pub(crate) hints: std::sync::Mutex<Option<Hints>>,
     /// Whether a stored tree or graph chunk may be planned as a fill of a
     /// template (E144). On by default. Off, its plans are only slices of
@@ -423,6 +429,7 @@ impl<S: Store> Repo<S> {
             exact_short_search: false,
             bm25_pack: 0,
             float_planes: false,
+            tensor_cuts: false,
             object_templates: true,
             plain_db_events: false,
             plain_hot_writes: false,
@@ -802,6 +809,7 @@ impl<S: Store> Repo<S> {
         r.exact_short_search = self.exact_short_search;
         r.bm25_pack = self.bm25_pack;
         r.float_planes = self.float_planes;
+        r.tensor_cuts = self.tensor_cuts;
         r
     }
 
