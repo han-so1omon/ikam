@@ -429,6 +429,75 @@ fn unescape(s: &[u8], out: &mut Vec<u8>) -> bool {
     true
 }
 
+/// A field's JSON text as `observe` counts values: a string with its
+/// escapes decoded, in quotes (`"\u0041"` reads as `"A"`); anything else,
+/// or a string with a malformed escape, as it is.
+pub fn value_text(t: &[u8]) -> std::borrow::Cow<'_, [u8]> {
+    let mut buf = Vec::new();
+    match t {
+        [b'"', s @ .., b'"'] if s.contains(&b'\\') && unescape(s, &mut buf) => {
+            buf.insert(0, b'"');
+            buf.push(b'"');
+            buf.into()
+        }
+        _ => t.into(),
+    }
+}
+
+/// E420: a top-level field's JSON text in a row (an object's key, its
+/// escapes decoded, or an array's position "0", "1", ...), as `observe`
+/// reads fields.
+pub fn field_value<'a>(row: &'a [u8], name: &str) -> Option<&'a [u8]> {
+    let mut i = skip_ws(row, 0);
+    let (object, close) = match row.get(i)? {
+        b'{' => (true, b'}'),
+        b'[' => (false, b']'),
+        _ => return None,
+    };
+    let want: Option<usize> = if object {
+        None
+    } else {
+        Some(name.parse().ok()?)
+    };
+    i += 1;
+    let mut pos = 0usize;
+    let mut buf = Vec::new();
+    loop {
+        i = skip_ws(row, i);
+        if *row.get(i)? == close {
+            return None;
+        }
+        let hit = if object {
+            let end = value_end(row, i).filter(|_| row[i] == b'"')?;
+            let raw = &row[i + 1..end - 1];
+            let key = if raw.contains(&b'\\') && unescape(raw, &mut buf) {
+                &buf[..]
+            } else {
+                raw
+            };
+            let hit = String::from_utf8_lossy(key) == name;
+            i = skip_ws(row, end);
+            if row.get(i) != Some(&b':') {
+                return None;
+            }
+            i = skip_ws(row, i + 1);
+            hit
+        } else {
+            pos += 1;
+            Some(pos - 1) == want
+        };
+        let end = value_end(row, i)?;
+        if hit {
+            return Some(&row[i..end]);
+        }
+        i = skip_ws(row, end);
+        match row.get(i)? {
+            b',' => i += 1,
+            _ => return None,
+        }
+    }
+}
+
 fn classify(t: &[u8]) -> Val<'_> {
     match t {
         b"null" => Val::Null,
