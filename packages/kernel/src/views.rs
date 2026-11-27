@@ -503,7 +503,7 @@ impl<S: Store> Repo<S> {
     }
 
     /// Rows that differ between two graphs of rows, with their values.
-    fn kv_delta(&self, a: &Id, b: &Id) -> Result<Delta, Error> {
+    pub(crate) fn kv_delta(&self, a: &Id, b: &Id) -> Result<Delta, Error> {
         let mut out = Delta::new();
         let (mut olds, mut news, mut labels) = (Vec::new(), Vec::new(), Vec::new());
         for (label, before, after) in self.graph_diff(a, b)? {
