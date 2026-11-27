@@ -79,6 +79,50 @@ pub fn quote(s: &str) -> String {
     out
 }
 
+/// A record value in a JSON answer (E434): a string when its bytes are
+/// UTF-8, as before, and otherwise `{"base64":"..."}` (standard alphabet,
+/// padded), so a client reads every value back byte-exact. The two never
+/// mix up: a string is never an object.
+pub fn value(v: &[u8]) -> Json {
+    match std::str::from_utf8(v) {
+        Ok(s) => Json::Str(s.into()),
+        Err(_) => Json::Obj(vec![("base64".into(), Json::Str(base64_encode(v)))]),
+    }
+}
+
+/// The bytes of a value that `value` wrote: the clients' side, and the
+/// tests'. Anything else (another type, other fields, bad base64): none.
+#[cfg_attr(not(test), allow(dead_code))]
+pub fn value_bytes(j: &Json) -> Option<Vec<u8>> {
+    match j {
+        Json::Str(s) => Some(s.as_bytes().to_vec()),
+        Json::Obj(fields) if fields.len() == 1 => {
+            let b = crate::auth::base64(j.get("base64")?.as_str()?)?;
+            (base64_encode(&b) == fields[0].1.as_str()?).then_some(b)
+        }
+        _ => None,
+    }
+}
+
+/// Standard base64 with padding.
+pub fn base64_encode(b: &[u8]) -> String {
+    const A: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(b.len().div_ceil(3) * 4);
+    for c in b.chunks(3) {
+        let n = (c[0] as u32) << 16
+            | (*c.get(1).unwrap_or(&0) as u32) << 8
+            | *c.get(2).unwrap_or(&0) as u32;
+        for i in 0..4 {
+            out.push(if i <= c.len() {
+                A[((n >> (18 - 6 * i)) & 63) as usize] as char
+            } else {
+                '='
+            });
+        }
+    }
+    out
+}
+
 pub fn parse(s: &str) -> Result<Json, String> {
     let mut p = Parser {
         b: s.as_bytes(),
