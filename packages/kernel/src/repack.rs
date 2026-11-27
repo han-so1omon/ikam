@@ -472,9 +472,11 @@ impl<S: Store + Sync> Repo<S> {
     /// is derived or shared; otherwise the tree goes back to object form
     /// (gc then drops the content).
     fn unshare_trees(&mut self) -> Result<(), Error> {
-        let used: HashSet<Id> = (self.ledger()?.by_output.values().flatten())
-            .flat_map(|d| d.args.iter().map(Arg::id))
-            .collect();
+        let mut used: HashSet<Id> = HashSet::new();
+        self.each_derivations(|_, ds| {
+            used.extend(ds.iter().flat_map(|d| d.args.iter().map(Arg::id)));
+            Ok(())
+        })?;
         for id in self.store.ids()? {
             if let Some(content) = tree_content(&self.store.read(&id)?)
                 && self.store.has(&content)
@@ -848,9 +850,9 @@ impl<S: Store + Sync> Repo<S> {
     /// derivation of content stored plainly, else its first.
     pub(crate) fn read_model(&self, roots: &[Id]) -> Result<ReadModel, Error> {
         let mut readers: HashMap<Id, Vec<Id>> = HashMap::new();
-        for (output, ds) in &self.ledger()?.by_output {
+        self.each_derivations(|output, ds| {
             if self.store.read(output).is_ok_and(|e| is_plain(&e)) {
-                continue;
+                return Ok(());
             }
             // A read caches what it decodes, so a source named by several
             // arguments of one derivation is decoded once for it (E048).
@@ -862,7 +864,8 @@ impl<S: Store + Sync> Repo<S> {
             sources
                 .into_iter()
                 .for_each(|id| readers.entry(id).or_default().push(*output));
-        }
+            Ok(())
+        })?;
         let roots: HashSet<Id> = roots.iter().copied().collect();
         let mut times = HashMap::new();
         for id in readers.keys().chain(&roots) {
