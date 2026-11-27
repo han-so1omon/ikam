@@ -36,7 +36,7 @@ use std::process::ExitCode;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use ikam_kernel::{Arg, FsStore, Id, Object, Repo, snapshot};
+use ikam_kernel::{Arg, FsStore, Id, Object, Repo, Store, snapshot};
 
 use corpus::{err, lookup};
 
@@ -59,6 +59,11 @@ const USAGE: &str = "usage: ikam [--store DIR] [--disk-guard] [--short-records] 
                                    N threads (E389, off); --fold-flush N writes a
                                    deferred catch-up's view every N events (E392, off); --lean-ledger keeps
                                    record ids in memory, not derivations (E391, off)
+  db squash [--cold [--group]]     on a stopped pack store: drop each database's
+                                   history before its head and what only that
+                                   reached (earlier view versions), then clean
+                                   the packs; reads stay the same (E414);
+                                   --cold also runs the cold pass (E268)
   host --config FILE [PORT]        several separate projects in one process, each
                                    its own store, users and limits, chosen by Host
                                    name; crossing only through scoped shares (host.rs);
@@ -367,8 +372,11 @@ fn main() -> ExitCode {
 /// loses none (E374).
 fn db_cmd(store_dir: &str, args: &[String]) -> Result<(), String> {
     let mut args = args.to_vec();
+    if args.first().map(String::as_str) == Some("squash") {
+        return db_squash(store_dir, &args[1..]);
+    }
     if args.first().map(String::as_str) != Some("serve") {
-        return Err("usage: ikam [--store DIR] db serve [--live] [--packs] [--plain-events] [--no-object-templates] [--concurrent-reads] [--edit-index] [--plain-writes] [--hnsw] [--hnsw-threads N] [--bm25-pack BYTES] [--lean-ledger] [--keep-search] [--no-keep-search] [--shared-store] [--skip-unchanged] [--keep-counts N] [--defer-kv N] [--fold-flush N] [--seed-index-max N] [--views FILE] [--plain-view-writes] [--view-chunk BYTES] [--keep-views] [--allow-host NAME]... [--log-requests] [--keep-on-hangup] [PORT]".into());
+        return Err("usage: ikam [--store DIR] db squash [--cold [--group]] | db serve [--live] [--packs] [--plain-events] [--no-object-templates] [--concurrent-reads] [--edit-index] [--plain-writes] [--hnsw] [--hnsw-threads N] [--bm25-pack BYTES] [--lean-ledger] [--keep-search] [--no-keep-search] [--shared-store] [--skip-unchanged] [--keep-counts N] [--defer-kv N] [--fold-flush N] [--seed-index-max N] [--views FILE] [--plain-view-writes] [--view-chunk BYTES] [--keep-views] [--allow-host NAME]... [--log-requests] [--keep-on-hangup] [PORT]".into());
     }
     args.remove(0);
     let keep_on_hangup = take_switch(&mut args, "--keep-on-hangup");
@@ -470,6 +478,11 @@ fn db_cmd(store_dir: &str, args: &[String]) -> Result<(), String> {
         let store = ikam_kernel::backends::PackStore::open_with(store_dir, opts).map_err(err)?;
         serve_db(store, serve_opts, views, port, allowed, log_requests)
     } else {
+        if is_pack_store(store_dir) {
+            return Err(format!(
+                "{store_dir} is a pack store (made by `db serve --packs` or `--live`): serve it with `--packs` or `--live`"
+            ));
+        }
         let store = FsStore::open(store_dir).map_err(err)?;
         serve_db(store, serve_opts, views, port, allowed, log_requests)
     }
@@ -669,6 +682,13 @@ fn quiet_on_closed_stdout() {
 }
 
 fn run(store_dir: &str, args: &mut Vec<String>, disk_guard: bool) -> Result<(), String> {
+    if is_pack_store(store_dir) {
+        // E414: opened as a store on disk, a pack store shows no objects,
+        // so `repack`, `gc` or `ls` did nothing and said nothing.
+        return Err(format!(
+            "{store_dir} is a pack store (made by `db serve --packs` or `--live`); this command reads a store on disk. On a pack store: `ikam --store {store_dir} db serve --live` or, stopped, `db squash`"
+        ));
+    }
     let mut repo = Repo::new(FsStore::open(store_dir).map_err(err)?);
     if let Some(i) = args.iter().position(|a| a == "--short-records") {
         args.remove(i);
@@ -1291,6 +1311,112 @@ fn request_line(req: &http::Request) -> String {
     )
 }
 
+/// Whether `dir` holds a pack store (E122): a `packs` folder with a pack
+/// in it. A store on disk (`FsStore`) has none.
+pub(crate) fn is_pack_store(dir: &str) -> bool {
+    std::fs::read_dir(Path::new(dir).join("packs"))
+        .map(|mut d| d.next().is_some())
+        .unwrap_or(false)
+}
+
+fn dir_bytes(dir: &Path) -> u64 {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return 0;
+    };
+    entries
+        .flatten()
+        .map(|e| match e.metadata() {
+            Ok(m) if m.is_dir() => dir_bytes(&e.path()),
+            Ok(m) => m.len(),
+            Err(_) => 0,
+        })
+        .sum()
+}
+
+/// `ikam [--store DIR] db squash [--cold [--group]]` (E414): on a stopped
+/// pack store (`db serve --packs` or `--live`), points every database
+/// (`db/` ref) at a commit of its current tree with no parent, deletes
+/// what only earlier commits reached and cleans the packs. Every append
+/// commits its database with the one before as parent, so a store keeps
+/// every version of every view chunk an append rewrote: a quarter of a
+/// collector's store after three days (E412). Each database reads the
+/// same after (its keys are counted before and after); its history before
+/// the head is given up. `--cold` then runs the incremental cold pass
+/// (E268; `--group` groups small contents): smaller, slower to read. A
+/// store a server holds is locked, and refused.
+fn db_squash(store_dir: &str, args: &[String]) -> Result<(), String> {
+    use ikam_kernel::backends::{PackOptions, PackStore};
+    let mut args = args.to_vec();
+    let cold = take_switch(&mut args, "--cold");
+    let group = take_switch(&mut args, "--group");
+    if !args.is_empty() || (group && !cold) {
+        return Err("usage: ikam [--store DIR] db squash [--cold [--group]]".into());
+    }
+    if !is_pack_store(store_dir) {
+        return Err(format!(
+            "{store_dir} is not a pack store: db squash is for a store `db serve --packs` or `--live` made"
+        ));
+    }
+    let opts = PackOptions {
+        lazy_checkpoint: true,
+        ref_log: false,
+        filters: true,
+    };
+    let store = PackStore::open_with(store_dir, opts).map_err(|e| match e {
+        ikam_kernel::Error::RefConflict(_) => {
+            format!("{store_dir} is in use (a server holds its LOCK): stop it first")
+        }
+        e => e.to_string(),
+    })?;
+    let t = Instant::now();
+    let bytes_before = dir_bytes(Path::new(store_dir));
+    let mut repo = Repo::new(store);
+    let objects_before = repo.store().ids().map_err(err)?.len();
+    let mut counts = Vec::new();
+    for (name, head) in repo.store().refs().map_err(err)? {
+        if name.starts_with("db/") {
+            let db = repo.db_at(&head).map_err(err)?;
+            counts.push((name, repo.db_count(&db, "", None).map_err(err)?));
+        }
+    }
+    let moved = repo.squash_refs("db/").map_err(err)?;
+    let deleted = repo.gc().map_err(err)?;
+    let mut store = repo.into_store();
+    store.sync().map_err(err)?;
+    store.compact().map_err(err)?;
+    if cold {
+        let mut repo = Repo::new(store);
+        repo.repack_incremental_with(ikam_kernel::ColdPassOpts { group })
+            .map_err(err)?;
+        store = repo.into_store();
+        store.sync().map_err(err)?;
+        store.compact().map_err(err)?;
+    }
+    let mut repo = Repo::new(store);
+    for (name, n) in &counts {
+        let head = repo
+            .store()
+            .get_ref(name)
+            .map_err(err)?
+            .ok_or_else(|| format!("{name} is gone"))?;
+        let db = repo.db_at(&head).map_err(err)?;
+        let after = repo.db_count(&db, "", None).map_err(err)?;
+        if after != *n {
+            return Err(format!("{name}: {n} keys before, {after} after"));
+        }
+    }
+    let objects_after = repo.store().ids().map_err(err)?.len();
+    drop(repo);
+    println!(
+        "databases={} squashed={} deleted={deleted} objects={objects_before}->{objects_after} bytes={bytes_before}->{} cold={cold} seconds={:.1}",
+        counts.len(),
+        moved.len(),
+        dir_bytes(Path::new(store_dir)),
+        t.elapsed().as_secs_f64()
+    );
+    Ok(())
+}
+
 /// Take a switch (a flag with no value) out of `args`: whether it was there.
 fn take_switch(args: &mut Vec<String>, flag: &str) -> bool {
     let before = args.len();
@@ -1388,6 +1514,63 @@ mod tests {
         assert!(take_switch(&mut a, "--keep-on-hangup"));
         assert!(!take_switch(&mut a, "--keep-on-hangup"));
         assert_eq!(a, ["--live", "8740"]);
+    }
+
+    #[test]
+    fn db_squash_keeps_reads_and_other_commands_refuse_a_pack_store() {
+        use ikam_kernel::Event;
+        use ikam_kernel::backends::{PackOptions, PackStore};
+        let dir = tempfile::tempdir().unwrap();
+        let s = dir.path().to_str().unwrap().to_string();
+        let opts = PackOptions {
+            lazy_checkpoint: true,
+            ref_log: false,
+            filters: true,
+        };
+        let mut repo = Repo::new(PackStore::open_with(&s, opts).unwrap());
+        let mut db = repo.db_empty().unwrap();
+        for i in 0..20 {
+            let events: Vec<Event> = (0..50)
+                .map(|k| {
+                    Event::upsert(
+                        &format!("t/{k:03}"),
+                        format!("{i}").as_bytes(),
+                        &format!("{i}-{k}"),
+                    )
+                })
+                .collect();
+            db = repo.db_append(&db, &events).unwrap();
+            repo.db_commit("db/t", &db, "append").unwrap();
+        }
+        let before = repo.db_scan(&db).unwrap();
+        drop(repo);
+        assert!(is_pack_store(&s));
+        let refused = run(&s, &mut vec!["gc".to_string()]).unwrap_err();
+        assert!(refused.contains("is a pack store"), "{refused}");
+        // `db serve` without `--packs` and a project's `Live` refuse it too.
+        let serve = db_cmd(&s, &["serve".to_string()]).unwrap_err();
+        assert!(serve.contains("is a pack store"), "{serve}");
+        let live = live::Live::open(&s, "main").err().unwrap();
+        assert!(live.contains("is a pack store"), "{live}");
+        assert!(!dir.path().join("objects").exists());
+        // A store a server holds is refused.
+        let held = PackStore::open_with(&s, opts).unwrap();
+        assert!(db_squash(&s, &[]).unwrap_err().contains("in use"));
+        drop(held);
+        let bytes = dir_bytes(dir.path());
+        db_squash(&s, &[]).unwrap();
+        assert!(dir_bytes(dir.path()) < bytes);
+        let mut repo = Repo::new(PackStore::open_with(&s, opts).unwrap());
+        let head = repo.store().get_ref("db/t").unwrap().unwrap();
+        let db = repo.db_at(&head).unwrap();
+        assert_eq!(repo.db_scan(&db).unwrap(), before);
+        drop(repo);
+        let usage = db_squash(&s, &["--group".to_string()]).unwrap_err();
+        assert!(usage.starts_with("usage"), "{usage}");
+        let empty = tempfile::tempdir().unwrap();
+        let not = db_squash(empty.path().to_str().unwrap(), &[]).unwrap_err();
+        assert!(not.contains("not a pack store"), "{not}");
+        assert!(!is_pack_store(empty.path().to_str().unwrap()));
     }
 
     #[test]

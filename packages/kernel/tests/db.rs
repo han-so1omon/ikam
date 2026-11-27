@@ -947,3 +947,49 @@ fn commit_new_refuses_an_existing_database() {
     assert_eq!(repo.db_get(&db, "k/a").unwrap().as_deref(), Some(&b"a"[..]));
     assert_eq!(repo.db_get(&db, "k/b").unwrap().as_deref(), Some(&b"b"[..]));
 }
+
+/// E414: a database squashed to a commit of its head's tree with no parent
+/// reads the same, and `gc` then drops the view versions only its earlier
+/// commits reached. Other refs keep their history.
+#[test]
+fn squashed_database_reads_the_same_and_gc_drops_old_views() {
+    let mut repo = Repo::new(MemStore::default());
+    let mut db = repo.db_empty().unwrap();
+    for i in 0..30 {
+        let events: Vec<Event> = (0..40)
+            .map(|k| {
+                up(
+                    &format!("t/{k:03}"),
+                    &format!("v{i}-{k}"),
+                    &format!("e{i}-{k}"),
+                )
+            })
+            .collect();
+        db = repo.db_append(&db, &events).unwrap();
+        repo.db_commit("db/t", &db, "append").unwrap();
+    }
+    let tree = repo.put(&Object::tree(Vec::new()).unwrap()).unwrap();
+    repo.commit("main", tree, "one").unwrap();
+    let main = repo.commit("main", tree, "two").unwrap();
+    let before = scan(&repo, &db);
+    let head = repo.store().get_ref("db/t").unwrap().unwrap();
+    let moved = repo.squash_refs("db/").unwrap();
+    assert_eq!(moved.len(), 1);
+    assert_eq!((moved[0].0.as_str(), moved[0].1), ("db/t", head));
+    let squashed = repo.store().get_ref("db/t").unwrap().unwrap();
+    let Object::Commit(c) = repo.get(&squashed).unwrap() else {
+        panic!("not a commit")
+    };
+    assert!(c.parents.is_empty());
+    assert_eq!(c.message, "append");
+    let deleted = repo.gc().unwrap();
+    assert!(deleted > 30, "{deleted}");
+    let after = repo.db_at(&squashed).unwrap();
+    assert_eq!(scan(&repo, &after), before);
+    assert_eq!(repo.db_count(&after, "", None).unwrap(), 40);
+    assert!(repo.fsck_deep().unwrap().is_empty());
+    // Other refs keep their history; a second squash has nothing to move.
+    assert_eq!(repo.store().get_ref("main").unwrap(), Some(main));
+    assert_eq!(repo.log(main).unwrap().len(), 2);
+    assert!(repo.squash_refs("db/").unwrap().is_empty());
+}

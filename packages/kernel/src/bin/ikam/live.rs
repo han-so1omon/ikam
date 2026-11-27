@@ -161,6 +161,11 @@ impl Live {
     /// `open`, with `deferred_sync`: the store makes edits durable when they
     /// commit (`FsStore::open_deferred`, E227).
     pub fn open_with(store_dir: &str, refname: &str, deferred_sync: bool) -> Result<Live, String> {
+        if crate::is_pack_store(store_dir) {
+            return Err(format!(
+                "{store_dir} is a pack store (made by `db serve --packs` or `--live`); this opens a store on disk"
+            ));
+        }
         let store = if deferred_sync {
             FsStore::open_deferred(store_dir)
         } else {
