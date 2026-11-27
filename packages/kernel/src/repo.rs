@@ -296,6 +296,16 @@ pub struct Repo<S: Store> {
     /// still scanned. Off, every candidate is decoded and scanned, so
     /// results never rest on the index alone.
     pub exact_short_search: bool,
+    /// Pack a BM25 view's postings lists into shared contents of up to
+    /// this many bytes when the view is built (E408): each term's node is
+    /// then a range of a pack, so a table with many rare terms (ids,
+    /// numbers) writes a few thousand contents instead of one per term.
+    /// Off (0) by default, when each list is a content of its own. A list
+    /// as large as the target stays its own content. Searches read a
+    /// whole pack for each term they look up; updates rewrite the terms
+    /// they touch as contents of their own either way. Views built either
+    /// way rank the same.
+    pub bm25_pack: usize,
     pub(crate) hints: std::sync::Mutex<Option<Hints>>,
     /// Whether a stored tree or graph chunk may be planned as a fill of a
     /// template (E144). On by default. Off, its plans are only slices of
@@ -405,6 +415,7 @@ impl<S: Store> Repo<S> {
             cache: Default::default(),
             replace_hints: false,
             exact_short_search: false,
+            bm25_pack: 0,
             object_templates: true,
             plain_db_events: false,
             plain_hot_writes: false,
@@ -782,6 +793,7 @@ impl<S: Store> Repo<S> {
         r.plain_hot_writes = self.plain_hot_writes;
         r.graph_cut = self.graph_cut;
         r.exact_short_search = self.exact_short_search;
+        r.bm25_pack = self.bm25_pack;
         r
     }
 

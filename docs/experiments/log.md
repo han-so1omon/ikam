@@ -7065,3 +7065,24 @@ Gates on the branch (E229 to E233): every kernel test suite passes (release); cl
 - Fixed benchmark (AGENTS.md section 7): unchanged. The change is in the CLI binary only and off by default.
 - Verdict: **kept** as an option (off by default). The kill check needs no change, since nothing half-built is reachable.
 - Not measured: the Mac, and its SanDisk drive; a 1M-row view build (200k here); `db serve`'s own writes on a full disk (an append fails and its leftovers wait for `gc`); a store-wide lock, so gc could run beside other writers.
+### E408 packed-postings (BM25 postings packed several to a content, as an option)
+- Branch / parent: exp/408-packed-postings / main 437aef6
+- Question: E382 left one stored content per term in a BM25 view: 405,119 for 200k rows, most of them a term only one row has (its number, its float's digits). Its Next: pack several lists to a content, as an option. What does that save, and what does a search pay for reading a pack to get one list?
+- Change (option, off): `Repo::bm25_pack` (bytes, 0 by default; copied by `sibling`) and `db serve --bm25-pack BYTES`. When it is set, `bm25_view_build` (and so `bm25_live_build`) appends the lists in term order to a pack until the next would take it past the target, stores the pack once, and points each term's node at its range of the pack (`Arg::Range`, as the database's `kv` view points into events); a list as large as the target stays its own content. Updates rewrite the terms they touch as contents of their own, as before; searches and updates read the lists through `node_values`, so a pack is read once however many of a query's terms it holds. With the option off the view is the same graph as on main (same root).
+- Result (`examples/bm25_build.rs`, 200k rows like E382's, MemStore, Linux cloud, 4 CPUs; each mode a fresh process; queries: 200 of four kinds, each run three times and its fastest kept; two runs of off and 64 KiB):
+
+  | pack target | build | objects the build stored | bytes stored | first search, one word | query p50 | query p99 |
+  |---|---|---|---|---|---|---|
+  | off | 4.73 / 5.19 s | 213,801 | 23.78 MB | 8.5 / 10.8 ms | 0.24 / 0.26 ms | 73 / 80 ms |
+  | 4 KiB | 5.01 s | 15,232 | 6.98 MB | 0.20 ms | 0.26 ms | 93 ms |
+  | 16 KiB | 6.24 s | 11,271 | 6.77 MB | 0.29 ms | 0.27 ms | 101 ms |
+  | 64 KiB | 7.52 / 7.52 s | 10,135 | 6.59 MB | 0.35 / 0.37 ms | 0.32 ms | 116 / 88 ms |
+  | 256 KiB | 8.15 s | 9,775 | 6.92 MB | 0.61 ms | 0.56 ms | 100 ms |
+
+  Every mode ranked the 200 queries with the same keys and score bits (one hash, `f51b6d8a35ea863a`). Packing stores 14 to 22 times fewer objects and about 3.5 times fewer bytes: the lists are tens of bytes, too small to compress alone, and compress well together. At 4 KiB the build takes the same time as off; larger packs build slower (more compression work per write) and make a rare term's search read more bytes, so p50 rises from 64 KiB. The first one-word search after the build costs 8 to 11 ms off and 0.2 ms packed; I did not trace why (probably the first read of a small content loading something packs do not need, such as the shared dictionary). p99 is the queries of a common date and word, whose lists are their own contents either way; its spread between the two off runs (73 to 80 ms) and the two 64 KiB runs (88 to 116 ms) is this machine's noise, so I read no difference into it.
+- Checks: `packed_views_rank_as_unpacked` (2,000 rows with empty, repeated and non-ASCII terms; pack targets of 1 byte, 40 bytes, 4 KiB and 64 KiB against off): 49 queries at k of 1, 10 and 5,000 give the same keys and score bits from the built view, the view after an update of 55 upserts and 38 removes, the live view and the live view after the same update (past its merge threshold); at 4 KiB and up the build stores under a twentieth of the objects. `cargo test --release --features embed`: 377 pass; clippy clean.
+- Fixed benchmark: not run. The option is off by default and the benchmark builds no BM25 view (E382), so nothing it measures changes.
+- Verdict: **kept** as an option (off by default). 4 KiB is the setting to try first: fewer objects and bytes at no build cost and about 5% on a median query. It is not on by default because a view built with it is a new format for a kept view (E369) to read back, and the time it saves on disk (fewer files, fewer `fsync`s in a pack store) was not measured here.
+- Not measured: a store on disk (FsStore, `--packs`), where a content is a file or a pack entry and the object count matters most; 1M rows through `db serve --live` (E375's `rss_load.py` is on its own branch); `gc` after updates leave packs part used; the Mac.
+- Next: the same packing for other views made of many small contents; then run E375's 1M-row load with `--live --bm25-pack 4096`.
+- Run: `cargo run --release --example bm25_build -- 200000 build` and `... 200000 packed 4096` (and 16384, 65536, 262144).
