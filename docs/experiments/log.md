@@ -6579,3 +6579,39 @@ Gates on the branch (E229 to E233): every kernel test suite passes (release); cl
   - No public tree edit puts a graph at a path; `ikam-compute` carries its own (E438).
   - Loading a yielding model by a moment past its limit point stalls Newton; prescribed displacements and continuation are needed (E439).
 - Verdict: kept (capability in `ikam-compute`: `Graph::inline`, `commit_at`, `load_at`; findings planned as E434 to E439).
+
+### E439 solver-constraints (prescribed values, arc-length continuation, explicit time stepping)
+
+- Branch / parent: exp/439-solver-constraints / exp/430-compute-graph aea44c8 (PR 104, not merged).
+- Question: loading a yielding model by a moment past its limit stalls Newton (E433). Do prescribed values (displacement or rotation control) and arc-length continuation, added to `ikam-compute`, follow such paths through plateaus and limit points, against closed forms? And does explicit time stepping over an energy graph keep the energy?
+- Change (opt-in, new API; `solve.rs` is untouched, so `Minimizer::minimize`, `PlannedMinimizer` and `sensitivity` take the same steps with the same bits, and the 16 E430 to E433 tests pass unchanged):
+  - `path::Linear` (`fix(i, value)`, `combo(terms, value)`: `A x = b`) and `Minimizer::minimize_constrained`: null-space Newton-CG (projected CG, every iterate feasible), returning the multipliers `grad E = A^T lambda` (the reactions). Its line search also accepts a full step that halves the projected gradient (see Found).
+  - `path::Continuation`: an energy with a scalar load input, followed by pseudo arc-length (normal plane, adaptive step, a jump guard that halves a step whose corrected point lies more than 1.5 steps away); the bordered system `[K q; t^T]` is solved densely (`K` from `n` Hessian-vector products, `q` from the same HVP graph in `(x, load)`), so it stays regular at limit points; `det K` sign and `dl/ds` per point; `locate_limit` bisects the arc between two points where `dl/ds` changes sign.
+  - `dynamics::Dynamics`: explicit Euler (contrast only), symplectic Euler and velocity Verlet with a lumped mass, one gradient evaluation per step.
+- Setup (`examples/e439_paths.rs`, generic models, closed forms independent of the graph code): a rod of 20 segments under an end moment with a yielding section `M(k) = My tanh(k/ky) + h k` (energy `ln cosh`), h = 1e-3 and 0, against uniform curvature `M(k)` (bisection for the inverse); a single softening section `M = tanh k - 0.5 k + 0.02 k^3` (a peak and a valley); a shallow two-bar truss (half span 1, rise 0.1, EA 1000, 2 unknowns), limit load `P* = 0.3810871904` in closed form (`l* = (L0 a^2)^(1/3)`); a pendulum (1 rad) and an 8-mass FPU-beta chain over 10^4 steps.
+- Results (4-CPU Linux container):
+
+| case | load control (today's solver) | displacement / rotation control | arc-length |
+|---|---|---|---|
+| rod, h = 1e-3, to k = 20 (M = 1.02 My) | converges, 2 to 5 Newton its per warm step; 7 from rest | 40 steps, 2 to 8 its, worst reaction error 1.9e-11, `|Ax-b|` 0 | 22 points, 1 to 2 corrector its, 0 halvings, worst `|load - M(k)|` 9.2e-13, 20 ms |
+| rod, h = 0 (no equilibrium for M >= My) | M = 0.999: 6 its; M = 1.0: **false convergence** (17 its, k = 12.3, residual 4e-11 under the tolerance); M >= 1.005: runs off to overflow | 40 steps, 0 to 9 its, worst reaction error 1.0e-10; curvatures not unique past k ~ 10 (spread 1.5e2 at k = 20) | to k = 20 with load -> 1, worst error 8.1e-13; `det K` flips at k ~ 19 (K singular in rounding), spread 14 |
+| softening section | jumps from k 0.86 to 4.01 past the peak | 50 steps, reaction error 6.7e-16 (one unknown: no iterations) | 30 points; peak 0.281973244595 and valley 0.031312226533 located to 1.1e-16 and 1.1e-13 |
+| two-bar truss to w = 2.2 rise | at 0.5 and 0.75 P*: **no convergence** in 100 its (`|g|` stuck at 8e-9, 7e-10); past P*: snaps to w = 2.16 rise | 44 steps from u = 1e-3, 87 its, worst error 2.4e-14 against `P(w)` | 68 points, 2.5 corrector its per point, 8 halvings, path error 9.9e-11; limits located at 0.381087190418 (error 3.2e-15) and -0.381087190418 (2.6e-14), w to 7e-15 |
+
+| 10^4 steps | scheme | dt | max `|dE|/E0` |
+|---|---|---|---|
+| pendulum | explicit Euler | 0.01 / 0.005 | 1.16 / 0.23 |
+| pendulum | symplectic Euler | 0.01 / 0.005 | 4.7e-3 / 2.4e-3 |
+| pendulum | velocity Verlet | 0.01 / 0.005 | 2.3e-5 / 5.8e-6 (second order, bounded) |
+| FPU-beta chain | explicit Euler | 0.05 / 0.025 | overflow / 1.41 |
+| FPU-beta chain | velocity Verlet | 0.05 / 0.025 | 7.7e-5 / 1.9e-5 |
+
+- Found:
+  - The stall is not on the plateau but past it: with any hardening, warm-started load control converges in a few Newton steps; with none, a moment at or past My has no equilibrium and Newton either overflows or, worse, reports convergence where `My - M(k)` drops below the absolute tolerance (k = 12.3). Rotation control and arc-length both give the plateau (reactions to 1e-10 or better).
+  - Arc-length needs the jump guard: without it, a step of 0.05 past the truss's second limit point corrected onto the other branch (w = -0.02, 0.23 away), and the path went back through the origin.
+  - Today's `minimize` stalls on the truss at moderate loads: the energy's rounding where `l - l0` cancels (about 1e-16) is larger than the Armijo slack `16 eps |f|` (about 1e-18), so steps are halved away near the solution. `minimize_constrained` with no constraints (full step accepted when it halves the gradient) converges in 4 its at the same loads. Changing `minimize` would change its bits; left as a proposal.
+  - On a flat plateau (h = 0) curvatures along the rod are not unique; the solvers return one of many states with the right moment.
+- Fixed benchmark: not run (the kernel is not changed).
+- Verdict: **kept** (capability, opt-in, `ikam-compute` only).
+- Not measured: a stencil op for cellular automata and lattice solvers (a 1-D stencil can be written now with `Pad`/`Slice` shifts; no dedicated op); nonlinear constraints; sparse or matrix-free bordered solves (the arc-length solve is dense, for up to a few hundred unknowns); localization on a softening rod (only a single softening section); a shallow arch; planned (no-allocation) versions of the new solvers.
+- Run: `cargo run --release --example e439_paths` in `packages/compute`; `cargo test --release` (22 tests, 6 new in `tests/paths.rs`).
