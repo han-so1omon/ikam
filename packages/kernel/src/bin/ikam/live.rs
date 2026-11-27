@@ -1329,6 +1329,7 @@ fn journal_line(e: &Edit) -> String {
     let v = |xs: &[&str]| Json::Arr(xs.iter().map(|x| Json::Str((*x).into())).collect());
     let line = match e {
         Edit::Put { path, id } => v(&["put", path, &id.to_hex()]),
+        Edit::PutGraph { path, id } => v(&["graph", path, &id.to_hex()]),
         Edit::Mkdir { path } => v(&["mkdir", path]),
         Edit::Remove { path } => v(&["rm", path]),
         Edit::Rename { from, to } => v(&["mv", from, to]),
@@ -1368,6 +1369,10 @@ fn parse_journal(text: &[u8]) -> Result<(String, Option<Id>, Vec<Edit>), String>
             ["put", p, c] => edits.push(Edit::Put {
                 path: (*p).into(),
                 id: id(c)?,
+            }),
+            ["graph", p, g] => edits.push(Edit::PutGraph {
+                path: (*p).into(),
+                id: id(g)?,
             }),
             ["mkdir", p] => edits.push(Edit::Mkdir { path: (*p).into() }),
             ["rm", p] => edits.push(Edit::Remove { path: (*p).into() }),
