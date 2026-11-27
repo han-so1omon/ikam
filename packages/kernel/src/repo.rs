@@ -134,6 +134,12 @@ pub struct Repo<S: Store> {
     /// a subtree remove lists every key below it and drops them one by
     /// one. Either way the view's root is the same.
     pub db_range_drop: bool,
+    /// E392: a deferred catch-up (`db_catch_up`) writes the kv view every
+    /// this many folded events instead of once at the end, so it holds at
+    /// most that many changes. 0 (the default) folds the whole span in one
+    /// edit. The view's root is the same either way; each early write
+    /// leaves chunks that only `gc` removes.
+    pub catch_up_flush: u64,
     /// Split the words of a zip's markup members (docx, xlsx, pptx XML)
     /// from their tags at ingest (E112): one skeleton member and one text
     /// member per zip, so the words compress with the same text in other
@@ -311,6 +317,7 @@ impl<S: Store> Repo<S> {
             search_sample: Vec::new(),
             short_records: false,
             db_range_drop: false,
+            catch_up_flush: 0,
             markup_layers: false,
             slow_codec_max: usize::MAX,
             group_size: crate::group::GROUP_SIZE,
@@ -686,6 +693,7 @@ impl<S: Store> Repo<S> {
         r.refresh_ledger = self.refresh_ledger;
         r.cache = self.cache.clone();
         r.short_records = self.short_records;
+        r.catch_up_flush = self.catch_up_flush;
         r.markup_layers = self.markup_layers;
         r.object_templates = self.object_templates;
         r.plain_db_events = self.plain_db_events;

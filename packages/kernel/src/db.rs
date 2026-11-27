@@ -316,6 +316,18 @@ fn parse_seq(label: &str) -> Result<u64, Error> {
 /// A logged event, its encoding and its id (E368: what a fold reads).
 type Logged = (Event, Vec<u8>, Id);
 
+/// E392: log events read a page at a time while catching the kv view up.
+const CATCH_UP_PAGE: usize = 1024;
+
+/// A kv fold in progress (E392): the changes so far, the ranges to drop
+/// and how many events went in.
+#[derive(Default)]
+struct KvFold {
+    changes: Changes,
+    drops: Vec<(String, String)>,
+    events: u64,
+}
+
 impl<S: Store> Repo<S> {
     /// An empty database: three empty graphs, at log position 0.
     pub fn db_empty(&mut self) -> Result<Db, Error> {
@@ -422,15 +434,35 @@ impl<S: Store> Repo<S> {
         if db.kv_at > head || db.counts.is_some_and(|c| c.at != db.kv_at) {
             return Err(Error::Decode("db views are out of step"));
         }
-        let mut span = Vec::new();
-        for n in self.graph_range(&db.log, &seq_label(db.kv_at + 1), None, usize::MAX, false)? {
-            let Target::Content(a) = n.target else {
-                return Err(Error::Decode("db log"));
-            };
-            let bytes = self.read_content(&a.id())?;
-            span.push((Event::decode(&bytes)?.0, bytes, a.id()));
+        // E392: the events are folded a page at a time as they are read,
+        // so only the changes (a key and an address each) are held, not
+        // every event and its bytes; the view is the same edit.
+        let mut fold = KvFold::default();
+        let mut cur = *db;
+        let mut from = seq_label(db.kv_at + 1);
+        loop {
+            let page = self.graph_range(&db.log, &from, None, CATCH_UP_PAGE, false)?;
+            let full = page.len() == CATCH_UP_PAGE;
+            let next = page.last().map(|n| format!("{}\0", n.label));
+            for n in page {
+                let Target::Content(a) = n.target else {
+                    return Err(Error::Decode("db log"));
+                };
+                let bytes = self.read_content(&a.id())?;
+                let e = Event::decode(&bytes)?.0;
+                self.db_fold_one(&cur, &mut fold, &e, &bytes, a.id())?;
+                // Write as soon as the limit is reached, so a limit below
+                // a page's 1,024 events still bounds what is held.
+                if self.catch_up_flush > 0 && fold.events >= self.catch_up_flush {
+                    cur = self.db_fold_finish(&cur, std::mem::take(&mut fold))?;
+                }
+            }
+            match (full, next) {
+                (true, Some(n)) => from = n,
+                _ => break,
+            }
         }
-        self.db_fold_kv(db, &span)
+        self.db_fold_finish(&cur, fold)
     }
 
     /// Check `events`, store their contents and log the fresh ones (those
@@ -502,41 +534,62 @@ impl<S: Store> Repo<S> {
     /// Fold `span`, the events logged right after `db.kv_at` (and already
     /// stored), into the kv view and kept counts, in one edit.
     fn db_fold_kv(&mut self, db: &Db, span: &[Logged]) -> Result<Db, Error> {
-        let mut changes = Changes::new();
-        let mut drops: Vec<(String, String)> = Vec::new();
+        let mut st = KvFold::default();
         for (e, bytes, id) in span {
-            let range = match &e.op {
-                // `/` is followed by `0`: the keys below `k` are [k/, k0).
-                Op::Remove { subtree: true } => {
-                    Some((format!("{}/", e.key), format!("{}0", e.key)))
-                }
-                Op::RemoveRange { end } => Some((e.key.clone(), end.clone())),
-                _ => None,
-            };
-            let below = match range {
-                // Kept counts (E233) need each removed key, so a database
-                // that keeps them lists the range instead of dropping it.
-                Some(r) if self.db_range_drop && db.counts.is_none() => {
-                    drops.push(r);
-                    Vec::new()
-                }
-                Some((lo, hi)) => self
-                    .graph_range(&db.kv, &lo, Some(&hi), usize::MAX, false)?
-                    .into_iter()
-                    .map(|n| n.label)
-                    .collect(),
-                None => Vec::new(),
-            };
-            fold(
-                &mut changes,
-                &below,
-                e,
-                *id,
-                Event::decode(bytes)?.1,
-                bytes.len(),
-            );
+            self.db_fold_one(db, &mut st, e, bytes, *id)?;
         }
-        let seq = db.kv_at + span.len() as u64;
+        self.db_fold_finish(db, st)
+    }
+
+    /// Fold one logged event into `st` (E392: one at a time, so a caller
+    /// need not hold every event of a span).
+    fn db_fold_one(
+        &mut self,
+        db: &Db,
+        st: &mut KvFold,
+        e: &Event,
+        bytes: &[u8],
+        id: Id,
+    ) -> Result<(), Error> {
+        let KvFold {
+            changes,
+            drops,
+            events,
+        } = st;
+        *events += 1;
+        let range = match &e.op {
+            // `/` is followed by `0`: the keys below `k` are [k/, k0).
+            Op::Remove { subtree: true } => Some((format!("{}/", e.key), format!("{}0", e.key))),
+            Op::RemoveRange { end } => Some((e.key.clone(), end.clone())),
+            _ => None,
+        };
+        let below = match range {
+            // Kept counts (E233) need each removed key, so a database
+            // that keeps them lists the range instead of dropping it.
+            Some(r) if self.db_range_drop && db.counts.is_none() => {
+                drops.push(r);
+                Vec::new()
+            }
+            Some((lo, hi)) => self
+                .graph_range(&db.kv, &lo, Some(&hi), usize::MAX, false)?
+                .into_iter()
+                .map(|n| n.label)
+                .collect(),
+            None => Vec::new(),
+        };
+        fold(changes, &below, e, id, Event::decode(bytes)?.1, bytes.len());
+        Ok(())
+    }
+
+    /// Write the view `st` folded: the kv edit and kept counts, at
+    /// `kv_at` plus the events folded.
+    fn db_fold_finish(&mut self, db: &Db, st: KvFold) -> Result<Db, Error> {
+        let KvFold {
+            changes,
+            drops,
+            events,
+        } = st;
+        let seq = db.kv_at + events;
         let counts = match db.counts {
             Some(c) => Some(Counts {
                 root: self.count_edit(db, &c, &changes)?,

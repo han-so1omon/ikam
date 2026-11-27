@@ -6537,3 +6537,27 @@ Gates on the branch (E229 to E233): every kernel test suite passes (release); cl
 - Verdict: **kept** (a fix, the paged first build, with no trade-off; `--hnsw-threads` an option, off).
 - Not measured: the Mac; real embeddings (clustered synthetic vectors stand in; recall on real text vectors may differ either way); a wider `ef` (a constant here: 80), which would trade query time for recall at 1M; keeping the graph across restarts; vectors changing while serving at 1M; more than one run each (build times on a shared cloud host move by tens of percent).
 - Run: `python3 -I experiments/vectors-1m/vec_1m.py WORK OUT.jsonl 100000,250000,500000,1000000 "exact=BRANCH:;exact-main=MAIN:;hnsw=BRANCH:--hnsw;hnsw4=BRANCH:--hnsw --hnsw-threads 4;hnsw-main@1000000=MAIN:--hnsw" 200`.
+
+### E392 fold-stream (a deferred catch-up's memory peak)
+- Branch / parent: exp/392-fold-stream / main 437aef6
+- Question: E384 found a fold of deferred kv events (E368) among a loading server's largest owners (47 MB at 200k rows). A catch-up (`db_catch_up`: a read after many unfolded appends, or the first read after a restart) read every waiting event into memory, then folded them in one edit. How high does that go, and can it be lower with the same view?
+- Profile (valgrind massif, 40k rows with `--live --defer-kv 1000000` so nothing folds during the load, then one count; one run, not committed): of a 125 MB peak inside the catch-up, 18 MB was the list of every waiting event with its bytes, 7 MB their decoding, 34 MB the change set and the tree edit (`graph_edit_with`'s merge), 29 MB decode buffers of the stored events.
+- Change:
+  - Fix (no option, the same view): `db_catch_up` (src/db.rs) reads the log 1,024 events at a time (`graph_range` pages) and folds each event as it is read (`db_fold_one`), so it holds the change set but no longer every event and its bytes; `db_fold_finish` writes the edit as before. `db_fold_kv` (an append's own fold) is the same two steps.
+  - Option: `Repo::catch_up_flush` and `db serve --fold-flush N` (off: 0; needs `--defer-kv`, which `--live` implies; not part of `--live`): the catch-up writes the kv view (and kept counts) every N folded events instead of once at the end, so it holds at most N events' changes. The root is the same; each early write leaves chunks only `gc` removes, and a catch-up writes the tree more than once.
+- Results (`experiments/fold-peak/fold_peak.py`: 200k E354 rows, 400k events, loaded with `--live --defer-kv 1000000`, then one count folds them all; one run each, 4-core cloud machine; peak is VmHWM):
+
+  | | main | branch | `--fold-flush 100000` | `--fold-flush 20000` |
+  |---|---|---|---|---|
+  | peak before the catch-up | 147 MB | 148 MB | 148 MB | 148 MB |
+  | peak after it | 614 MB | **369 MB** | **175 MB** | 206 MB |
+  | resident after it | 495 MB | 330 MB | 156 MB | 184 MB |
+  | catch-up (the count's time) | 4.17 s | 4.08 s | 5.55 s | 17.7 s |
+  | head commit | 9921801… | same | same | same |
+  | store | 119.9 MB | 119.9 MB | 123.5 MB (+3%) | 161.1 MB (+34%) |
+
+  Paging takes the catch-up's own growth from 467 to 221 MB with the same commit, the same store bytes and the same time. Writing the view every 100,000 events takes it to 27 MB for 3% more store until `gc` and a third more time; every 20,000 costs more of both and did not lower the peak further (the tree is rewritten twenty times).
+- Checks: `deferred_kv_catches_up_across_pages` (spans of 1,024, 1,025 and 3,000 events across page edges, subtree removes among them; the caught-up view equals appends folded batch by batch, and again with `catch_up_flush` 7 (inside a page), 1,000 and 2,048; the limit is checked after each event, so one below a page still bounds what is held) and `flushed_catch_up_matches_with_counts_and_range_drops` (kept counts, and `db_range_drop`, with early writes every 1,500 events: the same roots). Both fail when a page's next start is wrong.
+- Verdict: **kept** (the paged catch-up is a fix with no trade-off; `--fold-flush` an option, off: less memory for more store until `gc` and more time).
+- Not measured: the Mac; a catch-up on a restart of a server killed mid-load (the same path); a catch-up under `--shared-store`; more than one run each; the 29 MB of decode buffers, which both ways keep.
+- Run: `python3 -I experiments/fold-peak/fold_peak.py IKAM_BIN WORK 200000 "--live --defer-kv 1000000"`, and with `--fold-flush 100000` and `--fold-flush 20000`, on main and the branch.

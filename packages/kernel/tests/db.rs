@@ -846,6 +846,81 @@ fn deferred_kv_catches_up_to_the_same_roots() {
     }
 }
 
+/// E392: a catch-up reads the log a page at a time (1,024 events); spans
+/// of an exact page, a page and one, and several pages with removes in
+/// them fold to the same roots as appending batch by batch.
+#[test]
+fn deferred_kv_catches_up_across_pages() {
+    for span in [1024usize, 1025, 3000] {
+        let mut repo = Repo::new(MemStore::default());
+        let empty = repo.db_empty().unwrap();
+        let (mut now, mut late) = (empty, empty);
+        let mut i = 0;
+        while i < span {
+            let n = (span - i).min(700);
+            let batch: Vec<Event> = (i..i + n)
+                .map(|j| {
+                    let idem = format!("e{j}");
+                    if j % 97 == 50 {
+                        rm(&format!("t/{}", (j / 7) % 9), true, &idem)
+                    } else {
+                        up(&format!("t/{}/{}", j % 9, j % 400), &format!("v{j}"), &idem)
+                    }
+                })
+                .collect();
+            now = repo.db_append(&now, &batch).unwrap();
+            late = repo.db_append_deferred(&late, &batch).unwrap();
+            i += n;
+        }
+        assert_eq!(late.kv_at, 0);
+        let caught = repo.db_catch_up(&late).unwrap();
+        assert_eq!(caught, now, "span {span}");
+        assert_eq!(caught.kv_at, span as u64);
+        // Written early every 7 (inside a page), 1,000 or 2,048 events: the same view.
+        for flush in [7u64, 1000, 2048] {
+            repo.catch_up_flush = flush;
+            assert_eq!(
+                repo.db_catch_up(&late).unwrap(),
+                now,
+                "span {span} flush {flush}"
+            );
+            repo.catch_up_flush = 0;
+        }
+    }
+}
+
+/// E392: an early-written catch-up of a database that keeps counts and
+/// drops ranges a chunk at a time gives the same roots too.
+#[test]
+fn flushed_catch_up_matches_with_counts_and_range_drops() {
+    for (counts, range_drop) in [(true, false), (false, true)] {
+        let mut repo = Repo::new(MemStore::default());
+        repo.db_range_drop = range_drop;
+        let mut empty = repo.db_empty().unwrap();
+        if counts {
+            empty = repo.db_keep_counts(&empty, 2).unwrap();
+        }
+        let (mut now, mut late) = (empty, empty);
+        for b in 0..6 {
+            let batch: Vec<Event> = (0..800)
+                .map(|j| {
+                    let k = b * 800 + j;
+                    let idem = format!("e{k}");
+                    if k % 131 == 7 {
+                        rm(&format!("t/{}", k % 5), true, &idem)
+                    } else {
+                        up(&format!("t/{}/{}", k % 5, k % 900), &format!("v{k}"), &idem)
+                    }
+                })
+                .collect();
+            now = repo.db_append(&now, &batch).unwrap();
+            late = repo.db_append_deferred(&late, &batch).unwrap();
+        }
+        repo.catch_up_flush = 1500;
+        assert_eq!(repo.db_catch_up(&late).unwrap(), now, "counts {counts}");
+    }
+}
+
 /// E370: `db_commit_new` makes a database's first commit only while its
 /// ref does not exist, so a second writer creating the same database is
 /// refused and retries over the first one's head.
