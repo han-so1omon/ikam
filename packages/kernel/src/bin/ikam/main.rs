@@ -1574,7 +1574,7 @@ mod tests {
         let before = repo.db_scan(&db).unwrap();
         drop(repo);
         assert!(is_pack_store(&s));
-        let refused = run(&s, &mut vec!["gc".to_string()]).unwrap_err();
+        let refused = run(&s, &mut vec!["gc".to_string()], false).unwrap_err();
         assert!(refused.contains("is a pack store"), "{refused}");
         // `db serve` without `--packs` and a project's `Live` refuse it too.
         let serve = db_cmd(&s, &["serve".to_string()]).unwrap_err();
