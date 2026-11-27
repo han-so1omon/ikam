@@ -5,6 +5,14 @@
 //! bounded by fuel and memory. Under those rules the same module and inputs
 //! give the same output everywhere, which reconstruction requires.
 //!
+//! [`Floats::Pinned`] (E441, an option for the steps that ask for it) turns
+//! floats on. The kernel builds wasmi with `deterministic`, so every NaN an
+//! operation makes is the canonical one, and an interpreter runs one
+//! operation at a time with no fused multiply-add and no reordering: E409
+//! measured the same bits on 11 builds across x86-64, ARM64, macOS and
+//! Windows for float functions that carry their own math (`exp` inside the
+//! module). Those steps stay pure derivations that repack may rebuild.
+//!
 //! wasmi runs with `auto-dispatch` (tail-call dispatch where the build
 //! supports it; E066: 2.2-2.6x faster than `portable-dispatch`). Outputs do
 //! not depend on the dispatch mode; fuel totals differ by under 0.01%
@@ -34,19 +42,28 @@ const FUEL: u64 = 1 << 30;
 pub const FUEL_PER_WORK: u64 = 1_000;
 const MAX_MEMORY: usize = 256 << 20;
 
+/// Whether a module may use floating point.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum Floats {
+    /// The default: a module with float instructions is refused.
+    Off,
+    /// Floats on, every NaN canonical (see the module docs).
+    Pinned,
+}
+
 /// Compiled modules by content hash (E066): compiling (validation and
 /// translation) is pure, so a module is compiled once per process and each
 /// call only instantiates it, with fresh state and its own fuel.
-fn compiled(module: &[u8]) -> Result<(Engine, Module), Error> {
-    type Cache = Mutex<HashMap<[u8; 32], (Engine, Module)>>;
+fn compiled(module: &[u8], floats: Floats) -> Result<(Engine, Module), Error> {
+    type Cache = Mutex<HashMap<([u8; 32], Floats), (Engine, Module)>>;
     static CACHE: OnceLock<Cache> = OnceLock::new();
-    let key = *blake3::hash(module).as_bytes();
+    let key = (*blake3::hash(module).as_bytes(), floats);
     let cache = CACHE.get_or_init(Cache::default);
     if let Some(hit) = cache.lock().unwrap().get(&key) {
         return Ok(hit.clone());
     }
     let mut config = Config::default();
-    config.floats(false).consume_fuel(true);
+    config.floats(floats == Floats::Pinned).consume_fuel(true);
     let engine = Engine::new(&config);
     let compiled = Module::new(&engine, module).map_err(|e| Error::Exec(format!("wasm: {e}")))?;
     cache
@@ -58,8 +75,13 @@ fn compiled(module: &[u8]) -> Result<(Engine, Module), Error> {
 
 /// Run `module` on `args`: its output and the fuel it spent.
 pub fn run(module: &[u8], args: &[Vec<u8>]) -> Result<(Vec<u8>, u64), Error> {
+    run_with(module, args, Floats::Off)
+}
+
+/// `run`, with floats as `floats` says.
+pub fn run_with(module: &[u8], args: &[Vec<u8>], floats: Floats) -> Result<(Vec<u8>, u64), Error> {
     let fail = |e: &dyn std::fmt::Display| Error::Exec(format!("wasm: {e}"));
-    let (engine, module) = compiled(module)?;
+    let (engine, module) = compiled(module, floats)?;
     if module.imports().next().is_some() {
         return Err(Error::Exec("wasm: modules may not import anything".into()));
     }

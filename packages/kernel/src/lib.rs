@@ -47,6 +47,7 @@ mod search;
 pub mod share;
 pub mod snapshot;
 pub mod stem;
+pub mod step;
 mod store;
 pub mod temperature;
 mod template;
@@ -64,7 +65,8 @@ pub use grant::{Denied, FileGrant, FragmentGrant, Grant, Sections, windows_aroun
 pub use graph::Keys;
 pub use id::Id;
 pub use object::{
-    Arg, Claim, Commit, Derivation, Edge, Graph, Kind, Node, Object, Target, TreeEntry, node_key,
+    Arg, Check, Claim, Commit, Derivation, Edge, Graph, Kind, Node, Object, Run, Target, TreeEntry,
+    node_key,
 };
 pub use range::ReadSession;
 pub use repack::Repacked;

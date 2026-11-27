@@ -142,7 +142,9 @@ impl<S: Store + Sync> Repo<S> {
             .collect::<BTreeSet<_>>()
             .into_iter()
             .collect();
-        let (content, _) = self.closure(roots.clone(), |d| !func::is_plan(&d.func))?;
+        let (mut content, mut runs) = self.closure(roots.clone(), |d| !func::is_plan(&d.func))?;
+        // A recorded step's inputs (E441) stay with its output.
+        self.add_runs(&mut content, &mut runs, |d| !func::is_plan(&d.func))?;
         let mut files: Vec<(Id, Vec<u8>)> = content
             .iter()
             .map(|id| Ok((*id, self.read_content(id)?)))

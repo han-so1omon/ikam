@@ -125,6 +125,28 @@ impl Derivation {
     }
 }
 
+/// A recorded step (E441): `output` was made by `func(args)` and its bytes
+/// are kept. Unlike a [`Derivation`], it is never a way to rebuild the
+/// output: the step may use floats freely, a seed, or work outside the
+/// kernel (a command, an agent), so a rerun is a check that reports same or
+/// different, and the first output stays the one of record. `check`, when
+/// set, names the step that judges a rerun that differs:
+/// `verdict = check.func(first, now, check.args...)`, itself a derivation.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Run {
+    pub output: Id,
+    pub func: Id,
+    pub args: Vec<Arg>,
+    pub check: Option<Check>,
+}
+
+/// The step a rerun's output is judged by (see [`Run`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Check {
+    pub func: Id,
+    pub args: Vec<Arg>,
+}
+
 /// An unverified semantic relation between two selections of content:
 /// `subject predicate object`, e.g. "bytes 0..400 of report mentions
 /// <entity>". The predicate is free text. `gain_bits` is measured by the
@@ -149,6 +171,7 @@ pub enum Object {
     Derivation(Derivation),
     Claim(Claim),
     Graph(Graph),
+    Run(Run),
 }
 
 impl Object {
@@ -210,6 +233,20 @@ impl Object {
                 }
             }
             Object::Graph(g) => encode_graph(&mut out, g),
+            Object::Run(r) => {
+                out.push(b'E');
+                out.extend_from_slice(r.output.as_bytes());
+                out.extend_from_slice(r.func.as_bytes());
+                put_args(&mut out, &r.args);
+                match &r.check {
+                    None => out.push(0),
+                    Some(c) => {
+                        out.push(1);
+                        out.extend_from_slice(c.func.as_bytes());
+                        put_args(&mut out, &c.args);
+                    }
+                }
+            }
         }
         out
     }
@@ -241,6 +278,19 @@ impl Object {
                 },
             }),
             b'G' => Object::Graph(decode_graph(&mut r)?),
+            b'E' => Object::Run(Run {
+                output: r.id()?,
+                func: r.id()?,
+                args: r.many(Reader::arg)?,
+                check: match r.take(1)?[0] {
+                    0 => None,
+                    1 => Some(Check {
+                        func: r.id()?,
+                        args: r.many(Reader::arg)?,
+                    }),
+                    _ => return Err(Error::Decode("unknown run check tag")),
+                },
+            }),
             _ => return Err(Error::Decode("unknown object tag")),
         };
         r.finish()?;
@@ -291,6 +341,22 @@ impl Object {
                 })
                 .collect(),
             Object::Graph(Graph::Children(_, children)) => children.clone(),
+            Object::Run(r) => {
+                let mut links = vec![
+                    ("output".to_string(), r.output),
+                    ("func".to_string(), r.func),
+                ];
+                for (i, a) in r.args.iter().enumerate() {
+                    links.push((label(&format!("arg{i}"), a), a.id()));
+                }
+                if let Some(c) = &r.check {
+                    links.push(("check".to_string(), c.func));
+                    for (i, a) in c.args.iter().enumerate() {
+                        links.push((label(&format!("check{i}"), a), a.id()));
+                    }
+                }
+                links
+            }
         }
     }
 }
