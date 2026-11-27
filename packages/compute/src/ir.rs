@@ -49,12 +49,28 @@ pub enum Op {
     Transpose,
     /// The same values in another shape of the same size.
     Reshape { shape: Vec<usize> },
+    /// A bound on nondeterminism (E442): the identity in value, shape and
+    /// gradient, declaring that the value here may differ between runs
+    /// (another platform, another build's arithmetic) by at most this
+    /// much. An element pair (recorded `r`, now `x`) is within when
+    /// `ulp_distance(r, x) <= ulp`, or `|r - x| <= abs`, or
+    /// `|r - x| <= rel * |r|`; NaN matches only NaN and an infinity only
+    /// itself, and a zero field never passes on its own. With `local`,
+    /// a bounded check carries on past this node from the value of
+    /// record, so each stretch between local bounds is checked on its own
+    /// (a per-step bound); without it the rerun's own value carries on
+    /// and differences accumulate through it (a propagated bound). Only
+    /// `memo::check_bounded` and `memo::check_graph_bounded` read it.
+    Within { ulp: u64, abs: f64, rel: f64, local: bool },
 }
 
 impl Op {
     /// Bytes naming the op and its parameters (a constant by its value).
     pub fn encode(&self) -> Vec<u8> {
         let (name, params): (&str, Vec<u64>) = match self {
+            // A new name, so every other op encodes as before and graphs
+            // without bounds keep their ids; the tolerances by their bits.
+            Op::Within { ulp, abs, rel, local } => ("within", vec![*ulp, abs.to_bits(), rel.to_bits(), *local as u64]),
             Op::Input(n) => return [b"input:".as_slice(), n.as_bytes()].concat(),
             Op::Const(t) => return [b"const:".as_slice(), &t.encode()].concat(),
             Op::Add => ("add", vec![]),
@@ -98,6 +114,18 @@ impl Op {
             return Ok(Op::Const(Tensor::decode(t)?));
         }
         let text = std::str::from_utf8(bytes).map_err(|_| bad())?;
+        if let Some(rest) = text.strip_prefix("within:") {
+            let p: Vec<u64> = rest.split(':').map(|s| s.parse().map_err(|_| bad())).collect::<Result<_, _>>()?;
+            return match p.as_slice() {
+                [ulp, abs, rel, local @ (0 | 1)] => Ok(Op::Within {
+                    ulp: *ulp,
+                    abs: f64::from_bits(*abs),
+                    rel: f64::from_bits(*rel),
+                    local: *local == 1,
+                }),
+                _ => Err(bad()),
+            };
+        }
         let mut parts = text.split(':');
         let name = parts.next().ok_or_else(bad)?;
         let p: Vec<usize> = parts.map(|s| s.parse().map_err(|_| bad())).collect::<Result<_, _>>()?;
@@ -203,6 +231,10 @@ impl Graph {
     pub fn concat(&mut self, parts: &[V]) -> V {
         self.push(Op::Concat, parts)
     }
+    /// A bound on `a`'s nondeterminism (see [`Op::Within`]).
+    pub fn within(&mut self, a: V, ulp: u64, abs: f64, rel: f64, local: bool) -> V {
+        self.push(Op::Within { ulp, abs, rel, local }, &[a])
+    }
 
     /// Each input name once, in first-use order.
     pub fn input_names(&self) -> Vec<String> {
@@ -238,7 +270,9 @@ impl Graph {
                         _ => return Err(bad("shapes differ")),
                     }
                 }
-                Op::Neg | Op::Exp | Op::Ln | Op::Sin | Op::Cos | Op::Tanh | Op::Sqrt => s[0].clone(),
+                Op::Neg | Op::Exp | Op::Ln | Op::Sin | Op::Cos | Op::Tanh | Op::Sqrt | Op::Within { .. } => {
+                    s[0].clone()
+                }
                 Op::Sum => vec![],
                 Op::Cumsum | Op::RevCumsum => {
                     if s[0].len() != 1 {

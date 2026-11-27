@@ -1,5 +1,11 @@
 //! Evaluation in memory: each op over tensors with pinned arithmetic, so
 //! the same graph and inputs give the same bits everywhere.
+//!
+//! [`Arith::Host`] (E442) is another arithmetic for the same graph, a
+//! stand-in for another platform or build: the host's math library,
+//! fused multiply-add and sums reordered into 8 lanes. It exists to
+//! measure and check bounds on nondeterminism; `eval` and `eval_all`
+//! stay pinned.
 
 use std::collections::BTreeMap;
 
@@ -10,12 +16,32 @@ use crate::{Error, Tensor};
 /// Inputs by name.
 pub type Env = BTreeMap<String, Tensor>;
 
+/// Float arithmetic for an evaluation.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Arith {
+    /// The pinned rules (`pinned`): the same bits on every platform.
+    #[default]
+    Pinned,
+    /// A stand-in for another platform or build (E409's modes at once):
+    /// `exp`, `ln`, `sin`, `cos`, `tanh` and `sqrt` from the host's math
+    /// library (`f64` methods, not `libm`), every multiply-add in a
+    /// matrix product fused (`dot_host`), and sums kept in 8 lanes added
+    /// pairwise at the end (`sum_lanes8`), as a vectorized build reorders
+    /// them. NaN stays canonical.
+    Host,
+}
+
 /// Every node's value.
 pub fn eval_all(g: &Graph, env: &Env) -> Result<Vec<Tensor>, Error> {
+    eval_all_with(g, env, Arith::Pinned)
+}
+
+/// Every node's value with the given arithmetic.
+pub fn eval_all_with(g: &Graph, env: &Env, arith: Arith) -> Result<Vec<Tensor>, Error> {
     let mut vals: Vec<Tensor> = Vec::with_capacity(g.nodes.len());
     for (i, n) in g.nodes.iter().enumerate() {
         let args: Vec<&Tensor> = n.args.iter().map(|a| &vals[*a]).collect();
-        let v = apply(&n.op, &args, env).map_err(|e| match e {
+        let v = apply_with(&n.op, &args, env, arith).map_err(|e| match e {
             Error::Shape(m) => Error::Shape(format!("node {i}: {m}")),
             e => e,
         })?;
@@ -26,8 +52,53 @@ pub fn eval_all(g: &Graph, env: &Env) -> Result<Vec<Tensor>, Error> {
 
 /// The graph's outputs.
 pub fn eval(g: &Graph, env: &Env) -> Result<Vec<Tensor>, Error> {
-    let vals = eval_all(g, env)?;
+    eval_with(g, env, Arith::Pinned)
+}
+
+/// The graph's outputs with the given arithmetic.
+pub fn eval_with(g: &Graph, env: &Env, arith: Arith) -> Result<Vec<Tensor>, Error> {
+    let vals = eval_all_with(g, env, arith)?;
     Ok(g.outputs.iter().map(|o| vals[*o].clone()).collect())
+}
+
+/// Sum in 8 lanes (element i into lane i mod 8), the lanes added
+/// pairwise: E409's `lanes8`.
+pub fn sum_lanes8(xs: &[f64]) -> f64 {
+    let mut l = [0.0f64; 8];
+    for (i, x) in xs.iter().enumerate() {
+        l[i % 8] += x;
+    }
+    canon(((l[0] + l[1]) + (l[2] + l[3])) + ((l[4] + l[5]) + (l[6] + l[7])))
+}
+
+/// Sum of products with every multiply-add fused: one chain for fewer
+/// than 16 terms (as a scalar build with FMA), else 8 lanes of chains
+/// added pairwise (a vectorized build with FMA).
+pub fn dot_host(a: &[f64], b: &[f64]) -> f64 {
+    if a.len() < 16 {
+        let mut s = 0.0f64;
+        for (x, y) in a.iter().zip(b) {
+            s = x.mul_add(*y, s);
+        }
+        return canon(s);
+    }
+    let mut l = [0.0f64; 8];
+    for (i, (x, y)) in a.iter().zip(b).enumerate() {
+        l[i % 8] = x.mul_add(*y, l[i % 8]);
+    }
+    canon(((l[0] + l[1]) + (l[2] + l[3])) + ((l[4] + l[5]) + (l[6] + l[7])))
+}
+
+fn host_unary(op: &Op) -> Option<fn(f64) -> f64> {
+    Some(match op {
+        Op::Exp => f64::exp,
+        Op::Ln => f64::ln,
+        Op::Sin => f64::sin,
+        Op::Cos => f64::cos,
+        Op::Tanh => f64::tanh,
+        Op::Sqrt => f64::sqrt,
+        _ => return None,
+    })
 }
 
 fn map(a: &Tensor, mut f: impl FnMut(f64) -> f64) -> Tensor {
@@ -50,6 +121,21 @@ fn rank1(a: &Tensor) -> Result<(), Error> {
 }
 
 pub fn apply(op: &Op, a: &[&Tensor], env: &Env) -> Result<Tensor, Error> {
+    apply_with(op, a, env, Arith::Pinned)
+}
+
+/// One op with the given arithmetic.
+pub fn apply_with(op: &Op, a: &[&Tensor], env: &Env, arith: Arith) -> Result<Tensor, Error> {
+    if arith == Arith::Host {
+        if let Some(f) = host_unary(op) {
+            return Ok(map(a[0], f));
+        }
+        match op {
+            Op::Sum => return Ok(Tensor::scalar(sum_lanes8(&a[0].data))),
+            Op::MatMul => return matmul_with(a[0], a[1], arith),
+            _ => {}
+        }
+    }
     Ok(match op {
         Op::Input(name) => env.get(name).cloned().ok_or_else(|| Error::MissingInput(name.clone()))?,
         Op::Const(t) => t.clone(),
@@ -114,7 +200,8 @@ pub fn apply(op: &Op, a: &[&Tensor], env: &Env) -> Result<Tensor, Error> {
             Tensor { shape: shape.clone(), data: vec![a[0].data[0]; shape.iter().product()] }
         }
         Op::Reshape { shape } => Tensor::new(shape.clone(), a[0].data.clone())?,
-        Op::MatMul => matmul(a[0], a[1])?,
+        Op::Within { .. } => a[0].clone(),
+        Op::MatMul => matmul_with(a[0], a[1], Arith::Pinned)?,
         Op::Transpose => {
             let (r, c) = dims2(a[0])?;
             let mut data = vec![0.0; r * c];
@@ -135,14 +222,27 @@ fn dims2(t: &Tensor) -> Result<(usize, usize), Error> {
     }
 }
 
-/// Row by column, each dot product summed in index order.
-fn matmul(a: &Tensor, b: &Tensor) -> Result<Tensor, Error> {
+/// Row by column, each dot product summed in index order (pinned) or as
+/// `dot_host` (host).
+fn matmul_with(a: &Tensor, b: &Tensor, arith: Arith) -> Result<Tensor, Error> {
     let (n, k) = dims2(a)?;
     let (k2, m) = dims2(b)?;
     if k != k2 {
         return Err(Error::Shape(format!("matmul {n}x{k} by {k2}x{m}")));
     }
     let mut data = vec![0.0; n * m];
+    if arith == Arith::Host {
+        let mut col = vec![0.0; k];
+        for j in 0..m {
+            for (t, c) in col.iter_mut().enumerate() {
+                *c = b.data[t * m + j];
+            }
+            for i in 0..n {
+                data[i * m + j] = dot_host(&a.data[i * k..(i + 1) * k], &col);
+            }
+        }
+        return Ok(Tensor { shape: vec![n, m], data });
+    }
     for i in 0..n {
         for j in 0..m {
             let mut s = 0.0;
