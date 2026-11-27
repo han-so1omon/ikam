@@ -6879,3 +6879,29 @@ Gates on the branch (E229 to E233): every kernel test suite passes (release); cl
 - Next: E413 folds deferred appends when a database goes quiet, so the reader after a burst does not pay the fold; then a `db squash` command for a stopped pack store, and a clear error from the commands that cannot open one.
 - Not measured: the Mac; real collector rows (synthetic JSON stands in); more than 3 days; `--plain-writes`, E391's lean ledger and E392's catch-up fold (PRs 84 and 83, not merged); dedup of observation rows that repeat the item's last one (most rows here differ only in `observed_at`).
 - Run: `python3 -I experiments/collector/collector_load.py IKAM_BIN WORK 3 8 250 "--live" per-job KEEP`; then `cargo run --release --example db_squash -- COPY_OF_STORE [cold|cold-group]`.
+
+### E415 collector-options (Night 2's lean ledger and catch-up fold, and `--plain-writes`, on E412's collector)
+
+- Branch / parent: exp/415-collector-options / E412
+- Question: three options already built for large loads, not yet merged or not on by default, may suit a collector: `--plain-writes` (on main), E391's `--lean-ledger` (PR 84) and E392's paged catch-up fold (PR 83). Under E412's collector, what does each do to append and read latency, memory and the store?
+- Setup: `experiments/collector/collector_load.py` as E412: 8 jobs of 250 items, `per-job`, 3 simulated days (576,000 observations), `--live` plus each option; E391's and E392's binaries built from their branches with their review fixes (local heads 3270855 and ddb8163). Linux cloud, 4 CPUs, one run each, one after another.
+- Results (per day 1, 2, 3 where three numbers are given):
+
+  | | `--live` (main) | `+ --plain-writes` | E391 `+ --lean-ledger` | E392 (catch-up fold) |
+  |---|---|---|---|---|
+  | wall time | 178 s | **88 s** | 158 s | 165 s |
+  | append p50 | 18, 24, 27 ms | 14, 17, 15 ms | 18, 20, 22 ms | 18, 20, 24 ms |
+  | append p95 | 60, 85, 98 ms | 31, 48, 36 ms | 55, 57, 65 ms | 55, 62, 87 ms |
+  | hourly latest-rows scan p50 | 358, 614, 645 ms | **152, 181, 194 ms** | 309, 588, 546 ms | 364, 488, 622 ms |
+  | resident | 304, 456, 639 MB | **103, 111, 158 MB** | **137, 177, 193 MB** | 221, 369, 504 MB |
+  | store after 3 days | 866.6 MB | 1,194.0 MB (+38%) | 866.6 MB | 866.6 MB |
+  | rows the reader missed | 0 | 0 | 0 | 0 |
+
+  - `--lean-ledger` cuts resident memory to a third (639 -> 193 MB on day 3) with the same store bytes and a little faster appends. It is the one to turn on for a collector.
+  - `--plain-writes` halves the wall time, cuts the reader's wait to a third and memory to a quarter, for 38% more store (it skips compressing view writes). With E414's `db squash` to give back history, that may be the better trade on a laptop with a large disk; not measured together here.
+  - E392's paged catch-up fold lowers memory by a fifth (504 against 639 MB) and changes little else: here the folds are of 20,000 events at a time, not the long catch-ups it was built for.
+- Change: none (a measurement; the options are on main or on their branches).
+- Fixed benchmark: not run; nothing changed.
+- Verdict: **measured**. For a collector: `--live --lean-ledger` once PR 84 is merged; `--plain-writes` where disk is cheap and memory or time is not.
+- Not measured: the Mac; options together (lean ledger with plain writes, with E413's idle fold); `db squash` on a plain-writes store; more than one run each.
+- Run: `python3 -I experiments/collector/collector_load.py IKAM_BIN WORK 3 8 250 "--live;--live --plain-writes"`, and with each branch's binary and its flag.
