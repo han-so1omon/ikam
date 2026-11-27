@@ -111,7 +111,7 @@ impl Plan {
                     }
                 }
                 Op::Fill { .. } => out.fill(a(0)[0]),
-                Op::Reshape { .. } => out.copy_from_slice(a(0)),
+                Op::Reshape { .. } | Op::Within { .. } => out.copy_from_slice(a(0)),
                 Op::MatMul => {
                     let (n, k) = (self.shapes[args[0]][0], self.shapes[args[0]][1]);
                     let m = self.shapes[args[1]][1];

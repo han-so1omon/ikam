@@ -107,6 +107,8 @@ fn vjp(
             vec![(0, a), (1, b)]
         }
         Op::Neg => vec![(0, h.neg(gy))],
+        // A bound is the identity; its gradient passes through unbounded.
+        Op::Within { .. } => vec![(0, gy)],
         Op::Exp => vec![(0, h.mul(gy, y))],
         Op::Ln => vec![(0, h.div(gy, args[0]))],
         Op::Sin => {

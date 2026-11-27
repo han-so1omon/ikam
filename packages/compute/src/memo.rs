@@ -15,7 +15,8 @@ use std::collections::HashMap;
 
 use ikam_kernel::{Db, Event, Form, Id, Repo, Store};
 
-use crate::eval::{Env, apply};
+use crate::bounds::{Report, coverage};
+use crate::eval::{Arith, Env, apply, apply_with, eval_with};
 use crate::ir::{Graph, Op};
 use crate::{Error, Tensor};
 
@@ -192,4 +193,107 @@ pub fn eval_graph_stored<S: Store>(
             Ok((ids, db, false))
         }
     }
+}
+
+fn recorded_id<S: Store>(repo: &Repo<S>, db: &Db, k: &str) -> Result<Id, Error> {
+    match repo.db_get(db, k)? {
+        Some(b) if b.len() == 32 => Ok(Id::from_bytes(b.try_into().unwrap())),
+        _ => Err(Error::NotRecorded(k.to_string())),
+    }
+}
+
+/// Check a rerun against the records `eval_stored` made, with bounds on
+/// nondeterminism (E442). The graph is evaluated again in memory with
+/// `arith` and every node is compared with its record, found under the
+/// first run's key (the op over the recorded argument ids), so a value
+/// that moved upstream does not make the lookups downstream miss. A node
+/// whose bits differ must be covered by a Within node (`bounds::coverage`:
+/// itself, or one on every path to an output), or the check fails with
+/// `Error::Nondeterministic` as an exact check does. Each Within node is
+/// reported as same, within or outside; past a local one the check
+/// carries on from the value of record. Nothing is written: no memo
+/// record and no content, so the first run stays the one of record. A
+/// graph without Within nodes is checked exactly.
+pub fn check_bounded<S: Store>(repo: &Repo<S>, db: &Db, g: &Graph, env: &Env, arith: Arith) -> Result<Report, Error> {
+    let covered = coverage(g);
+    let mut rec: Vec<Id> = Vec::with_capacity(g.nodes.len());
+    let mut now: Vec<Tensor> = Vec::with_capacity(g.nodes.len());
+    let mut cache: HashMap<Id, Tensor> = HashMap::new();
+    let mut report = Report::default();
+    for (i, n) in g.nodes.iter().enumerate() {
+        if let Op::Input(name) = &n.op {
+            let t = env.get(name).ok_or_else(|| Error::MissingInput(name.clone()))?;
+            rec.push(Id::of_content(&t.encode()));
+            now.push(t.clone());
+            continue;
+        }
+        let args: Vec<Id> = n.args.iter().map(|a| rec[*a]).collect();
+        let k = key(&n.op, &args);
+        let r = recorded_id(repo, db, &k)?;
+        let refs: Vec<&Tensor> = n.args.iter().map(|a| &now[*a]).collect();
+        let v = apply_with(&n.op, &refs, env, arith)?;
+        let vid = Id::of_content(&v.encode());
+        report.compared += 1;
+        let differs = vid != r;
+        report.differing += differs as usize;
+        let v = match &n.op {
+            Op::Within { local, .. } => {
+                let recorded = get(repo, &r, &mut cache)?;
+                report.judge(i, &n.op, &recorded, &v);
+                if *local { recorded } else { v }
+            }
+            _ if differs && !covered[i] => {
+                return Err(Error::Nondeterministic { key: k, recorded: r, now: vid });
+            }
+            _ => v,
+        };
+        rec.push(r);
+        now.push(v);
+    }
+    Ok(report)
+}
+
+/// Check a rerun against the whole-graph record `eval_graph_stored` made,
+/// with bounds (E442). Only the outputs were recorded, so the bounds are
+/// the Within nodes among the outputs: an output that differs must be
+/// one, and each is reported; Within nodes inside the graph pass values
+/// through (a local one cannot restart from a record that was not kept).
+/// Nothing is written.
+pub fn check_graph_bounded<S: Store>(
+    repo: &Repo<S>,
+    db: &Db,
+    g: &Graph,
+    graph: &Id,
+    env: &Env,
+    arith: Arith,
+) -> Result<Report, Error> {
+    let mut inputs = Vec::new();
+    for name in g.input_names() {
+        let t = env.get(&name).ok_or_else(|| Error::MissingInput(name.clone()))?;
+        inputs.push((name, Id::of_content(&t.encode())));
+    }
+    let k = graph_key(graph, &inputs);
+    let rec: Vec<Id> = match repo.db_get(db, &k)? {
+        Some(b) if b.len() == 32 * g.outputs.len() => {
+            b.chunks(32).map(|c| Id::from_bytes(c.try_into().unwrap())).collect()
+        }
+        _ => return Err(Error::NotRecorded(k)),
+    };
+    let outs = eval_with(g, env, arith)?;
+    let mut cache = HashMap::new();
+    let mut report = Report::default();
+    for ((o, v), r) in g.outputs.iter().zip(&outs).zip(&rec) {
+        let vid = Id::of_content(&v.encode());
+        report.compared += 1;
+        let differs = vid != *r;
+        report.differing += differs as usize;
+        let op = &g.nodes[*o].op;
+        if matches!(op, Op::Within { .. }) {
+            let recorded = get(repo, r, &mut cache)?;
+            report.judge(*o, op, &recorded, v);
+        } else if differs {
+            return Err(Error::Nondeterministic { key: k, recorded: *r, now: vid });
+        }
+    }
+    Ok(report)
 }

@@ -9,7 +9,7 @@
 
 use std::collections::BTreeMap;
 
-use crate::eval::{Env, eval};
+use crate::eval::{Arith, Env, dot_host, eval, eval_with};
 use crate::grad::{grad, hvp};
 use crate::ir::{Graph, V};
 use crate::plan::Plan;
@@ -62,12 +62,22 @@ impl Minimizer {
     }
 
     pub fn minimize(&self, env: &Env, x0: Tensor, opt: &Options) -> Result<(Tensor, Report), Error> {
+        self.minimize_with(env, x0, opt, Arith::Pinned)
+    }
+
+    /// `minimize` with another arithmetic for the graphs and for the
+    /// solver's own dot products and updates (E442: with `Arith::Host`
+    /// they are fused and the dot products summed in 8 lanes, as another
+    /// build would compute them).
+    pub fn minimize_with(&self, env: &Env, x0: Tensor, opt: &Options, arith: Arith) -> Result<(Tensor, Report), Error> {
+        let dot = |a: &[f64], b: &[f64]| dot_with(a, b, arith);
+        let axpy = |x: &[f64], a: f64, y: &[f64]| axpy_with(x, a, y, arith);
         let mut env = env.clone();
         let mut x = x0;
         let mut rep = Report::default();
         for it in 0..=opt.max_iter {
             env.insert(self.var.clone(), x.clone());
-            let out = eval(&self.gradient, &env)?;
+            let out = eval_with(&self.gradient, &env, arith)?;
             rep.evals += 1;
             let (f, g) = (out[0].item(), out[1].clone());
             let gn = g.data.iter().fold(0.0f64, |m, v| m.max(v.abs()));
@@ -80,13 +90,13 @@ impl Minimizer {
             if it == opt.max_iter {
                 break;
             }
-            let p = self.cg(&env, &g, opt, &mut rep)?;
+            let p = self.cg(&env, &g, opt, &mut rep, arith)?;
             let slope = dot(&g.data, &p);
             let mut step = 1.0;
             loop {
                 let trial = Tensor { shape: x.shape.clone(), data: axpy(&x.data, step, &p) };
                 env.insert(self.var.clone(), trial.clone());
-                let ft = eval(&self.energy, &env)?[0].item();
+                let ft = eval_with(&self.energy, &env, arith)?[0].item();
                 rep.evals += 1;
                 // Near a minimum the predicted decrease is below the
                 // energy's rounding, so allow that much slack; otherwise a
@@ -103,7 +113,9 @@ impl Minimizer {
     }
 
     /// Solve H p = -g by conjugate gradients from p = 0.
-    fn cg(&self, env: &Env, g: &Tensor, opt: &Options, rep: &mut Report) -> Result<Vec<f64>, Error> {
+    fn cg(&self, env: &Env, g: &Tensor, opt: &Options, rep: &mut Report, arith: Arith) -> Result<Vec<f64>, Error> {
+        let dot = |a: &[f64], b: &[f64]| dot_with(a, b, arith);
+        let axpy = |x: &[f64], a: f64, y: &[f64]| axpy_with(x, a, y, arith);
         let n = g.data.len();
         let mut p = vec![0.0; n];
         let mut r: Vec<f64> = g.data.iter().map(|v| -v).collect();
@@ -114,7 +126,7 @@ impl Minimizer {
         let mut env = env.clone();
         for k in 0..opt.max_cg {
             env.insert(format!("v:{}", self.var), Tensor { shape: g.shape.clone(), data: d.clone() });
-            let hd = eval(&self.hessian_vec, &env)?.remove(0).data;
+            let hd = eval_with(&self.hessian_vec, &env, arith)?.remove(0).data;
             rep.evals += 1;
             rep.cg_steps += 1;
             let curv = dot(&d, &hd);
@@ -143,6 +155,20 @@ fn dot(a: &[f64], b: &[f64]) -> f64 {
 
 fn axpy(x: &[f64], a: f64, y: &[f64]) -> Vec<f64> {
     x.iter().zip(y).map(|(x, y)| x + a * y).collect()
+}
+
+fn dot_with(a: &[f64], b: &[f64], arith: Arith) -> f64 {
+    match arith {
+        Arith::Pinned => dot(a, b),
+        Arith::Host => dot_host(a, b),
+    }
+}
+
+fn axpy_with(x: &[f64], a: f64, y: &[f64], arith: Arith) -> Vec<f64> {
+    match arith {
+        Arith::Pinned => axpy(x, a, y),
+        Arith::Host => x.iter().zip(y).map(|(x, y)| a.mul_add(*y, *x)).collect(),
+    }
 }
 
 /// The same Newton-CG over planned programs, for solves inside a loop that
