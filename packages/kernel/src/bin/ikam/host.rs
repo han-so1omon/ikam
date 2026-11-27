@@ -2,8 +2,11 @@
 //! projects (E313, E314). Each project is its own store, opened as `ikam
 //! live` opens one, with its own users, limits and share key; nothing is
 //! shared between stores. A project is chosen by the request's Host name
-//! (the names in the config, and `NAME.localhost`), never by path, because
-//! the pages and WebDAV answers of `ikam live` use absolute links.
+//! (the names in the config, and `NAME.localhost`). On a host name given
+//! with `explorer HOSTNAME` (E440, `explorer.rs`), `/` lists the projects
+//! the caller opens with their links, and `/p/NAME/...` serves project NAME
+//! as its own host name would; its pages resolve their links from there
+//! (WebDAV mounts still take the project's own host name).
 //!
 //! A request names one project and is checked against that project's users
 //! only, so a password for one project opens no other. Unknown host names
@@ -56,13 +59,22 @@ use crate::http::{self, Request, Response};
 use crate::json::Json;
 use crate::live::{self, Live};
 use crate::tokens::{Bucket, Rate, Token};
-use crate::{dav, ui};
+use crate::{dav, explorer, ui};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Role {
     Read,
     Write,
     Owner,
+}
+
+/// E440: a link on a project's explorer page, in a group such as
+/// `project` or `demo` (any word; groups show in the order they first come).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Link {
+    pub group: String,
+    pub url: String,
+    pub label: String,
 }
 
 /// One project as the config file declares it.
@@ -78,6 +90,10 @@ pub struct ProjectConfig {
     pub tokens: Vec<(Role, String, Vec<String>)>,
     /// E363: a rate for all the project's callers together.
     pub rate: Option<Rate>,
+    /// E440: what the explorer shows for the project.
+    pub title: Option<String>,
+    pub about: Option<String>,
+    pub links: Vec<Link>,
 }
 
 pub struct Config {
@@ -85,6 +101,8 @@ pub struct Config {
     pub projects: Vec<ProjectConfig>,
     /// E362: heavy jobs at once across the host, and how long one waits.
     pub heavy: Option<(usize, Duration)>,
+    /// E440: host names that answer with the explorer.
+    pub explorers: Vec<String>,
 }
 
 fn valid_name(s: &str) -> bool {
@@ -98,10 +116,13 @@ impl Config {
     /// Lines: `port N`, `project NAME STORE_DIR [REF]`, `host NAME HOSTNAME`,
     /// `user NAME ROLE USER:SALT:HASH` (from `ikam passwd`), `max-store NAME
     /// BYTES`, `max-body NAME BYTES`, `token NAME ROLE ID:HASH [rate=N/s]
-    /// [expires=SECS]` and `rate NAME N/s` (E363); `#` starts a comment.
+    /// [expires=SECS]` and `rate NAME N/s` (E363); `explorer HOSTNAME`,
+    /// `title NAME TEXT`, `about NAME TEXT` and `link NAME GROUP URL LABEL`
+    /// (E440); `#` starts a comment.
     pub fn parse(text: &str) -> Result<Config, String> {
         let mut port = 8750;
         let mut projects: Vec<ProjectConfig> = Vec::new();
+        let mut explorers: Vec<String> = Vec::new();
         let (mut heavy_jobs, mut heavy_wait) = (None, Duration::from_secs(60));
         for (n, line) in text.lines().enumerate() {
             let line = line.split('#').next().unwrap_or("").trim();
@@ -147,15 +168,46 @@ impl Config {
                         max_body: None,
                         tokens: Vec::new(),
                         rate: None,
+                        title: None,
+                        about: None,
+                        links: Vec::new(),
                     });
                 }
                 ["host", name, host] => {
                     let i = project(&mut projects, name)?;
-                    let host = host.to_ascii_lowercase();
-                    if host.is_empty() || host.contains(['/', ':', '@']) {
-                        return Err(bad("host NAME HOSTNAME, a name without a port"));
+                    projects[i].hosts.push(
+                        host_name(host)
+                            .ok_or_else(|| bad("host NAME HOSTNAME, a name without a port"))?,
+                    );
+                }
+                ["explorer", host] => explorers.push(
+                    host_name(host)
+                        .ok_or_else(|| bad("explorer HOSTNAME, a name without a port"))?,
+                ),
+                ["title" | "about", name, text @ ..] if !text.is_empty() => {
+                    let i = project(&mut projects, name)?;
+                    let text = Some(text.join(" "));
+                    if words[0] == "title" {
+                        projects[i].title = text;
+                    } else {
+                        projects[i].about = text;
                     }
-                    projects[i].hosts.push(host);
+                }
+                ["link", name, group, url, label @ ..] if !label.is_empty() => {
+                    let i = project(&mut projects, name)?;
+                    if !valid_name(group) {
+                        return Err(bad("a link group is a-z, 0-9 and -"));
+                    }
+                    if !link_url(url) {
+                        return Err(bad(
+                            "a link is an http(s) URL, a /path, or a path inside the project",
+                        ));
+                    }
+                    projects[i].links.push(Link {
+                        group: group.to_string(),
+                        url: url.to_string(),
+                        label: label.join(" "),
+                    });
                 }
                 ["user", name, role, line] => {
                     let i = project(&mut projects, name)?;
@@ -214,12 +266,34 @@ impl Config {
                 }
             }
         }
+        if let Some(h) = explorers.iter().find(|h| seen.contains_key(*h)) {
+            return Err(format!("host {h} is named by {} and an explorer", seen[h]));
+        }
         Ok(Config {
             port,
             projects,
             heavy: heavy_jobs.map(|n| (n, heavy_wait)),
+            explorers,
         })
     }
+}
+
+/// A host name as the config gives it, lower case, without a port.
+fn host_name(s: &str) -> Option<String> {
+    let h = s.to_ascii_lowercase();
+    (!h.is_empty() && !h.contains(['/', ':', '@'])).then_some(h)
+}
+
+/// E440: an explorer link: `http://` or `https://`, a path on this host
+/// (`/...`, not `//`), or a path inside the project (`file?path=a.md`). Any
+/// other scheme (`javascript:`) is refused.
+fn link_url(u: &str) -> bool {
+    let lower = u.to_ascii_lowercase();
+    if lower.starts_with("https://") || lower.starts_with("http://") {
+        return u.len() > lower.find("//").unwrap() + 2;
+    }
+    let head = u.split(['/', '?', '#']).next().unwrap_or("");
+    !u.is_empty() && !u.starts_with("//") && !head.contains(':') && !u.contains('\\')
 }
 
 fn parse_role(s: &str) -> Option<Role> {
@@ -247,12 +321,16 @@ pub struct Project {
     key: [u8; 32],
     tokens: Vec<Token>,
     bucket: Option<Mutex<Bucket>>,
+    pub title: Option<String>,
+    pub about: Option<String>,
+    pub links: Vec<Link>,
 }
 
 pub struct Host {
     pub projects: BTreeMap<String, Project>,
     port: u16,
     heavy: Option<Heavy>,
+    explorers: Vec<String>,
 }
 
 /// E362: at most `max` heavy jobs at once across the host's projects; the
@@ -352,6 +430,73 @@ fn now() -> u64 {
         .map_or(0, |d| d.as_secs())
 }
 
+/// A host name without its port, lower case.
+fn bare_host(host: &str) -> String {
+    let host = host.to_ascii_lowercase();
+    match host.rsplit_once(':') {
+        Some((n, p)) if p.bytes().all(|b| b.is_ascii_digit()) => n.to_string(),
+        _ => host,
+    }
+}
+
+/// The caller's role in a project, from a token or the best user whose
+/// password matches, and the token if one let them in.
+fn role<'a>(p: &'a Project, req: &Request) -> (Option<Role>, Option<&'a Token>) {
+    let token = crate::tokens::bearer(&p.tokens, req.header("authorization"), now());
+    let role = match token {
+        Some(t) => Some(t.role),
+        None => p
+            .users
+            .iter()
+            .filter(|(_, a)| a.check(req).is_none())
+            .map(|(r, _)| *r)
+            .max(),
+    };
+    (role, token)
+}
+
+fn password_required() -> Response {
+    Response::text(401, "password required").with(
+        "WWW-Authenticate",
+        "Basic realm=\"ikam\", charset=\"UTF-8\"",
+    )
+}
+
+/// E440: a MOVE or COPY Destination under the explorer (`/p/NAME/dav/..`,
+/// or a URL with that path) as the project sees it (`/dav/..`). One outside
+/// the project is left as it is, and WebDAV refuses it.
+fn local_destination(d: &str, base: &str) -> String {
+    let path = match d.find("://") {
+        Some(i) => {
+            let after = &d[i + 3..];
+            &after[after.find('/').unwrap_or(after.len())..]
+        }
+        None => d,
+    };
+    match path.strip_prefix(base) {
+        Some(rest) if rest.starts_with('/') => rest.to_string(),
+        _ => d.to_string(),
+    }
+}
+
+/// E440: a page of the project served under the explorer resolves its
+/// links from the project's path, not from `/`.
+fn set_base(r: &mut Response, base: &str) {
+    const ROOT: &[u8] = b"<base href=\"/\">";
+    let html = r
+        .headers
+        .iter()
+        .any(|(k, v)| k.eq_ignore_ascii_case("content-type") && v.starts_with("text/html"));
+    let head = &r.body[..r.body.len().min(256)];
+    if let Some(i) = html
+        .then(|| head.windows(ROOT.len()).position(|w| w == ROOT))
+        .flatten()
+    {
+        let tag = format!("<base href=\"{}\">", http::esc(base));
+        r.body.splice(i..i + ROOT.len(), tag.into_bytes());
+    }
+}
+
 fn ok_json(j: Json) -> Response {
     Response::new(200).body("application/json", j.encode())
 }
@@ -404,6 +549,9 @@ impl Host {
                     key,
                     tokens,
                     bucket: p.rate.map(|r| Mutex::new(Bucket::new(r, start))),
+                    title: p.title,
+                    about: p.about,
+                    links: p.links,
                 },
             );
         }
@@ -411,41 +559,109 @@ impl Host {
             projects,
             port: config.port,
             heavy: config.heavy.map(|(n, wait)| Heavy::new(n, wait)),
+            explorers: config.explorers,
         })
     }
 
     /// The project a Host header names.
     fn project(&self, host: Option<&str>) -> Option<&Project> {
-        let host = host?.to_ascii_lowercase();
-        let name = match host.rsplit_once(':') {
-            Some((n, p)) if p.bytes().all(|b| b.is_ascii_digit()) => n.to_string(),
-            _ => host,
-        };
+        let name = bare_host(host?);
         self.projects.values().find(|p| p.hosts.contains(&name))
     }
 
+    /// E440: the project an explorer path (`/p/NAME/...`) names, with the
+    /// rest of the path.
+    fn explorer_project<'a>(&self, host: &str, path: &'a str) -> Option<(&Project, &'a str)> {
+        if !self.explorers.contains(&bare_host(host)) {
+            return None;
+        }
+        let rest = path.strip_prefix("/p/")?;
+        let (name, tail) = rest.split_once('/').unwrap_or((rest, ""));
+        Some((self.projects.get(name)?, tail))
+    }
+
+    /// The body limit for a request: its project's, by host name or by
+    /// explorer path; none at all for a host that names no project.
+    fn body_limit(&self, host: &str, path: &str) -> Option<usize> {
+        match self.explorer_project(host, path) {
+            Some((p, _)) => p.max_body,
+            None => self.project(Some(host)).map_or(Some(0), |p| p.max_body),
+        }
+    }
+
     pub fn handle(&self, req: Request) -> Response {
+        if self
+            .explorers
+            .contains(&bare_host(req.header("host").unwrap_or("")))
+        {
+            return self.explore(req);
+        }
         let Some(p) = self.project(req.header("host")) else {
             return Response::text(404, "no such project");
         };
+        self.serve(p, req)
+    }
+
+    /// E440: the explorer: `/` lists the projects the caller's user or token
+    /// opens, `/projects/NAME` is one project's page with its links, and
+    /// `/p/NAME/...` is the project itself, as its own host name serves it.
+    /// A project the caller cannot open, or that does not exist, asks for a
+    /// password, as a wrong password does.
+    fn explore(&self, mut req: Request) -> Response {
         if req.path == "/robots.txt" {
             return Response::text(200, "User-agent: *\nDisallow: /\n");
         }
-        let token = crate::tokens::bearer(&p.tokens, req.header("authorization"), now());
-        let role = match token {
-            Some(t) => Some(t.role),
-            None => p
-                .users
-                .iter()
-                .filter(|(_, a)| a.check(&req).is_none())
-                .map(|(r, _)| *r)
-                .max(),
-        };
+        if req.path.starts_with("/p/") {
+            let host = req.header("host").unwrap_or("");
+            let Some((p, tail)) = self.explorer_project(host, &req.path) else {
+                return password_required();
+            };
+            let base = format!("/p/{}", p.name);
+            let dav = tail == "dav" || tail.starts_with("dav/");
+            req.path = format!("/{tail}");
+            for (k, v) in req.headers.iter_mut() {
+                if k.eq_ignore_ascii_case("destination") {
+                    *v = local_destination(v, &base);
+                }
+            }
+            let mut r = self.serve(p, req);
+            if !dav {
+                set_base(&mut r, &format!("{base}/"));
+            }
+            return r;
+        }
+        let open: Vec<(&Project, Role)> = self
+            .projects
+            .values()
+            .filter_map(|p| Some((p, role(p, &req).0?)))
+            .collect();
+        if open.is_empty() {
+            return password_required();
+        }
+        if !matches!(req.method.as_str(), "GET" | "HEAD") {
+            return Response::text(405, "the explorer only reads");
+        }
+        match req.path.as_str() {
+            "/" => explorer::index(&open),
+            path => match path.strip_prefix("/projects/") {
+                Some(name) => match open.iter().find(|(p, _)| p.name == name) {
+                    Some((p, r)) => explorer::project(p, *r),
+                    None => Response::text(404, "no such project"),
+                },
+                None => Response::text(404, "no such page"),
+            },
+        }
+    }
+
+    /// One request to one project: its user or token, rates, body limit,
+    /// then the route, with a panic answered 500.
+    fn serve(&self, p: &Project, req: Request) -> Response {
+        if req.path == "/robots.txt" {
+            return Response::text(200, "User-agent: *\nDisallow: /\n");
+        }
+        let (role, token) = role(p, &req);
         let Some(role) = role else {
-            return Response::text(401, "password required").with(
-                "WWW-Authenticate",
-                "Basic realm=\"ikam\", charset=\"UTF-8\"",
-            );
+            return password_required();
         };
         // E363: the project's rate, then the token's.
         let at = std::time::Instant::now();
@@ -876,14 +1092,16 @@ pub fn host_cmd(args: &[String]) -> Result<(), String> {
     for p in host.projects.values() {
         say!("{t} project {}: {}", p.name, p.hosts.join(", "));
     }
+    if !host.explorers.is_empty() {
+        say!("{t} explorer: {}", host.explorers.join(", "));
+    }
     say!("{t} host on 127.0.0.1:{}", host.port);
     // Each project's body limit applies before its body is read: the
     // server asks for the limit of the project the Host header names. An
     // unknown host gets no body at all; its answer is 404 either way.
     let b = host.clone();
-    let body_limit: &'static http::BodyLimit = Box::leak(Box::new(move |h: &str| {
-        b.project(Some(h)).map_or(Some(0), |p| p.max_body)
-    }));
+    let body_limit: &'static http::BodyLimit =
+        Box::leak(Box::new(move |h: &str, path: &str| b.body_limit(h, path)));
     let limits = http::Limits {
         body_limit: Some(body_limit),
         ..http::Limits::default()
@@ -956,6 +1174,11 @@ mod tests {
     /// Projects a and b, each with an owner, a writer and a reader, and c
     /// with an owner only; a holds public and private files.
     fn host(name: &str) -> (Host, Vec<PathBuf>) {
+        host_with(name, "")
+    }
+
+    /// As `host`, with more config lines.
+    fn host_with(name: &str, extra: &str) -> (Host, Vec<PathBuf>) {
         let dirs: Vec<PathBuf> = ["a", "b", "c"]
             .iter()
             .map(|p| dir(&format!("{name}-{p}")))
@@ -971,6 +1194,7 @@ mod tests {
             }
         }
         text += "max-body c 1K\n";
+        text += extra;
         let h = Host::open(Config::parse(&text).unwrap()).unwrap();
         {
             let mut l = h.projects["a"].live.lock().unwrap();
@@ -1025,6 +1249,124 @@ mod tests {
         );
         assert!(Host::open(Config::parse(&t).unwrap()).is_err());
         let _ = std::fs::remove_dir_all(d);
+    }
+
+    #[test]
+    fn explorer_lines_are_checked() {
+        let base = format!("project a /x\nuser a owner {}\n", user("o", "pw"));
+        let parse = |more: &str| Config::parse(&format!("{base}{more}"));
+        let c = parse(
+            "explorer Explorer.Example\ntitle a The  A project\nabout a What a is.\n\
+             link a demo https://x.example/a Demo one\nlink a project file?path=a.md The file\n\
+             link a demo /projects/a Its page\n",
+        )
+        .unwrap();
+        assert_eq!(c.explorers, ["explorer.example"]);
+        let p = &c.projects[0];
+        assert_eq!(p.title.as_deref(), Some("The A project"));
+        assert_eq!(p.about.as_deref(), Some("What a is."));
+        assert_eq!(p.links.len(), 3);
+        assert_eq!(p.links[1].label, "The file");
+        for bad in [
+            "explorer a.localhost",
+            "host a a.example\nexplorer a.example",
+            "explorer x.example:8443",
+            "link a demo javascript:alert(1) x",
+            "link a demo JAVASCRIPT:alert(1) x",
+            "link a demo //elsewhere.example/ x",
+            "link a demo https:// x",
+            "link a Demo https://x.example/ x",
+            "link a demo https://x.example/",
+            "link b demo https://x.example/ x",
+            "title a",
+        ] {
+            assert!(parse(bad).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn the_explorer_shows_and_serves_only_the_projects_a_caller_opens() {
+        let (h, dirs) = host_with(
+            "explorer",
+            "explorer explorer.example\ntitle a Alpha <lab>\nabout a Notes & files.\n\
+             link a project https://a.example/run The running one\n\
+             link a demo file?path=pub/one.md The first note\n\
+             link b demo https://b.example/ Beta demo\n",
+        );
+        let ex = "explorer.example";
+        let ar = Some(("a-reader", "pw"));
+        let aw = Some(("a-writer", "pw"));
+        let text = |r: Response| (r.status, String::from_utf8_lossy(&r.body).into_owned());
+        // No password, a wrong one, or a project it does not open: 401.
+        let r = h.handle(req("GET", ex, None, "/", b""));
+        assert_eq!(r.status, 401);
+        assert!(r.headers.iter().any(|(k, _)| k == "WWW-Authenticate"));
+        assert_eq!(
+            h.handle(req("GET", ex, Some(("a-reader", "no")), "/", b""))
+                .status,
+            401
+        );
+        assert_eq!(h.handle(req("GET", ex, ar, "/p/b/", b"")).status, 401);
+        assert_eq!(h.handle(req("GET", ex, ar, "/p/nope/", b"")).status, 401);
+        // The list holds a only, escaped, with its links.
+        let (st, list) = text(h.handle(req("GET", ex, ar, "/", b"")));
+        assert_eq!(st, 200);
+        assert!(list.contains("Alpha &lt;lab&gt;") && list.contains("Notes &amp; files."));
+        assert!(
+            list.contains("href=\"/p/a/file?path=pub/one.md\""),
+            "{list}"
+        );
+        assert!(list.contains("href=\"https://a.example/run\""));
+        assert!(!list.contains("/projects/b") && !list.contains("Beta demo"));
+        let (st, page) = text(h.handle(req("GET", ex, ar, "/projects/a", b"")));
+        assert_eq!(st, 200);
+        assert!(page.contains("<h2>project</h2>") && page.contains("<h2>demo</h2>"));
+        assert!(page.contains("your role: read"));
+        assert_eq!(h.handle(req("GET", ex, ar, "/projects/b", b"")).status, 404);
+        assert_eq!(h.handle(req("GET", ex, OB, "/projects/a", b"")).status, 404);
+        assert_eq!(h.handle(req("POST", ex, ar, "/", b"")).status, 405);
+        // The project under its path: pages resolve links from there.
+        let (st, files) = text(h.handle(req("GET", ex, ar, "/p/a/", b"")));
+        assert_eq!(st, 200);
+        assert!(files.contains("<base href=\"/p/a/\">") && files.contains("pub"));
+        let (st, note) = text(h.handle(req("GET", ex, ar, "/p/a/dav/pub/one.md", b"")));
+        assert_eq!((st, note.as_str()), (200, "alpha shared\n"));
+        assert_eq!(
+            h.handle(req("PUT", ex, ar, "/p/a/dav/pub/x.md", b"x"))
+                .status,
+            403
+        );
+        assert_eq!(
+            h.handle(req("PUT", ex, aw, "/p/a/dav/pub/x.md", b"x"))
+                .status,
+            201
+        );
+        // MOVE: a Destination in the project, as a URL or a path, lands in
+        // it; one in another project is refused.
+        let mv = |to: &str| {
+            let mut r = req("MOVE", ex, aw, "/p/a/dav/pub/x.md", b"");
+            r.headers.push(("Destination".into(), to.into()));
+            h.handle(r).status
+        };
+        assert_eq!(mv("/p/b/dav/x.md"), 400);
+        assert_eq!(mv("https://explorer.example/p/a/dav/pub/y.md"), 201);
+        let mut l = h.projects["a"].live.lock().unwrap();
+        assert!(matches!(l.stat("pub/y.md"), Ok(Some((Kind::File, _)))));
+        assert!(matches!(l.stat("pub/x.md"), Ok(None)));
+        drop(l);
+        // The project's own host name serves as before, with the root base.
+        let (st, own) = text(h.handle(req("GET", "a.example-host", ar, "/", b"")));
+        assert_eq!(st, 200);
+        assert!(own.contains("<base href=\"/\">"));
+        // Body limits follow the project the path names.
+        assert_eq!(
+            h.body_limit("explorer.example:8750", "/p/c/dav/big"),
+            Some(1024)
+        );
+        assert_eq!(h.body_limit("explorer.example", "/p/a/dav/x"), None);
+        assert_eq!(h.body_limit("explorer.example", "/"), Some(0));
+        assert_eq!(h.body_limit("c.example-host", "/dav/x"), Some(1024));
+        done(dirs);
     }
 
     #[test]
