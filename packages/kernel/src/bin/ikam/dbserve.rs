@@ -89,6 +89,12 @@ pub struct Server<S: Store> {
     /// E376: per database, the keys written since its kv view's position,
     /// known while this process made every append since (see `Touched`).
     touched: Mutex<HashMap<String, Touched>>,
+    /// E413: fold a database's deferred appends once no append has come
+    /// for this long (None: only on a read or once `defer_kv` events wait).
+    fold_idle: Option<std::time::Duration>,
+    /// E413: when each database last took an append whose fold is still
+    /// owed, for `fold_idle`.
+    last_append: Mutex<HashMap<String, std::time::Instant>>,
 }
 
 /// E376: what a database's deferred appends wrote after its kv view's
@@ -168,7 +174,50 @@ impl<S: Store> Server<S> {
             shared: false,
             skip_unchanged: false,
             touched: Mutex::new(HashMap::new()),
+            fold_idle: None,
+            last_append: Mutex::new(HashMap::new()),
         }
+    }
+
+    /// E413 (off by default): fold a database's deferred appends (E368)
+    /// once it has taken no append for `idle`, in the background, so the
+    /// next read finds its view caught up instead of folding first. Fits a
+    /// database written in bursts with quiet between, such as a collector
+    /// whose jobs run every few minutes: the fold that `--defer-kv` saves
+    /// from each append is paid between bursts, not by the first reader.
+    /// An append that arrives during a fold waits for it, as it would
+    /// for a read's.
+    pub fn fold_idle(mut self, idle: Option<std::time::Duration>) -> Server<S> {
+        self.fold_idle = idle;
+        self
+    }
+
+    /// E413: fold every database whose last append is older than
+    /// `fold_idle` and whose view still lags. Returns how many it folded.
+    pub fn fold_idle_pass(&self) -> usize {
+        let Some(idle) = self.fold_idle else {
+            return 0;
+        };
+        let due: Vec<String> = {
+            let mut last = self.last_append.lock().unwrap();
+            let due: Vec<String> = last
+                .iter()
+                .filter(|(_, t)| t.elapsed() >= idle)
+                .map(|(n, _)| n.clone())
+                .collect();
+            for n in &due {
+                last.remove(n);
+            }
+            due
+        };
+        let mut folded = 0;
+        for name in due {
+            match self.settle(&name) {
+                Ok(()) => folded += 1,
+                Err(e) => say!("{} fold of {name} when idle: {e}", crate::live::stamp()),
+            }
+        }
+        folded
     }
 
     /// E376 (off by default): an upsert whose key holds those very bytes
@@ -852,6 +901,14 @@ fn append_once<S: Store>(
         .lock()
         .unwrap()
         .insert(name.to_string(), (Some(c), new));
+    if srv.fold_idle.is_some() {
+        let mut last = srv.last_append.lock().unwrap();
+        if new.kv_at < new.ids_at {
+            last.insert(name.to_string(), std::time::Instant::now());
+        } else {
+            last.remove(name);
+        }
+    }
     Ok(Response::new(200).body("application/json", head_json(Some(c), new.ids_at)))
 }
 
@@ -860,7 +917,7 @@ fn append_once<S: Store>(
 pub fn serve<S: Store + Send + 'static>(
     repo: Repo<S>,
     readers: Option<ReaderFactory<S>>,
-    (keep_counts, defer_kv, skip_unchanged): (u32, u64, bool),
+    (keep_counts, defer_kv, skip_unchanged, fold_idle): (u32, u64, bool, u64),
     (search, views): (crate::dbsearch::SearchOpts, Option<crate::dbviews::Served>),
     port: u16,
     allowed: Vec<String>,
@@ -882,12 +939,23 @@ pub fn serve<S: Store + Send + 'static>(
             .keep_counts(keep_counts)
             .defer_kv(defer_kv)
             .skip_unchanged(skip_unchanged)
+            .fold_idle((fold_idle > 0).then(|| std::time::Duration::from_millis(fold_idle)))
             .vector_index(search.index)
             .vector_threads(search.threads)
             .keep_search(search.keep)
             .views(views)
             .shared_store(shared),
     );
+    if fold_idle > 0 {
+        // E413: look a few times per idle period, at most every 250 ms.
+        let (st, every) = (state.clone(), fold_idle.clamp(10, 1000) / 4);
+        std::thread::spawn(move || {
+            loop {
+                std::thread::sleep(std::time::Duration::from_millis(every.max(5)));
+                st.fold_idle_pass();
+            }
+        });
+    }
     let hosts = Hosts::new(port, allowed);
     let password = auth.is_some();
     let handler = Arc::new(move |req: Request| {
@@ -1879,5 +1947,57 @@ mod tests {
             &[("content-type", "text/plain")],
         ));
         assert_eq!(r.status, 415);
+    }
+
+    /// E413: with `fold_idle`, deferred appends fold once a database has
+    /// been quiet that long, and not before; reads see the same rows.
+    #[test]
+    fn idle_databases_fold_their_deferred_appends() {
+        let st = Server::new(Repo::new(MemStore::default()), None)
+            .defer_kv(1000)
+            .fold_idle(Some(std::time::Duration::from_millis(40)));
+        let ct = [("content-type", EVENTS)];
+        let lag = |st: &Server<MemStore>, name: &str| {
+            let (_, db) = st.heads.lock().unwrap()[name];
+            db.ids_at - db.kv_at
+        };
+        for (name, n) in [("a", 3), ("b", 2)] {
+            let ev: Vec<Event> = (0..n)
+                .map(|i| Event::upsert(&format!("t/{i}"), name.as_bytes(), &format!("{name}{i}")))
+                .collect();
+            let r = handle(
+                &st,
+                &req(
+                    "POST",
+                    &format!("/db/{name}/append"),
+                    &encode_events(&ev),
+                    &ct,
+                ),
+            );
+            assert_eq!(r.status, 200);
+        }
+        assert_eq!((lag(&st, "a"), lag(&st, "b")), (3, 2));
+        // Not quiet long enough yet.
+        assert_eq!(st.fold_idle_pass(), 0);
+        assert_eq!(lag(&st, "a"), 3);
+        std::thread::sleep(std::time::Duration::from_millis(60));
+        assert_eq!(st.fold_idle_pass(), 2);
+        assert_eq!((lag(&st, "a"), lag(&st, "b")), (0, 0));
+        // Nothing owed: a second pass does nothing.
+        assert_eq!(st.fold_idle_pass(), 0);
+        let r = handle(&st, &req("GET", "/db/a/get?key=t/2", b"", &[]));
+        assert_eq!(r.body, b"a");
+        // An append that folds by itself leaves nothing owed.
+        let off = Server::new(Repo::new(MemStore::default()), None)
+            .defer_kv(1)
+            .fold_idle(Some(std::time::Duration::from_millis(1)));
+        let ev = encode_events(&[Event::upsert("t/x", b"1", "x1")]);
+        assert_eq!(
+            handle(&off, &req("POST", "/db/c/append", &ev, &ct)).status,
+            200
+        );
+        assert_eq!(lag(&off, "c"), 0);
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        assert_eq!(off.fold_idle_pass(), 0);
     }
 }

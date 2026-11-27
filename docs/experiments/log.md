@@ -6569,3 +6569,28 @@ Gates on the branch (E229 to E233): every kernel test suite passes (release); cl
 - Next: E413 folds deferred appends when a database goes quiet, so the reader after a burst does not pay the fold; then a `db squash` command for a stopped pack store, and a clear error from the commands that cannot open one.
 - Not measured: the Mac; real collector rows (synthetic JSON stands in); more than 3 days; `--plain-writes`, E391's lean ledger and E392's catch-up fold (PRs 84 and 83, not merged); dedup of observation rows that repeat the item's last one (most rows here differ only in `observed_at`).
 - Run: `python3 -I experiments/collector/collector_load.py IKAM_BIN WORK 3 8 250 "--live" per-job KEEP`; then `cargo run --release --example db_squash -- COPY_OF_STORE [cold|cold-group]`.
+
+### E413 idle-fold (`db serve --fold-idle MS`: fold deferred appends when a database goes quiet)
+
+- Branch / parent: exp/413-idle-fold / E412
+- Question: in E412 the collector's hourly reader waited about half a second on every reading for the fold of the appends written since the last one (`--live` defers them, `--defer-kv 20000`, and folds before a read). A collector is quiet most of the time between polls. If the server folds a database's deferred appends once it has had none for a while, does the reader after a burst find them folded, and what does it cost?
+- Change (option, off): `db serve --fold-idle MS` (needs `--defer-kv N` or `--live`; 0, off, by default; not part of `--live`). The server notes when each database last took an append that left events unfolded; a thread wakes every quarter of MS (at least 5 ms, at most 250) and settles each database that has had no append for MS, as a read would. A read still settles whatever is left, so answers are the same.
+- Result (`experiments/collector/collector_load.py` as E412, 8 jobs of 250 items, `per-job`, 1 simulated day, with `COLLECTOR_GAP=1.0`: one second of real time after each poll's writes, as the quiet between polls; Linux cloud, 4 CPUs, one run each):
+
+  | | `--live` (main) | `--live --fold-idle 300` |
+  |---|---|---|
+  | hourly latest-rows scan p50 / max | 452 / 1,079 ms | **66** / 1,426 ms |
+  | last hour's count / 500-row scan p50 | 7.1 / 4.9 ms | 7.6 / 6.1 ms |
+  | append p50 / p95 / max | 36 / 92 / 981 ms | 35 / 176 / 971 ms |
+  | rows the reader missed | 0 | 0 |
+  | store after the day | 265 MB | 362 MB (+36%) |
+  | resident | 299 MB | 452 MB |
+  | wall time | 153 s | 150 s |
+
+  - The reader no longer pays the fold in most readings (p50 452 -> 66 ms). Its worst case is not better: when a poll's fold takes longer than the quiet, the reader waits behind it (1.4 s).
+  - The cost is the store: folding after every poll writes the views 96 times a day instead of 30 to 50 (at every 20,000 events and at each reading), and every write keeps its earlier chunks reachable from history (E412), so the store grows a third faster. Resident memory rose by half. Appends at p95 doubled, from polls whose appends land while the previous poll's fold is running.
+- Checks: `idle_databases_fold_their_deferred_appends` (two databases with 1,000-event deferral and 40 ms idle: nothing folds before the idle time, both fold after, a second pass has nothing to do, reads answer the same; a server that does not defer owes nothing); `db_live_turns_on_the_live_options` (the option is not part of `--live`); `--fold-idle` without deferral is refused. `cargo test --release --features embed`: 377 pass; clippy `-D warnings` clean.
+- Fixed benchmark: not run; no default changed.
+- Verdict: **kept** as an option, off. It moves the fold off the reader at the price of store growth that only history reaches, so it pairs with E414's `db squash`, which gives those bytes back on a stopped store.
+- Not measured: the Mac; real time between polls (15 minutes, not one second); idle times other than 300 ms; the store after a squash with the option on; more than one day.
+- Run: `COLLECTOR_GAP=1.0 python3 -I experiments/collector/collector_load.py IKAM_BIN WORK 1 8 250 "--live;--live --fold-idle 300"`.

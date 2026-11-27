@@ -43,7 +43,7 @@ const USAGE: &str = "usage: ikam [--store DIR] [--short-records] [--slow-codec-m
   ls [REV[:PATH]] [-r]             list a directory of REV (default main)
   grep TEXT [REV]                  files of REV containing TEXT, with lines
   stats [REV]                      objects and bytes the store holds
-  db serve [--live] [--packs] [--plain-events] [--no-object-templates] [--concurrent-reads] [--edit-index] [--plain-writes] [--hnsw] [--hnsw-threads N] [--keep-search] [--no-keep-search] [--shared-store] [--skip-unchanged] [--keep-counts N] [--defer-kv N] [--seed-index-max N] [--views FILE] [--plain-view-writes] [--keep-views] [--keep-on-hangup] [PORT]
+  db serve [--live] [--packs] [--plain-events] [--no-object-templates] [--concurrent-reads] [--edit-index] [--plain-writes] [--hnsw] [--hnsw-threads N] [--keep-search] [--no-keep-search] [--shared-store] [--skip-unchanged] [--keep-counts N] [--defer-kv N] [--fold-idle MS] [--seed-index-max N] [--views FILE] [--plain-view-writes] [--keep-views] [--keep-on-hangup] [PORT]
                                    the store's databases over HTTP, for programs
                                    (default port 8740, 127.0.0.1 only; dbserve.rs);
                                    --live turns on the options a live database
@@ -54,7 +54,10 @@ const USAGE: &str = "usage: ikam [--store DIR] [--short-records] [--slow-codec-m
                                    ignores SIGHUP (E374); --skip-unchanged drops
                                    upserts of a key's current value (E376, off);
                                    --hnsw-threads N links --hnsw's first build on
-                                   N threads (E389, off)
+                                   N threads (E389, off); --fold-idle MS folds
+                                   deferred appends once a database has had none
+                                   for MS, so a read after a burst finds them
+                                   folded (E413, off)
   host --config FILE [PORT]        several separate projects in one process, each
                                    its own store, users and limits, chosen by Host
                                    name; crossing only through scoped shares (host.rs)
@@ -296,7 +299,7 @@ fn main() -> ExitCode {
 fn db_cmd(store_dir: &str, args: &[String]) -> Result<(), String> {
     let mut args = args.to_vec();
     if args.first().map(String::as_str) != Some("serve") {
-        return Err("usage: ikam [--store DIR] db serve [--live] [--packs] [--plain-events] [--no-object-templates] [--concurrent-reads] [--edit-index] [--plain-writes] [--hnsw] [--hnsw-threads N] [--keep-search] [--no-keep-search] [--shared-store] [--skip-unchanged] [--keep-counts N] [--defer-kv N] [--seed-index-max N] [--views FILE] [--plain-view-writes] [--keep-views] [--allow-host NAME]... [--log-requests] [--keep-on-hangup] [PORT]".into());
+        return Err("usage: ikam [--store DIR] db serve [--live] [--packs] [--plain-events] [--no-object-templates] [--concurrent-reads] [--edit-index] [--plain-writes] [--hnsw] [--hnsw-threads N] [--keep-search] [--no-keep-search] [--shared-store] [--skip-unchanged] [--keep-counts N] [--defer-kv N] [--fold-idle MS] [--seed-index-max N] [--views FILE] [--plain-view-writes] [--keep-views] [--allow-host NAME]... [--log-requests] [--keep-on-hangup] [PORT]".into());
     }
     args.remove(0);
     let keep_on_hangup = take_switch(&mut args, "--keep-on-hangup");
@@ -331,6 +334,10 @@ fn db_cmd(store_dir: &str, args: &[String]) -> Result<(), String> {
         None if plain_views => return Err("--plain-view-writes needs --views FILE".into()),
         None => None,
     };
+    let fold_idle: u64 = match take_flag(&mut args, "--fold-idle") {
+        Some(n) => n.parse().map_err(err)?,
+        None => 0,
+    };
     let seed_index_max: Option<usize> = match take_flag(&mut args, "--seed-index-max") {
         Some(n) => Some(n.parse().map_err(err)?),
         None => None,
@@ -341,6 +348,10 @@ fn db_cmd(store_dir: &str, args: &[String]) -> Result<(), String> {
     };
     let (packs, log_requests, mut serve_opts) =
         db_flags(&mut args, keep_counts, defer_kv, seed_index_max);
+    if fold_idle > 0 && serve_opts.defer_kv == 0 {
+        return Err("--fold-idle folds deferred appends: it needs --defer-kv N or --live".into());
+    }
+    serve_opts.fold_idle = fold_idle;
     if let Some(n) = hnsw_threads {
         if !serve_opts.hnsw {
             return Err("--hnsw-threads needs --hnsw".into());
@@ -432,6 +443,7 @@ fn db_flags(
         skip_unchanged,
         seed_index_max,
         hnsw_threads: 1,
+        fold_idle: 0,
     };
     (packs, log_requests, opts)
 }
@@ -461,6 +473,8 @@ struct DbServeOpts {
     seed_index_max: usize,
     /// E389: threads linking a graph's first build (1: one at a time).
     hnsw_threads: usize,
+    /// E413: fold deferred appends after this many ms without one (0: off).
+    fold_idle: u64,
 }
 
 /// `db serve` on `store`; with `concurrent_reads` the store is shared, so
@@ -511,7 +525,7 @@ fn serve_db<S: ikam_kernel::Store + Send + Sync + 'static>(
         dbserve::serve(
             tune(Repo::new(shared), o),
             Some(make),
-            (o.keep_counts, o.defer_kv, o.skip_unchanged),
+            (o.keep_counts, o.defer_kv, o.skip_unchanged, o.fold_idle),
             (search(o), views),
             port,
             allowed,
@@ -521,7 +535,7 @@ fn serve_db<S: ikam_kernel::Store + Send + Sync + 'static>(
         dbserve::serve(
             tune(Repo::new(store), o),
             None,
-            (o.keep_counts, o.defer_kv, o.skip_unchanged),
+            (o.keep_counts, o.defer_kv, o.skip_unchanged, o.fold_idle),
             (search(o), views),
             port,
             allowed,
@@ -1265,6 +1279,7 @@ mod tests {
             skip_unchanged: false,
             seed_index_max: LIVE_SEED_INDEX_MAX,
             hnsw_threads: 1,
+            fold_idle: 0,
         };
         let mut a = v(&["--live", "8752"]);
         assert_eq!(db_flags(&mut a, 0, None, None), (true, false, all));
@@ -1303,6 +1318,7 @@ mod tests {
             skip_unchanged: false,
             seed_index_max: 0,
             hnsw_threads: 1,
+            fold_idle: 0,
         };
         assert_eq!(db_flags(&mut a, 0, None, None), (false, false, off));
         // E357: `--plain-writes` is its own option, not part of `--live`.
