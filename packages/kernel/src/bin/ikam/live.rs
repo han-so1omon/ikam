@@ -24,6 +24,7 @@ use ikam_kernel::bm25::Bm25Mem;
 use ikam_kernel::{Edit, FsStore, Id, Kind, Object, Repo, Store, TreeEntry, snapshot};
 
 use crate::corpus::err;
+use crate::json::{self, Json};
 use crate::text::{self, Doc};
 
 /// Bytes of recently read content kept in memory.
@@ -114,6 +115,11 @@ pub struct Live {
     /// Run `gc` after this many commits (off by default: each gc walks the
     /// whole store while edits wait) (E116).
     pub gc_every: Option<usize>,
+    /// `--edit-journal` (E398, off): each edit is written to
+    /// `<store>/live-journal` and synced before it is answered, and a start
+    /// commits what a killed process left there. Without it an answered
+    /// edit lives only in memory until it commits.
+    journal: Option<std::fs::File>,
     commits_since_gc: usize,
     /// The store's size when last measured, and `repo.bytes_written` then.
     measured: Option<(u64, usize)>,
@@ -205,6 +211,7 @@ impl Live {
             started: SystemTime::now(),
             max_store: None,
             gc_every: None,
+            journal: None,
             commits_since_gc: 0,
             measured: None,
             events: VecDeque::new(),
@@ -256,6 +263,7 @@ impl Live {
     /// being discarded).
     pub fn switch_ref_dropping(&mut self, refname: &str) -> Result<(), String> {
         self.pending.clear();
+        self.journal_clear()?;
         self.hold_until = None;
         let base = self.repo.store().get_ref(refname).map_err(err)?;
         let base_tree = base
@@ -452,7 +460,10 @@ impl Live {
         }
         cost.store_ms = t.elapsed().as_secs_f64() * 1e3 - cost.index_ms;
         let t = Instant::now();
-        self.work = self.repo.edit_tree(Some(self.work), &edits).map_err(err)?;
+        // The work tree moves only once the journal holds the edits.
+        let work = self.repo.edit_tree(Some(self.work), &edits).map_err(err)?;
+        self.journal_edits(&edits)?;
+        self.work = work;
         self.pending.extend(edits);
         cost.tree_ms = t.elapsed().as_secs_f64() * 1e3;
         self.last_edit = Instant::now();
@@ -768,6 +779,103 @@ impl Live {
         }
     }
 
+    /// E398: turn on the edit journal. Edits a killed process answered
+    /// and never committed are committed first, on the ref they were made
+    /// on; returns how many. Needs a store that syncs every object (not
+    /// `--deferred-sync`), since a record names its content by id.
+    pub fn open_journal(&mut self) -> Result<usize, String> {
+        let path = self.store_dir.join(JOURNAL);
+        // Only a missing journal is an empty one: any other read error
+        // stops the start rather than truncating edits it could not read.
+        let (text, existed) = match std::fs::read(&path) {
+            Ok(t) => (t, true),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => (Vec::new(), false),
+            Err(e) => return Err(format!("edit journal {}: {e}", path.display())),
+        };
+        let (refname, base, edits) = parse_journal(&text)?;
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+            .map_err(err)?;
+        if !existed {
+            // A new file's name is durable only once its folder is synced.
+            std::fs::File::open(&self.store_dir)
+                .and_then(|d| d.sync_all())
+                .map_err(err)?;
+        }
+        let n = edits.len();
+        if n > 0 {
+            let home = self.refname.clone();
+            if refname != home {
+                self.switch_ref(&refname)?;
+            }
+            // A commit whose journal was not yet cleared when the process
+            // died: the head already holds these edits.
+            let base_tree = base
+                .map(|c| snapshot::tree_of(&self.repo, &c))
+                .transpose()
+                .map_err(err)?;
+            let done = self.base != base
+                && base_tree
+                    .is_some_and(|bt| self.repo.edit_tree(Some(bt), &edits).ok() == self.base_tree);
+            if !done {
+                self.work = self.repo.edit_tree(self.base_tree, &edits).map_err(err)?;
+                self.pending.extend(edits);
+                self.flush_with(
+                    true,
+                    Some(&format!("live: {n} edit(s) recovered after a restart")),
+                )?;
+            }
+            if refname != home {
+                self.switch_ref(&home)?;
+            }
+            self.log(format!(
+                "edit journal: {n} edit(s) left by a stopped process{}",
+                if done {
+                    ", already committed"
+                } else {
+                    ", committed"
+                }
+            ));
+        }
+        file.set_len(0).map_err(err)?;
+        file.sync_all().map_err(err)?;
+        self.journal = Some(file);
+        Ok(n)
+    }
+
+    /// Append `edits` to the journal and sync, before they are answered.
+    fn journal_edits(&mut self, edits: &[Edit]) -> Result<(), String> {
+        let Some(f) = self.journal.as_mut() else {
+            return Ok(());
+        };
+        let mut out = String::new();
+        if self.pending.is_empty() {
+            out.push_str(&journal_head(&self.refname, self.base));
+        }
+        for e in edits {
+            out.push_str(&journal_line(e));
+        }
+        // A failed append is cut back off, so a later record never follows
+        // a torn one and a restart never replays edits nobody was told of.
+        let len = f.metadata().map_err(err)?.len();
+        if let Err(e) = f.write_all(out.as_bytes()).and_then(|_| f.sync_data()) {
+            let _ = f.set_len(len).and_then(|_| f.sync_data());
+            return Err(format!("edit journal: {e}"));
+        }
+        Ok(())
+    }
+
+    /// Empty the journal: its edits are committed or dropped.
+    fn journal_clear(&mut self) -> Result<(), String> {
+        if let Some(f) = self.journal.as_mut() {
+            f.set_len(0).map_err(err)?;
+            f.sync_data().map_err(err)?;
+        }
+        Ok(())
+    }
+
     pub fn pending(&self) -> usize {
         self.pending.len()
     }
@@ -790,6 +898,7 @@ impl Live {
         self.sync()?;
         if Some(self.work) == self.base_tree {
             self.pending.clear();
+            self.journal_clear()?;
             return Ok(None);
         }
         let n = self.pending.len();
@@ -801,6 +910,7 @@ impl Live {
         self.base = Some(commit);
         self.base_tree = Some(self.work);
         self.pending.clear();
+        self.journal_clear()?;
         self.log(format!(
             "committed {n} change(s) as {}",
             &commit.to_hex()[..12]
@@ -1135,6 +1245,87 @@ fn civil(z: i64) -> (i64, u32, u32) {
     (if m <= 2 { y + 1 } else { y }, m, d)
 }
 
+/// E398: the edit journal's file, in the store's folder.
+pub const JOURNAL: &str = "live-journal";
+
+/// The journal's first line: the ref and the commit its edits apply on.
+fn journal_head(refname: &str, base: Option<Id>) -> String {
+    let base = base.map_or_else(|| "-".to_string(), |b| b.to_hex());
+    format!(
+        "{}\n",
+        Json::Arr(vec![
+            Json::Str("ref".into()),
+            Json::Str(refname.into()),
+            Json::Str(base)
+        ])
+        .encode()
+    )
+}
+
+/// One edit, one line.
+fn journal_line(e: &Edit) -> String {
+    let v = |xs: &[&str]| Json::Arr(xs.iter().map(|x| Json::Str((*x).into())).collect());
+    let line = match e {
+        Edit::Put { path, id } => v(&["put", path, &id.to_hex()]),
+        Edit::Mkdir { path } => v(&["mkdir", path]),
+        Edit::Remove { path } => v(&["rm", path]),
+        Edit::Rename { from, to } => v(&["mv", from, to]),
+        Edit::Copy { from, to } => v(&["cp", from, to]),
+    };
+    format!("{}\n", line.encode())
+}
+
+/// The ref, base and edits of a journal. A last line cut off by a kill
+/// (no newline, or not whole) was never answered and is left out.
+fn parse_journal(text: &[u8]) -> Result<(String, Option<Id>, Vec<Edit>), String> {
+    let text = String::from_utf8_lossy(text);
+    let mut lines: Vec<&str> = text.split_inclusive('\n').collect();
+    if lines.last().is_some_and(|l| !l.ends_with('\n')) {
+        lines.pop();
+    }
+    let mut refname = String::new();
+    let mut base = None;
+    let mut edits = Vec::new();
+    for (i, line) in lines.iter().enumerate() {
+        let Ok(j) = json::parse(line.trim_end()) else {
+            if i + 1 == lines.len() {
+                break;
+            }
+            return Err(format!("{JOURNAL}: line {} is not a record", i + 1));
+        };
+        let a: Vec<&str> = j.as_arr().iter().filter_map(Json::as_str).collect();
+        let id = |s: &str| {
+            s.parse::<Id>()
+                .map_err(|_| format!("{JOURNAL}: bad id {s}"))
+        };
+        match a.as_slice() {
+            ["ref", r, b] => {
+                refname = (*r).to_string();
+                base = if *b == "-" { None } else { Some(id(b)?) };
+            }
+            ["put", p, c] => edits.push(Edit::Put {
+                path: (*p).into(),
+                id: id(c)?,
+            }),
+            ["mkdir", p] => edits.push(Edit::Mkdir { path: (*p).into() }),
+            ["rm", p] => edits.push(Edit::Remove { path: (*p).into() }),
+            ["mv", f, to] => edits.push(Edit::Rename {
+                from: (*f).into(),
+                to: (*to).into(),
+            }),
+            ["cp", f, to] => edits.push(Edit::Copy {
+                from: (*f).into(),
+                to: (*to).into(),
+            }),
+            _ => return Err(format!("{JOURNAL}: line {} is not a record", i + 1)),
+        }
+    }
+    if !edits.is_empty() && refname.is_empty() {
+        return Err(format!("{JOURNAL}: edits without a ref line"));
+    }
+    Ok((refname, base, edits))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1144,6 +1335,94 @@ mod tests {
         let t = SystemTime::UNIX_EPOCH + Duration::from_secs(1_794_268_800); // 2026-11-10
         assert_eq!(http_date(t), "Tue, 10 Nov 2026 00:00:00 GMT");
         assert_eq!(iso_date(t), "2026-11-10T00:00:00Z");
+    }
+
+    #[test]
+    fn the_edit_journal_keeps_answered_edits_across_a_kill() {
+        // E398: edits answered and never committed (the process "killed":
+        // dropped with no flush) are committed by the next start.
+        let dir = std::env::temp_dir().join(format!("ikam-live-journal-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let d = dir.to_str().unwrap();
+        let read = |l: &mut Live, p: &str| -> Option<Vec<u8>> {
+            match l.stat(p).unwrap() {
+                Some((Kind::File, id)) => Some(l.read(&id).unwrap().to_vec()),
+                _ => None,
+            }
+        };
+        {
+            let mut l = Live::open(d, "main").unwrap();
+            assert_eq!(l.open_journal().unwrap(), 0);
+            l.apply(vec![Op::Put("a.txt".into(), b"one".to_vec())])
+                .unwrap();
+            l.flush(true).unwrap().expect("a commit");
+            assert_eq!(std::fs::metadata(dir.join(JOURNAL)).unwrap().len(), 0);
+            l.apply(vec![Op::Mkdir("d".into())]).unwrap();
+            l.apply(vec![Op::Put("d/b.txt".into(), b"two".to_vec())])
+                .unwrap();
+            l.apply(vec![Op::Copy("d/b.txt".into(), "c.txt".into())])
+                .unwrap();
+            l.apply(vec![Op::Rename("a.txt".into(), "e.txt".into())])
+                .unwrap();
+            l.apply(vec![Op::Remove("c.txt".into())]).unwrap();
+            assert_eq!(l.pending(), 5);
+        }
+        let head = |d: &str| {
+            let l = Live::open(d, "main").unwrap();
+            l.head()
+        };
+        let before = head(d);
+        // A record cut off mid-write was never answered: it is left out.
+        let mut j = std::fs::OpenOptions::new()
+            .append(true)
+            .open(dir.join(JOURNAL))
+            .unwrap();
+        j.write_all(b"[\"put\",\"torn.txt\",\"00").unwrap();
+        drop(j);
+        {
+            let mut l = Live::open(d, "main").unwrap();
+            assert_eq!(l.open_journal().unwrap(), 5);
+            assert_ne!(l.head(), before);
+            assert_eq!(l.pending(), 0);
+            assert_eq!(read(&mut l, "e.txt").as_deref(), Some(&b"one"[..]));
+            assert_eq!(read(&mut l, "d/b.txt").as_deref(), Some(&b"two"[..]));
+            assert_eq!(read(&mut l, "a.txt"), None);
+            assert_eq!(read(&mut l, "c.txt"), None);
+            assert_eq!(read(&mut l, "torn.txt"), None);
+            assert!(l.repo.fsck_deep().unwrap().is_empty());
+        }
+        // A commit made whose journal was not cleared (killed in between):
+        // the next start sees the head already holds the edits.
+        let committed = head(d);
+        {
+            let mut l = Live::open(d, "main").unwrap();
+            l.open_journal().unwrap();
+            l.apply(vec![Op::Put("f.txt".into(), b"three".to_vec())])
+                .unwrap();
+            let kept = std::fs::read(dir.join(JOURNAL)).unwrap();
+            l.flush(true).unwrap().expect("a commit");
+            std::fs::write(dir.join(JOURNAL), kept).unwrap();
+        }
+        let after = head(d);
+        assert_ne!(after, committed);
+        {
+            let mut l = Live::open(d, "main").unwrap();
+            assert_eq!(l.open_journal().unwrap(), 1);
+            assert_eq!(l.head(), after, "no second commit");
+            assert_eq!(read(&mut l, "f.txt").as_deref(), Some(&b"three"[..]));
+        }
+        assert_eq!(std::fs::metadata(dir.join(JOURNAL)).unwrap().len(), 0);
+        // A journal that exists but cannot be read stops the start; it is
+        // never taken as empty and truncated.
+        std::fs::remove_file(dir.join(JOURNAL)).unwrap();
+        std::fs::create_dir(dir.join(JOURNAL)).unwrap();
+        {
+            let mut l = Live::open(d, "main").unwrap();
+            let e = l.open_journal().unwrap_err();
+            assert!(e.contains("edit journal"), "{e}");
+        }
+        assert!(dir.join(JOURNAL).is_dir());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

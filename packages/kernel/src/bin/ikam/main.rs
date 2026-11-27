@@ -85,7 +85,7 @@ const USAGE: &str = "usage: ikam [--store DIR] [--short-records] [--slow-codec-m
        [--allow-host NAME]... [--log-requests] [--public]
        [--max-body BYTES] [--max-store BYTES] [--max-conns N] [--gc-every N]
        [--deferred-sync] [--no-object-templates] [--passage-index] [--keep-on-hangup]
-       [--rank-files] [--file-vectors PREFIX]
+       [--rank-files] [--file-vectors PREFIX] [--edit-journal]
                                    run REF (default main) as a live filesystem:
                                    WebDAV at http://127.0.0.1:PORT/dav/ (mount it
                                    in Finder: Go > Connect to Server), a web page
@@ -105,6 +105,11 @@ const USAGE: &str = "usage: ikam [--store DIR] [--short-records] [--slow-codec-m
                                    SIGHUP (the terminal closed) commits pending
                                    edits, logs which signal, then exits;
                                    --keep-on-hangup ignores SIGHUP instead.
+                                   --edit-journal syncs each edit to
+                                   <store>/live-journal before answering it, so
+                                   a kill (-9, power) loses none, and the next
+                                   start commits them (E398; off; not with
+                                   --deferred-sync).
                                    --log-requests prints one line per request
                                    (time, method, path, status, ms, client).
                                    For a copy open to anyone: --max-body refuses
@@ -967,6 +972,10 @@ fn live_cmd(
     let before = args.len();
     args.retain(|a| a != "--deferred-sync");
     let deferred_sync = args.len() != before;
+    let edit_journal = take_switch(&mut args, "--edit-journal");
+    if edit_journal && deferred_sync {
+        return Err("--edit-journal names content by id, so it needs every object synced when it is written: drop --deferred-sync".into());
+    }
     let before = args.len();
     args.retain(|a| a != "--no-object-templates");
     let object_templates = args.len() == before;
@@ -1008,6 +1017,15 @@ fn live_cmd(
     l.gc_every = gc_every;
     if let Some(ms) = commit_after {
         l.commit_after = Duration::from_millis(ms);
+    }
+    if edit_journal {
+        let n = l.open_journal()?;
+        if n > 0 {
+            say!(
+                "{} edit journal: {n} edit(s) a stopped process answered were committed",
+                live::stamp()
+            );
+        }
     }
     l.llm = llm;
     if llm && !ask::key_available() {

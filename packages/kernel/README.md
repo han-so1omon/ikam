@@ -109,6 +109,15 @@ ikam --store S ask "which file says how to add a paragraph?" [--llm]
   `--max-conns` (503 past that many connections). `--public` sets them to
   25M, 1G and 32 unless given, and closes idle connections after 30 s.
   Header lines over 16 KB or more than 100 headers get 431 everywhere.
+- **Edits a kill would lose** (E398): `live` answers an edit before it
+  commits (after `--commit-after` of quiet), so a `kill -9` or a power cut
+  loses what was answered since the last commit, and everything when a
+  writer never pauses for that long. The store itself stays sound (`fsck`
+  clean every time). `--edit-journal` (off) syncs each edit to
+  `<store>/live-journal` before answering, and the next start commits what
+  it holds: none lost in 40 kills, for about 3% on a PUT. Not with
+  `--deferred-sync`. `ikam mcp` keeps every commit it answered; its edits
+  are pending until the agent commits, as the tools say.
 - **Collecting garbage** (E116): every live edit stores a new working tree,
   and a file written then replaced or removed before a commit is in no
   commit, so a store that is edited often keeps bytes nothing needs.

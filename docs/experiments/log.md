@@ -6802,3 +6802,30 @@ Gates on the branch (E229 to E233): every kernel test suite passes (release); cl
 - Next: profile edit and write on a 70 KB file (re-index cost per call); a repack trigger by size for `mcp` and `live` (an option), then this run again; the same workload in the 2026-07-28 era once E406 lands.
 - Not measured: the Mac; Claude Code as the client (the SDK client stands in); concurrent agents on one store; office files changed through MCP (tools carry text only, so office files were read, not edited); more than one run per seed.
 - Run: `python3 -I experiments/agent-workload/agent_workload.py IKAM_BIN WORK 200 397` (and seed 398).
+### E398 live-crash (what `ikam live` and `ikam mcp` keep through a kill -9, and `live --edit-journal`)
+
+- Branch / parent: exp/398-live-crash / main 437aef6
+- Question: E374 checked that `db serve` keeps every append it answered through a SIGKILL. Do `ikam live` (WebDAV, watched folders) and `ikam mcp` (the agent tools) keep every edit they answered, and does the store come back clean? (Night 3 of the trip-week plan; business case: AI file service.)
+- Setup: `experiments/crash-safety/kill_live_mcp.py`, 20 trials a setting, seeded. `live`: a fresh store, a writer PUTs small files (10 B to 4 KB) over WebDAV one after another (`live`, no pause) or in bursts of about 15 with 0 to 3 s pauses (`live-burst`, a person saving or a sync tool), and the process gets SIGKILL after 0.2 to 3 s (1 to 10 s for bursts). A PUT answered 201 or 204 counts as acknowledged. Checked: what `main` holds right after the kill, then after the process has started again and stopped cleanly (SIGTERM, which commits pending edits), and `ikam fsck` both times. `mcp`: a scripted client writes 1 to 5 files and commits, over and over, killed the same way; every commit answered must check out exactly and `main` must be the last answered or the one in flight. Linux cloud, 4 CPUs.
+- Found on main: `live` answers an edit before it commits it (after `--commit-after`, 1.5 s of quiet), so a kill loses every edit answered since the last commit, and **everything** under a writer that never pauses for 1.5 s. The edits' objects are in the store (synced one by one), but no tree in any commit names them. The store was sound every time. `mcp` kept every commit.
+- Change: `ikam live --edit-journal` (off). Each edit, before it is answered, is appended to `<store>/live-journal` as one JSON line (a first line names the ref and the commit the edits apply on; a put names its content id) and synced. A commit or a drop empties the journal. On start, a journal left by a killed process is committed on its ref as "live: N edit(s) recovered after a restart"; a last line cut off mid-write was never answered and is left out; if the head already holds the edits (killed between the commit and the emptying), nothing is committed twice. Refused with `--deferred-sync`, where objects are not synced until a commit, so a journal of ids could name content that is gone. `ikam mcp` is left as it is: its edits are pending until the agent's own `commit`, by design (the tools say so), and at exit it leaves them uncommitted.
+- Results (20 kills each; PUT times are each answered PUT's round trip, over all trials):
+
+  | setting | binary | PUTs answered | lost after the kill | lost after a restart | fsck | PUT p50 / p99 | restart |
+  | --- | --- | --- | --- | --- | --- | --- | --- |
+  | `live`, steady writer | main | 2,660 | 2,660 (20 of 20 trials) | 2,660 | 20 / 20 | 7.80 / 186.8 ms | 0.024 s |
+  | | branch, off | 3,474 | 3,474 (20) | 3,474 | 20 / 20 | 8.51 / 15.8 ms | 0.023 s |
+  | | branch, `--edit-journal` | 4,048 | (4,048 not yet committed) | **0** | 20 / 20 | 8.79 / 16.7 ms | 0.042 s |
+  | `live-burst` | main | 1,460 | 696 (15) | 696 | 20 / 20 | 6.36 / 13.7 ms | 0.022 s |
+  | | main, `--deferred-sync` | 1,325 | 947 (18) | 947 | 20 / 20 | 3.22 / 8.9 ms | 0.022 s |
+  | | branch, off | 1,425 | 930 (16) | 930 | 20 / 20 | 6.94 / 16.0 ms | 0.022 s |
+  | | branch, `--edit-journal` | 1,442 | (940 not yet committed) | **0** | 20 / 20 | 7.41 / 15.0 ms | 0.042 s |
+  | `mcp` | main | 1,405 commits | 0 | | 20 / 20, head ok 20 | | 0.023 s |
+  | | branch | 1,204 commits | 0 | | 20 / 20, head ok 20 | | 0.026 s |
+
+  No file was ever torn (a file in `main` with bytes other than one PUT's). The journal costs about 3 to 7% on a PUT's median here (one more sync after the per-object ones). Main's 187 ms p99 in the steady run is one slow stretch on a shared host; the earlier run of the same set gave 7.55 / 14.9 ms.
+- Checks: `the_edit_journal_keeps_answered_edits_across_a_kill` (puts, a folder, a copy, a rename and a removal answered and never committed, the process dropped with no flush; a torn last record; a commit whose journal was not emptied, which must not commit twice). `cargo test --release --features embed`: 377 pass, 0 fail; clippy `-D warnings` clean. The fixed benchmark is not affected (no change to what is stored).
+- Verdict: **kept** as an option, off (one more sync per edit; a choice for a store where answered must mean kept, such as an agent or a sync tool writing over WebDAV).
+- Next: a size or age cap on `--commit-after` under a writer that never pauses (a steady writer here never committed at all, journal or not); the journal for `--watch` folders measured on their own (they use the same path); `ikam mcp --commit-on-exit` if agents want it.
+- Not measured: the Mac (APFS sync costs differ); a power cut of the machine rather than the process (the journal relies on `sync_data` as every store write does); large files; Finder as the client.
+- Run: `python3 -I experiments/crash-safety/kill_live_mcp.py IKAM_BIN WORK 20 "live;live-burst;live-burst:--deferred-sync;mcp"` with main's binary, and `"live;live-burst;live:--edit-journal;live-burst:--edit-journal;mcp"` with the branch's.
