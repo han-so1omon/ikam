@@ -84,7 +84,23 @@ impl<S: Store> Repo<S> {
     /// read through a derivation checks its output anyway. Every record is
     /// still hash-checked.
     fn check_object(&self, id: &Id, deep: bool) -> Result<(), Error> {
-        if let Object::Derivation(d) = self.get(id)?
+        let obj = self.get(id)?;
+        // A recorded step's output (E441) is never rebuilt: its bytes, or a
+        // storage plan that rebuilds them exactly, must be here.
+        let kept = |out: &Id| -> Result<(), Error> {
+            match self.store.has(out)
+                || (self.derivations(out)?.iter()).any(|d| crate::func::is_plan(&d.func))
+            {
+                true => Ok(()),
+                false => Err(Error::NotFound(*out)),
+            }
+        };
+        match &obj {
+            Object::Run(r) => return kept(&r.output),
+            Object::Derivation(d) if d.func == crate::func::recorded() => return kept(&d.output),
+            _ => {}
+        }
+        if let Object::Derivation(d) = obj
             && (deep || !self.store.has(&d.output))
         {
             let out = self.eval(&d.func, &d.args, &mut Cx::default())?;
@@ -209,7 +225,9 @@ impl<S: Store> Repo<S> {
     /// endpoints are live. Returns the number of objects deleted.
     pub fn gc(&mut self) -> Result<usize, Error> {
         let (mut objects, files) = self.reachable()?;
-        let (content, records) = self.closure(files, |_| true)?;
+        let (mut content, mut records) = self.closure(files, |_| true)?;
+        // Recorded steps (E441) of live content are kept, with their inputs.
+        self.add_runs(&mut content, &mut records, |_| true)?;
         objects.extend(records);
         // Dictionaries, groups and contexts that live stored encodings need:
         // every object their id prefix may name, and what those need in

@@ -148,7 +148,7 @@ pub(crate) fn contexts(encoded: &[u8]) -> Vec<&[u8]> {
 /// encoded; `None` for content.
 pub(crate) fn object_tag(encoded: &[u8]) -> Option<u8> {
     let tag = encoded.first()?.to_ascii_uppercase();
-    (!is_plain(encoded) && b"TCDLG".contains(&tag)).then_some(tag)
+    (!is_plain(encoded) && b"TCDLGE".contains(&tag)).then_some(tag)
 }
 
 /// The dictionary reference (an id prefix) a stored encoding needs, if any.

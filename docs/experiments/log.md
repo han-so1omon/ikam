@@ -7560,3 +7560,54 @@ Gates on the branch (E229 to E233): every kernel test suite passes (release); cl
 - Verdict: **kept** (a new edit, no trade-off; nothing changes for existing callers).
 - Not measured: replacing the compute crate's `put_entry` and `share.rs`'s own `put_entry` (for `Graph` imports) with the edit (left to their own branches, so this one touches nothing else); `Edit` is a public enum without `#[non_exhaustive]`, so a downstream exhaustive `match` on it must add the new arm (none in this repo outside `worktree.rs`).
 - Run: `cargo test --release --features embed --test put_graph`.
+### E441 float-steps (pinned-float and recorded steps, check steps, nets fired through steps)
+
+- Branch / parent: exp/441-float-steps / main 437aef6
+- Question: stored functions run with floats off, because a pure derivation lets repack drop an output and rebuild it anywhere, and NaN bits differ between platforms. Can a step choose, when it is recorded, to use floats and still be rebuilt bit for bit (*pinned-float*), or to use floats, seeds or outside work and keep its bytes, with a rerun as a check and never a rebuild (*recorded*)? Can the tolerance a rerun is held to live in the graph rather than in hard-coded checking code? Can a Petri net's transitions fire through the same steps rather than a path of their own? And which way should the foundation store a recorded step: (A) a derivation in the ledger whose function refuses evaluation, or (B) an object of its own? (Night 5 item 5, moved to daytime; the bound checks on ikam-compute's op graph are E442.)
+- Found before building: the kernel's wasmi is built with `deterministic`, which makes every NaN an operation produces canonical; fused multiply-add is never contracted and reductions run in the module's order. So the pinned interpreter E409's rules 1 to 3 need was already there; floats were only switched off (`Config::floats(false)`). Rule 4 (math functions shipped inside the module, not taken from the host) stays the module's to keep.
+- Change (all options; nothing in the default paths calls them):
+  - `wasm::Floats { Off, Pinned }` and `wasm::run_with`; `run` is unchanged (Off). Compiled modules are cached by (module, floats).
+  - *pinned-float*: `Repo::apply_pinned(module, args)` records the derivation `wasm-float/1(module, args...)`, a new builtin that runs the module with floats on. No format change: it is an ordinary derivation, so repack may drop the output and rebuild it, and fsck re-evaluates it.
+  - *recorded*: `Repo::record_step(func, args, output, check, design)` keeps the output's bytes and a record of the step. With `output` the work was done elsewhere (a command, an agent); without, the kernel runs the module now with floats pinned. `rerun(record, now)` compares a rerun with the output of record and reports same or different; the first output stays.
+  - *check steps*: a record may name a check step `Check { func, args }`. When a rerun differs, `verdict = func(first, now, args...)` is applied as an ordinary derivation, so the bound lives in the graph with the step, versioned and shared like it, and any pure function (builtin or WASM) can be one. `within-f64/1(first, now, spec)` is a builtin check: spec `ulp=N abs=X rel=Y`, an element passes if any bound holds, NaN matches NaN, an infinity only itself; it answers `same`, `within ...` or `outside ...` with the largest ULP, absolute and relative differences.
+  - Both designs, side by side: (A) `Design::Wrapped`, a ledger derivation `recorded/1(func, head, check args..., args...)` whose evaluation is refused, with `head` a small text naming the check function and its argument count; (B) `Design::Run`, an `Object::Run { output, func, args, check }` under a new object tag `E`. `step_records(output)` reads both. gc and repack keep a live output's records (B through `add_runs`, A through the ledger) with their inputs; fsck requires a recorded output's bytes (or a storage plan) and never evaluates it.
+  - Nets: `net_fire_step(db, net, transition, token, key, step)` fires a `pure` transition through `apply` and a `cmd` or `agent` transition through `record_step` (design B); other pairings are refused, and `human` keeps `net_fire`. The firing record gains an optional sixth line, the step's record id, written only when a step ran, so earlier firing records read back unchanged. `net_verify_steps` re-evaluates each pure step and checks each recorded one (kept, and same when the kernel can rerun it).
+- Results (`examples/e441_steps.rs`; E409's five functions on its six inputs, 256 values each, 8x8 matrices; Linux cloud, 4 CPUs, one run):
+  - *pinned-float*: 30 of 30 outputs match a native run with the same arithmetic (no fused multiply-add, sequential sums, the module's own `exp`) bit for bit, apart from NaN payloads on 4 of the 5 `special` inputs, where the native run's NaNs are not canonical and the kernel's are. Every NaN an operation made was `0x7ff8000000000000`; the one other NaN was an input NaN that the module's `exp` returns unchanged, which keeps its payload (a copy is bit-exact on every platform). A repack dropped all 30 outputs (34,497 to 16,658 stored bytes) and every one rebuilt to the same bits; `fsck_deep` clean. Interpreted, a step takes 29 to 94 µs against 0.3 to 16 µs native; on subnormal inputs, where native arithmetic is slow too, 64 to 238 µs against 11 to 167 µs.
+  - *Reruns with host arithmetic* (fused multiply-add, 8-lane sums, the host's `exp`), judged by `within-f64` check steps:
+
+    | spec | within or same |
+    | --- | --- |
+    | `ulp=1` | 16 of 30 |
+    | `ulp=4` | 20 |
+    | `ulp=64` | 27 |
+    | `ulp=100000` | 30 |
+    | `rel=1e-12` | 29 |
+    | `abs=1e-300 rel=1e-9` | 30 |
+
+    8 of 30 came out the same bits. `exp` stayed within 1 ULP; sums and products moved up to 156 ULP; the worst was mean and variance on the cancelling input, 27,127 ULP (the one `rel=1e-12` miss). E442 found the same shape with its own host arithmetic.
+  - *Designs*, 5,000 recorded steps of a command with three f64s out and a check (`none` stores the same outputs and inputs as plain content):
+
+    | design | bytes a record | record | lookup | rerun with check | fsck | gc | repack |
+    | --- | --- | --- | --- | --- | --- | --- | --- |
+    | none | 0 | 9 ms | 1.25 ms | – | 5 ms | 7 ms | 44.9 s |
+    | B, `Run` | 172 | 32 ms | 4.97 ms | 24.5 µs | 7 ms | 26 ms | 45.3 s |
+    | A, `Wrapped` | 201 | 65 ms | 2.30 ms | 28.0 µs | 9 ms | 24 ms | 53.4 s |
+
+    In both, every output was kept through gc and repack, fsck stayed clean and each output's record was found again. (Repack's own time grows faster than linearly with stored entries on the in-memory store, for all three.)
+  - *Nets*: the night net's propose (agent), start (command) and finish (pure, `wasm-float` mean and variance) fired for 500 candidates. Fired through steps against `net_fire_output`: 8.8 against 9.1 ms a firing, 10,253 against 10,283 bytes a firing (the database dominates), replay equal to the marking in both (158 and 150 ms), fsck clean. Through steps, `net_verify_steps` checked all 1,500 steps in 36 ms; `net_fire_output` leaves nothing to check. A retried firing with the same key and step changes nothing.
+  - Fixed bench: bytes 5.7493, proxy 3.8185, read 5.7140, north 0.3060; every corpus exact and fsck clean, the same as main.
+- Findings on the step layer (each one is something it lacked):
+  1. A float mode in the interpreter, chosen per step: `Floats::Pinned`, used only through the `wasm-float` builtin.
+  2. A way to say "keep these bytes and never rebuild them": the ledger only knew derivations that rebuild. Both designs add one.
+  3. A check that is itself a step: the tolerance is a function and its arguments in the store, not a parameter of checking code.
+  4. A firing that names its step: one optional line on the firing record. With it, a net needs no execution path of its own: pure transitions are derivations and recorded ones are recorded steps.
+- A against B, as a decision for the owner. **Recommendation: B.**
+  - A puts a derivation in the ledger that is not a fact, and code that reads the ledger treats its output as derived: repack leaves it out of dictionary training, offers it to the planner as a candidate whose evaluation then fails (repack 19% slower than B here), and ingest will not slice against it. Its check has to travel as text in a `head` content, because a builtin's id names no content and an argument must, so a WASM check function named there is not kept live by gc. It needed guards in `func::run` and fsck, and costs 17% more bytes a record.
+  - B adds an object variant and tag (other encodings unchanged, so existing stores read back as before), and gc and repack each add one pass (`add_runs`). Its cost: lookups scan the store (4.97 ms at 5,000 records), so a projection from output to records is the thing to add when lookups get hot. Its repack time matched the plain baseline.
+  - Lines touched: object.rs 66 (B), func.rs 41 (the builtins; A's guard is a few of them), history.rs 20 (both), repack.rs 4 (B), dict.rs 1 (B), net.rs 118 (steps for nets), wasm.rs 27; new step.rs 322 (both designs).
+- Per step or propagated (with E442): bound each step of anything iterated, end to end only for short feed-forward chains. Here a check names the step it bounds, so a recorded chain is checked step by step, each rerun against its own recorded input.
+- Checks: `tests/steps.rs`, 8 tests (floats still off by default; pinned-float bits equal pinned native and rebuild after a repack; canonical NaN; recorded steps in both designs kept through gc and repack and judged by a check; a random step reruns as different and reads back its first output; `within-f64` on ULP, absolute and relative bounds; gc drops runs of dead outputs and their inputs; a net fired through steps replays and verifies). `cargo test --release --features embed`: 384 pass, 0 fail; clippy `-D warnings` clean.
+- Verdict: **kept** (options, off by default; the A or B choice is the owner's).
+- Not measured or not done: nets as artifacts keyed by content id (firings naming the net version they fired under, several nets in one graph, a net edited mid-run), which is next; a second real platform (host arithmetic stands in for one, as in E409 and E442); the Mac; a seed as a field (a seed is an argument here, like any input).
+- Run: `cargo run --release --example e441_steps -- 5000`.
