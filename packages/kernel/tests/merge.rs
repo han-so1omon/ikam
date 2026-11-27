@@ -285,6 +285,45 @@ fn line_merge_refuses_edits_to_the_same_lines() {
     assert_eq!(repo.resolve("main").unwrap(), head);
 }
 
+/// A file that merges cleanly is not stored when another file conflicts:
+/// a refused merge writes none of its merged contents.
+#[test]
+fn line_merge_stores_nothing_when_another_file_conflicts() {
+    let base = text(&["one", "two", "three", "four"]);
+    let mut repo = Repo::new(MemStore::default());
+    put(&mut repo, "main", &[("f.txt", &base), ("g.txt", &base)]);
+    let c = repo.resolve("main").unwrap();
+    repo.branch("side", c).unwrap();
+    put(
+        &mut repo,
+        "main",
+        &[
+            ("f.txt", &text(&["ONE", "two", "three", "four"])),
+            ("g.txt", &text(&["one", "TWO", "three", "four"])),
+        ],
+    );
+    put(
+        &mut repo,
+        "side",
+        &[
+            ("f.txt", &text(&["one", "two", "three", "FOUR"])),
+            ("g.txt", &text(&["one", "2", "three", "four"])),
+        ],
+    );
+    let merged_f = text(&["ONE", "two", "three", "FOUR"]);
+    let id = Id::of_content(merged_f.as_bytes());
+    // The empty database object is the one thing a merge may write first
+    // (once per store); write it now so only the merge's own bytes count.
+    repo.db_empty().unwrap();
+    let written = repo.bytes_written;
+    assert!(matches!(
+        repo.merge_with("main", "side", "m", LINES).unwrap(),
+        Merged::Conflicts(_)
+    ));
+    assert!(!repo.has_content(&id).unwrap());
+    assert_eq!(repo.bytes_written, written);
+}
+
 #[test]
 fn merge_lines_cases() {
     let b = text(&["a", "b", "c", "d"]);

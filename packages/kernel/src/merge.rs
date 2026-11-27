@@ -75,6 +75,19 @@ pub enum Merged {
 
 type Entry = Option<(Kind, Id)>;
 
+/// What a merge will write once it is known to be clean, children first.
+enum Staged {
+    Content(Vec<u8>),
+    Tree(Object),
+}
+
+/// A merge's findings so far: its conflicts and what it will write.
+#[derive(Default)]
+struct Found {
+    conflicts: Vec<Conflict>,
+    staged: Vec<Staged>,
+}
+
 /// The keys one side's events write: single keys, and `[lo, hi)` spans.
 #[derive(Default)]
 struct Touched {
@@ -194,7 +207,6 @@ impl<S: Store> Repo<S> {
             self.store.set_ref(into, Some(ours), theirs)?;
             return Ok(Merged::FastForward(theirs));
         }
-        let mut conflicts = Vec::new();
         let tree = |r: &Self, c: Option<Id>| -> Result<Entry, Error> {
             match c {
                 Some(c) => match r.get(&c)? {
@@ -209,7 +221,10 @@ impl<S: Store> Repo<S> {
             tree(self, Some(ours))?,
             tree(self, Some(theirs))?,
         );
-        let files = self.merge_entry("", b, o, t, opts, &mut conflicts)?;
+        // Merged trees and line-merged file contents wait here until the
+        // merge is known to be clean, so a refused merge stores nothing.
+        let mut found = Found::default();
+        let files = self.merge_entry("", b, o, t, opts, &mut found)?;
         let empty = |r: &mut Self| r.db_empty();
         let db_of = |r: &mut Self, c: Option<Id>| match c {
             Some(c) => r.db_at(&c),
@@ -220,9 +235,19 @@ impl<S: Store> Repo<S> {
             db_of(self, Some(ours))?,
             db_of(self, Some(theirs))?,
         );
-        let db = self.merge_db(&bd, &od, &td, &mut conflicts)?;
-        if !conflicts.is_empty() {
-            return Ok(Merged::Conflicts(conflicts));
+        let db = self.merge_db(&bd, &od, &td, &mut found.conflicts)?;
+        if !found.conflicts.is_empty() {
+            return Ok(Merged::Conflicts(found.conflicts));
+        }
+        for s in &found.staged {
+            match s {
+                Staged::Content(bytes) => {
+                    self.put_content(bytes)?;
+                }
+                Staged::Tree(obj) => {
+                    self.put(obj)?;
+                }
+            }
         }
         let mut entries = match files {
             Some((Kind::Tree, id)) => match self.get(&id)? {
@@ -255,7 +280,7 @@ impl<S: Store> Repo<S> {
         o: Entry,
         t: Entry,
         opts: MergeOptions,
-        conflicts: &mut Vec<Conflict>,
+        found: &mut Found,
     ) -> Result<Entry, Error> {
         if o == t || b == t {
             return Ok(o);
@@ -272,23 +297,27 @@ impl<S: Store> Repo<S> {
                 self.read_content(&ti)?,
             );
             return match merge_lines(&bb, &ob, &tb) {
-                Some(Ok(bytes)) => Ok(Some((Kind::File, self.put_content(&bytes)?.id))),
+                Some(Ok(bytes)) => {
+                    let id = Id::of_content(&bytes);
+                    found.staged.push(Staged::Content(bytes));
+                    Ok(Some((Kind::File, id)))
+                }
                 Some(Err(lines)) => {
-                    conflicts.push(Conflict::Lines {
+                    found.conflicts.push(Conflict::Lines {
                         path: path.into(),
                         lines,
                     });
                     Ok(o)
                 }
                 None => {
-                    conflicts.push(Conflict::Path(path.into()));
+                    found.conflicts.push(Conflict::Path(path.into()));
                     Ok(o)
                 }
             };
         }
         let dir = |e: &Entry| matches!(e, Some((Kind::Tree, _)));
         if !(dir(&o) && dir(&t) && (b.is_none() || dir(&b))) {
-            conflicts.push(Conflict::Path(path.into()));
+            found.conflicts.push(Conflict::Path(path.into()));
             return Ok(o);
         }
         let load = |r: &Self, e: &Entry| -> Result<BTreeMap<String, (Kind, Id)>, Error> {
@@ -314,7 +343,7 @@ impl<S: Store> Repo<S> {
             };
             let get = |m: &BTreeMap<String, (Kind, Id)>| m.get(name).copied();
             if let Some((kind, id)) =
-                self.merge_entry(&sub, get(&bm), get(&om), get(&tm), opts, conflicts)?
+                self.merge_entry(&sub, get(&bm), get(&om), get(&tm), opts, found)?
             {
                 out.push(TreeEntry {
                     name: name.clone(),
@@ -323,7 +352,10 @@ impl<S: Store> Repo<S> {
                 });
             }
         }
-        Ok(Some((Kind::Tree, self.put(&Object::tree(out)?)?)))
+        let obj = Object::tree(out)?;
+        let id = obj.id();
+        found.staged.push(Staged::Tree(obj));
+        Ok(Some((Kind::Tree, id)))
     }
 
     /// Append `theirs`' events since `base` to `ours`, or report the keys
@@ -348,7 +380,6 @@ impl<S: Store> Repo<S> {
             .map(|e| (e.idempotency_key.as_str(), e.encode()))
             .collect();
         let touched = Touched::new(&mine);
-        let before = conflicts.len();
         for e in &other {
             match idem.get(e.idempotency_key.as_str()) {
                 Some(bytes) if *bytes == e.encode() => continue,
@@ -357,7 +388,9 @@ impl<S: Store> Repo<S> {
                 None => {}
             }
         }
-        if conflicts.len() > before {
+        // Any conflict, here or in the files, refuses the merge: append
+        // nothing then.
+        if !conflicts.is_empty() {
             return Ok(*ours);
         }
         self.db_append(ours, &other)
