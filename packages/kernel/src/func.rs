@@ -68,9 +68,25 @@ pub fn recorded() -> Id {
     builtin("recorded/1")
 }
 
+/// A sampled batch (E427, `sampler.rs`): `sample(view, spec)` samples
+/// fixed-fanout neighborhoods from a fragment view, integers only and
+/// seeded by the spec. A pure derivation: repack may drop a batch and
+/// rebuild it anywhere.
+pub fn sample() -> Id {
+    builtin("sample/1")
+}
+
+/// A fragment view (E427): the function a view's recorded step names,
+/// `fragment-view(pin)`. A view depends on the ledger as well as on the
+/// commit its pin names, so it is kept, never rebuilt: evaluating it is
+/// refused, and `Repo::check_fragment_view` rebuilds it from its commit.
+pub fn fragment_view() -> Id {
+    builtin("fragment-view/1")
+}
+
 /// Builtins by index, for short derivation records (`abbrev.rs`). Stored
 /// records depend on this order: only append.
-const BUILTINS: [&str; 9] = [
+const BUILTINS: [&str; 11] = [
     "concat/1",
     "deflate-pack/1",
     "fill/1",
@@ -80,6 +96,8 @@ const BUILTINS: [&str; 9] = [
     "wasm-float/1",
     "within-f64/1",
     "recorded/1",
+    "sample/1",
+    "fragment-view/1",
 ];
 
 pub(crate) fn builtin_index(func: &Id) -> Option<u8> {
@@ -132,6 +150,15 @@ pub fn run(
         crate::step::within(args)?
     } else if *func == recorded() {
         return Err(Error::Exec("a recorded step is kept, never rebuilt".into()));
+    } else if *func == sample() {
+        let out = crate::sampler::sample_builtin(args)?;
+        // Reading the view is most of the work.
+        let work = out.len() + args.first().map_or(0, Vec::len);
+        return Ok((out, work));
+    } else if *func == fragment_view() {
+        return Err(Error::Exec(
+            "a fragment view is kept from its commit, never rebuilt".into(),
+        ));
     } else {
         let module = module.ok_or_else(|| Error::Exec(format!("{func}: no such function")))?;
         let (out, fuel) = wasm::run(module, args)?;

@@ -43,6 +43,7 @@ mod pdftext;
 mod range;
 mod repack;
 mod repo;
+pub mod sampler;
 mod search;
 pub mod share;
 pub mod snapshot;

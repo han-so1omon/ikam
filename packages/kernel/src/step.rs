@@ -254,6 +254,132 @@ impl<S: Store> Repo<S> {
     }
 }
 
+/// One step a lineage walk found (E427).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Found {
+    /// A pure derivation (not a storage plan): rebuilt from its inputs.
+    Derived { record: Id, func: Id, args: Vec<Id> },
+    /// A recorded step: kept, never rebuilt; a rerun is a check.
+    Recorded {
+        record: Id,
+        func: Id,
+        args: Vec<Id>,
+        check: Option<(Id, Vec<Id>)>,
+    },
+    /// A view's pin (`sampler.rs`): the commit and tree a view was read
+    /// from.
+    Pin { commit: Id, tree: Id },
+}
+
+/// What a lineage walk from one content found: every content it reached
+/// with the steps that made it, the commits named by pins, and what it
+/// needed but could not find.
+#[derive(Clone, Debug, Default)]
+pub struct Lineage {
+    /// In walk order (breadth first from the start), each content with the
+    /// steps that made it; a content with none is a leaf (put as bytes).
+    pub nodes: Vec<(Id, Vec<Found>)>,
+    pub commits: Vec<Id>,
+    pub missing: Vec<Id>,
+}
+
+impl Lineage {
+    /// Every recorded step reached.
+    pub fn recorded(&self) -> impl Iterator<Item = (&Id, &Found)> {
+        (self.nodes.iter())
+            .flat_map(|(id, fs)| fs.iter().map(move |f| (id, f)))
+            .filter(|(_, f)| matches!(f, Found::Recorded { .. }))
+    }
+}
+
+impl<S: Store> Repo<S> {
+    /// Walk back from `id` through every step that made it (E427): recorded
+    /// steps (their function, arguments and check), pure derivations other
+    /// than storage plans (their function and arguments), and view pins
+    /// (the commit a view was read from), to a fixed point. Leaves are
+    /// contents put as bytes. Run records are found with one scan of the
+    /// store.
+    pub fn lineage(&self, id: &Id) -> Result<Lineage, Error> {
+        let mut runs: std::collections::HashMap<Id, Vec<(Id, Run)>> = Default::default();
+        for rid in self.store.ids()? {
+            if object_tag(&self.store.read_head(&rid, 2)?) == Some(b'E')
+                && let Object::Run(r) = self.get(&rid)?
+            {
+                runs.entry(r.output).or_default().push((rid, r));
+            }
+        }
+        let mut out = Lineage::default();
+        let mut seen = HashSet::from([*id]);
+        let mut queue = std::collections::VecDeque::from([*id]);
+        let ids = |args: &[Arg]| -> Vec<Id> { args.iter().map(Arg::id).collect() };
+        while let Some(c) = queue.pop_front() {
+            if !self.has_content(&c)? {
+                out.missing.push(c);
+                continue;
+            }
+            let mut found = Vec::new();
+            for d in self.derivations(&c)? {
+                if d.func == func::recorded() {
+                    let r = self.unwrap_run(&d)?;
+                    found.push(Found::Recorded {
+                        record: Object::Derivation(d).id(),
+                        func: r.func,
+                        args: ids(&r.args),
+                        check: r.check.map(|k| (k.func, ids(&k.args))),
+                    });
+                } else if !func::is_plan(&d.func) {
+                    found.push(Found::Derived {
+                        record: Object::Derivation(d.clone()).id(),
+                        func: d.func,
+                        args: ids(&d.args),
+                    });
+                }
+            }
+            for (rid, r) in runs.get(&c).into_iter().flatten() {
+                found.push(Found::Recorded {
+                    record: *rid,
+                    func: r.func,
+                    args: ids(&r.args),
+                    check: r.check.as_ref().map(|k| (k.func, ids(&k.args))),
+                });
+            }
+            let bytes = self.read_content(&c)?;
+            if let Some((commit, tree)) = crate::sampler::parse_pin(&bytes) {
+                if !self.store.has(&commit) || !self.store.has(&tree) {
+                    out.missing.push(commit);
+                }
+                out.commits.push(commit);
+                found.push(Found::Pin { commit, tree });
+            }
+            for f in &found {
+                let next: Vec<Id> = match f {
+                    Found::Derived { func, args, .. } => {
+                        std::iter::once(*func).chain(args.iter().copied()).collect()
+                    }
+                    Found::Recorded {
+                        func, args, check, ..
+                    } => std::iter::once(*func)
+                        .chain(args.iter().copied())
+                        .chain(
+                            check
+                                .iter()
+                                .flat_map(|(f, a)| std::iter::once(*f).chain(a.iter().copied())),
+                        )
+                        .collect(),
+                    Found::Pin { .. } => vec![],
+                };
+                for n in next {
+                    if !func::is_builtin(&n) && seen.insert(n) {
+                        queue.push_back(n);
+                    }
+                }
+            }
+            out.nodes.push((c, found));
+        }
+        Ok(out)
+    }
+}
+
 /// ULP distance between two f64 values: their bit patterns mapped to one
 /// ordered integer line (so -0.0 and 0.0 are one apart).
 fn ulps(a: f64, b: f64) -> u64 {
