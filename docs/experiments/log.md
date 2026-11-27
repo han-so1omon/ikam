@@ -6540,7 +6540,7 @@ Gates on the branch (E229 to E233): every kernel test suite passes (release); cl
 
 ### E445 week-scorecard (E354's goals and the business cases, rerun on the week's combined build)
 
-- Branch / parent: exp/445-week-scorecard / main 437aef6. Measured on main 437aef6 and on `trial/merge-order` 13f2369 (every open PR from E390 to E425 merged in a checked order, except E409's).
+- Branch / parent: exp/445-week-scorecard / main 437aef6. Measured on main 437aef6 and on `trial/merge-order` 13f2369 (39 of the 40 open PRs merged in a checked order, all but E409's).
 - Question: E354 tested the project's stated goals on main d49ac2c and E355 listed what the server lets a project use. After a week of experiments (E385 to E442, mostly unmerged), what moved for each goal and each use case, and what is still the largest gap?
 - Method (4-core cloud machine, synthetic data; other builds ran beside these runs, so times are indicative and bytes are exact):
   - G2: the fixed bench (`cargo run --release --example bench -- --json`) on main and on the trial branch, one session.
@@ -6583,7 +6583,7 @@ Gates on the branch (E229 to E233): every kernel test suite passes (release); cl
   | Compute and training (Nov 23-27 asks) | compute graphs (E430-E439), versioned nets (E422), learned planner (E425); training tables, sampler and trainer, step cache: E426-E444 | depends on those PRs |
   | N one graph | bytes held at 0.3060 | cross-type sharing (E366) |
 
-- Gap list, largest first: (1) none of the week's work is on main: 40 open PRs wait on one merge (the trial branch shows they merge cleanly and pass 471 tests); (2) append stalls at 1M rows from the BM25 fold under the writer lock (E393; E394's off-lock build was discarded, catching up in rounds off the lock is next); (3) semantic search quality on real text needs the embedder's weights (E387); (4) host memory grows with edits (E418); (5) no served filter, join or zone-map query (E405, E420); (6) cross-type sharing (E366); (7) MLIR and Apple rows.
+- Gap list, largest first: (1) none of the week's work is on main: 40 PRs are open; the trial branch merges 39 of them (all but E409's) cleanly and passes 471 tests; (2) append stalls at 1M rows from the BM25 fold under the writer lock (E393; E394's off-lock build was discarded, catching up in rounds off the lock is next); (3) semantic search quality on real text needs the embedder's weights (E387); (4) host memory grows with edits (E418); (5) no served filter, join or zone-map query (E405, E420); (6) cross-type sharing (E366); (7) MLIR and Apple rows.
 - Verdict: **measured**, no code change.
 - Not measured: the Mac; more than one run each; real data.
 - Run: `cargo run --release --example bench -- --json` on each build; `python3 experiments/goal-scorecard/db_first_write.py IKAM_BIN WORK 200000 2000 base+write-options,live`.
