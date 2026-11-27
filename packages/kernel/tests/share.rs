@@ -256,6 +256,7 @@ fn records_scope_clips_every_range() {
         Scope::Records {
             start: "notes/".into(),
             end: Some("notes0".into()),
+            content: false,
         },
         Right::Read,
     );
@@ -343,6 +344,7 @@ fn search_never_finds_outside_the_scope() {
         Scope::Records {
             start: "notes/".into(),
             end: Some("notes0".into()),
+            content: false,
         },
         Right::Read,
     );
@@ -475,6 +477,7 @@ fn merge_copies_records_incrementally() {
     let scope = || Scope::Records {
         start: "notes/".into(),
         end: Some("notes0".into()),
+        content: false,
     };
     let mut b = Repo::new(MemStore::default());
     let s = share("r", c, scope(), Right::Merge);
@@ -745,10 +748,12 @@ fn shares_decode_from_the_log() {
         Scope::Records {
             start: "a".into(),
             end: None,
+            content: false,
         },
         Scope::Records {
             start: "a".into(),
             end: Some("b".into()),
+            content: false,
         },
         Scope::Graph {
             path: "g".into(),

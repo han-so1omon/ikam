@@ -6537,3 +6537,32 @@ Gates on the branch (E229 to E233): every kernel test suite passes (release); cl
 - Verdict: **kept** (a fix, the paged first build, with no trade-off; `--hnsw-threads` an option, off).
 - Not measured: the Mac; real embeddings (clustered synthetic vectors stand in; recall on real text vectors may differ either way); a wider `ef` (a constant here: 80), which would trade query time for recall at 1M; keeping the graph across restarts; vectors changing while serving at 1M; more than one run each (build times on a shared cloud host move by tens of percent).
 - Run: `python3 -I experiments/vectors-1m/vec_1m.py WORK OUT.jsonl 100000,250000,500000,1000000 "exact=BRANCH:;exact-main=MAIN:;hnsw=BRANCH:--hnsw;hnsw4=BRANCH:--hnsw --hnsw-threads 4;hnsw-main@1000000=MAIN:--hnsw" 200`.
+
+### E437 share-content (a records share that also carries the content its records name)
+
+- Branch / parent: exp/437-share-content / main 437aef6
+- Question: a `Records` share carries record bytes, not the content a record names, so a record holding a content id (as a compute run's `state` record holds its state's id) arrives dangling in the receiver. Can a share carry that content too, only for the records in its scope and nothing else, with shares and imports without it unchanged? (Planned in docs/plans/2026-11-26-math-engine.md on exp/430; business case: the math engine, whose runs are shared by records scope.)
+- Change (option, off by default):
+  - `Scope::Records` gets `content: bool`. With it a share encodes as a new scope kind (byte 5, where a records share is 3), so a share without it encodes and seals exactly as before, and an older reader refuses one with it rather than reading it as a plain records share. The option is in the sealed share, so the source's owner decides; a receiver cannot ask for it.
+  - A record names content when its whole value is a content id: its 32 bytes or its 64 lowercase hex digits (`share::named_content`). Ids inside longer values are not looked for. A named id that is not content in the source (missing, or a tree, graph or commit) is left out, so only bytes are ever carried, never objects that would bring their subtrees.
+  - `import_share` with the option puts each named content again in the receiver and commits it as `content/<id>` beside the database on the import ref (so it is reachable and survives gc), replaced on every import, so content no record names any more goes. `share_named_content` and `share_content` (read right) list and read it; `share_import_bytes` counts it against a host's store limit. `ikam host`: scope `records-content:START..END` and `/from/SOURCE/SHARE/content?id=`.
+- Setup: `tests/share_content.rs` (in-memory stores) and a host test. The source holds files (one private), and records under `runs/` naming three contents (29 bytes, 300,000 bytes, 5,000 bytes by hex; one named twice), a missing id, a tree id, an id inside text, an uppercase hex id, plus `lab/x/state` outside the scope naming a fourth content. A merge share of `runs/..runs0` is imported into an empty receiver with and without the option.
+- Results:
+
+  | | without the option | with it |
+  | --- | --- | --- |
+  | named contents that resolve in the receiver | 0 of 3 (dangling, as on main) | **3 of 3** (4 records) |
+  | out-of-scope content (named by `lab/`), the private file, the tree a record names | not copied | not copied |
+  | names left unresolved | all | 2: the missing id and the tree id, by design |
+  | receiver objects after gc | 26 | 31 (the 3 contents' 3 objects, the `content` tree and one more) |
+  | fsck and fsck_deep, both sides | clean | clean |
+  | gc in the receiver | drops 2 | drops the same 2 |
+  | import commit, object set, share encoding | the same ids as main 437aef6 (pinned from a run there) | |
+
+  A second import after a record is removed drops that content from `content/`. Through `ikam host`, `content?id=` answers a named content and 404 for content only `lab/` names; a merge brings the named content and not the other; fsck clean.
+- Finding: on main, a records import leaves 2 objects that nothing reaches (gc drops them); the option adds none. Not looked into.
+- Checks: `cargo test --release --features embed`: 383 pass, 0 fail (`--no-fail-fast`); clippy `--all-targets -D warnings` clean. The existing records tests construct `Scope::Records` with `content: false` (the only change to them).
+- Fixed benchmark: not run. The bench makes no shares; without the option the import is pinned equal to main's above, and no default path or encoding changes.
+- Verdict: **kept** (an option, off).
+- Not measured: a real host run over sockets with large content (the host test runs the handler in process); ids inside structured values (JSON or a row of several ids), which would need a declared field rather than a whole-value rule; content a record names through a graph or tree (refused here on purpose); `Scope` is a public enum, so code outside this repo that builds `Scope::Records` must add the field.
+- Run: `cargo test --release --features embed --test share_content -- --nocapture`.
