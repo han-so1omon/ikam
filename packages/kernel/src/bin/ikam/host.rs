@@ -815,9 +815,13 @@ fn rank(l: &mut Live, cache: &Ranked, share: &Share, req: &Request) -> Result<Re
     };
     let vector: Option<Vec<f32>> = match req.param("vector").filter(|v| !v.is_empty()) {
         None => None,
-        Some(v) => match v.split(',').map(|x| x.trim().parse::<f32>()).collect() {
-            Ok(v) => Some(v),
-            Err(_) => return Ok(Response::text(400, "vector=X,Y,.. (numbers)")),
+        Some(v) => match v
+            .split(',')
+            .map(|x| x.trim().parse::<f32>())
+            .collect::<Result<Vec<f32>, _>>()
+        {
+            Ok(v) if v.iter().all(|x| x.is_finite()) => Some(v),
+            _ => return Ok(Response::text(400, "vector=X,Y,.. (finite numbers)")),
         },
     };
     let fuse = match (req.param("fuse").as_deref(), req.param("alpha")) {
@@ -1639,6 +1643,18 @@ mod tests {
             get("b.localhost", OB, "/from/a/pub/rank?q=a&vector=x").status,
             400
         );
+        for bad in ["NaN,0", "inf,0", "1,-inf"] {
+            assert_eq!(
+                get(
+                    "b.localhost",
+                    OB,
+                    &format!("/from/a/pub/rank?q=a&vector={bad}")
+                )
+                .status,
+                400,
+                "{bad}"
+            );
+        }
         // Refusals stay 404: another project, the source itself, an unknown
         // share, a scope that is not a folder, a project without
         // `share-rank`, and a revoked or expired share.

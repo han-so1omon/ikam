@@ -634,8 +634,14 @@ impl Live {
     pub fn scope_index(&self, files: &BTreeMap<String, Id>) -> Result<Bm25Mem, String> {
         let mut bm25 = Bm25Mem::new();
         for (path, id) in files {
-            let doc = match self.extracted.get(id) {
-                Some(d) => d.clone(),
+            // Reuse only this path's own extraction: text depends on the
+            // path (its extension), so the same content under an
+            // out-of-scope name may have been read differently.
+            let own = (self.files.get(path) == Some(id))
+                .then(|| self.docs.get(path).cloned())
+                .flatten();
+            let doc = match own {
+                Some(d) => d,
                 None => Arc::new(text::extract(
                     path,
                     &self.repo.read_content(id).map_err(err)?,
