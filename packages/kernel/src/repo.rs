@@ -541,6 +541,12 @@ impl<S: Store> Repo<S> {
         &self.store
     }
 
+    /// The store, giving up the handle (E412: a store's own maintenance,
+    /// such as `PackStore::compact`, outside the trait).
+    pub fn into_store(self) -> S {
+        self.store
+    }
+
     pub(crate) fn ledger(&self) -> Result<LedgerRef<'_>, Error> {
         {
             let got = self.ledger.read().unwrap_or_else(|e| e.into_inner());

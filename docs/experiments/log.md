@@ -6848,3 +6848,34 @@ Gates on the branch (E229 to E233): every kernel test suite passes (release); cl
 - Review fix: `Context::from_bytes` checks each length from the bytes before adding it (`checked_add`, `usize::try_from`), so a corrupt or hostile context answers an error, never an overflow. The test adds a context with a `u64::MAX` length and every cut of a real context.
 - Verdict: **kept** as a measured codec (`rowpack.rs`, unused by the store, so off). The next step is to make it a stored encoding the planner picks per row, a tag naming its context as "Y" names its dictionary, with gc keeping the context. Then measure the store bytes and point-read p50 through `db serve`.
 - Not measured: the Mac; zstd level 19 (the run was too slow for the night); hex and base64 strings as their own slot kind; a context per table rather than per sample; repack picking it.
+### E412 collector-load (a collector's database under `db serve`: what grows, and what the reader waits on)
+
+- Branch / parent: exp/412-collector-load / main 437aef6
+- Question: a collector is a set of scheduled jobs, each polling a source every 15 minutes and writing what it saw, with a reader that asks once an hour what changed. How does `db serve --live` carry that load over days: what does a batch append cost, how fast does the store grow and from what, does a read straight after a write see every row, and what does the hourly reader wait on? (Daytime batch of the trip-week plan; business case: records collected on a schedule.)
+- Setup: `experiments/collector/collector_load.py` (synthetic rows, 127.0.0.1 only). 8 jobs of 250 items each; every poll 1% of items turn over, 5% change price, 2% change stock and status; time is simulated, so 96 polls a day run as fast as the server takes them. Each poll writes, per item, an observation row `t/obs/JOB/ITEM/TS` (JSON, about 230 bytes), an index entry `i/obs/by_time/TS/JOB/ITEM` and the item's latest row `t/latest/JOB/ITEM`, and removes the latest row of each item that left; every event carries an idempotency key. `per-job` sends one append per job per poll (8 a poll, 750 events each), `per-tick` one append per poll (6,000 events). After every fourth poll the reader scans one job's latest rows, counts the last hour's index entries and scans the first 500 of them, and checks it saw every row just written. 3 days: 576,000 observations, 1.73M events, 310 MB of keys and values. Main's binary, `--live`, Linux cloud, 4 CPUs, one run each.
+- Results:
+
+  | | per-job | per-tick |
+  |---|---|---|
+  | wall time, 3 days | 175 s | 133 s |
+  | append p50 / p95 (day 3) | 25 / 84 ms | 188 / 1,689 ms |
+  | append max | 1.5 s | 2.1 s |
+  | hourly latest-rows scan p50 (days 1, 2, 3) | 392, 593, 665 ms | 9, 11, 14 ms |
+  | last hour's count / 500-row scan p50 | 5-7 / 3.5-4.5 ms | 6.5-7.4 / 3.4-4.4 ms |
+  | rows the reader missed | 0 | 0 |
+  | store after day 1, 2, 3 | 265, 565, 867 MB | 244, 505, 777 MB |
+  | bytes per observation | 1,505 | 1,348 |
+  | resident (day 3) | 630 MB | 533 MB |
+
+  - Read-after-write held: every hourly read saw every row of the poll just written, in both modes.
+  - The hourly latest-rows scan is slow in `per-job` because it pays the fold: `--live` defers appends (`--defer-kv 20000`) and folds them into the views before a read, and four polls of 6,000 events pass the 20,000 between readings. In `per-tick` the fold lands in the poll's own append just before the reader, so the read is fast and that append is the slow one (p95 1.7 s). Either way one request a reading waits about half a second for the fold.
+  - The store grows by about 300 MB a day, 2.8 times the keys and values written.
+- Where the bytes go (`examples/db_squash.rs` on a copy of the stopped `per-job` store): every append commits the database with the one before as parent, so the store keeps every version of every view chunk an append rewrote, though the head's log and views alone hold the data. Pointing the ref at a commit of the same tree with no parent, collecting what nothing needs and cleaning the packs: **866.6 -> 668.2 MB (-23%)**, 2,444,102 -> 1,962,253 objects (481,850 deleted), in 1.4 s, 25.9 s and 11.2 s; all 1,154,000 keys read the same; the latest-rows scan 10.9 -> 13.5 ms, the count 0.2 -> 0.3 ms (in-process, no fold owed). Then the incremental cold pass (E268) on top: 668.2 -> 580.3 MB (another 13%, 33% in all), but it took 827 s and the latest-rows scan rose to 34.6 ms. With grouping (`cold-group`) the pass had not finished after 45 minutes and was stopped.
+- Found on main: `ikam repack` (and the other commands outside `db serve`) on a pack store open it as a store on disk, see no objects and report `before=0 after=0 applied=false`: they do nothing and say nothing about why.
+- Change (measurement only): the load script; `examples/db_squash.rs`; `Repo::into_store`, which gives up the store, so an example can call a backend's own maintenance (`PackStore::compact`) after `Repo::gc`.
+- Checks: `cargo test --release --features embed` (378 pass, with E414 on top) and clippy `-D warnings` clean; no kernel behaviour changed.
+- Fixed benchmark: not run; no default storage changed.
+- Verdict: **measured**. For a collector: send one append per job per poll (`per-tick` cut store 10% and wall time 24% but made appends 7 times slower at p50); expect about half a second of fold a reading; and a quarter of the store is old view versions only history reaches.
+- Next: E413 folds deferred appends when a database goes quiet, so the reader after a burst does not pay the fold; then a `db squash` command for a stopped pack store, and a clear error from the commands that cannot open one.
+- Not measured: the Mac; real collector rows (synthetic JSON stands in); more than 3 days; `--plain-writes`, E391's lean ledger and E392's catch-up fold (PRs 84 and 83, not merged); dedup of observation rows that repeat the item's last one (most rows here differ only in `observed_at`).
+- Run: `python3 -I experiments/collector/collector_load.py IKAM_BIN WORK 3 8 250 "--live" per-job KEEP`; then `cargo run --release --example db_squash -- COPY_OF_STORE [cold|cold-group]`.
