@@ -40,6 +40,56 @@ pub enum Fuse {
 /// How deep each list is read before fusing, as `db serve` reads it.
 pub const FUSE_DEPTH: usize = 100;
 
+/// The `k` best of `files` for `query`, best first (E388's ranking, shared
+/// by `Live::rank_files` and E416's ranking through a share): BM25 from
+/// `bm25`; with a query vector and vectors (by content) of `dim` numbers,
+/// fused with the files nearest it, both lists read to `FUSE_DEPTH`.
+#[allow(clippy::too_many_arguments)]
+pub fn rank_in(
+    bm25: &Bm25Mem,
+    files: &BTreeMap<String, Id>,
+    vectors: &HashMap<Id, Vec<f32>>,
+    dim: usize,
+    query: &str,
+    vector: Option<&[f32]>,
+    k: usize,
+    fuse: Fuse,
+) -> Result<Vec<(String, f32)>, String> {
+    let Some(q) = vector.filter(|_| dim > 0) else {
+        return Ok(bm25.search(query, k));
+    };
+    if q.len() != dim {
+        return Err(format!(
+            "the query vector has {} numbers, files {}",
+            q.len(),
+            dim
+        ));
+    }
+    let depth = FUSE_DEPTH.max(k);
+    let keyword = bm25.search(query, depth);
+    let mut near: Vec<(f32, &String)> = files
+        .iter()
+        .filter_map(|(p, id)| Some((ikam_kernel::vectors::dot_lanes(q, vectors.get(id)?), p)))
+        .collect();
+    let by =
+        |a: &(f32, &String), b: &(f32, &String)| b.0.total_cmp(&a.0).then_with(|| a.1.cmp(b.1));
+    if near.len() > depth {
+        near.select_nth_unstable_by(depth - 1, by);
+        near.truncate(depth);
+    }
+    near.sort_by(by);
+    let near: Vec<(String, f32)> = near.into_iter().map(|(s, p)| (p.clone(), s)).collect();
+    let mut fused = match fuse {
+        Fuse::Convex(alpha) => ikam_kernel::fusion::convex(&keyword, &near, alpha),
+        Fuse::Rrf => {
+            let keys = |l: &[(String, f32)]| l.iter().map(|x| x.0.clone()).collect();
+            ikam_kernel::fusion::rrf(&[keys(&keyword), keys(&near)], 60.0)
+        }
+    };
+    fused.truncate(k);
+    Ok(fused)
+}
+
 /// E388: the file ranker `--rank-files` keeps.
 pub struct FileRanker {
     pub bm25: Bm25Mem,
@@ -583,40 +633,33 @@ impl Live {
     ) -> Result<Vec<(String, f32)>, String> {
         self.index_files();
         let r = self.ranker.as_ref().expect("ranker");
-        let Some(q) = vector.filter(|_| r.dim > 0) else {
-            return Ok(r.bm25.search(query, k));
-        };
-        if q.len() != r.dim {
-            return Err(format!(
-                "the query vector has {} numbers, files {}",
-                q.len(),
-                r.dim
-            ));
+        rank_in(
+            &r.bm25,
+            &self.files,
+            &r.vectors,
+            r.dim,
+            query,
+            vector,
+            k,
+            fuse,
+        )
+    }
+
+    /// E416: BM25 over just `files` (path, content), from their extracted
+    /// text, for ranking a share's scope as if it were all the store held.
+    pub fn scope_index(&self, files: &BTreeMap<String, Id>) -> Result<Bm25Mem, String> {
+        let mut bm25 = Bm25Mem::new();
+        for (path, id) in files {
+            let doc = match self.extracted.get(id) {
+                Some(d) => d.clone(),
+                None => Arc::new(text::extract(
+                    path,
+                    &self.repo.read_content(id).map_err(err)?,
+                )),
+            };
+            bm25.put(path, &doc_text(&doc));
         }
-        let depth = FUSE_DEPTH.max(k);
-        let keyword = r.bm25.search(query, depth);
-        let mut near: Vec<(f32, &String)> = self
-            .files
-            .iter()
-            .filter_map(|(p, id)| Some((ikam_kernel::vectors::dot_lanes(q, r.vectors.get(id)?), p)))
-            .collect();
-        let by =
-            |a: &(f32, &String), b: &(f32, &String)| b.0.total_cmp(&a.0).then_with(|| a.1.cmp(b.1));
-        if near.len() > depth {
-            near.select_nth_unstable_by(depth - 1, by);
-            near.truncate(depth);
-        }
-        near.sort_by(by);
-        let near: Vec<(String, f32)> = near.into_iter().map(|(s, p)| (p.clone(), s)).collect();
-        let mut fused = match fuse {
-            Fuse::Convex(alpha) => ikam_kernel::fusion::convex(&keyword, &near, alpha),
-            Fuse::Rrf => {
-                let keys = |l: &[(String, f32)]| l.iter().map(|x| x.0.clone()).collect();
-                ikam_kernel::fusion::rrf(&[keys(&keyword), keys(&near)], 60.0)
-            }
-        };
-        fused.truncate(k);
-        Ok(fused)
+        Ok(bm25)
     }
 
     /// The `n` passages of `path` that best answer `query`.
