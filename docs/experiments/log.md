@@ -6537,3 +6537,53 @@ Gates on the branch (E229 to E233): every kernel test suite passes (release); cl
 - Verdict: **kept** (a fix, the paged first build, with no trade-off; `--hnsw-threads` an option, off).
 - Not measured: the Mac; real embeddings (clustered synthetic vectors stand in; recall on real text vectors may differ either way); a wider `ef` (a constant here: 80), which would trade query time for recall at 1M; keeping the graph across restarts; vectors changing while serving at 1M; more than one run each (build times on a shared cloud host move by tens of percent).
 - Run: `python3 -I experiments/vectors-1m/vec_1m.py WORK OUT.jsonl 100000,250000,500000,1000000 "exact=BRANCH:;exact-main=MAIN:;hnsw=BRANCH:--hnsw;hnsw4=BRANCH:--hnsw --hnsw-threads 4;hnsw-main@1000000=MAIN:--hnsw" 200`.
+
+### E445 week-scorecard (E354's goals and the business cases, rerun on the week's combined build)
+
+- Branch / parent: exp/445-week-scorecard / main 437aef6. Measured on main 437aef6 and on `trial/merge-order` 13f2369 (every open PR from E390 to E425 merged in a checked order, except E409's).
+- Question: E354 tested the project's stated goals on main d49ac2c and E355 listed what the server lets a project use. After a week of experiments (E385 to E442, mostly unmerged), what moved for each goal and each use case, and what is still the largest gap?
+- Method (4-core cloud machine, synthetic data; other builds ran beside these runs, so times are indicative and bytes are exact):
+  - G2: the fixed bench (`cargo run --release --example bench -- --json`) on main and on the trial branch, one session.
+  - G4: `experiments/goal-scorecard/db_first_write.py` at 200k rows in 2,000-row batches with `base+write-options` (E354's best set) and `--live` (the preset since E356/E372), on binaries built from main and from the trial branch.
+  - G8: `.github/privacy/scan.py --all` on the trial branch.
+  - G1, G3, G5, G6, G7 and the new compute and training uses: the week's log entries and registry rows, and the trial branch's tests (`cargo test --release --features embed`: 471 pass; `ikam-compute`: 30 pass).
+- Results, the fixed bench: every byte field (ingest, repack, exact, fsck and per-kind counts) is equal on all 14 corpora between main and the trial branch; north 0.3060 and sharing 0.9496 on both. Summary cost 0.2391 (main) and 0.2335 (trial), north repack CPU 72.0 and 53.4 s, repack peak 46.3 and 49.5 MB: timing and peak differences are within what a shared host moves by, except the peak (+7%, one run, not explained).
+- Results, the database first-write test at 200k rows:
+
+  | build, flags | load | load batch p50 | first write after restart | later writes p50 | append to the big table | store |
+  | --- | --- | --- | --- | --- | --- | --- |
+  | E354, base | n/a | 649 ms | 5.06 s | 180 ms | n/a | 286.5 MB |
+  | E354, base + write options | n/a | 846 ms | 0.11 s | 146 ms | n/a | 286.5 MB |
+  | main, base + write options | 80.1 s | 841 ms | 0.094 s | 162 ms | 1.23 s | 286.5 MB |
+  | main, `--live` | 29.7 s | 121 ms | 0.071 s | 122 ms | 0.095 s | 167.9 MB |
+  | trial, base + write options | 74.0 s | 789 ms | 0.107 s | 173 ms | 1.11 s | 286.5 MB |
+  | trial, `--live` | 23.8 s | 74 ms | 0.075 s | 65 ms | 0.063 s | 167.9 MB |
+
+- Goals, E354 then now:
+
+  | Goal | E354 (Nov 18) | Now (main, then the trial branch) | Holds |
+  | --- | --- | --- | --- |
+  | G1 file service for AI | WebDAV and `/api` only; no tool interface | `ikam mcp` answers both MCP versions (E406), serves skills (E407, option); 200 agent sessions byte-exact, 5% smaller than git gc (E397); an edit journal keeps every answered write through 20 kills (E398, option) | yes |
+  | G2 one graph | north 0.306, cross-type sharing 5% | north 0.3060, sharing 0.9496, bytes unchanged by the week's options; float planes save 7.5% on float weights (E410, option); cross-type sharing (E366) not started | bytes yes, cross-type weak |
+  | G3 semantic search | not served | ranked whole-file search in `mcp`/`live` (E388), vector search in `db serve` to 1M rows (E389), ranked search over a share's scope (E416), packed postings (E408); a real embedder's weights not fetched here (E387) | yes, quality unmeasured on real text |
+  | G4 the database | first write 5.06 s at 200k with base flags | `--live`: first write 0.07 s, append to a 200k table 0.06-0.10 s, store 41% smaller; 1M rows resident 293 MB with `--lean-ledger` (E391); squash for collector stores (E414); but appends stall up to ~33 s at 1M rows while a BM25 delta folds under the writer lock (E393) | yes to 200k; stalls at 1M |
+  | G5 trade-offs as options | yes | every new behaviour this week is off by default; the fixed bench is byte-equal | yes |
+  | G6 execution modes | CPU yes | one function bit-identical in 23 integer modes (E423); compute graphs, pinned floats and recorded steps (E430, E441); bound checks as graph nodes (E442); 1 kHz loop p99 198 us (E432); MLIR rows not run (tools not installed here) | yes for CPU |
+  | G7 separate, shared by scope | merge for folder and key ranges; no vector search through a share | ranked search through a share (E416), line merges (E417), content in record shares (E437), base64 records (E434); five projects in one host hold their limits (E418) but host memory grows with edits (93 to 917 MB) | mostly |
+  | G8 nothing private | exit 0 | exit 0 on the trial branch | yes |
+
+- Use cases (from the owner's words; A's "running live" and C's "one shared service" are inferred):
+
+  | Case | Moved this week | Still open |
+  | --- | --- | --- |
+  | A a program's records in `db serve` | `--live` 200k rows in 24-30 s with 0.07 s first write; lean ledger; idle fold (E413); squash (E414) | append stalls at 1M (E393); no filter query over zone maps (E405); joins proposed but not served (E420) |
+  | B AI file service with semantic search | MCP both versions, skills, crash journal, ranked files | real embeddings and their quality; vectors kept across restarts |
+  | C one host, separate projects | share ranking, line merge, shared content, explorer pages (E440) | host memory growth (E418); tree cache and skip-busy-commits wait on an owner choice |
+  | D execution modes | mode matrix, compute crate, float steps and bounds | MLIR batch (E424) not built; Apple NEON rows need the Mac |
+  | Compute and training (Nov 23-27 asks) | compute graphs (E430-E439), versioned nets (E422), learned planner (E425); training tables, sampler and trainer, step cache: E426-E444 | depends on those PRs |
+  | N one graph | bytes held at 0.3060 | cross-type sharing (E366) |
+
+- Gap list, largest first: (1) none of the week's work is on main: 40 open PRs wait on one merge (the trial branch shows they merge cleanly and pass 471 tests); (2) append stalls at 1M rows from the BM25 fold under the writer lock (E393; E394's off-lock build was discarded, catching up in rounds off the lock is next); (3) semantic search quality on real text needs the embedder's weights (E387); (4) host memory grows with edits (E418); (5) no served filter, join or zone-map query (E405, E420); (6) cross-type sharing (E366); (7) MLIR and Apple rows.
+- Verdict: **measured**, no code change.
+- Not measured: the Mac; more than one run each; real data.
+- Run: `cargo run --release --example bench -- --json` on each build; `python3 experiments/goal-scorecard/db_first_write.py IKAM_BIN WORK 200000 2000 base+write-options,live`.
