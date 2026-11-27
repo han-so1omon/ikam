@@ -1392,11 +1392,6 @@ mod tests {
         host_with(name, "")
     }
 
-    /// As `host`, with more config lines.
-    fn host_with(name: &str, extra: &str) -> (Host, Vec<PathBuf>) {
-        host_with(name, "")
-    }
-
     /// `host` with more config lines.
     fn host_with(name: &str, extra: &str) -> (Host, Vec<PathBuf>) {
         let dirs: Vec<PathBuf> = ["a", "b", "c"]
