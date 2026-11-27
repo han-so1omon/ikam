@@ -133,6 +133,9 @@ impl<S: Store + Sync> Repo<S> {
         if self.screen_trials {
             h.update(b"screen_trials");
         }
+        if self.float_planes {
+            h.update(b"float_planes");
+        }
         Ok(Id::from_bytes(*h.finalize().as_bytes()))
     }
 
@@ -371,6 +374,7 @@ impl<S: Store + Sync> Repo<S> {
         fresh.short_records = self.short_records;
         fresh.markup_layers = self.markup_layers;
         fresh.slow_codec_max = self.slow_codec_max;
+        fresh.float_planes = self.float_planes;
         fresh.group_size = self.group_size;
         fresh.screen_trials = self.screen_trials;
         fresh.trial_threads = self.trial_threads;

@@ -306,6 +306,12 @@ pub struct Repo<S: Store> {
     /// they touch as contents of their own either way. Views built either
     /// way rank the same.
     pub bm25_pack: usize,
+    /// Let repack store float content as byte planes (E410, Xet's BG4):
+    /// a content of 4 KiB or more whose 4 byte positions the predictor
+    /// finds distributed differently (`planes::predict`) is also tried as
+    /// a zstd frame of its planes ("V"), kept if cheaper. Off by default.
+    /// Reading accepts "V" at any setting.
+    pub float_planes: bool,
     pub(crate) hints: std::sync::Mutex<Option<Hints>>,
     /// Whether a stored tree or graph chunk may be planned as a fill of a
     /// template (E144). On by default. Off, its plans are only slices of
@@ -416,6 +422,7 @@ impl<S: Store> Repo<S> {
             replace_hints: false,
             exact_short_search: false,
             bm25_pack: 0,
+            float_planes: false,
             object_templates: true,
             plain_db_events: false,
             plain_hot_writes: false,
@@ -794,6 +801,7 @@ impl<S: Store> Repo<S> {
         r.graph_cut = self.graph_cut;
         r.exact_short_search = self.exact_short_search;
         r.bm25_pack = self.bm25_pack;
+        r.float_planes = self.float_planes;
         r
     }
 

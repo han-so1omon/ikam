@@ -42,6 +42,7 @@ pub mod merge;
 pub mod net;
 mod object;
 mod pdftext;
+pub mod planes;
 mod range;
 mod repack;
 mod repo;

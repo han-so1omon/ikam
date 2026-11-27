@@ -7086,3 +7086,42 @@ Gates on the branch (E229 to E233): every kernel test suite passes (release); cl
 - Not measured: a store on disk (FsStore, `--packs`), where a content is a file or a pack entry and the object count matters most; 1M rows through `db serve --live` (E375's `rss_load.py` is on its own branch); `gc` after updates leave packs part used; the Mac.
 - Next: the same packing for other views made of many small contents; then run E375's 1M-row load with `--live --bm25-pack 4096`.
 - Run: `cargo run --release --example bm25_build -- 200000 build` and `... 200000 packed 4096` (and 16384, 65536, 262144).
+
+### E410 float-planes (float content stored as byte planes, as an option)
+- Branch / parent: exp/410-float-planes / main 437aef6
+- Question: Night 6 item 8. Hugging Face's Xet store regroups the bytes of float tensors before compressing (BG4: byte 0 of every 4-byte value, then byte 1, and so on), chosen by a cheap predictor. Does the same help ikam's stored float content (model weights, embedding vectors, float columns), at what cost to repack and reads, and how well does the predictor choose?
+- Change (option, off): `Repo::float_planes` (false by default; copied by `sibling` and into repack's re-plan). With it on, `encode_cheapest` also tries content of 4 KiB or more that `planes::predict` picks as a zstd frame of its 4 planes, stored as a new plain encoding "V" (`V` then the frame; a length that is not a multiple of 4 keeps its last 1 to 3 bytes after the planes), and keeps it only when its cost (bytes plus read weight) is lower than every other plain encoding, brotli included. The predictor (`planes::divergence`) samples at most 16,384 values, takes each byte position's histogram of set bits (0 to 8) and returns the largest Kullback-Leibler divergence between two positions; `predict` is that above `THRESHOLD`, 0.005. Reading accepts "V" whatever the setting; a range read of "V" decodes the whole frame, then cuts it. `corpus` labels it "content: zstd, byte planes". On the way, the first runs showed the option doing nothing: repack's re-plan builds its repo field by field and did not copy `float_planes`, so the fix copies it there.
+- Result (`examples/float_planes.rs`, MemStore, Linux cloud, 4 CPUs; each corpus written, committed and repacked with the option off and on; stored bytes after repack; reads are every content once after repack):
+
+  | corpus | contents | raw | off | on | change | repack off / on | read off / on |
+  |---|---|---|---|---|---|---|---|
+  | float32 weights (20 checkpoints of 8 tensors, about 1M parameters, each a small step from the last) | 160 | 84.0 MB | 76.93 MB | 71.18 MB | -7.5% | 45.7 / 43.6 s | 0.98 / 0.08 s |
+  | float32 unit vectors (2,000 of 384 dimensions) | 20 | 3.07 MB | 2.82 MB | 2.61 MB | -7.2% | 1.6 / 1.5 s | 33 / 3 ms |
+  | float64 prices (two decimals) | 8 | 1.05 MB | 0.326 MB | 0.326 MB | 0 | 0.9 / 1.0 s | 5 / 5 ms |
+  | float64 measurements (normal) | 8 | 1.05 MB | 0.934 MB | 0.907 MB | -2.8% | 0.6 / 0.5 s | 11 / 1 ms |
+  | source text | 4 | 157 KB | 38.3 KB | 38.3 KB | 0 | 0.2 / 0.2 s | 1 / 1 ms |
+  | JSON rows | 8 | 642 KB | 101 KB | 101 KB | 0 | 1.1 / 1.2 s | 2 / 3 ms |
+  | sorted u32 ids | 8 | 524 KB | 164 KB | 148 KB | -9.4% | 0.5 / 0.5 s | 2 / 0 ms |
+
+  Every content read back exact. With the option off, repack stored the float contents as brotli; with it on, as "V" (weights: 122 "V" and the 40 group members as before). Reads got about ten times faster where "V" replaced brotli, since a zstd frame and a regroup decode far faster than brotli at quality 11; repack time did not change beyond this machine's noise. The prices column (two decimals, so its low bytes are not noise) and text and JSON stayed as they were: planes compress them worse, and the cost check keeps the bytes.
+
+  Per content, against each codec at repack's settings (sums over the contents of 4 KiB or more):
+
+  | corpus | zstd | brotli | zstd, 4 planes | brotli, 4 planes | zstd, 8 planes | brotli, 8 planes |
+  |---|---|---|---|---|---|---|
+  | float32 weights | 77.77 MB | 76.91 MB | 71.17 MB | 70.46 MB | 71.34 MB | 71.77 MB |
+  | float32 vectors | 2.84 MB | 2.82 MB | 2.61 MB | 2.56 MB | 2.62 MB | 2.56 MB |
+  | float64 prices | 395 KB | 325 KB | 638 KB | 604 KB | 650 KB | 618 KB |
+  | float64 measurements | 972 KB | 934 KB | 907 KB | 862 KB | 862 KB | 849 KB |
+  | sorted u32 ids | 172 KB | 172 KB | 148 KB | 115 KB | 147 KB | 125 KB |
+
+  Brotli on planes would save about 1% more on weights and a fifth more on sorted ids, at brotli's read cost; 8 planes help float64 measurements a little more than 4. Neither is in this change.
+
+  The predictor, against which of planes and bytes zstd made smaller, over 196 contents: 176 right at threshold 0, 188 at 0.005, 180 at 0.01 and 0.02, 185 at 0.03, 188 from 0.05 to 0.5. At 0.005 the 8 wrong are the prices columns (divergence 0.025 to 0.032), where planes lose and the cost check then keeps the bytes, so a wrong yes costs one extra compression. At 0.05 the 8 wrong are the measurements (0.006 to 0.01), where planes win and are never tried. Float32 data scored 1.6 to 2.8, sorted ids 8.6 to 10.4, text and JSON 0.0001 to 0.0013.
+- Checks: `planes` unit tests (split and join at every length 0 to 39; floats picked, text and 1,000 bytes not); `float_content_is_stored_as_planes_and_reads_back` (float runs of 160 KB, 20 KB and an odd length, and text: with the option on some are stored "V", with it off none; every content and a 1,001-byte range from its middle read back exact; deep fsck clean). `cargo test --release --features embed`: 379 pass; clippy clean.
+- Fixed benchmark (`cargo run --release --example bench -- --json`, on the branch, the option off as by default): bytes 5.7493, proxy 3.8185, read 5.7140, north 0.3060, the same as main's (E391); every corpus exact, fsck clean.
+- Review (Codex): `float_planes` is now hashed into the repack fingerprint when set, as `slow_codec_max` and `group_size` are, so a store repacked without it is re-planned when it is turned on rather than skipped by the earlier mark.
+- Verdict: **kept** as an option (off by default). On float32 weights and vectors it stores 7% less and reads about ten times faster than the brotli repack picks today, at no repack cost; on content that is not float it does nothing. It is not on by default because "V" is a new stored encoding that older builds cannot read.
+- Not measured: real checkpoints (bf16 and fp16, where Xet reports most of its gain, and trained rather than synthetic weights); a store on disk; content added after the repack (writes stay zstd until the next repack); `db serve` (no flag yet); the Mac.
+- Next: a flag for `db serve`; then brotli or 8 planes as further "V" variants if real checkpoints show the gaps above; bf16 tensors with 2 planes.
+- Run: `cargo run --release --example float_planes`.
