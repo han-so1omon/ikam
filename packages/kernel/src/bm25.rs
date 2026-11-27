@@ -545,11 +545,43 @@ impl<S: Store> Repo<S> {
     /// each term's postings are encoded as rows arrive (key order is
     /// postings order); the graph is put whole rather than edited in.
     pub fn bm25_view_build(&mut self, db: &Db, prefix: &str) -> Result<Bm25View, Error> {
+        self.bm25_view_build_observed(db, prefix, None)
+    }
+
+    /// E403: `bm25_view_build` that also gathers the rows' column
+    /// statistics into `stats` (`colstats.rs`) in the same pass.
+    pub fn bm25_view_build_with_stats(
+        &mut self,
+        db: &Db,
+        prefix: &str,
+        stats: &mut crate::colstats::TableStats,
+    ) -> Result<Bm25View, Error> {
+        self.bm25_view_build_observed(db, prefix, Some(stats))
+    }
+
+    /// E403: keep `stats` as a derived content of the table (its JSON,
+    /// `TableStats::to_json`); its id.
+    pub fn put_table_stats(
+        &mut self,
+        stats: &mut crate::colstats::TableStats,
+    ) -> Result<Id, Error> {
+        self.put_derived(stats.to_json().as_bytes())
+    }
+
+    fn bm25_view_build_observed(
+        &mut self,
+        db: &Db,
+        prefix: &str,
+        mut stats: Option<&mut crate::colstats::TableStats>,
+    ) -> Result<Bm25View, Error> {
         let rows = self.node_values(self.graph_prefix(&db.kv, prefix)?)?;
         let mut post: HashMap<String, Vec<u8>> = HashMap::new();
         let mut row_terms: Vec<String> = Vec::new();
         let (n, mut total) = (rows.len(), 0);
         for (key, value) in &rows {
+            if let Some(s) = stats.as_deref_mut() {
+                s.observe(value);
+            }
             row_terms.clear();
             row_terms.extend(terms(&String::from_utf8_lossy(value)));
             let len = row_terms.len();
