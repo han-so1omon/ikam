@@ -172,6 +172,9 @@ fn similar_groups(
     groups
 }
 
+/// Grouping proposals `group_small` compares (see its loop).
+const PROPOSALS: usize = 5;
+
 /// Candidates measured per step when growing a group by compressed cost.
 const SHORTLIST: usize = 8;
 
@@ -275,28 +278,55 @@ impl<S: Store> Repo<S> {
             .map(|(_, d)| d.clone())
             .unwrap_or_default();
         let limit = self.group_size;
-        let proposals = [
-            byte_order_groups(&items, limit),
-            similar_groups(&items, None, None, limit),
-            similar_groups(&items, Some(&dict), None, limit),
-            // Byte order shortlists, measured cost picks.
-            similar_groups(
-                &items,
-                Some(&dict),
-                Some(&(0..items.len()).collect::<Vec<_>>()),
+        // A learned planner (E425, off by default) may leave out proposals
+        // it predicts lose; each proposal is exact, so that costs bytes at
+        // most.
+        let features = (self.planner.is_some() || self.plan_log.is_some()).then(|| {
+            let proposed: HashSet<Id> = self.proposed_order.iter().copied().collect();
+            let sizes: Vec<(usize, usize)> = items.iter().map(|i| (i.0.len(), i.2)).collect();
+            crate::planner::group_features(
+                &sizes,
+                !dict.is_empty(),
+                self.read_weight,
+                items.iter().filter(|i| proposed.contains(&i.1)).count(),
                 limit,
-            ),
-            proposed_groups(&items, &self.proposed_order, limit),
-        ];
-        for proposal in proposals {
+            )
+        });
+        let (mut outcome, mut ms, mut chosen) = ([None; PROPOSALS], [0.0; PROPOSALS], None);
+        for (i, (outcome, ms)) in outcome.iter_mut().zip(&mut ms).enumerate() {
+            if let (Some(planner), Some(f)) = (&self.planner, &features)
+                && !planner.build("group", i, f)
+            {
+                continue;
+            }
+            let began = std::time::Instant::now();
+            let proposal = match i {
+                0 => byte_order_groups(&items, limit),
+                1 => similar_groups(&items, None, None, limit),
+                2 => similar_groups(&items, Some(&dict), None, limit),
+                // Byte order shortlists, measured cost picks.
+                3 => similar_groups(
+                    &items,
+                    Some(&dict),
+                    Some(&(0..items.len()).collect::<Vec<_>>()),
+                    limit,
+                ),
+                _ => proposed_groups(&items, &self.proposed_order, limit),
+            };
             let plans: Vec<Planned> = proposal
                 .iter()
                 .filter_map(|g| self.plan_group(&g.iter().map(|&i| &items[i]).collect::<Vec<_>>()))
                 .collect();
             let saved = plans.iter().map(|p| p.saved).sum();
+            (*outcome, *ms) = (Some(saved), began.elapsed().as_secs_f64() * 1e3);
             if saved > best.0 {
-                best = (saved, plans);
+                (best, chosen) = ((saved, plans), Some(i));
             }
+        }
+        if let (Some(log), Some(f)) = (&self.plan_log, &features)
+            && items.len() >= 2
+        {
+            log.record("group", f, &outcome, &ms, chosen);
         }
         for p in &best.1 {
             self.store.write(p.group, &p.encoded)?;
