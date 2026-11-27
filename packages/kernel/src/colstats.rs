@@ -429,6 +429,52 @@ fn unescape(s: &[u8], out: &mut Vec<u8>) -> bool {
     true
 }
 
+/// E420: a top-level field's JSON text in a row (an object's key, or an
+/// array's position "0", "1", ...), as `observe` reads fields.
+pub fn field_value<'a>(row: &'a [u8], name: &str) -> Option<&'a [u8]> {
+    let mut i = skip_ws(row, 0);
+    let (object, close) = match row.get(i)? {
+        b'{' => (true, b'}'),
+        b'[' => (false, b']'),
+        _ => return None,
+    };
+    let want: Option<usize> = if object {
+        None
+    } else {
+        Some(name.parse().ok()?)
+    };
+    i += 1;
+    let mut pos = 0usize;
+    loop {
+        i = skip_ws(row, i);
+        if *row.get(i)? == close {
+            return None;
+        }
+        let hit = if object {
+            let end = value_end(row, i).filter(|_| row[i] == b'"')?;
+            let hit = &row[i + 1..end - 1] == name.as_bytes();
+            i = skip_ws(row, end);
+            if row.get(i) != Some(&b':') {
+                return None;
+            }
+            i = skip_ws(row, i + 1);
+            hit
+        } else {
+            pos += 1;
+            Some(pos - 1) == want
+        };
+        let end = value_end(row, i)?;
+        if hit {
+            return Some(&row[i..end]);
+        }
+        i = skip_ws(row, end);
+        match row.get(i)? {
+            b',' => i += 1,
+            _ => return None,
+        }
+    }
+}
+
 fn classify(t: &[u8]) -> Val<'_> {
     match t {
         b"null" => Val::Null,

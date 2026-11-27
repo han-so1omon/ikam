@@ -36,6 +36,7 @@ mod ingest;
 pub mod integrate;
 pub mod ir;
 pub mod join;
+pub mod joinkeys;
 mod library;
 mod markup;
 pub mod matcher;
