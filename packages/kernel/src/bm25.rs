@@ -580,7 +580,7 @@ impl<S: Store> Repo<S> {
         let (n, mut total) = (rows.len(), 0);
         for (key, value) in &rows {
             if let Some(s) = stats.as_deref_mut() {
-                s.observe(value);
+                s.observe_at(key, value);
             }
             row_terms.clear();
             row_terms.extend(terms(&String::from_utf8_lossy(value)));
