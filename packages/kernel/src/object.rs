@@ -138,6 +138,10 @@ pub struct Run {
     pub func: Id,
     pub args: Vec<Arg>,
     pub check: Option<Check>,
+    /// Name and value pairs stored with the record (E428, the step cache:
+    /// the step's kind and the platform it ran on). Empty for every record
+    /// made outside the cache, which then encodes as E441's did.
+    pub props: Vec<(String, String)>,
 }
 
 /// The step a rerun's output is judged by (see [`Run`]).
@@ -246,6 +250,14 @@ impl Object {
                         put_args(&mut out, &c.args);
                     }
                 }
+                // Only when set, so a record without them keeps E441's bytes.
+                if !r.props.is_empty() {
+                    put_u32(&mut out, r.props.len());
+                    for (k, v) in &r.props {
+                        put_str(&mut out, k);
+                        put_str(&mut out, v);
+                    }
+                }
             }
         }
         out
@@ -289,6 +301,13 @@ impl Object {
                         args: r.many(Reader::arg)?,
                     }),
                     _ => return Err(Error::Decode("unknown run check tag")),
+                },
+                props: match r.0.is_empty() {
+                    true => Vec::new(),
+                    false => match r.many(|r| Ok((r.string()?, r.string()?)))? {
+                        p if p.is_empty() => return Err(Error::Decode("empty run props")),
+                        p => p,
+                    },
                 },
             }),
             _ => return Err(Error::Decode("unknown object tag")),

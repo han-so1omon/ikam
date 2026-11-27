@@ -1,0 +1,23 @@
+# E428: a training-like step run outside the kernel (seeded least squares
+# fitted by a few hundred iterations of gradient descent), built twice to
+# stand in for two platforms: plain multiply-add with sequential sums, and
+# `--cfg fused` (fused multiply-add, four-lane sums) as an FMA build that
+# vectorises its dot products would. A separate crate so the kernel's
+# builds do not depend on it.
+[package]
+name = "step-cache"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[workspace]
+
+[[bin]]
+name = "train-gd"
+path = "src/main.rs"
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(fused)'] }
+
+[profile.release]
+debug = false
