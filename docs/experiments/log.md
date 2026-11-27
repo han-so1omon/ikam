@@ -6537,3 +6537,26 @@ Gates on the branch (E229 to E233): every kernel test suite passes (release); cl
 - Verdict: **kept** (a fix, the paged first build, with no trade-off; `--hnsw-threads` an option, off).
 - Not measured: the Mac; real embeddings (clustered synthetic vectors stand in; recall on real text vectors may differ either way); a wider `ef` (a constant here: 80), which would trade query time for recall at 1M; keeping the graph across restarts; vectors changing while serving at 1M; more than one run each (build times on a shared cloud host move by tens of percent).
 - Run: `python3 -I experiments/vectors-1m/vec_1m.py WORK OUT.jsonl 100000,250000,500000,1000000 "exact=BRANCH:;exact-main=MAIN:;hnsw=BRANCH:--hnsw;hnsw4=BRANCH:--hnsw --hnsw-threads 4;hnsw-main@1000000=MAIN:--hnsw" 200`.
+
+### E438 put-graph (`Edit::PutGraph`: a graph object at a path in a tree edit)
+
+- Branch / parent: exp/438-put-graph / main 437aef6
+- Question: `edit_tree` puts files (`Edit::Put`), directories and moves, but no public edit puts a graph object at a path, so code that commits a graph (the compute crate on exp/430, and `import_share` for a `Graph` scope) writes the tree entry by hand with its own `put_entry`. Can the kernel's tree edits take a graph, with the existing edits and their trees unchanged? (Planned in docs/plans/2026-11-26-math-engine.md on exp/430; business case: the math engine, which keeps op graphs at paths.)
+- Setup: unit tests only (`tests/put_graph.rs`), in-memory stores; graphs of 10 to 3,000 nodes (3,000 and 2,000 are several chunks).
+- Change: `Edit::PutGraph { path, id }`, the same shape as `Edit::Put`: creates or replaces the entry at `path` with kind `Graph`, making missing directories. Unlike `Put` (which names content by id and does not look it up), it reads the object first and refuses an id that is not in the store (`Error::NotFound`) or is not a graph (content or a tree: `Error::WrongKind`); a refused edit list writes no tree. `Rename`, `Copy` and `Remove` already carried any entry kind, graphs included. Nothing else changes: no new object kind, no encoding change, no default path touched.
+- Results (5 tests, all pass):
+
+  | check | result |
+  | --- | --- |
+  | put a 3,000-node graph at `models/solver/net`, commit, read back at the commit | entry kind `Graph`, same id, same nodes; fsck and fsck_deep clean; gc keeps every chunk |
+  | `Copy` and `Rename` of a graph entry | carried as any entry |
+  | second commit replaces the graph (2 of 2,000 nodes changed) | previous commit still reads v1; untouched sibling subtree keeps its id; `graph_diff(v1, v2)` names exactly the 2 nodes; the same graph again gives the same tree id |
+  | missing id, a content id, a tree id, a `..` path | refused (`NotFound`, `WrongKind`, `WrongKind`, `InvalidName`) |
+  | `PutGraph` against a tree written by hand (as exp/430's `put_entry`) | the same tree id |
+  | a fixed list of `Put`, `Mkdir`, `Copy`, `Rename`, `Remove` | tree id `7eaa8d01...` on this branch and on main 437aef6 (pinned from a run there) |
+
+- Fixed benchmark: not run. The change adds an edit that only a caller who names it uses; the bench never does, and the existing edits' trees are pinned equal to main's above.
+- Checks: `cargo test --release --features embed`: 381 pass, 0 fail (with `--no-fail-fast`; a first run stopped at `http::tests::limits_refuse_large_bodies_long_headers_and_extra_connections`, "closed early", a connection-cap timing test in a file this branch does not touch, on a host at load 16; it passed on the rerun); clippy `--all-targets -D warnings` clean.
+- Verdict: **kept** (a new edit, no trade-off; nothing changes for existing callers).
+- Not measured: replacing the compute crate's `put_entry` and `share.rs`'s own `put_entry` (for `Graph` imports) with the edit (left to their own branches, so this one touches nothing else); `Edit` is a public enum without `#[non_exhaustive]`, so a downstream exhaustive `match` on it must add the new arm (none in this repo outside `worktree.rs`).
+- Run: `cargo test --release --features embed --test put_graph`.
