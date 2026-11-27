@@ -10,6 +10,14 @@
 //! calls it from the BM25 view build's own pass over the rows, so the stats
 //! cost no second read. `to_json` is the derived view that is kept.
 //! A row that is not a JSON object or array counts only as a row.
+//!
+//! Zone maps (E405, off unless asked for with `TableStats::with_zones`):
+//! per zone of so many rows in the order observed (a table's key order in
+//! the BM25 build), per field, the rows that have it, its nulls, and the
+//! min and max of its numbers and of its strings (as stored, escapes
+//! included, compared bytewise), with the zone's first and last key.
+//! `zones_to_read` names the zones a filter can match, so a filtered read
+//! can skip the others.
 
 use std::collections::{BTreeMap, HashMap};
 use std::hash::{BuildHasher, BuildHasherDefault, DefaultHasher};
@@ -22,6 +30,7 @@ pub const CATEGORIES_MAX: usize = 256;
 const DELTA: f64 = 100.0;
 
 /// A field's value, as `observe` sees it.
+#[derive(Clone, Copy)]
 enum Val<'a> {
     Num(f64, &'a [u8]),
     Str(&'a [u8]),
@@ -169,6 +178,9 @@ pub struct ColumnStats {
     /// Value counts of strings and booleans, while there are at most
     /// `CATEGORIES_MAX` distinct ones; `None` after that.
     pub values: Option<HashMap<Vec<u8>, u64>>,
+    /// The field's place in each zone's columns (the order fields were
+    /// first seen).
+    idx: usize,
 }
 
 impl ColumnStats {
@@ -218,6 +230,11 @@ impl ColumnStats {
         }
     }
 
+    /// The field's place in each zone's `columns`.
+    pub fn idx(&self) -> usize {
+        self.idx
+    }
+
     /// The population variance of the numbers.
     pub fn variance(&self) -> f64 {
         if self.numbers == 0 {
@@ -234,6 +251,69 @@ impl ColumnStats {
 pub struct TableStats {
     pub rows: u64,
     pub columns: BTreeMap<String, ColumnStats>,
+    /// E405: zone maps, when asked for.
+    pub zones: Option<Zones>,
+}
+
+/// One field within one zone.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct ZoneColumn {
+    pub count: u64,
+    pub nulls: u64,
+    /// Min and max of the field's numbers in the zone.
+    pub num: Option<(f64, f64)>,
+    /// Min and max of the field's strings in the zone, bytewise.
+    pub str: Option<(Vec<u8>, Vec<u8>)>,
+}
+
+impl ZoneColumn {
+    fn add(&mut self, v: Val) {
+        self.count += 1;
+        match v {
+            Val::Null => self.nulls += 1,
+            Val::Num(x, _) => {
+                let (lo, hi) = self.num.get_or_insert((x, x));
+                *lo = lo.min(x);
+                *hi = hi.max(x);
+            }
+            Val::Str(s) => match &mut self.str {
+                None => self.str = Some((s.to_vec(), s.to_vec())),
+                Some((lo, hi)) => {
+                    if s < &lo[..] {
+                        *lo = s.to_vec();
+                    } else if s > &hi[..] {
+                        *hi = s.to_vec();
+                    }
+                }
+            },
+            Val::Bool(_) | Val::Other(_) => {}
+        }
+    }
+}
+
+/// One zone: its first and last key (when observed with keys), and its
+/// columns by field place.
+#[derive(Clone, Debug, Default)]
+pub struct Zone {
+    pub rows: u64,
+    pub first_key: Option<String>,
+    pub last_key: Option<String>,
+    pub columns: Vec<ZoneColumn>,
+}
+
+/// Zone maps over a table's rows.
+#[derive(Clone, Debug)]
+pub struct Zones {
+    pub zone_rows: u64,
+    pub zones: Vec<Zone>,
+}
+
+/// A filter on one field, for `zones_to_read`.
+pub enum Filter<'a> {
+    /// A number from `lo` to `hi`, both included.
+    Range(f64, f64),
+    /// A string equal to this (its stored bytes, without the quotes).
+    Eq(&'a [u8]),
 }
 
 fn skip_ws(b: &[u8], mut i: usize) -> usize {
@@ -366,9 +446,67 @@ fn classify(t: &[u8]) -> Val<'_> {
 }
 
 impl TableStats {
+    /// Stats that also keep zone maps, one zone for each `zone_rows` rows
+    /// (at least 1).
+    pub fn with_zones(zone_rows: u64) -> TableStats {
+        TableStats {
+            zones: Some(Zones {
+                zone_rows: zone_rows.max(1),
+                zones: Vec::new(),
+            }),
+            ..TableStats::default()
+        }
+    }
+
+    /// `observe`, noting the row's key as its zone's first or last.
+    pub fn observe_at(&mut self, key: &str, row: &[u8]) {
+        self.observe(row);
+        if let Some(z) = self.zones.as_mut().and_then(|z| z.zones.last_mut()) {
+            if z.first_key.is_none() {
+                z.first_key = Some(key.to_string());
+            }
+            let last = z.last_key.get_or_insert_default();
+            last.clear();
+            last.push_str(key);
+        }
+    }
+
+    /// The zones (their places) a row matching `filter` on `column` can be
+    /// in; every zone when there are no zone maps or no such column.
+    pub fn zones_to_read(&self, column: &str, filter: &Filter) -> Vec<usize> {
+        let Some(z) = &self.zones else {
+            return Vec::new();
+        };
+        let Some(c) = self.columns.get(column) else {
+            return (0..z.zones.len()).collect();
+        };
+        (0..z.zones.len())
+            .filter(|&i| {
+                let Some(zc) = z.zones[i].columns.get(c.idx) else {
+                    return false; // the field first appears after this zone
+                };
+                match *filter {
+                    Filter::Range(lo, hi) => zc.num.is_some_and(|(a, b)| a <= hi && b >= lo),
+                    Filter::Eq(s) => zc
+                        .str
+                        .as_ref()
+                        .is_some_and(|(a, b)| &a[..] <= s && s <= &b[..]),
+                }
+            })
+            .collect()
+    }
+
     /// Add one row (its value bytes).
     pub fn observe(&mut self, row: &[u8]) {
         self.rows += 1;
+        if let Some(z) = &mut self.zones
+            && (self.rows - 1).is_multiple_of(z.zone_rows)
+        {
+            z.zones.push(Zone::default());
+        }
+        if let Some(z) = self.zones.as_mut().and_then(|z| z.zones.last_mut()) {
+            z.rows += 1;
+        }
         let mut i = skip_ws(row, 0);
         let (object, close) = match row.get(i) {
             Some(b'{') => (true, b'}'),
@@ -406,18 +544,25 @@ impl TableStats {
             let Some(end) = value_end(row, i) else {
                 return;
             };
+            let next = self.columns.len();
             let col = match self.columns.get_mut(&name) {
                 Some(c) => c,
                 None => self.columns.entry(name).or_insert_with(|| ColumnStats {
                     values: Some(HashMap::new()),
+                    idx: next,
                     ..ColumnStats::default()
                 }),
             };
-            match classify(&row[i..end]) {
-                Val::Str(s) if s.contains(&b'\\') && unescape(s, &mut buf) => {
-                    col.add(Val::Str(&buf))
+            let v = match classify(&row[i..end]) {
+                Val::Str(s) if s.contains(&b'\\') && unescape(s, &mut buf) => Val::Str(&buf),
+                v => v,
+            };
+            col.add(v);
+            if let Some(z) = self.zones.as_mut().and_then(|z| z.zones.last_mut()) {
+                if z.columns.len() <= col.idx {
+                    z.columns.resize(col.idx + 1, ZoneColumn::default());
                 }
-                v => col.add(v),
+                z.columns[col.idx].add(v);
             }
             i = skip_ws(row, end);
             match row.get(i) {
@@ -486,7 +631,57 @@ impl TableStats {
             }
             out.push('}');
         }
-        out + "}}"
+        out.push('}');
+        if let Some(z) = &self.zones {
+            // Fields by place, then per zone each field's count, nulls and
+            // ranges (numbers as Rust formats them).
+            let mut names = vec![""; self.columns.len()];
+            for (name, c) in &self.columns {
+                names[c.idx] = name;
+            }
+            let names: Vec<String> = names.iter().map(|n| esc(n)).collect();
+            out += &format!(
+                ",\"zones\":{{\"zone_rows\":{},\"fields\":[{}],\"zones\":[",
+                z.zone_rows,
+                names.join(",")
+            );
+            for (i, zone) in z.zones.iter().enumerate() {
+                if i > 0 {
+                    out.push(',');
+                }
+                let key = |k: &Option<String>| k.as_deref().map_or("null".into(), esc);
+                out += &format!(
+                    "{{\"rows\":{},\"first\":{},\"last\":{},\"columns\":[",
+                    zone.rows,
+                    key(&zone.first_key),
+                    key(&zone.last_key)
+                );
+                for (j, c) in zone.columns.iter().enumerate() {
+                    if j > 0 {
+                        out.push(',');
+                    }
+                    out += &format!("[{},{}", c.count, c.nulls);
+                    match c.num {
+                        Some((a, b)) => out += &format!(",{a},{b}"),
+                        None => out += ",null,null",
+                    }
+                    match &c.str {
+                        Some((a, b)) => {
+                            out += &format!(
+                                ",{},{}",
+                                esc(&String::from_utf8_lossy(a)),
+                                esc(&String::from_utf8_lossy(b))
+                            )
+                        }
+                        None => out += ",null,null",
+                    }
+                    out.push(']');
+                }
+                out += "]}";
+            }
+            out += "]}";
+        }
+        out + "}"
     }
 }
 
@@ -577,5 +772,66 @@ mod tests {
         assert_eq!(s.columns["b"].bools, 45_000);
         assert_eq!(s.columns["1"].strings, 1);
         assert!(s.to_json().starts_with("{\"rows\":50002,"));
+        assert!(!s.to_json().contains("\"zones\""));
+    }
+
+    #[test]
+    fn zone_maps_match_an_exact_pass_and_skip_what_cannot_match() {
+        let rows: Vec<(String, String)> = (0..10_000u64)
+            .map(|i| {
+                let x = ((i * 2654435761) % 100_000) as f64 / 7.0;
+                let v = if i % 7 == 0 {
+                    format!(r#"[{i}, null, "w{}"]"#, i % 50)
+                } else {
+                    format!(r#"[{i}, {x}, "w{}"]"#, i % 50)
+                };
+                (format!("k{i:06}"), v)
+            })
+            .collect();
+        let mut s = TableStats::with_zones(1000);
+        let mut plain = TableStats::default();
+        for (k, v) in &rows {
+            s.observe_at(k, v.as_bytes());
+            plain.observe(v.as_bytes());
+        }
+        // Zones change none of the other stats.
+        let full = s.to_json();
+        assert!(full.starts_with(&plain.to_json()[..plain.to_json().len() - 1]));
+        let z = s.zones.as_ref().unwrap();
+        assert_eq!(z.zones.len(), 10);
+        for (n, zone) in z.zones.iter().enumerate() {
+            let part = &rows[n * 1000..(n + 1) * 1000];
+            assert_eq!(zone.first_key.as_deref(), Some(&part[0].0[..]));
+            assert_eq!(zone.last_key.as_deref(), Some(&part[999].0[..]));
+            let xs: Vec<f64> = part
+                .iter()
+                .filter_map(|(_, v)| v.split(", ").nth(1)?.parse().ok())
+                .collect();
+            let x = &zone.columns[s.columns["1"].idx];
+            assert_eq!(x.count, 1000);
+            assert_eq!(x.nulls as usize, 1000 - xs.len());
+            let lo = xs.iter().copied().fold(f64::INFINITY, f64::min);
+            let hi = xs.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+            assert_eq!(x.num, Some((lo, hi)));
+            let id = &zone.columns[s.columns["0"].idx];
+            assert_eq!(id.num, Some(((n * 1000) as f64, (n * 1000 + 999) as f64)));
+            assert_eq!(
+                zone.columns[s.columns["2"].idx].str,
+                Some((b"w0".to_vec(), b"w9".to_vec()))
+            );
+        }
+        // A range on the row number reads one zone; on the float every one;
+        // a word outside every zone's range reads none.
+        assert_eq!(
+            s.zones_to_read("0", &Filter::Range(2500.0, 2600.0)),
+            vec![2]
+        );
+        assert_eq!(
+            s.zones_to_read("1", &Filter::Range(0.0, 20_000.0)).len(),
+            10
+        );
+        assert!(s.zones_to_read("2", &Filter::Eq(b"x")).is_empty());
+        assert_eq!(s.zones_to_read("9", &Filter::Eq(b"x")).len(), 10);
+        assert!(full.contains("\"zones\":{\"zone_rows\":1000,"));
     }
 }
