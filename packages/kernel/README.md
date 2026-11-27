@@ -138,6 +138,11 @@ read-back against a copy of the tree, search freshness, restart).
 archives; see `docs/experiments/options.md`). Real-world corpora and how the
 kernel does on them: `realworld/README.md`.
 
+`--disk-guard` (E404, off) has `ingest`, `commit DIR` and `repack` check the
+store disk's free space against an estimate first and refuse when short, and
+free what they wrote if the disk still fills (use it where the command is the
+store's only writer).
+
 For an AI agent (E359): `ikam --store S mcp` serves the store as tools over
 the Model Context Protocol's stdio transport, so an agent's MCP client can
 start it as a local server.
