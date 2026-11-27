@@ -130,6 +130,9 @@ impl<S: Store + Sync> Repo<S> {
             h.update(b"group_size")
                 .update(&(self.group_size as u64).to_le_bytes());
         }
+        if let Some(planner) = &self.planner {
+            h.update(b"planner").update(planner.text().as_bytes());
+        }
         Ok(Id::from_bytes(*h.finalize().as_bytes()))
     }
 
@@ -369,6 +372,8 @@ impl<S: Store + Sync> Repo<S> {
         fresh.markup_layers = self.markup_layers;
         fresh.slow_codec_max = self.slow_codec_max;
         fresh.group_size = self.group_size;
+        fresh.planner = self.planner.clone();
+        fresh.plan_log = self.plan_log.clone();
         fresh.deflate_memo = self.deflate_memo.clone();
         fresh.proposed_order = self.proposed_order.clone();
         if let Some(dict) = dict {

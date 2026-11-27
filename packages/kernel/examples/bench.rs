@@ -862,6 +862,39 @@ struct Counting;
 static SHORT_RECORDS: AtomicBool = AtomicBool::new(false);
 /// `--markup-layers` (E112): `Repo::markup_layers` on every store.
 static MARKUP_LAYERS: AtomicBool = AtomicBool::new(false);
+/// `--planner FILE` (E425, an option, off): a learned planner's model.
+static PLANNER: std::sync::OnceLock<Option<std::sync::Arc<ikam_kernel::planner::Planner>>> =
+    std::sync::OnceLock::new();
+/// `--plan-log FILE` (E425, not a scoring option): the planner's records,
+/// from the first of each corpus's fresh stores, appended to FILE tagged
+/// with the corpus.
+static PLAN_LOG: std::sync::OnceLock<
+    Option<(PathBuf, std::sync::Arc<ikam_kernel::planner::PlanLog>)>,
+> = std::sync::OnceLock::new();
+
+/// Set the learned planner's options on a new store (E425).
+fn planner_options(repo: &mut Repo<MemStore>, log: bool) {
+    repo.planner = PLANNER.get().cloned().flatten();
+    if log {
+        repo.plan_log = PLAN_LOG.get().and_then(|l| l.as_ref()).map(|l| l.1.clone());
+    }
+}
+
+/// Append the planner's records so far to the plan log, tagged `corpus`.
+fn write_plan_log(corpus: &str) {
+    use std::io::Write;
+    let Some(Some((path, log))) = PLAN_LOG.get() else {
+        return;
+    };
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .unwrap();
+    for line in log.drain() {
+        writeln!(file, "{{\"corpus\":\"{corpus}\",{}", &line[1..]).unwrap();
+    }
+}
 static HEAP: AtomicUsize = AtomicUsize::new(0);
 static PEAK: AtomicUsize = AtomicUsize::new(0);
 
@@ -1446,6 +1479,7 @@ fn north_store(name: &str, files: &[&(String, Vec<u8>)]) -> (usize, Cost, Repo<M
     repo.short_records = SHORT_RECORDS.load(Relaxed);
     repo.markup_layers = MARKUP_LAYERS.load(Relaxed);
     repo.read_weight = ARCHIVE_READ_WEIGHT;
+    planner_options(&mut repo, true);
     let entries: Vec<TreeEntry> = files
         .iter()
         .map(|(file, bytes)| TreeEntry {
@@ -1462,6 +1496,7 @@ fn north_store(name: &str, files: &[&(String, Vec<u8>)]) -> (usize, Cost, Repo<M
         .all(|(_, b)| repo.read_content(&Id::of_content(b)).unwrap() == *b);
     let fsck = repo.fsck().unwrap().is_empty();
     assert!(exact && fsck, "{name}: verification failed");
+    write_plan_log(name);
     (stored(&repo), repack, repo)
 }
 
@@ -1707,6 +1742,16 @@ fn main() {
     let json = args.iter().any(|a| a == "--json");
     SHORT_RECORDS.store(args.iter().any(|a| a == "--short-records"), Relaxed);
     MARKUP_LAYERS.store(args.iter().any(|a| a == "--markup-layers"), Relaxed);
+    let value = |flag: &str| args.iter().position(|a| a == flag).map(|i| &args[i + 1]);
+    PLANNER
+        .set(value("--planner").map(|f| {
+            let text = std::fs::read_to_string(f).unwrap();
+            std::sync::Arc::new(ikam_kernel::planner::Planner::parse(&text).unwrap())
+        }))
+        .unwrap();
+    PLAN_LOG
+        .set(value("--plan-log").map(|f| (PathBuf::from(f), Default::default())))
+        .unwrap();
     // Not a scoring option: writes the generated corpus out as input for an
     // offline program writer (functions/write_programs.py), then exits.
     if let Some(i) = args.iter().position(|a| a == "--dump-generated") {
@@ -1720,7 +1765,12 @@ fn main() {
     let only: Vec<&String> = args
         .iter()
         .enumerate()
-        .filter(|(i, a)| !a.starts_with("--") && (*i == 0 || args[i - 1] != "--dump-generated"))
+        .filter(|(i, a)| {
+            !a.starts_with("--")
+                && (*i == 0
+                    || !["--dump-generated", "--planner", "--plan-log"]
+                        .contains(&args[i - 1].as_str()))
+        })
         .map(|(_, a)| a)
         .collect();
     let corpora: Vec<Corpus> = vec![
@@ -1755,11 +1805,12 @@ fn main() {
         // the stores are identical (the planner is deterministic).
         let (mut kept, mut ingest) = (None, 0);
         let fastest = |a: Cost, b: Cost| if b.cpu_ms < a.cpu_ms { b } else { a };
-        for _ in 0..PIPELINE_RUNS {
+        for run in 0..PIPELINE_RUNS {
             let mut repo = Repo::new(MemStore::default());
             repo.short_records = SHORT_RECORDS.load(Relaxed);
             repo.markup_layers = MARKUP_LAYERS.load(Relaxed);
             repo.read_weight = READ_WEIGHT;
+            planner_options(&mut repo, run == 0);
             let ((), ingest_cost) = measure(1, || {
                 snapshots.iter().for_each(|s| commit(&mut repo, s, graph))
             });
@@ -1778,6 +1829,10 @@ fn main() {
             let (_, repack_cost) = measure(1, || repo.repack().unwrap());
             // A daily repack mostly finds the store as the last one left it (E067).
             let (_, repack_again) = measure(1, || repo.repack().unwrap());
+            if run == 0 {
+                write_plan_log(name);
+            }
+            repo.plan_log = None;
             kept = Some(match kept {
                 None => (repo, ingest_cost, repack_cost, repack_again),
                 Some((r, i, p, a)) => (

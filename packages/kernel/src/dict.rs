@@ -485,27 +485,58 @@ impl<S: Store> Repo<S> {
         if self.cost(&checked, reads) < self.cost(&best, reads) {
             best = checked;
         }
+        let slow = bytes.len() <= self.slow_codec_max;
+        // A learned planner (E425, off by default) may skip a codec it
+        // predicts loses: every encoding is exact, so that costs bytes at
+        // most. Candidates: 0 raw, 1 zstd, then 2 + each of `CODECS`.
+        let features = (self.planner.is_some() || self.plan_log.is_some()).then(|| {
+            crate::planner::codec_features(
+                bytes,
+                reads,
+                self.read_weight,
+                self.dictionary().is_some(),
+                slow,
+            )
+        });
+        let skip = |cand: usize| match (&self.planner, &features) {
+            (Some(planner), Some(f)) => !planner.build("codec", cand, f),
+            _ => false,
+        };
+        let mut outcome = [None; 2 + codec::CODECS.len()];
+        let mut ms = [0.0; 2 + codec::CODECS.len()];
+        let mut chosen = 0;
+        outcome[0] = Some(self.cost(&best, reads));
         // A codec whose decode cost alone is above the best so far is never
         // run (E088): under heavy reads, compressing hot content at the
         // store level was most of a recompress, only to keep it raw.
         let floor = |tag: u8| self.read_weight * codec::read_weight(tag) * reads as f64;
-        if floor(b'Z') < self.cost(&best, reads) {
+        if floor(b'Z') < self.cost(&best, reads) && !skip(1) {
+            let began = std::time::Instant::now();
             let plain = self.encode_plain(bytes);
+            (outcome[1], ms[1]) = (
+                Some(self.cost(&plain, reads)),
+                began.elapsed().as_secs_f64() * 1e3,
+            );
             if self.cost(&plain, reads) < self.cost(&best, reads) {
-                best = plain;
+                (best, chosen) = (plain, 1);
             }
         }
-        let slow = bytes.len() <= self.slow_codec_max;
-        for (tag, encode, _) in codec::CODECS.iter().filter(|c| c.2 && slow) {
-            if floor(*tag) >= self.cost(&best, reads) {
+        for (j, (tag, encode, on)) in codec::CODECS.iter().enumerate() {
+            if !(*on && slow) || floor(*tag) >= self.cost(&best, reads) || skip(2 + j) {
                 continue;
             }
+            let began = std::time::Instant::now();
             if let Some(c) = encode(bytes) {
                 let c = [&[*tag][..], &c].concat();
+                outcome[2 + j] = Some(self.cost(&c, reads));
                 if self.cost(&c, reads) < self.cost(&best, reads) {
-                    best = c;
+                    (best, chosen) = (c, 2 + j);
                 }
             }
+            ms[2 + j] = began.elapsed().as_secs_f64() * 1e3;
+        }
+        if let (Some(log), Some(f)) = (&self.plan_log, &features) {
+            log.record("codec", f, &outcome, &ms, Some(chosen));
         }
         best
     }
