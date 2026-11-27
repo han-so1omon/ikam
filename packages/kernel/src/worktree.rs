@@ -1,5 +1,6 @@
 //! Path edits on trees: put, remove, rename and copy files and directories
-//! by path, writing only the trees on the changed paths (E110).
+//! by path, writing only the trees on the changed paths (E110), and put
+//! graph objects at a path (E438).
 //!
 //! Laws (tested in tests/worktree.rs):
 //! - after `edit_tree(root, edits)`, every path reads what the edits, applied
@@ -25,6 +26,10 @@ pub enum Edit {
     Rename { from: String, to: String },
     /// Copy the file or directory at `from` to `to`, replacing what is there.
     Copy { from: String, to: String },
+    /// Create or replace the entry at `path` with the graph object `id`
+    /// (its root chunk, from `put_graph`), creating missing directories.
+    /// Unlike `Put`, the object must be in the store and be a graph (E438).
+    PutGraph { path: String, id: Id },
 }
 
 /// A tree loaded only along edited paths.
@@ -69,6 +74,14 @@ impl<S: Store> Repo<S> {
                     let parts = split_path(path)?;
                     let (dir, name) = self.dir_for(&mut top, &parts, true)?;
                     dir.insert(name.into(), Node::Stored(Kind::File, *id));
+                }
+                Edit::PutGraph { path, id } => {
+                    let parts = split_path(path)?;
+                    if !matches!(self.get(id)?, Object::Graph(_)) {
+                        return Err(Error::WrongKind(*id));
+                    }
+                    let (dir, name) = self.dir_for(&mut top, &parts, true)?;
+                    dir.insert(name.into(), Node::Stored(Kind::Graph, *id));
                 }
                 Edit::Mkdir { path } => {
                     let parts = split_path(path)?;
