@@ -295,7 +295,7 @@ impl Minimizer {
                     rep.evals += 1;
                     let mut tg = out[1].data.clone();
                     con.project(&gram, &mut tg)?;
-                    if out[0].item().is_finite() && max_abs(&tg) <= 0.5 * gn {
+                    if out[0].item().is_finite() && tg.iter().all(|v| v.is_finite()) && max_abs(&tg) <= 0.5 * gn {
                         x = trial;
                         break;
                     }
