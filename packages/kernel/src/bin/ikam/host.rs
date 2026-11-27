@@ -26,6 +26,14 @@
 //!   new bytes as body (write role, propose right), and `merge[?into=REF]`
 //!   (receiver owner, merge right). Every refusal of a share answers 404,
 //!   as if the share did not exist.
+//! - E416 (off): `share-rank NAME` lets NAME's folder (`path:`) shares
+//!   answer `GET /from/NAME/SHARE/rank?q=[&k=][&vector=X,Y,..][&fuse=rrf|
+//!   convex][&alpha=]`: the scope's files ranked as `ikam mcp`'s `rank`
+//!   tool ranks a tree (E388), with BM25 statistics from the scope's files
+//!   alone, so the answer is the one a store holding only the scope would
+//!   give and nothing outside the scope moves a score. `file-vectors NAME
+//!   PREFIX` loads vectors for NAME's files (`--file-vectors`), which the
+//!   ranking fuses when the query gives a vector.
 //!
 //! A panic while serving one project is caught and answered 500; the other
 //! projects keep serving. `--public` is refused: every request needs a user
@@ -48,6 +56,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, SystemTime};
 
+use ikam_kernel::bm25::Bm25Mem;
 use ikam_kernel::share::{Refused, Right, SHARES_REF, Scope, Share, import_share};
 use ikam_kernel::{Id, Kind, merge::Merged};
 
@@ -78,6 +87,10 @@ pub struct ProjectConfig {
     pub tokens: Vec<(Role, String, Vec<String>)>,
     /// E363: a rate for all the project's callers together.
     pub rate: Option<Rate>,
+    /// E416: the project's folder shares answer ranked and vector search.
+    pub share_rank: bool,
+    /// E416: vectors for the project's files (`--file-vectors PREFIX`).
+    pub file_vectors: Option<String>,
 }
 
 pub struct Config {
@@ -147,6 +160,8 @@ impl Config {
                         max_body: None,
                         tokens: Vec::new(),
                         rate: None,
+                        share_rank: false,
+                        file_vectors: None,
                     });
                 }
                 ["host", name, host] => {
@@ -179,6 +194,14 @@ impl Config {
                     }
                     let rest = rest.iter().map(|w| w.to_string()).collect();
                     projects[i].tokens.push((role, line.to_string(), rest));
+                }
+                ["share-rank", name] => {
+                    let i = project(&mut projects, name)?;
+                    projects[i].share_rank = true;
+                }
+                ["file-vectors", name, prefix] => {
+                    let i = project(&mut projects, name)?;
+                    projects[i].file_vectors = Some(prefix.to_string());
                 }
                 ["rate", name, rate] => {
                     let i = project(&mut projects, name)?;
@@ -247,7 +270,17 @@ pub struct Project {
     key: [u8; 32],
     tokens: Vec<Token>,
     bucket: Option<Mutex<Bucket>>,
+    /// E416 (`share-rank`): the BM25 index of each recently ranked share's
+    /// scope, by the share's encoding (which names its commit and scope),
+    /// newest last. `None`: shares do not rank.
+    ranked: Option<Ranked>,
 }
+
+/// E416: scope indexes by share encoding, newest last.
+type Ranked = Mutex<VecDeque<(Vec<u8>, Arc<Bm25Mem>)>>;
+
+/// E416: scope indexes a project keeps for ranking through its shares.
+const RANKED_SCOPES: usize = 8;
 
 pub struct Host {
     pub projects: BTreeMap<String, Project>,
@@ -376,6 +409,9 @@ impl Host {
             }
             l.max_store = p.max_store;
             l.index_all(false)?;
+            if let Some(prefix) = &p.file_vectors {
+                l.load_file_vectors(prefix)?;
+            }
             let key = share_key(&p.store)?;
             let users = p
                 .users
@@ -404,6 +440,7 @@ impl Host {
                     key,
                     tokens,
                     bucket: p.rate.map(|r| Mutex::new(Bucket::new(r, start))),
+                    ranked: p.share_rank.then(|| Mutex::new(VecDeque::new())),
                 },
             );
         }
@@ -644,11 +681,17 @@ impl Host {
             Some(share) => share,
             None => return no_share(),
         };
-        let repo = &mut sl.repo;
         let refused = |e: Refused| match e {
             Refused::Store(e) => Response::text(500, e),
             _ => no_share(),
         };
+        if action == "rank" {
+            return match &s.ranked {
+                Some(cache) => rank(&mut sl, cache, &share, req).unwrap_or_else(refused),
+                None => no_share(),
+            };
+        }
+        let repo = &mut sl.repo;
         let r = match action {
             "files" => repo.share_files(&share).map(|f| {
                 ok_json(Json::Arr(
@@ -754,6 +797,79 @@ impl Host {
             Err(Refused::Store(e)) => Response::text(500, e),
             Err(_) => no_share(),
         }
+    }
+}
+
+/// E416: `GET /from/SOURCE/SHARE/rank` on a folder share, after its check:
+/// the scope's files at the share's commit ranked for `q` (and `vector`),
+/// with BM25 over those files alone. Any other scope is refused (404).
+fn rank(l: &mut Live, cache: &Ranked, share: &Share, req: &Request) -> Result<Response, Refused> {
+    if !matches!(share.scope, Scope::Path(_)) {
+        return Err(Refused::Outside);
+    }
+    let q = req.param("q").unwrap_or_default();
+    let k = match req.param("k").map(|k| k.parse::<usize>()) {
+        None => 10,
+        Some(Ok(k)) => k.clamp(1, 1000),
+        Some(Err(_)) => return Ok(Response::text(400, "k=N")),
+    };
+    let vector: Option<Vec<f32>> = match req.param("vector").filter(|v| !v.is_empty()) {
+        None => None,
+        Some(v) => match v
+            .split(',')
+            .map(|x| x.trim().parse::<f32>())
+            .collect::<Result<Vec<f32>, _>>()
+        {
+            Ok(v) if v.iter().all(|x| x.is_finite()) => Some(v),
+            _ => return Ok(Response::text(400, "vector=X,Y,.. (finite numbers)")),
+        },
+    };
+    let fuse = match (req.param("fuse").as_deref(), req.param("alpha")) {
+        (Some("rrf"), _) => live::Fuse::Rrf,
+        (Some("convex") | None, None) => live::Fuse::Convex(ikam_kernel::fusion::DEFAULT_ALPHA),
+        (Some("convex") | None, Some(a)) => match a.parse::<f32>() {
+            Ok(a) if (0.0..=1.0).contains(&a) => live::Fuse::Convex(a),
+            _ => return Ok(Response::text(400, "alpha is a number from 0 to 1")),
+        },
+        _ => return Ok(Response::text(400, "fuse is convex or rrf")),
+    };
+    let files: BTreeMap<String, Id> = l.repo.share_files(share)?.into_iter().collect();
+    let key = share.encode();
+    let found = {
+        let c = cache.lock().unwrap();
+        c.iter().find(|(k, _)| *k == key).map(|(_, i)| i.clone())
+    };
+    let index = match found {
+        Some(i) => i,
+        None => {
+            let i = Arc::new(l.scope_index(&files).map_err(Refused::Store)?);
+            let mut c = cache.lock().unwrap();
+            if c.len() >= RANKED_SCOPES {
+                c.pop_front();
+            }
+            c.push_back((key, i.clone()));
+            i
+        }
+    };
+    let empty = std::collections::HashMap::new();
+    let (vectors, dim) = match &l.ranker {
+        Some(r) => (&r.vectors, r.dim),
+        None => (&empty, 0),
+    };
+    let hybrid = vector.is_some() && dim > 0;
+    match live::rank_in(&index, &files, vectors, dim, &q, vector.as_deref(), k, fuse) {
+        Ok(hits) => Ok(ok_json(Json::Obj(vec![
+            ("hybrid".into(), Json::Bool(hybrid)),
+            (
+                "hits".into(),
+                Json::Arr(
+                    hits.into_iter()
+                        .map(|(p, s)| Json::Arr(vec![Json::Str(p), Json::Num(s as f64)]))
+                        .collect(),
+                ),
+            ),
+        ]))),
+        Err(e) => Ok(Response::text(400, e)),
     }
 }
 
@@ -956,6 +1072,11 @@ mod tests {
     /// Projects a and b, each with an owner, a writer and a reader, and c
     /// with an owner only; a holds public and private files.
     fn host(name: &str) -> (Host, Vec<PathBuf>) {
+        host_with(name, "")
+    }
+
+    /// `host` with more config lines.
+    fn host_with(name: &str, extra: &str) -> (Host, Vec<PathBuf>) {
         let dirs: Vec<PathBuf> = ["a", "b", "c"]
             .iter()
             .map(|p| dir(&format!("{name}-{p}")))
@@ -971,6 +1092,7 @@ mod tests {
             }
         }
         text += "max-body c 1K\n";
+        text += extra;
         let h = Host::open(Config::parse(&text).unwrap()).unwrap();
         {
             let mut l = h.projects["a"].live.lock().unwrap();
@@ -1395,6 +1517,212 @@ mod tests {
         done(dirs);
     }
 
+    /// E416: `hits` of a `rank` answer, as (path, score).
+    fn hits(body: &[u8]) -> (bool, Vec<(String, f32)>) {
+        let j = crate::json::parse(std::str::from_utf8(body).unwrap()).unwrap();
+        let hybrid = matches!(j.get("hybrid"), Some(Json::Bool(true)));
+        let hits = j
+            .get("hits")
+            .unwrap()
+            .as_arr()
+            .iter()
+            .map(|h| match h.as_arr() {
+                [Json::Str(p), Json::Num(s)] => (p.clone(), *s as f32),
+                _ => panic!("{h:?}"),
+            })
+            .collect();
+        (hybrid, hits)
+    }
+
+    #[test]
+    fn ranked_and_vector_search_through_a_share_stays_in_its_scope() {
+        let owner = user("o", "pw");
+        let c = Config::parse(&format!(
+            "project a st\nuser a owner {owner}\nshare-rank a\nfile-vectors a v\n"
+        ))
+        .unwrap();
+        assert!(c.projects[0].share_rank);
+        assert_eq!(c.projects[0].file_vectors.as_deref(), Some("v"));
+        let c = Config::parse(&format!("project a st\nuser a owner {owner}\n")).unwrap();
+        assert!(!c.projects[0].share_rank && c.projects[0].file_vectors.is_none());
+        assert!(
+            Config::parse(&format!(
+                "project a st\nuser a owner {owner}\nshare-rank b\n"
+            ))
+            .is_err()
+        );
+        let (h, dirs) = host_with("rank", "share-rank a\n");
+        let post = |host: &str, who, path: &str| h.handle(req("POST", host, who, path, b""));
+        let get = |host: &str, who, path: &str| h.handle(req("GET", host, who, path, b""));
+        // a's files (with near matches outside pub/), and c holding only
+        // a's pub/ files: the answer through the share must be c's own.
+        let files: &[(&str, &[u8], [f32; 2])] = &[
+            ("pub/one.md", b"alpha shared\n", [1.0, 0.0]),
+            ("pub/two.md", b"beta\n", [0.0, 1.0]),
+            ("pub/three.md", b"alpha alpha gamma\n", [0.5, 0.5]),
+            ("priv/secret.md", b"alpha private\n", [1.0, 0.1]),
+            ("priv/near.md", b"alpha alpha alpha gamma\n", [0.9, 0.0]),
+            ("pubx/side.md", b"alpha gamma gamma\n", [1.0, 0.0]),
+        ];
+        let vecs = format!("{}.vecs", dirs[0].display());
+        let paths: String = files.iter().map(|f| format!("{}\n", f.0)).collect();
+        std::fs::write(format!("{vecs}.paths"), paths).unwrap();
+        let flat: Vec<f32> = files.iter().flat_map(|f| f.2).collect();
+        std::fs::write(
+            format!("{vecs}.f32"),
+            ikam_kernel::vectors::from_f32s(&flat),
+        )
+        .unwrap();
+        let vecs = vecs.as_str();
+        for (p, only_pub) in [("a", false), ("c", true)] {
+            let mut l = h.projects[p].live.lock().unwrap();
+            let ops = files
+                .iter()
+                .filter(|f| !only_pub || f.0.starts_with("pub/"))
+                .map(|f| live::Op::Put(f.0.into(), f.1.to_vec()))
+                .collect();
+            l.apply(ops).unwrap();
+            l.flush(true).unwrap();
+            assert!(l.load_file_vectors(vecs).unwrap() >= 3);
+        }
+        let issue = "/shares/issue?name=pub&to=b&scope=path:pub&right=read&expires=600";
+        assert_eq!(post("a.localhost", OA, issue).status, 200);
+        let want = |q: &str, v: Option<&[f32]>, k: usize, fuse: live::Fuse| {
+            let mut c = h.projects["c"].live.lock().unwrap();
+            c.rank_files(q, v, k, fuse).unwrap()
+        };
+        let convex = live::Fuse::Convex(ikam_kernel::fusion::DEFAULT_ALPHA);
+        type Case<'a> = (&'a str, &'a str, Option<&'a [f32]>, usize, live::Fuse);
+        let cases: &[Case] = &[
+            ("alpha", "", None, 10, convex),
+            ("alpha gamma", "&k=1", None, 1, convex),
+            ("alpha", "&vector=1,0", Some(&[1.0, 0.0]), 10, convex),
+            (
+                "gamma",
+                "&vector=0.2,1&alpha=0.3",
+                Some(&[0.2, 1.0]),
+                10,
+                live::Fuse::Convex(0.3),
+            ),
+            (
+                "alpha",
+                "&vector=1,0&fuse=rrf",
+                Some(&[1.0, 0.0]),
+                10,
+                live::Fuse::Rrf,
+            ),
+        ];
+        for (q, more, v, k, fuse) in cases {
+            let r = get(
+                "b.localhost",
+                Some(("b-reader", "pw")),
+                &format!("/from/a/pub/rank?q={}{more}", q.replace(' ', "+")),
+            );
+            assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
+            let (hybrid, got) = hits(&r.body);
+            assert_eq!(hybrid, v.is_some());
+            assert!(got.iter().all(|(p, _)| p.starts_with("pub/")), "{got:?}");
+            assert!(!got.is_empty());
+            assert_eq!(got, want(q, *v, *k, *fuse), "{q}{more}");
+        }
+        // Files outside the scope move no score: a's private files change
+        // and a's owner shares again; the answer is the same.
+        let before = get("b.localhost", OB, "/from/a/pub/rank?q=alpha&vector=1,0").body;
+        put_files(&h, "a", &[("priv/more.md", b"alpha alpha beta beta\n")]);
+        assert_eq!(post("a.localhost", OA, issue).status, 200);
+        assert_eq!(
+            get("b.localhost", OB, "/from/a/pub/rank?q=alpha&vector=1,0").body,
+            before
+        );
+        // A malformed query after the check is a 400.
+        assert_eq!(
+            get("b.localhost", OB, "/from/a/pub/rank?q=a&vector=1").status,
+            400
+        );
+        assert_eq!(
+            get("b.localhost", OB, "/from/a/pub/rank?q=a&vector=x").status,
+            400
+        );
+        for bad in ["NaN,0", "inf,0", "1,-inf"] {
+            assert_eq!(
+                get(
+                    "b.localhost",
+                    OB,
+                    &format!("/from/a/pub/rank?q=a&vector={bad}")
+                )
+                .status,
+                400,
+                "{bad}"
+            );
+        }
+        // Refusals stay 404: another project, the source itself, an unknown
+        // share, a scope that is not a folder, a project without
+        // `share-rank`, and a revoked or expired share.
+        let c_owner = Some(("c-owner", "pw"));
+        assert_eq!(
+            get("c.localhost", c_owner, "/from/a/pub/rank?q=alpha").status,
+            404
+        );
+        assert_eq!(
+            get("a.localhost", OA, "/from/a/pub/rank?q=alpha").status,
+            404
+        );
+        assert_eq!(
+            get("b.localhost", OB, "/from/a/nope/rank?q=alpha").status,
+            404
+        );
+        let sec = "/shares/issue?name=sec&to=b&scope=section:pub/one.md@0-5&right=read&expires=600";
+        assert_eq!(post("a.localhost", OA, sec).status, 200);
+        assert_eq!(
+            get(
+                "b.localhost",
+                OB,
+                "/from/a/sec/read?path=pub/one.md&range=0-5"
+            )
+            .status,
+            200
+        );
+        assert_eq!(
+            get("b.localhost", OB, "/from/a/sec/rank?q=alpha").status,
+            404
+        );
+        let cs = "/shares/issue?name=cs&to=b&scope=path:pub&right=read&expires=600";
+        assert_eq!(post("c.localhost", c_owner, cs).status, 200);
+        assert_eq!(get("b.localhost", OB, "/from/c/cs/files").status, 200);
+        assert_eq!(
+            get("b.localhost", OB, "/from/c/cs/rank?q=alpha").status,
+            404
+        );
+        let gone = "/shares/issue?name=gone&to=b&scope=path:pub&right=read&expires=0";
+        assert_eq!(post("a.localhost", OA, gone).status, 200);
+        assert_eq!(
+            get("b.localhost", OB, "/from/a/gone/rank?q=alpha").status,
+            404
+        );
+        assert_eq!(
+            post("a.localhost", OA, "/shares/revoke?name=pub").status,
+            200
+        );
+        assert_eq!(
+            get("b.localhost", OB, "/from/a/pub/rank?q=alpha").status,
+            404
+        );
+        for ext in ["paths", "f32"] {
+            let _ = std::fs::remove_file(format!("{vecs}.{ext}"));
+        }
+        done(dirs);
+    }
+
+    fn put_files(h: &Host, p: &str, files: &[(&str, &[u8])]) {
+        let mut l = h.projects[p].live.lock().unwrap();
+        let ops = files
+            .iter()
+            .map(|f| live::Op::Put(f.0.into(), f.1.to_vec()))
+            .collect();
+        l.apply(ops).unwrap();
+        l.flush(true).unwrap();
+    }
+
     #[test]
     fn a_merge_keeps_to_the_receivers_store_limit() {
         let (h, dirs) = host("quota");
@@ -1534,6 +1862,275 @@ mod tests {
                 .body,
             b"x"
         );
+        done(dirs);
+    }
+
+    /// E416 bench: ranking through a folder share against a project that
+    /// holds only the scope (keys and scores), how often whole-store BM25
+    /// statistics would order the scope differently, and the cost. Synthetic
+    /// Zipf text; `E416_FILES` files a side (2,000), `E416_QUERIES` (300).
+    /// `cargo test --release --features embed --bin ikam share_rank_bench --
+    /// --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn share_rank_bench() {
+        use std::time::Instant;
+        let env = |k: &str, d: usize| {
+            std::env::var(k)
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(d)
+        };
+        let (n, nq) = (env("E416_FILES", 2000), env("E416_QUERIES", 300));
+        let (h, dirs) = host_with("rankbench", "share-rank a\n");
+        let mut seed = 0x9e37_79b9_7f4a_7c15u64;
+        let mut rnd = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        // Zipf over 20,000 words: cumulative weights 1/(rank+1).
+        let vocab: Vec<String> = (0..20_000).map(|i| format!("w{i:x}q")).collect();
+        let mut cum = Vec::with_capacity(vocab.len());
+        let mut t = 0.0f64;
+        for r in 0..vocab.len() {
+            t += 1.0 / (r as f64 + 1.0);
+            cum.push(t);
+        }
+        let word = |rnd: &mut dyn FnMut() -> u64| {
+            let x = (rnd() >> 11) as f64 / (1u64 << 53) as f64 * t;
+            &vocab[cum.partition_point(|c| *c < x).min(vocab.len() - 1)]
+        };
+        let doc = |rnd: &mut dyn FnMut() -> u64| {
+            let len = 100 + (rnd() % 500) as usize;
+            (0..len)
+                .map(|_| word(rnd).as_str())
+                .collect::<Vec<_>>()
+                .join(" ")
+                + "\n"
+        };
+        const DIM: usize = 64;
+        let embed = |text: &str| {
+            let mut v = vec![0f32; DIM];
+            for w in text.split_whitespace() {
+                let h = blake3::hash(w.as_bytes()).as_bytes()[0] as usize % DIM;
+                v[h] += 1.0;
+            }
+            let n = v.iter().map(|x| x * x).sum::<f32>().sqrt().max(1e-9);
+            v.iter().map(|x| x / n).collect::<Vec<f32>>()
+        };
+        let mut files: Vec<(String, String)> = Vec::new();
+        let mut queries: Vec<String> = Vec::new();
+        for i in 0..n {
+            let text = doc(&mut rnd);
+            let ws: Vec<&str> = text.split_whitespace().collect();
+            let q: Vec<&str> = (0..3).map(|_| ws[rnd() as usize % ws.len()]).collect();
+            let q = q.join(" ");
+            if i % 4 == 0 {
+                // A near copy outside the scope that matches the query better.
+                files.push((format!("priv/near{i}.md"), format!("{text}{q} {q}\n")));
+            }
+            if queries.len() < nq {
+                queries.push(q);
+            }
+            files.push((format!("pub/d{i}.md"), text));
+            files.push((format!("priv/p{i}.md"), doc(&mut rnd)));
+            if i % 4 == 1 {
+                files.push((format!("pubx/x{i}.md"), doc(&mut rnd)));
+            }
+        }
+        let t0 = Instant::now();
+        let vecs = format!("{}.vecs", dirs[0].display());
+        let paths: String = files.iter().map(|f| format!("{}\n", f.0)).collect();
+        std::fs::write(format!("{vecs}.paths"), paths).unwrap();
+        let flat: Vec<f32> = files.iter().flat_map(|f| embed(&f.1)).collect();
+        std::fs::write(
+            format!("{vecs}.f32"),
+            ikam_kernel::vectors::from_f32s(&flat),
+        )
+        .unwrap();
+        for (p, only_pub) in [("a", false), ("c", true)] {
+            let mut l = h.projects[p].live.lock().unwrap();
+            // c gets exactly a's pub/ files, host()'s two included.
+            let mut ops: Vec<live::Op> = files
+                .iter()
+                .filter(|f| !only_pub || f.0.starts_with("pub/"))
+                .map(|f| live::Op::Put(f.0.clone(), f.1.clone().into_bytes()))
+                .collect();
+            if only_pub {
+                ops.push(live::Op::Put(
+                    "pub/one.md".into(),
+                    b"alpha shared\n".to_vec(),
+                ));
+                ops.push(live::Op::Put("pub/two.md".into(), b"beta\n".to_vec()));
+            }
+            l.apply(ops).unwrap();
+            l.flush(true).unwrap();
+            l.load_file_vectors(&vecs).unwrap();
+            l.index_files();
+        }
+        let load = t0.elapsed().as_secs_f64();
+        let issue = "/shares/issue?name=pub&to=b&scope=path:pub&right=read&expires=6000";
+        assert_eq!(
+            h.handle(req("POST", "a.localhost", OA, issue, b"")).status,
+            200
+        );
+        let convex = live::Fuse::Convex(ikam_kernel::fusion::DEFAULT_ALPHA);
+        let mut report = String::new();
+        let enc = |v: &[f32]| {
+            v.iter()
+                .map(|x| x.to_string())
+                .collect::<Vec<_>>()
+                .join(",")
+        };
+        let pct = |mut v: Vec<f64>, p: f64| {
+            v.sort_by(f64::total_cmp);
+            v[((v.len() as f64 - 1.0) * p).round() as usize] * 1e3
+        };
+        for (mode, more) in [("keyword", 0), ("fused convex", 1), ("fused rrf", 2)] {
+            let (mut same, mut outside, mut share_t, mut ref_t, mut own_t) =
+                (0, 0, Vec::new(), Vec::new(), Vec::new());
+            let mut first = None;
+            for q in &queries {
+                let qv = embed(q);
+                let (v, extra, fuse) = match more {
+                    0 => (None, String::new(), convex),
+                    1 => (Some(qv.as_slice()), format!("&vector={}", enc(&qv)), convex),
+                    _ => (
+                        Some(qv.as_slice()),
+                        format!("&vector={}&fuse=rrf", enc(&qv)),
+                        live::Fuse::Rrf,
+                    ),
+                };
+                let target = format!("/from/a/pub/rank?q={}{extra}", q.replace(' ', "+"));
+                let t = Instant::now();
+                let r = h.handle(req("GET", "b.localhost", OB, &target, b""));
+                let dt = t.elapsed().as_secs_f64();
+                if first.is_none() {
+                    first = Some(dt);
+                } else {
+                    share_t.push(dt);
+                }
+                assert_eq!(r.status, 200);
+                let (_, got) = hits(&r.body);
+                outside += got.iter().filter(|(p, _)| !p.starts_with("pub/")).count();
+                let t = Instant::now();
+                let want = h.projects["c"]
+                    .live
+                    .lock()
+                    .unwrap()
+                    .rank_files(q, v, 10, fuse)
+                    .unwrap();
+                ref_t.push(t.elapsed().as_secs_f64());
+                same += (got == want) as usize;
+                let t = Instant::now();
+                let own = h.projects["a"]
+                    .live
+                    .lock()
+                    .unwrap()
+                    .rank_files(q, v, 10, fuse)
+                    .unwrap();
+                own_t.push(t.elapsed().as_secs_f64());
+                let _ = own;
+            }
+            report += &format!(
+                "{mode}: same keys and scores {same}/{}; hits outside the scope {outside}; first call {:.1} ms; share p50 {:.2} ms p95 {:.2} ms; reference (c, in process) p50 {:.2} ms; a's own whole-store rank p50 {:.2} ms\n",
+                queries.len(),
+                first.unwrap() * 1e3,
+                pct(share_t.clone(), 0.5),
+                pct(share_t, 0.95),
+                pct(ref_t, 0.5),
+                pct(own_t, 0.5),
+            );
+        }
+        // Whole-store statistics, filtered to the scope: how often the top
+        // 10 would be ordered differently, and does a private edit move them?
+        let mut differ = 0;
+        for q in &queries {
+            let mut a = h.projects["a"].live.lock().unwrap();
+            let all = a.rank_files(q, None, usize::MAX >> 1, convex).unwrap();
+            let filtered: Vec<String> = all
+                .iter()
+                .filter(|(p, _)| p.starts_with("pub/"))
+                .take(10)
+                .map(|(p, _)| p.clone())
+                .collect();
+            drop(a);
+            let want: Vec<String> = h.projects["c"]
+                .live
+                .lock()
+                .unwrap()
+                .rank_files(q, None, 10, convex)
+                .unwrap()
+                .into_iter()
+                .map(|x| x.0)
+                .collect();
+            differ += (filtered != want) as usize;
+        }
+        report += &format!(
+            "whole-store BM25 filtered to the scope: top 10 ordered differently for {differ}/{} queries\n",
+            queries.len()
+        );
+        // A private file added: does an in-scope score move under each?
+        let q = &queries[0];
+        let score = |h: &Host, scoped: bool| -> f32 {
+            if scoped {
+                let r = h.handle(req(
+                    "GET",
+                    "b.localhost",
+                    OB,
+                    &format!("/from/a/pub/rank?q={}", q.replace(' ', "+")),
+                    b"",
+                ));
+                hits(&r.body).1[0].1
+            } else {
+                let mut a = h.projects["a"].live.lock().unwrap();
+                a.rank_files(q, None, usize::MAX >> 1, convex)
+                    .unwrap()
+                    .into_iter()
+                    .find(|x| x.0.starts_with("pub/"))
+                    .unwrap()
+                    .1
+            }
+        };
+        let (s0, g0) = (score(&h, true), score(&h, false));
+        put_files(
+            &h,
+            "a",
+            &[("priv/extra.md", format!("{q} {q} {q}\n").as_bytes())],
+        );
+        assert_eq!(
+            h.handle(req("POST", "a.localhost", OA, issue, b"")).status,
+            200
+        );
+        let (s1, g1) = (score(&h, true), score(&h, false));
+        report += &format!(
+            "one private file added: best in-scope score through the share {s0} -> {s1}; with whole-store statistics {g0} -> {g1}\n"
+        );
+        let (terms, postings) = {
+            let mut a = h.projects["a"].live.lock().unwrap();
+            let share = a.repo.share_named("pub").unwrap().unwrap();
+            let files: BTreeMap<String, Id> =
+                a.repo.share_files(&share).unwrap().into_iter().collect();
+            let t = Instant::now();
+            let idx = a.scope_index(&files).unwrap();
+            report += &format!(
+                "scope index build: {} files in {:.1} ms\n",
+                files.len(),
+                t.elapsed().as_secs_f64() * 1e3
+            );
+            idx.size()
+        };
+        report += &format!(
+            "files: {} in a ({} under pub/), load {load:.1} s; scope index {terms} terms, {postings} postings\n",
+            files.len() + 3,
+            n + 2
+        );
+        println!("{report}");
+        for ext in ["paths", "f32"] {
+            let _ = std::fs::remove_file(format!("{vecs}.{ext}"));
+        }
         done(dirs);
     }
 
