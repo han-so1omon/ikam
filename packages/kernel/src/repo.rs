@@ -362,6 +362,15 @@ pub struct Repo<S: Store> {
     /// Takes effect when the ledger is (re)built.
     pub lean_ledger: bool,
     pub(crate) writing_object: bool,
+    /// A learned planner (E425): decision trees trained offline on
+    /// `plan_log` records that leave out candidate plans they predict lose
+    /// (grouping proposals, codecs). Off (`None`) by default. Every
+    /// candidate is exact, so a wrong guess costs bytes, never a read.
+    pub planner: Option<Arc<crate::planner::Planner>>,
+    /// Records each choice the learned planner's sites make (features, each
+    /// candidate's outcome and build time), for training it (E425). Off
+    /// (`None`) by default.
+    pub plan_log: Option<Arc<crate::planner::PlanLog>>,
 }
 
 /// Old chunk contents read during one edit with `replace_hints` on.
@@ -438,6 +447,8 @@ impl<S: Store> Repo<S> {
             lean_ledger: false,
             writing_object: false,
             hints: Default::default(),
+            planner: None,
+            plan_log: None,
         }
     }
 

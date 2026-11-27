@@ -139,6 +139,9 @@ impl<S: Store + Sync> Repo<S> {
         if self.tensor_cuts {
             h.update(b"tensor_cuts");
         }
+        if let Some(planner) = &self.planner {
+            h.update(b"planner").update(planner.text().as_bytes());
+        }
         Ok(Id::from_bytes(*h.finalize().as_bytes()))
     }
 
@@ -385,6 +388,8 @@ impl<S: Store + Sync> Repo<S> {
         fresh.screen_trials = self.screen_trials;
         fresh.trial_threads = self.trial_threads;
         fresh.trial_log = self.trial_log.clone();
+        fresh.planner = self.planner.clone();
+        fresh.plan_log = self.plan_log.clone();
         fresh.deflate_memo = self.deflate_memo.clone();
         fresh.proposed_order = self.proposed_order.clone();
         if let Some(dict) = dict {

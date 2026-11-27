@@ -7816,3 +7816,68 @@ Gates on the branch (E229 to E233): every kernel test suite passes (release); cl
 - Verdict: **partial**. The matrix, its costs and the extension point are here and every mode that ran agrees where it must; the MLIR rows did not run, because this machine has no `mlir-opt` or `mlir-translate` (LLVM, `opt`, `llc` and clang 18.1.3 are installed, MLIR's tools are not, and installing system packages was refused here). E327 and E328 measured those rows on another cloud machine with Ubuntu's `mlir-18-tools`; their `i8` scores matched the other modes there.
 - Not measured: the MLIR rows (above); Apple NEON (on the Mac after Nov 29); whole builds with `RUSTFLAGS="-C target-cpu=..."` (the levels here are `#[target_feature]` wrappers in one binary, which is how the kernel picks AVX2, E339); the interpreter's `f32` row with E441's `Floats::Pinned` (E441 measured those bits equal to a pinned native run, apart from NaN payloads); AMX (present on this CPU, not tried); special float inputs (NaN, infinities, subnormals), which E409 covers; other machines.
 - Run: `cargo run --release -- matrix` in `packages/kernel/experiments/vector-modes` (with `MLIR_BIN` set to a folder with `mlir-opt`, `mlir-translate`, `opt` and `llc` for the MLIR rows); `cargo test --release` there.
+
+### E425 learned-planner (decision trees trained on the planner's own records skip candidate plans they predict lose)
+
+- Branch / parent: exp/425-learned-planner / main 437aef6
+- Question: can a small tree model, trained offline on ikam's own planning records, choose among the planner's exact plans well enough to lower the cost score beyond its 2% spread while the north score holds? It may only remove candidates from a choice the planner already makes among exact plans, so a wrong guess costs bytes, never reconstruction. Is the win in bytes or in planning time?
+- Where planning time goes on main (temporary timers, not kept): under the heavy read weight the slice and template searches are already skipped exactly (E092), and so are the codecs whose decode cost alone loses (E088). What remains is the grouping step of each re-plan (`group_small`): it builds five grouping proposals and keeps the one that saves most. Two of them grow groups by measured compression (`similar_groups` with the dictionary) and cost 0.15 to 1.6 s each per re-plan; building them was most of the repack on md (about 5.2 of 5.3 s of grouping over six re-plans) and repo-history (14.9 of 16.6 s). At the heavy weight no proposal saved a byte on any corpus, in any re-plan. Under the archive weight (north) every pass saves, and the five proposals are near ties (the winner varies among four of them). On the north stores, brotli trials in `encode_cheapest` took 58 s of CPU and won 14 of 784 contents. Other choices were checked and left alone: the dictionary re-plan wins 9 of 10 corpora by under 2% (10 records, too few to learn), and the search index (one choice per corpus) prices search CPU, not bytes.
+- Change (all off by default; nothing changes without it):
+  - `src/planner.rs`: `Planner`, decision trees read from plain text (`site candidate node feature threshold left right value`; no library), and `PlanLog`, which records each choice as a JSON line: the site, its features, each candidate's outcome (bytes saved or cost; null when not built) and its build time. A candidate without a tree is always built, so an empty model plans as no model does.
+  - `Repo::planner` and `Repo::plan_log` (both `None` by default), copied into each re-plan, and the model's text added to the repack fingerprint when set.
+  - Site `group` (`group_small`): proposals are built one at a time and a proposal whose tree predicts it loses is not built. Features: items, total bytes, mean item size, share under 1 KiB, a dictionary, log10 of the read weight, stored over plain bytes, share in the proposed order, group size.
+  - Site `codec` (`encode_cheapest`): zstd (candidate 1) and each slow codec (brotli is 3) are skipped when predicted to lose, after the exact decode-cost floor. Raw is always built. Features: size, log10 of the read weight, bytes read over size, order-0 entropy of the first 16 KiB, share of text bytes, a dictionary, slow codecs allowed.
+  - `examples/bench.rs`: `--plan-log FILE` (writes the records of the first of each corpus's fresh stores and every north store, tagged with the corpus) and `--planner FILE` (the option).
+  - `experiments/learned-planner/train.py` (scikit-learn, offline): one tree a site and candidate, depth 3, at least 2 records a leaf. A candidate is labelled worth building when skipping it would lose more bytes than 1 byte a millisecond of its build time, and each record is weighted by that difference. The group site decides for the whole pass (every proposal or none), because the proposals are near ties. `plan_log.jsonl` (2,412 records from one bench run) and `model.txt` (the trained model) are committed; training again on the same log writes the same model.
+- Split: trained on md, office, synthetic-history, generated, transcripts, north/cases and north/tables; held out pdf, invoices, repo-history, repo-graph, structured, multiformat and north/multiformat (multiformat and north/multiformat share their texts, so both are held out).
+- What the trees learned:
+  - group: one split, on the read weight (build when log10 of it is at most -0.66, a weight of about 0.22). With 43 training passes at two weights, that is all the records can teach: at 49 no grouping pays, at 0.00097 every pass does. Training on every corpus gives the same split.
+  - codec: zstd is skipped for content the workload never reads (bytes read over size below about -11.9 in log2), where brotli or raw then wins; brotli is built only for such content, or with a dictionary absent and few reads.
+- Offline, on the plan log (what the skipped candidates would have saved, from their recorded outcomes):
+
+  | split | site | records | candidates skipped | build time saved | bytes lost |
+  | --- | --- | --- | --- | --- | --- |
+  | train | group | 43 passes | 50 | 3.5 of 29.6 s | 0 |
+  | train | codec | 1,227 contents | 558 | 26.9 of 46.3 s | 591 cost units, 12 contents |
+  | held-out | group | 25 passes | 50 | 6.7 of 13.5 s | 0 |
+  | held-out | codec | 1,117 contents | 176 | 31.6 of 49.4 s | 51 cost units, 2 contents |
+
+  At the cost score's own price (`--rate 480`: a millisecond of CPU a month against 480 bytes stored a month), every recorded grouping costs more time than it saves bytes, and that model drops every group on the north stores too (506 K of savings lost on the held-out passes alone). The rate of 1 byte a millisecond is what keeps the north score, which counts bytes only.
+- Results (fixed bench, Linux cloud, 4 CPUs shared with other builds; "removed" is an empty model, so every candidate is built; "shuffled" is a model trained on the same records with each tree's labels permuted, seed 1, as E051's swap test):
+
+  | run | cost score | bytes_score | proxy | read | north | planning CPU (ingest + repack, 11 corpora) | north repack CPU |
+  | --- | --- | --- | --- | --- | --- | --- | --- |
+  | main (before) | 0.2256 | 5.7493 | 3.8185 | 5.7140 | 0.3060 | 28.5 s | 82.3 s |
+  | option off, run 1 / run 2 | 0.2345 / 0.2343 | 5.7493 | 3.8185 | 5.7140 | 0.3060 | 24.9 / 24.9 s | 73.5 / 68.1 s |
+  | model on, run 1 / run 2 | **0.2251 / 0.2277** | 5.7493 | 3.8185 | 5.7140 | **0.3060** | **17.7 / 17.1 s** | **60.1 / 59.1 s** |
+  | removed (empty model) | 0.2265 | 5.7493 | 3.8185 | 5.7140 | 0.3060 | 23.9 s | 67.0 s |
+  | shuffled | 0.2337 | 5.7493 | 3.8185 | 5.7140 | **0.3102** | 23.5 s | 56.6 s |
+
+  The cost score's search timings (40 to 90% of most corpora's cost, microseconds a query) moved it by 4% between main and the option-off runs, with identical plans. So the cost score was also computed with every part but planning (ingest, repack, repack_again) taken from option-off run 1: option off 0.2345 / 0.2344, main 0.2386, model on **0.2260 / 0.2249** (3.6% and 4.1% lower), removed 0.2336, shuffled 0.2335.
+- Per corpus (stored bytes; repack CPU, mean of two runs where there are two; cost ratio of each run):
+
+  | corpus | split | bytes off | bytes on | removed | shuffled | repack CPU off | on | removed | shuffled | cost off | cost on |
+  | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+  | md | train | 303,085 | 303,085 | 303,085 | 303,085 | 1,638 ms | **234 ms** | 1,611 ms | 1,748 ms | 0.2686 / 0.2641 | 0.2249 / 0.2415 |
+  | pdf | held-out | 162,494 | 162,494 | 162,494 | 162,494 | 182 | **93** | 195 | 191 | 0.1711 / 0.1673 | 0.1477 / 0.1602 |
+  | office | train | 4,230,763 | 4,230,763 | 4,230,763 | 4,230,763 | 4,694 | 3,962 | 4,547 | 4,060 | 0.4059 / 0.4084 | 0.3973 / 0.3790 |
+  | invoices | held-out | 86,728 | 86,728 | 86,728 | 86,728 | 68 | 43 | 70 | 75 | 0.6683 / 0.6513 | 0.6033 / 0.6115 |
+  | synthetic-history | train | 689,566 | 689,566 | 689,566 | 689,566 | 545 | 487 | 555 | 556 | 0.6774 / 0.6915 | 0.6454 / 0.6929 |
+  | repo-history | held-out | 6,710,832 | 6,710,832 | 6,710,832 | 6,710,832 | 8,253 | **3,999** | 8,065 | 8,085 | 0.1389 / 0.1386 | 0.1354 / 0.1344 |
+  | repo-graph | held-out | 95,215 | 95,215 | 95,215 | 95,215 | 43 | 43 | 43 | 42 | 0.4339 / 0.4237 | 0.4432 / 0.4257 |
+  | generated | train | 786,932 | 786,932 | 786,932 | 786,932 | 652 | 591 | 630 | 640 | 0.0446 / 0.0448 | 0.0440 / 0.0437 |
+  | structured | held-out | 9,120,810 | 9,120,810 | 9,120,810 | 9,120,810 | 2,012 | 1,980 | 1,875 | 2,004 | 0.0995 / 0.1039 | 0.1089 / 0.1057 |
+  | transcripts | train | 3,646,238 | 3,646,240 | 3,646,238 | 3,646,412 | 1,460 | 1,186 | 1,337 | 1,137 | 0.3769 / 0.3701 | 0.3593 / 0.3678 |
+  | multiformat | held-out | 6,459,599 | 6,459,599 | 6,459,599 | 6,459,599 | 4,106 | 3,515 | 3,734 | 3,770 | 0.1382 / 0.1420 | 0.1416 / 0.1414 |
+  | north/cases | train | 379,432 | 379,432 | 379,432 | 380,079 | 29.1 s | 25.9 s | 26.7 s | 25.6 s | | |
+  | north/multiformat | held-out | 332,388 | 332,388 | 332,388 | **349,978** | 27.0 s | 21.2 s | 25.8 s | 19.4 s | | |
+  | north/tables | train | 135,551 | 135,551 | 135,551 | 133,849 | 14.7 s | 12.5 s | 14.5 s | 11.6 s | | |
+
+- Reading it:
+  - The win is planning time at equal bytes: every stored size is the same as main's but transcripts' (2 bytes larger, one content stored raw where zstd had won), and the north stores are byte-identical. Planning CPU over the 11 corpora fell 30% (24.9 to 17.4 s) and the north repacks 16% (70.8 to 59.6 s). The repack halved on held-out repo-history and pdf as on trained md, because the group tree's one split is on the read weight, which every heavy-weight corpus shares.
+  - The swap test says the model carries information. Removed, the bench plans as main does (same bytes, main's planning time). Shuffled, the trees keep building the groups that never pay at the heavy weight (no cost gain: 0.2335 against 0.2345 planning-only), and skip groups and codecs that pay on the north stores: north/multiformat 5.3% larger and the north score 0.3060 to 0.3102, beyond its 0.5% tolerance.
+  - What the trees learned is mostly the read weight: no grouping saves at weight 49, every one does at 0.00097. A rule written by hand (or an exact bound on a group's read cost, not found here) could give the group site's saving without a model; the codec trees are the part that uses content features (whether the workload reads the content).
+- Checks: `a_model_builds_what_it_predicts_and_everything_it_has_no_tree_for`, `a_planner_only_ever_costs_bytes` (an empty model and the log leave every stored object as no planner does; a model that builds no grouping proposal and no compressed encoding stores more, builds no group, and every file reads back exactly with fsck clean), `the_log_writes_one_json_line_a_choice`. `cargo test --release --features embed --no-fail-fast`: 379 pass, 0 fail (5 ignored); `cargo clippy --release --features embed --all-targets -- -D warnings` clean; `python3 .github/privacy/scan.py --all` clean. Every bench run above was exact with a clean fsck on every corpus.
+- Verdict: **kept**, as an option (off by default; option off, the bench equals main in every deterministic field). The cost score improved beyond 2% on both runs against both option-off runs (4.0% and 2.8%) and in the planning-only score (3.6% and 4.1%), with the north score unchanged; but main's own run scored 0.2256 and the removed run 0.2265, inside the model's range, so the full cost score's noise on this shared host is as large as the gain, and the planning CPU (30% less) is the firmer measure. The gain is time, not bytes.
+- Not measured: a second training set (another weight, or real-world corpora: with two read weights the group site cannot learn more than the weight); the Mac; candidates other sites build (the search index, the dictionary re-plan, container plans); a per-proposal model for the north stores' near ties (offline, a first try lost 84 K of savings on the held-out passes, so the group site decides for the whole pass); an exact bound for groups at a heavy weight.
+- Run: `cargo run --release --example bench -- --json --plan-log LOG` (records); `python3 -I experiments/learned-planner/train.py LOG MODEL [--shuffle SEED] [--all] [--rate R]`; `cargo run --release --example bench -- --json --planner experiments/learned-planner/model.txt`.
