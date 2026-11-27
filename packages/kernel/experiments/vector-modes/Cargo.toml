@@ -13,6 +13,15 @@ publish = false
 [dependencies]
 libc = "=0.2.189"
 tempfile = "3.27.0"
+# E423 (`-- matrix`): the kernel's interpreter (a stored WASM function run
+# by `Repo::evaluate`) and Cranelift (as net-jit pins it) as modes.
+ikam-kernel = { path = "../.." }
+cranelift-codegen = "=0.137.1"
+cranelift-frontend = "=0.137.1"
+cranelift-jit = "=0.137.1"
+cranelift-module = "=0.137.1"
+cranelift-native = "=0.137.1"
+wat = "1.260.0"
 
 [profile.release]
 debug = false

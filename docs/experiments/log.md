@@ -6537,3 +6537,79 @@ Gates on the branch (E229 to E233): every kernel test suite passes (release); cl
 - Verdict: **kept** (a fix, the paged first build, with no trade-off; `--hnsw-threads` an option, off).
 - Not measured: the Mac; real embeddings (clustered synthetic vectors stand in; recall on real text vectors may differ either way); a wider `ef` (a constant here: 80), which would trade query time for recall at 1M; keeping the graph across restarts; vectors changing while serving at 1M; more than one run each (build times on a shared cloud host move by tens of percent).
 - Run: `python3 -I experiments/vectors-1m/vec_1m.py WORK OUT.jsonl 100000,250000,500000,1000000 "exact=BRANCH:;exact-main=MAIN:;hnsw=BRANCH:--hnsw;hnsw4=BRANCH:--hnsw --hnsw-threads 4;hnsw-main@1000000=MAIN:--hnsw" 200`.
+
+### E423 mode-matrix (one function run in every execution mode the repo has, bit for bit)
+
+- Branch / parent: exp/423-mode-matrix / main 437aef6
+- Question: E277, E282, E311, E327, E328 and E339 each measured some execution modes for one loop, each in its own harness, and none put every mode side by side. For one function, do the interpreter, Cranelift, clang, MLIR, the lanes loops and the hand-written vector code give the same output bits at every instruction set this machine has, what does each cost to compile and to run, and how does a new mode plug in? (Plan item: a portability matrix across modes and instruction sets, the Apple NEON row left for the Mac.)
+- Setup: the function is E327's inner loop, scoring `n` int8 codes of 256 dimensions against a query, in two forms. `i8`: an int8 query with exact i32 sums, so every mode must give the same bits; this is the form every mode can run, the kernel's interpreter included, since it needs no floats. `f32`: an f32 query (what `vectors::code_dot` computes), where the bits depend on the order of the sums and on fused multiply-adds (E409's rules 2 and 3), so a mode can only match the modes that keep its order. Codes and query from E327's generator (seed 423); `n` of 64, 1,024 and 16,384 codes (16 KB, 256 KB and 4 MB of codes). Each mode is timed as the fastest of 5 runs of at least 200 ms; ns a code is the time of a call divided by `n`. One 4-core cloud Xeon (Linux, x86-64) with SSE4.2, AVX2, FMA, AVX-512 F, BW, CD, DQ and VL, AVX-512 VNNI and AVX-VNNI (from `/proc/cpuinfo`, and checked again at run time); two runs, numbers from the second: the same bits on every row in both, and 121 of 132 timings within 10% of each other; the rest moved by 15 to 63%, all in single rows rather than whole modes (other builds shared the machine).
+- Change: none in the kernel. In `experiments/vector-modes` (separate crate, its own workspace), `src/matrix.rs` and a `matrix` subcommand; the crate now depends on the kernel (for its interpreter) and on Cranelift at net-jit's pinned version (its lock file was started from net-jit's, since the kernel's wasmi 2.0.0 is pinned by lock file only). The modes:
+  - `interp`: the kernel's own path for a stored function. The `i8` function as a WASM module in the kernel's ABI (`wasm.rs`: arguments in, output bytes out), stored as content and applied with `Repo::evaluate` (wasmi with fuel, floats off), each call storing its two arguments first as a caller would.
+  - `rust` and `lanes`: E327's loops as written (one running sum) and with 16 independent sums (`vectors::code_dot_lanes_body`), each compiled at five levels in one binary with `#[target_feature]` wrappers chosen after a run-time check, the mechanism E339 put in the kernel: x86-64 baseline (SSE2), x86-64-v2, x86-64-v3 (AVX2 and FMA), x86-64-v4 (AVX-512) and v4 with AVX-512 VNNI. Plus the kernel's `vectors::code_dot_lanes` itself (the AVX2 dispatch of E339) for `f32`.
+  - Intrinsics for `i8`: E327's AVX2 row (widen to i16, `vpmaddwd`), the same at 512 bits, and the two VNNI forms (`vpdpbusd`, 512-bit AVX-512 VNNI and 256-bit AVX-VNNI). `vpdpbusd` multiplies unsigned by signed bytes, so the query is offset by 128 and 128 times the code's sum is taken back off, which is exact in i32.
+  - `cranelift`: the function built with cranelift-frontend and compiled by cranelift-jit at `opt_level=speed` (as net-jit does), for the host's instruction set or for the baseline (`cranelift_native::builder_with_options(false)`): a scalar loop, and for `i8` a 16-byte SIMD loop (widen to i16, multiply, widen to i32, add; Cranelift 0.137 has no pairwise dot product instruction).
+  - `clang`: E327's C file at `-O3` with `-march=x86-64`, `x86-64-v2`, `x86-64-v3`, `x86-64-v4` and `native`, and for `f32` also `-ffp-contract=off` and `-ffast-math`; built into shared libraries and loaded with dlopen.
+  - `mlir+llc` and `mlir+opt`: E327's vector-dialect lowering, run when `MLIR_BIN` names a folder with `mlir-opt`, `mlir-translate`, `opt` and `llc`.
+  - Every row's output is compared bit for bit with the first row (`rust` at the baseline), and each row names the first row that gave the same bits.
+- Results, `i8` (exact sums; every row gave the reference's bits at every size):
+
+  | Mode | Built for | Compile | ns a code, 64 | 1,024 | 16,384 |
+  | --- | --- | --- | --- | --- | --- |
+  | interp (kernel wasmi) | portable | 0.25 ms | 3,274 | 3,223 | 3,533 |
+  | rust | SSE2 | ahead of time | 62.3 | 61.5 | 62.7 |
+  | rust | x86-64-v2 | ahead of time | 41.2 | 40.5 | 40.4 |
+  | rust | x86-64-v3 | ahead of time | 18.7 | 17.9 | 18.0 |
+  | rust | x86-64-v4 | ahead of time | 15.5 | 15.0 | 15.1 |
+  | rust | v4 + VNNI | ahead of time | 16.3 | 14.9 | 15.2 |
+  | lanes | SSE2 | ahead of time | 44.4 | 43.2 | 44.1 |
+  | lanes | x86-64-v2 | ahead of time | 20.9 | 18.5 | 21.5 |
+  | lanes | x86-64-v3 | ahead of time | 25.3 | 24.5 | 25.7 |
+  | lanes | x86-64-v4 | ahead of time | 19.6 | 19.1 | 24.4 |
+  | lanes | v4 + VNNI | ahead of time | 19.3 | 19.8 | 19.9 |
+  | AVX2 `vpmaddwd` | x86-64-v3 | ahead of time | 12.4 | 11.7 | 13.0 |
+  | AVX-512 `vpmaddwd` | x86-64-v4 | ahead of time | 8.7 | 8.1 | 10.8 |
+  | AVX-512 VNNI `vpdpbusd` | v4 + VNNI | ahead of time | 6.8 | 6.0 | 8.6 |
+  | AVX-VNNI `vpdpbusd` (256-bit) | AVX-VNNI | ahead of time | 6.4 | 6.3 | 9.2 |
+  | cranelift, scalar | host | 0.25 ms | 191.5 | 190.3 | 190.1 |
+  | cranelift, SIMD | host | 0.22 ms | 39.9 | 39.6 | 39.9 |
+  | cranelift, SIMD | SSE2 | 0.32 ms | 45.7 | 44.1 | 45.7 |
+  | clang | x86-64 (SSE2) | 94 ms | 62.3 | 62.8 | 64.6 |
+  | clang | x86-64-v2 | 78 ms | 40.6 | 40.4 | 40.7 |
+  | clang | x86-64-v3 | 95 ms | 18.0 | 17.9 | 17.8 |
+  | clang | x86-64-v4 | 81 ms | 18.3 | 18.0 | 18.0 |
+  | clang | native | 77 ms | 18.2 | 17.6 | 17.9 |
+  | mlir+llc, mlir+opt | host | not run | | | |
+  | NEON | Apple silicon | on the Mac after Nov 29 | | | |
+
+- Results, `f32` (bits against `vectors::code_dot` as written at the baseline; "rows differing" and the worst distance in representable floats are at 16,384 codes; the worst distances are on scores near zero, where a small absolute error is many floats):
+
+  | Mode | Built for | Compile | ns a code, 16,384 | Bits | Rows differing | Worst ULP |
+  | --- | --- | --- | --- | --- | --- | --- |
+  | rust (`code_dot`) | SSE2, v2, v3, v4, v4 + VNNI | ahead of time | 151 to 160 | the reference | 0 | 0 |
+  | cranelift, scalar | host, SSE2 | 0.23 to 0.39 ms | 190 to 193 | the reference | 0 | 0 |
+  | clang | x86-64, x86-64-v2 | 73 to 78 ms | 150 to 151 | the reference | 0 | 0 |
+  | clang `-ffp-contract=off` | x86-64-v4 | 90 ms | 162 | the reference | 0 | 0 |
+  | lanes (`code_dot_lanes_body`) | SSE2 | ahead of time | 70.0 | lanes | 14,804 | 2,688 |
+  | lanes | v2, v3, v4, v4 + VNNI | ahead of time | 37.8, 26.8, 24.3, 23.3 | lanes | 14,804 | 2,688 |
+  | kernel `code_dot_lanes` (E339 dispatch) | AVX2 | ahead of time | 27.1 | lanes | 14,804 | 2,688 |
+  | clang (default `-ffp-contract=on`) | x86-64-v3, v4, native | 81 to 86 ms | 284 to 286 | fused | 12,333 | 1,280 |
+  | clang `-ffast-math` | x86-64-v4, native | 76 to 92 ms | 16.0 to 16.1 | fast-math | 14,807 | 2,504 |
+  | interp (kernel wasmi) | portable | not run: floats off on main (E441's `Floats::Pinned` is not merged) | | | | |
+  | mlir+llc, mlir+opt | host | not run | | | | |
+  | NEON | Apple silicon | on the Mac after Nov 29 | | | | |
+
+- Reading the matrix:
+  - Integer: all 23 rows that ran gave the same bits at every size and every instruction set, from the interpreter to AVX-512 VNNI. An exact integer function is portable across every mode here with nothing to enforce.
+  - Float: the bits fall into four classes, and each class is fixed by the order of the sums and whether a multiply and an add fuse, not by the instruction set. The sequential sum gives the same bits in Rust at all five levels, in Cranelift (host and baseline) and in clang until clang is allowed to contract: at `-march=x86-64-v3` and above, clang's default `-ffp-contract=on` fuses `s += q * c` into an FMA, which changes 75% of the scores and makes the loop 1.9x slower (each step waits on the FMA's latency). `-ffp-contract=off` restores the reference bits. The lanes loop gives one set of bits at every level, and the kernel's dispatched `code_dot_lanes` gives the same (E339's claim, now checked at five levels). `-ffast-math` gives its own bits, the same on v4 and native here, but nothing promises that. So E409's rules 2 and 3 hold here, and rule 2 needs `-ffp-contract=off` whenever C or C++ is a mode; Rust and Cranelift never contract.
+  - Cost: the interpreter is about 55 times slower than the baseline Rust loop and about 500 times slower than AVX-512 VNNI. Cranelift compiles in about a quarter of a millisecond, so against the interpreter it repays itself after about 70 codes, a single small call; its SIMD loop runs at baseline Rust's speed or better, but its scalar loop is 3x slower than baseline Rust. clang compiles in 73 to 95 ms (a process start included) and runs at Rust's speed for the same level; against Cranelift's SIMD loop it repays after about 3.5 million codes (about 210 calls of 16,384). The integer loop vectorizes without lanes (integer addition is associative), so lanes help only up to x86-64-v2 and are slower than the plain loop at v3 and v4. The VNNI instructions are the fastest rows, 2.5x the auto-vectorized v4 loop in cache.
+- The extension point: a mode is a `Mode` (a name, a family, the instruction set it is built for, its compile cost or none when built ahead of time, and a closure with the function's signature), and a new mode is one more builder in `i8_modes` or `f32_modes` that returns the mode or a `Skip` naming why it cannot run here (a tool or a CPU feature missing). The bit comparison, the classes, the timing at each size and the output lines are shared. That is a harness, not a kernel interface. What is missing for one clean interface:
+  1. One source for the function. Each mode here has its own hand-written copy (WAT, Rust, C, Cranelift IR, MLIR text), and the matrix only shows that the copies agree. A clean interface lowers one definition to every mode: the stored WASM module is the natural one, since the kernel already runs it, and a compiled mode would be a WASM compiler (Cranelift through a WASM front end, or a WASM to MLIR or C translation) rather than another copy.
+  2. A numeric contract per function, stated with it: exact integer (every mode may run it), pinned float order (only modes that keep the order and never fuse; for C, `-ffp-contract=off`), lanes order (lanes at any level), or free (fast-math, which must keep its output). The kernel has the first and, with E441's `Floats::Pinned`, the second; nothing names the third or fourth yet.
+  3. A dispatch in the kernel from a function to its modes. `func::run` chooses between a builtin and a WASM module only, and the vector code chooses its instruction set inside each function (`is_x86_feature_detected`, E339); neither knows of the other.
+  4. A compile cache keyed by module, mode and instruction set, as `wasm.rs` caches compiled modules by hash (and E441 by module and floats).
+  5. One calling convention. The interpreter takes length-prefixed bytes in linear memory, the native modes take pointers and lengths, and MLIR's take memref descriptors; each mode here carries its own adapter.
+- Checks: `cargo test --release` in `experiments/vector-modes`: 2 pass (every `i8` mode gives the reference's bits at `d` of 1, 17, 64, 100 and 256, the vector modes at multiples of 64 only; the sequential `f32` modes give `code_dot`'s bits and the lanes modes, the kernel's included, give `code_dot_lanes_body`'s bits); `cargo clippy --release --all-targets -- -D warnings` clean on the crate. Kernel unchanged: `cargo test --release --features embed --no-fail-fast`: 376 pass, 0 fail; clippy `-D warnings` clean; the privacy scan prints nothing.
+- Fixed benchmark: not run; no kernel code, storage path or encoding changed.
+- Verdict: **partial**. The matrix, its costs and the extension point are here and every mode that ran agrees where it must; the MLIR rows did not run, because this machine has no `mlir-opt` or `mlir-translate` (LLVM, `opt`, `llc` and clang 18.1.3 are installed, MLIR's tools are not, and installing system packages was refused here). E327 and E328 measured those rows on another cloud machine with Ubuntu's `mlir-18-tools`; their `i8` scores matched the other modes there.
+- Not measured: the MLIR rows (above); Apple NEON (on the Mac after Nov 29); whole builds with `RUSTFLAGS="-C target-cpu=..."` (the levels here are `#[target_feature]` wrappers in one binary, which is how the kernel picks AVX2, E339); the interpreter's `f32` row with E441's `Floats::Pinned` (E441 measured those bits equal to a pinned native run, apart from NaN payloads); AMX (present on this CPU, not tried); special float inputs (NaN, infinities, subnormals), which E409 covers; other machines.
+- Run: `cargo run --release -- matrix` in `packages/kernel/experiments/vector-modes` (with `MLIR_BIN` set to a folder with `mlir-opt`, `mlir-translate`, `opt` and `llc` for the MLIR rows); `cargo test --release` there.
