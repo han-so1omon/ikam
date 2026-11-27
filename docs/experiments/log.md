@@ -6905,3 +6905,44 @@ Gates on the branch (E229 to E233): every kernel test suite passes (release); cl
 - Verdict: **measured**. For a collector: `--live --lean-ledger` once PR 84 is merged; `--plain-writes` where disk is cheap and memory or time is not.
 - Not measured: the Mac; options together (lean ledger with plain writes, with E413's idle fold); `db squash` on a plain-writes store; more than one run each.
 - Run: `python3 -I experiments/collector/collector_load.py IKAM_BIN WORK 3 8 250 "--live;--live --plain-writes"`, and with each branch's binary and its flag.
+### E430 compute-graph (op graphs on ikam: gradients, Newton-CG, sensitivities)
+
+- Branch / parent: exp/430-compute-graph / main 437aef6
+- Question: can a JAX-like engine (graphs of tensor ops, autodiff, solvers) be built from ikam's own pieces, with no new foundation, and does it give right answers on nonlinear mechanics with known solutions? (The owner, Nov 26; plan: `docs/plans/2026-11-26-math-engine.md`.)
+- Change: new crate `packages/compute` (`ikam-compute`), outside the kernel and opt-in. Tensors as content (`ikT1`); `ir::Graph` with ops as graph-object nodes (`put`, `load`, `commit_at`, `load_at`, `inline`); pinned float ops (`pinned.rs`, libm); `grad` (reverse mode) and Hessian-vector products (reverse over reverse) as graph transforms; `solve::Minimizer` (Newton-CG, Armijo with a rounding slack, a step budget option) and `sensitivity` (adjoint at an equilibrium).
+- Results (`examples/engine_numbers.rs`, `tests/engine.rs`, 13 checks):
+  - Gradients against central differences on a mixed graph (matmul, transpose, reshape, broadcast, max, cumsum, slice, concat, pad, unary ops); HVP against differences of the gradient.
+  - Elastica, end-moment bend of 120 degrees: tip error 2.42e-4 L (25 segments), 6.05e-5, 1.51e-5, 3.78e-6, 9.45e-7 L (400), second order; one Newton step each, 0.2 to 5.6 ms.
+  - End load PL^2/EI = 1, 200 segments: tip deflection 0.30172 L, shortening 0.05643 L (the published elastica values), 4 Newton steps.
+  - Adjoint sensitivity of a tip coordinate to a load matches re-solving.
+- Verdict: kept (capability, opt-in crate; no kernel change).
+
+### E431 stored-eval (where evaluation records belong)
+
+- Branch / parent: exp/430-compute-graph / E430
+- Question: should evaluation be stored per op node (like derivations) or per whole graph?
+- Change: `memo.rs`: `eval_stored` (one record per node, key from the op and argument ids) and `eval_graph_stored` (one record per graph and inputs, `memo/g/<hex>`), both in a database with the event's idempotency key equal to the key, so a different answer for the same key is refused; `check` re-runs and compares.
+- Results: 44-node gradient graph: per node 2,332 us first, 542 us rerun, against 9 us plain; per graph 82 us first, 4 us rerun. A tampered stored value is caught by `check`.
+- Found: the derivation ledger can't hold these (WASM floats are off), hence the database.
+- Verdict: kept; record whole steps. Next: E435 (pinned-float functions in the ledger).
+
+### E432 planned-loop (graphs inside a fixed-period loop)
+
+- Branch / parent: exp/430-compute-graph / E431
+- Question: can an interpreted op graph run inside a 1 kHz control loop, and if not, what does?
+- Change: `plan.rs` (`Plan`: fixed buffers, every op pinned, bit-identical to `eval`), `Minimizer::plan` (`PlannedMinimizer`: same steps and bits as the interpreted solver, no allocation per solve), `run.rs` (steps recorded as a stream and committed on `runs/<name>`).
+- Results (4-CPU Linux container): 44-node gradient p50 0.64 us planned against 3.14 us interpreted. A downstream 1 kHz loop (PI and feedforward, two warm-started Newton steps per tick, 24-segment rod): planned compute p50 107 us, p99 198 us, 0 misses in 3,000 ticks (7 in 10,000, container jitter); interpreted p50 895 us, 1,152 misses in 3,000. Telemetry: every step recorded, 0 dropped, writer done 14 ms after the loop; a second run records the same commit.
+- Verdict: kept.
+
+### E433 model-shares (compute graphs and tables across projects)
+
+- Branch / parent: exp/430-compute-graph / E432
+- Question: can one project publish a model (graph and tables) and another use it, through ikam's scoped shares only?
+- Setup: downstream, two projects: one publishes a yielding-section energy graph that fixes no sizes and its moment-curvature tables as records; the other imports both by a graph share and a records share, inlines the graph into its rod energy, and checks the rod against the tables. In-process (`import_share`) and through one `ikam host` serving both projects (`/shares/issue`, `/from/S/N/records`, `/from/S/N/merge`).
+- Results: graph and records arrive; a record outside the share's range does not; the rod on the imported graph reproduces the imported tables (210 solves, worst curvature error 7.7e-5); merging the same shares again gives the same commits; a share for another project, after expiry or after revocation is refused.
+- Found:
+  - A records share copies record bytes only: a content id in a record arrives dangling, so tables keep values inline (E437 proposes an option).
+  - `/from/S/N/records` answers non-UTF-8 values with replacement characters (lossy); merge is exact (E434).
+  - No public tree edit puts a graph at a path; `ikam-compute` carries its own (E438).
+  - Loading a yielding model by a moment past its limit point stalls Newton; prescribed displacements and continuation are needed (E439).
+- Verdict: kept (capability in `ikam-compute`: `Graph::inline`, `commit_at`, `load_at`; findings planned as E434 to E439).
