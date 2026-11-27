@@ -11,6 +11,7 @@ mod claims;
 mod codec;
 pub mod colblock;
 pub mod rowpack;
+pub mod colstats;
 mod coldpass;
 mod container;
 mod db;

@@ -1,0 +1,581 @@
+//! Column statistics gathered while a table's rows are read anyway (E403),
+//! after Kumo's ingest column stats: for each top-level field of JSON rows
+//! (an object's keys, or an array's positions), its count and nulls; for
+//! numbers, the mean and variance (Welford), min and max, and quantiles (a
+//! merging t-digest, Dunning and Ertl); distinct values (HyperLogLog,
+//! Flajolet et al., 2^12 registers, about 1.6% standard error); for strings
+//! and booleans, value counts while a column has few values.
+//!
+//! `TableStats::observe` takes one row's bytes; `bm25_view_build_with_stats`
+//! calls it from the BM25 view build's own pass over the rows, so the stats
+//! cost no second read. `to_json` is the derived view that is kept.
+//! A row that is not a JSON object or array counts only as a row.
+
+use std::collections::{BTreeMap, HashMap};
+use std::hash::{BuildHasher, BuildHasherDefault, DefaultHasher};
+
+/// HyperLogLog precision: 2^P registers.
+const P: u32 = 12;
+/// Most distinct values a column's value counts follow.
+pub const CATEGORIES_MAX: usize = 256;
+/// t-digest compression (most centroids about this many).
+const DELTA: f64 = 100.0;
+
+/// A field's value, as `observe` sees it.
+enum Val<'a> {
+    Num(f64, &'a [u8]),
+    Str(&'a [u8]),
+    Bool(bool),
+    Null,
+    Other(&'a [u8]),
+}
+
+/// Distinct-value estimate: HyperLogLog with 2^P registers.
+#[derive(Clone)]
+pub struct Hll {
+    reg: Vec<u8>,
+}
+
+impl Default for Hll {
+    fn default() -> Hll {
+        Hll {
+            reg: vec![0; 1 << P],
+        }
+    }
+}
+
+fn hash(b: &[u8]) -> u64 {
+    BuildHasherDefault::<DefaultHasher>::default().hash_one(b)
+}
+
+impl Hll {
+    pub fn add(&mut self, b: &[u8]) {
+        let h = hash(b);
+        let i = (h >> (64 - P)) as usize;
+        let rest = h << P | (1 << (P - 1));
+        let rank = rest.leading_zeros() as u8 + 1;
+        if rank > self.reg[i] {
+            self.reg[i] = rank;
+        }
+    }
+
+    pub fn estimate(&self) -> f64 {
+        let m = self.reg.len() as f64;
+        let sum: f64 = self.reg.iter().map(|r| 2f64.powi(-(*r as i32))).sum();
+        let raw = 0.7213 / (1.0 + 1.079 / m) * m * m / sum;
+        let zeros = self.reg.iter().filter(|r| **r == 0).count();
+        if raw <= 2.5 * m && zeros > 0 {
+            m * (m / zeros as f64).ln() // linear counting for small sets
+        } else {
+            raw
+        }
+    }
+}
+
+/// Quantiles: a merging t-digest with the k1 scale function.
+#[derive(Clone, Default)]
+pub struct TDigest {
+    /// (mean, weight), sorted by mean.
+    c: Vec<(f64, f64)>,
+    buf: Vec<f64>,
+    n: f64,
+}
+
+fn k1(q: f64) -> f64 {
+    DELTA / (2.0 * std::f64::consts::PI) * (2.0 * q - 1.0).asin()
+}
+
+impl TDigest {
+    pub fn add(&mut self, x: f64) {
+        self.buf.push(x);
+        if self.buf.len() >= 20 * DELTA as usize {
+            self.merge();
+        }
+    }
+
+    fn merge(&mut self) {
+        if self.buf.is_empty() {
+            return;
+        }
+        let mut all: Vec<(f64, f64)> = self.buf.drain(..).map(|x| (x, 1.0)).collect();
+        all.append(&mut self.c);
+        all.sort_by(|a, b| a.0.total_cmp(&b.0));
+        let total: f64 = all.iter().map(|c| c.1).sum();
+        let mut out: Vec<(f64, f64)> = Vec::with_capacity(2 * DELTA as usize);
+        let (mut seen, mut cur) = (0.0, all[0]);
+        let mut limit = k1(0.0) + 1.0;
+        for &(m, w) in &all[1..] {
+            let q = (seen + cur.1 + w) / total;
+            if k1(q.min(1.0)) <= limit {
+                cur.0 += (m - cur.0) * w / (cur.1 + w);
+                cur.1 += w;
+            } else {
+                seen += cur.1;
+                out.push(cur);
+                limit = k1((seen / total).min(1.0)) + 1.0;
+                cur = (m, w);
+            }
+        }
+        out.push(cur);
+        self.c = out;
+        self.n = total;
+    }
+
+    /// The value at quantile `q` (0 to 1), interpolated between centroids.
+    pub fn quantile(&mut self, q: f64) -> Option<f64> {
+        self.merge();
+        let c = &self.c;
+        if c.is_empty() {
+            return None;
+        }
+        let target = q * self.n;
+        let mut seen = 0.0;
+        for i in 0..c.len() {
+            let mid = seen + c[i].1 / 2.0;
+            if target < mid {
+                if i == 0 {
+                    return Some(c[0].0);
+                }
+                let prev = seen - c[i - 1].1 / 2.0;
+                let t = (target - prev) / (mid - prev);
+                return Some(c[i - 1].0 + t * (c[i].0 - c[i - 1].0));
+            }
+            seen += c[i].1;
+        }
+        Some(c[c.len() - 1].0)
+    }
+
+    pub fn centroids(&mut self) -> usize {
+        self.merge();
+        self.c.len()
+    }
+}
+
+/// What one field holds over the rows that have it.
+#[derive(Clone, Default)]
+pub struct ColumnStats {
+    pub count: u64,
+    pub nulls: u64,
+    pub numbers: u64,
+    pub strings: u64,
+    pub bools: u64,
+    pub other: u64,
+    pub mean: f64,
+    m2: f64,
+    pub min: f64,
+    pub max: f64,
+    pub distinct: Hll,
+    pub quantiles: TDigest,
+    /// Value counts of strings and booleans, while there are at most
+    /// `CATEGORIES_MAX` distinct ones; `None` after that.
+    pub values: Option<HashMap<Vec<u8>, u64>>,
+}
+
+impl ColumnStats {
+    fn add(&mut self, v: Val) {
+        self.count += 1;
+        let (seen, category): (&[u8], bool) = match v {
+            Val::Null => {
+                self.nulls += 1;
+                return;
+            }
+            Val::Num(x, text) => {
+                self.numbers += 1;
+                let n = self.numbers as f64;
+                if self.numbers == 1 {
+                    (self.min, self.max) = (x, x);
+                }
+                self.min = self.min.min(x);
+                self.max = self.max.max(x);
+                let d = x - self.mean;
+                self.mean += d / n;
+                self.m2 += d * (x - self.mean);
+                self.quantiles.add(x);
+                (text, false)
+            }
+            Val::Str(s) => {
+                self.strings += 1;
+                (s, true)
+            }
+            Val::Bool(b) => {
+                self.bools += 1;
+                (if b { b"true" } else { b"false" }, true)
+            }
+            Val::Other(o) => {
+                self.other += 1;
+                (o, false)
+            }
+        };
+        self.distinct.add(seen);
+        if category && let Some(m) = &mut self.values {
+            if let Some(n) = m.get_mut(seen) {
+                *n += 1;
+            } else if m.len() < CATEGORIES_MAX {
+                m.insert(seen.to_vec(), 1);
+            } else {
+                self.values = None;
+            }
+        }
+    }
+
+    /// The population variance of the numbers.
+    pub fn variance(&self) -> f64 {
+        if self.numbers == 0 {
+            0.0
+        } else {
+            self.m2 / self.numbers as f64
+        }
+    }
+}
+
+/// Statistics of a table's rows, by field name (an array's positions are
+/// named "0", "1", ...).
+#[derive(Clone, Default)]
+pub struct TableStats {
+    pub rows: u64,
+    pub columns: BTreeMap<String, ColumnStats>,
+}
+
+fn skip_ws(b: &[u8], mut i: usize) -> usize {
+    while i < b.len() && matches!(b[i], b' ' | b'\t' | b'\n' | b'\r') {
+        i += 1;
+    }
+    i
+}
+
+/// The end (one past) of the JSON value starting at `i`, if well formed
+/// enough to step over (strings, and brackets balanced outside strings).
+fn value_end(b: &[u8], i: usize) -> Option<usize> {
+    match *b.get(i)? {
+        b'"' => {
+            let mut j = i + 1;
+            while j < b.len() {
+                match b[j] {
+                    b'\\' => j += 2,
+                    b'"' => return Some(j + 1),
+                    _ => j += 1,
+                }
+            }
+            None
+        }
+        b'{' | b'[' => {
+            let (mut depth, mut j) = (0usize, i);
+            while j < b.len() {
+                match b[j] {
+                    b'"' => {
+                        j = value_end(b, j)?;
+                        continue;
+                    }
+                    b'{' | b'[' => depth += 1,
+                    b'}' | b']' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            return Some(j + 1);
+                        }
+                    }
+                    _ => {}
+                }
+                j += 1;
+            }
+            None
+        }
+        _ => {
+            let mut j = i;
+            while j < b.len() && !matches!(b[j], b',' | b'}' | b']' | b' ' | b'\t' | b'\n' | b'\r')
+            {
+                j += 1;
+            }
+            (j > i).then_some(j)
+        }
+    }
+}
+
+/// A JSON string's contents (between its quotes) with escapes decoded into
+/// `out`, so that `"\u0041"` and `"A"` count as one value. False for a
+/// malformed escape (`out` then holds a part): the raw bytes are used.
+fn unescape(s: &[u8], out: &mut Vec<u8>) -> bool {
+    out.clear();
+    let hex4 = |b: &[u8]| -> Option<u32> {
+        let h = std::str::from_utf8(b.get(..4)?).ok()?;
+        u32::from_str_radix(h, 16).ok()
+    };
+    let mut i = 0;
+    while i < s.len() {
+        if s[i] != b'\\' {
+            out.push(s[i]);
+            i += 1;
+            continue;
+        }
+        let Some(&c) = s.get(i + 1) else {
+            return false;
+        };
+        i += 2;
+        let ch = match c {
+            b'"' => '"',
+            b'\\' => '\\',
+            b'/' => '/',
+            b'b' => '\u{8}',
+            b'f' => '\u{c}',
+            b'n' => '\n',
+            b'r' => '\r',
+            b't' => '\t',
+            b'u' => {
+                let Some(hi) = hex4(&s[i..]) else {
+                    return false;
+                };
+                i += 4;
+                let code = if (0xd800..0xdc00).contains(&hi) {
+                    // A surrogate pair: the low half must follow.
+                    match (s.get(i..i + 2), hex4(s.get(i + 2..).unwrap_or(&[]))) {
+                        (Some(b"\\u"), Some(lo)) if (0xdc00..0xe000).contains(&lo) => {
+                            i += 6;
+                            0x10000 + ((hi - 0xd800) << 10) + (lo - 0xdc00)
+                        }
+                        _ => return false,
+                    }
+                } else {
+                    hi
+                };
+                match char::from_u32(code) {
+                    Some(ch) => ch,
+                    None => return false,
+                }
+            }
+            _ => return false,
+        };
+        let mut b = [0; 4];
+        out.extend_from_slice(ch.encode_utf8(&mut b).as_bytes());
+    }
+    true
+}
+
+fn classify(t: &[u8]) -> Val<'_> {
+    match t {
+        b"null" => Val::Null,
+        b"true" => Val::Bool(true),
+        b"false" => Val::Bool(false),
+        [b'"', s @ .., b'"'] => Val::Str(s),
+        _ => match std::str::from_utf8(t)
+            .ok()
+            .and_then(|s| s.parse::<f64>().ok())
+        {
+            Some(x) if x.is_finite() && !t.starts_with(b"+") && t != b"inf" => Val::Num(x, t),
+            _ => Val::Other(t),
+        },
+    }
+}
+
+impl TableStats {
+    /// Add one row (its value bytes).
+    pub fn observe(&mut self, row: &[u8]) {
+        self.rows += 1;
+        let mut i = skip_ws(row, 0);
+        let (object, close) = match row.get(i) {
+            Some(b'{') => (true, b'}'),
+            Some(b'[') => (false, b']'),
+            _ => return,
+        };
+        i += 1;
+        let mut pos = 0usize;
+        let mut buf = Vec::new();
+        loop {
+            i = skip_ws(row, i);
+            if row.get(i) == Some(&close) {
+                return;
+            }
+            let name = if object {
+                let Some(end) = value_end(row, i).filter(|_| row[i] == b'"') else {
+                    return;
+                };
+                let raw = &row[i + 1..end - 1];
+                let name = if raw.contains(&b'\\') && unescape(raw, &mut buf) {
+                    String::from_utf8_lossy(&buf).into_owned()
+                } else {
+                    String::from_utf8_lossy(raw).into_owned()
+                };
+                i = skip_ws(row, end);
+                if row.get(i) != Some(&b':') {
+                    return;
+                }
+                i = skip_ws(row, i + 1);
+                name
+            } else {
+                pos += 1;
+                (pos - 1).to_string()
+            };
+            let Some(end) = value_end(row, i) else {
+                return;
+            };
+            let col = match self.columns.get_mut(&name) {
+                Some(c) => c,
+                None => self.columns.entry(name).or_insert_with(|| ColumnStats {
+                    values: Some(HashMap::new()),
+                    ..ColumnStats::default()
+                }),
+            };
+            match classify(&row[i..end]) {
+                Val::Str(s) if s.contains(&b'\\') && unescape(s, &mut buf) => {
+                    col.add(Val::Str(&buf))
+                }
+                v => col.add(v),
+            }
+            i = skip_ws(row, end);
+            match row.get(i) {
+                Some(b',') => i += 1,
+                Some(c) if *c == close => return,
+                _ => return,
+            }
+        }
+    }
+
+    /// The derived view kept for the table: one JSON object, fields in name
+    /// order, numbers as Rust formats them, value counts most common first
+    /// (up to 20).
+    pub fn to_json(&mut self) -> String {
+        let mut out = format!("{{\"rows\":{},\"columns\":{{", self.rows);
+        let esc = |s: &str| {
+            let mut o = String::from("\"");
+            for ch in s.chars() {
+                match ch {
+                    '"' => o.push_str("\\\""),
+                    '\\' => o.push_str("\\\\"),
+                    c if (c as u32) < 0x20 => o.push_str(&format!("\\u{:04x}", c as u32)),
+                    c => o.push(c),
+                }
+            }
+            o + "\""
+        };
+        for (i, (name, c)) in self.columns.iter_mut().enumerate() {
+            if i > 0 {
+                out.push(',');
+            }
+            out += &format!(
+                "{}:{{\"count\":{},\"nulls\":{},\"numbers\":{},\"strings\":{},\"bools\":{},\"other\":{},\"distinct\":{:.0}",
+                esc(name),
+                c.count,
+                c.nulls,
+                c.numbers,
+                c.strings,
+                c.bools,
+                c.other,
+                c.distinct.estimate()
+            );
+            if c.numbers > 0 {
+                out += &format!(
+                    ",\"min\":{},\"max\":{},\"mean\":{},\"variance\":{}",
+                    c.min,
+                    c.max,
+                    c.mean,
+                    c.variance()
+                );
+                let qs: Vec<String> = [0.01, 0.1, 0.25, 0.5, 0.75, 0.9, 0.99]
+                    .iter()
+                    .map(|q| format!("\"{q}\":{}", c.quantiles.quantile(*q).unwrap()))
+                    .collect();
+                out += &format!(",\"quantiles\":{{{}}}", qs.join(","));
+            }
+            if let Some(m) = &c.values {
+                let mut v: Vec<(&Vec<u8>, &u64)> = m.iter().collect();
+                v.sort_by(|a, b| b.1.cmp(a.1).then(a.0.cmp(b.0)));
+                let top: Vec<String> = v
+                    .iter()
+                    .take(20)
+                    .map(|(k, n)| format!("[{},{n}]", esc(&String::from_utf8_lossy(k))))
+                    .collect();
+                out += &format!(",\"values\":[{}]", top.join(","));
+            }
+            out.push('}');
+        }
+        out + "}}"
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn escaped_strings_count_as_the_value_they_spell() {
+        let mut s = TableStats::default();
+        for row in [
+            r#"{"w":"A","k\u0065y":1}"#,
+            r#"{"w":"\u0041","key":2}"#,
+            r#"{"w":"a\"b","key":3}"#,
+            r#"{"w":"\ud83d\ude00","key":4}"#,
+            r#"{"w":"\ud83d","key":5}"#, // a lone surrogate: kept raw
+        ] {
+            s.observe(row.as_bytes());
+        }
+        assert_eq!(
+            s.columns["key"].count, 5,
+            "the escaped key is the same column"
+        );
+        let v = s.columns["w"].values.as_ref().unwrap();
+        assert_eq!(v[&b"A"[..].to_vec()], 2);
+        assert_eq!(v[&b"a\"b"[..].to_vec()], 1);
+        assert_eq!(v["\u{1f600}".as_bytes()], 1);
+        assert_eq!(v[&br"\ud83d"[..].to_vec()], 1);
+        let mut out = Vec::new();
+        assert!(!unescape(br"\x", &mut out) && !unescape(br"\u12", &mut out));
+    }
+
+    #[test]
+    fn stats_match_an_exact_pass() {
+        let mut s = TableStats::default();
+        let mut xs = Vec::new();
+        let mut words = std::collections::HashSet::new();
+        for i in 0..50_000u64 {
+            let x = ((i * 2654435761) % 100_000) as f64 / 7.0;
+            xs.push(x);
+            let w = format!("w{}", i % 3000);
+            words.insert(w.clone());
+            let row = if i % 10 == 0 {
+                format!(
+                    r#"{{"x": {x}, "w": "{w}", "c": "{}", "n": null, "o": {{"a": [1, "]"]}}}}"#,
+                    i % 3
+                )
+            } else {
+                format!(
+                    r#"{{"x":{x},"w":"{w}","c":"{}","b":{}}}"#,
+                    i % 3,
+                    i % 2 == 0
+                )
+            };
+            s.observe(row.as_bytes());
+        }
+        s.observe(b"not json");
+        s.observe(b"[1, \"a\\\"b\", true]");
+        assert_eq!(s.rows, 50_002);
+        let x = &mut s.columns.get_mut("x").unwrap().clone();
+        assert_eq!(x.numbers, 50_000);
+        let mean = xs.iter().sum::<f64>() / xs.len() as f64;
+        let var = xs.iter().map(|v| (v - mean).powi(2)).sum::<f64>() / xs.len() as f64;
+        assert!((x.mean - mean).abs() < 1e-6 * mean.abs());
+        assert!((x.variance() - var).abs() < 1e-6 * var);
+        xs.sort_by(f64::total_cmp);
+        assert_eq!((x.min, x.max), (xs[0], xs[xs.len() - 1]));
+        for q in [0.01, 0.5, 0.99] {
+            let est = x.quantiles.quantile(q).unwrap();
+            let rank = xs.partition_point(|v| *v < est) as f64 / xs.len() as f64;
+            assert!((rank - q).abs() < 0.01, "q {q}: rank {rank}");
+        }
+        let w = &s.columns["w"];
+        let d = w.distinct.estimate();
+        assert!(
+            (d - words.len() as f64).abs() < 0.05 * words.len() as f64,
+            "{d}"
+        );
+        assert!(
+            w.values.is_none(),
+            "3000 words is more than the categories kept"
+        );
+        let c = &s.columns["c"];
+        assert_eq!(c.values.as_ref().unwrap().len(), 3);
+        assert_eq!(c.values.as_ref().unwrap()[&b"0"[..].to_vec()], 16_667);
+        assert_eq!(s.columns["n"].nulls, 5_000);
+        assert_eq!(s.columns["o"].other, 5_000);
+        assert_eq!(s.columns["b"].bools, 45_000);
+        assert_eq!(s.columns["1"].strings, 1);
+        assert!(s.to_json().starts_with("{\"rows\":50002,"));
+    }
+}
