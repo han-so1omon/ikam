@@ -25,6 +25,7 @@ mod http;
 mod json;
 mod live;
 mod mcp;
+mod netcmd;
 mod serve;
 mod text;
 mod tokens;
@@ -67,6 +68,11 @@ const USAGE: &str = "usage: ikam [--store DIR] [--disk-guard] [--short-records] 
                                    deferred appends once a database has had none
                                    for MS, so a read after a burst finds them
                                    folded (E413, off)
+  net NETFILE [--ref REF] fire T TOKEN [OUTFILE] | history | marking | enabled | check
+                                   run any Petri net from a net file on the store,
+                                   one firing a call, history on REF (default
+                                   net/NAME); human transitions are never fired
+                                   (netcmd.rs, E401)
   host --config FILE [PORT]        several separate projects in one process, each
                                    its own store, users and limits, chosen by Host
                                    name; crossing only through scoped shares (host.rs);
@@ -203,6 +209,15 @@ fn main() -> ExitCode {
     }
     if args.first().map(String::as_str) == Some("host") {
         return match host::host_cmd(&args[1..]) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(msg) => {
+                say!("{msg}");
+                ExitCode::FAILURE
+            }
+        };
+    }
+    if args.first().map(String::as_str) == Some("net") {
+        return match netcmd::net_cmd(&store_dir, &args[1..]) {
             Ok(()) => ExitCode::SUCCESS,
             Err(msg) => {
                 say!("{msg}");
