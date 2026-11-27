@@ -169,6 +169,7 @@ fn part1() {
                             Conflict::Key(k) | Conflict::Idempotency(k) | Conflict::Path(k) => {
                                 k.clone()
                             }
+                            Conflict::Lines { path, .. } => path.clone(),
                         })
                         .collect();
                     println!("  {label}       refused, conflicts on {keys:?}");

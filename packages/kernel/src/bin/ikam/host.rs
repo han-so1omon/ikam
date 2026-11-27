@@ -26,6 +26,9 @@
 //!   new bytes as body (write role, propose right), and `merge[?into=REF]`
 //!   (receiver owner, merge right). Every refusal of a share answers 404,
 //!   as if the share did not exist.
+//! - E417 (off): `lines=1` on `merge` or `/shares/accept` merges a file
+//!   both sides changed line by line (`MergeOptions::lines`): edits to
+//!   different lines are both kept, edits to the same lines answer 409.
 //!
 //! A panic while serving one project is caught and answered 500; the other
 //! projects keep serving. `--public` is refused: every request needs a user
@@ -48,8 +51,9 @@ use std::path::PathBuf;
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, SystemTime};
 
-use ikam_kernel::share::{Refused, Right, SHARES_REF, Scope, Share, import_share};
-use ikam_kernel::{Id, Kind, merge::Merged};
+use ikam_kernel::merge::{MergeOptions, Merged};
+use ikam_kernel::share::{Refused, Right, SHARES_REF, Scope, Share, import_share_with};
+use ikam_kernel::{Id, Kind};
 
 use crate::auth::{self, Auth};
 use crate::http::{self, Request, Response};
@@ -612,7 +616,7 @@ impl Host {
         }
         let into = l.refname.clone();
         let msg = format!("accept proposal {name}");
-        let out = l.repo.merge(&into, &branch, &msg);
+        let out = l.repo.merge_with(&into, &branch, &msg, merge_options(req));
         let _ = l.sync();
         merged(out.map_err(|e| e.to_string()))
     }
@@ -744,7 +748,8 @@ impl Host {
             Err(_) => return no_share(),
         }
         let msg = format!("merge {name} from {}", s.name);
-        let out = import_share(&mut sl.repo, &share, &mut pl.repo, &into, &msg);
+        let opts = merge_options(req);
+        let out = import_share_with(&mut sl.repo, &share, &mut pl.repo, &into, &msg, opts);
         let _ = pl.sync();
         match out {
             Ok(m) => merged(Ok(m)),
@@ -783,6 +788,14 @@ fn merged(out: Result<Merged, String>) -> Response {
                 .collect::<String>(),
         ),
         Err(e) => Response::text(500, e),
+    }
+}
+
+/// E417 (off): `lines=1` on a merge or an accept merges a file both sides
+/// changed line by line; without it, any such file is a conflict.
+fn merge_options(req: &Request) -> MergeOptions {
+    MergeOptions {
+        lines: req.param("lines").as_deref() == Some("1"),
     }
 }
 
@@ -1391,6 +1404,99 @@ mod tests {
             )
             .status,
             400
+        );
+        done(dirs);
+    }
+
+    #[test]
+    fn line_merges_through_shares_only_when_asked() {
+        // E417: with `lines=1`, a merge or an accept keeps both sides'
+        // edits to different lines of one file; the same lines answer 409.
+        let (h, dirs) = host("lines");
+        let post = |host: &str, who, path: &str, body: &[u8]| {
+            let r = h.handle(req("POST", host, who, path, body));
+            (r.status, String::from_utf8_lossy(&r.body).into_owned())
+        };
+        let put = |host: &str, who, path: &str, body: &[u8]| {
+            let r = h.handle(req("PUT", host, who, path, body));
+            assert!(r.status < 300, "{path}: {}", r.status);
+        };
+        let get = |host: &str, who, path: &str| h.handle(req("GET", host, who, path, b"")).body;
+        let issue = "/shares/issue?name=pub&to=b&scope=path:pub&right=merge&expires=600";
+        put(
+            "a.localhost",
+            OA,
+            "/dav/pub/lines.md",
+            b"one\ntwo\nthree\nfour\n",
+        );
+        assert_eq!(post("a.localhost", OA, issue, b"").0, 200);
+        assert_eq!(post("b.localhost", OB, "/from/a/pub/merge", b"").0, 200);
+        // b edits line 1, a edits line 4, and a shares again.
+        put(
+            "b.localhost",
+            OB,
+            "/dav/pub/lines.md",
+            b"ONE\ntwo\nthree\nfour\n",
+        );
+        put(
+            "a.localhost",
+            OA,
+            "/dav/pub/lines.md",
+            b"one\ntwo\nthree\nFOUR\n",
+        );
+        assert_eq!(post("a.localhost", OA, issue, b"").0, 200);
+        let (st, body) = post("b.localhost", OB, "/from/a/pub/merge", b"");
+        assert_eq!(st, 409, "{body}");
+        assert!(body.contains("Path(\"pub/lines.md\")"), "{body}");
+        let (st, body) = post("b.localhost", OB, "/from/a/pub/merge?lines=1", b"");
+        assert_eq!(st, 200, "{body}");
+        assert_eq!(
+            get("b.localhost", OB, "/dav/pub/lines.md"),
+            b"ONE\ntwo\nthree\nFOUR\n"
+        );
+        // Both edit line 2: refused, b's file as it was.
+        put(
+            "b.localhost",
+            OB,
+            "/dav/pub/lines.md",
+            b"ONE\nb2\nthree\nFOUR\n",
+        );
+        put(
+            "a.localhost",
+            OA,
+            "/dav/pub/lines.md",
+            b"one\na2\nthree\nFOUR\n",
+        );
+        assert_eq!(post("a.localhost", OA, issue, b"").0, 200);
+        let (st, body) = post("b.localhost", OB, "/from/a/pub/merge?lines=1", b"");
+        assert_eq!(st, 409, "{body}");
+        assert!(body.contains("Lines"), "{body}");
+        assert_eq!(
+            get("b.localhost", OB, "/dav/pub/lines.md"),
+            b"ONE\nb2\nthree\nFOUR\n"
+        );
+        // A proposal accepted by a's owner merges by lines when asked.
+        let prop = "/shares/issue?name=p&to=b&scope=path:pub&right=propose&expires=600";
+        assert_eq!(post("a.localhost", OA, prop, b"").0, 200);
+        let (st, _) = post(
+            "b.localhost",
+            Some(("b-writer", "pw")),
+            "/from/a/p/propose?path=pub/lines.md",
+            b"one\na2\nthree\nFOUR\nfive, from b\n",
+        );
+        assert_eq!(st, 200);
+        put(
+            "a.localhost",
+            OA,
+            "/dav/pub/lines.md",
+            b"one, a\na2\nthree\nFOUR\n",
+        );
+        assert_eq!(post("a.localhost", OA, "/shares/accept?name=p", b"").0, 409);
+        let (st, body) = post("a.localhost", OA, "/shares/accept?name=p&lines=1", b"");
+        assert_eq!(st, 200, "{body}");
+        assert_eq!(
+            get("a.localhost", OA, "/dav/pub/lines.md"),
+            b"one, a\na2\nthree\nFOUR\nfive, from b\n"
         );
         done(dirs);
     }

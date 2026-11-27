@@ -6537,3 +6537,33 @@ Gates on the branch (E229 to E233): every kernel test suite passes (release); cl
 - Verdict: **kept** (a fix, the paged first build, with no trade-off; `--hnsw-threads` an option, off).
 - Not measured: the Mac; real embeddings (clustered synthetic vectors stand in; recall on real text vectors may differ either way); a wider `ef` (a constant here: 80), which would trade query time for recall at 1M; keeping the graph across restarts; vectors changing while serving at 1M; more than one run each (build times on a shared cloud host move by tens of percent).
 - Run: `python3 -I experiments/vectors-1m/vec_1m.py WORK OUT.jsonl 100000,250000,500000,1000000 "exact=BRANCH:;exact-main=MAIN:;hnsw=BRANCH:--hnsw;hnsw4=BRANCH:--hnsw --hnsw-threads 4;hnsw-main@1000000=MAIN:--hnsw" 200`.
+
+### E417 share-line-merge (line-level merge for scoped shares: what E365 left)
+
+- Branch / parent: exp/417-share-line-merge / main 437aef6
+- Question: E365 made every scope a share can name mergeable, but "both sides changing the imported file is a conflict, as for path scopes: there is no content-level merge", and its Next proposed a line-level merge for section imports. On main `Repo::merge` still refuses any file both sides changed (`Conflict::Path`). Can a merge keep both sides' edits when they touch different lines of one file, and still refuse edits to the same lines, without changing a default merge?
+- Change (an option, off by default):
+  - `merge::MergeOptions { lines }` and `Repo::merge_with(into, from, message, opts)`; `Repo::merge` is `merge_with` with the default options and behaves as before. With `lines`, a path that is a file on the base and on both sides and changed on both is merged by `merge::merge_lines(base, ours, theirs)`: each side's changes against the base as hunks (the `similar` crate's Myers diff over lines, already a dependency), applied together when no two clash. Two replacements clash when their base ranges overlap; an insertion clashes with a replacement it falls strictly inside and with an insertion at the same place (their order would be a guess); a change made identically on both sides is kept once. Edits to adjacent lines do not clash (git's `merge-file` refuses them; see below). A clash is the new `Conflict::Lines { path, lines }`, naming the base lines (from 0) both sides changed, and nothing is written, as for every conflict. Files holding a NUL byte, files added on both sides, and a file deleted on one side stay `Conflict::Path`.
+  - `share::import_share_with(.., opts)` passes the options to the import's merge (`import_share` is it with the default); E365's section, fragment and graph imports and E316's folder imports all get it, since each re-import is three-way against the last.
+  - `ikam host`: `lines=1` on `POST /from/SOURCE/SHARE/merge` (the receiver's import) and on `POST /shares/accept` (the source taking a proposal) turns it on for that merge; without it, as before, a file changed on both sides answers 409.
+  - `examples/net_two_writers.rs` names the new conflict kind in its exhaustive match.
+- Tests: `tests/merge.rs`: `line_merge_keeps_edits_to_different_lines` (off: `Conflict::Path` and the ref unmoved; on: both edits and an appended line kept, fsck clean), `line_merge_refuses_edits_to_the_same_lines` (`Lines` naming line 1, ref unmoved), `merge_lines_cases` (adjacent lines, the same change on both sides, a deletion beside an edit, an insertion beside a changed line, two insertions at one place refused, an insertion inside a replaced range refused, a deleted line the other side changed refused, a last line without a newline, NUL bytes not text) and `line_merge_leaves_binary_and_added_files_as_conflicts`. `tests/share.rs`: `line_merge_keeps_both_sides_edits_to_a_shared_section` (a section import edited by the receiver while the source edits other lines of the section and the private text outside it: off, a conflict; on, both edits and the receiver's own file kept; then both edit one line: `Lines`, nothing written; fsck clean) and `line_merge_keeps_both_sides_edits_to_a_shared_folder`. `host.rs`: `line_merges_through_shares_only_when_asked` (merge without `lines=1` 409, with it 200 and both edits; same line 409 naming `Lines`, the receiver's file unchanged; an accepted proposal adding a line while the source changed another, 409 then 200 with `lines=1`).
+- Setup: `examples/line_merge.rs`, against `git merge-file -p` (git 2.43, its default Myers diff), 5,000 generated cases: a base of 5 to 44 lines drawn from 160 distinct lines (so alignments are sometimes ambiguous) and two sides with 1 to 4 random edits each (a line changed, deleted, or one or two lines inserted). On every case it also checks that a side merged with the base, or with itself, is that side. Then one large file with 10 edits a side, far apart. Linux cloud, 4 CPUs shared with another job, one run.
+- Results:
+
+  | 5,000 cases | count |
+  |---|---|
+  | clean in both, same bytes | 2,883 |
+  | clean in both, different bytes | **0** |
+  | clean here, refused by git | 1,436 |
+  | refused here, clean in git | **0** |
+  | refused by both | 681 |
+
+  - Wherever both merge, the bytes are git's; nothing git merges is refused here. The 1,436 are cases git refuses for changes that touch without overlapping (the shortest one printed: one side changes lines 1 and 5 of 5, the other inserts before line 1, deletes line 2, inserts after line 3 and after line 5). Not checked one by one that every such case is only adjacency.
+  - The laws held on all 5,000 cases.
+  - One file, 10 edits a side: 1,000 lines (14 KB) 0.06 to 0.12 ms, 10,000 lines (157 KB) 2.2 to 3.6 ms, 100,000 lines (1.6 MB) 22 to 42 ms (two runs; `git merge-file` with its process start 3 to 12, 11 to 15 and 60 to 103 ms), with git's bytes each time.
+- Checks: `cargo test --release --features embed` 383 pass, 0 fail (5 ignored); clippy `-D warnings` clean.
+- Fixed benchmark: not run. The bench does not merge; with the option off `Repo::merge` takes the same path as before, and no storage encoding changed.
+- Verdict: **kept** (an option, off). Two sides editing different lines of one imported file merge; edits to the same lines refuse with the lines named and nothing written.
+- Not measured: the Mac; a diff that gives up on large, very different files (no deadline is set, so a merge of two large rewrites runs Myers to the end: its time is not bounded here); merges of word or byte ranges inside a line; criss-cross histories (the merge base is still the first common ancestor found, as E265).
+- Run: `cargo test --release --test merge --test share`; `cargo test --release --bin ikam line_merges`; `cargo run --release --example line_merge -- WORK 5000`.

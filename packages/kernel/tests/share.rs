@@ -5,8 +5,8 @@
 
 #![allow(clippy::single_range_in_vec_init)] // a grant of one range is the usual case
 
-use ikam_kernel::merge::{Conflict, Merged};
-use ikam_kernel::share::{Refused, Right, Scope, Share, import_share};
+use ikam_kernel::merge::{Conflict, MergeOptions, Merged};
+use ikam_kernel::share::{Refused, Right, Scope, Share, import_share, import_share_with};
 use ikam_kernel::{
     Arg, Edge, Edit, Event, Id, Kind, MemStore, Node, Object, Repo, Target, TreeEntry,
 };
@@ -772,4 +772,120 @@ fn shares_decode_from_the_log() {
     }
     assert_eq!(Share::decode(&[bytes.as_slice(), b"x"].concat()), None);
     assert_eq!(a.share_named("missing").unwrap(), None);
+}
+
+#[test]
+fn line_merge_keeps_both_sides_edits_to_a_shared_section() {
+    // E417: a section import (E365) edited by the receiver, while the
+    // source edits other lines of the same section: with `lines` both edits
+    // are kept; edits to the same lines refuse, and nothing is written.
+    let lines = MergeOptions { lines: true };
+    let mut a = Repo::new(MemStore::default());
+    let head = "private head\n";
+    let body = "l1\nl2\nl3\nl4\n";
+    let file = format!("{head}{body}private tail\n");
+    let c = put(&mut a, "main", &[("doc.md", &file)]);
+    let id = |a: &Repo<MemStore>, c: Id| match a.get(&tree(a, c)).unwrap() {
+        Object::Tree(es) => es.into_iter().find(|e| e.name == "doc.md").unwrap().id,
+        _ => unreachable!(),
+    };
+    let section = |c: Id, a: &Repo<MemStore>, start: usize, len: usize| Scope::Section {
+        path: "doc.md".into(),
+        id: id(a, c),
+        ranges: vec![start as u64..(start + len) as u64],
+    };
+    let s = share("s", c, section(c, &a, head.len(), body.len()), Right::Merge);
+    a.share_issue(&s, &KEY).unwrap();
+    let mut b = Repo::new(MemStore::default());
+    put(&mut b, "main", &[("own.md", "b\n")]);
+    import_share_with(&mut a, &s, &mut b, "main", "first", lines).unwrap();
+    assert_eq!(read(&b, "main", "doc.md").unwrap(), body.as_bytes());
+    // The receiver edits line 1; the source edits line 3 and the tail.
+    put(&mut b, "main", &[("doc.md", "L1 by b\nl2\nl3\nl4\n")]);
+    let body2 = "l1\nl2\nL3 by a\nl4\n";
+    let c2 = put(
+        &mut a,
+        "main",
+        &[("doc.md", &format!("{head}{body2}tail changed\n"))],
+    );
+    let s2 = share(
+        "s",
+        c2,
+        section(c2, &a, head.len(), body2.len()),
+        Right::Merge,
+    );
+    a.share_issue(&s2, &KEY).unwrap();
+    // Without the option, as before: a conflict.
+    let before = b.resolve("main").unwrap();
+    assert_eq!(
+        import_share(&mut a, &s2, &mut b, "main", "again").unwrap(),
+        Merged::Conflicts(vec![Conflict::Path("doc.md".into())])
+    );
+    assert_eq!(b.resolve("main").unwrap(), before);
+    assert!(matches!(
+        import_share_with(&mut a, &s2, &mut b, "main", "again", lines).unwrap(),
+        Merged::Commit(_)
+    ));
+    assert_eq!(
+        read(&b, "main", "doc.md").unwrap(),
+        b"L1 by b\nl2\nL3 by a\nl4\n"
+    );
+    assert_eq!(read(&b, "main", "own.md").unwrap(), b"b\n");
+    // Both sides edit line 2: refused, nothing written. (Against the last
+    // import, b changed lines 1 and 2 as one run, so that run is named.)
+    let mine = put(
+        &mut b,
+        "main",
+        &[("doc.md", "L1 by b\nb's l2\nL3 by a\nl4\n")],
+    );
+    let body3 = "l1\na's l2\nL3 by a\nl4\n";
+    let c3 = put(
+        &mut a,
+        "main",
+        &[("doc.md", &format!("{head}{body3}tail changed\n"))],
+    );
+    let s3 = share(
+        "s",
+        c3,
+        section(c3, &a, head.len(), body3.len()),
+        Right::Merge,
+    );
+    a.share_issue(&s3, &KEY).unwrap();
+    assert_eq!(
+        import_share_with(&mut a, &s3, &mut b, "main", "third", lines).unwrap(),
+        Merged::Conflicts(vec![Conflict::Lines {
+            path: "doc.md".into(),
+            lines: vec![0..2],
+        }])
+    );
+    assert_eq!(b.resolve("main").unwrap(), mine);
+    assert!(b.fsck().unwrap().is_empty());
+}
+
+#[test]
+fn line_merge_keeps_both_sides_edits_to_a_shared_folder() {
+    let lines = MergeOptions { lines: true };
+    let (mut a, c) = source();
+    let s = share("m", c, Scope::Path("pub".into()), Right::Merge);
+    a.share_issue(&s, &KEY).unwrap();
+    let mut b = Repo::new(MemStore::default());
+    put(&mut b, "main", &[("own.md", "b\n")]);
+    import_share(&mut a, &s, &mut b, "main", "first").unwrap();
+    put(
+        &mut b,
+        "main",
+        &[("pub/one.md", "alpha shared line\nsecond line, b\n")],
+    );
+    let c2 = put(&mut a, "main", &[("pub/one.md", "alpha, a\nsecond line\n")]);
+    let s2 = share("m", c2, Scope::Path("pub".into()), Right::Merge);
+    a.share_issue(&s2, &KEY).unwrap();
+    assert!(matches!(
+        import_share_with(&mut a, &s2, &mut b, "main", "again", lines).unwrap(),
+        Merged::Commit(_)
+    ));
+    assert_eq!(
+        read(&b, "main", "pub/one.md").unwrap(),
+        b"alpha, a\nsecond line, b\n"
+    );
+    assert!(b.fsck().unwrap().is_empty());
 }
