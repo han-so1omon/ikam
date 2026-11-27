@@ -4574,6 +4574,7 @@ Gates on the branch (E229 to E233): every kernel test suite passes (release); cl
   - Nothing was lost in any run: every put and every seed reads back through a fresh handle and fsck is clean, so the drop's own check held across processes.
   - The failed puts were real failures for the caller: a loop runner would have seen 28% of its writes error out.
   - The shared temporary name never happens across processes (each has its own id); it needs two FsStore handles in one process, which `SharedStore` (one handle, siblings) avoids.
+- Fixed benchmark after the packed index, against the follow-up's run: stored bytes equal on every corpus, bytes, proxy and read scores equal, north 0.3060, cost score 0.2363 (0.2435 before; timing). repo-history's ingest peak fell from 16.97 to 6.23 MB; its repack peak, counted above the heap held when repack starts, rose from 28.5 to 39.1 MB, but that start is 10.6 MB lower because the commit's index is smaller, and repack drops that index: the heap's highest point was 94.2 MB before and 94.3 to 95.9 MB after (two runs each, peak printed locally and not committed).
 - Verdict: **kept** (two fixes, both unconditional: neither has a cost). The kernel suite passes.
 - Not measured: FsStore opened deferred (E227) across processes; a gc or repack during other writes.
 - Run: as above (about 3 minutes).
@@ -6621,3 +6622,95 @@ Gates on the branch (E229 to E233): every kernel test suite passes (release); cl
 - Question: on E395's sidecar, keep an anchor when its hash mod K is 0 instead of every K-th, so copies of the same bytes anywhere pick the same anchors.
 - Finding: it stacks on E395, which was not built for want of headroom (above).
 - Verdict: **not-applicable** (depends on E395). It belongs with E395 if a document-sized corpus shows headroom.
+### E390 enwik-speed (why a wiki dump's page tree ingests far slower than zstd or xz compress it)
+
+- Branch / parent: exp/390-enwik-roundtrip / main 437aef6
+- Question: enwik8 split into one file per `<page>` round-tripped byte-exact through `ikam ingest`, but the ingest took minutes where `zstd -19` and `xz -9` take a second or two a megabyte, and enwik9 was slower still. Where does an ingest of a wiki-shaped tree spend its time, and what can be cut without changing the stored bytes?
+- Setup: `experiments/enwik-speed/`. The enwik files themselves were not reachable from the cloud host, so `genwiki.py` writes a MediaWiki-export-shaped stand-in (Markov prose from any large English text, Zipf-popular `[[links]]` and piped links, infoboxes, categories, interwiki lines, 25% redirects, enwik's XML layout) and `splitwiki.py` cuts it into one file per page, in order, so the files concatenate back to the input. 5, 20 and 100 MB (18,497 pages at 100 MB). `ikam --store S ingest PAGES -m t` (commit, repack, verify) with each binary; wall time, user time and peak RSS from `time`; phase times from timers added locally and not committed. Linux cloud, 4 CPUs, 15 GB, one run each.
+- References on the same 100 MB file: `zstd -3` 31.4 MB in 0.6 s; `zstd -19 --long=27` 19.0 MB in 119 s; `xz -9e` 17.1 MB in 153 s; `ikam put` of the single file 0.5 s (one plain blob).
+- Found on main:
+  - Repack is 95% of an ingest (commit about 4%, verify 1%), about 7 s a MB at 20 MB and 9 s a MB at 100 MB.
+  - Repack trains a dictionary, builds three alternative whole-store plans in parallel (`read_weight` under 2: dictionary without and with induced bases, and no dictionary), then recompresses: cheapest plain encodings, then one thread over every 64 KiB group trying block frames (4 and 16 KiB) and context frames (one or two related contents), each built at level 19 and kept only if cheaper.
+  - Most of those trials never win. At 5 MB: block frames 80 tried, 0 kept, 7.3 s; context frames 644 tried, 1 kept, 7.2 s, out of an 18.7 s recompress. At 100 MB: context frames 9,339 tried, 388 kept, 293 s; block frames 2,076 tried, 3 kept, 41 s.
+  - A block frame with a dictionary built a new level-19 compressor for every 4 KiB chunk, which indexes the whole dictionary each time (`ZSTD_updateTree` was 28% of samples in `perf`).
+  - Peak memory is about 14 times the input (1.39 GB at 100 MB): the store and the three plans are all held. At that rate enwik9 needs about 14 GB, close to an 18 GB laptop's memory.
+- Change:
+  - Fix (default): `zstd_frame` with a dictionary keeps the last compressor per thread and reuses it while the same dictionary (by BLAKE3) and level come back. zstd writes the same frames with a reused compressor, so the store is byte-identical.
+  - Option: `Repo::screen_trials`, `ikam --screen-trials` (off). Before a block or context trial is built at level 19, it is built at the measuring level (3) and scaled by the group's own level-19/level-3 size ratio; the trial goes on only if that estimate is within 5% (`SCREEN_MARGIN`) of the current cost. A trial whose estimate is wrong by more than 5% can be skipped though it would have won, so a store can come out slightly larger. The option is part of the repack fingerprint.
+- Results (stored bytes include every object; fsck clean and every file read back exact in all runs):
+
+  | input | binary | wall | repack | peak RSS | stored bytes |
+  | --- | --- | --- | --- | --- | --- |
+  | 5 MB | main | | 29.3 s | | 1,490,192 |
+  | | fix | | 20.4 s | | 1,490,192 |
+  | | fix + `--screen-trials` | | 15.1 s | | 1,490,192 |
+  | 20 MB | main | 149.1 s | 141.9 s | 380 MB | 5,944,876 |
+  | | fix | 111.2 s | 101.7 s | 381 MB | 5,944,876 |
+  | | fix + `--screen-trials` | **78.0 s** | 69.1 s | 339 MB | 5,945,123 (+0.004%) |
+  | 100 MB | main | 946.5 s | 895.8 s | 1,394 MB | 29,396,239 |
+  | | fix | 723.1 s | 673.0 s | 1,459 MB | 29,396,239 |
+  | | fix + `--screen-trials` | **478.3 s** | 428.7 s | 1,458 MB | 29,396,239 |
+
+  At 100 MB with screening, context frames tried fell from 9,339 to 533 with the same 388 kept; the sequential loop went from 373 to 133 s.
+- What is left (100 MB, screened): the three whole-store plans about 220 s, the loop 133 s (block trials about 49 s of it, for 3 wins), training and plain encodings the rest. Ingest is still about 4 times `zstd -19 --long`'s time and its store 55% larger: every page stays its own object, readable alone and shared by content, where a stream compressor sees one 128 MB window. Next to try: plan on a sample past a size instead of three whole-store plans; skip 4 KiB block trials where reads are rare; stream the plans so memory stops growing with the store.
+- Follow-up: keep every trial, run them on all cores, and log them. Screening skips trials, but a trial that loses still says which kinds of content gain from one, so two more options, both off:
+  - `Repo::trial_threads`, `ikam --trial-threads N|all`: before the sequential pass, every plain content's store-level trials run on N threads, largest content first, as if no content were yet encoded against another, and only each trial's length and build time are kept. The sequential pass then reuses a kept length and builds a frame again only to keep it, or when its context differs from the one guessed (a context already taken by a content before it). zstd's frames are deterministic, so every choice and every stored byte is the same; the per-content trial code moved into `Repo::trials` for both passes.
+  - `Repo::trial_log`, `ikam --trial-log FILE`: one tab-separated line per trial: kind, content length, its cheapest plain encoding, bytes decoded and reads, context length and count, best cost before the trial, the fast estimate when screened, the trial's length, cost, whether it won, and its build time.
+
+  | input | binary | wall | repack | peak RSS | stored bytes |
+  | --- | --- | --- | --- | --- | --- |
+  | 20 MB | fix + `--trial-threads 4` | 73.6 s | 66.2 s | 356 MB | 5,944,876 (same as main) |
+  | | + `--screen-trials` | 69.4 s | 61.1 s | 365 MB | 5,945,123 |
+  | 100 MB | fix + `--trial-threads 4` | 518.3 s | 466.8 s | 1,460 MB | 29,396,239 (same as main) |
+  | | + `--screen-trials` | 465.3 s | 412.1 s | 1,443 MB | 29,396,239 |
+
+  On four cores, running every trial ahead is about as fast as screening at 20 MB and 8% slower at 100 MB, with no trial skipped and no more peak memory (each thread's zstd state is small next to the store). Both together save little more: the three whole-store plans are now most of what is left.
+- What the trial log says (100 MB, all trials kept): context frames 9,339 tried, 388 won, 298 s of build time, saving 153,009 B (0.52% of the store); 4 KiB blocks 1,038 tried, 3 won, 25 s, 703 B; 16 KiB blocks 1,038 tried, none won, 18 s. At 20 MB: context 2,291 tried, 36 won, 36 s, 8,194 B; blocks 372 tried, 2 won, 151 B. At 20 MB, context wins were large contents with a context short next to them (medians 40 KB, and a context 6 times the content's length) against 5 KB and 22 times for losses, and nine losses in ten cost at least 5% more than the best encoding they were up against (median 15%).
+- A rule learned from the log, replayed (not built): fit on alternate rows of the 20 MB log, keep the context trials whose context is at most 15 times the content and whose content is at least 16 KiB. On the other 20 MB rows it kept all 26 wins and all their savings at 45% of the context trials' time. On the 100 MB log, which it never saw, it kept 356 of 388 wins and 98.9% of the savings at 50% of the time; content at least 16 KiB alone kept all 388 at 51.5%. A gate like that, fit from a store's own log, is the next thing to build and measure as an option, against real enwik data first.
+- Second follow-up: the commit phase. On real enwik9 (243,000 pages) the commit before repack took 410 times as long as enwik8's for 10 times the data, and the machine swapped. Here commit scales near-linearly (25k to 200k pages of a small-page stand-in), but its peak memory was about 3 times the input, and dropping the matcher's seed index at the end of a commit frees nearly all of it (25k pages: 192.6 MB to 10 MB). The index held a map from each seed to its own small vector of (id, position), about 210 bytes an entry where its notes said about 40, mostly each vector's heap allocation for what is usually one entry.
+  - Fix (default): `matcher::Index` keeps each seed's candidates as a chain through one arena of 16-byte entries (blob number, position, next) and each blob's id once. The same candidates in the same order, so plans and stores are the same.
+
+  | pages | binary | commit wall | user | peak RSS |
+  | --- | --- | --- | --- | --- |
+  | 25k | before | 27.9 s | 11.9 s | 191 MB |
+  | | packed | 28.7 s | 11.0 s | 46 MB |
+  | 50k | before | 55.9 s | 24.0 s | 370 MB |
+  | | packed | 57.2 s | 23.0 s | 81 MB |
+  | 100k | before | 139.7 s | 63.1 s | 718 MB |
+  | | packed | 129.1 s | 56.1 s | 150 MB |
+  | 200k | before | 316.1 s | 138.0 s | 1,416 MB |
+  | | packed | 261.9 s | 114.8 s | 290 MB |
+
+  The store written at 25k pages is identical file for file. The packed index saves memory, but it is not why enwik9's commit was slow (next bullet).
+- Third follow-up: what is slow in enwik9's commit. On the Mac, enwik9 with this branch and `--screen-trials` took 32,062 s (8.9 h; 33,116 s on main): commit about 6.6 h, repack 6,788 s (8,327 s on main), verify 947 s; 284,774,148 stored bytes (+15,023 from screening), fsck clean, rebuilt sha256 equal. During the commit ikam stayed under about 0.5 GB with no swap-outs, so memory does not explain it; the machine swapped in repack instead (peak RSS 6.39 GB, about 19 GB paged out; a VM also held about 2 GB).
+  - A stand-in for the bot-written pages that make up much of enwik9 after enwik8 (one census-stub template, names and numbers varying: `towns.py`) does reproduce it: commit time more than doubles when the page count doubles.
+  - Cause: when a new page's plan supersedes an older page's stored copy (a template shared with its neighbour, say), `apply_candidate` asks `is_needed` whether any stored encoding names that copy. With `needed_index` off, the default, that lists the store and reads every object, each time, so a commit of n near-identical pages reads O(n^2) objects. `perf`: `Store::read` 39% and `Store::ids` 7% of a 5,000-page commit, all under `apply_candidate`.
+  - The fix already exists as an option: `needed_index` (E129, `--needed-index`) keeps that set in memory. It assumes the handle is the store's only writer while open, so it stays off by default; a one-off `ikam ingest` or `commit` with nothing else writing the store fits that.
+
+  | town pages | `--needed-index` | commit wall | user | sys | peak RSS |
+  | --- | --- | --- | --- | --- | --- |
+  | 5,000 | off | 18.0 s | 5.2 s | 4.4 s | 15 MB |
+  | | on | 11.0 s | 3.0 s | 1.7 s | 15 MB |
+  | 10,000 | off | 40.7 s | 12.3 s | 10.8 s | 21 MB |
+  | | on | 24.7 s | 6.0 s | 5.9 s | 21 MB |
+  | 20,000 | off | 93.8 s | 33.2 s | 31.2 s | 31 MB |
+  | | on | 47.2 s | 12.6 s | 9.8 s | 31 MB |
+
+  Off, user time grows 2.4 and 2.7 times per doubling; on, 2.0 and 2.1 times. The 20,000-page stores are identical file for file. What is left on is mostly writing one file per object (wall is still about twice user time here). Not yet measured: enwik9's commit with `--needed-index` on the Mac.
+- Fourth follow-up: the Mac's runs on real enwik8 and enwik9 (one run each, a fresh store each time, nothing else writing it).
+  - enwik9, load step only (`commit`) with `--needed-index` at 35fa6cd: 924.8 s wall (user 169.8 s, sys 167.4 s), peak RSS 0.79 GB, no swap-outs, 461,689,065 new bytes before any repack. The same step took about 23,400 to 23,900 s inside the two full ingests above, so it is about 26 times faster. The commit checks out to a copy of enwik9 equal in sha256 and by `cmp` (checkout 214.7 s, 0.44 GB).
+  - enwik8 with `--trial-threads all` (all cores) at f5a5e29: 254.4 s wall (ingest 53.9 s, repack 188.6 s, verify 8.7 s), peak RSS 1.59 GB, 31,562,039 stored bytes, the same as the branch without options. Fsck clean, rebuilt sha256 equal.
+
+  | enwik8, Mac | wall | repack | peak RSS | stored bytes |
+  | --- | --- | --- | --- | --- |
+  | main 437aef6 | 356.1 s | 286.8 s | 1.90 GB | 31,562,039 |
+  | branch f2e4ea1 | 290.8 s | 219.7 s | 1.93 GB | 31,562,039 |
+  | + `--screen-trials` | 278.2 s | 207.0 s | 1.83 GB | 31,564,201 |
+  | f5a5e29 `--trial-threads all` | 254.4 s | 188.6 s | 1.59 GB | 31,562,039 |
+
+  - The trial log on real enwik8 (8,232 trials): context trials 6,726, 880 won, 59.2 s in all; 4 KiB block trials 753, 12 won, 15.9 s; 16 KiB block trials 753, 10 won, 9.1 s. Block trials cost 25 s for 22 wins; context trials carry most of the gain.
+- Checks: `a_reused_dictionary_compressor_writes_the_same_frames` (a reused compressor's frames equal a fresh one's for 4 KiB chunks at both levels, and after switching dictionaries), `screened_trials_repack_to_an_exact_store` (300 wiki-like pages repacked with and without screening: every file exact, fsck clean, fingerprints differ), `parallel_trials_store_the_same_bytes` (400 pages, screening off and on: every stored object equal with 0 and 4 trial threads, every file exact, fsck clean, the same number of trial log lines), `the_packed_index_keeps_the_candidates_a_plain_map_would` (40 overlapping blobs, some added twice: every seed's candidates equal a plain map of vectors', in order, with full slots). `cargo test --release`: 377 pass, 0 fail (376 before the packed index); clippy `-D warnings` clean.
+- Fixed benchmark (AGENTS.md section 7), this branch against main 437aef6 in the same session: stored bytes equal on every corpus; bytes, proxy and read scores equal (5.7493, 3.8185, 5.7140); north score 0.3060 both; every reconstruction exact and fsck clean. North repack CPU 65.9 s on main, 50.3 s here (wall 86.4 to 63.0 s). Cost score 0.2394 here, 0.2389 on main, within its timing noise. Run again after the follow-up (the trial code moved into `Repo::trials`, options off): the same bytes on every corpus, north 0.3060, cost score 0.2435 (timing; its total time was the lowest of the three runs).
+- Verdict: **kept** (two fixes with no trade-off, the same bytes: the reused compressor and the packed seed index; `--screen-trials`, `--trial-threads` and `--trial-log` options, off). On the Mac `--trial-threads all` stored the same bytes in 12% less time than the branch without it, and `--needed-index` cut enwik9's load step from about 6.6 h to 15 min; both stay options here (one uses every core, the other assumes a single writer). Making `--needed-index` the default for a one-off `ingest` or `commit` is the next step, not done here.
+- Not measured: a full enwik9 ingest (commit and repack) with `--needed-index`; repack's memory on enwik9 (it swapped); this stand-in compresses further than real enwik8 and may have fewer context-frame wins; more than one run each.
+- Run: `python3 -I experiments/enwik-speed/genwiki.py SEED.txt OUT.xml 100000000 1`; `python3 -I experiments/enwik-speed/splitwiki.py OUT.xml PAGES`; `python3 -I experiments/enwik-speed/towns.py PAGES 20000`; `ikam --store S [--screen-trials] [--trial-threads 4] [--trial-log trials.tsv] ingest PAGES -m t`.

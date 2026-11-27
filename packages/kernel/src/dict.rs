@@ -207,7 +207,10 @@ pub(crate) fn names(prefix: &[u8], id: &Id) -> bool {
 /// fields would only repeat what is known (up to ~10 B per stored object).
 /// `dict` empty means no dictionary.
 pub(crate) fn zstd_frame(bytes: &[u8], dict: &[u8], level: i32) -> Option<Vec<u8>> {
-    if !dict.is_empty() || level != MEASURE_LEVEL {
+    if !dict.is_empty() {
+        return dict_frame(bytes, dict, level);
+    }
+    if level != MEASURE_LEVEL {
         return framer_at(dict, level)?.compress(bytes).ok();
     }
     // E336: what ingest writes reuses one compressor per thread; setting
@@ -223,6 +226,27 @@ thread_local! {
     /// `zstd_frame`'s compressor at `MEASURE_LEVEL` without a dictionary.
     static FRAMER: std::cell::Cell<Option<zstd::bulk::Compressor<'static>>> =
         const { std::cell::Cell::new(None) };
+    /// E390: the last dictionary compressor, by dictionary hash and level.
+    static DICT_FRAMER: std::cell::Cell<Option<DictFramer>> = const { std::cell::Cell::new(None) };
+}
+
+type DictFramer = ([u8; 32], i32, zstd::bulk::Compressor<'static>);
+
+/// `zstd_frame` with a dictionary (E390). Loading a dictionary at level 19
+/// indexes all of it, which cost more than compressing a 4 KiB block: the
+/// last compressor is kept per thread and reused while the same dictionary
+/// comes back (a group's blocks, every content against the store's
+/// dictionary). A compressor keeps a loaded dictionary across frames, so
+/// the frames are the same as from a fresh one.
+fn dict_frame(bytes: &[u8], dict: &[u8], level: i32) -> Option<Vec<u8>> {
+    let key = *blake3::hash(dict).as_bytes();
+    let mut c = match DICT_FRAMER.take() {
+        Some((k, l, c)) if k == key && l == level => c,
+        _ => framer_at(dict, level)?,
+    };
+    let out = c.compress(bytes).ok();
+    DICT_FRAMER.set(Some((key, level, c)));
+    out
 }
 
 /// zstd level for estimates (growing groups, scoring dictionaries, comparing
@@ -385,9 +409,14 @@ fn unzstd_stream(
 /// with `dict`, so a member read decodes only the blocks it overlaps (as in
 /// zstd's seekable format). Stored as "K" dict[4] body.
 pub(crate) fn block_frames(bytes: &[u8], dict: &[u8], block: usize) -> Option<Vec<u8>> {
+    block_frames_at(bytes, dict, block, STORE_LEVEL)
+}
+
+/// `block_frames` at a zstd `level` (E390 estimates at `MEASURE_LEVEL`).
+pub(crate) fn block_frames_at(bytes: &[u8], dict: &[u8], block: usize, level: i32) -> Option<Vec<u8>> {
     let frames: Vec<Vec<u8>> = bytes
         .chunks(block)
-        .map(|c| zstd_frame(c, dict, STORE_LEVEL))
+        .map(|c| zstd_frame(c, dict, level))
         .collect::<Option<_>>()?;
     let mut out = Vec::new();
     put_varint(&mut out, block);
@@ -827,6 +856,22 @@ impl<S: Store> Repo<S> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_reused_dictionary_compressor_writes_the_same_frames() {
+        let dict: Vec<u8> = (0..40_000u32).flat_map(|i| (i * 2654435761 % 977).to_le_bytes()).collect();
+        let text: Vec<u8> = (0..70_000u32).flat_map(|i| (i % 613 + i / 5000).to_le_bytes()).collect();
+        for level in [MEASURE_LEVEL, STORE_LEVEL] {
+            for chunk in text.chunks(4096) {
+                let fresh = framer_at(&dict, level).unwrap().compress(chunk).unwrap();
+                assert_eq!(zstd_frame(chunk, &dict, level).unwrap(), fresh);
+                assert_eq!(unzstd_frame(&fresh, &dict).unwrap(), chunk);
+            }
+            let other = &dict[..20_000];
+            let fresh = framer_at(other, level).unwrap().compress(&text).unwrap();
+            assert_eq!(zstd_frame(&text, other, level).unwrap(), fresh);
+        }
+    }
 
     /// E336: frames from the kept compressor are byte for byte the frames
     /// of a new one, in any order of sizes, and decode back.
