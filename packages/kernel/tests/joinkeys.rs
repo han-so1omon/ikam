@@ -1,17 +1,23 @@
 //! E420: join keys proposed by name are kept only when the data confirms
 //! them, with their evidence.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 
-use ikam_kernel::colstats::{TableStats, field_value};
-use ikam_kernel::joinkeys::{Rejected, TableInfo, ValueCache, column_prefix, name_score, propose};
-use ikam_kernel::{Event, MemStore, Repo, Target};
+use ikam_kernel::colstats::{TableStats, field_value, value_text};
+use ikam_kernel::joinkeys::{
+    Candidate, Evidence, Rejected, TableInfo, ValueCache, column_prefix, markers, name_score,
+    propose,
+};
+use ikam_kernel::{Event, Id, MemStore, Repo, Target};
 
 #[test]
 fn names_say_which_columns_are_one_thing() {
     assert_eq!(column_prefix(["ss_item_sk", "ss_sold_date_sk"]), "ss_");
     assert_eq!(column_prefix(["ca_address_sk", "c_customer_sk"]), "");
     assert_eq!(column_prefix(["id", "name"]), "");
+    // Key markers as `markers` learns them from TPC-DS's tables.
+    let m: HashSet<String> = ["sk", "id", "dim"].map(String::from).into();
+    let name_score = |c: &str, p: &str, t: &str| name_score(c, p, t, &m);
     // Roles before the parent's words are allowed; a prefix of three
     // letters matches a longer word.
     assert_eq!(name_score("sold_date_sk", "date_sk", "date_dim"), 1.0);
@@ -28,6 +34,18 @@ fn names_say_which_columns_are_one_thing() {
     assert_eq!(name_score("cdemo_sk", "customer_sk", "customer"), 0.0);
     // A column called only by its suffix stands for its table.
     assert_eq!(name_score("order_id", "id", "orders"), 1.0);
+    assert_eq!(name_score("date_sk", "sk", "date_dim"), 1.0);
+    // A child may end in a word that marks no key in these tables.
+    assert_eq!(name_score("customer_fk", "id", "customer"), 1.0);
+    assert_eq!(name_score("customer_fk", "id", "store"), 0.0);
+    // Object keys are read with their escapes decoded, string values as
+    // `observe` counts them.
+    assert_eq!(field_value(b"{\"\x5cu0061\":1}", "a"), Some(&b"1"[..]));
+    assert_eq!(field_value(b"{\"b\x5c\"c\":2}", "b\"c"), Some(&b"2"[..]));
+    assert_eq!(field_value(b"{\"\x5cu0061\":1}", "\x5cu0061"), None);
+    assert_eq!(&value_text(b"\"\x5cu0041\"")[..], b"\"A\"");
+    assert_eq!(&value_text(b"\"A\"")[..], b"\"A\"");
+    assert_eq!(&value_text(b"12")[..], b"12");
     assert_eq!(
         field_value(br#"{"a":1,"b":"x"}"#, "b"),
         Some(&br#""x""#[..])
@@ -133,8 +151,15 @@ fn only_pairs_the_data_confirms_are_kept() {
     assert_eq!(kept.len(), 1);
     let root = repo.put_join_keys(&kept).unwrap();
     let nodes = repo.graph_nodes(&root).unwrap();
-    assert_eq!(nodes.len(), 1);
+    assert_eq!(nodes.len(), 2);
     assert_eq!(nodes[0].label, "t/pet.p_owner_sk>t/owner.o_owner_sk");
+    assert_eq!(nodes[1].label, "t/pet.p_owner_sk>t/owner.o_owner_sk/join");
+    assert_eq!(nodes[1].target, Target::Object(kept[0].1.join_root));
+    assert_eq!(nodes[0].edges[0].label, "join_root");
+    // Kept by a ref, the evidence keeps its join from gc.
+    repo.commit("keys", root, "").unwrap();
+    repo.gc().unwrap();
+    assert!(repo.graph_nodes(&kept[0].1.join_root).is_ok());
     let Target::Content(a) = &nodes[0].target else {
         panic!("evidence is content")
     };
@@ -191,4 +216,95 @@ fn exact_checks_catch_what_stats_let_through() {
         .join_key_confirm(&db, &cand("1", "1"), &stats, &mut cache)
         .unwrap();
     assert_eq!(r.unwrap().join_rows, 30);
+}
+
+#[test]
+fn key_markers_are_learned_from_the_tables() {
+    // `id` is the key of both tables; `customer_fk` and `customer_code`
+    // name the customer in words no fixed list holds. Some orders spell a
+    // code with escapes, which must read as the code it spells.
+    let mut repo = Repo::new(MemStore::default());
+    let mut rows = Vec::new();
+    for i in 1..=30 {
+        rows.push((
+            format!("t/customer/{i:03}"),
+            format!(r#"{{"id":{i},"code":"C{i}","city":"x{}"}}"#, i % 4),
+        ));
+    }
+    for i in 0..90 {
+        let c = 1 + i % 30;
+        let code = if i % 9 == 0 {
+            format!("\\u0043{c}")
+        } else {
+            format!("C{c}")
+        };
+        rows.push((
+            format!("t/orders/{i:03}"),
+            format!(
+                r#"{{"id":{},"customer_fk":{c},"customer_code":"{code}","amount":{}}}"#,
+                100 + i,
+                i % 7
+            ),
+        ));
+    }
+    let rows: Vec<(&str, String)> = rows.iter().map(|(k, v)| (k.as_str(), v.clone())).collect();
+    let db = load(&mut repo, &rows);
+    let mut stats = BTreeMap::new();
+    for t in ["t/customer", "t/orders"] {
+        let mut s = TableStats::with_zones(16);
+        repo.bm25_view_build_with_stats(&db, &format!("{t}/"), &mut s)
+            .unwrap();
+        stats.insert(t.to_string(), s);
+    }
+    let infos: Vec<TableInfo> = ["customer", "orders"]
+        .iter()
+        .map(|n| TableInfo {
+            table: format!("t/{n}"),
+            name: n.to_string(),
+            stats: &stats[&format!("t/{n}")],
+        })
+        .collect();
+    assert_eq!(markers(&infos), HashSet::from(["id".to_string()]));
+    let cands = propose(&infos, 1.0, None);
+    let mut cache = ValueCache::new();
+    for want in [
+        "t/orders.customer_fk>t/customer.id",
+        "t/orders.customer_code>t/customer.code",
+    ] {
+        let c = cands.iter().find(|c| c.label() == want);
+        let c = c.unwrap_or_else(|| panic!("{want} in {cands:?}"));
+        let e = repo.join_key_confirm(&db, c, &stats, &mut cache).unwrap();
+        let e = e.unwrap_or_else(|r| panic!("{want}: {r:?}"));
+        assert_eq!((e.contained, e.join_rows, e.child_distinct), (90, 90, 30));
+    }
+    // One table's id names nothing in the other.
+    assert!(!cands.iter().any(|c| c.child == "id"));
+}
+
+#[test]
+fn evidence_json_escapes_names() {
+    let c = Candidate {
+        child_table: "t/a\"b".into(),
+        child: "x\\y".into(),
+        parent_table: "t/p".into(),
+        parent: "k\nl".into(),
+        name_score: 1.0,
+    };
+    let e = Evidence {
+        name_score: 1.0,
+        child_rows: 1,
+        child_nulls: 0,
+        child_distinct_est: 1.0,
+        parent_rows: 1,
+        parent_distinct_est: 1.0,
+        ranges: None,
+        contained: 1,
+        child_distinct: 1,
+        parent_distinct: 1,
+        join_rows: 1,
+        join_root: Id::of_content(b""),
+    };
+    let v: serde_json::Value = serde_json::from_str(&e.to_json(&c)).unwrap();
+    assert_eq!(v["child"], "t/a\"b.x\\y");
+    assert_eq!(v["parent"], "t/p.k\nl");
 }

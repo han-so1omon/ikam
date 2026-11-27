@@ -17,7 +17,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::time::Instant;
 
 use ikam_kernel::colstats::TableStats;
-use ikam_kernel::joinkeys::{Candidate, Rejected, TableInfo, ValueCache, propose};
+use ikam_kernel::joinkeys::{Candidate, Rejected, TableInfo, ValueCache, markers, propose};
 use ikam_kernel::{Event, MemStore, Repo};
 
 fn pair(c: &Candidate) -> (String, String, String, String) {
@@ -109,6 +109,8 @@ fn main() {
         })
         .collect();
 
+    let mut marks: Vec<String> = markers(&infos).into_iter().collect();
+    marks.sort();
     let t0 = Instant::now();
     let cands = propose(&infos, min_score, None);
     let propose_ms = t0.elapsed().as_secs_f64() * 1000.0;
@@ -209,7 +211,7 @@ fn main() {
     }
     let data_fp: Vec<String> = data_kept.difference(&declared).map(show).collect();
     println!(
-        "{{\"rows\":{},\"tables\":{},\"load_s\":{load_s:.2},\"min_score\":{min_score},\"declared\":{},\"composite_declared\":{},\"proposed\":{n_named},\"kept\":{n_kept},\"true_kept\":{tp},\"precision\":{precision:.3},\"recall\":{recall:.3},\"propose_ms\":{propose_ms:.2},\"rejected\":{why_counts:?},\"names_only\":{{\"proposed\":{n_named},\"true\":{ntp},\"precision\":{nprec:.3},\"recall\":{nrec:.3}}},\"data_only\":{{\"pairs\":{},\"ruled_out_by_stats\":{by_stats},\"kept\":{n_data},\"true\":{dtp},\"precision\":{dprec:.3},\"recall\":{drec:.3},\"s\":{data_s:.2},\"false\":[{}]}},\"false_positives\":[{}],\"missed\":[{}],\"declared_rejected\":[{}],\"keys_root\":\"{keys_root}\",\"per_table\":{{{table_times}}}}}",
+        "{{\"rows\":{},\"tables\":{},\"load_s\":{load_s:.2},\"min_score\":{min_score},\"markers\":{marks:?},\"declared\":{},\"composite_declared\":{},\"proposed\":{n_named},\"kept\":{n_kept},\"true_kept\":{tp},\"precision\":{precision:.3},\"recall\":{recall:.3},\"propose_ms\":{propose_ms:.2},\"rejected\":{why_counts:?},\"names_only\":{{\"proposed\":{n_named},\"true\":{ntp},\"precision\":{nprec:.3},\"recall\":{nrec:.3}}},\"data_only\":{{\"pairs\":{},\"ruled_out_by_stats\":{by_stats},\"kept\":{n_data},\"true\":{dtp},\"precision\":{dprec:.3},\"recall\":{drec:.3},\"s\":{data_s:.2},\"false\":[{}]}},\"false_positives\":[{}],\"missed\":[{}],\"declared_rejected\":[{}],\"keys_root\":\"{keys_root}\",\"per_table\":{{{table_times}}}}}",
         stats.values().map(|s| s.rows).sum::<u64>(),
         tables.len(),
         declared.len(),

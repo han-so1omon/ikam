@@ -3,11 +3,16 @@
 //! the data confirms them.
 //!
 //! - `propose` pairs a child column with a parent column of another table
-//!   when their names say they are one thing: each column's table prefix
-//!   (`ss_`, `i_`) is dropped, a key suffix (`sk`, `id`, `key`) on either
-//!   side must be on both, and the parent's other words must each be in
+//!   when their names say they are one thing. The words that mark a key
+//!   are learned from the tables given (`markers`; no fixed list): the
+//!   last word of a column unique in its table, when columns of two or
+//!   more tables end with it (`sk`, `id` in TPC-DS). Each column's table
+//!   prefix (`ss_`, `i_`) is dropped; a child ending in a key marker
+//!   needs a parent ending in the same one, and a parent ending in one
+//!   takes a child ending in it or in a word that marks no key
+//!   (`customer_fk` for `id`); the parent's other words must each be in
 //!   the child's name, whole or as a prefix of at least three letters
-//!   (`addr` for `address`); a column called only by its suffix stands for
+//!   (`addr` for `address`); a column called only by a marker stands for
 //!   its table's name. With a name embedder (E387's, when its weights are
 //!   present), the cosine of the two names may vouch for a pair instead.
 //! - `stats_check` rejects what the column statistics (E403) and zone maps
@@ -28,12 +33,9 @@
 use std::cell::RefCell;
 use std::collections::{BTreeMap, HashMap, HashSet};
 
-use crate::colstats::{ColumnStats, TableStats, field_value};
+use crate::colstats::{ColumnStats, TableStats, field_value, value_text};
 use crate::join::{Arrangement, Join};
-use crate::{Arg, Db, Error, Id, Node, Repo, Store, Target};
-
-/// Name words that say a column is a key, not what it is the key of.
-const KEY_WORDS: [&str; 3] = ["sk", "id", "key"];
+use crate::{Arg, Db, Edge, Error, Id, Node, Repo, Store, Target, node_key};
 /// A parent is unique when its distinct estimate is at least this share
 /// of its rows (HyperLogLog's error is about 1.6%).
 const UNIQUE_SHARE: f64 = 0.95;
@@ -110,6 +112,22 @@ pub struct Evidence {
     pub join_root: Id,
 }
 
+/// A JSON string: quotes, backslashes and control characters escaped.
+fn json_str(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('"');
+    for ch in s.chars() {
+        match ch {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
+}
+
 impl Evidence {
     pub fn to_json(&self, c: &Candidate) -> String {
         let ranges = match self.ranges {
@@ -117,11 +135,9 @@ impl Evidence {
             None => "null".into(),
         };
         format!(
-            "{{\"child\":\"{}.{}\",\"parent\":\"{}.{}\",\"name_score\":{:?},\"child_rows\":{},\"child_nulls\":{},\"child_distinct_est\":{:.0},\"parent_rows\":{},\"parent_distinct_est\":{:.0},\"ranges\":{ranges},\"contained\":{},\"child_distinct\":{},\"parent_distinct\":{},\"join_rows\":{},\"join_root\":\"{}\"}}",
-            c.child_table,
-            c.child,
-            c.parent_table,
-            c.parent,
+            "{{\"child\":{},\"parent\":{},\"name_score\":{:?},\"child_rows\":{},\"child_nulls\":{},\"child_distinct_est\":{:.0},\"parent_rows\":{},\"parent_distinct_est\":{:.0},\"ranges\":{ranges},\"contained\":{},\"child_distinct\":{},\"parent_distinct\":{},\"join_rows\":{},\"join_root\":\"{}\"}}",
+            json_str(&format!("{}.{}", c.child_table, c.child)),
+            json_str(&format!("{}.{}", c.parent_table, c.parent)),
             self.name_score,
             self.child_rows,
             self.child_nulls,
@@ -166,24 +182,63 @@ fn word_match(a: &str, b: &str) -> bool {
     a == b || (a.len().min(b.len()) >= 3 && (a.starts_with(b) || b.starts_with(a)))
 }
 
+/// A parent is a key when it is in every row, never null, and unique by
+/// its distinct estimate.
+fn is_key(p: &ColumnStats, table: &TableStats) -> bool {
+    p.nulls == 0
+        && p.count >= table.rows
+        && p.distinct.estimate() >= UNIQUE_SHARE * table.rows as f64
+}
+
+/// Words that say what kind of name they end, not which thing it names,
+/// learned from the tables given: the last word of a column that is a key
+/// of its table (`is_key`, its table prefix dropped) when such columns of
+/// at least two tables end with it (`sk`, `id`), and the last word of the
+/// names of at least two tables named by more than one word (`dim`).
+pub fn markers(tables: &[TableInfo]) -> HashSet<String> {
+    let mut keyed: HashMap<String, HashSet<usize>> = HashMap::new();
+    let mut named: HashMap<String, usize> = HashMap::new();
+    for (i, t) in tables.iter().enumerate() {
+        let pre = column_prefix(t.stats.columns.keys().map(String::as_str));
+        for (c, s) in &t.stats.columns {
+            if is_key(s, t.stats)
+                && let Some(w) = words(c.strip_prefix(&pre).unwrap_or(c)).pop()
+            {
+                keyed.entry(w).or_default().insert(i);
+            }
+        }
+        let w = words(&t.name);
+        if w.len() > 1 {
+            *named.entry(w[w.len() - 1].clone()).or_default() += 1;
+        }
+    }
+    let keyed = keyed
+        .into_iter()
+        .filter(|(_, t)| t.len() >= 2)
+        .map(|(w, _)| w);
+    let named = named.into_iter().filter(|(_, n)| *n >= 2).map(|(w, _)| w);
+    keyed.chain(named).collect()
+}
+
 /// How well a child column's name names a parent column (0 to 1): the
-/// share of the parent's words, its key suffix aside, found in the
-/// child's name; 0 when a key suffix is on one side only or differs.
-/// `parent_table` stands in for a parent named only by its suffix.
-pub fn name_score(child: &str, parent: &str, parent_table: &str) -> f64 {
+/// share of the parent's words, its key marker aside, found in the
+/// child's name. 0 when the parent ends in a marker and the child in
+/// another one, or the child ends in a marker the parent does not.
+/// `parent_table` stands in for a parent named only by a marker.
+pub fn name_score(child: &str, parent: &str, parent_table: &str, markers: &HashSet<String>) -> f64 {
     let (c, p) = (words(child), words(parent));
     let (Some(cl), Some(pl)) = (c.last(), p.last()) else {
         return 0.0;
     };
-    let key = |w: &str| KEY_WORDS.contains(&w);
-    if (key(cl) || key(pl)) && cl != pl {
+    let key = |w: &str| markers.contains(w);
+    if key(cl) && cl != pl {
         return 0.0;
     }
     let mut head: Vec<String> = p.iter().filter(|w| !key(w)).cloned().collect();
     if head.is_empty() {
         head = words(parent_table)
             .into_iter()
-            .filter(|w| w != "dim")
+            .filter(|w| !key(w))
             .collect();
     }
     if head.is_empty() {
@@ -222,6 +277,7 @@ pub fn propose(
     min_score: f64,
     embed: Option<&NameEmbedder>,
 ) -> Vec<Candidate> {
+    let marks = markers(tables);
     let stripped: Vec<(String, Vec<(&String, String)>)> = tables
         .iter()
         .map(|t| {
@@ -253,7 +309,7 @@ pub fn propose(
             }
             for (child, cs) in &stripped[ci].1 {
                 for (parent, ps) in &stripped[pi].1 {
-                    let mut score = name_score(cs, ps, &pt.name);
+                    let mut score = name_score(cs, ps, &pt.name, &marks);
                     if let (Some(a), Some(b)) = (vec_of(cs), vec_of(&format!("{} {ps}", pt.name))) {
                         score = score.max(cosine(&a, &b));
                     }
@@ -281,10 +337,7 @@ pub fn propose(
 /// What the statistics alone rule out for a child column `c` and a parent
 /// column `p` of the table `parent` (its zone maps too, if kept).
 pub fn stats_check(c: &ColumnStats, p: &ColumnStats, parent: &TableStats) -> Result<(), Rejected> {
-    if p.nulls > 0 || p.count < parent.rows {
-        return Err(Rejected::NotUnique);
-    }
-    if p.distinct.estimate() < UNIQUE_SHARE * parent.rows as f64 {
+    if !is_key(p, parent) {
         return Err(Rejected::NotUnique);
     }
     let kinds = |s: &ColumnStats| (s.numbers > 0, s.strings > 0, s.bools > 0, s.other > 0);
@@ -339,7 +392,7 @@ fn key_text(v: &[u8], left: bool) -> Option<String> {
         let name = if left { &f.0 } else { &f.1 };
         field_value(v, name)
             .filter(|t| *t != b"null")
-            .map(|t| String::from_utf8_lossy(t).into_owned())
+            .map(|t| String::from_utf8_lossy(&value_text(t)).into_owned())
             .filter(|t| !t.contains('\u{1f}'))
     })
 }
@@ -372,7 +425,7 @@ impl<S: Store> Repo<S> {
                 .map(|(_, v)| {
                     field_value(v, column)
                         .filter(|t| *t != b"null")
-                        .map(<[u8]>::to_vec)
+                        .map(|t| value_text(t).into_owned())
                 })
                 .collect();
             cache.insert(k.clone(), vals);
@@ -462,14 +515,25 @@ impl<S: Store> Repo<S> {
     }
 
     /// Keep confirmed pairs with their evidence: a graph with a node per
-    /// pair (`Candidate::label`), its content the evidence's JSON.
+    /// pair (`Candidate::label`), its content the evidence's JSON, and an
+    /// edge `join_root` to a node `LABEL/join` that holds the join's root,
+    /// so that whatever keeps the graph keeps the join.
     pub fn put_join_keys(&mut self, kept: &[(Candidate, Evidence)]) -> Result<Id, Error> {
-        let mut nodes = Vec::with_capacity(kept.len());
+        let mut nodes = Vec::with_capacity(2 * kept.len());
         for (c, e) in kept {
             let id = self.put_content(e.to_json(c).as_bytes())?.id;
+            let join = format!("{}/join", c.label());
             nodes.push(Node {
                 label: c.label(),
                 target: Target::Content(Arg::Whole(id)),
+                edges: vec![Edge {
+                    to: node_key(&join),
+                    label: "join_root".into(),
+                }],
+            });
+            nodes.push(Node {
+                label: join,
+                target: Target::Object(e.join_root),
                 edges: Vec::new(),
             });
         }
