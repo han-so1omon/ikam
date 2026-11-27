@@ -127,6 +127,26 @@ pub struct Firing {
     /// The work's output, when the firing was made with `net_fire_output`
     /// (E271).
     pub output: Option<Id>,
+    /// The step that made the output, when the firing was made with
+    /// `net_fire_step` (E441): a derivation for a pure transition, a
+    /// recorded step for a command or an agent.
+    pub step: Option<Id>,
+}
+
+/// The work a firing runs (E441, `net_fire_step`).
+#[derive(Clone, Debug)]
+pub enum Step<'a> {
+    /// For a `pure` transition: `func(args)`, applied as a derivation.
+    Pure { func: Id, args: Vec<Arg> },
+    /// For a `cmd` or `agent` transition: a recorded step. `output` is the
+    /// work's bytes when it ran outside the kernel; without it the kernel
+    /// runs `func` (a WASM module, floats pinned).
+    Recorded {
+        func: Id,
+        args: Vec<Arg>,
+        output: Option<&'a [u8]>,
+        check: Option<crate::Check>,
+    },
 }
 
 fn valid_name(s: &str) -> bool {
@@ -452,6 +472,10 @@ fn encode_record(f: &Firing) -> Vec<u8> {
     // keep E269's bytes.
     if let Some(o) = &f.output {
         s += &format!("{o}\n");
+        // A sixth, the step, only with an output (E441).
+        if let Some(st) = &f.step {
+            s += &format!("{st}\n");
+        }
     }
     s.into_bytes()
 }
@@ -460,7 +484,7 @@ fn decode_record(key: &str, bytes: &[u8]) -> Result<Firing, Error> {
     let s = std::str::from_utf8(bytes).map_err(|_| Error::Decode("net firing"))?;
     let l: Vec<&str> = s.lines().collect();
     let id = |s: &str| s.parse::<Id>();
-    if l.len() != 4 && l.len() != 5 {
+    if !(4..=6).contains(&l.len()) {
         return Err(Error::Decode("net firing"));
     }
     Ok(Firing {
@@ -470,6 +494,7 @@ fn decode_record(key: &str, bytes: &[u8]) -> Result<Firing, Error> {
         before: id(l[2])?,
         after: id(l[3])?,
         output: l.get(4).map(|o| id(o)).transpose()?,
+        step: l.get(5).map(|o| id(o)).transpose()?,
     })
 }
 
@@ -841,7 +866,7 @@ impl<S: Store> Repo<S> {
         token: Option<&str>,
         key: &str,
     ) -> Result<(Db, Firing), Error> {
-        self.fire_inner(db, net, transition, token, key, None)
+        self.fire_inner(db, net, transition, token, key, None, None)
     }
 
     /// Fire as `net_fire`, recording the work's output in the same append
@@ -859,7 +884,7 @@ impl<S: Store> Repo<S> {
         key: &str,
         output: &[u8],
     ) -> Result<(Db, Firing), Error> {
-        self.fire_inner(db, net, transition, token, key, Some(output))
+        self.fire_inner(db, net, transition, token, key, Some(output), None)
     }
 
     /// Whether `output` (the work recomputed) matches what the firing under
@@ -876,6 +901,86 @@ impl<S: Store> Repo<S> {
             .map(|(id, _)| id == Id::of_content(output)))
     }
 
+    /// Fire `transition` through an executable step (E441), so a net's work
+    /// and a stored function share one model: a `pure` transition applies
+    /// `func(args)` as a derivation (re-evaluated by fsck and
+    /// [`net_verify_steps`](Repo::net_verify_steps)); a `cmd` or `agent`
+    /// transition records its output as a recorded step (kept, never
+    /// rebuilt; a rerun is a check). A `human` transition runs no step. The
+    /// firing record names the output and the step. A retry with the same
+    /// key and the same step changes nothing.
+    pub fn net_fire_step(
+        &mut self,
+        db: &Db,
+        net: &Net,
+        transition: &str,
+        token: Option<&str>,
+        key: &str,
+        step: Step<'_>,
+    ) -> Result<(Db, Firing), Error> {
+        let t = net
+            .transition(transition)
+            .ok_or_else(|| invalid("transition", transition))?;
+        let (output, record) = match (t.kind, step) {
+            (Kind::Pure, Step::Pure { func, args }) => {
+                let output = self.apply(func, args.clone())?;
+                let d = crate::Derivation { output, func, args };
+                (output, crate::Object::Derivation(d).id())
+            }
+            (
+                Kind::Cmd | Kind::Agent,
+                Step::Recorded {
+                    func,
+                    args,
+                    output,
+                    check,
+                },
+            ) => self.record_step(func, args, output, check, crate::step::Design::Run)?,
+            (kind, _) => {
+                return Err(Error::Exec(format!(
+                    "transition {transition} is {}: no step of that kind",
+                    kind.name()
+                )));
+            }
+        };
+        let bytes = self.read_content(&output)?;
+        self.fire_inner(db, net, transition, token, key, Some(&bytes), Some(record))
+    }
+
+    /// Check every firing made through a step (E441), in log order, by the
+    /// same code that reconstructs files: a pure step is evaluated again
+    /// and must give its output; a recorded step's output must still be
+    /// here as bytes, and a step the kernel can run (a WASM function) is
+    /// rerun and must give the same bits. Returns each firing's key and
+    /// whether it passed.
+    pub fn net_verify_steps(&mut self, db: &Db, net: &str) -> Result<Vec<(String, bool)>, Error> {
+        let mut out = Vec::new();
+        for f in self.net_firings(db, net)? {
+            let (Some(step), Some(output)) = (f.step, f.output) else {
+                continue;
+            };
+            let ok = match self.get(&step)? {
+                crate::Object::Derivation(d) if d.func != crate::func::recorded() => {
+                    let (bytes, _) = self.evaluate(&d.func, &d.args)?;
+                    d.output == output && Id::of_content(&bytes) == output
+                }
+                _ => {
+                    let kept = self.read_content(&output).is_ok();
+                    let runs = self.rerun(&step, None);
+                    kept && match runs {
+                        Ok(r) => r.first == output && r.same,
+                        // Work done outside the kernel: kept is the check.
+                        Err(Error::Exec(_)) => true,
+                        Err(e) => return Err(e),
+                    }
+                }
+            };
+            out.push((f.key, ok));
+        }
+        Ok(out)
+    }
+
+    #[allow(clippy::too_many_arguments)]
     fn fire_inner(
         &mut self,
         db: &Db,
@@ -884,6 +989,7 @@ impl<S: Store> Repo<S> {
         token: Option<&str>,
         key: &str,
         output: Option<&[u8]>,
+        step: Option<Id>,
     ) -> Result<(Db, Firing), Error> {
         if !valid_name(key) {
             return Err(invalid("firing key", key));
@@ -901,7 +1007,11 @@ impl<S: Store> Repo<S> {
                 None => true,
                 Some(o) => f.output == Some(Id::of_content(o)),
             };
-            if f.transition != transition || f.token.as_deref() != token || !same_output {
+            if f.transition != transition
+                || f.token.as_deref() != token
+                || !same_output
+                || f.step != step
+            {
                 return Err(Error::IdempotencyConflict(rec_key));
             }
             return Ok((*db, f));
@@ -910,7 +1020,7 @@ impl<S: Store> Repo<S> {
             .transition(transition)
             .ok_or_else(|| invalid("transition", transition))?;
         if let Some(h) = self.hash_state(db, &net.name)? {
-            return self.fire_sum(db, net, t, token, key, output, h);
+            return self.fire_sum(db, net, t, token, key, output, step, h);
         }
         let before = self.net_marking(db, &net.name)?;
         let after = net
@@ -928,6 +1038,7 @@ impl<S: Store> Repo<S> {
             before: marking_id(&before),
             after: marking_id(&after),
             output,
+            step,
         };
         let mut events = Vec::new();
         let places: std::collections::BTreeSet<&String> =
@@ -985,6 +1096,7 @@ impl<S: Store> Repo<S> {
         token: Option<&str>,
         key: &str,
         output: Option<&[u8]>,
+        step: Option<Id>,
         mut acc: Acc,
     ) -> Result<(Db, Firing), Error> {
         let before = acc.digest();
@@ -1055,6 +1167,7 @@ impl<S: Store> Repo<S> {
             before,
             after,
             output,
+            step,
         };
         let hk = match acc {
             Acc::Sum(_) => format!("{p}hash"),

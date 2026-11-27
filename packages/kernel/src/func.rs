@@ -43,15 +43,43 @@ pub fn ir_block_member() -> Id {
     builtin("ir-block-member/1")
 }
 
+/// A pinned-float step (E441): `pinned_float(module, args...)` runs the
+/// WASM module given as the first argument on the rest with floats on and
+/// every NaN canonical (`wasm::Floats::Pinned`). A pure derivation like any
+/// other: repack may drop its output and rebuild it anywhere.
+pub fn pinned_float() -> Id {
+    builtin("wasm-float/1")
+}
+
+/// A float check (E441): `within_f64(first, now, spec)` compares two
+/// outputs read as little-endian f64 values under a tolerance (`spec`, text
+/// such as `ulp=4 abs=0 rel=1e-12`). Its output is a verdict, one line:
+/// `same`, `within ...` or `outside ...` with the largest ULP, absolute and
+/// relative differences. A pure builtin, so a verdict is a derivation, and
+/// a check is a step in the graph like the steps it checks.
+pub fn within_f64() -> Id {
+    builtin("within-f64/1")
+}
+
+/// Design A of a recorded step (E441, measured against `Run`): a
+/// derivation `recorded(func, head, check args..., args...)` whose output is kept and
+/// never rebuilt. Evaluating it is refused.
+pub fn recorded() -> Id {
+    builtin("recorded/1")
+}
+
 /// Builtins by index, for short derivation records (`abbrev.rs`). Stored
 /// records depend on this order: only append.
-const BUILTINS: [&str; 6] = [
+const BUILTINS: [&str; 9] = [
     "concat/1",
     "deflate-pack/1",
     "fill/1",
     "render/1",
     "ir-member/1",
     "ir-block-member/1",
+    "wasm-float/1",
+    "within-f64/1",
+    "recorded/1",
 ];
 
 pub(crate) fn builtin_index(func: &Id) -> Option<u8> {
@@ -72,12 +100,7 @@ pub fn is_plan(func: &Id) -> bool {
 }
 
 pub fn is_builtin(func: &Id) -> bool {
-    *func == concat()
-        || *func == deflate_pack()
-        || *func == fill()
-        || *func == render()
-        || *func == ir_member()
-        || *func == ir_block_member()
+    builtin_index(func).is_some()
 }
 
 /// Run `func` on `args`: its output and the decode work it took (bytes
@@ -98,6 +121,17 @@ pub fn run(
         return crate::ir::member(args);
     } else if *func == ir_block_member() {
         return crate::ir::block_member(args);
+    } else if *func == pinned_float() {
+        let (module, rest) = args
+            .split_first()
+            .ok_or_else(|| Error::Exec("wasm-float: no module".into()))?;
+        let (out, fuel) = wasm::run_with(module, rest, wasm::Floats::Pinned)?;
+        let work = out.len() + (fuel / wasm::FUEL_PER_WORK) as usize;
+        return Ok((out, work));
+    } else if *func == within_f64() {
+        crate::step::within(args)?
+    } else if *func == recorded() {
+        return Err(Error::Exec("a recorded step is kept, never rebuilt".into()));
     } else {
         let module = module.ok_or_else(|| Error::Exec(format!("{func}: no such function")))?;
         let (out, fuel) = wasm::run(module, args)?;
