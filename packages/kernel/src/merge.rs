@@ -14,6 +14,12 @@
 //!   logged with different bytes on each side. Only the events since the
 //!   fork are read.
 //!
+//! With [`MergeOptions::lines`] (E417, off by default), a file changed on
+//! both sides is merged line by line ([`merge_lines`]): changes to
+//! different lines of the base are both kept, and changes to the same
+//! lines are a [`Conflict::Lines`]. Without it, as before, any file changed
+//! on both sides is a conflict.
+//!
 //! Conflicts are reported and nothing is written: no merge resolves one
 //! silently. Otherwise the result is a commit with both heads as parents,
 //! and the ref moves by compare-and-swap. A merge into an ancestor is a
@@ -24,6 +30,9 @@
 //! best one. Both branches' views must be current (as `db_append` needs).
 
 use std::collections::{BTreeMap, BTreeSet, HashSet, VecDeque};
+use std::ops::Range;
+
+use similar::{Algorithm, DiffOp, capture_diff_slices};
 
 use crate::{Commit, Db, Error, Event, Id, Kind, Object, Op, Repo, Store, TreeEntry};
 
@@ -36,6 +45,20 @@ pub enum Conflict {
     Key(String),
     /// An idempotency key logged on both sides with different bytes.
     Idempotency(String),
+    /// E417 (`MergeOptions::lines`): a file whose two sides changed the
+    /// same lines of the base: each range is base lines (from 0, end
+    /// excluded) both sides changed.
+    Lines {
+        path: String,
+        lines: Vec<Range<usize>>,
+    },
+}
+
+/// How `Repo::merge_with` merges. The default is `Repo::merge`'s.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct MergeOptions {
+    /// E417: merge a file changed on both sides line by line.
+    pub lines: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -51,6 +74,19 @@ pub enum Merged {
 }
 
 type Entry = Option<(Kind, Id)>;
+
+/// What a merge will write once it is known to be clean, children first.
+enum Staged {
+    Content(Vec<u8>),
+    Tree(Object),
+}
+
+/// A merge's findings so far: its conflicts and what it will write.
+#[derive(Default)]
+struct Found {
+    conflicts: Vec<Conflict>,
+    staged: Vec<Staged>,
+}
 
 /// The keys one side's events write: single keys, and `[lo, hi)` spans.
 #[derive(Default)]
@@ -150,6 +186,17 @@ impl<S: Store> Repo<S> {
 
     /// Merge the commit `from` (a ref name or id) into the ref `into`.
     pub fn merge(&mut self, into: &str, from: &str, message: &str) -> Result<Merged, Error> {
+        self.merge_with(into, from, message, MergeOptions::default())
+    }
+
+    /// `merge` with options (E417).
+    pub fn merge_with(
+        &mut self,
+        into: &str,
+        from: &str,
+        message: &str,
+        opts: MergeOptions,
+    ) -> Result<Merged, Error> {
         let ours = self.resolve(into)?;
         let theirs = self.resolve(from)?;
         let base = self.merge_base(ours, theirs)?;
@@ -160,7 +207,6 @@ impl<S: Store> Repo<S> {
             self.store.set_ref(into, Some(ours), theirs)?;
             return Ok(Merged::FastForward(theirs));
         }
-        let mut conflicts = Vec::new();
         let tree = |r: &Self, c: Option<Id>| -> Result<Entry, Error> {
             match c {
                 Some(c) => match r.get(&c)? {
@@ -175,7 +221,10 @@ impl<S: Store> Repo<S> {
             tree(self, Some(ours))?,
             tree(self, Some(theirs))?,
         );
-        let files = self.merge_entry("", b, o, t, &mut conflicts)?;
+        // Merged trees and line-merged file contents wait here until the
+        // merge is known to be clean, so a refused merge stores nothing.
+        let mut found = Found::default();
+        let files = self.merge_entry("", b, o, t, opts, &mut found)?;
         let empty = |r: &mut Self| r.db_empty();
         let db_of = |r: &mut Self, c: Option<Id>| match c {
             Some(c) => r.db_at(&c),
@@ -186,9 +235,19 @@ impl<S: Store> Repo<S> {
             db_of(self, Some(ours))?,
             db_of(self, Some(theirs))?,
         );
-        let db = self.merge_db(&bd, &od, &td, &mut conflicts)?;
-        if !conflicts.is_empty() {
-            return Ok(Merged::Conflicts(conflicts));
+        let db = self.merge_db(&bd, &od, &td, &mut found.conflicts)?;
+        if !found.conflicts.is_empty() {
+            return Ok(Merged::Conflicts(found.conflicts));
+        }
+        for s in &found.staged {
+            match s {
+                Staged::Content(bytes) => {
+                    self.put_content(bytes)?;
+                }
+                Staged::Tree(obj) => {
+                    self.put(obj)?;
+                }
+            }
         }
         let mut entries = match files {
             Some((Kind::Tree, id)) => match self.get(&id)? {
@@ -220,7 +279,8 @@ impl<S: Store> Repo<S> {
         b: Entry,
         o: Entry,
         t: Entry,
-        conflicts: &mut Vec<Conflict>,
+        opts: MergeOptions,
+        found: &mut Found,
     ) -> Result<Entry, Error> {
         if o == t || b == t {
             return Ok(o);
@@ -228,9 +288,36 @@ impl<S: Store> Repo<S> {
         if b == o {
             return Ok(t);
         }
+        if let (true, Some((Kind::File, bi)), Some((Kind::File, oi)), Some((Kind::File, ti))) =
+            (opts.lines, b, o, t)
+        {
+            let (bb, ob, tb) = (
+                self.read_content(&bi)?,
+                self.read_content(&oi)?,
+                self.read_content(&ti)?,
+            );
+            return match merge_lines(&bb, &ob, &tb) {
+                Some(Ok(bytes)) => {
+                    let id = Id::of_content(&bytes);
+                    found.staged.push(Staged::Content(bytes));
+                    Ok(Some((Kind::File, id)))
+                }
+                Some(Err(lines)) => {
+                    found.conflicts.push(Conflict::Lines {
+                        path: path.into(),
+                        lines,
+                    });
+                    Ok(o)
+                }
+                None => {
+                    found.conflicts.push(Conflict::Path(path.into()));
+                    Ok(o)
+                }
+            };
+        }
         let dir = |e: &Entry| matches!(e, Some((Kind::Tree, _)));
         if !(dir(&o) && dir(&t) && (b.is_none() || dir(&b))) {
-            conflicts.push(Conflict::Path(path.into()));
+            found.conflicts.push(Conflict::Path(path.into()));
             return Ok(o);
         }
         let load = |r: &Self, e: &Entry| -> Result<BTreeMap<String, (Kind, Id)>, Error> {
@@ -256,7 +343,7 @@ impl<S: Store> Repo<S> {
             };
             let get = |m: &BTreeMap<String, (Kind, Id)>| m.get(name).copied();
             if let Some((kind, id)) =
-                self.merge_entry(&sub, get(&bm), get(&om), get(&tm), conflicts)?
+                self.merge_entry(&sub, get(&bm), get(&om), get(&tm), opts, found)?
             {
                 out.push(TreeEntry {
                     name: name.clone(),
@@ -265,7 +352,10 @@ impl<S: Store> Repo<S> {
                 });
             }
         }
-        Ok(Some((Kind::Tree, self.put(&Object::tree(out)?)?)))
+        let obj = Object::tree(out)?;
+        let id = obj.id();
+        found.staged.push(Staged::Tree(obj));
+        Ok(Some((Kind::Tree, id)))
     }
 
     /// Append `theirs`' events since `base` to `ours`, or report the keys
@@ -290,7 +380,6 @@ impl<S: Store> Repo<S> {
             .map(|e| (e.idempotency_key.as_str(), e.encode()))
             .collect();
         let touched = Touched::new(&mine);
-        let before = conflicts.len();
         for e in &other {
             match idem.get(e.idempotency_key.as_str()) {
                 Some(bytes) if *bytes == e.encode() => continue,
@@ -299,9 +388,128 @@ impl<S: Store> Repo<S> {
                 None => {}
             }
         }
-        if conflicts.len() > before {
+        // Any conflict, here or in the files, refuses the merge: append
+        // nothing then.
+        if !conflicts.is_empty() {
             return Ok(*ours);
         }
         self.db_append(ours, &other)
     }
+}
+
+/// `bytes` as lines, each with its `\n` (the last may have none).
+fn lines(bytes: &[u8]) -> Vec<&[u8]> {
+    bytes.split_inclusive(|&b| b == b'\n').collect()
+}
+
+/// One side's change to the base: base lines `base` replaced by `new`.
+struct Hunk<'a> {
+    base: Range<usize>,
+    new: &'a [&'a [u8]],
+}
+
+/// The changes from `base` to `side`, in order, each between equal runs
+/// (so two hunks of one side never touch).
+fn hunks<'a>(base: &[&[u8]], side: &'a [&'a [u8]]) -> Vec<Hunk<'a>> {
+    let mut out = Vec::new();
+    let (mut b, mut s) = (0, 0);
+    let mut push = |b0: usize, b1: usize, s0: usize, s1: usize| {
+        if b0 < b1 || s0 < s1 {
+            out.push(Hunk {
+                base: b0..b1,
+                new: &side[s0..s1],
+            });
+        }
+    };
+    for op in capture_diff_slices(Algorithm::Myers, base, side) {
+        if let DiffOp::Equal {
+            old_index,
+            new_index,
+            len,
+        } = op
+        {
+            push(b, old_index, s, new_index);
+            (b, s) = (old_index + len, new_index + len);
+        }
+    }
+    push(b, base.len(), s, side.len());
+    out
+}
+
+/// Do two changes from different sides touch the same base lines? Two
+/// replacements clash when their ranges overlap; an insertion clashes with
+/// a replacement it falls strictly inside, and with another insertion at
+/// the same place (their order would be a guess). Changes to adjacent
+/// lines do not clash.
+fn clash(a: &Range<usize>, b: &Range<usize>) -> bool {
+    match (a.is_empty(), b.is_empty()) {
+        (false, false) => a.start < b.end && b.start < a.end,
+        (true, false) => b.start < a.start && a.start < b.end,
+        (false, true) => a.start < b.start && b.start < a.end,
+        (true, true) => a.start == b.start,
+    }
+}
+
+/// E417: a three-way merge of one file by lines. `Some(Ok(bytes))` holds
+/// both sides' changes to `base` applied together; `Some(Err(ranges))`
+/// names the base lines both sides changed differently (a change made
+/// identically on both sides is kept once). `None`: a side holds a NUL
+/// byte, so it is not treated as text.
+pub fn merge_lines(
+    base: &[u8],
+    ours: &[u8],
+    theirs: &[u8],
+) -> Option<Result<Vec<u8>, Vec<Range<usize>>>> {
+    if [base, ours, theirs].iter().any(|b| b.contains(&0)) {
+        return None;
+    }
+    let (bl, ol, tl) = (lines(base), lines(ours), lines(theirs));
+    let (ho, ht) = (hunks(&bl, &ol), hunks(&bl, &tl));
+    let mut clashes: Vec<Range<usize>> = Vec::new();
+    let mut same = vec![false; ht.len()];
+    let mut from = 0;
+    for a in &ho {
+        while from < ht.len() && ht[from].base.end < a.base.start {
+            from += 1;
+        }
+        for (j, b) in ht.iter().enumerate().skip(from) {
+            if b.base.start > a.base.end {
+                break;
+            }
+            if a.base == b.base && a.new == b.new {
+                same[j] = true;
+            } else if clash(&a.base, &b.base) {
+                clashes.push(a.base.start.min(b.base.start)..a.base.end.max(b.base.end));
+            }
+        }
+    }
+    if !clashes.is_empty() {
+        clashes.sort_by_key(|r| (r.start, r.end));
+        let mut joined: Vec<Range<usize>> = Vec::new();
+        for r in clashes {
+            match joined.last_mut() {
+                Some(last) if r.start <= last.end => last.end = last.end.max(r.end),
+                _ => joined.push(r),
+            }
+        }
+        return Some(Err(joined));
+    }
+    let mut all: Vec<&Hunk> = ho.iter().collect();
+    all.extend(ht.iter().zip(&same).filter(|(_, s)| !**s).map(|(h, _)| h));
+    all.sort_by_key(|h| (h.base.start, h.base.end));
+    let mut out = Vec::with_capacity(ours.len().max(theirs.len()));
+    let mut at = 0;
+    for h in all {
+        for l in &bl[at..h.base.start] {
+            out.extend_from_slice(l);
+        }
+        for l in h.new {
+            out.extend_from_slice(l);
+        }
+        at = h.base.end;
+    }
+    for l in &bl[at..] {
+        out.extend_from_slice(l);
+    }
+    Some(Ok(out))
 }

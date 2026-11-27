@@ -33,7 +33,7 @@
 
 use std::ops::Range;
 
-use crate::merge::Merged;
+use crate::merge::{MergeOptions, Merged};
 use crate::worktree::split_path;
 use crate::{Db, Edit, Error, Event, FileGrant, Id, Kind, Node, Object, Repo, Store};
 
@@ -662,6 +662,20 @@ pub fn import_share<S: Store, T: Store>(
     into: &str,
     message: &str,
 ) -> Result<Merged, Refused> {
+    import_share_with(src, share, dst, into, message, MergeOptions::default())
+}
+
+/// `import_share` with merge options (E417: `lines` merges an imported
+/// file both sides changed line by line, so edits to different lines of a
+/// section or file are both kept).
+pub fn import_share_with<S: Store, T: Store>(
+    src: &mut Repo<S>,
+    share: &Share,
+    dst: &mut Repo<T>,
+    into: &str,
+    message: &str,
+    opts: MergeOptions,
+) -> Result<Merged, Refused> {
     if share.right != Right::Merge {
         return Err(Refused::Right);
     }
@@ -763,7 +777,7 @@ pub fn import_share<S: Store, T: Store>(
         dst.branch(into, head)?;
         return Ok(Merged::FastForward(head));
     }
-    Ok(dst.merge(into, &import, message)?)
+    Ok(dst.merge_with(into, &import, message, opts)?)
 }
 
 /// Whether `path` lands in the top-level `db` entry, which a commit keeps

@@ -3,6 +3,8 @@
 //! path written on both sides differently is a conflict and nothing is
 //! written; the merged views equal a rebuild of the merged log.
 
+#![allow(clippy::single_range_in_vec_init)] // a conflict on one range of lines is the usual case
+
 use ikam_kernel::merge::{Conflict, Merged};
 use ikam_kernel::{Db, Edit, Event, Id, MemStore, Object, Repo};
 
@@ -198,4 +200,200 @@ fn ancestors_fast_forward_or_change_nothing() {
         Merged::FastForward(side)
     );
     assert_eq!(repo.merge("side", "main", "m").unwrap(), Merged::UpToDate);
+}
+
+// E417: line-level merge, an option (`MergeOptions::lines`).
+
+use ikam_kernel::merge::{MergeOptions, merge_lines};
+
+const LINES: MergeOptions = MergeOptions { lines: true };
+
+fn text(lines: &[&str]) -> String {
+    lines.iter().map(|l| format!("{l}\n")).collect()
+}
+
+/// `main` and `side` forked at a commit holding `f.txt` = `base`.
+fn forked_file(base: &str) -> Repo<MemStore> {
+    let mut repo = Repo::new(MemStore::default());
+    put(&mut repo, "main", &[("f.txt", base)]);
+    let c = repo.resolve("main").unwrap();
+    repo.branch("side", c).unwrap();
+    repo
+}
+
+#[test]
+fn line_merge_keeps_edits_to_different_lines() {
+    let base = text(&["one", "two", "three", "four", "five", "six"]);
+    let mut repo = forked_file(&base);
+    put(
+        &mut repo,
+        "main",
+        &[(
+            "f.txt",
+            &text(&["ONE", "two", "three", "four", "five", "six"]),
+        )],
+    );
+    put(
+        &mut repo,
+        "side",
+        &[(
+            "f.txt",
+            &text(&["one", "two", "three", "four", "FIVE", "six", "seven"]),
+        )],
+    );
+    // Off (the default): any file changed on both sides is a conflict.
+    let head = repo.resolve("main").unwrap();
+    assert_eq!(
+        repo.merge("main", "side", "m").unwrap(),
+        Merged::Conflicts(vec![Conflict::Path("f.txt".into())])
+    );
+    assert_eq!(repo.resolve("main").unwrap(), head);
+    // On: both edits are kept.
+    assert!(matches!(
+        repo.merge_with("main", "side", "m", LINES).unwrap(),
+        Merged::Commit(_)
+    ));
+    assert_eq!(
+        read(&repo, "main", "f.txt").unwrap(),
+        text(&["ONE", "two", "three", "four", "FIVE", "six", "seven"]).as_bytes()
+    );
+    assert!(repo.fsck().unwrap().is_empty());
+}
+
+#[test]
+fn line_merge_refuses_edits_to_the_same_lines() {
+    let base = text(&["one", "two", "three", "four"]);
+    let mut repo = forked_file(&base);
+    put(
+        &mut repo,
+        "main",
+        &[("f.txt", &text(&["one", "TWO", "three", "four"]))],
+    );
+    put(
+        &mut repo,
+        "side",
+        &[("f.txt", &text(&["one", "2", "three", "4"]))],
+    );
+    let head = repo.resolve("main").unwrap();
+    assert_eq!(
+        repo.merge_with("main", "side", "m", LINES).unwrap(),
+        Merged::Conflicts(vec![Conflict::Lines {
+            path: "f.txt".into(),
+            lines: vec![1..2],
+        }])
+    );
+    assert_eq!(repo.resolve("main").unwrap(), head);
+}
+
+/// A file that merges cleanly is not stored when another file conflicts:
+/// a refused merge writes none of its merged contents.
+#[test]
+fn line_merge_stores_nothing_when_another_file_conflicts() {
+    let base = text(&["one", "two", "three", "four"]);
+    let mut repo = Repo::new(MemStore::default());
+    put(&mut repo, "main", &[("f.txt", &base), ("g.txt", &base)]);
+    let c = repo.resolve("main").unwrap();
+    repo.branch("side", c).unwrap();
+    put(
+        &mut repo,
+        "main",
+        &[
+            ("f.txt", &text(&["ONE", "two", "three", "four"])),
+            ("g.txt", &text(&["one", "TWO", "three", "four"])),
+        ],
+    );
+    put(
+        &mut repo,
+        "side",
+        &[
+            ("f.txt", &text(&["one", "two", "three", "FOUR"])),
+            ("g.txt", &text(&["one", "2", "three", "four"])),
+        ],
+    );
+    let merged_f = text(&["ONE", "two", "three", "FOUR"]);
+    let id = Id::of_content(merged_f.as_bytes());
+    // The empty database object is the one thing a merge may write first
+    // (once per store); write it now so only the merge's own bytes count.
+    repo.db_empty().unwrap();
+    let written = repo.bytes_written;
+    assert!(matches!(
+        repo.merge_with("main", "side", "m", LINES).unwrap(),
+        Merged::Conflicts(_)
+    ));
+    assert!(!repo.has_content(&id).unwrap());
+    assert_eq!(repo.bytes_written, written);
+}
+
+#[test]
+fn merge_lines_cases() {
+    let b = text(&["a", "b", "c", "d"]);
+    let ok =
+        |o: &[&str], t: &[&str]| merge_lines(b.as_bytes(), text(o).as_bytes(), text(t).as_bytes());
+    let clean = |o: &[&str], t: &[&str], want: &[&str]| {
+        assert_eq!(ok(o, t), Some(Ok(text(want).into_bytes())), "{o:?} {t:?}");
+    };
+    // Adjacent lines changed on each side merge.
+    clean(
+        &["A", "b", "c", "d"],
+        &["a", "B", "c", "d"],
+        &["A", "B", "c", "d"],
+    );
+    // The same change on both sides is kept once.
+    clean(
+        &["a", "X", "c", "d"],
+        &["a", "X", "c", "D"],
+        &["a", "X", "c", "D"],
+    );
+    // A deletion on one side, an edit elsewhere on the other.
+    clean(&["a", "c", "d"], &["a", "b", "c", "D"], &["a", "c", "D"]);
+    // An insertion beside a line the other side changed.
+    clean(
+        &["a", "new", "b", "c", "d"],
+        &["a", "B", "c", "d"],
+        &["a", "new", "B", "c", "d"],
+    );
+    // Insertions at the same place: a guess at their order, so refused.
+    assert_eq!(
+        ok(&["a", "x", "b", "c", "d"], &["a", "y", "b", "c", "d"]),
+        Some(Err(vec![1..1]))
+    );
+    // An insertion inside a range the other side replaced.
+    assert_eq!(
+        ok(&["a", "b", "x", "c", "d"], &["a", "B", "C", "d"]),
+        Some(Err(vec![1..3]))
+    );
+    // A deleted line the other side changed.
+    assert_eq!(
+        ok(&["a", "c", "d"], &["a", "B", "c", "d"]),
+        Some(Err(vec![1..2]))
+    );
+    // A last line without a newline.
+    assert_eq!(
+        merge_lines(b"a\nb\nc", b"A\nb\nc", b"a\nb\nC"),
+        Some(Ok(b"A\nb\nC".to_vec()))
+    );
+    // Bytes with a NUL are not text.
+    assert_eq!(merge_lines(b"a\0", b"b\0", b"c\0"), None);
+}
+
+#[test]
+fn line_merge_leaves_binary_and_added_files_as_conflicts() {
+    let mut repo = forked_file("x\0y\n");
+    put(
+        &mut repo,
+        "main",
+        &[("f.txt", "x\0Y\n"), ("n.txt", "ours\n")],
+    );
+    put(
+        &mut repo,
+        "side",
+        &[("f.txt", "X\0y\n"), ("n.txt", "theirs\n")],
+    );
+    assert_eq!(
+        repo.merge_with("main", "side", "m", LINES).unwrap(),
+        Merged::Conflicts(vec![
+            Conflict::Path("f.txt".into()),
+            Conflict::Path("n.txt".into())
+        ])
+    );
 }
