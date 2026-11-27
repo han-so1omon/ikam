@@ -41,6 +41,23 @@
 //! the others wait their turn in order, for up to `heavy-wait SECS` (60 by
 //! default), then get 503 with `Retry-After`. Without the line, as before,
 //! every owner's job runs at once.
+//!
+//! Busy projects' commits (E418): one thread makes every project's timed
+//! commit, in turn, and waits for each project's lock, so while one
+//! project's repack holds its lock, no other project's edits are committed.
+//! `skip-busy-commits` (off) passes over a project whose lock is held and
+//! comes back to it on the next round (a quarter second later); when the
+//! host stops, it still waits for every project.
+//!
+//! Memory (E418): each project caches every tree version it reads, so a
+//! host's memory grows with the number of edits, not with the files kept.
+//! `tree-cache ENTRIES` (off) empties a project's tree cache when it would
+//! hold more than ENTRIES entries.
+//!
+//! `heavy-nice N` (E418, off, Linux): a maintenance job runs on a thread of
+//! its own at nice N (1 to 19), and the threads a repack starts inherit it,
+//! so the scheduler serves other projects' reads first while it runs. The
+//! job takes longer when the machine has other work.
 
 use std::collections::{BTreeMap, VecDeque};
 use std::panic::{AssertUnwindSafe, catch_unwind};
@@ -85,6 +102,12 @@ pub struct Config {
     pub projects: Vec<ProjectConfig>,
     /// E362: heavy jobs at once across the host, and how long one waits.
     pub heavy: Option<(usize, Duration)>,
+    /// E418: the commit round passes over a project whose lock is held.
+    pub skip_busy_commits: bool,
+    /// E418: tree entries each project may cache.
+    pub tree_cache: Option<usize>,
+    /// E418: the nice value maintenance jobs run at.
+    pub heavy_nice: Option<i32>,
 }
 
 fn valid_name(s: &str) -> bool {
@@ -103,6 +126,9 @@ impl Config {
         let mut port = 8750;
         let mut projects: Vec<ProjectConfig> = Vec::new();
         let (mut heavy_jobs, mut heavy_wait) = (None, Duration::from_secs(60));
+        let mut skip_busy_commits = false;
+        let mut tree_cache = None;
+        let mut heavy_nice = None;
         for (n, line) in text.lines().enumerate() {
             let line = line.split('#').next().unwrap_or("").trim();
             if line.is_empty() {
@@ -119,6 +145,17 @@ impl Config {
                 ["heavy-jobs", n] => match n.parse() {
                     Ok(n) if n > 0 => heavy_jobs = Some(n),
                     _ => return Err(bad("heavy-jobs N, at least 1")),
+                },
+                ["skip-busy-commits"] => skip_busy_commits = true,
+                ["heavy-nice", n] => match n.parse() {
+                    Ok(n) if (1..=19).contains(&n) && cfg!(target_os = "linux") => {
+                        heavy_nice = Some(n)
+                    }
+                    _ => return Err(bad("heavy-nice N, 1 to 19 (Linux only)")),
+                },
+                ["tree-cache", n] => match n.parse() {
+                    Ok(n) if n > 0 => tree_cache = Some(n),
+                    _ => return Err(bad("tree-cache ENTRIES, at least 1")),
                 },
                 ["heavy-wait", secs] => match secs.parse() {
                     Ok(s) => heavy_wait = Duration::from_secs(s),
@@ -218,6 +255,9 @@ impl Config {
             port,
             projects,
             heavy: heavy_jobs.map(|n| (n, heavy_wait)),
+            skip_busy_commits,
+            tree_cache,
+            heavy_nice,
         })
     }
 }
@@ -253,6 +293,8 @@ pub struct Host {
     pub projects: BTreeMap<String, Project>,
     port: u16,
     heavy: Option<Heavy>,
+    skip_busy_commits: bool,
+    heavy_nice: Option<i32>,
 }
 
 /// E362: at most `max` heavy jobs at once across the host's projects; the
@@ -323,6 +365,20 @@ impl Heavy {
     }
 }
 
+/// Set the calling thread's nice value (Linux: nice is per thread, and new
+/// threads inherit it). Best effort: a failure leaves the thread as it was.
+#[cfg(target_os = "linux")]
+fn set_nice(n: i32) {
+    // SAFETY: plain system calls on the calling thread's own id.
+    unsafe {
+        let tid = libc::syscall(libc::SYS_gettid) as libc::id_t;
+        libc::setpriority(libc::PRIO_PROCESS, tid, n);
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn set_nice(_: i32) {}
+
 /// The project's share key, kept in `STORE/share.key`, made on first use.
 fn share_key(store: &std::path::Path) -> Result<[u8; 32], String> {
     let path = store.join("share.key");
@@ -375,6 +431,7 @@ impl Host {
                 ));
             }
             l.max_store = p.max_store;
+            l.tree_cache_max = config.tree_cache;
             l.index_all(false)?;
             let key = share_key(&p.store)?;
             let users = p
@@ -411,7 +468,34 @@ impl Host {
             projects,
             port: config.port,
             heavy: config.heavy.map(|(n, wait)| Heavy::new(n, wait)),
+            skip_busy_commits: config.skip_busy_commits,
+            heavy_nice: config.heavy_nice,
         })
+    }
+
+    /// One round of timed commits over every project (`now` when stopping:
+    /// commit whatever is pending). True if a commit failed. With
+    /// `skip-busy-commits` (E418), a project whose lock is held is passed
+    /// over unless `now`; the next round tries it again.
+    pub fn commit_round(&self, now: bool) -> bool {
+        let mut failed = false;
+        for p in self.projects.values() {
+            let l = if self.skip_busy_commits && !now {
+                match p.live.try_lock() {
+                    Ok(l) => Ok(l),
+                    Err(std::sync::TryLockError::WouldBlock) => continue,
+                    Err(std::sync::TryLockError::Poisoned(e)) => Err(e),
+                }
+            } else {
+                p.live.lock()
+            };
+            let Ok(mut l) = l else { continue };
+            if let Err(e) = l.flush(now) {
+                say!("{} {}: commit failed: {e}", live::stamp(), p.name);
+                failed = true;
+            }
+        }
+        failed
     }
 
     /// The project a Host header names.
@@ -518,6 +602,19 @@ impl Host {
         // E360: promoting a draft writes the project's main ref, as a merge does.
         if req.path == "/api/tool/draft_promote" && role < Role::Owner {
             return Response::text(403, "the project's owner promotes drafts");
+        }
+        if let (Some(n), true) = (self.heavy_nice, admin) {
+            // E418: on a thread of its own, which takes the nice value and
+            // passes it to the threads the job starts, and ends with it (an
+            // unprivileged thread cannot lower its nice value again).
+            return std::thread::scope(|s| {
+                s.spawn(|| {
+                    set_nice(n);
+                    ui::handle(&p.live, req)
+                })
+                .join()
+                .unwrap_or_else(|e| std::panic::resume_unwind(e))
+            });
         }
         if req.path == dav::PREFIX || req.path.starts_with("/dav/") {
             dav::handle(&mut p.live.lock().unwrap(), req)
@@ -857,14 +954,7 @@ pub fn host_cmd(args: &[String]) -> Result<(), String> {
             loop {
                 std::thread::sleep(Duration::from_millis(250));
                 let stopping = auth::stopping();
-                let mut failed = false;
-                for p in host.projects.values() {
-                    let Ok(mut l) = p.live.lock() else { continue };
-                    if let Err(e) = l.flush(stopping) {
-                        say!("{} {}: commit failed: {e}", live::stamp(), p.name);
-                        failed = true;
-                    }
-                }
+                let failed = host.commit_round(stopping);
                 if stopping {
                     say!("{} stopped ({})", live::stamp(), auth::stop_signal());
                     std::process::exit(failed as i32);
@@ -1151,6 +1241,140 @@ mod tests {
             401
         );
         assert_eq!(st(req("GET", "a.localhost", OA, "/", b"")), 200);
+        done(dirs);
+    }
+
+    #[test]
+    fn skip_busy_commits_commits_the_others_while_one_project_is_busy() {
+        // E418: project a's lock is held (as by a long repack); b's pending
+        // edit is committed in the same round with the option, and still
+        // when the host stops.
+        let (hst, dirs) = host("busy");
+        let mut text = String::from("skip-busy-commits\n");
+        for (p, d) in ["a", "b"].iter().zip(&dirs) {
+            text += &format!("project {p} {}\n", d.display());
+            text += &format!("user {p} owner {}\n", user(&format!("{p}-owner"), "pw"));
+        }
+        drop(hst);
+        assert!(
+            !Config::parse(&text.replace("skip-busy-commits\n", ""))
+                .unwrap()
+                .skip_busy_commits
+        );
+        let h = Arc::new(Host::open(Config::parse(&text).unwrap()).unwrap());
+        let edit = |p: &str, path: &str| {
+            let mut l = h.projects[p].live.lock().unwrap();
+            l.commit_after = Duration::ZERO;
+            l.apply(vec![live::Op::Put(path.into(), b"x\n".to_vec())])
+                .unwrap();
+            l.head()
+        };
+        let (a0, b0) = (edit("a", "one.md"), edit("b", "one.md"));
+        let (hold, release) = std::sync::mpsc::channel::<()>();
+        let (held, is_held) = std::sync::mpsc::channel::<()>();
+        let h2 = h.clone();
+        let busy = std::thread::spawn(move || {
+            let _l = h2.projects["a"].live.lock().unwrap();
+            held.send(()).unwrap();
+            release.recv().unwrap();
+        });
+        is_held.recv().unwrap();
+        let t = std::time::Instant::now();
+        assert!(!h.commit_round(false));
+        assert!(
+            t.elapsed() < Duration::from_secs(5),
+            "the round waited for a"
+        );
+        assert_ne!(
+            h.projects["b"].live.lock().unwrap().head(),
+            b0,
+            "b committed"
+        );
+        hold.send(()).unwrap();
+        busy.join().unwrap();
+        assert_eq!(
+            h.projects["a"].live.lock().unwrap().head(),
+            a0,
+            "a was passed over"
+        );
+        assert!(!h.commit_round(false));
+        assert_ne!(
+            h.projects["a"].live.lock().unwrap().head(),
+            a0,
+            "a on the next round"
+        );
+        // Stopping waits for a busy project.
+        let a1 = edit("a", "two.md");
+        let (hold, release) = std::sync::mpsc::channel::<()>();
+        let h2 = h.clone();
+        let (held, is_held) = std::sync::mpsc::channel::<()>();
+        let busy = std::thread::spawn(move || {
+            let _l = h2.projects["a"].live.lock().unwrap();
+            held.send(()).unwrap();
+            release.recv().unwrap();
+            std::thread::sleep(Duration::from_millis(100));
+        });
+        is_held.recv().unwrap();
+        hold.send(()).unwrap();
+        assert!(!h.commit_round(true));
+        assert_ne!(
+            h.projects["a"].live.lock().unwrap().head(),
+            a1,
+            "a committed at stop"
+        );
+        busy.join().unwrap();
+        drop(h);
+        done(dirs);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn heavy_nice_runs_maintenance_niced_and_leaves_the_caller_as_it_was() {
+        // E418: the job's thread is niced; the thread that served the
+        // request is not.
+        fn nice() -> i32 {
+            // SAFETY: reads the calling thread's own nice value.
+            unsafe {
+                let tid = libc::syscall(libc::SYS_gettid) as libc::id_t;
+                libc::getpriority(libc::PRIO_PROCESS, tid)
+            }
+        }
+        let before = nice();
+        assert_eq!(
+            std::thread::spawn(move || {
+                set_nice(before + 7);
+                let inner = std::thread::spawn(nice).join().unwrap();
+                (nice(), inner)
+            })
+            .join()
+            .unwrap(),
+            (before + 7, before + 7),
+            "a niced thread's own threads inherit it"
+        );
+        let (hst, dirs) = host("nice");
+        let mut text = String::from("heavy-nice 10\n");
+        for (p, d) in ["a", "b"].iter().zip(&dirs) {
+            text += &format!("project {p} {}\n", d.display());
+            text += &format!("user {p} owner {}\n", user(&format!("{p}-owner"), "pw"));
+        }
+        drop(hst);
+        for bad in ["heavy-nice 0\n", "heavy-nice 20\n", "heavy-nice x\n"] {
+            assert!(
+                Config::parse(&text.replace("heavy-nice 10\n", bad)).is_err(),
+                "{bad}"
+            );
+        }
+        let h = Host::open(Config::parse(&text).unwrap()).unwrap();
+        for path in ["/api/fsck", "/api/gc", "/api/repack"] {
+            let r = h.handle(req("POST", "a.localhost", OA, path, b""));
+            assert_eq!(r.status, 200, "{path}");
+        }
+        assert_eq!(nice(), before, "the serving thread keeps its nice value");
+        assert_eq!(
+            h.handle(req("GET", "a.localhost", OA, "/", b"")).status,
+            200
+        );
+        drop(h);
         done(dirs);
     }
 

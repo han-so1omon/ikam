@@ -82,6 +82,11 @@ pub struct Live {
     /// `flush(false)` leaves them alone. Cleared by a commit.
     pub hold_until: Option<Instant>,
     trees: HashMap<Id, Arc<Vec<TreeEntry>>>,
+    /// Entries held in `trees`, and (E418, off) how many it may hold
+    /// before it is emptied: every edit makes a new root tree, and each
+    /// version read stays cached otherwise, so memory grows with edits.
+    tree_entries: usize,
+    pub tree_cache_max: Option<usize>,
     sizes: HashMap<Id, u64>,
     sizes_file: Option<std::fs::File>,
     bytes: VecDeque<(Id, Arc<Vec<u8>>)>,
@@ -192,6 +197,8 @@ impl Live {
             commit_after: Duration::from_millis(1500),
             hold_until: None,
             trees: HashMap::new(),
+            tree_entries: 0,
+            tree_cache_max: None,
             sizes,
             sizes_file,
             bytes: VecDeque::new(),
@@ -335,6 +342,17 @@ impl Live {
             return Err("not a tree".into());
         };
         let e = Arc::new(entries);
+        if let Some(max) = self.tree_cache_max {
+            // A tree larger than the whole cap is read, never kept.
+            if e.len() > max {
+                return Ok(e);
+            }
+            if self.tree_entries + e.len() > max {
+                self.trees.clear();
+                self.tree_entries = 0;
+            }
+            self.tree_entries += e.len();
+        }
         self.trees.insert(*tree, e.clone());
         Ok(e)
     }
@@ -1219,6 +1237,38 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         let l = Live::open(dir.to_str().unwrap(), "main").unwrap();
         (dir, l)
+    }
+
+    /// E418: with `tree_cache_max`, the tree cache stays under its bound
+    /// through many edits, even below one directory's size (`d` reaches 40
+    /// entries), and every file still reads back; without it, every root
+    /// tree version stays cached.
+    #[test]
+    fn tree_cache_max_bounds_the_cached_trees() {
+        for max in [None, Some(50), Some(10)] {
+            let (dir, mut l) = store(&format!("trees-{}", max.unwrap_or(0)));
+            l.tree_cache_max = max;
+            for i in 0..40 {
+                let body = format!("file {i}\n").into_bytes();
+                l.apply(vec![Op::Put(format!("d/f{i:02}.md"), body)])
+                    .unwrap();
+            }
+            l.flush(true).unwrap();
+            let cached: usize = l.trees.values().map(|e| e.len()).sum();
+            match max {
+                Some(m) => assert!(cached <= m && l.tree_entries <= m, "{cached}"),
+                None => assert!(cached > 400, "{cached}"),
+            }
+            for i in 0..40 {
+                let Some((Kind::File, id)) = l.stat(&format!("d/f{i:02}.md")).unwrap() else {
+                    panic!("f{i:02} missing")
+                };
+                assert_eq!(*l.read(&id).unwrap(), format!("file {i}\n").into_bytes());
+            }
+            assert_eq!(l.files.len(), 40);
+            drop(l);
+            let _ = std::fs::remove_dir_all(dir);
+        }
     }
 
     /// Edits between commits each store a working tree, and a file written
