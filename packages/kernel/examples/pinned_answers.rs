@@ -126,7 +126,7 @@ fn main() {
                 definitions: None,
                 commit: c1,
                 read: ReadSet {
-                    ranges: vec![(key(i), key(i + 500))],
+                    ranges: vec![(key(i), Some(key(i + 500)))],
                     fields: Some(vec!["4".into()]),
                     filter: None,
                 },

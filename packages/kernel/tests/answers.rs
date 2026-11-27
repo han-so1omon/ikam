@@ -112,7 +112,7 @@ fn stale_flags_equal_a_full_recheck() {
             definitions: None,
             commit: c1,
             read: ReadSet {
-                ranges: vec![(key(100), key(200))],
+                ranges: vec![(key(100), Some(key(200)))],
                 fields: Some(vec!["3".into()]),
                 filter: None,
             },
@@ -194,7 +194,7 @@ fn stale_flags_equal_a_full_recheck() {
 #[test]
 fn a_recorded_answer_flags_only_on_its_fields_in_its_range() {
     let rs = ReadSet {
-        ranges: vec![("a".into(), "b".into())],
+        ranges: vec![("a".into(), Some("b".into()))],
         fields: Some(vec!["1".into()]),
         filter: None,
     };
@@ -211,4 +211,105 @@ fn a_recorded_answer_flags_only_on_its_fields_in_its_range() {
     let whole = ReadSet { fields: None, ..rs };
     assert!(whole.touched_by(Some(b"[1, 2]"), Some(b"[1, 2] ")));
     assert!(!whole.touched_by(Some(b"[1, 2]"), Some(b"[1, 2]")));
+}
+
+#[test]
+fn object_keys_match_with_their_escapes_decoded() {
+    let o = b"{\"\x5cu0061\": 1, \"b\x5c\"c\": 2, \"d\x5c\x5ce\": 3, \"\x5cud83d\x5cude00\": 4}";
+    assert_eq!(field(o, "a"), Some(&b"1"[..]));
+    assert_eq!(field(o, "b\"c"), Some(&b"2"[..]));
+    assert_eq!(field(o, "d\\e"), Some(&b"3"[..]));
+    assert_eq!(field(o, "\u{1f600}"), Some(&b"4"[..]));
+    assert_eq!(field(o, "\\u0061"), None);
+    // A sum over rows that spell the key with an escape counts them.
+    let mut repo = Repo::new(MemStore::default());
+    let db = repo.db_empty().unwrap();
+    let events = [
+        Event::upsert("t/1", br#"{"a": 1}"#, "1"),
+        Event::upsert("t/2", b"{\"\x5cu0061\": 2}", "2"),
+    ];
+    let db = repo.db_append(&db, &events).unwrap();
+    let q = Query::Sum {
+        start: "t/".into(),
+        end: "t0".into(),
+        field: "a".into(),
+    };
+    assert_eq!(repo.answer_query(&db, &q).unwrap(), b"3.0 2");
+}
+
+#[test]
+fn query_text_round_trips_any_argument() {
+    let qs = [
+        Query::Get {
+            key: "t/a b".into(),
+        },
+        Query::Get { key: "".into() },
+        Query::Sum {
+            start: "t/ a%20".into(),
+            end: "t/\tz\n".into(),
+            field: "a field".into(),
+        },
+        Query::CountEq {
+            prefix: "p %".into(),
+            field: "\u{10ffff} x".into(),
+            value: b"\"a b\"".to_vec(),
+        },
+    ];
+    for q in &qs {
+        assert_eq!(Query::parse(&q.text()).as_ref(), Some(q), "{}", q.text());
+    }
+    assert_eq!(
+        Query::parse("get t/a"),
+        Some(Query::Get { key: "t/a".into() })
+    );
+    // A pure answer over a key with a space rechecks.
+    let mut repo = Repo::new(MemStore::default());
+    let db = repo.db_empty().unwrap();
+    let db = repo
+        .db_append(&db, &[Event::upsert("t/a b", b"[1]", "1")])
+        .unwrap();
+    let c = repo.db_commit("db/t", &db, "load").unwrap();
+    let a = repo.answer_pure("q", &qs[0], &c, None).unwrap();
+    assert_eq!(repo.answer_recheck(&a, &c).unwrap(), Some(true));
+}
+
+#[test]
+fn a_count_under_a_prefix_of_max_chars_is_flagged() {
+    for prefix in ["\u{10ffff}", "\u{10ffff}\u{10ffff}", ""] {
+        let mut repo = Repo::new(MemStore::default());
+        let db = repo.db_empty().unwrap();
+        let k = format!("{prefix}\u{10ffff}/1");
+        let db = repo
+            .db_append(&db, &[Event::upsert(&k, b"[1]", "1")])
+            .unwrap();
+        let c1 = repo.db_commit("db/t", &db, "load").unwrap();
+        let q = Query::CountEq {
+            prefix: prefix.into(),
+            field: "0".into(),
+            value: b"1".to_vec(),
+        };
+        let a = repo.answer_pure("q", &q, &c1, None).unwrap();
+        assert_eq!(a.result, b"1");
+        let set = repo.answers_put(&[("n".into(), a.clone())]).unwrap();
+        let db2 = repo
+            .db_append(&db, &[Event::upsert(&k, b"[2]", "2")])
+            .unwrap();
+        let c2 = repo.db_commit("db/t", &db2, "change").unwrap();
+        assert_eq!(repo.answer_recheck(&a, &c2).unwrap(), Some(false));
+        let flagged = repo.answers_flag(&set, &c1, &c2).unwrap();
+        assert_eq!(flagged.stale, vec!["n".to_string()], "{prefix:?}");
+        assert_eq!(Answer::decode(&a.encode()).unwrap(), a);
+        // A range whose end is before its start reads nothing (no panic).
+        let back = Answer {
+            kind: AnswerKind::Recorded,
+            read: ReadSet {
+                ranges: vec![(k.clone(), Some(prefix.into()))],
+                fields: None,
+                filter: None,
+            },
+            ..a
+        };
+        let set = repo.answers_put(&[("back".into(), back)]).unwrap();
+        assert!(repo.answers_flag(&set, &c1, &c2).unwrap().stale.is_empty());
+    }
 }

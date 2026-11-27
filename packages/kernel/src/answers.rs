@@ -28,6 +28,7 @@
 //! asks.
 
 use std::collections::BTreeMap;
+use std::ops::Bound;
 
 use crate::{Arg, Db, Error, Id, Node, Repo, Store, Target};
 
@@ -59,8 +60,8 @@ pub enum Query {
 /// What an answer read.
 #[derive(Clone, Debug, PartialEq, Default)]
 pub struct ReadSet {
-    /// Key ranges, `[start, end)`.
-    pub ranges: Vec<(String, String)>,
+    /// Key ranges, `[start, end)`; no end: every key from `start` on.
+    pub ranges: Vec<(String, Option<String>)>,
     /// The fields whose values the result depends on; `None`: the whole
     /// row.
     pub fields: Option<Vec<String>>,
@@ -154,7 +155,52 @@ fn value_end(b: &[u8], i: usize) -> Option<usize> {
     }
 }
 
-/// A top-level field's JSON text in a row, if it has it.
+/// A JSON string's contents (between its quotes) with its escapes
+/// decoded; `None` for a malformed escape.
+fn unescape(s: &[u8]) -> Option<Vec<u8>> {
+    let hex4 = |i: usize| -> Option<u32> {
+        u32::from_str_radix(std::str::from_utf8(s.get(i..i + 4)?).ok()?, 16).ok()
+    };
+    let (mut out, mut i) = (Vec::with_capacity(s.len()), 0);
+    while i < s.len() {
+        if s[i] != b'\\' {
+            out.push(s[i]);
+            i += 1;
+            continue;
+        }
+        let c = *s.get(i + 1)?;
+        i += 2;
+        let ch = match c {
+            b'"' | b'\\' | b'/' => c as char,
+            b'b' => '\u{8}',
+            b'f' => '\u{c}',
+            b'n' => '\n',
+            b'r' => '\r',
+            b't' => '\t',
+            b'u' => {
+                let hi = hex4(i)?;
+                i += 4;
+                if (0xd800..0xdc00).contains(&hi) {
+                    // A surrogate pair: the low half must follow.
+                    let lo = hex4(i + 2).filter(|lo| (0xdc00..0xe000).contains(lo))?;
+                    if s.get(i..i + 2)? != b"\\u" {
+                        return None;
+                    }
+                    i += 6;
+                    char::from_u32(0x10000 + ((hi - 0xd800) << 10) + (lo - 0xdc00))?
+                } else {
+                    char::from_u32(hi)?
+                }
+            }
+            _ => return None,
+        };
+        out.extend_from_slice(ch.encode_utf8(&mut [0; 4]).as_bytes());
+    }
+    Some(out)
+}
+
+/// A top-level field's JSON text in a row, if it has it. An object's keys
+/// are compared with their escapes decoded (`"\u0061"` is `a`).
 pub fn field<'a>(row: &'a [u8], name: &str) -> Option<&'a [u8]> {
     let mut i = skip_ws(row, 0);
     let (object, close) = match row.get(i)? {
@@ -175,7 +221,12 @@ pub fn field<'a>(row: &'a [u8], name: &str) -> Option<&'a [u8]> {
         }
         let hit = if object {
             let end = value_end(row, i).filter(|_| row[i] == b'"')?;
-            let hit = &row[i + 1..end - 1] == name.as_bytes();
+            let key = &row[i + 1..end - 1];
+            let hit = if key.contains(&b'\\') {
+                unescape(key).is_some_and(|k| k == name.as_bytes())
+            } else {
+                key == name.as_bytes()
+            };
             i = skip_ws(row, end);
             if row.get(i) != Some(&b':') {
                 return None;
@@ -198,17 +249,57 @@ pub fn field<'a>(row: &'a [u8], name: &str) -> Option<&'a [u8]> {
     }
 }
 
+/// An argument of a query's text: `%`, space and control characters as
+/// `%XX`, so that the text splits back into its arguments at spaces.
+fn arg_text(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        if c == '%' || c == ' ' || c.is_ascii_control() {
+            out.push_str(&format!("%{:02x}", c as u32));
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
+fn arg_parse(s: &str) -> Option<String> {
+    let mut out = Vec::with_capacity(s.len());
+    let mut i = 0;
+    while i < s.len() {
+        if s.as_bytes()[i] == b'%' {
+            out.push(u8::from_str_radix(s.get(i + 1..i + 3)?, 16).ok()?);
+            i += 3;
+        } else {
+            out.push(s.as_bytes()[i]);
+            i += 1;
+        }
+    }
+    String::from_utf8(out).ok()
+}
+
 impl Query {
-    /// The query as one line of text (the record's `query`).
+    /// The query as one line of text (the record's `query`); arguments as
+    /// `arg_text` writes them.
     pub fn text(&self) -> String {
         match self {
-            Query::Get { key } => format!("get {key}"),
-            Query::Sum { start, end, field } => format!("sum {start} {end} {field}"),
+            Query::Get { key } => format!("get {}", arg_text(key)),
+            Query::Sum { start, end, field } => format!(
+                "sum {} {} {}",
+                arg_text(start),
+                arg_text(end),
+                arg_text(field)
+            ),
             Query::CountEq {
                 prefix,
                 field,
                 value,
-            } => format!("count {prefix} {field} {}", hex(value)),
+            } => format!(
+                "count {} {} {}",
+                arg_text(prefix),
+                arg_text(field),
+                hex(value)
+            ),
         }
     }
 
@@ -217,16 +308,16 @@ impl Query {
         let p: Vec<&str> = s.split(' ').collect();
         match p.as_slice() {
             ["get", key] => Some(Query::Get {
-                key: key.to_string(),
+                key: arg_parse(key)?,
             }),
             ["sum", start, end, field] => Some(Query::Sum {
-                start: start.to_string(),
-                end: end.to_string(),
-                field: field.to_string(),
+                start: arg_parse(start)?,
+                end: arg_parse(end)?,
+                field: arg_parse(field)?,
             }),
             ["count", prefix, field, value] => Some(Query::CountEq {
-                prefix: prefix.to_string(),
-                field: field.to_string(),
+                prefix: arg_parse(prefix)?,
+                field: arg_parse(field)?,
                 value: unhex(value)?,
             }),
             _ => None,
@@ -237,12 +328,12 @@ impl Query {
     pub fn read_set(&self) -> ReadSet {
         match self {
             Query::Get { key } => ReadSet {
-                ranges: vec![(key.clone(), format!("{key}\0"))],
+                ranges: vec![(key.clone(), Some(format!("{key}\0")))],
                 fields: None,
                 filter: None,
             },
             Query::Sum { start, end, field } => ReadSet {
-                ranges: vec![(start.clone(), end.clone())],
+                ranges: vec![(start.clone(), Some(end.clone()))],
                 fields: Some(vec![field.clone()]),
                 filter: None,
             },
@@ -251,10 +342,7 @@ impl Query {
                 field,
                 value,
             } => ReadSet {
-                ranges: vec![(
-                    prefix.clone(),
-                    crate::prefix_end(prefix).unwrap_or_else(|| "\u{10ffff}".into()),
-                )],
+                ranges: vec![(prefix.clone(), crate::prefix_end(prefix))],
                 fields: Some(vec![field.clone()]),
                 filter: Some((field.clone(), value.clone())),
             },
@@ -307,7 +395,8 @@ fn unhex(s: &str) -> Option<Vec<u8>> {
 
 impl Answer {
     /// The record's bytes: a header of `key: value` lines (texts and
-    /// keys hex-encoded where they could hold a newline), then the result.
+    /// keys hex-encoded where they could hold a newline; a range with no
+    /// end has `*` for it), then the result.
     pub fn encode(&self) -> Vec<u8> {
         let mut out = format!(
             "{MAGIC}\nquestion: {}\nquery: {}\nkind: {}\ndefinitions: {}\ncommit: {}\n",
@@ -321,11 +410,8 @@ impl Answer {
             self.commit,
         );
         for (s, e) in &self.read.ranges {
-            out.push_str(&format!(
-                "range: {} {}\n",
-                hex(s.as_bytes()),
-                hex(e.as_bytes())
-            ));
+            let e = e.as_ref().map_or("*".into(), |e| hex(e.as_bytes()));
+            out.push_str(&format!("range: {} {e}\n", hex(s.as_bytes())));
         }
         if let Some(fs) = &self.read.fields {
             let fs: Vec<String> = fs.iter().map(|f| hex(f.as_bytes())).collect();
@@ -386,7 +472,8 @@ impl Answer {
                 "commit" => a.commit = v.parse().map_err(|_| bad())?,
                 "range" => {
                     let (s, e) = v.split_once(' ').ok_or_else(bad)?;
-                    a.read.ranges.push((text(s)?, text(e)?));
+                    let e = if e == "*" { None } else { Some(text(e)?) };
+                    a.read.ranges.push((text(s)?, e));
                 }
                 "fields" => {
                     a.read.fields = Some(v.split(' ').map(text).collect::<Result<_, _>>()?);
@@ -530,11 +617,13 @@ impl<S: Store> Repo<S> {
                 continue;
             }
             let hit = ans.read.ranges.iter().any(|(s, e)| {
+                let end = match e {
+                    Some(e) if e < s => return false,
+                    Some(e) => Bound::Excluded(e.as_str()),
+                    None => Bound::Unbounded,
+                };
                 delta
-                    .range::<str, _>((
-                        std::ops::Bound::Included(s.as_str()),
-                        std::ops::Bound::Excluded(e.as_str()),
-                    ))
+                    .range::<str, _>((Bound::Included(s.as_str()), end))
                     .any(|(_, (before, after))| {
                         ans.read.touched_by(before.as_deref(), after.as_deref())
                     })
