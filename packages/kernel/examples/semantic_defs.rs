@@ -325,7 +325,7 @@ fn main() {
     }
     let t_cert = ms(t) / metrics.len() as f64;
     let count = |a: &mut Repo<FsStore>, c: &Id| {
-        a.defs_certified(c, "tpcds")
+        a.defs_certified(c, "tpcds", &KEY_A)
             .unwrap()
             .into_iter()
             .filter(|(d, ok)| *ok && kind_of(&d.path) == "metric")
@@ -532,12 +532,12 @@ fn main() {
     // Link: the unchanged set back once (E365's import needs a base).
     let (s0, t0) = back(&mut b);
     let tok0 = a.defs_offer(&s0).unwrap();
-    let r0 = a.defs_merge_in("a", &mut b, &s0, &t0, &KEY_B, "main", "m", NOW);
+    let r0 = a.defs_merge_in("a", &KEY_A, &mut b, &s0, &t0, &KEY_B, "main", "m", NOW);
     let (ap, apt) = approve("merge-in", "authorize", &tok0);
     a.defs_authorize(&ap, &apt, &KEY_A).unwrap();
     let before = a.resolve("main").unwrap();
     let m0 = a
-        .defs_merge_in("a", &mut b, &s0, &t0, &KEY_B, "main", "link", NOW)
+        .defs_merge_in("a", &KEY_A, &mut b, &s0, &t0, &KEY_B, "main", "link", NOW)
         .unwrap();
     let linked = a.resolve("main").unwrap();
     println!(
@@ -562,18 +562,28 @@ fn main() {
     .unwrap();
     let (s1, t1) = back(&mut b);
     let tok1 = a.defs_offer(&s1).unwrap();
-    let r1 = a.defs_merge_in("a", &mut b, &s1, &t1, &KEY_B, "main", "m", NOW);
+    let r1 = a.defs_merge_in("a", &KEY_A, &mut b, &s1, &t1, &KEY_B, "main", "m", NOW);
     let leaked = a.has_content(&Id::of_content(bnew.as_bytes())).unwrap();
     let unmoved = a.resolve("main").unwrap() == linked;
     let (st, stt) = approve("merge-in", "authorize", &tok0);
     a.defs_authorize(&st, &stt, &KEY_A).unwrap();
-    let r_stale = a.defs_merge_in("a", &mut b, &s1, &t1, &KEY_B, "main", "m", NOW);
+    let r_stale = a.defs_merge_in("a", &KEY_A, &mut b, &s1, &t1, &KEY_B, "main", "m", NOW);
     let (ap, apt) = approve("merge-in", "authorize", &tok1);
     a.defs_authorize(&ap, &apt, &KEY_A).unwrap();
     let t = Instant::now();
     let objs = a.store().ids().unwrap().len();
     let m1 = a
-        .defs_merge_in("a", &mut b, &s1, &t1, &KEY_B, "main", "merge b's clv", NOW)
+        .defs_merge_in(
+            "a",
+            &KEY_A,
+            &mut b,
+            &s1,
+            &t1,
+            &KEY_B,
+            "main",
+            "merge b's clv",
+            NOW,
+        )
         .unwrap();
     let t_m1 = ms(t);
     let after = a.resolve("main").unwrap();
@@ -589,7 +599,7 @@ fn main() {
         )
         .unwrap();
     let data_kept = has_path(&a, &after, "data/store_sales.csv");
-    let again = a.defs_merge_in("a", &mut b, &s1, &t1, &KEY_B, "main", "again", NOW);
+    let again = a.defs_merge_in("a", &KEY_A, &mut b, &s1, &t1, &KEY_B, "main", "again", NOW);
     let other_sets = ["flights", "sap"]
         .iter()
         .all(|s| a.defs_diff(&linked, &after, s).unwrap().is_empty());

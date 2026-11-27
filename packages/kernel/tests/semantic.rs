@@ -6,7 +6,8 @@
 
 use ikam_kernel::merge::Merged;
 use ikam_kernel::semantic::{
-    Approval, MergeRefused, certify_net, kind_of, merge_net, segment, share_token, trigram_vector,
+    Approval, MERGE_REF, MergeRefused, cert_ref, certify_net, kind_of, merge_net, segment,
+    share_token, trigram_vector,
 };
 use ikam_kernel::share::{Refused, Right, Scope, Share, import_share};
 use ikam_kernel::{Edit, Id, MemStore, Object, Repo};
@@ -351,6 +352,33 @@ fn import_exports_exactly_and_an_edit_changes_one_fragment() {
         r.defs_edit("main", "shop", "shop.yaml", "metrics/nope", b"x", "x")
             .is_err()
     );
+    // The set's own files are not definitions: refused, nothing written.
+    let head = r.resolve("main").unwrap();
+    for p in ["_order", "_links", "../_links", "metrics", ""] {
+        assert!(
+            r.defs_edit(
+                "main",
+                "shop",
+                "shop.yaml",
+                p,
+                b"metrics/total_amount\n",
+                "x"
+            )
+            .is_err(),
+            "{p}"
+        );
+    }
+    assert_eq!(r.resolve("main").unwrap(), head);
+    assert_eq!(
+        r.defs_export(&head, "shop", "shop.yaml").unwrap(),
+        MODEL
+            .replace("Total order amount\n", "Total order amount, all regions\n")
+            .replace(
+                "SUM(orders.amount)\n",
+                "SUM(orders.amount) - SUM(orders.order_id)\n"
+            )
+            .as_bytes()
+    );
     assert!(r.fsck().unwrap().is_empty());
 }
 
@@ -390,7 +418,7 @@ fn certification_fires_only_with_a_persons_approval() {
     let f = r.defs_review("shop", &a, &tag, &KEY).unwrap();
     assert_eq!(f.transition, "certify");
     let certified = |r: &mut Repo<MemStore>, c: &Id| {
-        r.defs_certified(c, "shop")
+        r.defs_certified(c, "shop", &KEY)
             .unwrap()
             .into_iter()
             .find(|(d, _)| d.key() == key)
@@ -417,7 +445,7 @@ fn certification_fires_only_with_a_persons_approval() {
     // Who certified is recorded; replay equals the marking.
     let db = r.defs_cert_db("shop").unwrap();
     let out = r.net_output(&db, "certify", &f.key).unwrap().unwrap().1;
-    assert_eq!(out, a.encode());
+    assert_eq!(out, a.evidence(&tag));
     assert_eq!(
         r.net_replay(&db, &certify_net()).unwrap(),
         r.net_marking(&db, "certify").unwrap()
@@ -504,14 +532,14 @@ fn a_shared_definition_set_merges_back_only_when_authorized() {
     let (s0, t0) = back_share(&mut b);
     let tok0 = a.defs_offer(&s0).unwrap();
     assert_eq!(
-        a.defs_merge_in("a", &mut b, &s0, &t0, &KEY_B, "main", "m", NOW),
+        a.defs_merge_in("a", &KEY, &mut b, &s0, &t0, &KEY_B, "main", "m", NOW),
         Err(MergeRefused::NotAuthorized)
     );
     let (ap, apt) = approve("merge-in", "authorize", &tok0);
     a.defs_authorize(&ap, &apt, &KEY).unwrap();
     let before = a.resolve("main").unwrap();
     assert!(matches!(
-        a.defs_merge_in("a", &mut b, &s0, &t0, &KEY_B, "main", "link", NOW)
+        a.defs_merge_in("a", &KEY, &mut b, &s0, &t0, &KEY_B, "main", "link", NOW)
             .unwrap(),
         Merged::Commit(_)
     ));
@@ -535,7 +563,7 @@ fn a_shared_definition_set_merges_back_only_when_authorized() {
     let tok1 = a.defs_offer(&s1).unwrap();
     assert_ne!(tok1, tok0);
     assert_eq!(
-        a.defs_merge_in("a", &mut b, &s1, &t1, &KEY_B, "main", "m", NOW),
+        a.defs_merge_in("a", &KEY, &mut b, &s1, &t1, &KEY_B, "main", "m", NOW),
         Err(MergeRefused::NotAuthorized)
     );
     assert!(!a.has_content(&Id::of_content(new.as_bytes())).unwrap());
@@ -546,7 +574,7 @@ fn a_shared_definition_set_merges_back_only_when_authorized() {
     let (stale, stag) = approve("merge-in", "authorize", &tok0);
     a.defs_authorize(&stale, &stag, &KEY).unwrap();
     assert_eq!(
-        a.defs_merge_in("a", &mut b, &s1, &t1, &KEY_B, "main", "m", NOW),
+        a.defs_merge_in("a", &KEY, &mut b, &s1, &t1, &KEY_B, "main", "m", NOW),
         Err(MergeRefused::NotAuthorized)
     );
     let db = a.defs_merge_db().unwrap();
@@ -556,7 +584,7 @@ fn a_shared_definition_set_merges_back_only_when_authorized() {
     let (ap, apt) = approve("merge-in", "authorize", &tok1);
     a.defs_authorize(&ap, &apt, &KEY).unwrap();
     assert!(matches!(
-        a.defs_merge_in("a", &mut b, &s1, &t1, &KEY_B, "main", "merge", NOW)
+        a.defs_merge_in("a", &KEY, &mut b, &s1, &t1, &KEY_B, "main", "merge", NOW)
             .unwrap(),
         Merged::Commit(_)
     ));
@@ -575,7 +603,7 @@ fn a_shared_definition_set_merges_back_only_when_authorized() {
     );
     // The authorization is used up.
     assert_eq!(
-        a.defs_merge_in("a", &mut b, &s1, &t1, &KEY_B, "main", "again", NOW),
+        a.defs_merge_in("a", &KEY, &mut b, &s1, &t1, &KEY_B, "main", "again", NOW),
         Err(MergeRefused::NotAuthorized)
     );
     // A revoked share is refused even when authorized.
@@ -594,7 +622,7 @@ fn a_shared_definition_set_merges_back_only_when_authorized() {
     a.defs_authorize(&ap, &apt, &KEY).unwrap();
     b.share_revoke("shop-back").unwrap();
     assert_eq!(
-        a.defs_merge_in("a", &mut b, &s2, &t2, &KEY_B, "main", "m", NOW),
+        a.defs_merge_in("a", &KEY, &mut b, &s2, &t2, &KEY_B, "main", "m", NOW),
         Err(MergeRefused::Share(Refused::Revoked))
     );
     let db = a.defs_merge_db().unwrap();
@@ -632,4 +660,142 @@ fn hybrid_search_finds_definitions() {
             .unwrap(),
         "shop.yaml"
     );
+}
+
+fn metric_id(r: &Repo<MemStore>, c: &Id, name: &str) -> Id {
+    let key = format!("shop.yaml/metrics/{name}");
+    r.defs_list(c, "shop")
+        .unwrap()
+        .into_iter()
+        .find(|d| d.key() == key)
+        .unwrap()
+        .id
+}
+
+#[test]
+fn raw_net_firings_neither_certify_nor_authorize() {
+    let mut r = Repo::new(MemStore::default());
+    let c = r.defs_import("main", "shop", &docs(), "import").unwrap();
+    let (id, id2) = (
+        metric_id(&r, &c, "total_amount"),
+        metric_id(&r, &c, "amount_per_customer"),
+    );
+    r.defs_submit("shop", &id).unwrap();
+    r.defs_submit("shop", &id2).unwrap();
+    // `certify` fired and committed through the raw net API: with no
+    // approval, and with an approval sealed by another key.
+    let net = certify_net();
+    let db = r.defs_cert_db("shop").unwrap();
+    let (db, _) = r
+        .net_fire(&db, &net, "certify", Some(&id.to_hex()), "raw")
+        .unwrap();
+    let (forged, _) = approve("certify", "certify", &id2.to_hex());
+    let wrong = forged.seal(&[3; 32]);
+    let (db, _) = r
+        .net_fire_output(
+            &db,
+            &net,
+            "certify",
+            Some(&id2.to_hex()),
+            "raw2",
+            &forged.evidence(&wrong),
+        )
+        .unwrap();
+    r.db_commit(&cert_ref("shop"), &db, "raw certify").unwrap();
+    let m = r.net_marking(&db, "certify").unwrap();
+    assert!(
+        m["certified"].contains_key(&id.to_hex()) && m["certified"].contains_key(&id2.to_hex())
+    );
+    let certified = r.defs_certified(&c, "shop", &KEY).unwrap();
+    assert!(
+        certified.iter().all(|(_, ok)| !ok),
+        "raw firings are not certifications"
+    );
+
+    // The merge-in net: `offer` and `authorize` fired raw, then a merge in.
+    let (mut a, mut b, s) = two_projects();
+    import_share(&mut a, &s, &mut b, "main", "take").unwrap();
+    let (s0, t0) = back_share(&mut b);
+    let tok = share_token(&s0);
+    let mnet = merge_net();
+    let db = a.defs_merge_db().unwrap();
+    let (db, _) = a
+        .net_fire(&db, &mnet, "offer", Some(&tok), "raw-offer")
+        .unwrap();
+    let (db, _) = a
+        .net_fire(&db, &mnet, "authorize", Some(&tok), "raw-auth")
+        .unwrap();
+    a.db_commit(MERGE_REF, &db, "raw authorize").unwrap();
+    let head = a.resolve("main").unwrap();
+    assert_eq!(
+        a.defs_merge_in("a", &KEY, &mut b, &s0, &t0, &KEY_B, "main", "m", NOW),
+        Err(MergeRefused::NotAuthorized)
+    );
+    // An approval sealed with another key is no evidence either.
+    let db = a.defs_merge_db().unwrap();
+    let (other, _) = approve("merge-in", "authorize", &tok);
+    let wrong = other.seal(&[3; 32]);
+    let (db, _) = a
+        .net_fire(&db, &mnet, "offer", Some(&tok), "raw-offer2")
+        .unwrap();
+    let (db, _) = a
+        .net_fire_output(
+            &db,
+            &mnet,
+            "authorize",
+            Some(&tok),
+            "raw-auth2",
+            &other.evidence(&wrong),
+        )
+        .unwrap();
+    a.db_commit(MERGE_REF, &db, "raw authorize 2").unwrap();
+    assert_eq!(
+        a.defs_merge_in("a", &KEY, &mut b, &s0, &t0, &KEY_B, "main", "m", NOW),
+        Err(MergeRefused::NotAuthorized)
+    );
+    assert_eq!(a.resolve("main").unwrap(), head);
+    // A person's approval: merged once; its evidence replayed through the
+    // raw API does not authorize a second merge.
+    a.defs_offer(&s0).unwrap();
+    let (ap, apt) = approve("merge-in", "authorize", &tok);
+    a.defs_authorize(&ap, &apt, &KEY).unwrap();
+    assert!(matches!(
+        a.defs_merge_in("a", &KEY, &mut b, &s0, &t0, &KEY_B, "main", "m", NOW),
+        Ok(Merged::Commit(_))
+    ));
+    let db = a.defs_merge_db().unwrap();
+    let (db, _) = a
+        .net_fire(&db, &mnet, "offer", Some(&tok), "raw-offer3")
+        .unwrap();
+    let (db, _) = a
+        .net_fire_output(
+            &db,
+            &mnet,
+            "authorize",
+            Some(&tok),
+            "raw-auth3",
+            &ap.evidence(&apt),
+        )
+        .unwrap();
+    a.db_commit(MERGE_REF, &db, "replay").unwrap();
+    assert_eq!(
+        a.defs_merge_in("a", &KEY, &mut b, &s0, &t0, &KEY_B, "main", "again", NOW),
+        Err(MergeRefused::NotAuthorized)
+    );
+    // Evidence decodes back to the approval.
+    assert_eq!(Approval::decode(&ap.encode()), Some(ap.clone()));
+    assert!(Approval::check_evidence(
+        &ap.evidence(&apt),
+        &KEY,
+        "merge-in",
+        "authorize",
+        &tok
+    ));
+    assert!(!Approval::check_evidence(
+        &ap.evidence(&apt),
+        &KEY,
+        "certify",
+        "authorize",
+        &tok
+    ));
 }

@@ -24,14 +24,19 @@
 //!   it unchanged.
 //! - **Certification** is a `human` transition of the `certify` net, fired
 //!   only with an [`Approval`] sealed by the owner's key (which a person's
-//!   surface holds, not a scheduler). Its tokens are fragment content ids,
+//!   surface holds, not a scheduler); the approval and its seal are the
+//!   firing's recorded output, and a version counts as certified only
+//!   with that evidence, so a token moved through the raw net API is not
+//!   certified. Its tokens are fragment content ids,
 //!   so a certified definition that is edited is a new, uncertified
 //!   version, and the old one stays certified at the commits that hold it.
 //! - **Merging in** a definition set from another project is the scoped
 //!   share merge (E365, [`import_share`]) behind the `authorize` human
 //!   transition of the receiver's `merge-in` net: a share offered by an
 //!   agent is merged only once a person has authorized that exact share
-//!   (its scope and commit); the merge consumes the authorization.
+//!   (its scope and commit), checked from the sealed approval its
+//!   `authorize` firing recorded, not from the marking alone; the merge
+//!   consumes the authorization.
 //!
 //! The YAML is not parsed into values: only line indents, `key:` prefixes
 //! and `- ` items are read, which is enough to cut block-style documents
@@ -709,6 +714,53 @@ impl Approval {
     pub fn seal(&self, key: &[u8; 32]) -> [u8; 32] {
         *blake3::keyed_hash(key, &self.encode()).as_bytes()
     }
+
+    /// The approval `encode` wrote; none for anything else.
+    pub fn decode(bytes: &[u8]) -> Option<Approval> {
+        let mut r = bytes.strip_prefix(&APPROVAL_TAG[..])?;
+        let mut next = || -> Option<String> {
+            let n = usize::try_from(u64::from_le_bytes(r.get(..8)?.try_into().ok()?)).ok()?;
+            let s = String::from_utf8(r.get(8..8 + n)?.to_vec()).ok()?;
+            r = &r[8 + n..];
+            Some(s)
+        };
+        let a = Approval {
+            person: next()?,
+            net: next()?,
+            transition: next()?,
+            token: next()?,
+        };
+        (a.encode() == bytes).then_some(a)
+    }
+
+    /// The evidence a firing records: the approval and its seal.
+    pub fn evidence(&self, tag: &[u8; 32]) -> Vec<u8> {
+        let mut out = self.encode();
+        out.extend_from_slice(tag);
+        out
+    }
+
+    /// Whether `bytes` is the evidence of an approval of exactly `net`,
+    /// `transition` and `token`, sealed with `key`.
+    pub fn check_evidence(
+        bytes: &[u8],
+        key: &[u8; 32],
+        net: &str,
+        transition: &str,
+        token: &str,
+    ) -> bool {
+        let Some(split) = bytes.len().checked_sub(32) else {
+            return false;
+        };
+        let (body, tag) = bytes.split_at(split);
+        let Some(a) = Approval::decode(body) else {
+            return false;
+        };
+        a.net == net
+            && a.transition == transition
+            && a.token == token
+            && blake3::keyed_hash(key, body).as_bytes()[..] == tag[..]
+    }
 }
 
 /// The certification net: an agent submits a definition version for
@@ -800,7 +852,8 @@ impl From<Error> for MergeRefused {
     }
 }
 
-fn cert_ref(set: &str) -> String {
+/// The ref holding `set`'s certification net and its marking.
+pub fn cert_ref(set: &str) -> String {
     format!("certify/{set}")
 }
 
@@ -1103,7 +1156,8 @@ impl<S: Store> Repo<S> {
     }
 
     /// Replace fragment `path` of document `doc` with `bytes`, relink and
-    /// commit on `refname`.
+    /// commit on `refname`. `path` must be a fragment the document's
+    /// `_order` lists.
     pub fn defs_edit(
         &mut self,
         refname: &str,
@@ -1116,7 +1170,16 @@ impl<S: Store> Repo<S> {
         let head = self.resolve(refname)?;
         let root = self.commit_tree(&head)?;
         let full = format!("{}/{doc}/{path}", set_dir(set));
-        if !matches!(self.entry_at(root, &full)?, Some((Kind::File, _))) {
+        // Only a fragment `_order` lists: never `_order`, `_links` or any
+        // other file of the set's own.
+        let listed = match self.entry_at(root, &format!("{}/{doc}/{ORDER}", set_dir(set)))? {
+            Some((Kind::File, o)) => self
+                .read_content(&o)?
+                .split(|&b| b == b'\n')
+                .any(|l| l == path.as_bytes()),
+            _ => false,
+        };
+        if !listed || !matches!(self.entry_at(root, &full)?, Some((Kind::File, _))) {
             return Err(Error::InvalidName(full));
         }
         let id = self.put_content(bytes)?.id;
@@ -1219,7 +1282,7 @@ impl<S: Store> Repo<S> {
             t,
             Some(&approval.token),
             &fire_key(t, &approval.token),
-            &approval.encode(),
+            &approval.evidence(tag),
         )?;
         self.db_commit(
             refname,
@@ -1227,6 +1290,50 @@ impl<S: Store> Repo<S> {
             &format!("{} {t} by {}", net.name, approval.person),
         )?;
         Ok(f)
+    }
+
+    /// Distinct approvals, sealed with `key`, recorded by firings of the
+    /// human transition `t` on `token`. A firing made through the raw net
+    /// API carries no such evidence and counts for nothing; a recorded
+    /// approval fired again counts once.
+    fn approvals(
+        &mut self,
+        refname: &str,
+        net: &Net,
+        t: &str,
+        token: &str,
+        key: &[u8; 32],
+    ) -> Result<usize, Error> {
+        let db = self.net_db(refname, net)?;
+        let mut seen = BTreeSet::new();
+        for f in self.net_firings(&db, &net.name)? {
+            if f.transition != t || f.token.as_deref() != Some(token) {
+                continue;
+            }
+            if let Some(o) = f.output
+                && !seen.contains(&o)
+                && Approval::check_evidence(&self.read_content(&o)?, key, &net.name, t, token)
+            {
+                seen.insert(o);
+            }
+        }
+        Ok(seen.len())
+    }
+
+    /// Firings of transition `t` on `token`.
+    fn firings_of(
+        &mut self,
+        refname: &str,
+        net: &Net,
+        t: &str,
+        token: &str,
+    ) -> Result<usize, Error> {
+        let db = self.net_db(refname, net)?;
+        Ok(self
+            .net_firings(&db, &net.name)?
+            .iter()
+            .filter(|f| f.transition == t && f.token.as_deref() == Some(token))
+            .count())
     }
 
     fn marking_of(&mut self, refname: &str, net: &Net) -> Result<Marking, Error> {
@@ -1258,18 +1365,26 @@ impl<S: Store> Repo<S> {
     }
 
     /// Each definition of `set` at `commit` with whether that version is
-    /// certified.
-    pub fn defs_certified(&mut self, commit: &Id, set: &str) -> Result<Vec<(Def, bool)>, Error> {
-        let m = self.marking_of(&cert_ref(set), &certify_net())?;
+    /// certified: in the `certified` place and with a person's approval,
+    /// sealed with the owner's `key`, recorded by a `certify` firing (a
+    /// token moved there through the raw net API is not certified).
+    pub fn defs_certified(
+        &mut self,
+        commit: &Id,
+        set: &str,
+        key: &[u8; 32],
+    ) -> Result<Vec<(Def, bool)>, Error> {
+        let net = certify_net();
+        let m = self.marking_of(&cert_ref(set), &net)?;
         let done = m.get("certified").cloned().unwrap_or_default();
-        Ok(self
-            .defs_list(commit, set)?
-            .into_iter()
-            .map(|d| {
-                let c = done.contains_key(&d.id.to_hex());
-                (d, c)
-            })
-            .collect())
+        let mut out = Vec::new();
+        for d in self.defs_list(commit, set)? {
+            let tok = d.id.to_hex();
+            let c = done.contains_key(&tok)
+                && self.approvals(&cert_ref(set), &net, "certify", &tok, key)? > 0;
+            out.push((d, c));
+        }
+        Ok(out)
     }
 
     /// The certification net's database, for replay checks.
@@ -1296,14 +1411,17 @@ impl<S: Store> Repo<S> {
     }
 
     /// Merge `share` (issued by project `src` to this project `me`) into
-    /// `into`, only if a person authorized that exact share and it has not
-    /// been merged on that authorization yet. Nothing is read from `src`
-    /// before the authorization checks. The merge is E365's
-    /// [`import_share`]; a successful one consumes the authorization.
+    /// `into`, only if a person authorized that exact share (an approval
+    /// sealed with this project's `owner_key`, recorded by an `authorize`
+    /// firing) and it has not been merged on that authorization yet.
+    /// Nothing is read from `src` before the authorization checks. The
+    /// merge is E365's [`import_share`]; a successful one consumes the
+    /// authorization.
     #[allow(clippy::too_many_arguments)]
     pub fn defs_merge_in<T: Store>(
         &mut self,
         me: &str,
+        owner_key: &[u8; 32],
         src: &mut Repo<T>,
         share: &Share,
         tag: &[u8; 32],
@@ -1315,7 +1433,10 @@ impl<S: Store> Repo<S> {
         let net = merge_net();
         let token = share_token(share);
         let m = self.marking_of(MERGE_REF, &net)?;
-        if !m.get("authorized").is_some_and(|t| t.contains_key(&token)) {
+        if !m.get("authorized").is_some_and(|t| t.contains_key(&token))
+            || self.approvals(MERGE_REF, &net, "authorize", &token, owner_key)?
+                <= self.firings_of(MERGE_REF, &net, "merge", &token)?
+        {
             return Err(MergeRefused::NotAuthorized);
         }
         src.share_check(share, tag, src_key, me, Right::Merge, now)?;
