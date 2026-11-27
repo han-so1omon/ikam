@@ -24,6 +24,9 @@
 //!
 //! `cargo run --release -- [d]`, with `MLIR_BIN` naming the folder of
 //! mlir-opt, mlir-translate, opt and llc (else those modes are skipped).
+//!
+//! E423: `cargo run --release -- matrix` runs one function in every mode
+//! and compares their bits (`matrix.rs`).
 
 #![allow(clippy::type_complexity)]
 
@@ -31,6 +34,8 @@ use std::ffi::CString;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Instant;
+
+mod matrix;
 
 struct Lcg(u64);
 impl Lcg {
@@ -355,6 +360,10 @@ fn top(scores: &[f32], k: usize) -> Vec<usize> {
 }
 
 fn main() {
+    if std::env::args().nth(1).as_deref() == Some("matrix") {
+        matrix::main();
+        return;
+    }
     let d: usize = std::env::args()
         .nth(1)
         .and_then(|a| a.parse().ok())
