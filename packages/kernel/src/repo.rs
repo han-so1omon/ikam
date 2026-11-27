@@ -56,6 +56,11 @@ impl std::ops::Deref for LedgerRef<'_> {
 #[derive(Default)]
 pub(crate) struct Ledger {
     pub(crate) by_output: BTreeMap<Id, Vec<Derivation>>,
+    /// E391, a lean ledger (`Repo::lean_ledger`): in place of `by_output`,
+    /// each output's derivation record ids, the records themselves read
+    /// from the store when wanted. Empty otherwise.
+    pub(crate) records: BTreeMap<Id, Vec<Id>>,
+    pub(crate) lean: bool,
     pub(crate) by_key: HashMap<Id, Id>,
     /// Every stored id this ledger has looked at, so `refresh_ledger`
     /// (E298) reads only objects written since (by another process).
@@ -63,12 +68,41 @@ pub(crate) struct Ledger {
 }
 
 impl Ledger {
-    fn insert(&mut self, d: Derivation) {
+    /// Add `d`, whose record is stored as `record`.
+    fn insert(&mut self, d: Derivation, record: Id) {
         self.by_key
             .insert(Derivation::key(&d.func, &d.args), d.output);
+        if self.lean {
+            // Most outputs have one record: start at one slot (not the
+            // four a first push gives) and let later pushes grow as usual.
+            let rs = self
+                .records
+                .entry(d.output)
+                .or_insert_with(|| Vec::with_capacity(1));
+            if !rs.contains(&record) {
+                rs.push(record);
+            }
+            return;
+        }
         let ds = self.by_output.entry(d.output).or_default();
         if !ds.contains(&d) {
             ds.push(d);
+        }
+    }
+
+    /// True if `id` has a recorded derivation.
+    pub(crate) fn has_output(&self, id: &Id) -> bool {
+        match self.lean {
+            true => self.records.contains_key(id),
+            false => self.by_output.contains_key(id),
+        }
+    }
+
+    /// Outputs with a recorded derivation, from `start` on, in id order.
+    pub(crate) fn outputs_from(&self, start: Id) -> Box<dyn Iterator<Item = &Id> + '_> {
+        match self.lean {
+            true => Box::new(self.records.range(start..).map(|(id, _)| id)),
+            false => Box::new(self.by_output.range(start..).map(|(id, _)| id)),
         }
     }
 }
@@ -265,6 +299,14 @@ pub struct Repo<S: Store> {
     /// scope it is ignored: that index is every stored object, read again
     /// in full when built.
     pub seed_index_max: usize,
+    /// E391: keep only each derivation's record id in the ledger, not the
+    /// derivation, and read a record from the store when a read needs it.
+    /// Off by default. A long-running writer's ledger grows with every
+    /// derivation it records (all of their arguments, in memory); lean, it
+    /// holds an id per record, at the price of a store read and a decode
+    /// each time a derived content is rebuilt. The store is the same.
+    /// Takes effect when the ledger is (re)built.
+    pub lean_ledger: bool,
     pub(crate) writing_object: bool,
 }
 
@@ -331,6 +373,7 @@ impl<S: Store> Repo<S> {
             plain_db_events: false,
             plain_hot_writes: false,
             seed_index_max: 0,
+            lean_ledger: false,
             writing_object: false,
             hints: Default::default(),
         }
@@ -518,7 +561,10 @@ impl<S: Store> Repo<S> {
                 return Ok(LedgerRef(got));
             }
         }
-        let mut ledger = Ledger::default();
+        let mut ledger = Ledger {
+            lean: self.lean_ledger,
+            ..Ledger::default()
+        };
         // Records' outputs first: short records resolve their arguments
         // against stored ids and these (E104, `abbrev.rs`).
         let mut records = Vec::new();
@@ -578,7 +624,7 @@ impl<S: Store> Repo<S> {
             if Id::of(&encoded) == id
                 && let Object::Derivation(d) = Object::decode(&encoded)?
             {
-                ledger.insert(d);
+                ledger.insert(d, id);
             }
         }
         if let Some(set) = needed {
@@ -623,8 +669,7 @@ impl<S: Store> Repo<S> {
         }
         let known: std::collections::BTreeSet<Id> = {
             let l = self.ledger()?;
-            l.by_output
-                .keys()
+            l.outputs_from(Id::from_bytes([0; 32]))
                 .copied()
                 .chain(outputs.iter().copied())
                 .collect()
@@ -649,7 +694,7 @@ impl<S: Store> Repo<S> {
             if Id::of(&encoded) == id
                 && let Object::Derivation(d) = Object::decode(&encoded)?
             {
-                found.push(d);
+                found.push((d, id));
             }
         }
         let mut slot = self.ledger.write().unwrap_or_else(|e| e.into_inner());
@@ -658,8 +703,8 @@ impl<S: Store> Repo<S> {
         };
         ledger.seen.extend(new_ids);
         let added = !found.is_empty();
-        for d in found {
-            ledger.insert(d);
+        for (d, id) in found {
+            ledger.insert(d, id);
         }
         Ok(added)
     }
@@ -684,6 +729,7 @@ impl<S: Store> Repo<S> {
         r.read_weight = self.read_weight;
         r.read_cache = self.read_cache;
         r.refresh_ledger = self.refresh_ledger;
+        r.lean_ledger = self.lean_ledger;
         r.cache = self.cache.clone();
         r.short_records = self.short_records;
         r.markup_layers = self.markup_layers;
@@ -724,21 +770,64 @@ impl<S: Store> Repo<S> {
 
     /// Every recorded derivation of `id`.
     pub fn derivations(&self, id: &Id) -> Result<Vec<Derivation>, Error> {
-        Ok(self
-            .ledger()?
-            .by_output
-            .get(id)
-            .cloned()
-            .unwrap_or_default())
+        let records = {
+            let l = self.ledger()?;
+            if !l.lean {
+                return Ok(l.by_output.get(id).cloned().unwrap_or_default());
+            }
+            l.records.get(id).cloned().unwrap_or_default()
+        };
+        self.read_derivations(&records)
+    }
+
+    /// E391: the derivations stored as `records`, read and decoded; a
+    /// record deleted since (by gc) is left out.
+    fn read_derivations(&self, records: &[Id]) -> Result<Vec<Derivation>, Error> {
+        let mut out = Vec::with_capacity(records.len());
+        for r in records {
+            match self.get(r) {
+                Ok(Object::Derivation(d)) => out.push(d),
+                Ok(_) => return Err(Error::WrongKind(*r)),
+                Err(Error::NotFound(_)) => {}
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(out)
+    }
+
+    /// Call `f` with each output and its recorded derivations, in output
+    /// order: from memory, or read record by record from a lean ledger.
+    pub(crate) fn each_derivations(
+        &self,
+        mut f: impl FnMut(&Id, &[Derivation]) -> Result<(), Error>,
+    ) -> Result<(), Error> {
+        let records: Vec<(Id, Vec<Id>)> = {
+            let l = self.ledger()?;
+            if !l.lean {
+                for (output, ds) in &l.by_output {
+                    f(output, ds)?;
+                }
+                return Ok(());
+            }
+            l.records.iter().map(|(o, r)| (*o, r.clone())).collect()
+        };
+        for (output, rs) in records {
+            let ds = self.read_derivations(&rs)?;
+            if !ds.is_empty() {
+                f(&output, &ds)?;
+            }
+        }
+        Ok(())
     }
 
     /// Stored or derivable ids starting with `prefix`, without duplicates.
     pub(crate) fn ids_with_prefix(&self, prefix: &[u8]) -> Result<Vec<Id>, Error> {
         let mut out = self.store.ids_with_prefix(prefix)?;
-        for (id, _) in self
+        for id in self
             .ledger()?
-            .by_output
-            .range(Id::from_bytes(std::array::from_fn(|i| prefix.get(i).copied().unwrap_or(0)))..)
+            .outputs_from(Id::from_bytes(std::array::from_fn(|i| {
+                prefix.get(i).copied().unwrap_or(0)
+            })))
         {
             if !id.as_bytes().starts_with(prefix) {
                 break;
@@ -752,7 +841,7 @@ impl<S: Store> Repo<S> {
 
     /// True if `id` (a content id) is stored as bytes or has a derivation.
     pub fn has_content(&self, id: &Id) -> Result<bool, Error> {
-        Ok(self.store.has(id) || self.ledger()?.by_output.contains_key(id))
+        Ok(self.store.has(id) || self.ledger()?.has_output(id))
     }
 
     /// Write content in a plain encoding, or an object in its canonical
@@ -812,7 +901,7 @@ impl<S: Store> Repo<S> {
             .unwrap_or_else(|e| e.into_inner())
             .as_mut()
         {
-            ledger.insert(d);
+            ledger.insert(d, id);
         }
         Ok(id)
     }

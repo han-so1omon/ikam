@@ -20,11 +20,12 @@ impl<S: Store> Repo<S> {
     /// at it. Returns its root, or `None` if no function is in use.
     pub fn function_library(&mut self) -> Result<Option<Id>, Error> {
         let mut applications = Vec::new();
-        for ds in self.ledger()?.by_output.values() {
+        self.each_derivations(|_, ds| {
             for d in ds.iter().filter(|d| !func::is_builtin(&d.func)) {
                 applications.push(d.clone());
             }
-        }
+            Ok(())
+        })?;
         if applications.is_empty() {
             return Ok(None);
         }
