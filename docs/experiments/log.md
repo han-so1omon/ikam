@@ -6770,3 +6770,35 @@ Gates on the branch (E229 to E233): every kernel test suite passes (release); cl
 - Verdict: **kept** as an option, off. H2(b) confirmed; H2(a) refuted at start (+47 bytes), and the guidance on demand is new.
 - Not measured: Claude Code (whether it lists `ikam-store`, loads it when asked to edit, and E359's rename task with and without it) waits for the Mac after Nov 29; skills in `host`.
 - Run: `python3 experiments/agent-tools/mcp_skills_check.py IKAM_BIN WORK`; option off as in E406.
+### E397 agent-workload (an AI agent's file work through `ikam mcp`: call costs, store size against git, every version read back)
+
+- Branch / parent: exp/397-agent-workload / main 437aef6
+- Question: ikam is meant to be the service behind projects that use AI to generate and change files. Through `ikam mcp` alone, what does each tool call cost an agent working on a mixed project (notes, code, tables, office files) over many sessions, how big does the store grow against plain files and git holding the same history, and does every commit read back byte for byte? (Night 3 of the trip-week plan; business case: AI file service.)
+- Setup: `experiments/agent-workload/agent_workload.py`, seeded. A project of 40 Markdown notes, 30 Python and 20 Rust sources, 15 CSV tables (200 to 2,000 rows), 8 Word documents and a tar of 5 logs (about 0.8 MB), ingested first (MCP tools carry text only). Then 200 sessions through the official MCP Python SDK's client over one `ikam mcp` process (main's binary, handshake era). Each session lists a folder, searches, asks `passages`, reads a range, reads an office file's extracted text, reads a file at an earlier commit (checked against a model of every commit), makes 1 to 4 code edits and a paragraph rewrite, appends 5 to 50 rows to a table (`write` of the whole file, as an agent does), writes a report half the time, calls `status` and `diff`, and commits with its own message; every fifth session works on a draft and promotes it. After the sessions: `repack`, `gc`, `fsck`, every commit checked out (`ikam checkout`) and compared with the model, and the same history replayed into git (`git add -A`, `git commit`, then `git gc`). Linux cloud, 4 CPUs, two seeds (397, 398), one run each.
+- Results (seed 397 / seed 398):
+
+  | | seed 397 | seed 398 |
+  | --- | --- | --- |
+  | tool calls / commits | 2,894 / 201 | 2,887 / 201 |
+  | wall time, all sessions | 11.4 s | 16.4 s |
+  | reads at an earlier commit equal to the model | 200 / 200 | 200 / 200 |
+  | checkouts equal to the model, byte for byte | 241 / 241 | 241 / 241 |
+  | `fsck` after repack and gc | ok | ok |
+  | head, plain files | 957,926 B | 857,913 B |
+  | every version, plain files | 8,682,837 B | 7,230,700 B |
+  | store after ingest | 201,365 B | 174,567 B |
+  | store after the sessions | 1,567,387 B | 1,533,274 B |
+  | store after `repack` and `gc` | **730,534 B** | **651,842 B** |
+  | git, loose | 4,519,885 B | 3,905,840 B |
+  | git after `git gc` | 767,243 B | 731,220 B |
+
+  Per tool call, ms, p50 / p99 (seed 397; seed 398 in brackets): read 0.60 / 1.59 (0.60 / 2.08), list 0.47 / 4.53 (0.49 / 3.92), search 0.86 / 1.45 (0.84 / 3.62), passages 2.30 / 3.48 (2.17 / 4.52), status 0.57 / 0.97 (0.58 / 1.66), diff 0.43 / 0.91 (0.43 / 1.39), history 1.30 / 2.99 (1.29 / 6.54), commit 1.97 / 3.78 (2.42 / 17.6), draft_open 1.17 / 1.83 (1.52 / 8.88), draft_promote 1.54 / 2.51 (1.99 / 9.40), **edit 7.73 / 45.8 (9.62 / 125)**, **write 8.72 / 45.2 (10.5 / 55.8)**.
+- Reading it:
+  - Every version came back exact: 200 reads at an old commit and 241 checkouts (the promoted drafts fast-forward, so 201 distinct commits), both seeds.
+  - After `repack` and `gc` the store holds the whole history in 5% (seed 397) and 11% (seed 398) fewer bytes than git after `git gc`, and in 8.4% and 9.0% of the plain bytes of every version. Between repacks it grows faster: 1.5 MB after 200 sessions against git's 3.9 to 4.5 MB loose, so a store that an agent writes all day wants a repack now and then (`live --gc-every` does gc, not repack).
+  - Reads, lists, searches, status, diff, commits and drafts all answer in about 2 ms at the median and under 18 ms at p99. Edits and writes are the slow calls, 8 to 10 ms at the median and 45 to 125 ms at p99: each one re-reads and re-indexes the changed file, and the tail falls on the large tables (whole-file writes of up to about 70 KB). Not profiled further tonight.
+- Checks: docs and a script only, no kernel code; the kernel's tests are not affected. Privacy scan clean.
+- Verdict: **kept** (a measurement; no change to ikam).
+- Next: profile edit and write on a 70 KB file (re-index cost per call); a repack trigger by size for `mcp` and `live` (an option), then this run again; the same workload in the 2026-07-28 era once E406 lands.
+- Not measured: the Mac; Claude Code as the client (the SDK client stands in); concurrent agents on one store; office files changed through MCP (tools carry text only, so office files were read, not edited); more than one run per seed.
+- Run: `python3 -I experiments/agent-workload/agent_workload.py IKAM_BIN WORK 200 397` (and seed 398).
