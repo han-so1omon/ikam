@@ -133,7 +133,7 @@ const USAGE: &str = "usage: ikam [--store DIR] [--short-records] [--slow-codec-m
   write PATH [FILE|-]              store FILE (or stdin) at PATH in REF, commit
   rm PATH | mkdir PATH             remove a file or folder / make a folder in REF
   mv FROM TO | cp FROM TO          rename or copy a file or folder in REF
-  mcp [--passage-index] [--rank-files] [--file-vectors PREFIX]
+  mcp [--passage-index] [--rank-files] [--file-vectors PREFIX] [--skills [PATH]]
                                    the store as tools for an AI agent: a Model
                                    Context Protocol server on stdin/stdout (list,
                                    read, search, write, edit, commit with a
@@ -148,6 +148,9 @@ const USAGE: &str = "usage: ikam [--store DIR] [--short-records] [--slow-codec-m
                                    them; --rank-files builds its index at start
                                    (else on first use); --file-vectors PREFIX
                                    reads PREFIX.paths and PREFIX.f32 (E388, off)
+                                   --skills serves the built-in ikam-store skill
+                                   and, with PATH, each folder under PATH with a
+                                   SKILL.md at REF's head (E407, off)
   search TEXT                      files of REF whose text contains TEXT (also the
                                    text inside docx, xlsx, pdf and tar members)
   ask QUESTION [--llm]             the passages of REF that answer QUESTION best;
@@ -802,11 +805,13 @@ fn run(store_dir: &str, args: &mut Vec<String>) -> Result<(), String> {
             let passage_index = args.iter().any(|a| a == "--passage-index");
             let mut rest = args.to_vec();
             let rank = mcp::RankFlags::take(&mut rest)?;
+            let skills = mcp::take_skills(&mut rest);
             mcp::run(
                 store_dir,
                 &refname,
                 passage_index,
                 &rank,
+                skills,
                 stdin.lock(),
                 std::io::stdout().lock(),
             )?;
