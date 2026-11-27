@@ -131,6 +131,10 @@ pub struct Firing {
     /// `net_fire_step` (E441): a derivation for a pure transition, a
     /// recorded step for a command or an agent.
     pub step: Option<Id>,
+    /// The version of the net the firing ran under (E422): the id of the
+    /// net's canonical text ([`Net::version_id`]), on a net whose database
+    /// tracks versions ([`net_track_versions`](Repo::net_track_versions)).
+    pub net: Option<Id>,
 }
 
 /// The work a firing runs (E441, `net_fire_step`).
@@ -163,6 +167,14 @@ fn invalid(what: &str, name: &str) -> Error {
 impl Net {
     pub fn place(&self, name: &str) -> Option<&Place> {
         self.places.iter().find(|p| p.name == name)
+    }
+
+    /// The id this version of the net goes by (E422): the content id of
+    /// its canonical text ([`to_text`](Net::to_text)). Two nets with the
+    /// same places and transitions have the same id, whatever comments or
+    /// spacing a file holding them has.
+    pub fn version_id(&self) -> Id {
+        Id::of_content(self.to_text().as_bytes())
     }
 
     pub fn transition(&self, name: &str) -> Option<&Transition> {
@@ -477,13 +489,27 @@ fn encode_record(f: &Firing) -> Vec<u8> {
             s += &format!("{st}\n");
         }
     }
+    // Last, and only on a net that tracks versions (E422), so every other
+    // record keeps its bytes: `net <id>`, which no positional line starts
+    // with.
+    if let Some(v) = &f.net {
+        s += &format!("net {v}\n");
+    }
     s.into_bytes()
 }
 
 fn decode_record(key: &str, bytes: &[u8]) -> Result<Firing, Error> {
     let s = std::str::from_utf8(bytes).map_err(|_| Error::Decode("net firing"))?;
-    let l: Vec<&str> = s.lines().collect();
+    let mut l: Vec<&str> = s.lines().collect();
     let id = |s: &str| s.parse::<Id>();
+    let net = match l.last().and_then(|x| x.strip_prefix("net ")) {
+        Some(v) => {
+            let v = id(v)?;
+            l.pop();
+            Some(v)
+        }
+        None => None,
+    };
     if !(4..=6).contains(&l.len()) {
         return Err(Error::Decode("net firing"));
     }
@@ -495,6 +521,7 @@ fn decode_record(key: &str, bytes: &[u8]) -> Result<Firing, Error> {
         after: id(l[3])?,
         output: l.get(4).map(|o| id(o)).transpose()?,
         step: l.get(5).map(|o| id(o)).transpose()?,
+        net,
     })
 }
 
@@ -1001,6 +1028,7 @@ impl<S: Store> Repo<S> {
         }
         let p = prefix(&net.name);
         let rec_key = format!("{p}fire/{key}");
+        let version = self.tracked_version(db, net)?;
         if let Some(bytes) = self.db_get(db, &rec_key)? {
             let f = decode_record(key, &bytes)?;
             let same_output = match output {
@@ -1011,6 +1039,7 @@ impl<S: Store> Repo<S> {
                 || f.token.as_deref() != token
                 || !same_output
                 || f.step != step
+                || f.net != version
             {
                 return Err(Error::IdempotencyConflict(rec_key));
             }
@@ -1020,7 +1049,7 @@ impl<S: Store> Repo<S> {
             .transition(transition)
             .ok_or_else(|| invalid("transition", transition))?;
         if let Some(h) = self.hash_state(db, &net.name)? {
-            return self.fire_sum(db, net, t, token, key, output, step, h);
+            return self.fire_sum(db, net, t, token, key, output, step, version, h);
         }
         let before = self.net_marking(db, &net.name)?;
         let after = net
@@ -1039,6 +1068,7 @@ impl<S: Store> Repo<S> {
             after: marking_id(&after),
             output,
             step,
+            net: version,
         };
         let mut events = Vec::new();
         let places: std::collections::BTreeSet<&String> =
@@ -1097,6 +1127,7 @@ impl<S: Store> Repo<S> {
         key: &str,
         output: Option<&[u8]>,
         step: Option<Id>,
+        version: Option<Id>,
         mut acc: Acc,
     ) -> Result<(Db, Firing), Error> {
         let before = acc.digest();
@@ -1168,6 +1199,7 @@ impl<S: Store> Repo<S> {
             after,
             output,
             step,
+            net: version,
         };
         let hk = match acc {
             Acc::Sum(_) => format!("{p}hash"),
@@ -1216,6 +1248,191 @@ impl<S: Store> Repo<S> {
             }
             None => Ok(None),
         }
+    }
+
+    /// Store `net` as a file (E422): its canonical text at `path` in tree
+    /// `root` (None: an empty tree), as any other file is stored, so it is
+    /// versioned by commits, diffed and fragmented as text, and a tree may
+    /// hold any number of nets. Returns the new tree and the net's
+    /// [`version_id`](Net::version_id).
+    pub fn put_net_file(
+        &mut self,
+        root: Option<Id>,
+        path: &str,
+        net: &Net,
+    ) -> Result<(Id, Id), Error> {
+        net.check()?;
+        let id = self.put_content(net.to_text().as_bytes())?.id;
+        let edit = crate::worktree::Edit::Put {
+            path: path.into(),
+            id,
+        };
+        Ok((self.edit_tree(root, &[edit])?, id))
+    }
+
+    /// The net held as a file at `path` in `rev` (a commit or a tree): the
+    /// version that commit holds. The file may be written by hand, comments
+    /// and all; it is parsed with [`Net::parse`].
+    pub fn net_file(&self, rev: &Id, path: &str) -> Result<Net, Error> {
+        let mut tree = crate::snapshot::tree_of(self, rev)?;
+        let parts = crate::worktree::split_path(path)?;
+        let (last, dirs) = parts.split_last().expect("split_path is never empty");
+        let entry = |r: &Self, t: &Id, name: &str, kind: crate::Kind| -> Result<Id, Error> {
+            let crate::Object::Tree(entries) = r.get(t)? else {
+                return Err(Error::WrongKind(*t));
+            };
+            (entries.into_iter())
+                .find(|e| e.name == name && e.kind == kind)
+                .map(|e| e.id)
+                .ok_or_else(|| Error::InvalidName(path.into()))
+        };
+        for d in dirs {
+            tree = entry(self, &tree, d, crate::Kind::Tree)?;
+        }
+        let id = entry(self, &tree, last, crate::Kind::File)?;
+        let bytes = self.read_content(&id)?;
+        Net::parse(std::str::from_utf8(&bytes).map_err(|_| Error::Decode("net text"))?)
+    }
+
+    /// Every net held as a file in `rev` (paths ending `.net`), in path
+    /// order, with the file's content id.
+    pub fn net_files(&self, rev: &Id) -> Result<Vec<(String, Id)>, Error> {
+        let mut out = Vec::new();
+        let mut stack = vec![(String::new(), crate::snapshot::tree_of(self, rev)?)];
+        while let Some((dir, t)) = stack.pop() {
+            let crate::Object::Tree(entries) = self.get(&t)? else {
+                return Err(Error::WrongKind(t));
+            };
+            for e in entries {
+                let path = match dir.is_empty() {
+                    true => e.name.clone(),
+                    false => format!("{dir}/{}", e.name),
+                };
+                match e.kind {
+                    crate::Kind::Tree => stack.push((path, e.id)),
+                    crate::Kind::File if e.name.ends_with(".net") => out.push((path, e.id)),
+                    _ => {}
+                }
+            }
+        }
+        out.sort();
+        Ok(out)
+    }
+
+    /// The net whose [`version_id`](Net::version_id) is `id`, read back
+    /// from the store.
+    pub fn net_version(&self, id: &Id) -> Result<Net, Error> {
+        let bytes = self.read_content(id)?;
+        let net = Net::parse(std::str::from_utf8(&bytes).map_err(|_| Error::Decode("net text"))?)?;
+        if net.version_id() != *id {
+            return Err(Error::Decode("net version: not a net's canonical text"));
+        }
+        Ok(net)
+    }
+
+    /// Track versions on `net` (E422; off unless called): from here on each
+    /// firing records the version of the net it was fired with (one more
+    /// line on its record), and that version's text is kept, so the net can
+    /// be edited while it runs and every firing still replays against the
+    /// version it ran under ([`net_replay_versions`](Repo::net_replay_versions)).
+    /// Call after `net_init` (or a hashed init) of this same version, before
+    /// the first firing. An edited version fires on the same marking: its
+    /// new places start empty, and initial tokens count only at init.
+    pub fn net_track_versions(&mut self, db: &Db, net: &Net) -> Result<Db, Error> {
+        net.check()?;
+        let p = prefix(&net.name);
+        let key = format!("{p}ver");
+        let id = self.put_content(net.to_text().as_bytes())?.id;
+        if let Some(v) = self.db_get(db, &key)? {
+            if v == id.to_string().as_bytes() {
+                return Ok(*db);
+            }
+            return Err(invalid("net tracks versions from another", &net.name));
+        }
+        match self.db_get(db, &format!("{p}init"))? {
+            Some(m) if m == marking_bytes(&net.initial_marking()) => {}
+            Some(_) => return Err(invalid("net was initialized by another version", &net.name)),
+            None => return Err(invalid("net is not initialized", &net.name)),
+        }
+        if !self
+            .db_prefix(db, &format!("{p}fire/"), 1, false)?
+            .is_empty()
+        {
+            return Err(invalid("net fired before tracking versions", &net.name));
+        }
+        self.db_append(db, &[Event::upsert(&key, id.to_string().as_bytes(), &key)])
+    }
+
+    /// The version of the net that tracking started from, if it tracks
+    /// versions.
+    pub fn net_first_version(&self, db: &Db, net: &str) -> Result<Option<Id>, Error> {
+        match self.db_get(db, &format!("{}ver", prefix(net)))? {
+            Some(v) => Ok(Some(
+                std::str::from_utf8(&v)
+                    .map_err(|_| Error::Decode("net version"))?
+                    .parse()?,
+            )),
+            None => Ok(None),
+        }
+    }
+
+    /// On a net that tracks versions, the version `net` is, its text kept
+    /// so replay can read it back; None on any other net.
+    fn tracked_version(&mut self, db: &Db, net: &Net) -> Result<Option<Id>, Error> {
+        if self
+            .db_get(db, &format!("{}ver", prefix(&net.name)))?
+            .is_none()
+        {
+            return Ok(None);
+        }
+        Ok(Some(self.put_content(net.to_text().as_bytes())?.id))
+    }
+
+    /// Recompute the marking of a net that tracks versions from the
+    /// recorded firings alone, each against the version of the net it
+    /// names (read back from the store), checking every record's before
+    /// and after hashes. It must equal `net_marking`, however often the
+    /// net was edited between firings.
+    pub fn net_replay_versions(&self, db: &Db, name: &str) -> Result<Marking, Error> {
+        let first = self
+            .net_first_version(db, name)?
+            .ok_or_else(|| invalid("net does not track versions", name))?;
+        let hash: fn(&Marking) -> Id = match self.hash_state(db, name)? {
+            Some(Acc::Sum(_)) => sum_hash,
+            Some(Acc::Lt(_)) => lt_hash,
+            None => marking_id,
+        };
+        let mut nets: std::collections::HashMap<Id, Net> = Default::default();
+        let mut m = self.net_version(&first)?.initial_marking();
+        for f in self.net_firings(db, name)? {
+            let v = f
+                .net
+                .ok_or(Error::Decode("net replay: firing names no version"))?;
+            if let std::collections::hash_map::Entry::Vacant(e) = nets.entry(v) {
+                let net = self.net_version(&v)?;
+                if net.name != name {
+                    return Err(Error::Decode("net replay: version of another net"));
+                }
+                e.insert(net);
+            }
+            let net = &nets[&v];
+            let t = net
+                .transition(&f.transition)
+                .ok_or_else(|| invalid("recorded transition", &f.transition))?;
+            if hash(&m) != f.before {
+                return Err(Error::Decode("net replay: marking before differs"));
+            }
+            m = net
+                .fire(&m, t, f.token.as_deref())
+                .ok_or(Error::Decode("net replay: recorded firing not enabled"))?;
+            if hash(&m) != f.after {
+                return Err(Error::Decode("net replay: marking after differs"));
+            }
+            if let Some(o) = &f.output {
+                self.read_content(o)?;
+            }
+        }
+        Ok(m)
     }
 
     /// The firings recorded for `net`, in log order.
