@@ -5,6 +5,7 @@
 //! See docs/plans/2026-10-02-rust-kernel.md for the layer laws.
 
 mod abbrev;
+pub mod answers;
 pub mod backends;
 pub mod bm25;
 mod claims;
