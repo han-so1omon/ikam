@@ -139,7 +139,7 @@ fn unhex(s: &str) -> Option<Vec<u8>> {
 }
 
 /// Standard base64, padding optional.
-fn base64(s: &str) -> Option<Vec<u8>> {
+pub(crate) fn base64(s: &str) -> Option<Vec<u8>> {
     let val = |c: u8| -> Option<u32> {
         Some(match c {
             b'A'..=b'Z' => c - b'A',

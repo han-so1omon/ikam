@@ -21,7 +21,8 @@
 //! - `GET /shares`, `POST /shares/revoke?name=`, `POST /shares/accept?name=`
 //!   (source owner; accept merges a proposal branch into the project).
 //! - `/from/SOURCE/SHARE/ACTION` on the receiving project: `files`,
-//!   `read?path=[&range=A-B]`, `search?q=`, `records?start=&end=`,
+//!   `read?path=[&range=A-B]`, `search?q=`, `records?start=&end=` (pairs
+//!   `[key, value]`; a value that is not UTF-8 is `{"base64":"..."}`, E434),
 //!   `fragment?id=`, `nodes?prefix=` (read role), `propose?path=` with the
 //!   new bytes as body (write role, propose right), and `merge[?into=REF]`
 //!   (receiver owner, merge right). Every refusal of a share answers 404,
@@ -677,12 +678,7 @@ impl Host {
                     .map(|rows| {
                         ok_json(Json::Arr(
                             rows.into_iter()
-                                .map(|(k, v)| {
-                                    Json::Arr(vec![
-                                        Json::Str(k),
-                                        Json::Str(String::from_utf8_lossy(&v).into_owned()),
-                                    ])
-                                })
+                                .map(|(k, v)| Json::Arr(vec![Json::Str(k), crate::json::value(&v)]))
                                 .collect(),
                         ))
                     })
@@ -1263,6 +1259,63 @@ mod tests {
             h.handle(req("PUT", "a.localhost", OA, "/dav/big", &big))
                 .status,
             201
+        );
+        done(dirs);
+    }
+
+    #[test]
+    fn records_shares_answer_binary_values_exactly() {
+        let (h, dirs) = host("records-b64");
+        let rows = crate::dbserve::tests::binary_values();
+        {
+            let mut l = h.projects["a"].live.lock().unwrap();
+            let refname = l.refname.clone();
+            let events: Vec<ikam_kernel::Event> = rows
+                .iter()
+                .map(|(k, v)| ikam_kernel::Event::upsert(k, v, k))
+                .collect();
+            let db = l.repo.db_empty().unwrap();
+            let db = l.repo.db_append(&db, &events).unwrap();
+            l.repo.db_commit(&refname, &db, "records").unwrap();
+            l.sync().unwrap();
+        }
+        let issue = h.handle(req(
+            "POST",
+            "a.localhost",
+            OA,
+            "/shares/issue?name=rec&to=b&scope=records:..&right=read&expires=600",
+            b"",
+        ));
+        assert_eq!(
+            issue.status,
+            200,
+            "{}",
+            String::from_utf8_lossy(&issue.body)
+        );
+        let get = |q: &str| h.handle(req("GET", "b.localhost", OB, q, b""));
+        let r = get("/from/a/rec/records");
+        assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
+        let j = crate::json::parse(std::str::from_utf8(&r.body).unwrap()).unwrap();
+        let back: Vec<(String, Vec<u8>)> = j
+            .as_arr()
+            .iter()
+            .map(|p| {
+                let p = p.as_arr();
+                let k = p[0].as_str().unwrap().to_string();
+                (k, crate::json::value_bytes(&p[1]).unwrap())
+            })
+            .collect();
+        assert_eq!(back, rows);
+        // UTF-8 values answer as they did before E434, byte for byte.
+        let utf8 = get("/from/a/rec/records?start=u/");
+        assert_eq!(
+            String::from_utf8(utf8.body).unwrap(),
+            r#"[["u/empty",""],["u/marker","{\"base64\":\"AAEC\"}"],["u/text","plain été 😀 \"q\"\n"]]"#
+        );
+        let lone = get("/from/a/rec/records?start=b/lone&end=b/lone0");
+        assert_eq!(
+            String::from_utf8(lone.body).unwrap(),
+            r#"[["b/lone",{"base64":"gA=="}]]"#
         );
         done(dirs);
     }
