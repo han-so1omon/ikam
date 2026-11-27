@@ -7,7 +7,9 @@
 //! - `Path`: the files under a prefix;
 //! - `Section`: byte ranges of one file version (as section grants, E140);
 //! - `Fragments`: listed fragments (content ids), as fragment grants (E155);
-//! - `Records`: a key range of the database at the share's commit;
+//! - `Records`: a key range of the database at the share's commit; with
+//!   `content` (E437, off unless issued so), also the content each of those
+//!   records names (a value that is a content id, see [`named_content`]);
 //! - `Graph`: the nodes under a label prefix of a graph at a path.
 //!
 //! A [`Share`] gives one receiving project a [`Right`] on a scope, pinned to
@@ -29,7 +31,9 @@
 //! ranges, joined in order; a `Fragments` import is `fragments/<id>` for
 //! each fragment; a `Graph` import is a graph at its path with the share's
 //! nodes, each node's bytes put again (a range as its own content) and
-//! only the edges among them (E365).
+//! only the edges among them (E365). A `Records` import with `content`
+//! also puts each named content again as `content/<id>` beside the
+//! database, so the ids its records hold resolve in the receiver (E437).
 
 use std::ops::Range;
 
@@ -54,6 +58,10 @@ pub enum Scope {
     Records {
         start: String,
         end: Option<String>,
+        /// E437: also carry the content the scope's records name. Encoded
+        /// as its own scope kind, so a share without it encodes (and seals)
+        /// as before, and an older reader refuses one with it.
+        content: bool,
     },
     Graph {
         path: String,
@@ -134,8 +142,12 @@ impl Share {
                 out.extend_from_slice(&(ids.len() as u64).to_le_bytes());
                 ids.iter().for_each(|i| out.extend_from_slice(i.as_bytes()));
             }
-            Scope::Records { start, end } => {
-                out.push(3);
+            Scope::Records {
+                start,
+                end,
+                content,
+            } => {
+                out.push(if *content { 5 } else { 3 });
                 put_bytes(&mut out, start.as_bytes());
                 match end {
                     Some(e) => {
@@ -188,14 +200,18 @@ impl Share {
                 }
                 Scope::Fragments(ids)
             }
-            3 => {
+            kind @ (3 | 5) => {
                 let start = r.text()?;
                 let end = match r.byte()? {
                     0 => None,
                     1 => Some(r.text()?),
                     _ => return None,
                 };
-                Scope::Records { start, end }
+                Scope::Records {
+                    start,
+                    end,
+                    content: kind == 5,
+                }
             }
             4 => Scope::Graph {
                 path: r.text()?,
@@ -268,6 +284,21 @@ fn under(path: &str, prefix: &str) -> bool {
     prefix.is_empty()
         || path == prefix
         || (path.starts_with(prefix) && path.as_bytes().get(prefix.len()) == Some(&b'/'))
+}
+
+/// The content id a record value names, if the whole value is one: its 32
+/// bytes, or its 64 lowercase hex digits (E437). Ids inside a longer value
+/// are not looked for.
+pub fn named_content(value: &[u8]) -> Option<Id> {
+    match value.len() {
+        32 => Some(Id::from_bytes(value.try_into().ok()?)),
+        64 => {
+            let hex = std::str::from_utf8(value).ok()?;
+            let id: Id = hex.parse().ok()?;
+            (id.to_hex() == hex).then_some(id)
+        }
+        _ => None,
+    }
 }
 
 fn key_of(name: &str) -> String {
@@ -438,9 +469,14 @@ impl<S: Store> Repo<S> {
                     n += self.read_content(&id)?.len();
                 }
             }
-            Scope::Records { .. } => {
+            Scope::Records { content, .. } => {
                 for (k, v) in self.share_records(share, "", None)? {
                     n += k.len() + v.len();
+                }
+                if *content {
+                    for id in self.share_named_content(share)? {
+                        n += self.read_content(&id)?.len();
+                    }
                 }
             }
             Scope::Section { id, ranges, .. } => {
@@ -522,7 +558,10 @@ impl<S: Store> Repo<S> {
         start: &str,
         end: Option<&str>,
     ) -> Result<Vec<(String, Vec<u8>)>, Refused> {
-        let Scope::Records { start: s, end: e } = &share.scope else {
+        let Scope::Records {
+            start: s, end: e, ..
+        } = &share.scope
+        else {
             return Err(Refused::Outside);
         };
         let lo = start.max(s.as_str()).to_string();
@@ -535,6 +574,44 @@ impl<S: Store> Repo<S> {
         }
         let db = self.db_at(&share.commit)?;
         Ok(self.db_range(&db, &lo, hi, usize::MAX, false)?)
+    }
+
+    /// The content ids named by the records of a `Records` share with
+    /// `content`, that this store holds as content, sorted and without
+    /// repeats (E437). A named id that is not content here (missing, or a
+    /// tree, graph or commit) is left out: only bytes are ever carried.
+    /// Each named content is read once here to tell it from an object.
+    pub fn share_named_content(&mut self, share: &Share) -> Result<Vec<Id>, Refused> {
+        let Scope::Records { content: true, .. } = &share.scope else {
+            return Err(Refused::Outside);
+        };
+        let mut ids = std::collections::BTreeSet::new();
+        for (_, v) in self.share_records(share, "", None)? {
+            if let Some(id) = named_content(&v)
+                && !ids.contains(&id)
+                && self.has_content(&id)?
+            {
+                // `has_content` is also true of a stored tree or graph,
+                // which reads back as `WrongKind`: not content, left out.
+                match self.read_content(&id) {
+                    Ok(_) => {
+                        ids.insert(id);
+                    }
+                    Err(Error::WrongKind(_)) => {}
+                    Err(e) => return Err(e.into()),
+                }
+            }
+        }
+        Ok(ids.into_iter().collect())
+    }
+
+    /// The bytes of content `id` through a `Records` share with `content`,
+    /// only if one of its records names it (E437).
+    pub fn share_content(&mut self, share: &Share, id: &Id) -> Result<Vec<u8>, Refused> {
+        if self.share_named_content(share)?.binary_search(id).is_err() {
+            return Err(Refused::Outside);
+        }
+        Ok(self.read_content(id)?)
     }
 
     /// Graph nodes whose labels start with `prefix`, clipped to a `Graph`
@@ -730,7 +807,12 @@ pub fn import_share_with<S: Store, T: Store>(
                 let empty = dst.edit_tree(None, &[])?;
                 dst.commit(&import, empty, &note)?;
             }
-            dst.db_commit(&import, &db, &note)?
+            match &share.scope {
+                Scope::Records { content: true, .. } => {
+                    import_content(src, share, dst, &import, &db, &note)?
+                }
+                _ => dst.db_commit(&import, &db, &note)?,
+            }
         }
         // E365: the other scopes import what a reader of the share sees,
         // as a fresh tree each time (the scope's state at the share's
@@ -778,6 +860,47 @@ pub fn import_share_with<S: Store, T: Store>(
         return Ok(Merged::FastForward(head));
     }
     Ok(dst.merge_with(into, &import, message, opts)?)
+}
+
+/// Commit `db` on the import ref with `content/<id>` beside it for each
+/// content the share's records name (E437): what was there from an earlier
+/// import is replaced, so a content no record names any more goes.
+fn import_content<S: Store, T: Store>(
+    src: &mut Repo<S>,
+    share: &Share,
+    dst: &mut Repo<T>,
+    import: &str,
+    db: &Db,
+    note: &str,
+) -> Result<Id, Refused> {
+    let mut files = Vec::new();
+    for id in src.share_named_content(share)? {
+        let put = dst.put_content(&src.read_content(&id)?)?.id;
+        if put != id {
+            return Err(Refused::Store(format!("{id}: put again as {put}")));
+        }
+        files.push(crate::TreeEntry {
+            name: id.to_hex(),
+            kind: Kind::File,
+            id,
+        });
+    }
+    let head = dst.store.get_ref(import)?.ok_or(Refused::NotMergeable)?;
+    let Object::Tree(mut entries) = dst.get(&dst.tree_at(&head)?)? else {
+        return Err(Refused::Store(format!("{head}: not a tree")));
+    };
+    entries.retain(|e| e.name != "db" && e.name != "content");
+    if !files.is_empty() {
+        let id = dst.put(&Object::tree(files)?)?;
+        entries.push(crate::TreeEntry {
+            name: "content".into(),
+            kind: Kind::Tree,
+            id,
+        });
+    }
+    entries.push(dst.db_entry(db)?);
+    let tree = dst.put(&Object::tree(entries)?)?;
+    Ok(dst.commit(import, tree, note)?)
 }
 
 /// Whether `path` lands in the top-level `db` entry, which a commit keeps

@@ -18,7 +18,9 @@
 //!
 //! - `POST /shares/issue?name=&to=&scope=&right=&expires=` (source owner):
 //!   pin the current commit; `scope` is `path:PREFIX`, `section:PATH@A-B,..`,
-//!   `fragments:ID,..`, `records:START..END` (END may be empty) or
+//!   `fragments:ID,..`, `records:START..END` (END may be empty),
+//!   `records-content:START..END` (E437: records, and the content each of
+//!   them names, which a merge copies as `content/<id>`) or
 //!   `graph:PATH:PREFIX`; `right` is `read`, `propose` or `merge`; `expires`
 //!   is seconds from now.
 //! - `GET /shares`, `POST /shares/revoke?name=`, `POST /shares/accept?name=`
@@ -26,7 +28,8 @@
 //! - `/from/SOURCE/SHARE/ACTION` on the receiving project: `files`,
 //!   `read?path=[&range=A-B]`, `search?q=`, `records?start=&end=` (pairs
 //!   `[key, value]`; a value that is not UTF-8 is `{"base64":"..."}`, E434),
-//!   `fragment?id=`, `nodes?prefix=` (read role), `propose?path=` with the
+//!   `fragment?id=`, `content?id=` (a records-content share), `nodes?prefix=`
+//!   (read role), `propose?path=` with the
 //!   new bytes as body (write role, propose right), and `merge[?into=REF]`
 //!   (receiver owner, merge right). Every refusal of a share answers 404,
 //!   as if the share did not exist.
@@ -1043,6 +1046,12 @@ impl Host {
                         ))
                     })
             }
+            "content" => match req.param("id").and_then(|i| i.parse::<Id>().ok()) {
+                Some(id) => repo
+                    .share_content(&share, &id)
+                    .map(|b| Response::new(200).body("application/octet-stream", b)),
+                None => return Response::text(400, "id=HEX"),
+            },
             "fragment" => match req.param("id").and_then(|i| i.parse::<Id>().ok()) {
                 Some(id) => repo
                     .share_fragment(&share, &id)
@@ -1250,11 +1259,12 @@ fn parse_scope(l: &mut Live, s: &str) -> Result<Scope, String> {
                 .map(|i| i.parse::<Id>().map_err(|_| format!("not an id: {i}")))
                 .collect::<Result<_, _>>()?,
         ),
-        "records" => {
+        "records" | "records-content" => {
             let (start, end) = rest.split_once("..").ok_or("records:START..END")?;
             Scope::Records {
                 start: start.into(),
                 end: (!end.is_empty()).then(|| end.into()),
+                content: kind == "records-content",
             }
         }
         "graph" => {
@@ -1264,7 +1274,11 @@ fn parse_scope(l: &mut Live, s: &str) -> Result<Scope, String> {
                 prefix: prefix.into(),
             }
         }
-        _ => return Err("scope kinds: path, section, fragments, records, graph".into()),
+        _ => {
+            return Err(
+                "scope kinds: path, section, fragments, records, records-content, graph".into(),
+            );
+        }
     })
 }
 
@@ -2008,6 +2022,52 @@ mod tests {
             String::from_utf8(lone.body).unwrap(),
             r#"[["b/lone",{"base64":"gA=="}]]"#
         );
+        done(dirs);
+    }
+
+    #[test]
+    fn records_content_shares_serve_and_merge_named_content() {
+        let (h, dirs) = host("records-content");
+        let (named, other) = {
+            let mut l = h.projects["a"].live.lock().unwrap();
+            let named = l.repo.put_content(b"a state").unwrap().id;
+            let other = l.repo.put_content(b"not named").unwrap().id;
+            let refname = l.refname.clone();
+            let db = l.repo.db_empty().unwrap();
+            let events = [
+                ikam_kernel::Event::upsert("runs/1/state", named.as_bytes(), "1"),
+                ikam_kernel::Event::upsert("lab/1/state", other.as_bytes(), "2"),
+            ];
+            let db = l.repo.db_append(&db, &events).unwrap();
+            l.repo.db_commit(&refname, &db, "records").unwrap();
+            l.sync().unwrap();
+            (named, other)
+        };
+        let issue = h.handle(req(
+            "POST",
+            "a.localhost",
+            OA,
+            "/shares/issue?name=rc&to=b&scope=records-content:runs/..runs0&right=merge&expires=600",
+            b"",
+        ));
+        assert_eq!(
+            issue.status,
+            200,
+            "{}",
+            String::from_utf8_lossy(&issue.body)
+        );
+        let get = |q: &str| h.handle(req("GET", "b.localhost", OB, q, b""));
+        let r = get(&format!("/from/a/rc/content?id={named}"));
+        assert_eq!((r.status, r.body), (200, b"a state".to_vec()));
+        assert_eq!(get(&format!("/from/a/rc/content?id={other}")).status, 404);
+        let m = h.handle(req("POST", "b.localhost", OB, "/from/a/rc/merge", b""));
+        assert_eq!(m.status, 200, "{}", String::from_utf8_lossy(&m.body));
+        let mut l = h.projects["b"].live.lock().unwrap();
+        l.sync().unwrap();
+        assert_eq!(l.repo.read_content(&named).unwrap(), b"a state");
+        assert!(!l.repo.has_content(&other).unwrap());
+        assert!(l.repo.fsck().unwrap().is_empty());
+        drop(l);
         done(dirs);
     }
 
