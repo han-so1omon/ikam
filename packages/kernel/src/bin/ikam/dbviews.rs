@@ -241,6 +241,9 @@ pub struct Served {
     /// E381: the views' chunks are stored as they are, not planned as
     /// slices of the chunks they replace (`Repo::plain_hot_writes`).
     plain: bool,
+    /// E399: the views' graph chunk bounds (`Repo::graph_cut`), when not
+    /// the default: smaller chunks, so a change rewrites fewer bytes.
+    cut: Option<(usize, usize)>,
 }
 
 /// The ref a database's kept views live on (E380).
@@ -269,6 +272,7 @@ impl Served {
             from_ref: Mutex::new(HashSet::new()),
             no_ref: Mutex::new(HashSet::new()),
             plain: false,
+            cut: None,
         })
     }
 
@@ -280,13 +284,24 @@ impl Served {
     /// The rules as kept views record them: views kept for other rules are
     /// built again.
     fn rules_text(&self) -> String {
-        format!("{:?}", self.rules)
+        match self.cut {
+            None => format!("{:?}", self.rules),
+            Some(c) => format!("{:?} cut {c:?}", self.rules),
+        }
     }
 
     /// Store the views' chunks plain (E381): a view update after a change
     /// skips planning slices against the old chunks, for a larger store.
     pub fn plain_writes(mut self, plain: bool) -> Served {
         self.plain = plain;
+        self
+    }
+
+    /// Cut the views' graphs into chunks of at most `max` encoded bytes
+    /// (E399; no chunk ends before `max / 8`). Kept views cut otherwise are
+    /// built again.
+    pub fn chunk(mut self, max: Option<usize>) -> Served {
+        self.cut = max.map(|m| (m / 8, m));
         self
     }
 
@@ -328,9 +343,14 @@ impl Served {
         // E381: the views' chunks stored plain, for the writes below only.
         let plain = writer.plain_hot_writes;
         writer.plain_hot_writes |= self.plain;
+        let cut = writer.graph_cut;
+        if let Some(c) = self.cut {
+            writer.graph_cut = c;
+        }
         let state = match kept {
             Some(s) if s.db == *db => {
                 writer.plain_hot_writes = plain;
+                writer.graph_cut = cut;
                 self.states
                     .lock()
                     .unwrap()
@@ -358,6 +378,7 @@ impl Served {
             }
         };
         writer.plain_hot_writes = plain;
+        writer.graph_cut = cut;
         let state = state?;
         // Views that cannot be kept are still served; the next restart
         // builds them again.

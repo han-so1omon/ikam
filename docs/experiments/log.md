@@ -6981,3 +6981,22 @@ Gates on the branch (E229 to E233): every kernel test suite passes (release); cl
 - Verdict: **kept** (an option, off: memory that stops growing with the load, for a store read on each derivation lookup and a 4 to 8% slower load here).
 - Not measured: the Mac; a workload heavy in derivation lookups (repack of a large store, the library's walks), where each lookup now reads records; more than one load run each; a mixed read and write load (E393).
 - Run: `python3 -I experiments/seed-index/load_mem.py IKAM_BIN WORK 1000000 100000 "--live --seed-index-max 50000;--live --seed-index-max 50000 --lean-ledger;--live;--live --lean-ledger"`, and `python3 -I experiments/lean-ledger/read_lat.py IKAM_BIN WORK 200000 3000 "--live;--live --lean-ledger"`.
+### E399 view-chunk (a smaller chunk target for served views: `db serve --view-chunk BYTES`)
+
+- Branch / parent: exp/399-view-chunks / main 437aef6
+- Question: E381 left the rest of a served view's update after a change (zstd and BLAKE3 on each rewritten index chunk) for later and named a smaller chunk target as one way to cut it. A change to 100 rows rewrites every index chunk those rows fall in, and a chunk is up to 32 KiB, so each update compresses and hashes far more than it changed. Does a smaller target for the views' chunks alone bring the lookup after a change below E381's 59 ms (plain) and 127 ms (planned), and for how much store? (Night 3 of the trip-week plan; business case: databases on ikam with mixed write and read traffic.)
+- Change: `graph.rs`'s content-defined cutting takes its bounds as an argument (`GRAPH_CHUNK`, the old 4 KiB and 32 KiB, is the default), and `Repo::graph_cut` holds them; `sibling` copies them. `db serve --view-chunk BYTES` (off; needs `--views`; 1K to 1M) sets `Served::chunk`: while the served views build or update, `graph_cut` is BYTES/8 to BYTES and is restored after, as `--plain-view-writes` does with `plain_hot_writes`. A graph has to be edited with the bounds it was built with (`splice` re-cuts until a new boundary meets an old one), so the bounds are part of a view's rules text and kept views (`--keep-views`, E380) built with other bounds are built afresh. The database's own graphs keep the default.
+- Checks: `views_follow_appends_and_match_a_build_at_the_head` now runs four ways (planned and plain, with no option, 1 KiB and 2 KiB): the updated views give the same rows as a build at the head. With the option off a fresh store's ingest and a 200k-row store's first view build give byte-identical stores on main and on this branch. `cargo test --release --features embed`: 376 pass, 0 fail; clippy `-D warnings` clean.
+- Run (Linux cloud, 4 CPUs; `experiments/view-writes/view_edit.py` as in E381, 100 rounds of 100 changed rows, a point read, a lookup; the 200k-row store is now made by `experiments/view-writes/make_store.py`, which needs no PostgreSQL). Main 437aef6 and this branch in the same session:
+
+  | rows changed a round | writes | main | 8 KiB | 4 KiB | 2 KiB |
+  | --- | --- | --- | --- | --- | --- |
+  | 100 neighbours | planned | 127.3 ms (112.4 again), 33.5 MB | 73.2 ms, 39.6 MB | 62.3 ms, 44.0 MB | 57.2 ms, 49.3 MB |
+  | 100 neighbours | plain | 57.5 ms (50.1 again), 47.6 MB | 39.4 ms, 48.0 MB | 36.7 ms (36.0 again), 50.7 MB | 31.6 ms, 53.0 MB |
+  | 100 from 100 batches | planned | 147.0 ms, 43.2 MB | 103.9 ms, 49.5 MB | 96.5 ms, 53.6 MB | - |
+  | 100 from 100 batches | plain | 81.8 ms, 56.8 MB | 65.0 ms, 57.8 MB | 62.1 ms, 60.1 MB | - |
+
+  Each cell is the lookup p50 after a change and how much the store grew over the 10,000 changes. Lookup max fell with it (neighbours, plain: 104 to 76 ms at 4 KiB). The first lookup (the build), the point read that folds the changes and the appends are about the same with or without the option.
+- Fixed benchmark (AGENTS.md section 7): unchanged. With the option off the bounds are the old constants, every graph is cut as before, and the stores above are byte-identical; the option is in the server binary only and off by default.
+- Verdict: **kept** as an option (off by default). 4 KiB is about half the lookup after a change, planned (127 to 62 ms) and plain (58 to 37 ms), below E381's line both ways; it costs 3 to 11 MB more store over 10,000 changed rows here, and smaller chunks mean more objects for a cold read of a whole view.
+- Not measured: the Mac; more than 200k rows; a cold scan of a whole view with small chunks; with `--keep-views` across a restart; what `gc` gives back; a cheaper codec for view chunks (the other E381 idea).
