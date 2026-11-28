@@ -189,7 +189,7 @@ fn new_repo(form: Form) -> Repo<MemStore> {
         )
     {
         let (a, b) = v.split_once(',').unwrap();
-        repo.graph_chunk = (a.parse().unwrap(), b.parse().unwrap());
+        repo.graph_chunks = ikam_kernel::ChunkSizes::uniform(a.parse().unwrap(), b.parse().unwrap());
     }
     repo.short_records = std::env::var("E447_SHORT").is_ok();
     if std::env::var("E447_NOTPL").is_ok() {

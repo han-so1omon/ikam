@@ -25,8 +25,6 @@ pub type NodeChange = (String, Option<Node>, Option<Node>);
 const MIN_CHUNK: usize = 4096;
 /// Every chunk ends by this many encoded bytes.
 const MAX_CHUNK: usize = 32768;
-/// The default `Repo::graph_chunk` (E447).
-pub(crate) const CHUNK_SIZES: (usize, usize) = (MIN_CHUNK, MAX_CHUNK);
 
 /// Whether two labels of a graph may share a key (see `node_key`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -40,10 +38,40 @@ pub enum Keys {
     Any,
 }
 
+/// Bounds on a prolly tree's chunk sizes, in encoded bytes (E448): `leaf`
+/// for node chunks, `parent` for the levels above. The default is the
+/// store's fixed rule, 4 KiB to 32 KiB at every level; other bounds give
+/// other (equally valid) trees of the same graph, so one graph has one
+/// root per setting.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ChunkSizes {
+    pub leaf: (usize, usize),
+    pub parent: (usize, usize),
+}
+
+impl ChunkSizes {
+    /// The same bounds at every level (E447's `(min, max)`).
+    pub fn uniform(min: usize, max: usize) -> ChunkSizes {
+        ChunkSizes {
+            leaf: (min, max),
+            parent: (min, max),
+        }
+    }
+}
+
+impl Default for ChunkSizes {
+    fn default() -> Self {
+        ChunkSizes {
+            leaf: (MIN_CHUNK, MAX_CHUNK),
+            parent: (MIN_CHUNK, MAX_CHUNK),
+        }
+    }
+}
+
 /// True if a chunk of `size` bytes ends after the entry labelled `label`:
-/// the boundary probability rises linearly from 0 at `min` to 1 at `max`
-/// (`MIN_CHUNK` and `MAX_CHUNK` unless `Repo::graph_chunk` says other),
-/// decided by the label's hash alone.
+/// the boundary probability rises linearly from 0 at the lower bound
+/// (`MIN_CHUNK` by default) to 1 at the upper (`MAX_CHUNK`), decided by
+/// the label's hash alone.
 fn ends_chunk(label: &str, size: usize, (min, max): (usize, usize)) -> bool {
     let h = u64::from_be_bytes(node_key(label)) as f64 / u64::MAX as f64;
     size >= max || (size >= min && h < (size - min) as f64 / (max - min) as f64)
@@ -64,12 +92,12 @@ fn cut<T>(
     items: &[T],
     label: impl Fn(&T) -> &str,
     size: impl Fn(&T) -> usize,
-    sizes: (usize, usize),
+    bounds: (usize, usize),
 ) -> Vec<usize> {
     let (mut ends, mut acc) = (Vec::new(), 0);
     for (i, item) in items.iter().enumerate() {
         acc += size(item);
-        if ends_chunk(label(item), acc, sizes) {
+        if ends_chunk(label(item), acc, bounds) {
             ends.push(i + 1);
             acc = 0;
         }
@@ -105,7 +133,7 @@ impl<S: Store> Repo<S> {
         }
         let mut level: Vec<(String, Id)> = Vec::new();
         let mut start = 0;
-        for end in cut(&nodes, |n| &n.label, node_size, self.graph_chunk) {
+        for end in cut(&nodes, |n| &n.label, node_size, self.graph_chunks.leaf) {
             let chunk = nodes[start..end].to_vec();
             let first = chunk.first().map_or(String::new(), |n| n.label.clone());
             level.push((first, self.put(&Object::Graph(Graph::Nodes(chunk)))?));
@@ -121,7 +149,7 @@ impl<S: Store> Repo<S> {
         while level.len() > 1 {
             height += 1;
             let (mut parents, mut start) = (Vec::new(), 0);
-            for end in cut(&level, |c| &c.0, child_size, self.graph_chunk) {
+            for end in cut(&level, |c| &c.0, child_size, self.graph_chunks.parent) {
                 let children = level[start..end].to_vec();
                 let id = self.put(&Object::Graph(Graph::Children(height, children)))?;
                 parents.push((level[start].0.clone(), id));
@@ -503,7 +531,7 @@ impl<S: Store> Repo<S> {
 
     /// `graph_diff`, pruning shared subtrees or not as `prune` says, and
     /// counting the chunks it reads (E446).
-    pub(crate) fn graph_diff_counted(
+    pub fn graph_diff_counted(
         &self,
         a: &Id,
         b: &Id,
@@ -828,6 +856,10 @@ impl<S: Store> Repo<S> {
         load: impl Fn(&Self, &mut Upper, &Id) -> Result<Vec<T>, Error>,
         make: impl Fn(Vec<T>) -> Result<Graph, Error>,
     ) -> Result<Vec<Run>, Error> {
+        let bounds = match height {
+            0 => self.graph_chunks.leaf,
+            _ => self.graph_chunks.parent,
+        };
         let put = |r: &mut Self, items: Vec<T>| -> Result<(String, Id), Error> {
             let first = items[0].label().to_string();
             Ok((first, r.put(&Object::Graph(make(items)?))?))
@@ -855,7 +887,7 @@ impl<S: Store> Repo<S> {
                 old.push(cur);
                 for item in items {
                     acc += item.size();
-                    let ends = ends_chunk(item.label(), acc, self.graph_chunk);
+                    let ends = ends_chunk(item.label(), acc, bounds);
                     buf.push(item);
                     if ends {
                         new.push(put(self, std::mem::take(&mut buf))?);
@@ -952,7 +984,7 @@ impl<S: Store> Repo<S> {
             };
             for n in nodes.into_iter().filter(|n| !in_range(&n.label, lo, hi)) {
                 acc += node_size(&n);
-                let ends = ends_chunk(&n.label, acc, self.graph_chunk);
+                let ends = ends_chunk(&n.label, acc, self.graph_chunks.leaf);
                 buf.push(n);
                 if ends {
                     emit(self, &mut buf)?;

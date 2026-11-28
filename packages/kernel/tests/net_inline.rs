@@ -6,7 +6,7 @@
 use std::collections::BTreeMap;
 
 use ikam_kernel::net::{Arc, InlineCodec, Kind, Layout, Net, Place, Transition};
-use ikam_kernel::{Db, Edge, Edit, Graph, MemStore, Node, Object, Repo, Store, Target, node_key};
+use ikam_kernel::{ChunkSizes, Db, Edge, Edit, Graph, MemStore, Node, Object, Repo, Store, Target, node_key};
 
 const CODECS: [InlineCodec; 3] = [
     InlineCodec::Lines,
@@ -450,7 +450,7 @@ fn graphs_without_inline_nodes_keep_their_bytes() {
     assert_eq!(g.encode(), want);
     // The default chunk sizes are the ones every graph was cut with.
     let repo = Repo::new(MemStore::default());
-    assert_eq!(repo.graph_chunk, (4096, 32768));
+    assert_eq!(repo.graph_chunks, ChunkSizes::uniform(4096, 32768));
 }
 
 #[test]
@@ -458,7 +458,7 @@ fn other_chunk_sizes_give_valid_graphs_that_edit_consistently() {
     let mut repo = Repo::new(MemStore::default());
     let net = synth(3000);
     let small = repo.put_net_fragments(&net, Layout::Inline).unwrap();
-    repo.graph_chunk = (16384, 131072);
+    repo.graph_chunks = ChunkSizes::uniform(16384, 131072);
     let big = repo.put_net_fragments(&net, Layout::Inline).unwrap();
     assert_ne!(small, big);
     assert_eq!(repo.net_fragments(&big).unwrap(), net);

@@ -198,12 +198,6 @@ pub struct Repo<S: Store> {
     /// subtrees both share (same id), instead of listing every leaf of
     /// both. The same changes either way; off by default.
     pub prune_diff: bool,
-    /// E447: the encoded sizes graph leaf and parent chunks are cut
-    /// between, `(min, max)`: no chunk ends before `min` bytes, every chunk
-    /// by `max`. The default `(4096, 32768)` is what every graph was cut
-    /// with before; a graph is edited with the sizes it was built with
-    /// (other sizes still give a valid graph, but another root).
-    pub graph_chunk: (usize, usize),
     pub(crate) memo: std::sync::Mutex<Option<Memo>>,
     /// Keep up to this many bytes of contents read, rebuilt ones included,
     /// across reads (E294). 0, the default, keeps none. A content's bytes
@@ -271,6 +265,17 @@ pub struct Repo<S: Store> {
     /// scope it is ignored: that index is every stored object, read again
     /// in full when built.
     pub seed_index_max: usize,
+    /// Store a new tree's or graph chunk's content as a zstd frame against
+    /// the most related stored content ("Q"), when that scores below the
+    /// slice, template and plain plans (E448, `chunk_delta.rs`). Off by
+    /// default, when only repack writes "Q". Reads accept it either way.
+    pub object_contexts: bool,
+    /// Bounds on the chunk sizes of the prolly trees `put_graph` and the
+    /// graph edits cut (E448; E447's `(min, max)` is
+    /// `ChunkSizes::uniform(min, max)`, E451). The default is the fixed
+    /// 4 KiB to 32 KiB. A graph is edited with the bounds it was built with
+    /// (other bounds still give a valid graph, but another root).
+    pub graph_chunks: crate::graph::ChunkSizes,
     pub(crate) writing_object: bool,
     /// Keep up to this many decoded graph chunks, and what readers decode
     /// from them, across reads and versions (E449). 0, the default, keeps
@@ -346,7 +351,6 @@ impl<S: Store> Repo<S> {
             deflate_memo: None,
             read_memo: false,
             prune_diff: false,
-            graph_chunk: crate::graph::CHUNK_SIZES,
             memo: Default::default(),
             read_cache: 0,
             refresh_ledger: false,
@@ -357,6 +361,8 @@ impl<S: Store> Repo<S> {
             plain_db_events: false,
             plain_hot_writes: false,
             seed_index_max: 0,
+            object_contexts: false,
+            graph_chunks: Default::default(),
             writing_object: false,
             hints: Default::default(),
             graph_cache: 0,
@@ -727,6 +733,8 @@ impl<S: Store> Repo<S> {
         r.plain_db_events = self.plain_db_events;
         r.plain_hot_writes = self.plain_hot_writes;
         r.exact_short_search = self.exact_short_search;
+        r.object_contexts = self.object_contexts;
+        r.graph_chunks = self.graph_chunks;
         r
     }
 

@@ -6850,3 +6850,105 @@ Gates on the branch (E229 to E233): every kernel test suite passes (release); cl
   - a bound on the cache by bytes rather than count;
   - FsStore, where a cold fetch costs more and the cache would weigh more.
 - Run: `cargo run --release --example e449_net_read_path -- nets 1000,10000`, `-- fire 300`, `-- graphs 1.0`, `-- profile 1000,10000`.
+
+### E448 chunk-deltas (a rewritten graph chunk stored as a frame against the chunk it replaces, and the prolly tree's chunk bounds)
+
+- Branch / parent: exp/448-net-chunk-deltas / exp/446-net-fragments
+- Question: in E446's tree layout a version of a 10,000-transition net adds 3,098 B at the default weight, 3.7x the text file's 849 B. What does one edit rewrite, and can the bytes a version adds be brought to the text's or below, at the default and the heavy read weight, at 1,000 and 10,000 transitions, by storing a rewritten graph chunk as a delta of the chunk it replaces, by tuning the prolly tree, or by repack, while keeping the delta view (shared chunks skipped by id, every delta applied exactly) and reads of version 25 within 1.2x of E446? The owner widened the scope to general graphs: the same lever on `put_graph` objects, a sparse power-law link graph and a property graph, each through 25 versions of local edits.
+- Found before building (anatomy of a version, `examples/e448_net_chunk_deltas`, mode `anatomy`):
+  - A version rewrites 6.5 chunks at 10,000 transitions (3.8 leaves, 1.7 at level 1, 1.0 at level 2) and 4.4 at 1,000. 92% of a rewritten leaf's bytes at 10,000 (81% at 1,000) are a prefix and suffix the replaced chunk already holds.
+  - The premise that graph chunks are stored whole is wrong at the default weight: a chunk's content (`g 2 content`) is already planned as slices of earlier contents. What a version pays at 10,000 transitions (3,098 B) is 1,175 B of `concat` records (two ids, then a source id and a range for every piece, for every chunk on the path), about 1,100 B of literals, 221 B of chunk and tree wrappers and 295 B for the 7.2 new fragments. Text pays one record and one literal for the whole file. At the heavy weight (48.8) no slice pays, so every rewritten chunk is stored whole (22.5 KB).
+- Change (all options, off by default; default stored bytes and behaviour are unchanged, the fixed bench equal):
+  - `Repo::object_contexts` (new module `chunk_delta.rs`): when ingest stores the content of a tree or graph chunk, it may store it as "Q", a zstd frame with a related stored content as its context, the encoding repack already writes (E057). The base is the most related stored content the seed index finds (3 tried); when that content is itself a frame, its own base is tried in its place. The frame competes on the planner's own score (bytes plus `read_weight` times decode work) against the slice and template plans and the plain encoding, so at the heavy weight it is never chosen. Chains are capped at one step: a base is always stored plain (not "Q", "M" or "S"), so a read decodes at most one base, as for repack's frames. gc keeps a frame's base through `needs`, and ingest's drop of a stored copy checks it. A chain of frames was measured as a hack and dropped: it saved nothing (1,743 B against 1,717 at 1,000) and breaks the one-base read.
+  - `Repo::graph_chunks` (`ChunkSizes { leaf, parent }`, default `(MIN_CHUNK, MAX_CHUNK)` for both, so the default math is unchanged): the prolly tree's minimum and maximum chunk size, separately for leaves and parent levels (the fanout). `put_graph`, `graph_edit`'s splice and range drops cut with the same bounds, so an edit gives the same root as storing the edited graph whole.
+  - Repack: `unshare_trees` turned every graph chunk whose content no derivation names back into object form, so with frames it stored each version of a chunk whole again (1,000 transitions: 161.8 KB before repack, 228.1 KB after, against 152.5 KB without frames). With `object_contexts`, a content stored as a frame, or that a frame is framed against, now stays content, and repack re-plans it with the rest (after the fix, 152.4 KB at 1,000 and 1,069.6 KB at 10,000, the same as or below E446's repack). Without the option nothing changes.
+  - `graph_diff_counted` made public, so a graph's delta can count chunk reads outside the net code. The key order was left as it is (the net's node labels), and the boundary rule is E249's, with only its bounds made settable.
+- Method (`examples/e448_net_chunk_deltas`, Linux cloud, 4 CPUs shared with other builds (load about 7 to 8), MemStore): E446's synthetic nets and 25 versions of mixed edits, copied from `e446_net_fragments.rs`. The text and tree rows come from the same run as the option rows. Bytes are the store's growth a version (the commit left out) at the default weight and again at the heavy weight. Times in the bytes run are the median of three fastest-of runs. Reads of version 25 come from a separate run where the rows alternate over 7 rounds (median), so load falls on every row alike. Repack is run on the default-weight store. General graphs: a power-law link graph of 100,000 nodes with Zipf sources and targets, 1M draws giving 718,017 distinct edges, titles of 8 to 40 bytes; and a property graph of 10,000 nodes with 1 to 4 KB payloads and 30,000 edges. Each goes through 25 versions of local edits in turn: add or remove edges, edit payloads, add a subgraph of 5 to 20 nodes. The text form is one canonical file of the graph's lines, sliced by the store like a net's text, and its delta is a line diff. The tree form is `put_graph`, and its delta is `graph_diff_counted` with the shared-chunk skip, applied to the earlier version.
+- Results, nets, bytes (25 versions; "+C" is `object_contexts`, "P16K" is parent bounds 16,384:131,072, "S256" is leaf and parent bounds 256:2,048):
+
+  | transitions | form | bytes v1 | a version adds, default weight | a version adds, heavy weight | after repack |
+  | --- | --- | --- | --- | --- | --- |
+  | 1,000 | text (E422) | 8,405 | 782 | 8,441 | 16,378 |
+  | 1,000 | tree (E446) | 118,782 | 2,536 | 14,110 | 152,522 |
+  | 1,000 | tree +C | 118,782 | 1,717 | 14,110 | 152,432 |
+  | 1,000 | tree +C P16K | 118,782 | 1,717 | 14,110 | 152,432 |
+  | 1,000 | tree S256 | 138,679 | 3,717 | 5,471 | 164,328 |
+  | 1,000 | tree leaf 128:1,024, parent 256:2,048 | – | 3,901 | 5,138 | – |
+  | 1,000 | tree +C S256 | 138,679 | 2,405 | 5,471 | 170,114 |
+  | 10,000 | text (E422) | 84,647 | 849 | 85,295 | 71,572 |
+  | 10,000 | tree (E446) | 1,232,063 | 3,098 | 22,544 | 1,071,255 |
+  | 10,000 | tree +C | 1,232,063 | 1,965 | 22,544 | – |
+  | 10,000 | tree +C P16K | 1,231,908 | 1,753 | 23,199 | 1,069,593 |
+  | 10,000 | tree S256 | 1,432,099 | 4,363 | 7,779 | 1,219,198 |
+  | 10,000 | tree leaf 128:1,024, parent 256:2,048 | – | 4,524 | 6,969 | – |
+  | 10,000 | tree +C S256 | 1,432,099 | 2,727 | 7,779 | – |
+
+  Objects reused stay at E446's (99.2% at 1,000, 99.9% at 10,000). The anatomy with frames at 1,000 transitions (1,717 B): 733 B of frames for 3.2 chunks, 217 B of wrappers, 270 B of fragments, 279 B of records and 123 B of literals left on chunks still sliced, 95 B other. Wider sweeps (sweep files in the run directory): at the default weight smaller chunks always cost more (leaf 256:2,048 alone, 3,440 at 1,000) and larger parents help a little with frames. At the heavy weight smaller leaves and parents help (best 5,138 and 6,969), and frames change nothing.
+- Results, nets, time (µs; read v25 from the interleaved run, median of 7; delta and chunks from the bytes run):
+
+  | transitions | form | read v25, default store | read v25, heavy store | write a version | delta | delta chunks read (unpruned) | applied exactly | fsck |
+  | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+  | 1,000 | text | 1,235 | 1,206 | 2,846 | 589 | – | – | 0 |
+  | 1,000 | tree (E446) | 4,249 | 3,912 | 5,956 | 604 | 15.5 (42.8) | 25/25 | 0 |
+  | 1,000 | tree +C | 4,335 | 4,108 | 8,494 | 601 | 15.5 (42.8) | 25/25 | 0 |
+  | 1,000 | tree +C P16K | 4,345 | 4,172 | 10,512 | 591 | 15.5 (42.8) | 25/25 | 0 |
+  | 1,000 | tree S256 | 4,232 | 4,015 | 8,474 | 187 | 30.7 (341.4) | 25/25 | 0 |
+  | 1,000 | tree +C S256 | 4,201 | 4,015 | 7,077 | 174 | 30.7 (341.4) | 25/25 | 0 |
+  | 10,000 | text | 15,855 | 14,839 | 27,647 | 6,842 | – | – | 0 |
+  | 10,000 | tree (E446) | 58,928 | 57,123 | 53,654 | 770 | 20.7 (367.7) | 25/25 | 0 |
+  | 10,000 | tree +C | 59,565 | 58,330 | 60,216 | 737 | 20.7 (367.7) | 25/25 | 0 |
+  | 10,000 | tree +C P16K | 59,422 | 57,192 | 59,974 | 810 | 17.3 (363.7) | 25/25 | 0 |
+  | 10,000 | tree S256 | 60,780 | 57,269 | 75,640 | 249 | 35.9 (3,278.9) | 25/25 | 0 |
+  | 10,000 | tree +C S256 | 58,550 | 57,144 | 66,577 | 213 | 35.9 (3,278.9) | 25/25 | 0 |
+
+  Every read is within 1.03x of E446's tree. Write times in the bytes run are noisy under the shared load (the interleaved run's single-pass writes put +C between 0.8x and 1.3x of E446).
+- Results, general graphs (`put_graph`, 25 versions; delta in µs, its chunks read with the skip and without it):
+
+  | graph | form | bytes v1 | a version adds, default | a version adds, heavy | read v25 µs | delta µs | delta chunks (unpruned) | applied |
+  | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+  | links, 100k nodes, 718k edges | text | 2,752,534 | 984 | 2,753,330 | 303,246 | 254,327 | – | – |
+  | links | tree | 14,906,308 | 2,510 | 82,313 | 1,064,345 | 10,998 | 18.4 (3,639.8) | 24/24 |
+  | links | tree +C | 14,719,966 | 1,682 | 82,313 | 1,005,670 | 8,581 | 18.4 (3,639.8) | 24/24 |
+  | links | tree +C P16K | 14,718,214 | 1,708 | 99,139 | 1,526,857 | 16,194 | 17.8 (3,619.8) | 24/24 |
+  | links | tree S256 | 16,985,365 | 3,644 | 67,226 | 1,466,863 | 10,333 | 28.7 (27,960.4) | 24/24 |
+  | properties, 10k nodes, 1-4 KB | text | 7,866,493 | 986 | 7,867,110 | 313,407 | 574,925 | – | – |
+  | properties | tree | 10,952,846 | 2,902 | 23,258 | 197,431 | 992 | 18.2 (297.3) | 24/24 |
+  | properties | tree +C | 10,952,846 | 1,931 | 23,258 | 113,625 | 939 | 18.2 (297.3) | 24/24 |
+  | properties | tree +C P16K | 10,952,696 | 1,809 | 23,594 | 111,105 | 936 | 15.2 (293.3) | 24/24 |
+  | properties | tree S256 | 11,101,301 | 3,688 | 7,498 | 168,503 | 179 | 27.7 (2,628.4) | 24/24 |
+
+  fsck clean in every row. These general-graph timings are from one run under load.
+- Findings:
+  1. Frames cut what a version adds at the default weight by a third or more, with nothing else changed. With frames and larger parents, a version adds 1,717 B at 1,000 transitions and 1,753 B at 10,000, against E446's 2,536 and 3,098 (32% and 43% less). The same lever cuts general graphs by about a third: the link graph from 2,510 to 1,682 B and the property graph from 2,902 to 1,809 B. Reads, deltas, chunk reuse and the shared-chunk skip are unchanged: a frame is an encoding of the same content id.
+  2. The win line is missed at the default weight: 1,717 against text's 782 at 1,000 transitions (2.2x) and 1,753 against 849 at 10,000 (2.1x). The general graphs miss in the same way (1.7x and 1.8x text). What is left is mostly structural. Each version still pays 3 to 4 frames of about 230 B each (a 33 B header and zstd's frame overhead around 40 to 80 bytes of change), 217 B of `g` and `t` wrappers, and 270 B for new fragments. The fragments alone are a third of the text's whole cost. With chunk deltas at zero, wrappers and fragments would still be about 490 B, so a tree form can only reach the text's level by also shrinking those.
+  3. The win line is met at the heavy weight by chunk size, not frames: leaf and parent bounds 256:2,048 give 5,471 B at 1,000 and 7,779 B at 10,000, against text's 8,441 and 85,295 (leaf 128:1,024 with parent 256:2,048: 5,138 and 6,969). The same bounds give the property graph 7,498 B against text's 7.87 MB. The bounds that win at the heavy weight lose at the default weight (3,717 and 4,363 without frames, 2,405 and 2,727 with them). No single setting meets both weights. The bounds would need to follow the read weight.
+  4. Smaller chunks also make deltas 3x faster (174 µs against 604 at 1,000; 213 against 770 at 10,000), but the unpruned walk grows 9x, so a full listing costs more.
+  5. Repack: frames now survive repack. Repack re-plans them into the same store as without them: 152.4 KB at 1,000 and 1,069.6 KB at 10,000, against E446's 152.5 and 1,071.3 KB. Repack does not fold chains below that. The text after repack is still 9x smaller at 1,000 (16.4 KB) and 15x at 10,000 (71.6 KB), because version 1's fragments dominate.
+  6. Where nets are used: firings tracked by framed fragments (`net_track_fragments`, `net_fire`) replay to the same marking as without frames (test below). Recorded steps (E441) name contents by id and are unaffected. Small nets (night, train, under one chunk) have chunks under 4 KB whose frames rarely pay over the slices; the option matters for nets of thousands of transitions. Beyond nets, the frame is in the store's ingest path for any tree or graph chunk content, so `put_graph` objects and file trees benefit alike. The general graphs show the same one-third cut.
+- Verdict: **partial** (options, off by default). Frames cut a version's bytes by a third to 43% for nets and general graphs, with reads within 1.03x of E446. Small chunk bounds meet the heavy-weight win line at both sizes. The default-weight win line is missed (2.1x to 2.2x text), and no one setting wins at both weights. Mutation checks:
+  - Frames allowed to chain on a frame: 5 of 8 tests fail.
+  - Frames never chosen: 3 fail (bytes, gc, firings).
+  - gc's `needs` ignoring a frame's base: the gc test fails with NotFound.
+  - Repack's keep of framed contents removed: `repack_after_frames_reads_back_and_keeps_frames` fails (175,846 B after against 116,739 before).
+- Owner's choices raised:
+  - Whether `object_contexts` should become the default for tree and graph chunks: it would change stored bytes, so it is left as an option.
+  - Whether the prolly tree's chunk bounds should be chosen by the read weight (large parents at the default weight, 128 to 256 B leaves at the heavy weight).
+- Checks: `tests/chunk_deltas.rs`, 8 tests:
+  - Off by default; the same roots with frames; later versions under 0.8x the bytes; read back; fsck and fsck_deep clean.
+  - A frame's base is never a frame.
+  - Deltas over frames skip shared chunks and apply exactly.
+  - gc keeps a frame's base when only the frame's branch is live.
+  - Repack after frames reads back and does not grow the store.
+  - Smaller bounds cut more chunks of the same graph.
+  - `graph_edit` cuts with the same bounds as `put_graph`.
+  - Firings tracked by framed fragments replay to the same marking.
+
+  `cargo test --release --features embed`: 408 pass, 0 fail. clippy `-D warnings` clean. Fixed bench: north 0.3060, sharing 0.9496, every corpus's byte figures equal to main's (only timings differ). Privacy scan clean.
+- Not done / Next:
+  - A frame without the `g 2` wrapper, and a short base reference (the 33 B header is about 15% of a frame).
+  - Grouping a version's new fragments into one content: the remaining floor that E447's inline form addresses.
+  - Bounds chosen by the read weight.
+  - A key order that keeps an edit's neighbours in one leaf. The net's labels sort places and transitions by name, so the order follows names, not the net's.
+  - Repack at 10,000 transitions for every row: one repack takes about 4 minutes here.
+  - FsStore.
+- Run: `cargo run --release --example e448_net_chunk_deltas -- nets 1000,10000 "text,tree,tree+contexts,..."`, `-- graphs links,props "text,tree,tree+contexts,..."`, `-- reads 1000,10000 ROWS`, `-- repack 1000,10000 contexts+parent=16384:131072`, `-- anatomy 1000,10000 base,contexts`.
