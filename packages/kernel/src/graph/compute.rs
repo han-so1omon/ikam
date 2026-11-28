@@ -44,7 +44,9 @@
 //! [`MemGraph`] runs the same algorithms over a plain in-memory adjacency,
 //! the floor the fragment form is measured against.
 
+use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::rc::Rc;
 use std::sync::Arc;
 
 use crate::{Arg, Edge, Error, Graph, Id, Node, Repo, Store, Target, node_key};
@@ -249,6 +251,112 @@ struct KeyDelta {
     edges_added: Vec<(Key, Key, String)>,
     edges_removed: Vec<(Key, Key, String)>,
 }
+
+/// How stored results are brought up to date (E454, [`Repo::graph_update`]):
+/// every option is off by default, and a result's root is the same with any
+/// of them, since each changes only what an update reads, not what it
+/// writes.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct UpdateOptions {
+    /// Hops, reach and components read labels, presence and in-edges from
+    /// the earlier version's index with the delta laid over it, and the
+    /// out-edges of the nodes the delta names from the delta itself, so they
+    /// do not wait for the new index to be written (and read none of it).
+    /// Degree reads no index either way.
+    pub overlay: bool,
+    /// [`Layout::Label`]: a key's label is taken from what the update has
+    /// already read (the delta, the earlier result's nodes, the labels the
+    /// traversal's view resolved), and the labels still missing when the
+    /// edits are made are resolved together, once, through the earlier
+    /// index, instead of before each read of a value.
+    pub shared_labels: bool,
+    /// Read an earlier result whole when it has at most this many leaves
+    /// (0, the default: never), so every value is known by key and a key
+    /// with no value costs no read.
+    pub whole_result_leaves: usize,
+    /// A traversal's view takes from each index entry and graph node only
+    /// what it keeps (a label and the keys of in- and out-edges), read in
+    /// place in the decoded chunk, instead of copying the whole node (a hub's
+    /// in-edge labels included) first.
+    pub lean_reads: bool,
+    /// PageRank keeps the last version's adjacency and result nodes in
+    /// memory (in [`Repo`], for the graph root they were made from): the
+    /// next version's adjacency is that one with the delta applied, the
+    /// ranks are recomputed exactly over it, and only the result nodes whose
+    /// value changed are written. Without it (or for another root) the
+    /// graph is read whole, as before.
+    pub pagerank_kept: bool,
+    /// A lookup of a few labels in a chunk finds each by binary search (a
+    /// leaf's nodes and a parent's children are in label order) instead of
+    /// testing every node, or splitting the wanted set at every child.
+    pub sparse_lookups: bool,
+}
+
+/// What `pagerank_kept` holds between versions: a graph's adjacency and,
+/// by spec, the PageRank result made from it (root and nodes).
+pub(crate) struct Kept {
+    graph: Id,
+    mem: MemGraph,
+    results: HashMap<String, (Id, Vec<Node>)>,
+}
+
+/// The new version's index as the earlier one with a delta laid over it
+/// (E454's `overlay`): for every key the delta names, its label and
+/// out-edge targets after; by target, the in-edges gained and lost.
+#[derive(Default)]
+struct Overlay {
+    label: HashMap<Key, Option<String>>,
+    out: HashMap<Key, Vec<Key>>,
+    inn_add: HashMap<Key, Vec<(Key, String)>>,
+    inn_del: HashMap<Key, Vec<(Key, String)>>,
+}
+
+impl Overlay {
+    fn of(kd: &KeyDelta) -> Overlay {
+        let mut o = Overlay::default();
+        for (k, (present, out)) in &kd.new_out {
+            o.label.insert(*k, present.then(|| kd.label[k].clone()));
+            o.out.insert(*k, out.clone());
+        }
+        for (from, to, label) in &kd.edges_added {
+            o.inn_add
+                .entry(*to)
+                .or_default()
+                .push((*from, label.clone()));
+        }
+        for (from, to, label) in &kd.edges_removed {
+            o.inn_del
+                .entry(*to)
+                .or_default()
+                .push((*from, label.clone()));
+        }
+        o
+    }
+
+    /// Key `k`'s entry in the new index from its entry in the earlier one,
+    /// as `update_index` makes it.
+    fn entry(&self, k: Key, mut e: Entry) -> Entry {
+        if let Some(l) = self.label.get(&k) {
+            e.label = l.clone();
+        }
+        let (del, add) = (self.inn_del.get(&k), self.inn_add.get(&k));
+        for (s, l) in del.into_iter().flatten() {
+            if let Some(i) = e.inn.iter().position(|(a, b)| a == s && b == l) {
+                e.inn.remove(i);
+            }
+        }
+        e.inn.extend(add.into_iter().flatten().cloned());
+        if add.is_some() || del.is_some() {
+            e.inn.sort();
+        }
+        e
+    }
+}
+
+/// Labels a traversal's view resolved (keys the delta does not name keep
+/// their label across the two versions), shared with the result's values
+/// (E454's `shared_labels`).
+type Known = Rc<RefCell<HashMap<Key, Option<String>>>>;
 
 /// A computation over a graph whose result is a graph keyed by node key.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -685,6 +793,10 @@ struct FragView<'a, S: Store> {
     index: Id,
     adj: HashMap<Key, Adj>,
     chunks: ChunkCache,
+    /// E454: `index` is the earlier version's, with this delta laid over it.
+    overlay: Option<Rc<Overlay>>,
+    /// E454: where the labels this view resolves are shared.
+    known: Option<Known>,
 }
 
 /// Decoded chunks read during one computation, so each is read once. A
@@ -707,6 +819,65 @@ impl<S: Store> Repo<S> {
         cache: &mut ChunkCache,
         out: &mut Vec<Node>,
     ) -> Result<(), Error> {
+        self.nodes_visit(root, labels, cache, &mut |n| {
+            out.push(n.clone());
+            Ok(())
+        })
+    }
+
+    /// Visit the nodes labelled with any of `labels` in place, reading each
+    /// chunk that can hold one at most once per `cache`.
+    fn nodes_visit(
+        &self,
+        root: &Id,
+        labels: &BTreeSet<String>,
+        cache: &mut ChunkCache,
+        f: &mut dyn FnMut(&Node) -> Result<(), Error>,
+    ) -> Result<(), Error> {
+        if labels.is_empty() {
+            return Ok(());
+        }
+        if self.graph_update.sparse_lookups {
+            let wanted: Vec<&str> = labels.iter().map(String::as_str).collect();
+            return self.nodes_visit_sparse(root, &wanted, cache, f);
+        }
+        if !cache.chunks.contains_key(root) {
+            cache.reads += 1;
+            let g = self.graph_chunk_cached(root)?;
+            cache.chunks.insert(*root, g);
+        }
+        let chunk = Arc::clone(&cache.chunks[root]);
+        match &*chunk {
+            Graph::Nodes(nodes) => {
+                for n in nodes.iter().filter(|n| labels.contains(&n.label)) {
+                    f(n)?;
+                }
+            }
+            Graph::Children(_, children) => {
+                for (i, (first, child)) in children.iter().enumerate() {
+                    let low = if i == 0 { String::new() } else { first.clone() };
+                    let mine: BTreeSet<String> = match children.get(i + 1) {
+                        Some((next, _)) => labels.range(low..next.clone()).cloned().collect(),
+                        None => labels.range(low..).cloned().collect(),
+                    };
+                    self.nodes_visit(child, &mine, cache, f)?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// `nodes_visit` with E454's `sparse_lookups`: `labels` sorted, each
+    /// found by binary search, and split over a parent's children by where
+    /// each falls (the last child whose first label is at most it, or the
+    /// first child), as `graph_edit`'s cursor does.
+    fn nodes_visit_sparse(
+        &self,
+        root: &Id,
+        labels: &[&str],
+        cache: &mut ChunkCache,
+        f: &mut dyn FnMut(&Node) -> Result<(), Error>,
+    ) -> Result<(), Error> {
         if labels.is_empty() {
             return Ok(());
         }
@@ -718,16 +889,24 @@ impl<S: Store> Repo<S> {
         let chunk = Arc::clone(&cache.chunks[root]);
         match &*chunk {
             Graph::Nodes(nodes) => {
-                out.extend(nodes.iter().filter(|n| labels.contains(&n.label)).cloned())
+                for l in labels {
+                    if let Ok(i) = nodes.binary_search_by(|n| n.label.as_str().cmp(l)) {
+                        f(&nodes[i])?;
+                    }
+                }
             }
             Graph::Children(_, children) => {
-                for (i, (first, child)) in children.iter().enumerate() {
-                    let low = if i == 0 { String::new() } else { first.clone() };
-                    let mine: BTreeSet<String> = match children.get(i + 1) {
-                        Some((next, _)) => labels.range(low..next.clone()).cloned().collect(),
-                        None => labels.range(low..).cloned().collect(),
-                    };
-                    self.nodes_in_cached(child, &mine, cache, out)?;
+                let at = |l: &str| {
+                    children
+                        .partition_point(|c| c.0.as_str() <= l)
+                        .saturating_sub(1)
+                };
+                let mut start = 0;
+                while start < labels.len() {
+                    let i = at(labels[start]);
+                    let end = start + labels[start..].partition_point(|l| at(l) == i);
+                    self.nodes_visit_sparse(&children[i].1, &labels[start..end], cache, f)?;
+                    start = end;
                 }
             }
         }
@@ -766,6 +945,95 @@ impl<S: Store> Repo<S> {
     }
 }
 
+impl<S: Store> FragView<'_, S> {
+    /// `need` with E454's `lean_reads`: each index entry and graph node is
+    /// read in place for the label and edge keys the view keeps. An entry
+    /// the overlay changes is decoded whole, to lay the delta over it.
+    fn need_lean(&mut self, missing: Vec<Key>) -> Result<(), Error> {
+        let ov = self.overlay.clone();
+        let touched = |k: &Key| {
+            ov.as_ref()
+                .is_some_and(|o| o.inn_add.contains_key(k) || o.inn_del.contains_key(k))
+        };
+        let mut got: HashMap<Key, (Option<String>, Vec<Key>)> = HashMap::new();
+        let labels: BTreeSet<String> = missing.iter().map(|k| hex(*k)).collect();
+        self.repo
+            .nodes_visit(&self.index, &labels, &mut self.chunks, &mut |n| {
+                let k = unhex(&n.label).ok_or_else(bad)?;
+                let (label, inn) = match touched(&k) {
+                    true => {
+                        let e = Entry::dec(&n.edges).ok_or_else(bad)?;
+                        (e.label, e.inn.into_iter().map(|x| x.0).collect())
+                    }
+                    false => {
+                        // As `Entry::dec`: the first value edge with '=' is
+                        // the label, every other edge an in-edge.
+                        let mut label = None;
+                        let mut inn = Vec::with_capacity(n.edges.len());
+                        for e in &n.edges {
+                            match (e.to == VALUE, e.label.strip_prefix('=')) {
+                                (true, Some(l)) if label.is_none() => label = Some(l.to_string()),
+                                _ => inn.push(u64::from_be_bytes(e.to)),
+                            }
+                        }
+                        (label, inn)
+                    }
+                };
+                got.insert(k, (label, inn));
+                Ok(())
+            })?;
+        if let Some(o) = &ov {
+            // Keys the overlay names: their label and in-edges after.
+            for k in &missing {
+                if o.label.contains_key(k) || touched(k) {
+                    let mut before = Vec::new();
+                    let one = BTreeSet::from([hex(*k)]);
+                    self.repo
+                        .nodes_in_cached(&self.index, &one, &mut self.chunks, &mut before)?;
+                    let e = match before.first() {
+                        Some(n) => Entry::dec(&n.edges).ok_or_else(bad)?,
+                        None => Entry::default(),
+                    };
+                    let e = o.entry(*k, e);
+                    got.insert(*k, (e.label, e.inn.into_iter().map(|x| x.0).collect()));
+                }
+            }
+        }
+        let from_delta = |k: &Key| ov.as_ref().and_then(|o| o.out.get(k));
+        let wanted: BTreeSet<String> = (got.iter())
+            .filter(|(k, _)| from_delta(k).is_none())
+            .filter_map(|(_, e)| e.0.clone())
+            .collect();
+        let mut outs: HashMap<String, Vec<Key>> = HashMap::new();
+        self.repo
+            .nodes_visit(&self.graph, &wanted, &mut self.chunks, &mut |n| {
+                let out = n.edges.iter().map(|e| u64::from_be_bytes(e.to)).collect();
+                outs.insert(n.label.clone(), out);
+                Ok(())
+            })?;
+        for k in missing {
+            let (label, inn) = got.remove(&k).unwrap_or_default();
+            let out = match from_delta(&k) {
+                Some(o) if label.is_some() => o.clone(),
+                _ => label
+                    .as_ref()
+                    .and_then(|l| outs.remove(l))
+                    .unwrap_or_default(),
+            };
+            if let Some(known) = &self.known {
+                known.borrow_mut().insert(k, label.clone());
+            }
+            let adj = Adj {
+                present: label.is_some(),
+                out,
+                inn,
+            };
+            self.adj.insert(k, adj);
+        }
+        Ok(())
+    }
+}
+
 impl<S: Store> View for FragView<'_, S> {
     fn need(&mut self, keys: &[Key]) -> Result<(), Error> {
         let missing: Vec<Key> = (keys.iter())
@@ -777,10 +1045,28 @@ impl<S: Store> View for FragView<'_, S> {
         if missing.is_empty() {
             return Ok(());
         }
-        let entries: HashMap<Key, Entry> =
+        if self.repo.graph_update.lean_reads {
+            return self.need_lean(missing);
+        }
+        let mut entries: HashMap<Key, Entry> =
             self.repo
                 .values_in(&self.index, &missing, &mut self.chunks)?;
-        let labels: BTreeSet<String> = entries.values().filter_map(|e| e.label.clone()).collect();
+        if let Some(ov) = &self.overlay {
+            for k in &missing {
+                let e = entries.remove(k).unwrap_or_default();
+                let e = ov.entry(*k, e);
+                if e.label.is_some() || !e.inn.is_empty() {
+                    entries.insert(*k, e);
+                }
+            }
+        }
+        // With the overlay, the out-edges of a node the delta names are the
+        // delta's, and the graph is read for the others only.
+        let from_delta = |k: &Key| self.overlay.as_ref().and_then(|o| o.out.get(k));
+        let labels: BTreeSet<String> = (entries.iter())
+            .filter(|(k, _)| from_delta(k).is_none())
+            .filter_map(|(_, e)| e.label.clone())
+            .collect();
         let mut nodes = Vec::new();
         self.repo
             .nodes_in_cached(&self.graph, &labels, &mut self.chunks, &mut nodes)?;
@@ -794,13 +1080,20 @@ impl<S: Store> View for FragView<'_, S> {
         for k in missing {
             let e = entries.get(&k);
             let label = e.and_then(|e| e.label.as_ref());
+            let out = match from_delta(&k) {
+                Some(o) if label.is_some() => o.clone(),
+                _ => label.and_then(|l| outs.get(l)).cloned().unwrap_or_default(),
+            };
             let adj = Adj {
                 present: label.is_some(),
-                out: label.and_then(|l| outs.get(l)).cloned().unwrap_or_default(),
+                out,
                 inn: e
                     .map(|e| e.inn.iter().map(|x| x.0).collect())
                     .unwrap_or_default(),
             };
+            if let Some(known) = &self.known {
+                known.borrow_mut().insert(k, label.cloned());
+            }
             self.adj.insert(k, adj);
         }
         Ok(())
@@ -847,6 +1140,14 @@ struct FragVals<'a, S: Store, V> {
     labels: HashMap<Key, (Option<String>, Option<String>)>,
     /// A key was set that `need` never resolved a label for.
     unresolved: bool,
+    /// E454 `shared_labels`: labels the view resolved, and values set for
+    /// keys whose label is resolved when the edits are taken.
+    known: Option<Known>,
+    pending: BTreeMap<Key, Option<V>>,
+    /// E454 `whole_result_leaves`: read the earlier result whole when it
+    /// has at most this many leaves; `whole` once it has been.
+    whole_leaves: usize,
+    whole: Option<bool>,
 }
 
 impl<'a, S: Store, V> FragVals<'a, S, V> {
@@ -861,7 +1162,82 @@ impl<'a, S: Store, V> FragVals<'a, S, V> {
             index: None,
             labels: HashMap::new(),
             unresolved: false,
+            known: None,
+            pending: BTreeMap::new(),
+            whole_leaves: 0,
+            whole: None,
         }
+    }
+
+    /// The earlier result read whole into `vals` (and, in the label
+    /// layout, each present key's label into `labels`), when it has at most
+    /// `whole_leaves` leaves. True once it has been.
+    fn load_whole(&mut self) -> Result<bool, Error>
+    where
+        V: Val,
+    {
+        if let Some(w) = self.whole {
+            return Ok(w);
+        }
+        self.whole = Some(false);
+        if self.whole_leaves == 0 {
+            return Ok(false);
+        }
+        // List the leaves through the parents, giving up past the bound.
+        let (mut leaves, mut stack) = (Vec::new(), vec![self.root]);
+        while let Some(id) = stack.pop() {
+            if !self.chunks.chunks.contains_key(&id) {
+                self.chunks.reads += 1;
+                let g = self.repo.graph_chunk_cached(&id)?;
+                self.chunks.chunks.insert(id, g);
+            }
+            match &*self.chunks.chunks[&id] {
+                Graph::Nodes(_) => leaves.push(id),
+                Graph::Children(1, children) => {
+                    if leaves.len() + children.len() > self.whole_leaves {
+                        return Ok(false);
+                    }
+                    leaves.extend(children.iter().map(|c| c.1));
+                }
+                Graph::Children(_, children) => stack.extend(children.iter().map(|c| c.1)),
+            }
+            if leaves.len() > self.whole_leaves {
+                return Ok(false);
+            }
+        }
+        for id in leaves {
+            if !self.chunks.chunks.contains_key(&id) {
+                self.chunks.reads += 1;
+                let g = self.repo.graph_chunk_cached(&id)?;
+                self.chunks.chunks.insert(id, g);
+            }
+            let chunk = Arc::clone(&self.chunks.chunks[&id]);
+            let Graph::Nodes(nodes) = &*chunk else {
+                return Err(bad());
+            };
+            for n in nodes {
+                let k = self.layout.key(&n.label).ok_or_else(bad)?;
+                if self.layout == Layout::Label && !self.labels.contains_key(&k) {
+                    let l = (!n.label.starts_with('\0')).then(|| n.label.clone());
+                    self.labels.insert(k, (l.clone(), l));
+                }
+                self.vals.insert(k, Some(V::dec(&n.edges).ok_or_else(bad)?));
+            }
+        }
+        self.whole = Some(true);
+        Ok(true)
+    }
+
+    /// A key's present label, before and after, from what has been read
+    /// already: the delta's and the result's (`labels`), or the view's
+    /// (`known`; a key the delta does not name keeps its label).
+    fn label_known(&self, k: Key) -> Option<(Option<String>, Option<String>)> {
+        if let Some(l) = self.labels.get(&k) {
+            return Some(l.clone());
+        }
+        let known = self.known.as_ref()?.borrow();
+        let l = known.get(&k)?.clone();
+        Some((l.clone(), l))
     }
 
     /// Resolve the present labels, before and after, of `keys`.
@@ -883,6 +1259,22 @@ impl<'a, S: Store, V> FragVals<'a, S, V> {
     }
 }
 
+impl<S: Store, V: Val> FragVals<'_, S, V> {
+    /// The edits, once every value set for a key with no label yet has its
+    /// label (E454 `shared_labels`: those are resolved here, together).
+    fn finish(&mut self) -> Result<Edits, Error> {
+        let pending = std::mem::take(&mut self.pending);
+        if !pending.is_empty() {
+            let keys: Vec<Key> = pending.keys().copied().collect();
+            self.resolve(&keys)?;
+            for (k, v) in pending {
+                self.set(k, v);
+            }
+        }
+        Ok(std::mem::take(&mut self.edits))
+    }
+}
+
 impl<S: Store, V: Val> Vals<V> for FragVals<'_, S, V> {
     fn need(&mut self, keys: &[Key]) -> Result<(), Error> {
         let missing: Vec<Key> = (keys.iter())
@@ -894,9 +1286,32 @@ impl<S: Store, V: Val> Vals<V> for FragVals<'_, S, V> {
         if missing.is_empty() {
             return Ok(());
         }
+        if self.load_whole()? {
+            // Every value is held: the missing keys have none. Their labels
+            // are needed only if one is set: then, without shared labels,
+            // they are resolved now.
+            if self.layout == Layout::Label && self.known.is_none() {
+                let unheld: Vec<Key> = (missing.iter())
+                    .filter(|k| !self.vals.contains_key(k))
+                    .copied()
+                    .collect();
+                self.resolve(&unheld)?;
+            }
+            for k in missing {
+                self.vals.entry(k).or_insert(None);
+            }
+            return Ok(());
+        }
         let labels: BTreeSet<String> = match self.layout {
             Layout::Hash => missing.iter().map(|k| hex(*k)).collect(),
             Layout::Label => {
+                if self.known.is_some() {
+                    for k in &missing {
+                        if let Some(l) = self.label_known(*k) {
+                            self.labels.insert(*k, l);
+                        }
+                    }
+                }
                 self.resolve(&missing)?;
                 (missing.iter())
                     .map(|k| Layout::Label.label(*k, self.labels[k].0.as_deref()))
@@ -915,6 +1330,24 @@ impl<S: Store, V: Val> Vals<V> for FragVals<'_, S, V> {
         self.vals.get(&k).and_then(|v| v.as_ref())
     }
     fn set(&mut self, k: Key, v: Option<V>) {
+        if let Some(p) = self.pending.get_mut(&k) {
+            *p = v.clone();
+            self.vals.insert(k, v);
+            return;
+        }
+        if self.layout == Layout::Label && self.known.is_some() && !self.labels.contains_key(&k) {
+            match self.label_known(k) {
+                Some(l) => {
+                    self.labels.insert(k, l);
+                }
+                None => {
+                    // Resolved with the others in `finish`.
+                    self.pending.insert(k, v.clone());
+                    self.vals.insert(k, v);
+                    return;
+                }
+            }
+        }
         let label = match self.layout {
             Layout::Hash => hex(k),
             Layout::Label => match self.labels.get(&k) {
@@ -1551,6 +1984,52 @@ impl<S: Store> Repo<S> {
         Ok(GraphDelta { nodes, chunks_read })
     }
 
+    /// E454: the delta that `edits` make to the graph at `root`, from the
+    /// edits themselves: the earlier node of each edited label is looked up
+    /// (one path per label, through `graph_chunk_cached`), so the two
+    /// versions are not diffed. Its nodes equal `graph_delta(root,
+    /// graph_edit(root, edits))`'s; `chunks_read` counts the lookups.
+    pub fn graph_delta_of_edits(
+        &self,
+        root: &Id,
+        edits: &BTreeMap<String, Option<Node>>,
+    ) -> Result<GraphDelta, Error> {
+        let labels: BTreeSet<String> = edits.keys().cloned().collect();
+        let mut cache = ChunkCache::default();
+        let mut found = Vec::new();
+        self.nodes_in_cached(root, &labels, &mut cache, &mut found)?;
+        let mut before: HashMap<String, Node> =
+            found.into_iter().map(|n| (n.label.clone(), n)).collect();
+        let mut nodes = Vec::new();
+        for (label, after) in edits {
+            let after = after.clone().map(|mut n| {
+                n.edges.sort();
+                n.edges.dedup();
+                n
+            });
+            let was = before.remove(label);
+            if was != after {
+                nodes.push((label.clone(), was, after));
+            }
+        }
+        Ok(GraphDelta {
+            nodes,
+            chunks_read: cache.reads,
+        })
+    }
+
+    /// E454: `graph_edit` and the delta it makes, from the edits (see
+    /// [`Repo::graph_delta_of_edits`]).
+    pub fn graph_edit_delta(
+        &mut self,
+        root: &Id,
+        edits: BTreeMap<String, Option<Node>>,
+    ) -> Result<(Id, GraphDelta), Error> {
+        let delta = self.graph_delta_of_edits(root, &edits)?;
+        let id = self.graph_edit(root, edits)?;
+        Ok((id, delta))
+    }
+
     /// `put_values` with each node labelled as `layout` says, the labels of
     /// present nodes taken from `mem`.
     fn put_values_as(
@@ -1722,6 +2201,9 @@ impl<S: Store> Repo<S> {
             let old = *prev.results.get(&spec).ok_or_else(bad)?;
             let at = std::time::Instant::now();
             let (root, reads, changed) = match c {
+                Compute::PageRank { .. } if self.graph_update.pagerank_kept => {
+                    self.pagerank_kept(c, old, &prev.graph, graph, delta)?
+                }
                 Compute::PageRank { .. } => {
                     let (id, cost) = self.graph_compute_one(graph, c)?;
                     (id, cost.chunks_read, 0)
@@ -1796,6 +2278,60 @@ impl<S: Store> Repo<S> {
         ))
     }
 
+    /// PageRank with E454's `pagerank_kept`: the adjacency kept for
+    /// `prev_graph` with `delta` applied (or `graph` read whole), the ranks
+    /// recomputed over it, and the nodes that differ from the earlier
+    /// result `old` written over it.
+    fn pagerank_kept(
+        &mut self,
+        c: &Compute,
+        old: Id,
+        prev_graph: &Id,
+        graph: &Id,
+        delta: &GraphDelta,
+    ) -> Result<(Id, usize, usize), Error> {
+        let spec = c.spec();
+        let mut reads = 0;
+        let kept = self.graph_kept.lock().unwrap().take();
+        let mut kept = match kept {
+            Some(mut k) if k.graph == *prev_graph => {
+                k.mem.apply(delta);
+                k.graph = *graph;
+                k
+            }
+            Some(k) if k.graph == *graph => k,
+            _ => {
+                let nodes = self.graph_nodes_counted(graph, &mut reads)?;
+                Kept {
+                    graph: *graph,
+                    mem: MemGraph::from_nodes(&nodes),
+                    results: HashMap::new(),
+                }
+            }
+        };
+        let layout = self.graph_result_layout;
+        let nodes = value_nodes(kept.mem.compute(c), layout, &kept.mem)?;
+        let before = match kept.results.remove(&spec) {
+            Some((root, nodes)) if root == old => nodes,
+            _ => self.graph_nodes_counted(&old, &mut reads)?,
+        };
+        let mut edits: Edits = BTreeMap::new();
+        let mut was: BTreeMap<&str, &Node> = before.iter().map(|n| (n.label.as_str(), n)).collect();
+        for n in &nodes {
+            if was.remove(n.label.as_str()) != Some(n) {
+                edits.insert(n.label.clone(), Some(n.clone()));
+            }
+        }
+        for l in was.into_keys() {
+            edits.insert(l.to_string(), None);
+        }
+        let changed = edits.len();
+        let root = self.graph_edit(&old, edits)?;
+        kept.results.insert(spec, (root, nodes));
+        *self.graph_kept.lock().unwrap() = Some(kept);
+        Ok((root, reads, changed))
+    }
+
     fn update_one(
         &self,
         c: &Compute,
@@ -1811,12 +2347,17 @@ impl<S: Store> Repo<S> {
             Layout::Hash => HashMap::new(),
         };
         let start = (layout, Some(*prev_index), labels);
+        // E454: with the overlay, the view reads the earlier index and lays
+        // the delta over it, so it does not need `index`.
+        let overlay = self.graph_update.overlay;
         let mut view = FragView {
             repo: self,
             graph: *graph,
-            index: *index,
+            index: if overlay { *prev_index } else { *index },
             adj: HashMap::new(),
             chunks: ChunkCache::default(),
+            overlay: overlay.then(|| Rc::new(Overlay::of(kd))),
+            known: None,
         };
         match c {
             Compute::Degree => self.run_update(old, start, &mut view, |_, v| update_degree(v, kd)),
@@ -1845,13 +2386,20 @@ impl<S: Store> Repo<S> {
     ) -> Result<(Edits, usize), Error> {
         let mut vals: FragVals<'a, S, V> = FragVals::new(self, old);
         (vals.layout, vals.index, vals.labels) = start;
+        vals.whole_leaves = self.graph_update.whole_result_leaves;
+        if vals.layout == Layout::Label && self.graph_update.shared_labels {
+            let known: Known = Default::default();
+            view.known = Some(Rc::clone(&known));
+            vals.known = Some(known);
+        }
         f(view, &mut vals)?;
+        let edits = vals.finish()?;
         if vals.unresolved {
             return Err(Error::Exec(
                 "label layout: a key set without its label".into(),
             ));
         }
-        Ok((vals.edits, vals.chunks.reads + view.chunks.reads))
+        Ok((edits, vals.chunks.reads + view.chunks.reads))
     }
 
     /// Record one computation of a version as a step graph: `func` (the

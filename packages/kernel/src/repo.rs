@@ -204,6 +204,11 @@ pub struct Repo<S: Store> {
     /// How graph computation results label their nodes (E452): by key in
     /// hex (the default, E450's) or by the input's labels. Off by default.
     pub graph_result_layout: crate::graph::compute::Layout,
+    /// How stored graph computations are brought up to date (E454): each
+    /// option off by default, and every result's root the same either way.
+    pub graph_update: crate::graph::compute::UpdateOptions,
+    /// E454 `pagerank_kept`: the last graph's adjacency and PageRank results.
+    pub(crate) graph_kept: std::sync::Mutex<Option<crate::graph::compute::Kept>>,
     /// Keep up to this many bytes of contents read, rebuilt ones included,
     /// across reads (E294). 0, the default, keeps none. A content's bytes
     /// never change for its id and are checked against it before they are
@@ -364,6 +369,8 @@ impl<S: Store> Repo<S> {
             memo: Default::default(),
             graph_ledger: Default::default(),
             graph_result_layout: Default::default(),
+            graph_update: Default::default(),
+            graph_kept: Default::default(),
             read_cache: 0,
             refresh_ledger: false,
             cache: Default::default(),
@@ -753,6 +760,7 @@ impl<S: Store> Repo<S> {
         r.plain_db_events = self.plain_db_events;
         r.plain_hot_writes = self.plain_hot_writes;
         r.graph_result_layout = self.graph_result_layout;
+        r.graph_update = self.graph_update;
         r.exact_short_search = self.exact_short_search;
         r.object_contexts = self.object_contexts;
         r.graph_chunks = self.graph_chunks;

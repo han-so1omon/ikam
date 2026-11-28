@@ -582,3 +582,205 @@ impl<S: Store> Repo<S> {
         Ok(out)
     }
 }
+
+/// E454: the link index in segments by commit order, an option beside
+/// [`LinkIndex`]. Each update writes the in-links of the objects it found
+/// new as a segment of its own: a graph with one node per linked id
+/// (labelled with the id in hex) holding an edge per link into it (the
+/// edge's key is the source's, its label the source's id in hex, a space
+/// and the link's label). New objects are in a segment of their own, so
+/// they no longer scatter over a hash-ordered index: an update writes one
+/// small graph whole. Segments merge when the newer is at least half the
+/// older's size (so there are about log2 of them), and a lookup reads the
+/// id's node in each. Objects the source store lost are kept as a graph of
+/// tombstones, which a lookup and a merge drop; an object that comes back
+/// leaves it.
+#[derive(Clone, Debug)]
+pub struct LinkSegments {
+    /// `(root, objects indexed in it)`, oldest first.
+    pub segments: Vec<(Id, usize)>,
+    /// The ids the source store lost (a graph of empty nodes by id hex).
+    pub gone: Id,
+    /// Every id the source store held at the last update.
+    pub seen: HashSet<Id>,
+}
+
+/// What one segmented link index update did.
+#[derive(Clone, Debug, Default)]
+pub struct SegmentUpdate {
+    pub added: usize,
+    pub removed: usize,
+    pub objects_read: usize,
+    /// Chunks of earlier segments read to merge them.
+    pub chunks_read: usize,
+    /// Segments merged into one.
+    pub merged: usize,
+}
+
+fn segment_nodes(links: BTreeMap<Id, Vec<(Id, String)>>) -> Vec<Node> {
+    (links.into_iter())
+        .map(|(to, from)| {
+            let mut edges: Vec<Edge> = (from.into_iter())
+                .map(|(src, label)| {
+                    let hex = src.to_string();
+                    Edge {
+                        to: node_key(&hex),
+                        label: format!("{hex} {label}"),
+                    }
+                })
+                .collect();
+            edges.sort();
+            edges.dedup();
+            Node {
+                label: to.to_string(),
+                target: Target::None,
+                edges,
+            }
+        })
+        .collect()
+}
+
+fn segment_link(e: &Edge) -> Result<(Id, String), Error> {
+    let (src, label) = e
+        .label
+        .split_once(' ')
+        .ok_or(Error::Decode("link segment"))?;
+    Ok((src.parse::<Id>()?, label.to_string()))
+}
+
+impl<S: Store> Repo<S> {
+    /// Build (no `prev`) or bring up to date the segmented link index of
+    /// `src`'s objects, stored in this repo.
+    pub fn link_segments_update<T: Store>(
+        &mut self,
+        src: &Repo<T>,
+        prev: Option<&LinkSegments>,
+    ) -> Result<(LinkSegments, SegmentUpdate), Error> {
+        let ids: HashSet<Id> = src.store().ids()?.into_iter().collect();
+        let mut u = SegmentUpdate::default();
+        let mut links: BTreeMap<Id, Vec<(Id, String)>> = BTreeMap::new();
+        let mut back = BTreeSet::new();
+        for id in &ids {
+            if prev.is_some_and(|p| p.seen.contains(id)) {
+                continue;
+            }
+            back.insert(id.to_string());
+            let stored = src.store().read(id)?;
+            if is_plain(&stored) {
+                continue;
+            }
+            u.objects_read += 1;
+            u.added += 1;
+            for (label, to) in src.get(id)?.links() {
+                links.entry(to).or_default().push((*id, label));
+            }
+        }
+        let objects = u.added;
+        let segment = self.put_graph(segment_nodes(links))?;
+        let Some(prev) = prev else {
+            let gone = self.put_graph(Vec::new())?;
+            let ix = LinkSegments {
+                segments: vec![(segment, objects)],
+                gone,
+                seen: ids,
+            };
+            return Ok((ix, u));
+        };
+        // Tombstones: the ids lost since the last update join, the ids back
+        // again leave.
+        let mut edits: BTreeMap<String, Option<Node>> = BTreeMap::new();
+        for id in prev.seen.iter().filter(|id| !ids.contains(id)) {
+            u.removed += 1;
+            let label = id.to_string();
+            let n = Node {
+                label: label.clone(),
+                target: Target::None,
+                edges: Vec::new(),
+            };
+            edits.insert(label, Some(n));
+        }
+        let was_gone = self.graph_nodes_in(&prev.gone, &back)?;
+        for n in was_gone {
+            edits.insert(n.label, None);
+        }
+        let gone = self.graph_edit(&prev.gone, edits)?;
+        let mut segments = prev.segments.clone();
+        if objects > 0 {
+            segments.push((segment, objects));
+        }
+        // Merge while the newest is at least half the one before.
+        while segments.len() >= 2 {
+            let (b, nb) = segments[segments.len() - 1];
+            let (a, na) = segments[segments.len() - 2];
+            if nb * 2 < na {
+                break;
+            }
+            let mut reads = 0;
+            let mut merged: BTreeMap<String, Node> = BTreeMap::new();
+            for root in [a, b] {
+                for n in self.graph_nodes_counted(&root, &mut reads)? {
+                    match merged.get_mut(&n.label) {
+                        Some(m) => m.edges.extend(n.edges),
+                        None => {
+                            merged.insert(n.label.clone(), n);
+                        }
+                    }
+                }
+            }
+            u.chunks_read += reads;
+            // Drop the links of sources gone.
+            let sources: BTreeSet<String> = (merged.values())
+                .flat_map(|n| n.edges.iter())
+                .filter_map(|e| e.label.split_once(' ').map(|s| s.0.to_string()))
+                .collect();
+            let dead: HashSet<String> = (self.graph_nodes_in(&gone, &sources)?.into_iter())
+                .map(|n| n.label)
+                .collect();
+            let nodes: Vec<Node> = (merged.into_values())
+                .filter_map(|mut n| {
+                    n.edges
+                        .retain(|e| e.label.split_once(' ').is_none_or(|s| !dead.contains(s.0)));
+                    n.edges.sort();
+                    n.edges.dedup();
+                    (!n.edges.is_empty()).then_some(n)
+                })
+                .collect();
+            let root = self.put_graph(nodes)?;
+            segments.truncate(segments.len() - 2);
+            segments.push((root, na + nb));
+            u.merged += 1;
+        }
+        Ok((
+            LinkSegments {
+                segments,
+                gone,
+                seen: ids,
+            },
+            u,
+        ))
+    }
+
+    /// `used_by` through a segmented link index: every object of the
+    /// source store that links to `id`, with the link's label, sorted.
+    pub fn used_by_segments(&self, ix: &LinkSegments, id: &Id) -> Result<Vec<(Id, String)>, Error> {
+        let want = BTreeSet::from([id.to_string()]);
+        let mut out = Vec::new();
+        for (root, _) in &ix.segments {
+            for n in self.graph_nodes_in(root, &want)? {
+                for e in &n.edges {
+                    out.push(segment_link(e)?);
+                }
+            }
+        }
+        if !out.is_empty() {
+            let sources: BTreeSet<String> = out.iter().map(|(s, _)| s.to_string()).collect();
+            let dead: HashSet<String> = (self.graph_nodes_in(&ix.gone, &sources)?.into_iter())
+                .map(|n| n.label)
+                .collect();
+            out.retain(|(s, _)| !dead.contains(&s.to_string()));
+        }
+        out.sort();
+        out.dedup();
+        Ok(out)
+    }
+}
