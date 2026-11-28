@@ -6589,3 +6589,43 @@ Gates on the branch (E229 to E233): every kernel test suite passes (release); cl
 - Verdict: **kept** (options, off by default; the A or B choice is the owner's).
 - Not measured or not done: nets as artifacts keyed by content id (firings naming the net version they fired under, several nets in one graph, a net edited mid-run), which is next; a second real platform (host arithmetic stands in for one, as in E409 and E442); the Mac; a seed as a field (a seed is an argument here, like any input).
 - Run: `cargo run --release --example e441_steps -- 5000`.
+
+### E428 step-cache (a platform-keyed cache for recorded and float steps)
+
+- Branch / parent: exp/428-step-cache / E441 (exp/441-float-steps fe6d593)
+- Question: pure derivations are already a memo (`apply` never runs one twice), but E441's recorded and float steps had none: the same training step on the same machine ran from scratch every time. Can such a step be keyed as Bazel's action cache keys an action, by (function id, input ids, kind, platform tag), so a second run on one platform returns the recorded output without running, while a run under another platform tag records its own output beside the first, so where platforms differ is visible in the store? (Idea note M2, from Bazel's remote execution action cache.)
+- Change (an option, off: nothing calls it unless a caller chooses it):
+  - `stepcache.rs`: `StepKey { func, args, kind, platform }` with `StepKind::{Recorded, Float}` (work done outside the kernel, or a WASM function the kernel runs with floats pinned). `Repo::step_cached(key, check, outside)`: on a hit returns the recorded output and runs nothing; on a miss runs the step (the caller's closure for `Recorded`, the kernel for `Float`), keeps the output as an E441 recorded step (design B, a `Run`) and files it under the ref `steps/<group>/<platform>`, where `<group>` is a BLAKE3 of the key without its platform. A failed run files nothing. `step_cache_get` reads one entry (and refuses a record that is not the step its key names); `step_cache_entries` lists every platform's result of one step side by side.
+  - `Run` gains `props`, name and value pairs stored with the record (here the kind and the platform). They are encoded only when set, so every record made without the cache keeps E441's bytes (checked in the test).
+  - gc: a ref that names a `Run` keeps its output live (one arm in `reachable_from`), and E441's `add_runs` then keeps its inputs; fsck already requires a recorded output.
+  - `experiments/step-cache`: `train-gd`, a training-like outside command: least squares on 4,096 seeded rows of 64 features, 400 iterations of full-batch gradient descent, weights and final mean squared error out as f64s.
+- The second platform, simulated: three builds of the same source on this machine. `x86-64-plain` is `-C target-cpu=x86-64`; `x86-64-v3` is `-C target-cpu=x86-64-v3` alone (Rust never contracts a multiply and an add on its own, so the same bits are expected; the binary has no `vfmadd`); `x86-64-v3-fma` is `-C target-cpu=x86-64-v3 --cfg fused`, whose dot products use fused multiply-add into four lanes summed at the end, as a vectorising build on an FMA machine would (36 `vfmadd` in the binary). The function's id is the program's source, so the three builds are one function on three platforms. A second real machine was not used.
+- Results (`examples/e428_step_cache.rs`, an FsStore; Linux cloud, 4 CPUs shared with other builds; three runs, same bits every run):
+
+  | # | platform tag | build | result | ms (runs 1 / 2 / 3) |
+  | --- | --- | --- | --- | --- |
+  | 1 | `x86-64-plain` | target-cpu=x86-64 | miss, ran | 130.6 / 211.9 / 132.9 |
+  | 2 | `x86-64-plain` | same | **hit** | 0.053 / 0.031 / 0.036 |
+  | 3 | `x86-64-plain` | same | **hit** | 0.017 / 0.016 / 0.016 |
+  | 4 | `x86-64-v3` | target-cpu=x86-64-v3 | miss, ran | 180.6 / 128.7 / 217.4 |
+  | 5 | `x86-64-v3-fma` | target-cpu=x86-64-v3, cfg fused | miss, ran | 69.9 / 73.3 / 65.0 |
+  | 6 | `x86-64-v3-fma` | same | **hit** | 0.028 / 0.028 / 0.030 |
+
+  A hit costs 0.016 to 0.053 ms (a ref read, the record and a has-content check) against 65 to 217 ms for a run (the command, its 2.1 MB input and process start): about 127 to 138 ms saved a hit on average over the three runs, more than 99.9% of the step.
+
+  Side by side under the one key, each judged against the plain build's output by a `within-f64` check step applied as a derivation (E441):
+
+  | platform | output | same bits as plain | max ULP over the weights | final mse | `within-f64 ulp=4` |
+  | --- | --- | --- | --- | --- | --- |
+  | `x86-64-plain` | `969e5a4ef669` | yes | 0 | 7.953928e-6 | same |
+  | `x86-64-v3` | `969e5a4ef669` | yes | 0 | 7.953928e-6 | same |
+  | `x86-64-v3-fma` | `2a18d18d3c9a` | no | 667 | 7.953928e-6 | outside, abs 1.1e-16, rel 1.1e-13 |
+
+  The target-cpu build alone matched bit for bit; the fused build moved weights by up to 667 ULP (relative 1.1e-13) after 400 iterations, with the same loss to seven digits. Both outputs stay in the store as their own records; a cache keeping one answer per step would have hidden which.
+  - A float step (E441's `matmul` module, 8x8, run by the kernel with floats pinned): 1.1 to 1.6 ms the first time (compiling the module), 0.022 to 0.037 ms the second (a hit). The kind is in the key: the same function and inputs as outside work is another key (test).
+  - gc removed 5 objects (the unreferenced check verdicts and their spec; nothing of the cache), repack ran (2.7 to 3.1 s), all 4 cache refs and every output read back, `fsck` and `fsck_deep` clean, and the next call after repack was still a hit.
+- Checks: `tests/step_cache.rs`, 4 tests (a second run is a hit and runs nothing, another platform sits beside it with its props, outputs and inputs kept through gc and repack, fsck clean; the kind is in the key and a float step runs in the kernel, refusing outside work, while a recorded one needs it; recording a step without the cache files nothing and a record without props keeps E441's layout, an empty props list is refused on decode; a failed run files nothing and bad platform names are refused). `cargo test --release --features embed`: 388 pass (E441's 384 and these 4), 0 fail; clippy `-D warnings` clean.
+- Fixed bench: north_score 0.3060, sharing_kernel 0.9496; bytes 5.7493, proxy 3.8185, read 5.7140; every byte field of all 16 lines equal to main's; every corpus exact and fsck clean.
+- Verdict: **kept** (an option, off by default; every win line met: the second same-platform run is a hit, saving about 130 ms a step here; cross-platform records sit side by side and the fused build's differ visibly; fsck clean; existing tests unchanged).
+- Not done: a second real machine (three builds stand in); keying by more than one tag (E443: exact-match platform properties, timeout, salt, do-not-cache); eviction (entries are refs and live until removed); `net_fire_step` through the cache; design A records (the cache files design B only, as E441 recommends); check verdicts are not kept by the cache (commit them to keep them).
+- Run: build `experiments/step-cache` three times (`RUSTFLAGS="-C target-cpu=x86-64"`, `"-C target-cpu=x86-64-v3"`, `"-C target-cpu=x86-64-v3 --cfg fused"`), then `cargo run --release --example e428_step_cache -- WORK PLAIN V3 FUSED`.

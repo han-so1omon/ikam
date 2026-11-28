@@ -48,6 +48,7 @@ pub mod share;
 pub mod snapshot;
 pub mod stem;
 pub mod step;
+pub mod stepcache;
 mod store;
 pub mod temperature;
 mod template;

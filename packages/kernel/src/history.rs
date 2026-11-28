@@ -151,6 +151,9 @@ impl<S: Store> Repo<S> {
                 Ok(Object::Graph(Graph::Children(_, children))) => {
                     stack.extend(children.into_iter().map(|(_, id)| id))
                 }
+                // A ref may name a recorded step (E428, the step cache): its
+                // output is live, and gc keeps its inputs with it.
+                Ok(Object::Run(r)) => files.push(r.output),
                 Ok(Object::Graph(Graph::Nodes(nodes))) => {
                     for n in nodes {
                         match n.target {
