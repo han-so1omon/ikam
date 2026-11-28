@@ -158,7 +158,12 @@ impl<S: Store> Repo<S> {
     /// both are walked a level at a time, and a chunk id on both sides'
     /// frontier is dropped from each. Labels are unique in a graph, so a
     /// shared subtree holds the same nodes on both sides and no change.
-    fn leaves_not_shared(&self, a: &Id, b: &Id) -> Result<(Vec<Id>, Vec<Id>), Error> {
+    fn leaves_not_shared(
+        &self,
+        a: &Id,
+        b: &Id,
+        reads: &mut usize,
+    ) -> Result<(Vec<Id>, Vec<Id>), Error> {
         let (mut fa, mut fb) = (vec![*a], vec![*b]);
         let (mut la, mut lb) = (Vec::new(), Vec::new());
         while !fa.is_empty() || !fb.is_empty() {
@@ -186,6 +191,7 @@ impl<S: Store> Repo<S> {
             for (front, leaves) in [(&mut fa, &mut la), (&mut fb, &mut lb)] {
                 let mut next = Vec::new();
                 for id in front.drain(..) {
+                    *reads += 1;
                     match self.graph_chunk(&id)? {
                         Graph::Nodes(_) => leaves.push(id),
                         Graph::Children(_, children) => {
@@ -200,13 +206,14 @@ impl<S: Store> Repo<S> {
     }
 
     /// Ids of the node chunks under `root`, in label order.
-    fn graph_leaves(&self, root: &Id) -> Result<Vec<Id>, Error> {
+    fn graph_leaves(&self, root: &Id, reads: &mut usize) -> Result<Vec<Id>, Error> {
+        *reads += 1;
         match self.graph_chunk(root)? {
             Graph::Nodes(_) => Ok(vec![*root]),
             Graph::Children(_, children) => {
                 let mut out = Vec::new();
                 for (_, id) in children {
-                    out.extend(self.graph_leaves(&id)?);
+                    out.extend(self.graph_leaves(&id, reads)?);
                 }
                 Ok(out)
             }
@@ -492,15 +499,31 @@ impl<S: Store> Repo<S> {
     /// Nodes that differ between two graphs: `(label, before, after)`.
     /// Chunks the two share are skipped without being read.
     pub fn graph_diff(&self, a: &Id, b: &Id) -> Result<Vec<NodeChange>, Error> {
-        let (la, lb) = match self.prune_diff {
-            true => self.leaves_not_shared(a, b)?,
-            false => (self.graph_leaves(a)?, self.graph_leaves(b)?),
+        Ok(self.graph_diff_counted(a, b, self.prune_diff)?.0)
+    }
+
+    /// `graph_diff`, pruning shared subtrees or not as `prune` says, and
+    /// counting the chunks it reads (E446).
+    pub(crate) fn graph_diff_counted(
+        &self,
+        a: &Id,
+        b: &Id,
+        prune: bool,
+    ) -> Result<(Vec<NodeChange>, usize), Error> {
+        let mut reads = 0;
+        let (la, lb) = match prune {
+            true => self.leaves_not_shared(a, b, &mut reads)?,
+            false => (
+                self.graph_leaves(a, &mut reads)?,
+                self.graph_leaves(b, &mut reads)?,
+            ),
         };
         let (sa, sb): (HashSet<Id>, HashSet<Id>) =
             (la.iter().copied().collect(), lb.iter().copied().collect());
         let mut side: BTreeMap<String, (Option<Node>, Option<Node>)> = BTreeMap::new();
         for (leaves, other, before) in [(&la, &sb, true), (&lb, &sa, false)] {
             for leaf in leaves.iter().filter(|l| !other.contains(l)) {
+                reads += 1;
                 if let Graph::Nodes(nodes) = self.graph_chunk(leaf)? {
                     for n in nodes {
                         let slot = side.entry(n.label.clone()).or_default();
@@ -513,11 +536,12 @@ impl<S: Store> Repo<S> {
                 }
             }
         }
-        Ok(side
+        let changes = side
             .into_iter()
             .filter(|(_, (x, y))| x != y)
             .map(|(label, (x, y))| (label, x, y))
-            .collect())
+            .collect();
+        Ok((changes, reads))
     }
 }
 

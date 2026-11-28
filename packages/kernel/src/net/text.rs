@@ -19,7 +19,9 @@
 //! [`Net::check`]; [`Net::to_text`] prints the canonical form, which parses
 //! back to the same net. Errors name the line.
 
-use super::{Arc, Kind, Net, Place, Transition, valid_name};
+use std::collections::HashSet;
+
+use super::{Arc, Kind, Net, Place, Transition, invalid, valid_name};
 use crate::Error;
 
 fn err(line: usize, msg: impl std::fmt::Display) -> Error {
@@ -72,6 +74,10 @@ impl Net {
     /// Parse the text form and check the net.
     pub fn parse(text: &str) -> Result<Net, Error> {
         let mut net: Option<Net> = None;
+        // Names so far, so each line is checked against them in constant
+        // time (E446): the checks below are exactly what `Net::check` would
+        // refuse on the net so far, which every earlier line already passed.
+        let (mut places, mut transitions) = (HashSet::new(), HashSet::new());
         for (i, raw) in text.lines().enumerate() {
             let line = i + 1;
             let l = raw.split('#').next().unwrap_or("").trim();
@@ -106,68 +112,48 @@ impl Net {
                 .ok_or_else(|| err(line, "expected the net line first"))?;
             match word {
                 "place" => {
-                    let f: Vec<&str> = rest.split_whitespace().collect();
-                    let (name, colored, initial) = match f[..] {
-                        [name] => (name, false, 0),
-                        [name, "colored"] => (name, true, 0),
-                        [name, k] => (
-                            name,
-                            false,
-                            k.parse()
-                                .map_err(|_| err(line, format!("bad token count {k:?}")))?,
-                        ),
-                        _ => return Err(err(line, "expected: place NAME [COUNT | colored]")),
-                    };
-                    if !valid_name(name) {
-                        return Err(err(line, format!("bad place name {name:?}")));
+                    let place = parse_place(line, rest)?;
+                    if places.contains(&place.name) {
+                        return Err(err(line, format!("place {} defined twice", place.name)));
                     }
-                    if n.place(name).is_some() {
-                        return Err(err(line, format!("place {name} defined twice")));
+                    // A transition already holds the name: `check` refuses
+                    // that transition.
+                    if transitions.contains(&place.name) {
+                        return Err(err(line, invalid("transition", &place.name)));
                     }
-                    n.places.push(Place {
-                        name: name.into(),
-                        colored,
-                        initial,
-                    });
+                    places.insert(place.name.clone());
+                    n.places.push(place);
                 }
                 "transition" => {
-                    let (head, arcs) = rest
-                        .split_once(':')
-                        .ok_or_else(|| err(line, "expected a colon before the arcs"))?;
-                    let h: Vec<&str> = head.split_whitespace().collect();
-                    let (name, kind, cap) = match h[..] {
-                        [name, kind] => (name, kind, None),
-                        [name, kind, cap] => (name, kind, Some(cap)),
-                        _ => {
-                            return Err(err(
-                                line,
-                                "expected: transition NAME KIND [CAPABILITY]: IN -> OUT",
-                            ));
-                        }
-                    };
-                    let kind =
-                        Kind::parse(kind).ok_or_else(|| err(line, format!("bad kind {kind:?}")))?;
-                    let (ins, outs) = arcs
-                        .split_once("->")
-                        .ok_or_else(|| err(line, "expected -> between inputs and outputs"))?;
-                    let t = Transition {
-                        name: name.into(),
-                        inputs: parse_side(line, ins)?,
-                        outputs: parse_side(line, outs)?,
-                        kind,
-                        capability: cap.map(String::from),
-                    };
+                    let t = parse_transition(line, rest)?;
                     if let Some(a) =
-                        (t.inputs.iter().chain(&t.outputs)).find(|a| n.place(&a.place).is_none())
+                        (t.inputs.iter().chain(&t.outputs)).find(|a| !places.contains(&a.place))
                     {
                         return Err(err(line, format!("undefined place {}", a.place)));
                     }
+                    // What `check` refuses in a transition, in its order.
+                    if !valid_name(&t.name)
+                        || places.contains(&t.name)
+                        || transitions.contains(&t.name)
+                    {
+                        return Err(err(line, invalid("transition", &t.name)));
+                    }
+                    if t.inputs.is_empty() && t.outputs.is_empty() {
+                        return Err(err(line, invalid("transition with no arcs", &t.name)));
+                    }
+                    if let Some(a) = (t.inputs.iter().chain(&t.outputs)).find(|a| a.weight == 0) {
+                        return Err(err(line, invalid("arc of weight 0 to", &a.place)));
+                    }
+                    if let Some(c) = &t.capability
+                        && (t.kind == Kind::Human || !valid_name(c))
+                    {
+                        return Err(err(line, invalid("capability", c)));
+                    }
+                    transitions.insert(t.name.clone());
                     n.transitions.push(t);
                 }
                 _ => return Err(err(line, format!("unknown declaration {word:?}"))),
             }
-            // Check what we have so far, so an error names this line.
-            n.check().map_err(|e| err(line, e))?;
         }
         let net = net.ok_or_else(|| err(0, "no net line"))?;
         net.check()?;
@@ -177,32 +163,101 @@ impl Net {
     /// The canonical text form: the net line, places, then transitions, in
     /// their order, single spaces, no comments.
     pub fn to_text(&self) -> String {
-        let mut out = format!("net {} {}\n", self.name, self.version);
+        let mut out = head_line(self);
         for p in &self.places {
-            out += &match (p.colored, p.initial) {
-                (true, _) => format!("place {} colored\n", p.name),
-                (false, 0) => format!("place {}\n", p.name),
-                (false, k) => format!("place {} {k}\n", p.name),
-            };
+            out += &place_line(p);
         }
         for t in &self.transitions {
-            let cap = t
-                .capability
-                .as_ref()
-                .map(|c| format!(" {c}"))
-                .unwrap_or_default();
-            let ins = side_text(&t.inputs);
-            let outs = side_text(&t.outputs);
-            let arrow = match (ins.is_empty(), outs.is_empty()) {
-                (true, true) => "->".to_string(),
-                (true, false) => format!("-> {outs}"),
-                (false, true) => format!("{ins} ->"),
-                (false, false) => format!("{ins} -> {outs}"),
-            };
-            out += &format!("transition {} {}{cap}: {arrow}\n", t.name, t.kind.name());
+            out += &transition_line(t);
         }
         out
     }
+}
+
+/// The canonical `net NAME VERSION` line.
+pub(super) fn head_line(net: &Net) -> String {
+    format!("net {} {}\n", net.name, net.version)
+}
+
+/// A place's canonical line.
+pub(super) fn place_line(p: &Place) -> String {
+    match (p.colored, p.initial) {
+        (true, _) => format!("place {} colored\n", p.name),
+        (false, 0) => format!("place {}\n", p.name),
+        (false, k) => format!("place {} {k}\n", p.name),
+    }
+}
+
+/// A transition's canonical line, its arcs and weights included.
+pub(super) fn transition_line(t: &Transition) -> String {
+    let cap = t
+        .capability
+        .as_ref()
+        .map(|c| format!(" {c}"))
+        .unwrap_or_default();
+    let ins = side_text(&t.inputs);
+    let outs = side_text(&t.outputs);
+    let arrow = match (ins.is_empty(), outs.is_empty()) {
+        (true, true) => "->".to_string(),
+        (true, false) => format!("-> {outs}"),
+        (false, true) => format!("{ins} ->"),
+        (false, false) => format!("{ins} -> {outs}"),
+    };
+    format!("transition {} {}{cap}: {arrow}\n", t.name, t.kind.name())
+}
+
+/// The rest of a `place` line (after the word): the place it declares.
+pub(super) fn parse_place(line: usize, rest: &str) -> Result<Place, Error> {
+    let f: Vec<&str> = rest.split_whitespace().collect();
+    let (name, colored, initial) = match f[..] {
+        [name] => (name, false, 0),
+        [name, "colored"] => (name, true, 0),
+        [name, k] => (
+            name,
+            false,
+            k.parse()
+                .map_err(|_| err(line, format!("bad token count {k:?}")))?,
+        ),
+        _ => return Err(err(line, "expected: place NAME [COUNT | colored]")),
+    };
+    if !valid_name(name) {
+        return Err(err(line, format!("bad place name {name:?}")));
+    }
+    Ok(Place {
+        name: name.into(),
+        colored,
+        initial,
+    })
+}
+
+/// The rest of a `transition` line (after the word): the transition it
+/// declares, its places not yet checked against a net.
+pub(super) fn parse_transition(line: usize, rest: &str) -> Result<Transition, Error> {
+    let (head, arcs) = rest
+        .split_once(':')
+        .ok_or_else(|| err(line, "expected a colon before the arcs"))?;
+    let h: Vec<&str> = head.split_whitespace().collect();
+    let (name, kind, cap) = match h[..] {
+        [name, kind] => (name, kind, None),
+        [name, kind, cap] => (name, kind, Some(cap)),
+        _ => {
+            return Err(err(
+                line,
+                "expected: transition NAME KIND [CAPABILITY]: IN -> OUT",
+            ));
+        }
+    };
+    let kind = Kind::parse(kind).ok_or_else(|| err(line, format!("bad kind {kind:?}")))?;
+    let (ins, outs) = arcs
+        .split_once("->")
+        .ok_or_else(|| err(line, "expected -> between inputs and outputs"))?;
+    Ok(Transition {
+        name: name.into(),
+        inputs: parse_side(line, ins)?,
+        outputs: parse_side(line, outs)?,
+        kind,
+        capability: cap.map(String::from),
+    })
 }
 
 #[cfg(test)]
@@ -284,6 +339,23 @@ transition merge human: waiting ->
                 "transition a",
             ),
             ("net n 1\nplace a\ntransition t pure: ->\n", 3, "no arcs"),
+            // E446: a place named like an earlier transition, and two
+            // transitions of one name, refused on the line that makes them.
+            (
+                "net n 1\nplace a\ntransition t pure: a ->\nplace t\n",
+                4,
+                "transition t",
+            ),
+            (
+                "net n 1\nplace a\ntransition t pure: a ->\ntransition t cmd: -> a\n",
+                4,
+                "transition t",
+            ),
+            (
+                "net n 1\nplace a\ntransition t/u pure: a ->\n",
+                3,
+                "transition t/u",
+            ),
             ("net n 1\nplace a b c\n", 2, "expected: place"),
             ("net n 1\nfrobnicate\n", 2, "unknown declaration"),
             ("", 0, "no net line"),
