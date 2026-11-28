@@ -86,18 +86,13 @@ impl<S: Store> Repo<S> {
         };
         let output = self.put_content(&bytes)?.id;
         let record = match design {
-            Design::Run => {
-                let encoded = Object::Run(Run {
-                    output,
-                    func,
-                    args,
-                    check,
-                })
-                .encode();
-                let id = Id::of(&encoded);
-                self.write(id, &encoded)?;
-                id
-            }
+            Design::Run => self.write_run(Run {
+                output,
+                func,
+                args,
+                check,
+                props: Vec::new(),
+            })?,
             Design::Wrapped => {
                 // `recorded(func, head, check args..., args...)`. `head` is
                 // text: `none`, or the check function's id and its argument
@@ -121,6 +116,14 @@ impl<S: Store> Repo<S> {
             }
         };
         Ok((output, record))
+    }
+
+    /// Store a recorded step's record (design `Run`) and return its id.
+    pub(crate) fn write_run(&mut self, run: Run) -> Result<Id, Error> {
+        let encoded = Object::Run(run).encode();
+        let id = Id::of(&encoded);
+        self.write(id, &encoded)?;
+        Ok(id)
     }
 
     /// Every recorded step of `output`, in either design, as `Run`s.
@@ -178,7 +181,7 @@ impl<S: Store> Repo<S> {
         })
     }
 
-    fn run_step(&self, func: &Id, args: &[Arg]) -> Result<Vec<u8>, Error> {
+    pub(crate) fn run_step(&self, func: &Id, args: &[Arg]) -> Result<Vec<u8>, Error> {
         if func::is_builtin(func) {
             return Ok(self.evaluate(func, args)?.0);
         }
@@ -210,6 +213,7 @@ impl<S: Store> Repo<S> {
                 func,
                 args: rest[..k].to_vec(),
             }),
+            props: Vec::new(),
         })
     }
 
