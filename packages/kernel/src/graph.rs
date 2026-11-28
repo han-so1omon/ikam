@@ -132,7 +132,7 @@ impl<S: Store> Repo<S> {
         Ok(level[0].1)
     }
 
-    fn graph_chunk(&self, id: &Id) -> Result<Graph, Error> {
+    pub(crate) fn graph_chunk(&self, id: &Id) -> Result<Graph, Error> {
         graph_decode(id, &self.graph_encoded(id)?)
     }
 
