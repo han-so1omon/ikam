@@ -24,6 +24,7 @@ pub mod func;
 pub mod fusion;
 mod grant;
 mod graph;
+mod graph_fast;
 mod group;
 mod history;
 pub mod hnsw;
@@ -63,6 +64,7 @@ pub use dict::decode_cost;
 pub use fragment::{FragmentIndex, blocks};
 pub use grant::{Denied, FileGrant, FragmentGrant, Grant, Sections, windows_around};
 pub use graph::Keys;
+pub use graph_fast::Leaf;
 pub use id::Id;
 pub use object::{
     Arg, Check, Claim, Commit, Derivation, Edge, Graph, Kind, Node, Object, Run, Target, TreeEntry,

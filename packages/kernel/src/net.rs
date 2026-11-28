@@ -31,6 +31,7 @@
 //!
 //! Nothing in the default paths calls this module.
 
+mod fast;
 mod fragments;
 mod table;
 mod text;
@@ -898,7 +899,7 @@ impl<S: Store> Repo<S> {
         token: Option<&str>,
         key: &str,
     ) -> Result<(Db, Firing), Error> {
-        self.fire_inner(db, net, transition, token, key, None, None)
+        self.fire_inner(db, net, transition, token, key, None, None, None)
     }
 
     /// Fire as `net_fire`, recording the work's output in the same append
@@ -916,7 +917,7 @@ impl<S: Store> Repo<S> {
         key: &str,
         output: &[u8],
     ) -> Result<(Db, Firing), Error> {
-        self.fire_inner(db, net, transition, token, key, Some(output), None)
+        self.fire_inner(db, net, transition, token, key, Some(output), None, None)
     }
 
     /// Whether `output` (the work recomputed) matches what the firing under
@@ -976,7 +977,16 @@ impl<S: Store> Repo<S> {
             }
         };
         let bytes = self.read_content(&output)?;
-        self.fire_inner(db, net, transition, token, key, Some(&bytes), Some(record))
+        self.fire_inner(
+            db,
+            net,
+            transition,
+            token,
+            key,
+            Some(&bytes),
+            Some(record),
+            None,
+        )
     }
 
     /// Check every firing made through a step (E441), in log order, by the
@@ -1022,6 +1032,7 @@ impl<S: Store> Repo<S> {
         key: &str,
         output: Option<&[u8]>,
         step: Option<Id>,
+        at: Option<Id>,
     ) -> Result<(Db, Firing), Error> {
         if !valid_name(key) {
             return Err(invalid("firing key", key));
@@ -1033,7 +1044,11 @@ impl<S: Store> Repo<S> {
         }
         let p = prefix(&net.name);
         let rec_key = format!("{p}fire/{key}");
-        let version = self.tracked_version(db, net)?;
+        // E449: `net_fire_at` names the version it read by its root.
+        let version = match at {
+            Some(root) => Some(root),
+            None => self.tracked_version(db, net)?,
+        };
         if let Some(bytes) = self.db_get(db, &rec_key)? {
             let f = decode_record(key, &bytes)?;
             let same_output = match output {
