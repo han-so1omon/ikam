@@ -17,6 +17,9 @@ use crate::{Error, Id, Kind, Object, Repo, Store, TreeEntry};
 pub enum Edit {
     /// Create or replace the file at `path`, creating missing directories.
     Put { path: String, id: Id },
+    /// Create or replace the entry at `path` with the graph rooted at `id`
+    /// (an entry of kind `Graph`, E446), creating missing directories.
+    PutGraph { path: String, id: Id },
     /// Create an empty directory (and its parents) if missing.
     Mkdir { path: String },
     /// Remove the file or directory at `path`; missing paths are ignored.
@@ -69,6 +72,11 @@ impl<S: Store> Repo<S> {
                     let parts = split_path(path)?;
                     let (dir, name) = self.dir_for(&mut top, &parts, true)?;
                     dir.insert(name.into(), Node::Stored(Kind::File, *id));
+                }
+                Edit::PutGraph { path, id } => {
+                    let parts = split_path(path)?;
+                    let (dir, name) = self.dir_for(&mut top, &parts, true)?;
+                    dir.insert(name.into(), Node::Stored(Kind::Graph, *id));
                 }
                 Edit::Mkdir { path } => {
                     let parts = split_path(path)?;

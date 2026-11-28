@@ -31,9 +31,11 @@
 //!
 //! Nothing in the default paths calls this module.
 
+mod fragments;
 mod table;
 mod text;
 
+pub use fragments::{ArcChange, Change, Layout, Link, NetDelta};
 pub use table::Table;
 
 use std::collections::BTreeMap;
@@ -191,10 +193,13 @@ impl Net {
             return Err(invalid("net", &self.name));
         }
         let mut seen = std::collections::BTreeSet::new();
+        // Place names, so an arc's place is found in constant time (E446).
+        let mut places = std::collections::HashSet::new();
         for p in &self.places {
             if !valid_name(&p.name) || !seen.insert(p.name.as_str()) {
                 return Err(invalid("place", &p.name));
             }
+            places.insert(p.name.as_str());
             if p.colored && p.initial > 0 {
                 return Err(invalid("colored place with initial tokens", &p.name));
             }
@@ -207,7 +212,7 @@ impl Net {
                 return Err(invalid("transition with no arcs", &t.name));
             }
             for a in t.inputs.iter().chain(&t.outputs) {
-                if self.place(&a.place).is_none() {
+                if !places.contains(a.place.as_str()) {
                     return Err(invalid("arc to an undefined place", &a.place));
                 }
                 if a.weight == 0 {
@@ -1320,8 +1325,19 @@ impl<S: Store> Repo<S> {
     }
 
     /// The net whose [`version_id`](Net::version_id) is `id`, read back
-    /// from the store.
+    /// from the store; or, when `id` is no net's text, the net whose
+    /// fragment root it is (E446, [`put_net_fragments`](Repo::put_net_fragments)).
     pub fn net_version(&self, id: &Id) -> Result<Net, Error> {
+        match self.net_text_version(id) {
+            Ok(net) => Ok(net),
+            Err(e) => match self.get(id) {
+                Ok(crate::Object::Graph(_)) => self.net_fragments(id),
+                _ => Err(e),
+            },
+        }
+    }
+
+    fn net_text_version(&self, id: &Id) -> Result<Net, Error> {
         let bytes = self.read_content(id)?;
         let net = Net::parse(std::str::from_utf8(&bytes).map_err(|_| Error::Decode("net text"))?)?;
         if net.version_id() != *id {
@@ -1340,11 +1356,26 @@ impl<S: Store> Repo<S> {
     /// new places start empty, and initial tokens count only at init.
     pub fn net_track_versions(&mut self, db: &Db, net: &Net) -> Result<Db, Error> {
         net.check()?;
+        let id = self.put_content(net.to_text().as_bytes())?.id;
+        self.track_from(db, net, id.to_string())
+    }
+
+    /// [`net_track_versions`](Repo::net_track_versions) with each version
+    /// named by its fragment root (E446): every firing stores `net` as
+    /// fragments laid out as `layout` says (what an earlier version wrote
+    /// is found, not written again) and names the root. Replay reads each
+    /// root back with [`net_version`](Repo::net_version). The tracking key
+    /// holds the first root and the layout, so a firing knows the form.
+    pub fn net_track_fragments(&mut self, db: &Db, net: &Net, layout: Layout) -> Result<Db, Error> {
+        let id = self.put_net_fragments(net, layout)?;
+        self.track_from(db, net, format!("{id} {}", layout.name()))
+    }
+
+    fn track_from(&mut self, db: &Db, net: &Net, value: String) -> Result<Db, Error> {
         let p = prefix(&net.name);
         let key = format!("{p}ver");
-        let id = self.put_content(net.to_text().as_bytes())?.id;
         if let Some(v) = self.db_get(db, &key)? {
-            if v == id.to_string().as_bytes() {
+            if v == value.as_bytes() {
                 return Ok(*db);
             }
             return Err(invalid("net tracks versions from another", &net.name));
@@ -1360,32 +1391,36 @@ impl<S: Store> Repo<S> {
         {
             return Err(invalid("net fired before tracking versions", &net.name));
         }
-        self.db_append(db, &[Event::upsert(&key, id.to_string().as_bytes(), &key)])
+        self.db_append(db, &[Event::upsert(&key, value.as_bytes(), &key)])
+    }
+
+    /// The tracking key's first version and, for fragments, layout.
+    fn tracking(&self, db: &Db, net: &str) -> Result<Option<(Id, Option<Layout>)>, Error> {
+        let Some(v) = self.db_get(db, &format!("{}ver", prefix(net)))? else {
+            return Ok(None);
+        };
+        let bad = || Error::Decode("net version");
+        let v = std::str::from_utf8(&v).map_err(|_| bad())?;
+        Ok(Some(match v.split_once(' ') {
+            None => (v.parse()?, None),
+            Some((id, layout)) => (id.parse()?, Some(Layout::parse(layout).ok_or_else(bad)?)),
+        }))
     }
 
     /// The version of the net that tracking started from, if it tracks
     /// versions.
     pub fn net_first_version(&self, db: &Db, net: &str) -> Result<Option<Id>, Error> {
-        match self.db_get(db, &format!("{}ver", prefix(net)))? {
-            Some(v) => Ok(Some(
-                std::str::from_utf8(&v)
-                    .map_err(|_| Error::Decode("net version"))?
-                    .parse()?,
-            )),
-            None => Ok(None),
-        }
+        Ok(self.tracking(db, net)?.map(|(id, _)| id))
     }
 
     /// On a net that tracks versions, the version `net` is, its text kept
     /// so replay can read it back; None on any other net.
     fn tracked_version(&mut self, db: &Db, net: &Net) -> Result<Option<Id>, Error> {
-        if self
-            .db_get(db, &format!("{}ver", prefix(&net.name)))?
-            .is_none()
-        {
-            return Ok(None);
+        match self.tracking(db, &net.name)? {
+            None => Ok(None),
+            Some((_, None)) => Ok(Some(self.put_content(net.to_text().as_bytes())?.id)),
+            Some((_, Some(layout))) => Ok(Some(self.put_net_fragments(net, layout)?)),
         }
-        Ok(Some(self.put_content(net.to_text().as_bytes())?.id))
     }
 
     /// Recompute the marking of a net that tracks versions from the
