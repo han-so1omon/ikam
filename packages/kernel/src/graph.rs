@@ -16,7 +16,7 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use crate::object::{Found, graph_scan};
-use crate::{Error, Graph, Id, Node, Object, Repo, Store, node_key};
+use crate::{Arg, Error, Graph, Id, Node, Object, Repo, Store, Target, node_key};
 
 /// A node that differs between two graphs: `(label, before, after)`.
 pub type NodeChange = (String, Option<Node>, Option<Node>);
@@ -25,6 +25,8 @@ pub type NodeChange = (String, Option<Node>, Option<Node>);
 const MIN_CHUNK: usize = 4096;
 /// Every chunk ends by this many encoded bytes.
 const MAX_CHUNK: usize = 32768;
+/// The default `Repo::graph_chunk` (E447).
+pub(crate) const CHUNK_SIZES: (usize, usize) = (MIN_CHUNK, MAX_CHUNK);
 
 /// Whether two labels of a graph may share a key (see `node_key`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -39,12 +41,12 @@ pub enum Keys {
 }
 
 /// True if a chunk of `size` bytes ends after the entry labelled `label`:
-/// the boundary probability rises linearly from 0 at `MIN_CHUNK` to 1 at
-/// `MAX_CHUNK`, decided by the label's hash alone.
-fn ends_chunk(label: &str, size: usize) -> bool {
+/// the boundary probability rises linearly from 0 at `min` to 1 at `max`
+/// (`MIN_CHUNK` and `MAX_CHUNK` unless `Repo::graph_chunk` says other),
+/// decided by the label's hash alone.
+fn ends_chunk(label: &str, size: usize, (min, max): (usize, usize)) -> bool {
     let h = u64::from_be_bytes(node_key(label)) as f64 / u64::MAX as f64;
-    size >= MAX_CHUNK
-        || (size >= MIN_CHUNK && h < (size - MIN_CHUNK) as f64 / (MAX_CHUNK - MIN_CHUNK) as f64)
+    size >= max || (size >= min && h < (size - min) as f64 / (max - min) as f64)
 }
 
 /// Encoded size of a node, as chunk boundaries count it.
@@ -58,11 +60,16 @@ fn child_size(c: &(String, Id)) -> usize {
 }
 
 /// Cut `items` (label, encoded size) into chunks; returns end indices.
-fn cut<T>(items: &[T], label: impl Fn(&T) -> &str, size: impl Fn(&T) -> usize) -> Vec<usize> {
+fn cut<T>(
+    items: &[T],
+    label: impl Fn(&T) -> &str,
+    size: impl Fn(&T) -> usize,
+    sizes: (usize, usize),
+) -> Vec<usize> {
     let (mut ends, mut acc) = (Vec::new(), 0);
     for (i, item) in items.iter().enumerate() {
         acc += size(item);
-        if ends_chunk(label(item), acc) {
+        if ends_chunk(label(item), acc, sizes) {
             ends.push(i + 1);
             acc = 0;
         }
@@ -98,7 +105,7 @@ impl<S: Store> Repo<S> {
         }
         let mut level: Vec<(String, Id)> = Vec::new();
         let mut start = 0;
-        for end in cut(&nodes, |n| &n.label, node_size) {
+        for end in cut(&nodes, |n| &n.label, node_size, self.graph_chunk) {
             let chunk = nodes[start..end].to_vec();
             let first = chunk.first().map_or(String::new(), |n| n.label.clone());
             level.push((first, self.put(&Object::Graph(Graph::Nodes(chunk)))?));
@@ -114,7 +121,7 @@ impl<S: Store> Repo<S> {
         while level.len() > 1 {
             height += 1;
             let (mut parents, mut start) = (Vec::new(), 0);
-            for end in cut(&level, |c| &c.0, child_size) {
+            for end in cut(&level, |c| &c.0, child_size, self.graph_chunk) {
                 let children = level[start..end].to_vec();
                 let id = self.put(&Object::Graph(Graph::Children(height, children)))?;
                 parents.push((level[start].0.clone(), id));
@@ -848,7 +855,7 @@ impl<S: Store> Repo<S> {
                 old.push(cur);
                 for item in items {
                     acc += item.size();
-                    let ends = ends_chunk(item.label(), acc);
+                    let ends = ends_chunk(item.label(), acc, self.graph_chunk);
                     buf.push(item);
                     if ends {
                         new.push(put(self, std::mem::take(&mut buf))?);
@@ -945,7 +952,7 @@ impl<S: Store> Repo<S> {
             };
             for n in nodes.into_iter().filter(|n| !in_range(&n.label, lo, hi)) {
                 acc += node_size(&n);
-                let ends = ends_chunk(&n.label, acc);
+                let ends = ends_chunk(&n.label, acc, self.graph_chunk);
                 buf.push(n);
                 if ends {
                     emit(self, &mut buf)?;
@@ -962,6 +969,21 @@ impl<S: Store> Repo<S> {
             return self.put_graph(Vec::new());
         }
         self.put_parents(out, 1)
+    }
+}
+
+impl<S: Store> Repo<S> {
+    /// A node target for `payload` (E447): the bytes themselves
+    /// ([`Target::Inline`]) when there are at most `inline_max` of them,
+    /// else a content of its own. Inline, a payload costs its bytes in the
+    /// leaf chunk, compressed with its neighbours, and no object or id; as a
+    /// content it is kept apart, so an edit to its node leaves it, and an
+    /// edit beside it leaves the chunk's other payloads, where they are.
+    pub fn put_payload(&mut self, payload: &[u8], inline_max: usize) -> Result<Target, Error> {
+        if payload.len() <= inline_max {
+            return Ok(Target::Inline(payload.to_vec()));
+        }
+        Ok(Target::Content(Arg::Whole(self.put_content(payload)?.id)))
     }
 }
 

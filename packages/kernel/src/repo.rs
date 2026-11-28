@@ -198,6 +198,12 @@ pub struct Repo<S: Store> {
     /// subtrees both share (same id), instead of listing every leaf of
     /// both. The same changes either way; off by default.
     pub prune_diff: bool,
+    /// E447: the encoded sizes graph leaf and parent chunks are cut
+    /// between, `(min, max)`: no chunk ends before `min` bytes, every chunk
+    /// by `max`. The default `(4096, 32768)` is what every graph was cut
+    /// with before; a graph is edited with the sizes it was built with
+    /// (other sizes still give a valid graph, but another root).
+    pub graph_chunk: (usize, usize),
     pub(crate) memo: std::sync::Mutex<Option<Memo>>,
     /// Keep up to this many bytes of contents read, rebuilt ones included,
     /// across reads (E294). 0, the default, keeps none. A content's bytes
@@ -321,6 +327,7 @@ impl<S: Store> Repo<S> {
             deflate_memo: None,
             read_memo: false,
             prune_diff: false,
+            graph_chunk: crate::graph::CHUNK_SIZES,
             memo: Default::default(),
             read_cache: 0,
             refresh_ledger: false,
