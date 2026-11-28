@@ -61,9 +61,9 @@ pub fn within_f64() -> Id {
     builtin("within-f64/1")
 }
 
-/// Design A of a recorded step (E441, measured against `Run`): a
-/// derivation `recorded(func, head, check args..., args...)` whose output is kept and
-/// never rebuilt. Evaluating it is refused.
+/// The builtin of E441's dropped second design for recorded steps (E455).
+/// Its slot in `BUILTINS` stays, since short records store positions, and
+/// evaluating it is refused.
 pub fn recorded() -> Id {
     builtin("recorded/1")
 }

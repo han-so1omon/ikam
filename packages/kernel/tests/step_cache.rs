@@ -134,14 +134,8 @@ fn off_unless_asked_and_records_without_props_keep_their_bytes() {
     let mut repo = Repo::new(MemStore::default());
     let func = repo.put_content(b"cmd").unwrap().id;
     let arg = repo.put_content(b"in").unwrap().id;
-    repo.record_step(
-        func,
-        vec![Arg::Whole(arg)],
-        Some(b"out"),
-        None,
-        ikam_kernel::step::Design::Run,
-    )
-    .unwrap();
+    repo.record_step(func, vec![Arg::Whole(arg)], Some(b"out"), None)
+        .unwrap();
     assert_eq!(cache_refs(&repo), 0, "recording a step caches nothing");
 
     let out = Id::of_content(b"out");

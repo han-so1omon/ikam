@@ -23,27 +23,16 @@
 //! such check (ULP, absolute and relative bounds on f64 outputs); any pure
 //! function, builtin or WASM, can be another.
 //!
-//! The recorded record is stored one of two ways, and E441 measures both:
-//! [`Design::Run`] (a [`Run`] object of its own, tag `E`, outside the
-//! ledger) and [`Design::Wrapped`] (a derivation whose function is the
-//! builtin `recorded`, refused when evaluated). Nothing in the default
-//! paths calls this module.
+//! The record is a [`Run`] object of its own (tag `E`), outside the ledger,
+//! so nothing that rebuilds content ever sees it. E441 also measured a
+//! second design, a derivation of the builtin `recorded`; it was dropped
+//! (E455), and the builtin stays only to refuse evaluation. Nothing in the
+//! default paths calls this module.
 
 use std::collections::HashSet;
 
 use crate::dict::object_tag;
 use crate::{Arg, Check, Derivation, Error, Id, Object, Repo, Run, Store, func};
-
-/// How a recorded step's record is stored (E441 compares the two).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Design {
-    /// A `Run` object, outside the ledger: nothing that rebuilds content
-    /// ever sees it.
-    Run,
-    /// A derivation `recorded(func, head, check args..., args...)` in the ledger, whose
-    /// evaluation is refused.
-    Wrapped,
-}
 
 /// What a rerun of a recorded step found.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -78,7 +67,6 @@ impl<S: Store> Repo<S> {
         args: Vec<Arg>,
         output: Option<&[u8]>,
         check: Option<Check>,
-        design: Design,
     ) -> Result<(Id, Id), Error> {
         // A graph root is not content (E452): a run's arguments are.
         if let Some(a) = args.iter().find(|a| a.is_graph()) {
@@ -89,36 +77,13 @@ impl<S: Store> Repo<S> {
             None => self.run_step(&func, &args)?,
         };
         let output = self.put_content(&bytes)?.id;
-        let record = match design {
-            Design::Run => self.write_run(Run {
-                output,
-                func,
-                args,
-                check,
-                props: Vec::new(),
-            })?,
-            Design::Wrapped => {
-                // `recorded(func, head, check args..., args...)`. `head` is
-                // text: `none`, or the check function's id and its argument
-                // count. The check function cannot be an argument itself:
-                // a builtin's id names no content, and an argument must.
-                let (head, check_args) = match check {
-                    None => ("none".to_string(), vec![]),
-                    Some(c) => (format!("{} {}", c.func, c.args.len()), c.args),
-                };
-                let head = self.put_content(head.as_bytes())?.id;
-                let mut all = vec![Arg::Whole(func), Arg::Whole(head)];
-                // Measured as a cost of this design (E441): a WASM check
-                // function named only in `head` is not kept live by gc.
-                all.extend(check_args);
-                all.extend(args);
-                self.record(Derivation {
-                    output,
-                    func: func::recorded(),
-                    args: all,
-                })?
-            }
-        };
+        let record = self.write_run(Run {
+            output,
+            func,
+            args,
+            check,
+            props: Vec::new(),
+        })?;
         Ok((output, record))
     }
 
@@ -130,15 +95,9 @@ impl<S: Store> Repo<S> {
         Ok(id)
     }
 
-    /// Every recorded step of `output`, in either design, as `Run`s.
+    /// Every recorded step of `output`.
     pub fn step_records(&self, output: &Id) -> Result<Vec<(Id, Run)>, Error> {
         let mut out = Vec::new();
-        for d in self.derivations(output)? {
-            if d.func == func::recorded() {
-                let id = Object::Derivation(d.clone()).id();
-                out.push((id, self.unwrap_run(&d)?));
-            }
-        }
         for id in self.store.ids()? {
             if object_tag(&self.store.read_head(&id, 2)?) == Some(b'E')
                 && let Object::Run(r) = self.get(&id)?
@@ -158,7 +117,6 @@ impl<S: Store> Repo<S> {
     pub fn rerun(&mut self, record: &Id, now: Option<&[u8]>) -> Result<Rerun, Error> {
         let run = match self.get(record)? {
             Object::Run(r) => r,
-            Object::Derivation(d) if d.func == func::recorded() => self.unwrap_run(&d)?,
             _ => return Err(Error::WrongKind(*record)),
         };
         let bytes = match now {
@@ -194,34 +152,7 @@ impl<S: Store> Repo<S> {
         Ok(self.evaluate(&func::pinned_float(), &all)?.0)
     }
 
-    fn unwrap_run(&self, d: &Derivation) -> Result<Run, Error> {
-        let bad = || Error::Decode("recorded step");
-        let (Some(Arg::Whole(f)), Some(Arg::Whole(head))) = (d.args.first(), d.args.get(1)) else {
-            return Err(bad());
-        };
-        let head = String::from_utf8(self.read_content(head)?).map_err(|_| bad())?;
-        let (check, k) = match head.split_once(' ') {
-            None if head == "none" => (None, 0),
-            Some((func, k)) => (
-                Some(func.parse::<Id>()?),
-                k.parse::<usize>().map_err(|_| bad())?,
-            ),
-            None => return Err(bad()),
-        };
-        let rest = d.args.get(2..).filter(|r| r.len() >= k).ok_or_else(bad)?;
-        Ok(Run {
-            output: d.output,
-            func: *f,
-            args: rest[k..].to_vec(),
-            check: check.map(|func| Check {
-                func,
-                args: rest[..k].to_vec(),
-            }),
-            props: Vec::new(),
-        })
-    }
-
-    /// Recorded steps (design `Run`) whose outputs are in `content`, added
+    /// Recorded steps whose outputs are in `content`, added
     /// to `records`, with what their functions, arguments and checks need
     /// added to `content` (through derivations `follow` accepts), to a
     /// fixed point: a step's input may be another step's output. A full
@@ -327,15 +258,7 @@ impl<S: Store> Repo<S> {
             }
             let mut found = Vec::new();
             for d in self.derivations(&c)? {
-                if d.func == func::recorded() {
-                    let r = self.unwrap_run(&d)?;
-                    found.push(Found::Recorded {
-                        record: Object::Derivation(d).id(),
-                        func: r.func,
-                        args: ids(&r.args),
-                        check: r.check.map(|k| (k.func, ids(&k.args))),
-                    });
-                } else if !func::is_plan(&d.func) {
+                if !func::is_plan(&d.func) && d.func != func::recorded() {
                     found.push(Found::Derived {
                         record: Object::Derivation(d.clone()).id(),
                         func: d.func,

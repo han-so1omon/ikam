@@ -814,7 +814,6 @@ impl<S: Store> Repo<S> {
             vec![Arg::Whole(pin)],
             Some(bytes),
             None,
-            crate::step::Design::Run,
         )
     }
 
