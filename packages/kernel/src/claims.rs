@@ -27,6 +27,7 @@ impl<S: Store> Repo<S> {
                 .and_then(|(s, e)| bytes.get(s..e))
                 .map(<[u8]>::to_vec)
                 .ok_or_else(|| Error::Exec(format!("{id}: range {start}+{len} out of bounds"))),
+            Arg::Graph(id) => Err(crate::object::graph_not_content(id)),
         }
     }
 

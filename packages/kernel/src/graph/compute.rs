@@ -64,6 +64,61 @@ pub fn hex(k: Key) -> String {
     format!("{k:016x}")
 }
 
+/// How a result (anything but the index) labels its nodes (E452, an
+/// option; [`Repo::graph_result_layout`]).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum Layout {
+    /// By the key in hex (E450, the default): a local edit's keys scatter
+    /// over the result's chunks.
+    #[default]
+    Hash,
+    /// By the input node's own label, so a result is in the graph's order
+    /// and an edit to nearby labels rewrites nearby chunks. A key that no
+    /// present node holds (only edges name it) is labelled NUL and the key
+    /// in hex, so input labels starting with NUL are refused. The index
+    /// stays by key: edges name keys, and it is what resolves them.
+    Label,
+}
+
+impl Layout {
+    /// The result label of key `k`, whose present node (if any) is `label`.
+    pub fn label(self, k: Key, label: Option<&str>) -> String {
+        match (self, label) {
+            (Layout::Label, Some(l)) => l.to_string(),
+            (Layout::Label, None) => format!("\0{}", hex(k)),
+            (Layout::Hash, _) => hex(k),
+        }
+    }
+
+    /// The key a result label names.
+    pub fn key(self, label: &str) -> Option<Key> {
+        match self {
+            Layout::Hash => unhex(label),
+            Layout::Label => match label.strip_prefix('\0') {
+                Some(h) => unhex(h),
+                None => Some(key_of(label)),
+            },
+        }
+    }
+
+    /// The text a derivation's function names this layout by (E452).
+    pub fn func_text(self, spec: &str) -> String {
+        match self {
+            Layout::Hash => format!("ikam/graph-compute/1 {spec}"),
+            Layout::Label => format!("ikam/graph-compute/1 label {spec}"),
+        }
+    }
+
+    /// The layout and computation a function text names.
+    pub fn parse_func(text: &str) -> Option<(Layout, Compute)> {
+        let rest = text.strip_prefix("ikam/graph-compute/1 ")?;
+        match rest.strip_prefix("label ") {
+            Some(spec) => Some((Layout::Label, Compute::parse(spec)?)),
+            None => Some((Layout::Hash, Compute::parse(rest)?)),
+        }
+    }
+}
+
 fn unhex(s: &str) -> Option<Key> {
     if s.len() != 16 {
         return None;
@@ -158,6 +213,13 @@ impl GraphDelta {
             if let Some(n) = b {
                 d.label.insert(k, n.label.clone());
             }
+            d.present_labels.insert(
+                k,
+                (
+                    a.as_ref().map(|_| label.clone()),
+                    b.as_ref().map(|_| label.clone()),
+                ),
+            );
             d.old_out.insert(k, (a.is_some(), oa));
             d.new_out.insert(k, (b.is_some(), ob));
         }
@@ -180,6 +242,9 @@ struct KeyDelta {
     /// and after.
     old_out: HashMap<Key, (bool, Vec<Key>)>,
     new_out: HashMap<Key, (bool, Vec<Key>)>,
+    /// Every node in the delta: its label when present, before and after
+    /// (for [`Layout::Label`]).
+    present_labels: HashMap<Key, (Option<String>, Option<String>)>,
     /// `(from, to, edge label)`.
     edges_added: Vec<(Key, Key, String)>,
     edges_removed: Vec<(Key, Key, String)>,
@@ -356,12 +421,12 @@ impl Val for u32 {
     }
 }
 
-fn value_node<V: Val>(k: Key, v: &V) -> Node {
+fn value_node<V: Val>(label: String, v: &V) -> Node {
     let mut edges = v.enc();
     edges.sort();
     edges.dedup();
     Node {
-        label: hex(k),
+        label,
         target: Target::None,
         edges,
     }
@@ -627,15 +692,15 @@ struct FragView<'a, S: Store> {
 /// shared with other reads and versions (E451); with it off (the default)
 /// each is decoded here as before.
 #[derive(Default)]
-struct ChunkCache {
+pub(crate) struct ChunkCache {
     chunks: HashMap<Id, Arc<Graph>>,
-    reads: usize,
+    pub(crate) reads: usize,
 }
 
 impl<S: Store> Repo<S> {
     /// The nodes labelled with any of `labels`, reading each chunk that can
     /// hold one at most once per `cache`.
-    fn nodes_in_cached(
+    pub(crate) fn nodes_in_cached(
         &self,
         root: &Id,
         labels: &BTreeSet<String>,
@@ -669,20 +734,31 @@ impl<S: Store> Repo<S> {
         Ok(())
     }
 
-    fn values_in<V: Val>(
+    pub(crate) fn values_in<V: Val>(
         &self,
         root: &Id,
         keys: &[Key],
         cache: &mut ChunkCache,
     ) -> Result<HashMap<Key, V>, Error> {
         let labels: BTreeSet<String> = keys.iter().map(|k| hex(*k)).collect();
+        self.values_at(root, &labels, Layout::Hash, cache)
+    }
+
+    /// The values of a result at result labels `labels`, by key.
+    fn values_at<V: Val>(
+        &self,
+        root: &Id,
+        labels: &BTreeSet<String>,
+        layout: Layout,
+        cache: &mut ChunkCache,
+    ) -> Result<HashMap<Key, V>, Error> {
         let mut nodes = Vec::new();
-        self.nodes_in_cached(root, &labels, cache, &mut nodes)?;
+        self.nodes_in_cached(root, labels, cache, &mut nodes)?;
         nodes
             .into_iter()
             .map(|n| {
                 Ok((
-                    unhex(&n.label).ok_or_else(bad)?,
+                    layout.key(&n.label).ok_or_else(bad)?,
                     V::dec(&n.edges).ok_or_else(bad)?,
                 ))
             })
@@ -763,6 +839,48 @@ struct FragVals<'a, S: Store, V> {
     vals: HashMap<Key, Option<V>>,
     edits: BTreeMap<String, Option<Node>>,
     chunks: ChunkCache,
+    /// E452: how the result labels its nodes; with [`Layout::Label`], the
+    /// earlier version's index (labels of keys the delta does not name)
+    /// and each key's present label before and after.
+    layout: Layout,
+    index: Option<Id>,
+    labels: HashMap<Key, (Option<String>, Option<String>)>,
+    /// A key was set that `need` never resolved a label for.
+    unresolved: bool,
+}
+
+impl<'a, S: Store, V> FragVals<'a, S, V> {
+    fn new(repo: &'a Repo<S>, root: Id) -> Self {
+        FragVals {
+            repo,
+            root,
+            vals: HashMap::new(),
+            edits: BTreeMap::new(),
+            chunks: ChunkCache::default(),
+            layout: Layout::Hash,
+            index: None,
+            labels: HashMap::new(),
+            unresolved: false,
+        }
+    }
+
+    /// Resolve the present labels, before and after, of `keys`.
+    fn resolve(&mut self, keys: &[Key]) -> Result<(), Error> {
+        let todo: Vec<Key> = (keys.iter())
+            .filter(|k| !self.labels.contains_key(k))
+            .copied()
+            .collect();
+        if todo.is_empty() {
+            return Ok(());
+        }
+        let index = self.index.ok_or_else(bad)?;
+        let found: HashMap<Key, Entry> = self.repo.values_in(&index, &todo, &mut self.chunks)?;
+        for k in todo {
+            let l = found.get(&k).and_then(|e| e.label.clone());
+            self.labels.insert(k, (l.clone(), l));
+        }
+        Ok(())
+    }
 }
 
 impl<S: Store, V: Val> Vals<V> for FragVals<'_, S, V> {
@@ -776,9 +894,18 @@ impl<S: Store, V: Val> Vals<V> for FragVals<'_, S, V> {
         if missing.is_empty() {
             return Ok(());
         }
+        let labels: BTreeSet<String> = match self.layout {
+            Layout::Hash => missing.iter().map(|k| hex(*k)).collect(),
+            Layout::Label => {
+                self.resolve(&missing)?;
+                (missing.iter())
+                    .map(|k| Layout::Label.label(*k, self.labels[k].0.as_deref()))
+                    .collect()
+            }
+        };
         let mut found: HashMap<Key, V> =
             self.repo
-                .values_in(&self.root, &missing, &mut self.chunks)?;
+                .values_at(&self.root, &labels, self.layout, &mut self.chunks)?;
         for k in missing {
             self.vals.insert(k, found.remove(&k));
         }
@@ -788,8 +915,27 @@ impl<S: Store, V: Val> Vals<V> for FragVals<'_, S, V> {
         self.vals.get(&k).and_then(|v| v.as_ref())
     }
     fn set(&mut self, k: Key, v: Option<V>) {
+        let label = match self.layout {
+            Layout::Hash => hex(k),
+            Layout::Label => match self.labels.get(&k) {
+                Some((before, after)) => {
+                    let (old, new) = (
+                        Layout::Label.label(k, before.as_deref()),
+                        Layout::Label.label(k, after.as_deref()),
+                    );
+                    if old != new {
+                        self.edits.insert(old, None);
+                    }
+                    new
+                }
+                None => {
+                    self.unresolved = true;
+                    hex(k)
+                }
+            },
+        };
         self.edits
-            .insert(hex(k), v.as_ref().map(|v| value_node(k, v)));
+            .insert(label.clone(), v.as_ref().map(|v| value_node(label, v)));
         self.vals.insert(k, v);
     }
 }
@@ -1405,24 +1551,57 @@ impl<S: Store> Repo<S> {
         Ok(GraphDelta { nodes, chunks_read })
     }
 
-    fn put_values(&mut self, values: Vec<(Key, Vec<Edge>)>) -> Result<Id, Error> {
+    /// `put_values` with each node labelled as `layout` says, the labels of
+    /// present nodes taken from `mem`.
+    fn put_values_as(
+        &mut self,
+        values: Vec<(Key, Vec<Edge>)>,
+        layout: Layout,
+        mem: &MemGraph,
+    ) -> Result<Id, Error> {
+        let nodes = value_nodes(values, layout, mem)?;
+        self.put_graph(nodes)
+    }
+}
+
+/// A result's nodes: each value labelled as `layout` says, with the labels
+/// of present nodes taken from `mem`.
+pub(crate) fn value_nodes(
+    values: Vec<(Key, Vec<Edge>)>,
+    layout: Layout,
+    mem: &MemGraph,
+) -> Result<Vec<Node>, Error> {
+    {
+        if layout == Layout::Label && mem.labels.values().any(|l| l.starts_with('\0')) {
+            return Err(Error::Exec(
+                "label layout: an input label starts with NUL".into(),
+            ));
+        }
         let nodes = values
             .into_iter()
             .map(|(k, mut edges)| {
                 edges.sort();
                 edges.dedup();
+                let present = mem.adj.get(&k).is_some_and(|a| a.present);
+                let label = mem.labels.get(&k).filter(|_| present).map(String::as_str);
                 Node {
-                    label: hex(k),
+                    label: layout.label(k, label),
                     target: Target::None,
                     edges,
                 }
             })
             .collect();
-        self.put_graph(nodes)
+        Ok(nodes)
     }
+}
 
+impl<S: Store> Repo<S> {
     /// Every node of a graph, counting the chunks read.
-    fn graph_nodes_counted(&self, root: &Id, reads: &mut usize) -> Result<Vec<Node>, Error> {
+    pub(crate) fn graph_nodes_counted(
+        &self,
+        root: &Id,
+        reads: &mut usize,
+    ) -> Result<Vec<Node>, Error> {
         let mut out = Vec::new();
         let mut stack = vec![*root];
         while let Some(id) = stack.pop() {
@@ -1453,7 +1632,11 @@ impl<S: Store> Repo<S> {
         let mut index = None;
         for c in std::iter::once(&Compute::Index).chain(computes) {
             let at = std::time::Instant::now();
-            let id = self.put_values(mem.compute(c))?;
+            let layout = match c {
+                Compute::Index => Layout::Hash,
+                _ => self.graph_result_layout,
+            };
+            let id = self.put_values_as(mem.compute(c), layout, &mem)?;
             match c {
                 Compute::Index => index = Some(id),
                 c => {
@@ -1482,7 +1665,12 @@ impl<S: Store> Repo<S> {
         let at = std::time::Instant::now();
         let mut reads = 0;
         let nodes = self.graph_nodes_counted(graph, &mut reads)?;
-        let id = self.put_values(MemGraph::from_nodes(&nodes).compute(c))?;
+        let mem = MemGraph::from_nodes(&nodes);
+        let layout = match c {
+            Compute::Index => Layout::Hash,
+            _ => self.graph_result_layout,
+        };
+        let id = self.put_values_as(mem.compute(c), layout, &mem)?;
         let cost = Cost {
             spec: c.spec(),
             chunks_read: reads,
@@ -1516,13 +1704,7 @@ impl<S: Store> Repo<S> {
         let mut costs = Vec::new();
         let at = std::time::Instant::now();
         let (edits, reads, changed) = {
-            let mut v: FragVals<'_, S, Entry> = FragVals {
-                repo: self,
-                root: prev.index,
-                vals: HashMap::new(),
-                edits: BTreeMap::new(),
-                chunks: ChunkCache::default(),
-            };
+            let mut v: FragVals<'_, S, Entry> = FragVals::new(self, prev.index);
             update_index(&mut v, &kd)?;
             let n = v.edits.len();
             (v.edits, v.chunks.reads, n)
@@ -1545,7 +1727,8 @@ impl<S: Store> Repo<S> {
                     (id, cost.chunks_read, 0)
                 }
                 _ => {
-                    let (edits, reads) = self.update_one(c, old, graph, &index, &kd)?;
+                    let (edits, reads) =
+                        self.update_one(c, old, graph, &index, &prev.index, &kd)?;
                     let n = edits.len();
                     (self.graph_edit(&old, edits)?, reads, n)
                 }
@@ -1568,14 +1751,66 @@ impl<S: Store> Repo<S> {
         ))
     }
 
+    /// One computation's result for `graph`, from the earlier version's
+    /// result `old`, the earlier and the later index, and their delta (E452:
+    /// what a recorded graph derivation runs on a memo miss).
+    pub(crate) fn graph_update_result(
+        &mut self,
+        c: &Compute,
+        old: Id,
+        graph: &Id,
+        index: &Id,
+        prev_index: &Id,
+        delta: &GraphDelta,
+    ) -> Result<(Id, Cost), Error> {
+        let at = std::time::Instant::now();
+        let kd = delta.keys();
+        let (root, reads, changed) = match c {
+            Compute::PageRank { .. } => {
+                let (id, cost) = self.graph_compute_one(graph, c)?;
+                (id, cost.chunks_read, 0)
+            }
+            Compute::Index => {
+                let (edits, reads) = {
+                    let mut v: FragVals<'_, S, Entry> = FragVals::new(self, old);
+                    update_index(&mut v, &kd)?;
+                    (v.edits, v.chunks.reads)
+                };
+                let n = edits.len();
+                (self.graph_edit(&old, edits)?, reads, n)
+            }
+            _ => {
+                let (edits, reads) = self.update_one(c, old, graph, index, prev_index, &kd)?;
+                let n = edits.len();
+                (self.graph_edit(&old, edits)?, reads, n)
+            }
+        };
+        Ok((
+            root,
+            Cost {
+                spec: c.spec(),
+                chunks_read: reads,
+                changed,
+                seconds: at.elapsed().as_secs_f64(),
+            },
+        ))
+    }
+
     fn update_one(
         &self,
         c: &Compute,
         old: Id,
         graph: &Id,
         index: &Id,
+        prev_index: &Id,
         kd: &KeyDelta,
     ) -> Result<(Edits, usize), Error> {
+        let layout = self.graph_result_layout;
+        let labels = match layout {
+            Layout::Label => kd.present_labels.clone(),
+            Layout::Hash => HashMap::new(),
+        };
+        let start = (layout, Some(*prev_index), labels);
         let mut view = FragView {
             repo: self,
             graph: *graph,
@@ -1584,32 +1819,38 @@ impl<S: Store> Repo<S> {
             chunks: ChunkCache::default(),
         };
         match c {
-            Compute::Degree => self.run_update(old, &mut view, |_, v| update_degree(v, kd)),
+            Compute::Degree => self.run_update(old, start, &mut view, |_, v| update_degree(v, kd)),
             Compute::Hops { roots, k } => {
                 let rk = root_keys(roots);
-                self.run_update(old, &mut view, |w, v| update_hops(w, v, kd, &rk, *k))
+                self.run_update(old, start, &mut view, |w, v| update_hops(w, v, kd, &rk, *k))
             }
             Compute::Components => {
-                self.run_update(old, &mut view, |w, v| update_components(w, v, kd))
+                self.run_update(old, start, &mut view, |w, v| update_components(w, v, kd))
             }
             Compute::Index | Compute::PageRank { .. } => Err(bad()),
         }
     }
 
+    #[allow(clippy::type_complexity)]
     fn run_update<'a, V: Val>(
         &'a self,
         old: Id,
+        start: (
+            Layout,
+            Option<Id>,
+            HashMap<Key, (Option<String>, Option<String>)>,
+        ),
         view: &mut FragView<'a, S>,
         f: impl FnOnce(&mut FragView<'a, S>, &mut FragVals<'a, S, V>) -> Result<(), Error>,
     ) -> Result<(Edits, usize), Error> {
-        let mut vals: FragVals<'a, S, V> = FragVals {
-            repo: self,
-            root: old,
-            vals: HashMap::new(),
-            edits: BTreeMap::new(),
-            chunks: ChunkCache::default(),
-        };
+        let mut vals: FragVals<'a, S, V> = FragVals::new(self, old);
+        (vals.layout, vals.index, vals.labels) = start;
         f(view, &mut vals)?;
+        if vals.unresolved {
+            return Err(Error::Exec(
+                "label layout: a key set without its label".into(),
+            ));
+        }
         Ok((vals.edits, vals.chunks.reads + view.chunks.reads))
     }
 
@@ -1680,13 +1921,23 @@ impl<S: Store> Repo<S> {
         })
     }
 
-    /// The values of a result graph, by key.
+    /// The values of a result graph, by key (labelled as
+    /// `graph_result_layout` says; the index is always by key).
     pub fn graph_values<V: Val>(&self, result: &Id) -> Result<BTreeMap<Key, V>, Error> {
+        self.graph_values_as(result, self.graph_result_layout)
+    }
+
+    /// The values of a result graph labelled as `layout` says, by key.
+    pub fn graph_values_as<V: Val>(
+        &self,
+        result: &Id,
+        layout: Layout,
+    ) -> Result<BTreeMap<Key, V>, Error> {
         self.graph_nodes(result)?
             .into_iter()
             .map(|n| {
                 Ok((
-                    unhex(&n.label).ok_or_else(bad)?,
+                    layout.key(&n.label).ok_or_else(bad)?,
                     V::dec(&n.edges).ok_or_else(bad)?,
                 ))
             })

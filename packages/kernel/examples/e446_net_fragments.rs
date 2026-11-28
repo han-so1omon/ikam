@@ -190,7 +190,7 @@ fn reach(repo: &Repo<MemStore>, form: Form, root: &Id) -> Vec<(Id, usize)> {
                     if let Target::Content(a) = n.target {
                         let c = match a {
                             Arg::Whole(c) => c,
-                            Arg::Range { id, .. } => id,
+                            Arg::Range { id, .. } | Arg::Graph(id) => id,
                         };
                         out.push((c, repo.read_content(&c).unwrap().len()));
                     }

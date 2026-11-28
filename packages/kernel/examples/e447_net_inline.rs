@@ -331,6 +331,7 @@ fn raw_fields(nodes: &[Node], raw: &mut Raw) {
         match &n.target {
             Target::Content(Arg::Whole(_)) => raw.target_ids += 33,
             Target::Content(Arg::Range { .. }) => raw.target_ids += 49,
+            Target::Content(Arg::Graph(_)) => raw.target_ids += 33,
             Target::Object(_) => raw.target_ids += 32,
             Target::Inline(b) => {
                 raw.counts += varint_len(b.len());
@@ -527,6 +528,7 @@ fn reused_ranges(repo: &Repo<MemStore>, content: &Id, before: &HashSet<Id>) -> V
         let (id, len) = match a {
             Arg::Whole(id) => (*id, repo.read_content(id).unwrap().len()),
             Arg::Range { id, len, .. } => (*id, *len as usize),
+            Arg::Graph(id) => (*id, 0),
         };
         if before.contains(&id) {
             out.push((at, at + len));
