@@ -61,6 +61,7 @@ mod store;
 pub mod temperature;
 mod template;
 pub mod tensors;
+pub mod train;
 pub mod vectors;
 pub mod views;
 mod wasm;

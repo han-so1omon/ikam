@@ -84,9 +84,15 @@ pub fn fragment_view() -> Id {
     builtin("fragment-view/1")
 }
 
+/// A point-in-time training table (E426, `train.rs`):
+/// `train_table(rule, history)`. A fact like `render`: repack keeps it.
+pub fn train_table() -> Id {
+    builtin("train-table/1")
+}
+
 /// Builtins by index, for short derivation records (`abbrev.rs`). Stored
 /// records depend on this order: only append.
-const BUILTINS: [&str; 11] = [
+const BUILTINS: [&str; 12] = [
     "concat/1",
     "deflate-pack/1",
     "fill/1",
@@ -98,6 +104,7 @@ const BUILTINS: [&str; 11] = [
     "recorded/1",
     "sample/1",
     "fragment-view/1",
+    "train-table/1",
 ];
 
 pub(crate) fn builtin_index(func: &Id) -> Option<u8> {
@@ -159,6 +166,8 @@ pub fn run(
         return Err(Error::Exec(
             "a fragment view is kept from its commit, never rebuilt".into(),
         ));
+    } else if *func == train_table() {
+        crate::train::run(args)?
     } else {
         let module = module.ok_or_else(|| Error::Exec(format!("{func}: no such function")))?;
         let (out, fuel) = wasm::run(module, args)?;
