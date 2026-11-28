@@ -266,6 +266,25 @@ pub struct Repo<S: Store> {
     /// in full when built.
     pub seed_index_max: usize,
     pub(crate) writing_object: bool,
+    /// Keep up to this many decoded graph chunks, and what readers decode
+    /// from them, across reads and versions (E449). 0, the default, keeps
+    /// none. A chunk id names its bytes, so a kept chunk is always right;
+    /// only the `_cached` graph reads, `graph_read` and the fast net read
+    /// use it. Shared with siblings; gc empties it.
+    pub graph_cache: usize,
+    pub(crate) chunk_cache: Arc<std::sync::Mutex<crate::graph_fast::ChunkCache>>,
+    /// Threads the `_par` graph and net reads decode chunks on (E449); 0
+    /// or 1, the default, decodes on the calling thread.
+    pub read_threads: usize,
+    /// Read fragment versions of nets (`net_fragments`, `net_fragment_file`,
+    /// `net_version`) by the fast path of E449: each leaf decoded once, kept
+    /// by `graph_cache`, a strict canonical parse in place of building every
+    /// node again. Off by default.
+    pub net_fast_read: bool,
+    /// Write fragment versions of nets against the last version written
+    /// (E449): only what changed is built and put, and the graph edited in
+    /// place; the same root. Off by default.
+    pub net_delta_write: bool,
 }
 
 /// Old chunk contents read during one edit with `replace_hints` on.
@@ -333,6 +352,11 @@ impl<S: Store> Repo<S> {
             seed_index_max: 0,
             writing_object: false,
             hints: Default::default(),
+            graph_cache: 0,
+            chunk_cache: Default::default(),
+            read_threads: 0,
+            net_fast_read: false,
+            net_delta_write: false,
         }
     }
 
@@ -685,6 +709,11 @@ impl<S: Store> Repo<S> {
         r.read_cache = self.read_cache;
         r.refresh_ledger = self.refresh_ledger;
         r.cache = self.cache.clone();
+        r.graph_cache = self.graph_cache;
+        r.chunk_cache = self.chunk_cache.clone();
+        r.read_threads = self.read_threads;
+        r.net_fast_read = self.net_fast_read;
+        r.net_delta_write = self.net_delta_write;
         r.short_records = self.short_records;
         r.markup_layers = self.markup_layers;
         r.object_templates = self.object_templates;
@@ -713,6 +742,7 @@ impl<S: Store> Repo<S> {
         self.dict = OnceLock::new();
         *self.needed.lock().unwrap() = None;
         *self.cache.lock().unwrap() = Cache::default();
+        *self.chunk_cache.lock().unwrap() = Default::default();
     }
 
     /// Keep the needed set current after storing `encoded` (E129).

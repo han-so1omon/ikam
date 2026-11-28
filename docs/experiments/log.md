@@ -6683,3 +6683,82 @@ Gates on the branch (E229 to E233): every kernel test suite passes (release); cl
 - Checks: `tests/net_fragments.rs`, 8 tests (read back in both layouts and through `net_version`, one root for one net; 22 versions chained by commits writing under 60 objects each after the first and read back after gc, fsck and fsck_deep clean; every delta applied exactly, pruned equal to unpruned; a one-weight edit to a 5,000-transition net read in at most 10 chunks and 2 fragments, under a tenth of the unpruned walk; rename, removal and relink named as such; a root whose nodes are not the net's refused; firings named by fragment roots replay to the text-tracked run's marking; a graph entry beside files). `cargo test --release --features embed`: 400 pass, 0 fail. clippy `-D warnings` clean. Fixed bench: bytes 5.7493, proxy 3.8185, read 5.7140, north 0.3060, sharing 0.9496, every corpus's byte figures equal to main.
 - Not done / Next: a repack at 10,000 transitions (repack time grows faster than linearly on the in-memory store); a fragment form whose fragments share compression (grouping fragments per leaf chunk at repack, or holding the fragment graph only as an index beside the text); a three-way merge of two fragment versions through the delta; rename detection (a rename is a removal and an addition); a fragment root kept live by gc through the database that names it (as in E422, a database is not a gc root); FsStore, where per-object overhead would weigh against the fragment form further.
 - Run: `cargo run --release --example e446_net_fragments -- 10,1000,10000 300`.
+
+### E449 net-read-path (fragment nets and graphs read, written and fired faster: decode once, a shared chunk cache, delta writes, reads by key)
+
+- Branch / parent: exp/449-net-read-path / exp/446-net-fragments (9dffb34)
+- Question: E446's fragment form reads a net about 3.5x slower than E422's text file and writes a version about 2x slower. Where does that time go, and can it be brought to the text's time or under, for a read of version 25 and a version's write at 1,000 and 10,000 transitions, and for a firing on a 10,000-transition fragment net? The owner widened the question to graphs in general: the same lever on `put_graph` graphs (a sparse power-law link graph and a property graph) through 25 versions of local edits, including traversal (k-hop reads, reads by key).
+- Found before building (profile, `e449_net_read_path profile`, version 25):
+  - E446's read at 10,000 transitions (75.5 ms): fetch and decode the graph chunks 6.8 ms, `read_content` of 15,006 fragments 7.3 ms, `Net::parse` of every line (about 1 µs each), `Net::check` 3.3 ms, then the canonical check rebuilds every node (print each element with `to_text`, 4.2 ms; hash each line, 1.3 ms; clone the net, 2.5 ms) and compares. The text read is 19.7 ms, nearly all `Net::parse`.
+  - E446's write: a write of a version already stored still takes 53 ms at 10,000 (`put_graph` of every node 24.3 ms, `put_content` of every line 7.9 ms), against the text's 11.7 ms. In a write of new chunks, the planner's template search (`object_templates`, E144) is the largest part.
+  - A chunk's bytes are stored as slices of earlier chunks, so a cold chunk read may rebuild a chain of slice derivations across versions; this is the floor of a cold read.
+- Change (every behaviour an option, off by default; default reads, writes and stored bytes are unchanged; new code in `graph_fast.rs` and `net/fast.rs`):
+  - Graph layer (`graph_fast.rs`, for any graph): `Repo::graph_cache` (count, 0 = off) holds decoded objects keyed by (chunk id, kind) behind `Arc`, FIFO, shared with siblings, emptied by gc. Ids name content, so a kept entry is valid in every version that holds the chunk. `graph_chunk_cached`, `graph_leaf_ids` (lists the leaves from the height-1 chunks without reading the leaves), `graph_nodes_cached`, `graph_read(root)` (every leaf with its payloads, one read each, kept per leaf), `graph_node_cached` (one node by key: walk from the root, binary search the leaf), `graph_nodes_in_cached`, `graph_hops(root, starts, k, follow)` (k-hop neighbourhood by key), `graph_decoded` for a caller's own decoded form of a leaf, `graph_cache_stats` and `graph_cache_clear`. `Repo::read_threads` (0 = off) decodes cold leaves on scoped threads (`graph_read_par`, `graph_decoded_par`). With the cache off, contents are read and verified straight from the store, skipping the read cache's copy.
+  - Fast net read (`Repo::net_fast_read`, `net_fragments_fast`): each leaf is decoded once into its elements and kept in the cache as kind `net-leaf`. A line is parsed by a strict canonical parser that accepts exactly what `Net::to_text` prints, so nothing is printed or hashed again to compare. Each edge's key is checked against its target, then the order links are followed through an Fx-hashed map with counts and arc places checked, and `Net::check` runs with hash sets. A forged root is refused as the full read refuses it (14 forged cases in the tests); the full check stays in `net_fragments_full` and `fsck_deep`.
+  - Delta write (`Repo::net_delta_write`): `put_net_fragments` keeps the last net written under each name with its root. The next version is diffed with it (positional alignment, then by name), and only the nodes whose element or `next` link changed go to `graph_edit` with their new lines. An unchanged net returns the kept root at once, which removes the net write from a firing. The roots are those of the whole write, so stored bytes are equal.
+  - Reads by key: `net_fragments_part(root, transitions)` reads the head, those transitions and their places only. `net_fire_at(db, root, transition, token, key)` fires one transition of a fragment-tracked net reading only that part, and records the firing as `net_fire` does (`fire_inner` takes the version root). `net_fragments_par` is the threaded read.
+- Method (`examples/e449_net_read_path.rs`, reusing E446's synthetic nets and its 25-version edit chain; Linux cloud, 4 CPUs, MemStore; other experiments' builds ran on the machine throughout, load average 4.7 to 9, so times are noisy). Times are medians: 15 runs at 1,000 transitions, 7 at 10,000, 5 for the graphs, 3 runs of the firing loop. "After reading v24" reads v25 with the cache kept from reading v24 (what a process following the chain sees). "Cold" empties the cache before each read. Bytes are the store's growth at the default weight and at the bench's heavy weight (48.8), the E446 rows from the same run. The graphs: a link graph of 100,000 nodes and 997,238 edges with short titles (4.1 MB of payloads), and a property graph of 10,000 nodes of 1 to 4 KB (26 MB), each through 25 versions of 10 edges toggled, 5 payloads edited, and every third version a 5-node subgraph added.
+- Results, nets (µs; reads of version 25, writes the mean of versions 2 to 25):
+
+  | transitions, weight | text write | E446 write | E449 delta write | text read | E446 read | E449 cold | E449 after v24 | E449 one transition by key, cold / cached |
+  | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+  | 1,000, default | 4,248 | 5,743 | 3,578 | 1,520 | 4,704 (3.09x) | 2,060 (1.35x) | 540 (0.35x) | 166 / 9 |
+  | 10,000, default | 22,789 | 44,816 | 10,436 | 15,341 | 84,558 (5.51x) | 36,313 (2.37x) | 5,374 (0.35x) | 212 / 23 |
+  | 1,000, heavy | 1,710 | 6,167 | 1,840 | 1,439 | 4,621 (3.21x) | 1,960 (1.36x) | 615 (0.43x) | 127 / 8 |
+  | 10,000, heavy | 14,222 | 44,841 | 11,736 | 22,337 | 74,929 (3.35x) | 29,853 (1.34x) | 5,401 (0.24x) | 188 / 23 |
+
+  Each idea alone, same run: the fast read with no cache is 2,221 / 44,433 / 2,181 / 25,725 µs in the four rows (1.46x, 2.90x, 1.52x, 1.15x text); with v25 kept (hot) 361 / 5,402 / 417 / 9,118. The threaded cold read (3 threads) gained nothing on the loaded machine (4,142 / 37,478 / 2,179 / 38,660). E446's own delta applied to a held v24 is 2,400 / 42,424 / 2,281 / 34,213. With `object_templates` off the delta write is 2,248 / 10,007 / 1,723 / 10,576 µs, at 2,461 against 2,536 B a version at 1,000 (default weight) and equal bytes otherwise. After reading v24, reading v25 decoded 3 chunks and took 16 from the cache at 1,000, 5 and 176 at 10,000. Bytes v1 and bytes a version adds are E446's exactly (118,782 and 2,536 at 1,000; 1,232,063 and 3,098 at 10,000; 14,110 and 22,544 at heavy weight), 99.2% and 99.9% of objects reused. fsck and fsck_deep: 0 problems in every store.
+- Results, firings (µs a firing; replay of the whole run; three runs, median):
+
+  | net | text (E422) | fragments (E446) | E449 delta write + fast read | E449 `net_fire_at` by key |
+  | --- | --- | --- | --- | --- |
+  | night net, edited 9 times, 300 candidates | 4,951 (replay 62 ms) | 4,711 (70 ms) | 4,845 (75 ms) | 4,903 (62 ms) |
+  | night net inside 10,000 more transitions, 100 candidates | 13,040 (430 ms) | 49,500 (1,027 ms) | 8,795 (203 ms) | 7,021 (223 ms) |
+
+  The four runs end in the same marking, and each replays to it.
+- Results, general graphs (25 versions; µs):
+
+  | | link graph (100k nodes, 1M edges) | property graph (10k nodes, 1-4 KB) |
+  | --- | --- | --- |
+  | bytes v1 | 20,741,606 | 8,683,972 |
+  | bytes a version adds, default / heavy weight | 12,894 / 150,656 | 8,587 / 80,953 |
+  | objects reused | 100.0% | 99.8% |
+  | write a version: `put_graph` every payload, default / heavy | 1,127,434 / 981,755 | 139,186 / 107,301 |
+  | write a version: `graph_edit` touched payloads, default / heavy | 210,430 / 7,528 | 25,153 / 6,242 |
+  | read v25 whole: plain (`graph_nodes` + `read_content`) | 429,688 | 143,398 |
+  | read v25 whole: `graph_read`, no cache / cold / after v24 | 550,506 / 446,273 / 7,941 | 159,558 / 152,891 / 15,159 |
+  | read v25 whole: `graph_read_par`, 3 threads, cold | 460,148 | 109,517 |
+  | delta v24 to v25 (`graph_diff`, shared chunks skipped) | 15,956 | 8,851 |
+  | 100 nodes by key: plain `graph_node` / cached cold / kept | 10,732 / 22,721 / 135 | 14,186 / 8,489 / 45 |
+  | 2-hop of 10 starts: plain `graph_nodes_in` / `graph_hops` cold / kept | 50,673 / 100,050 / 3,758 (973 nodes) | 3,469 / 6,144 / 186 (120 nodes) |
+
+  `graph_edit` and `put_graph` give the same roots and bytes. fsck and fsck_deep: 0 problems.
+- Findings:
+  1. The time E446 added was work done twice. A read decoded every chunk, parsed every line, then printed and hashed every element again to prove it canonical. Parsing a line strictly once is as strict and removes the second pass: a cold read drops from 3.1-5.5x the text to 1.15-2.4x, with no cache at all. The rest of a cold read is fetching chunks and fragments whose bytes are stored as slices of earlier versions, which this change does not alter.
+  2. A shared decoded-chunk cache pays whenever versions are read in turn. Version 25 after version 24 decodes 3 to 5 chunks and takes the rest decoded, so it reads in 0.24-0.43x the text's time at both sizes and weights. The same holds for general graphs: the link graph's v25 reads in 7.9 ms after v24 against 430 ms plain (54x), the property graph's in 15 ms against 143 ms. Reads by key and hops from kept chunks are 80-300x faster than the plain walks.
+  3. A delta write that diffs against the last written net and edits only those nodes meets the text's write time at 10,000 transitions (10.4 against 22.8 ms; 11.7 against 14.2 ms heavy) and at 1,000 at the default weight (3.6 against 4.2 ms). At 1,000 under the heavy weight it misses slightly (1,840 against 1,710 µs). With `object_templates` off it is 1,723, in noise of the text. For general graphs `graph_edit` with the touched payloads is 5x (default weight) to 130x (heavy weight) faster than `put_graph` of the whole graph. At the default weight its time is mostly the planner slicing the rewritten chunks.
+  4. Firing on a 10,000-transition fragment net goes from 3.8x slower than text (49.5 against 13.0 ms) to faster (8.8 ms; 7.0 ms by key), and replay is 2x faster than text. An unchanged net is no longer written again at each firing. On the night net nothing changes beyond noise, because the database append dominates a firing there, as in E446.
+  5. Cold cache misses cost: a cache filled from cold is slower than the plain path for scattered reads by key (22.7 against 10.7 ms for 100 keys on the link graph) and for hops (2x). Decoding a whole leaf to keep it costs more than one binary search through a leaf read once. The cache pays from the second touch of a chunk.
+  6. The threaded decode showed no gain for nets on a loaded machine; on the property graph's cold read it gave 110 against 153 ms. It needs free cores to judge.
+- Fit with the places nets are used: E422's night, train and small nets are a few transitions. A firing on them is the database append, so the change neither helps nor hurts there. `net_fire`, `net_fire_step` and E441's recorded steps all go through `fire_inner`, so the delta write's memo removes the per-firing net write for each of them when `net_delta_write` is on. `net_fire_at` serves the large-net case. `net_replay_versions` gains from the cache, since a replay reads each named version in turn. Beyond nets, the cache, `graph_read`, the keyed reads and `graph_hops` are in the graph layer and serve any `put_graph` object. The database views and the tree's graph entries could use them, but neither is wired here.
+- Verdict: **partial** (options, off by default). Met: a version's write at 10,000 at both weights and at 1,000 at the default weight; a firing on a 10,000-transition net (faster than text); a read of version 25 when the previous version was read (0.24-0.43x text); reads by key (0.01-0.11x). Missed: a cold read of version 25 (1.34-2.37x text, at best 1.15x with no cache under the heavy weight), and the write at 1,000 under the heavy weight (1.08x; equal with `object_templates` off). Mutation checks: with `list_edits` ignoring a changed `next` link, `delta_writes_give_the_whole_writes_roots` and the firing test fail. With the cache key ignoring the chunk id, 6 of the 8 tests fail. With the parser taking a written weight of 1, `the_fast_read_refuses_what_the_full_read_refuses` fails.
+- Owner's choices raised: (a) `object_templates` off for fragment writes: about 1.6x faster small-net delta writes, for 3% more bytes a version at 1,000 transitions at the default weight and none at 10,000. (b) A cold read can only reach the text's time with a different stored form, fragments held inline in their leaf chunk (the bytes lever a sibling experiment measures) so that a read fetches chunks only, or with parallel decode on free cores. (c) Whether the decoded-chunk cache, a count of `Arc`s kept in memory, should be on by default for long-lived processes (db serve, replay).
+- Checks: `tests/net_read_path.rs`, 8 tests:
+  - fast read equal to full read at every version, both layouts;
+  - reading the next version decodes at most 12 chunks;
+  - delta writes give the whole write's roots over 26 versions, a repeat writes no objects, flat layout, gc, fsck, read back, and an invalid net refused;
+  - 14 forged roots refused by the fast read as by the full read;
+  - firings by key record and replay as whole-net firings do;
+  - a firing by key needs fragment tracking;
+  - cached graph reads, keyed reads and hops equal the plain ones and an in-memory BFS;
+  - kept chunks shared with siblings and dropped by gc.
+
+  `cargo test --release --features embed --no-fail-fast`: 408 pass, 0 fail, 5 ignored. clippy `--all-targets -D warnings` clean. Fixed bench: bytes 5.7493, proxy 3.8185, read 5.7140, north 0.3060, sharing 0.9496, as on the parent. Privacy scan: `scan.py --all` exits 0.
+- Not done / Next:
+  - a step variant of `net_fire_at` (`net_fire_step` still takes the whole net from its caller);
+  - db views and tree graph entries using the cached reads;
+  - the inline-fragment stored form for cold reads;
+  - the threaded decode measured on an idle machine;
+  - a bound on the cache by bytes rather than count;
+  - FsStore, where a cold fetch costs more and the cache would weigh more.
+- Run: `cargo run --release --example e449_net_read_path -- nets 1000,10000`, `-- fire 300`, `-- graphs 1.0`, `-- profile 1000,10000`.
