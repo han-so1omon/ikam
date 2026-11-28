@@ -296,6 +296,11 @@ pub struct Repo<S: Store> {
     /// (E449): only what changed is built and put, and the graph edited in
     /// place; the same root. Off by default.
     pub net_delta_write: bool,
+    /// Store the derivation records of graph and tree chunks with short
+    /// ids (E451): `short_records` (E104) for the records a chunk's
+    /// content is derived by, and no others. Off by default; reading
+    /// accepts both forms.
+    pub short_chunk_records: bool,
 }
 
 /// Old chunk contents read during one edit with `replace_hints` on.
@@ -329,7 +334,7 @@ pub(crate) const MEMO_LIMIT: usize = 64 << 20;
 
 impl<S: Store> Repo<S> {
     pub fn new(store: S) -> Repo<S> {
-        Repo {
+        let r = Repo {
             store,
             index: None,
             ledger: Default::default(),
@@ -370,7 +375,14 @@ impl<S: Store> Repo<S> {
             read_threads: 0,
             net_fast_read: false,
             net_delta_write: false,
-        }
+            short_chunk_records: false,
+        };
+        // E451: a test-only switch (never in a default build) that turns
+        // the fragment-net options on for every handle, to run the whole
+        // suite under them.
+        #[cfg(feature = "test-net-options")]
+        let r = crate::net::test_options(r);
+        r
     }
 
     /// Start noting old chunks read, if `replace_hints` is on, a scope is
@@ -727,6 +739,7 @@ impl<S: Store> Repo<S> {
         r.read_threads = self.read_threads;
         r.net_fast_read = self.net_fast_read;
         r.net_delta_write = self.net_delta_write;
+        r.short_chunk_records = self.short_chunk_records;
         r.short_records = self.short_records;
         r.markup_layers = self.markup_layers;
         r.object_templates = self.object_templates;

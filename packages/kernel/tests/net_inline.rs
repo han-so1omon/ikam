@@ -6,7 +6,9 @@
 use std::collections::BTreeMap;
 
 use ikam_kernel::net::{Arc, InlineCodec, Kind, Layout, Net, Place, Transition};
-use ikam_kernel::{ChunkSizes, Db, Edge, Edit, Graph, MemStore, Node, Object, Repo, Store, Target, node_key};
+use ikam_kernel::{
+    ChunkSizes, Db, Edge, Edit, Graph, MemStore, Node, Object, Repo, Store, Target, node_key,
+};
 
 const CODECS: [InlineCodec; 3] = [
     InlineCodec::Lines,

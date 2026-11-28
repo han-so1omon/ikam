@@ -30,7 +30,7 @@ use std::collections::BTreeMap;
 
 use super::{Element, FIRST_PLACE, FIRST_TRANSITION, HEAD, NEXT, Read, bad, fragment_nodes};
 use super::{parse_fragment, place_label, transition_label};
-use crate::net::text::{head_line, place_line, transition_line};
+use crate::net::text::{place_line, transition_line};
 use crate::net::{Arc, Kind, Net, Place, Transition};
 use crate::{Error, Node, Target};
 
@@ -119,31 +119,57 @@ pub(super) fn inline_nodes(net: &Net, codec: InlineCodec) -> Vec<Node> {
     let name_of = |n: Option<&String>| n.cloned().unwrap_or_default();
     let first_p = name_of(net.places.first().map(|p| &p.name));
     let first_t = name_of(net.transitions.first().map(|t| &t.name));
-    let head = match codec {
-        InlineCodec::Compact => format!(
-            "{}{} {}\n{first_p}\n{first_t}",
-            COMPACT_HEAD as char, net.name, net.version
-        ),
-        _ => format!("{}{first_p}\n{first_t}", head_line(net)),
-    };
+    let head = head_payload(&net.name, net.version, &first_p, &first_t, codec);
     let mut out = vec![node(HEAD.into(), head)];
     for (i, p) in net.places.iter().enumerate() {
         let next = name_of(net.places.get(i + 1).map(|p| &p.name));
-        let body = match codec {
-            InlineCodec::Compact => format!("{}\n{next}", compact_place(p)),
-            _ => format!("{}{next}", place_line(p)),
-        };
-        out.push(node(place_label(&p.name), body));
+        out.push(node(place_label(&p.name), place_payload(p, &next, codec)));
     }
     for (i, t) in net.transitions.iter().enumerate() {
         let next = name_of(net.transitions.get(i + 1).map(|t| &t.name));
-        let body = match codec {
-            InlineCodec::Compact => format!("{}\n{next}", compact_transition(t)),
-            _ => format!("{}{next}", transition_line(t)),
-        };
-        out.push(node(transition_label(&t.name), body));
+        out.push(node(
+            transition_label(&t.name),
+            transition_payload(t, &next, codec),
+        ));
     }
     out
+}
+
+/// The head payload `inline_nodes` writes under `codec` (not `Lines`,
+/// whose head is E446's line with edges): the name and version, then the
+/// first place's and first transition's names ("" for none).
+pub(in crate::net) fn head_payload(
+    name: &str,
+    version: u32,
+    first_p: &str,
+    first_t: &str,
+    codec: InlineCodec,
+) -> String {
+    match codec {
+        InlineCodec::Compact => format!(
+            "{}{name} {version}\n{first_p}\n{first_t}",
+            COMPACT_HEAD as char
+        ),
+        _ => format!("net {name} {version}\n{first_p}\n{first_t}"),
+    }
+}
+
+/// The payload `inline_nodes` writes for place `p` followed by the place
+/// named `next` ("" for none), under `codec` (not `Lines`).
+pub(in crate::net) fn place_payload(p: &Place, next: &str, codec: InlineCodec) -> String {
+    match codec {
+        InlineCodec::Compact => format!("{}\n{next}", compact_place(p)),
+        _ => format!("{}{next}", place_line(p)),
+    }
+}
+
+/// The payload `inline_nodes` writes for transition `t` followed by the
+/// transition named `next` ("" for none), under `codec` (not `Lines`).
+pub(in crate::net) fn transition_payload(t: &Transition, next: &str, codec: InlineCodec) -> String {
+    match codec {
+        InlineCodec::Compact => format!("{}\n{next}", compact_transition(t)),
+        _ => format!("{}{next}", transition_line(t)),
+    }
 }
 
 /// The codec a head node's payload was written with.
@@ -179,7 +205,7 @@ fn parse_arcs(s: &str) -> Result<Vec<Arc>, Error> {
 /// What an inline node declares and links to. `net_fragments` writes the
 /// net it reads back and refuses nodes it would not write, so one element
 /// has one payload.
-pub(super) fn read_inline(n: &Node, bytes: &[u8]) -> Result<Read, Error> {
+pub(in crate::net) fn read_inline(n: &Node, bytes: &[u8]) -> Result<Read, Error> {
     let text = std::str::from_utf8(bytes).map_err(|_| bad())?;
     let label = n.label.as_str();
     let mut links = BTreeMap::new();

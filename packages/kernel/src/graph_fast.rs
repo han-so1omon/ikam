@@ -51,8 +51,9 @@ const CHUNK: &str = "graph";
 /// The kind under which a leaf's nodes with their payloads are kept.
 const PAYLOADS: &str = "payloads";
 
-/// A leaf chunk's nodes, each with its content's bytes (None for a node
-/// whose target is not a whole content).
+/// A leaf chunk's nodes, each with its payload's bytes: a whole content's,
+/// or the inline bytes of `Target::Inline` (E451); None for any other
+/// target.
 pub struct Leaf {
     pub id: Id,
     pub nodes: Vec<(Node, Option<Vec<u8>>)>,
@@ -185,6 +186,8 @@ impl<S: Store> Repo<S> {
         for n in nodes {
             let bytes = match &n.target {
                 Target::Content(Arg::Whole(id)) => Some(self.read_content_direct(id)?),
+                // E451: a payload kept in the node (E447) is its own bytes.
+                Target::Inline(bytes) => Some(bytes.clone()),
                 _ => None,
             };
             out.push((n.clone(), bytes));

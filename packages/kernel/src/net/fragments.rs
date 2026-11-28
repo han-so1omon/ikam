@@ -40,6 +40,7 @@ use super::{Net, Place, Transition};
 use crate::{Arg, Edge, Error, Graph, Id, Node, Object, Repo, Store, Target, node_key};
 
 pub use inline::InlineCodec;
+pub(super) use inline::{head_payload, place_payload, read_inline, transition_payload};
 
 /// How a fragment version's nodes are kept.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -393,18 +394,10 @@ impl<S: Store> Repo<S> {
     /// Fragments and chunks earlier versions wrote are found, not written
     /// again.
     pub fn put_net_fragments(&mut self, net: &Net, layout: Layout) -> Result<Id, Error> {
-        match layout {
-            Layout::Inline => return self.put_net_inline(net, InlineCodec::Compact),
-            Layout::InlineFlat => {
-                net.check()?;
-                let mut nodes = inline::inline_nodes(net, InlineCodec::Compact);
-                nodes.sort_by(|a, b| a.label.cmp(&b.label));
-                return self.put(&Object::Graph(Graph::Nodes(nodes)));
-            }
-            _ => {}
-        }
+        let layout = super::test_layout(layout);
         // E449: with `net_delta_write`, only what changed since the last
-        // version written is hashed and stored; the root is the same.
+        // version written is hashed and stored; the root is the same (every
+        // layout, the inline ones of E447 included: E451).
         if self.net_delta_write {
             return self.put_net_fragments_delta(net, layout);
         }
@@ -418,6 +411,16 @@ impl<S: Store> Repo<S> {
         net: &Net,
         layout: Layout,
     ) -> Result<Id, Error> {
+        match layout {
+            Layout::Inline => return self.put_net_inline(net, InlineCodec::Compact),
+            Layout::InlineFlat => {
+                net.check()?;
+                let mut nodes = inline::inline_nodes(net, InlineCodec::Compact);
+                nodes.sort_by(|a, b| a.label.cmp(&b.label));
+                return self.put(&Object::Graph(Graph::Nodes(nodes)));
+            }
+            Layout::Tree | Layout::Flat => {}
+        }
         net.check()?;
         let mut nodes = Vec::new();
         for (node, text) in fragment_nodes(net) {
@@ -425,11 +428,11 @@ impl<S: Store> Repo<S> {
             nodes.push(node);
         }
         match layout {
-            Layout::Tree | Layout::Inline | Layout::InlineFlat => self.put_graph(nodes),
             Layout::Flat => {
                 nodes.sort_by(|a, b| a.label.cmp(&b.label));
                 self.put(&Object::Graph(Graph::Nodes(nodes)))
             }
+            _ => self.put_graph(nodes),
         }
     }
 

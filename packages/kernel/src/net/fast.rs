@@ -35,12 +35,14 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
 
 use super::fragments::{
-    Element, FIRST_PLACE, FIRST_TRANSITION, HEAD, Layout, NEXT, bad, head_node, place_label,
-    place_node, transition_label, transition_node,
+    Element, FIRST_PLACE, FIRST_TRANSITION, HEAD, InlineCodec, Layout, NEXT, bad, head_node,
+    head_payload, place_label, place_node, place_payload, read_inline, transition_label,
+    transition_node, transition_payload,
 };
+use super::text::{place_line, transition_line};
 use super::{Arc as NetArc, Firing, Kind, Net, Place, Transition, invalid, valid_name};
 use crate::db::Db;
-use crate::{Arg, Error, Graph, Id, Node, Repo, Store, Target, node_key};
+use crate::{Arg, ChunkSizes, Error, Graph, Id, Node, Repo, Store, Target, node_key};
 
 /// FxHash (as `ir.rs` uses for its short keys): labels are short, and a
 /// read hashes every one of them twice.
@@ -85,13 +87,28 @@ struct Item {
     next: Option<String>,
     first_place: Option<String>,
     first_transition: Option<String>,
+    /// The stored forms this node is exactly the node of (E451, `FORM_*`):
+    /// a version's nodes must share one, as the full read requires.
+    forms: u8,
 }
+
+/// An E446 node: its fragment a content of its own.
+const FORM_CONTENT: u8 = 1;
+/// Inline (E447) under [`InlineCodec::Lines`]: E446's line and edges.
+const FORM_LINES: u8 = 2;
+/// Inline under [`InlineCodec::LinesNext`].
+const FORM_LINES_NEXT: u8 = 4;
+/// Inline under [`InlineCodec::Compact`] (`Layout::Inline`, `InlineFlat`).
+const FORM_COMPACT: u8 = 8;
 
 /// The last fragment version written of a net (`net_delta_write`).
 struct Last {
     net: Net,
     root: Id,
     layout: Layout,
+    /// The chunk bounds the root was cut with: under other bounds the same
+    /// net has another root, so the kept one is not reused (E451).
+    chunks: ChunkSizes,
 }
 
 /// A canonical decimal: digits, no leading zero.
@@ -232,7 +249,258 @@ fn decode_item(n: Node, text: &[u8]) -> Result<Item, Error> {
         next,
         first_place,
         first_transition,
+        forms: FORM_CONTENT,
     })
+}
+
+/// The rules `Net::check` applies to one element (E451; the strict
+/// canonical parse of `decode_item` applies them as it parses, an inline
+/// payload is checked here).
+fn check_element(el: &Element) -> Result<(), Error> {
+    match el {
+        Element::Head(name, _) => {
+            name_ok(name)?;
+        }
+        Element::Place(p) => {
+            name_ok(&p.name)?;
+            if p.colored && p.initial > 0 {
+                return Err(invalid("colored place with initial tokens", &p.name));
+            }
+        }
+        Element::Transition(t) => {
+            name_ok(&t.name)?;
+            if t.inputs.is_empty() && t.outputs.is_empty() {
+                return Err(invalid("transition with no arcs", &t.name));
+            }
+            for a in t.inputs.iter().chain(&t.outputs) {
+                name_ok(&a.place)?;
+                if a.weight == 0 {
+                    return Err(invalid("arc of weight 0 to", &a.place));
+                }
+            }
+            if let Some(c) = &t.capability
+                && (t.kind == Kind::Human || !valid_name(c))
+            {
+                return Err(invalid("capability", c));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// One side of a compact transition payload (E447's codec): `w*p` for
+/// weights above 1, `p` for 1, joined by `,`; empty for no arcs.
+fn compact_side(s: &str) -> Result<Vec<NetArc>, Error> {
+    if s.is_empty() {
+        return Ok(vec![]);
+    }
+    let mut out = Vec::with_capacity(2);
+    for a in s.split(',') {
+        let (weight, place) = match a.find('*') {
+            Some(at) => match canonical_u32(&a[..at])? {
+                w if w >= 2 => (w, &a[at + 1..]),
+                _ => return Err(bad()),
+            },
+            None => (1, a),
+        };
+        out.push(NetArc {
+            place: name_ok(place)?.into(),
+            weight,
+        });
+    }
+    Ok(out)
+}
+
+/// The label a compact payload's link names: `prefix` and the name, or
+/// none for "".
+fn compact_link(prefix: &str, name: &str) -> Result<Option<String>, Error> {
+    match name {
+        "" => Ok(None),
+        n => Ok(Some(format!("{prefix}{}", name_ok(n)?))),
+    }
+}
+
+/// A node in E447's compact codec, parsed strictly (E451): accepted only
+/// when `bytes` is exactly the payload `inline_nodes` writes for what is
+/// read, with the element rules of `Net::check`, so no payload is printed
+/// again to compare. None when the payload is not in the compact codec.
+fn decode_compact(label: &str, bytes: &[u8]) -> Result<Option<Item>, Error> {
+    let text = std::str::from_utf8(bytes).map_err(|_| bad())?;
+    let item = |element, next, first_place, first_transition| Item {
+        label: label.to_string(),
+        element,
+        next,
+        first_place,
+        first_transition,
+        forms: FORM_COMPACT,
+    };
+    if label == HEAD {
+        let Some(rest) = text.strip_prefix('@') else {
+            return Ok(None);
+        };
+        let (line, firsts) = rest.split_once('\n').ok_or_else(bad)?;
+        let (fp, ft) = firsts.split_once('\n').ok_or_else(bad)?;
+        let (name, version) = line.split_once(' ').ok_or_else(bad)?;
+        let head = Element::Head(name_ok(name)?.into(), canonical_u32(version)?);
+        let (fp, ft) = (compact_link("p/", fp)?, compact_link("t/", ft)?);
+        return Ok(Some(item(head, None, fp, ft)));
+    }
+    if text.starts_with("place ") || text.starts_with("transition ") {
+        return Ok(None);
+    }
+    let (body, next) = text.split_once('\n').ok_or_else(bad)?;
+    if let Some(name) = label.strip_prefix("p/") {
+        let (colored, initial) = match body {
+            "" => (false, 0),
+            "c" => (true, 0),
+            k => match canonical_u32(k)? {
+                0 => return Err(bad()),
+                k => (false, k),
+            },
+        };
+        let place = Element::Place(Place {
+            name: name_ok(name)?.into(),
+            colored,
+            initial,
+        });
+        return Ok(Some(item(place, compact_link("p/", next)?, None, None)));
+    }
+    let name = label.strip_prefix("t/").ok_or_else(bad)?;
+    let (head, arcs) = body.split_once(':').ok_or_else(bad)?;
+    let (kind, capability) = match head.split_once(' ') {
+        None => (head, None),
+        Some((k, c)) => (k, Some(name_ok(c)?.to_string())),
+    };
+    let kind = match kind {
+        "p" => Kind::Pure,
+        "c" => Kind::Cmd,
+        "a" => Kind::Agent,
+        "h" if capability.is_none() => Kind::Human,
+        _ => return Err(bad()),
+    };
+    let (ins, outs) = arcs.split_once('>').ok_or_else(bad)?;
+    let (inputs, outputs) = (compact_side(ins)?, compact_side(outs)?);
+    if inputs.is_empty() && outputs.is_empty() {
+        return Err(invalid("transition with no arcs", name));
+    }
+    let t = Element::Transition(Transition {
+        name: name_ok(name)?.into(),
+        inputs,
+        outputs,
+        kind,
+        capability,
+    });
+    Ok(Some(item(t, compact_link("t/", next)?, None, None)))
+}
+
+/// An inline node (E447, `Target::Inline`) as the fast read decodes it
+/// (E451): read as `read_inline` reads it, then refused unless its payload
+/// is exactly the one `inline_nodes` writes for what was read under some
+/// codec, and its element passes `check_element`. A node with edges is
+/// E446's line inline (`InlineCodec::Lines`) and is decoded as E446's.
+fn decode_inline(n: Node) -> Result<Item, Error> {
+    let Target::Inline(bytes) = &n.target else {
+        return Err(bad());
+    };
+    if !n.edges.is_empty() {
+        let bytes = bytes.clone();
+        let mut item = decode_item(n, &bytes)?;
+        item.forms = FORM_LINES;
+        return Ok(item);
+    }
+    if let Some(item) = decode_compact(&n.label, bytes)? {
+        return Ok(item);
+    }
+    let r = read_inline(&n, bytes)?;
+    check_element(&r.element)?;
+    // Items hold the labels links name; payloads hold the names.
+    let link = |edge: &str| r.links.get(edge).cloned();
+    let (next, first_place, first_transition) = match &r.element {
+        Element::Head(..) => (None, link(FIRST_PLACE), link(FIRST_TRANSITION)),
+        _ => (link(NEXT), None, None),
+    };
+    let codecs = [
+        (InlineCodec::LinesNext, FORM_LINES_NEXT),
+        (InlineCodec::Compact, FORM_COMPACT),
+    ];
+    let mut forms = 0;
+    match &r.element {
+        Element::Head(name, version) => {
+            let (fp, ft) = (name_in(&first_place), name_in(&first_transition));
+            for (codec, form) in codecs {
+                if head_payload(name, *version, fp, ft, codec).as_bytes() == bytes.as_slice() {
+                    forms |= form;
+                }
+            }
+            if fp.is_empty()
+                && ft.is_empty()
+                && *bytes == format!("net {name} {version}\n").as_bytes()
+            {
+                forms |= FORM_LINES;
+            }
+        }
+        Element::Place(p) => {
+            let nx = name_in(&next);
+            for (codec, form) in codecs {
+                if place_payload(p, nx, codec).as_bytes() == bytes.as_slice() {
+                    forms |= form;
+                }
+            }
+            if nx.is_empty() && place_line(p).as_bytes() == bytes.as_slice() {
+                forms |= FORM_LINES;
+            }
+        }
+        Element::Transition(t) => {
+            let nx = name_in(&next);
+            for (codec, form) in codecs {
+                if transition_payload(t, nx, codec).as_bytes() == bytes.as_slice() {
+                    forms |= form;
+                }
+            }
+            if nx.is_empty() && transition_line(t).as_bytes() == bytes.as_slice() {
+                forms |= FORM_LINES;
+            }
+        }
+    }
+    if forms == 0 {
+        return Err(bad());
+    }
+    Ok(Item {
+        label: n.label,
+        element: r.element,
+        next,
+        first_place,
+        first_transition,
+        forms,
+    })
+}
+
+/// The name a link's target label names ("" for none).
+fn name_in(l: &Option<String>) -> &str {
+    l.as_deref().and_then(|l| l.get(2..)).unwrap_or("")
+}
+
+/// A node of a fragment version, E446's or inline, as the fast read
+/// decodes it; `text` is the fragment of an E446 node.
+fn decode_node(n: Node, text: Option<&[u8]>) -> Result<Item, Error> {
+    match (&n.target, text) {
+        (Target::Inline(_), _) => decode_inline(n),
+        (Target::Content(Arg::Whole(_)), Some(text)) => decode_item(n, text),
+        _ => Err(bad()),
+    }
+}
+
+/// The ids of the fragments E446 nodes among `nodes` name, in order.
+fn fragment_ids(nodes: &[Node]) -> Result<Vec<Id>, Error> {
+    let mut out = Vec::new();
+    for n in nodes {
+        match &n.target {
+            Target::Content(Arg::Whole(id)) => out.push(*id),
+            Target::Inline(_) => {}
+            _ => return Err(bad()),
+        }
+    }
+    Ok(out)
 }
 
 /// A fragment version put together from its decoded leaves, in label
@@ -241,10 +509,16 @@ fn decode_item(n: Node, text: &[u8]) -> Result<Item, Error> {
 fn assemble(leaves: &[Arc<Vec<Item>>]) -> Result<Net, Error> {
     let total = leaves.iter().map(|l| l.len()).sum();
     let mut by: FxMap<&str, &Item> = FxMap::with_capacity_and_hasher(total, Default::default());
+    let mut forms = u8::MAX;
     for item in leaves.iter().flat_map(|l| l.iter()) {
+        forms &= item.forms;
         if by.insert(&item.label, item).is_some() {
             return Err(bad());
         }
+    }
+    // E451: one stored form for every node, as the full read builds them.
+    if forms == 0 {
+        return Err(Error::Decode("net fragments: not this net's nodes"));
     }
     let find = |label: &str| -> Result<&Item, Error> { by.get(label).copied().ok_or_else(bad) };
     let head = find(HEAD)?;
@@ -391,6 +665,41 @@ fn list_edits<T: PartialEq>(
     }
 }
 
+/// An inline compact node (E447's `Layout::Inline`) with its payload,
+/// as `inline_nodes` builds it; the text is empty (nothing is put).
+fn compact_node(label: String, payload: String) -> (Node, String) {
+    let node = Node {
+        label,
+        target: Target::Inline(payload.into_bytes()),
+        edges: vec![],
+    };
+    (node, String::new())
+}
+
+fn compact_head_node(net: &Net) -> (Node, String) {
+    let name = |n: Option<&String>| n.cloned().unwrap_or_default();
+    let fp = name(net.places.first().map(|p| &p.name));
+    let ft = name(net.transitions.first().map(|t| &t.name));
+    let payload = head_payload(&net.name, net.version, &fp, &ft, InlineCodec::Compact);
+    compact_node(HEAD.into(), payload)
+}
+
+fn compact_place_node(p: &Place, next: Option<&Place>) -> (Node, String) {
+    let next = next.map(|n| n.name.as_str()).unwrap_or("");
+    compact_node(
+        place_label(&p.name),
+        place_payload(p, next, InlineCodec::Compact),
+    )
+}
+
+fn compact_transition_node(t: &Transition, next: Option<&Transition>) -> (Node, String) {
+    let next = next.map(|n| n.name.as_str()).unwrap_or("");
+    compact_node(
+        transition_label(&t.name),
+        transition_payload(t, next, InlineCodec::Compact),
+    )
+}
+
 impl<S: Store> Repo<S> {
     /// A leaf of a fragment version, decoded by the fast read.
     fn net_leaf(&self, leaf: &Id) -> Result<Vec<Item>, Error> {
@@ -399,11 +708,11 @@ impl<S: Store> Repo<S> {
         };
         let mut out = Vec::with_capacity(nodes.len());
         for n in nodes {
-            let Target::Content(Arg::Whole(id)) = n.target else {
-                return Err(bad());
+            let text = match &n.target {
+                Target::Content(Arg::Whole(id)) => Some(self.read_content_direct(id)?),
+                _ => None,
             };
-            let text = self.read_content_direct(&id)?;
-            out.push(decode_item(n, &text)?);
+            out.push(decode_node(n, text.as_deref())?);
         }
         Ok(out)
     }
@@ -430,18 +739,17 @@ impl<S: Store> Repo<S> {
             if nodes.len() != labels.len() {
                 return Err(invalid("transition", "not in this version"));
             }
-            let ids: Vec<Id> = nodes
-                .iter()
+            let texts = self.read_contents(&fragment_ids(&nodes)?)?;
+            let mut texts = texts.iter();
+            (nodes.into_iter())
                 .map(|n| match &n.target {
-                    Target::Content(Arg::Whole(id)) => Ok(*id),
-                    _ => Err(bad()),
+                    Target::Inline(_) => decode_node(n, None),
+                    _ => decode_node(n, texts.next().map(|t| t.as_slice())),
                 })
-                .collect::<Result<_, _>>()?;
-            let texts = self.read_contents(&ids)?;
-            (nodes.into_iter().zip(&texts))
-                .map(|(n, t)| decode_item(n, t))
                 .collect()
         };
+        // E451: the nodes read share one stored form.
+        let mut forms = u8::MAX;
         let mut labels: BTreeSet<String> =
             transitions.iter().map(|t| transition_label(t)).collect();
         labels.insert(HEAD.into());
@@ -453,6 +761,7 @@ impl<S: Store> Repo<S> {
         };
         let mut by_label = HashMap::new();
         for item in read(&labels)? {
+            forms &= item.forms;
             by_label.insert(item.label, item.element);
         }
         match by_label.remove(HEAD) {
@@ -474,9 +783,13 @@ impl<S: Store> Repo<S> {
         let labels: BTreeSet<String> = wanted.iter().map(|p| place_label(p)).collect();
         let mut places = HashMap::new();
         for item in read(&labels)? {
+            forms &= item.forms;
             if let Element::Place(p) = item.element {
                 places.insert(p.name.clone(), p);
             }
+        }
+        if forms == 0 {
+            return Err(Error::Decode("net fragments: not this net's nodes"));
         }
         for p in &wanted {
             net.places.push(places.remove(p).ok_or_else(bad)?);
@@ -517,16 +830,22 @@ impl<S: Store> Repo<S> {
         let key = format!("net/{}", net.name);
         let last = self.graph_named::<Last>(&key);
         let id = match last {
-            Some(l) if l.layout == layout && l.net == *net && self.store.has(&l.root) => {
+            Some(l)
+                if l.layout == layout
+                    && l.chunks == self.graph_chunks
+                    && l.net == *net
+                    && self.store.has(&l.root) =>
+            {
                 return Ok(l.root);
             }
             Some(l)
-                if l.layout == Layout::Tree
-                    && layout == Layout::Tree
+                if l.layout == layout
+                    && l.chunks == self.graph_chunks
+                    && matches!(layout, Layout::Tree | Layout::Inline)
                     && self.store.has(&l.root) =>
             {
                 check_hashed(net)?;
-                self.fragment_edit(&l.net, &l.root, net)?
+                self.fragment_edit(&l.net, &l.root, net, layout)?
             }
             _ => self.put_net_fragments_whole(net, layout)?,
         };
@@ -536,13 +855,22 @@ impl<S: Store> Repo<S> {
                 net: net.clone(),
                 root: id,
                 layout,
+                chunks: self.graph_chunks,
             }),
         );
         Ok(id)
     }
 
-    /// The tree-layout root of `new` from that of `old` at `root`.
-    fn fragment_edit(&mut self, old: &Net, root: &Id, new: &Net) -> Result<Id, Error> {
+    /// The root of `new` laid out as `layout` (`Tree`, or E447's `Inline`:
+    /// E451) from that of `old` at `root`.
+    fn fragment_edit(
+        &mut self,
+        old: &Net,
+        root: &Id,
+        new: &Net,
+        layout: Layout,
+    ) -> Result<Id, Error> {
+        let inline = layout == Layout::Inline;
         let (mut edits, mut texts) = (Vec::new(), Vec::new());
         let first = |n: &Net| {
             (
@@ -551,7 +879,10 @@ impl<S: Store> Repo<S> {
             )
         };
         if (&old.name, old.version, first(old)) != (&new.name, new.version, first(new)) {
-            let (n, text) = head_node(new);
+            let (n, text) = match inline {
+                true => compact_head_node(new),
+                false => head_node(new),
+            };
             texts.push(text);
             edits.push((n.label.clone(), Some(n)));
         }
@@ -560,7 +891,10 @@ impl<S: Store> Repo<S> {
             &new.places,
             |p| &p.name,
             place_label,
-            place_node,
+            match inline {
+                true => compact_place_node,
+                false => place_node,
+            },
             &mut edits,
             &mut texts,
         );
@@ -569,12 +903,17 @@ impl<S: Store> Repo<S> {
             &new.transitions,
             |t| &t.name,
             transition_label,
-            transition_node,
+            match inline {
+                true => compact_transition_node,
+                false => transition_node,
+            },
             &mut edits,
             &mut texts,
         );
-        for t in &texts {
-            self.put_content(t.as_bytes())?;
+        if !inline {
+            for t in &texts {
+                self.put_content(t.as_bytes())?;
+            }
         }
         self.graph_edit(root, edits.into_iter().collect())
     }

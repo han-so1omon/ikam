@@ -1382,6 +1382,7 @@ impl<S: Store> Repo<S> {
     /// root back with [`net_version`](Repo::net_version). The tracking key
     /// holds the first root and the layout, so a firing knows the form.
     pub fn net_track_fragments(&mut self, db: &Db, net: &Net, layout: Layout) -> Result<Db, Error> {
+        let layout = test_layout(layout);
         let id = self.put_net_fragments(net, layout)?;
         self.track_from(db, net, format!("{id} {}", layout.name()))
     }
@@ -1528,6 +1529,44 @@ impl<S: Store> Repo<S> {
         }
         Ok(m)
     }
+}
+
+/// E451's test-only switch (feature `test-net-options`): the options
+/// `IKAM_NET_OPTIONS` names, set on a new handle. `fast` is
+/// `net_fast_read`, `delta` is `net_delta_write`, `cache=N` is
+/// `graph_cache`, `threads=N` is `read_threads`; `inline` stores what is
+/// asked for as `Layout::Tree` as `Layout::Inline` and `Layout::Flat` as
+/// `Layout::InlineFlat` ([`test_layout`]).
+#[cfg(feature = "test-net-options")]
+pub(crate) fn test_options<S: Store>(mut r: Repo<S>) -> Repo<S> {
+    let Ok(v) = std::env::var("IKAM_NET_OPTIONS") else {
+        return r;
+    };
+    for o in v.split(',') {
+        let num = |s: &str| s.parse::<usize>().unwrap_or(0);
+        match o.split_once('=') {
+            Some(("cache", n)) => r.graph_cache = num(n),
+            Some(("threads", n)) => r.read_threads = num(n),
+            _ if o == "fast" => r.net_fast_read = true,
+            _ if o == "delta" => r.net_delta_write = true,
+            _ => {}
+        }
+    }
+    r
+}
+
+/// The layout a fragment net asked for as `layout` is stored in: itself,
+/// or with the test-only switch's `inline`, its inline twin.
+pub(crate) fn test_layout(layout: Layout) -> Layout {
+    #[cfg(feature = "test-net-options")]
+    if std::env::var("IKAM_NET_OPTIONS").is_ok_and(|v| v.split(',').any(|o| o == "inline")) {
+        return match layout {
+            Layout::Tree => Layout::Inline,
+            Layout::Flat => Layout::InlineFlat,
+            l => l,
+        };
+    }
+    layout
 }
 
 #[cfg(test)]

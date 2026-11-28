@@ -45,6 +45,7 @@
 //! the floor the fragment form is measured against.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::sync::Arc;
 
 use crate::{Arg, Edge, Error, Graph, Id, Node, Repo, Store, Target, node_key};
 
@@ -621,10 +622,13 @@ struct FragView<'a, S: Store> {
     chunks: ChunkCache,
 }
 
-/// Decoded chunks read during one computation, so each is read once.
+/// Decoded chunks read during one computation, so each is read once. A
+/// chunk comes through `graph_chunk_cached`, so with `graph_cache` on it is
+/// shared with other reads and versions (E451); with it off (the default)
+/// each is decoded here as before.
 #[derive(Default)]
 struct ChunkCache {
-    chunks: HashMap<Id, Graph>,
+    chunks: HashMap<Id, Arc<Graph>>,
     reads: usize,
 }
 
@@ -643,15 +647,15 @@ impl<S: Store> Repo<S> {
         }
         if !cache.chunks.contains_key(root) {
             cache.reads += 1;
-            let g = self.graph_chunk(root)?;
+            let g = self.graph_chunk_cached(root)?;
             cache.chunks.insert(*root, g);
         }
-        match &cache.chunks[root] {
+        let chunk = Arc::clone(&cache.chunks[root]);
+        match &*chunk {
             Graph::Nodes(nodes) => {
                 out.extend(nodes.iter().filter(|n| labels.contains(&n.label)).cloned())
             }
             Graph::Children(_, children) => {
-                let children = children.clone();
                 for (i, (first, child)) in children.iter().enumerate() {
                     let low = if i == 0 { String::new() } else { first.clone() };
                     let mine: BTreeSet<String> = match children.get(i + 1) {
@@ -1423,11 +1427,9 @@ impl<S: Store> Repo<S> {
         let mut stack = vec![*root];
         while let Some(id) = stack.pop() {
             *reads += 1;
-            match self.graph_chunk(&id)? {
-                Graph::Nodes(nodes) => out.extend(nodes),
-                Graph::Children(_, children) => {
-                    stack.extend(children.into_iter().rev().map(|c| c.1))
-                }
+            match &*self.graph_chunk_cached(&id)? {
+                Graph::Nodes(nodes) => out.extend(nodes.iter().cloned()),
+                Graph::Children(_, children) => stack.extend(children.iter().rev().map(|c| c.1)),
             }
         }
         Ok(out)

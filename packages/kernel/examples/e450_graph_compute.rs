@@ -26,12 +26,13 @@
 //! median of each time.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::sync::OnceLock;
 use std::time::Instant;
 
 use ikam_kernel::graph_compute::{Compute, Computed, Deg, Entry, GraphDelta, Key, MemGraph};
 use ikam_kernel::net::{Arc, Kind, Net, Place, Transition};
 use ikam_kernel::{
-    Arg, Edge, Edit, Graph, Id, MemStore, Node, Object, Repo, Store, Target, node_key,
+    Arg, ChunkSizes, Edge, Edit, Graph, Id, MemStore, Node, Object, Repo, Store, Target, node_key,
 };
 
 const VERSIONS: usize = 25;
@@ -85,7 +86,24 @@ fn words(rng: &mut Rng, n: usize) -> String {
         .join(" ")
 }
 
+/// E451's combined options, on with `E450_E451=1`, for the input graph and
+/// every result graph alike: E449's decoded-chunk cache (and its fast net
+/// read, which these graphs do not use), E448's chunk frames with parent
+/// bounds 16 to 128 KiB, E451's short chunk records, and E447's inline
+/// payloads (up to `INLINE_MAX` bytes held in the node, not stored apart).
+fn e451() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var("E450_E451").is_ok_and(|v| v == "1"))
+}
+
+/// The largest payload held inline under `E450_E451=1` (E447's link-graph
+/// setting).
+const INLINE_MAX: usize = 256;
+
 fn content(text: &str) -> Target {
+    if e451() && text.len() <= INLINE_MAX {
+        return Target::Inline(text.as_bytes().to_vec());
+    }
     Target::Content(Arg::Whole(Id::of_content(text.as_bytes())))
 }
 
@@ -590,6 +608,9 @@ struct Run {
 
 fn put_payloads(repo: &mut Repo<MemStore>, texts: &[String]) {
     for t in texts {
+        if e451() && t.len() <= INLINE_MAX {
+            continue;
+        }
         repo.put_content(t.as_bytes()).unwrap();
     }
 }
@@ -628,6 +649,16 @@ fn new_repo(heavy: bool, fast: bool) -> Repo<MemStore> {
         repo.plain_hot_writes = true;
         repo.read_cache = 512 << 20;
         repo.read_memo = true;
+    }
+    if e451() {
+        repo.graph_cache = 1 << 16;
+        repo.net_fast_read = true;
+        repo.object_contexts = true;
+        repo.graph_chunks = ChunkSizes {
+            leaf: (4096, 32768),
+            parent: (16384, 131072),
+        };
+        repo.short_chunk_records = true;
     }
     repo
 }
@@ -937,6 +968,13 @@ fn main() {
             "default"
         }
     );
+    if e451() {
+        println!(
+            "E451 options (E450_E451=1): graph_cache 65536, net_fast_read, object_contexts, \
+             graph_chunks leaf 4096:32768 parent 16384:131072, short_chunk_records, \
+             payloads up to {INLINE_MAX} B inline"
+        );
+    }
     for name in which {
         let at = Instant::now();
         let w = match name.as_str() {

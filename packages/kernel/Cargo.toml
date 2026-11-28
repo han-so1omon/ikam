@@ -49,6 +49,10 @@ store-redb = ["dep:redb"]
 store-rocksdb = ["dep:rocksdb"]
 store-sqlite = ["dep:rusqlite"]
 embed = ["dep:candle-core", "dep:candle-nn", "dep:candle-transformers", "dep:tokenizers", "dep:serde_json"]
+# E451: test-only. With it, `IKAM_NET_OPTIONS` (comma list: fast, delta,
+# cache=N, threads=N, inline) turns the fragment-net options on in every
+# `Repo::new`, so the whole suite runs under them. Never on by default.
+test-net-options = []
 stores = ["store-fjall", "store-lmdb", "store-redb", "store-rocksdb", "store-sqlite"]
 
 [dev-dependencies]

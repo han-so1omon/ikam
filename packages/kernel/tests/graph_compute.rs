@@ -7,7 +7,7 @@
 use std::collections::{BTreeMap, HashMap};
 
 use ikam_kernel::graph_compute::{Compute, Deg, Entry, GraphDelta, Key, MemGraph, key_of};
-use ikam_kernel::{Arg, Edge, Edit, Id, MemStore, Node, Repo, Target, node_key};
+use ikam_kernel::{Arg, ChunkSizes, Edge, Edit, Id, MemStore, Node, Repo, Target, node_key};
 
 struct Rng(u64);
 
@@ -377,4 +377,103 @@ fn a_graph_delta_applies_exactly_and_names_its_edges() {
     let whole = repo.graph_nodes(&root).unwrap().len();
     assert!(d.chunks_read < 20, "{} of {whole}", d.chunks_read);
     assert_eq!(key_of("n7"), u64::from_be_bytes(node_key("n7")));
+}
+
+/// The same graph with each title held inline (E447) in place of its
+/// content id.
+fn inlined(plain: &Repo<MemStore>, g: &BTreeMap<String, Node>) -> Vec<Node> {
+    g.values()
+        .map(|n| {
+            let mut n = n.clone();
+            if let Target::Content(Arg::Whole(id)) = n.target {
+                n.target = Target::Inline(plain.read_content(&id).unwrap());
+            }
+            n
+        })
+        .collect()
+}
+
+/// E451: with E449's chunk cache, E448's frames and parent bounds, short
+/// chunk records and inline titles, every computation gives the values it
+/// gives in a plain store, and the update still equals the full recompute.
+#[test]
+fn computations_are_the_same_with_the_e451_options() {
+    let mut plain = Repo::new(MemStore::default());
+    let mut opts = Repo::new(MemStore::default());
+    opts.graph_cache = 4096;
+    opts.object_contexts = true;
+    opts.graph_chunks = ChunkSizes {
+        leaf: (4096, 32768),
+        parent: (16384, 131072),
+    };
+    opts.short_chunk_records = true;
+    let mut rng = Rng(0x451);
+    let mut g = random_graph(&mut plain, 1500, &mut rng);
+    let roots = vec!["n3".to_string(), "n401".to_string(), "n999".to_string()];
+    let cs = computes(roots);
+    let mut pr = plain.put_graph(g.values().cloned().collect()).unwrap();
+    let mut or = opts.put_graph(inlined(&plain, &g)).unwrap();
+    let (mut pd, _) = plain.graph_compute(&pr, &cs).unwrap();
+    let (mut od, _) = opts.graph_compute(&or, &cs).unwrap();
+    for v in 2..=20 {
+        let e = edits(&mut plain, &g, v, &mut rng);
+        for (l, n) in &e {
+            match n {
+                Some(n) => g.insert(l.clone(), n.clone()),
+                None => g.remove(l),
+            };
+        }
+        let inl: BTreeMap<String, Node> = inlined(&plain, &g)
+            .into_iter()
+            .map(|n| (n.label.clone(), n))
+            .collect();
+        let oe: BTreeMap<String, Option<Node>> =
+            e.keys().map(|l| (l.clone(), inl.get(l).cloned())).collect();
+        let pn = plain.graph_edit(&pr, e).unwrap();
+        let on = opts.graph_edit(&or, oe).unwrap();
+        assert_eq!(on, opts.put_graph(inl.values().cloned().collect()).unwrap());
+        let pdelta = plain.graph_delta(&pr, &pn).unwrap();
+        let odelta = opts.graph_delta(&or, &on).unwrap();
+        let (pi, _) = plain
+            .graph_compute_update(&pd, &pn, Some(&pdelta), &cs)
+            .unwrap();
+        let (oi, _) = opts
+            .graph_compute_update(&od, &on, Some(&odelta), &cs)
+            .unwrap();
+        if v % 5 == 0 {
+            opts.graph_cache_clear();
+        }
+        let (ofull, _) = opts.graph_compute(&on, &cs).unwrap();
+        assert_eq!(oi, ofull, "version {v}: incremental differs from full");
+        let same = |spec: &str| (&pi.results[spec], &oi.results[spec]);
+        assert_eq!(
+            plain.graph_values::<Entry>(&pi.index).unwrap(),
+            opts.graph_values::<Entry>(&oi.index).unwrap()
+        );
+        let (a, b) = same(&cs[0].spec());
+        assert_eq!(
+            plain.graph_values::<Deg>(a).unwrap(),
+            opts.graph_values::<Deg>(b).unwrap()
+        );
+        for c in [&cs[1], &cs[2]] {
+            let (a, b) = same(&c.spec());
+            assert_eq!(
+                plain.graph_values::<u32>(a).unwrap(),
+                opts.graph_values::<u32>(b).unwrap(),
+                "v{v} {}",
+                c.spec()
+            );
+        }
+        for c in [&cs[3], &cs[4]] {
+            let (a, b) = same(&c.spec());
+            assert_eq!(
+                plain.graph_values::<u64>(a).unwrap(),
+                opts.graph_values::<u64>(b).unwrap(),
+                "v{v} {}",
+                c.spec()
+            );
+        }
+        (pr, pd, or, od) = (pn, pi, on, oi);
+    }
+    assert_eq!(opts.fsck().unwrap().len(), 0);
 }

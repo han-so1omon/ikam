@@ -368,6 +368,7 @@ impl<S: Store + Sync> Repo<S> {
         let mut fresh = Repo::new(MemStore::default());
         fresh.read_weight = self.read_weight;
         fresh.short_records = self.short_records;
+        fresh.short_chunk_records = self.short_chunk_records;
         fresh.markup_layers = self.markup_layers;
         fresh.slow_codec_max = self.slow_codec_max;
         fresh.group_size = self.group_size;
