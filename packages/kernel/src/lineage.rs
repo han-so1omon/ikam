@@ -45,6 +45,53 @@ pub enum Unit {
     Prefix(usize),
     /// One unit for every key.
     Table,
+    /// Chosen by a pattern over keys (E444), as a pipeline's glob pattern
+    /// chooses its datums: a key's unit is the longest prefix of it the
+    /// pattern matches whole ([`glob_prefix`]), and a key no prefix of
+    /// which matches is its own unit. With keys `t/0012345`: `*/` is one
+    /// unit a table (`t/`), `*/?????` one a key prefix of 100 keys
+    /// (`t/00123`), `*/*` one a row.
+    Pattern(String),
+}
+
+/// The longest prefix of `key` that `pattern` matches whole (E444), or
+/// `None`. In a pattern `*` matches any run of characters but `/`, `?` one
+/// character but `/`, and any other character itself.
+pub fn glob_prefix<'a>(pattern: &str, key: &'a str) -> Option<&'a str> {
+    let s = key.as_bytes();
+    // The positions in `key` the pattern read so far can end at, sorted.
+    let mut at = vec![0usize];
+    for c in pattern.bytes() {
+        let mut next = Vec::with_capacity(at.len());
+        for &p in &at {
+            match c {
+                b'*' => {
+                    let stop = (s[p..].iter().position(|&b| b == b'/')).map_or(s.len(), |q| p + q);
+                    next.extend(p..=stop);
+                }
+                b'?' => {
+                    if p < s.len() && s[p] != b'/' {
+                        next.push(p + 1);
+                    }
+                }
+                _ => {
+                    if p < s.len() && s[p] == c {
+                        next.push(p + 1);
+                    }
+                }
+            }
+        }
+        next.sort_unstable();
+        next.dedup();
+        if next.is_empty() {
+            return None;
+        }
+        at = next;
+    }
+    at.into_iter()
+        .rev()
+        .find(|&e| key.is_char_boundary(e))
+        .map(|e| &key[..e])
 }
 
 impl Unit {
@@ -54,6 +101,7 @@ impl Unit {
             Unit::Row => "row".into(),
             Unit::Prefix(n) => format!("prefix {n}"),
             Unit::Table => "table".into(),
+            Unit::Pattern(p) => format!("glob {p}"),
         }
     }
 
@@ -62,6 +110,7 @@ impl Unit {
         Ok(match s {
             "row" => Unit::Row,
             "table" => Unit::Table,
+            _ if s.starts_with("glob ") => Unit::Pattern(s["glob ".len()..].to_string()),
             _ => Unit::Prefix(
                 s.strip_prefix("prefix ")
                     .ok_or_else(bad)?
@@ -77,6 +126,7 @@ impl Unit {
             Unit::Row => key,
             Unit::Prefix(n) => key.get(..*n).unwrap_or(key),
             Unit::Table => "",
+            Unit::Pattern(p) => glob_prefix(p, key).unwrap_or(key),
         }
     }
 }

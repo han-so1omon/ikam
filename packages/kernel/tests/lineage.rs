@@ -2,11 +2,14 @@
 //! built in units after a change, reusing the units whose keys did not
 //! change, is the table built at once; batches of a view numbered by paths,
 //! sampled again only where they hold a changed node, are the batches
-//! sampled again in full; fsck evaluates the reused records.
+//! sampled again in full; fsck evaluates the reused records. E444: the
+//! unit of rebuild chosen by a pattern over keys.
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use ikam_kernel::lineage::{BatchIndex, Delta, Manifest, Unit, units_reached, view_delta};
+use ikam_kernel::lineage::{
+    BatchIndex, Delta, Manifest, Unit, glob_prefix, units_reached, view_delta,
+};
 use ikam_kernel::sampler::{Order, Spec, Targets};
 use ikam_kernel::train::{self, History, TrainRule};
 use ikam_kernel::{Arg, Edit, Event, Id, MemStore, Repo, func};
@@ -325,4 +328,103 @@ fn a_change_of_shape_builds_the_view_again_and_ids_order_resamples_all() {
         panic!("shape kept");
     };
     assert_eq!(changed.len(), 3);
+}
+
+#[test]
+fn a_pattern_names_the_longest_prefix_of_a_key_it_matches_whole() {
+    let g = |p, k| glob_prefix(p, k);
+    assert_eq!(g("*/*", "t/0012345"), Some("t/0012345"));
+    assert_eq!(g("*/", "t/0012345"), Some("t/"));
+    assert_eq!(g("*/?????", "t/0012345"), Some("t/00123"));
+    assert_eq!(g("*/????????", "t/0012345"), None);
+    assert_eq!(g("t/00*", "t/0012345"), Some("t/0012345"));
+    assert_eq!(g("t/01*", "t/0012345"), None);
+    assert_eq!(g("*", "a/b/c"), Some("a"));
+    assert_eq!(g("*/*/", "a/b/c"), Some("a/b/"));
+    assert_eq!(g("*/*/", "a/b"), None);
+    assert_eq!(g("?/*", "ab/c"), None);
+    assert_eq!(g("", "t/1"), Some(""));
+    for unit in [
+        Unit::Pattern("*/???".into()),
+        Unit::Pattern("t/0* x".into()),
+    ] {
+        assert_eq!(Unit::parse(&unit.text()).unwrap(), unit);
+    }
+    // A key no prefix of which matches is its own unit.
+    let p = Unit::Pattern("t/01*".into());
+    assert_eq!(p.of("t/0003"), "t/0003");
+    assert_eq!(p.of("t/0107"), "t/0107");
+    let q = Unit::Pattern("*/??".into());
+    assert_eq!(q.of("t/0107"), "t/01");
+    assert_eq!(q.of("t"), "t");
+}
+
+#[test]
+fn every_pattern_rebuilds_the_table_built_at_once_and_finer_ones_rebuild_less() {
+    let mut repo = Repo::new(MemStore::default());
+    let fixed: BTreeSet<u64> = [3, 41, 42, 97].into();
+    let a = history(&mut repo, "db/a", 120, 11, &BTreeSet::new(), 0);
+    let b = history(&mut repo, "db/b", 120, 11, &fixed, 4);
+    let (ta, tb) = (*a.last().unwrap(), *b.last().unwrap());
+    let ha = History::decode(&repo.train_history(&ta, &rule()).unwrap()).unwrap();
+    let hb = History::decode(&repo.train_history(&tb, &rule()).unwrap()).unwrap();
+    let changed = train::changed_keys(&rule(), &ha, &hb);
+    let whole = whole_rows(&mut repo, &tb);
+    let build = |repo: &mut Repo<MemStore>, unit: &Unit| {
+        repo.train_table_units("units/a", &ta, &rule(), unit, false)
+            .unwrap();
+        let inc = repo
+            .train_table_units("units/b", &tb, &rule(), unit, false)
+            .unwrap();
+        let mut fresh = Repo::new(MemStore::default());
+        let c = history(&mut fresh, "db/b", 120, 11, &fixed, 4);
+        let full = fresh
+            .train_table_units("units/b", c.last().unwrap(), &rule(), unit, true)
+            .unwrap();
+        assert_eq!(inc.manifest, full.manifest, "{unit:?}");
+        assert_eq!(full.evaluated.len(), full.units, "{unit:?}");
+        assert_eq!(unit_rows(repo, &inc.manifest), whole, "{unit:?}");
+        inc
+    };
+    // Coarse to fine: one unit; 100 keys a unit; 10 keys a unit; one row.
+    let mut rows = Vec::new();
+    for p in ["*/", "*/??", "*/???", "*/*"] {
+        let unit = Unit::Pattern(p.into());
+        let inc = build(&mut repo, &unit);
+        let reached = units_reached(&unit, changed.iter().map(String::as_str));
+        assert_eq!(inc.evaluated, reached, "{p}");
+        rows.push((p, inc.evaluated.len(), inc.rows_evaluated));
+    }
+    let units: Vec<usize> = rows.iter().map(|r| r.1).collect();
+    assert_eq!(units, [1, 1, 3, 4]);
+    assert!(rows.windows(2).all(|w| w[0].2 > w[1].2), "{rows:?}");
+    // A pattern naming the same groups as a fixed unit cuts the same
+    // shards and builds the same tables.
+    let ids = |repo: &mut Repo<MemStore>, unit: &Unit| {
+        let m = repo
+            .train_table_units("units/c", &tb, &rule(), unit, false)
+            .unwrap()
+            .manifest;
+        let m = Manifest::decode(&repo.read_content(&m).unwrap()).unwrap();
+        m.units
+            .into_iter()
+            .map(|u| (u.shard, u.table))
+            .collect::<Vec<_>>()
+    };
+    for (p, unit) in [
+        ("*/*", Unit::Row),
+        ("*/??", Unit::Prefix(4)),
+        ("*/", Unit::Table),
+    ] {
+        let want = ids(&mut repo, &unit);
+        assert_eq!(ids(&mut repo, &Unit::Pattern(p.into())), want, "{p}");
+    }
+    // A pattern matching only some keys: `t/01*` keeps t/0100..t/0119 as
+    // rows and every other key too (none of them matches), so it is per
+    // row, and its units are the shards `*/*` built: none is evaluated.
+    let inc = build(&mut repo, &Unit::Pattern("t/01*".into()));
+    assert_eq!(inc.units, 120);
+    assert!(inc.evaluated.is_empty());
+    assert!(repo.fsck().unwrap().is_empty());
+    assert!(repo.fsck_deep().unwrap().is_empty());
 }
