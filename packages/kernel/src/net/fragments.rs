@@ -31,11 +31,15 @@
 //! both share is skipped unread (E249's walk), and only the nodes in the
 //! chunks left are compared and their fragments read. Nothing is stored.
 
+mod inline;
+
 use std::collections::{BTreeMap, HashMap};
 
 use super::text::{head_line, parse_place, parse_transition, place_line, transition_line};
 use super::{Net, Place, Transition};
 use crate::{Arg, Edge, Error, Graph, Id, Node, Object, Repo, Store, Target, node_key};
+
+pub use inline::InlineCodec;
 
 /// How a fragment version's nodes are kept.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -45,6 +49,13 @@ pub enum Layout {
     /// The prolly tree `put_graph` cuts: an edit rewrites the chunks it
     /// falls in and their parents.
     Tree,
+    /// `Tree`'s nodes with each element's bytes inline and no edges
+    /// (E447, [`InlineCodec::Compact`]): no element is an object.
+    Inline,
+    /// `Inline`'s nodes in one chunk, as `Flat` keeps E446's (E447): an
+    /// edit rewrites the chunk, which the planner stores as slices of the
+    /// one before, as it stores a text file's versions.
+    InlineFlat,
 }
 
 impl Layout {
@@ -52,6 +63,8 @@ impl Layout {
         match self {
             Layout::Flat => "flat",
             Layout::Tree => "tree",
+            Layout::Inline => "inline",
+            Layout::InlineFlat => "inline-flat",
         }
     }
 
@@ -59,6 +72,8 @@ impl Layout {
         match s {
             "flat" => Some(Layout::Flat),
             "tree" => Some(Layout::Tree),
+            "inline" => Some(Layout::Inline),
+            "inline-flat" => Some(Layout::InlineFlat),
             _ => None,
         }
     }
@@ -360,6 +375,16 @@ impl<S: Store> Repo<S> {
     /// Fragments and chunks earlier versions wrote are found, not written
     /// again.
     pub fn put_net_fragments(&mut self, net: &Net, layout: Layout) -> Result<Id, Error> {
+        match layout {
+            Layout::Inline => return self.put_net_inline(net, InlineCodec::Compact),
+            Layout::InlineFlat => {
+                net.check()?;
+                let mut nodes = inline::inline_nodes(net, InlineCodec::Compact);
+                nodes.sort_by(|a, b| a.label.cmp(&b.label));
+                return self.put(&Object::Graph(Graph::Nodes(nodes)));
+            }
+            _ => {}
+        }
         net.check()?;
         let mut nodes = Vec::new();
         for (node, text) in fragment_nodes(net) {
@@ -367,7 +392,7 @@ impl<S: Store> Repo<S> {
             nodes.push(node);
         }
         match layout {
-            Layout::Tree => self.put_graph(nodes),
+            Layout::Tree | Layout::Inline | Layout::InlineFlat => self.put_graph(nodes),
             Layout::Flat => {
                 nodes.sort_by(|a, b| a.label.cmp(&b.label));
                 self.put(&Object::Graph(Graph::Nodes(nodes)))
@@ -414,7 +439,20 @@ impl<S: Store> Repo<S> {
         self.net_fragments(&id)
     }
 
+    /// Store `net` inline (E447): one graph, laid out as `Tree` is, whose
+    /// nodes hold their elements' bytes as `codec` writes them. Returns the
+    /// root, the version's id in this form; [`net_fragments`](Repo::net_fragments),
+    /// [`net_delta`](Repo::net_delta) and [`net_version`](Repo::net_version)
+    /// read it as they read E446's.
+    pub fn put_net_inline(&mut self, net: &Net, codec: InlineCodec) -> Result<Id, Error> {
+        net.check()?;
+        self.put_graph(inline::inline_nodes(net, codec))
+    }
+
     fn read_node(&self, n: &Node) -> Result<Read, Error> {
+        if let Target::Inline(bytes) = &n.target {
+            return inline::read_inline(n, bytes);
+        }
         let Target::Content(Arg::Whole(id)) = &n.target else {
             return Err(bad());
         };
@@ -485,7 +523,10 @@ impl<S: Store> Repo<S> {
         }
         net.check()?;
         // The root names this net's nodes and no others.
-        let mut want: Vec<Node> = fragment_nodes(&net).into_iter().map(|(n, _)| n).collect();
+        let mut want: Vec<Node> = match &nodes.iter().find(|n| n.label == HEAD).map(|n| &n.target) {
+            Some(Target::Inline(head)) => inline::inline_nodes(&net, inline::codec_of(head)?),
+            _ => fragment_nodes(&net).into_iter().map(|(n, _)| n).collect(),
+        };
         want.sort_by(|a, b| a.label.cmp(&b.label));
         if want != nodes {
             return Err(Error::Decode("net fragments: not this net's nodes"));

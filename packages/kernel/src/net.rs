@@ -35,7 +35,7 @@ mod fragments;
 mod table;
 mod text;
 
-pub use fragments::{ArcChange, Change, Layout, Link, NetDelta};
+pub use fragments::{ArcChange, Change, InlineCodec, Layout, Link, NetDelta};
 pub use table::Table;
 
 use std::collections::BTreeMap;

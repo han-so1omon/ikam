@@ -10,6 +10,7 @@
 //!   graph      = "G" level:u8 count:u32 { node (level 0) | label_len:u32 first_label id[32] (above) }
 //!   node       = label_len:u32 label target nedges:u32 { key[8] label_len:u32 label }
 //!   target     = 0 | 1 arg | 2 id[32]                  (none | content | another object)
+//!              | 3 len:varint bytes                    (inline bytes, E447; compact chunks only)
 //!
 //! A graph is a prolly tree of `G` chunks (see `graph.rs`): nodes sorted by
 //! label, each with its outgoing edges, which name their target node by
@@ -45,6 +46,11 @@ pub enum Target {
     Content(Arg),
     /// Another object: a tree, graph, commit or derivation record.
     Object(Id),
+    /// Bytes kept in the node itself (E447, opt-in: only a caller that
+    /// builds such a node writes one). A small payload costs its bytes in
+    /// the chunk, compressed with its neighbours, instead of a content of
+    /// its own and a 32-byte id; gc and fsck have nothing to follow.
+    Inline(Vec<u8>),
 }
 
 /// An edge to the node whose label has key `to` (see `node_key`).
@@ -335,7 +341,7 @@ impl Object {
             Object::Graph(Graph::Nodes(nodes)) => nodes
                 .iter()
                 .filter_map(|n| match &n.target {
-                    Target::None => None,
+                    Target::None | Target::Inline(_) => None,
                     Target::Content(a) => Some((label(&n.label, a), a.id())),
                     Target::Object(id) => Some((n.label.clone(), *id)),
                 })
@@ -428,6 +434,11 @@ fn encode_graph(out: &mut Vec<u8>, g: &Graph) {
                         out.push(2);
                         out.extend_from_slice(id.as_bytes());
                     }
+                    Target::Inline(bytes) => {
+                        out.push(3);
+                        put_varint(out, bytes.len());
+                        out.extend_from_slice(bytes);
+                    }
                 }
                 put_varint(out, n.edges.len());
                 for e in &n.edges {
@@ -508,12 +519,7 @@ fn decode_compact(r: &mut Reader, level: u8) -> Result<Graph, Error> {
         let mut nodes = Vec::with_capacity(n.min(r.0.len()));
         for _ in 0..n {
             let label = r.front(&prev)?;
-            let target = match r.take(1)?[0] {
-                0 => Target::None,
-                1 => Target::Content(r.arg()?),
-                2 => Target::Object(r.id()?),
-                _ => return Err(Error::Decode("unknown graph target")),
-            };
+            let target = r.target()?;
             let m = r.varint()?;
             let mut edges = Vec::with_capacity(m.min(r.0.len()));
             for _ in 0..m {
@@ -582,12 +588,7 @@ pub(crate) fn graph_scan(
         for i in 0..n {
             let ord = r.front_step(&mut prev)?;
             sorted &= i == 0 || ord == Greater;
-            let target = match r.take(1)?[0] {
-                0 => Target::None,
-                1 => Target::Content(r.arg()?),
-                2 => Target::Object(r.id()?),
-                _ => return Err(Error::Decode("unknown graph target")),
-            };
+            let target = r.target()?;
             // Valid UTF-8: `front_step` checked it.
             let name = std::str::from_utf8(&prev).unwrap_or_default();
             let mine = keep(name);
@@ -723,6 +724,20 @@ impl<'a> Reader<'a> {
 
     fn varint(&mut self) -> Result<usize, Error> {
         varint(&mut self.0).ok_or(Error::Decode("bad varint"))
+    }
+
+    /// A compact chunk's node target, inline bytes (E447) included.
+    fn target(&mut self) -> Result<Target, Error> {
+        Ok(match self.take(1)?[0] {
+            0 => Target::None,
+            1 => Target::Content(self.arg()?),
+            2 => Target::Object(self.id()?),
+            3 => {
+                let n = self.varint()?;
+                Target::Inline(self.take(n)?.to_vec())
+            }
+            _ => return Err(Error::Decode("unknown graph target")),
+        })
     }
 
     /// A front-coded string (see `put_front`) after `prev`.
