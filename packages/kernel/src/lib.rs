@@ -7,6 +7,7 @@
 mod abbrev;
 pub mod backends;
 pub mod bm25;
+mod chunk_delta;
 mod claims;
 mod codec;
 pub mod colblock;
@@ -62,7 +63,7 @@ pub use db::{Counts, Db, Event, Op, prefix_end};
 pub use dict::decode_cost;
 pub use fragment::{FragmentIndex, blocks};
 pub use grant::{Denied, FileGrant, FragmentGrant, Grant, Sections, windows_around};
-pub use graph::Keys;
+pub use graph::{ChunkSizes, Keys};
 pub use id::Id;
 pub use object::{
     Arg, Check, Claim, Commit, Derivation, Edge, Graph, Kind, Node, Object, Run, Target, TreeEntry,

@@ -265,6 +265,14 @@ pub struct Repo<S: Store> {
     /// scope it is ignored: that index is every stored object, read again
     /// in full when built.
     pub seed_index_max: usize,
+    /// Store a new tree's or graph chunk's content as a zstd frame against
+    /// the most related stored content ("Q"), when that scores below the
+    /// slice, template and plain plans (E448, `chunk_delta.rs`). Off by
+    /// default, when only repack writes "Q". Reads accept it either way.
+    pub object_contexts: bool,
+    /// Bounds on the chunk sizes of the prolly trees `put_graph` and the
+    /// graph edits cut (E448). The default is the fixed 4 KiB to 32 KiB.
+    pub graph_chunks: crate::graph::ChunkSizes,
     pub(crate) writing_object: bool,
 }
 
@@ -331,6 +339,8 @@ impl<S: Store> Repo<S> {
             plain_db_events: false,
             plain_hot_writes: false,
             seed_index_max: 0,
+            object_contexts: false,
+            graph_chunks: Default::default(),
             writing_object: false,
             hints: Default::default(),
         }
@@ -691,6 +701,8 @@ impl<S: Store> Repo<S> {
         r.plain_db_events = self.plain_db_events;
         r.plain_hot_writes = self.plain_hot_writes;
         r.exact_short_search = self.exact_short_search;
+        r.object_contexts = self.object_contexts;
+        r.graph_chunks = self.graph_chunks;
         r
     }
 

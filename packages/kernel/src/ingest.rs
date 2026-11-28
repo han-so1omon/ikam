@@ -98,19 +98,33 @@ impl<S: Store> Repo<S> {
         // work is at least its length: when that alone costs more than
         // storing it plain, the plan cannot win and is not searched for
         // (E092; the heavy read weight, every content).
+        let mut frame = None;
         if !self.plain_hot_writes && self.read_weight * (bytes.len() as f64) < plain.len() as f64 {
             candidates.extend(self.slice_candidate(bytes)?);
             if self.object_templates || !self.writing_object {
                 candidates.extend(self.template_candidates(bytes)?);
+            }
+            // E448: a tree or chunk version as a frame against its base.
+            if self.object_contexts && self.writing_object {
+                frame = self.object_context_frame(bytes)?;
             }
         }
         let best = candidates
             .into_iter()
             .map(|c| (c.cost as f64 + self.read_weight * c.work as f64, c))
             .filter(|(score, _)| *score < plain.len() as f64)
-            .min_by(|a, b| a.0.total_cmp(&b.0))
-            .map(|(_, c)| c);
-        let Some(c) = best else {
+            .min_by(|a, b| a.0.total_cmp(&b.0));
+        if let Some((q, score)) = frame
+            && score < plain.len() as f64
+            && best.as_ref().is_none_or(|b| score < b.0)
+        {
+            self.materialize(id, &q, bytes)?;
+            return Ok(Put {
+                id,
+                form: Form::Blob,
+            });
+        }
+        let Some(c) = best.map(|(_, c)| c) else {
             self.materialize(id, &plain, bytes)?;
             return Ok(Put {
                 id,
