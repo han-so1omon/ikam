@@ -8356,3 +8356,621 @@ Gates on the branch (E229 to E233): every kernel test suite passes (release); cl
 - Checks: `tests/net_fragments.rs`, 8 tests (read back in both layouts and through `net_version`, one root for one net; 22 versions chained by commits writing under 60 objects each after the first and read back after gc, fsck and fsck_deep clean; every delta applied exactly, pruned equal to unpruned; a one-weight edit to a 5,000-transition net read in at most 10 chunks and 2 fragments, under a tenth of the unpruned walk; rename, removal and relink named as such; a root whose nodes are not the net's refused; firings named by fragment roots replay to the text-tracked run's marking; a graph entry beside files). `cargo test --release --features embed`: 400 pass, 0 fail. clippy `-D warnings` clean. Fixed bench: bytes 5.7493, proxy 3.8185, read 5.7140, north 0.3060, sharing 0.9496, every corpus's byte figures equal to main.
 - Not done / Next: a repack at 10,000 transitions (repack time grows faster than linearly on the in-memory store); a fragment form whose fragments share compression (grouping fragments per leaf chunk at repack, or holding the fragment graph only as an index beside the text); a three-way merge of two fragment versions through the delta; rename detection (a rename is a removal and an addition); a fragment root kept live by gc through the database that names it (as in E422, a database is not a gc root); FsStore, where per-object overhead would weigh against the fragment form further.
 - Run: `cargo run --release --example e446_net_fragments -- 10,1000,10000 300`.
+
+### E447 net-inline (elements' bytes inline in graph leaf chunks: a node costs its bytes, not an object)
+
+- Branch / parent: exp/447-net-inline / exp/446-net-fragments
+- Question: E446's fragment tree stores the first version of a 1,000-transition net in 14.1x the bytes of E422's text (118,782 against 8,405) and adds 2,536 B a version against 782. Where do those bytes go, and how far does storing each element's bytes inside the leaf chunk (no content object, no 32-byte id, no order edges) bring them down while an edit still rewrites only the chunks it falls in? Win line: v1 at most 1.5x text at 1,000 and 10,000 transitions, a version adding at most text's bytes at the default weight, reads no slower than E446's tree, reuse at or above 99% of elements. The owner widened the scope mid-run to graphs in general, so the same lever is measured on graphs stored with `put_graph`.
+- Found before building (byte breakdown of E446's first version, `e447_net_inline` part 1):
+
+  | 1,000 transitions | E446 tree | inline: line + E446 edges | inline: line + next | inline: compact | inline: compact, one chunk |
+  | --- | --- | --- | --- | --- | --- |
+  | stored bytes, v1 | 118,782 | 35,926 | 18,052 | 13,483 | 9,925 |
+  | element contents (an object each) | 50,355 | 0 | 0 | 0 | 0 |
+  | leaf chunk bodies (stored compressed) | 67,018 | 34,450 | 16,924 | 12,638 | 9,728 |
+  | leaf pointer objects, parent chunks, trees | 1,409 | 1,476 | 1,128 | 845 | 197 |
+  | leaf chunks raw | 74,186 | 75,025 | 63,750 | 34,616 | 34,598 |
+  | raw: target ids (tag + 32 bytes) | 49,533 | 0 | 0 | 0 | 0 |
+  | raw: inline payloads | 0 | 48,854 | 54,635 | 25,530 | 25,530 |
+  | raw: edge keys (8 bytes) / edge labels | 12,000 / 2,011 | 12,000 / 2,019 | 0 | 0 | 0 |
+  | raw: labels / counts and lengths | 1,587 / 7,554 | 1,591 / 9,060 | 1,568 / 6,046 | 1,548 / 6,037 | 1,500 / 6,008 |
+
+  E446's bytes were 42% element objects (each line stored apart, 37 B for a 36 B line) and 56% leaf chunks that do not compress (raw 74 KB to 67 KB stored), because two thirds of a leaf is 32-byte ids and 8-byte edge keys. At 10,000 transitions the shares are the same (548 KB of objects, 671 KB of leaves). Prolly-tree internal nodes and trees are about 1%.
+- Change (all options; default stored bytes and behaviour unchanged):
+  - `Target::Inline(Vec<u8>)` (graph layer, `object.rs`): a node target that is the bytes themselves, encoded as tag 3, a varint length and the bytes, in compact chunks only. Only a caller that builds such a node writes one, so every existing chunk encodes as before (pinned by a test). gc and fsck have nothing to follow; the chunk, stored as content like every graph chunk, is compressed and sliced against earlier versions as a whole. `graph_scan` and decode read it, so lookups, edits, slices and diffs work unchanged.
+  - `Repo::put_payload(bytes, inline_max)`: a target inline when at most `inline_max` bytes, else a content of its own.
+  - `Repo::graph_chunk: (min, max)`, default `(4096, 32768)`, the sizes `put_graph`, `graph_edit` and `graph_drop_range` cut chunks between (they were constants).
+  - Nets (`net/fragments/inline.rs`): `Repo::put_net_inline(net, codec)` and `Layout::Inline` (tracking key `inline`): E446's nodes and labels (`net`, `p/<place>`, `t/<transition>`) with each element's bytes inline. Codecs, to measure each step alone: `Lines` (E446's canonical line inline, E446's order edges kept), `LinesNext` (the line, then the next element's name; no edges), `Compact` (what `Layout::Inline` uses: the next name too, and only what the label does not already say: `c bench:2*p8,p12>p3`, kind as a letter). Every payload rebuilds its element's canonical line, so `to_text` and E422's text id are one step away; the version id is the inline root, as in E446 it is the fragment root. `Layout::InlineFlat` holds the same nodes in one chunk. `net_fragments`, `net_delta`, `net_version`, `net_fragment_file`, `net_track_fragments` and `net_replay_versions` read both through E446's code (one dispatch in `read_node`), and `net_fragments` still refuses nodes the net it reads would not be stored with.
+- Method: `examples/e447_net_inline.rs` (E446's generator and 25-version chain copied, so the examples build apart) at 10, 1,000 and 10,000 transitions, E446's text and tree rows from the same runs, MemStore, default and heavy (48.8) read weight. Element reuse is counted two ways: in a chunk stored before (or, for E446, its own object), and also when a slice of earlier content covers its bytes in a rewritten chunk (the derivation's ranges against the encoding's node spans). Timings: median of at least 5 runs inside each run, then the median of 3 whole runs; other builds ran on the machine throughout, so absolute times are about 1.5x an earlier quieter run (whose 10,000 numbers are given in brackets). `examples/e447_graph_inline.rs`: a power-law link graph (100,120 nodes, 1.14M edges, 2.6 MB of short titles) and a property graph (10,120 nodes, 28.6 MB of 1-4 KB texts), 25 versions of local edits each (5 edges added and removed, 3 payloads edited, a 5-node subgraph added) through `graph_edit`.
+- Results, nets, bytes (deterministic, equal in all 3 runs):
+
+  | transitions | form | bytes v1 | x text | a version adds (mean / max) | heavy: v1, adds | elements in chunks kept | elements reused (slices too) | 25 versions after repack |
+  | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+  | 10 | text (E422) | 331 | 1.00 | 352 / 367 | 331, 352 | – | – | 3,907 |
+  | 10 | fragments, tree (E446) | 1,433 | 4.33 | 1,003 / 1,489 | 1,433, 1,299 | 78.9% | 78.9% | 13,550 |
+  | 10 | inline, compact | 384 | 1.16 | 423 / 463 | 384, 423 | 0.0% | 0.0% | 8,682 |
+  | 1,000 | text (E422) | 8,405 | 1.00 | 782 / 1,239 | 8,405, 8,441 | – | – | 16,378 |
+  | 1,000 | fragments, tree (E446) | 118,782 | 14.13 | 2,536 / 4,961 | 118,782, 14,110 | 99.5% | 99.5% | 152,522 |
+  | 1,000 | inline: line + E446 edges | 35,926 | 4.27 | 2,022 / 3,539 | 35,926, 7,866 | 78.1% | 95.9% | 55,313 |
+  | 1,000 | inline: line + next | 18,052 | 2.15 | 1,854 / 3,491 | 18,052, 4,744 | 70.3% | 95.3% | 37,584 |
+  | 1,000 | inline, compact (`Layout::Inline`) | 13,483 | 1.60 | 1,619 / 2,703 | 13,483, 4,352 | 59.1% | 93.0% | 30,217 |
+  | 1,000 | inline, compact, one chunk (`InlineFlat`) | 9,925 | 1.18 | 1,187 / 1,975 | 9,925, 10,050 | 0.0% | 91.8% | 22,300 |
+  | 10,000 | text (E422) | 84,647 | 1.00 | 849 / 2,231 | 84,647, 85,295 | – | – | not run |
+  | 10,000 | fragments, tree (E446) | 1,232,063 | 14.56 | 3,098 / 4,876 | 1,232,063, 22,544 | 100.0% | 100.0% | not run |
+  | 10,000 | inline: line + E446 edges | 359,695 | 4.25 | 2,817 / 5,198 | 359,695, 13,819 | 97.6% | 99.8% | not run |
+  | 10,000 | inline: line + next | 176,389 | 2.08 | 2,563 / 4,630 | 176,389, 9,822 | 96.6% | 99.7% | not run |
+  | 10,000 | inline, compact (`Layout::Inline`) | 124,676 | 1.47 | 2,224 / 4,314 | 124,676, 7,858 | 95.5% | 99.6% | not run |
+  | 10,000 | inline, compact, one chunk (`InlineFlat`) | 86,245 | 1.02 | 1,275 / 1,984 | 86,245, 86,638 | 0.0% | 95.4% | not run |
+
+  With `graph_chunk = (16384, 131072)` (one run): inline compact v1 11,178 (1.33x) and 111,941 (1.32x), adds 1,555 and 2,096, heavy adds 7,858 and 16,468, elements reused with slices 92.6% and 98.9%, delta 1.7 ms and 4.1 ms. With `short_records` (E104) on for every form at 1,000: text adds 635, inline compact 1,239.
+- Results, nets, time (µs; median of 3 runs on a loaded machine; [quieter single run]):
+
+  | transitions | form | write a version | read v25 | delta | applied exactly | fsck problems |
+  | --- | --- | --- | --- | --- | --- | --- |
+  | 10 | text | 98 | 15 | 9 | – | 0 |
+  | 10 | fragments, tree (E446) | 836 | 65 | 58 | 25/25 | 0 |
+  | 10 | inline, compact | 90 | 39 | 37 | 25/25 | 0 |
+  | 1,000 | text | 2,988 | 1,500 | 687 | – | 0 |
+  | 1,000 | fragments, tree (E446) | 8,017 | 8,880 | 690 | 25/25 | 0 |
+  | 1,000 | inline, compact | 4,549 | 3,253 | 1,002 | 25/25 | 0 |
+  | 1,000 | inline, one chunk | 3,687 | 3,128 | 2,179 | 25/25 | 0 |
+  | 10,000 | text | 31,291 [20,057] | 23,255 [14,262] | 10,881 [7,422] | – | 0 |
+  | 10,000 | fragments, tree (E446) | 67,243 [41,984] | 120,489 [62,845] | 900 [805] | 25/25 | 0 |
+  | 10,000 | inline, compact | 38,102 [29,143] | 56,960 [38,810] | 1,168 [1,049] | 25/25 | 0 |
+  | 10,000 | inline, one chunk | 34,061 [25,393] | 53,950 [34,567] | 30,688 [20,080] | 25/25 | 0 |
+
+  fsck and fsck_deep clean before and after a gc in every form; every version read back after the gc. Firings (the night net edited 9 times, 300 candidates): tracked by text, by E446's tree and by `Layout::Inline`, all replay to the same marking with 10 versions named; firing cost in noise (7.2 ms each on the loaded machine).
+- Results, general graphs (one run; times are medians of runs within it):
+
+  | graph | payloads | bytes v1 | a version adds | heavy: v1, adds | chunks reused | write µs | read all µs | delta µs |
+  | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+  | links, 100k nodes, 1.14M edges | a content each (as E446) | 16,833,437 | 6,968 | 16,833,437, 80,739 | 99.3% | 82,269 | 472,578 | 6,149 |
+  | links | inline | 12,759,722 | 6,829 | 12,759,722, 79,083 | 99.3% | 13,490 | 228,685 | 3,985 |
+  | props, 10k nodes of 1-4 KB | a content each (as E446) | 12,897,122 | 10,677 | 12,897,122, 53,462 | 91.7% | 10,336 | 132,469 | 3,045 |
+  | props | inline | 11,121,420 | 11,126 | 11,121,420, 87,789 | 99.1% | 14,771 | 88,282 | 2,395 |
+  | props | `put_payload` up to 2,048 B | 12,650,033 | 12,697 | 12,650,033, 65,570 | 97.4% | 13,069 | 135,214 | 2,564 |
+
+- Findings:
+  1. The bytes were ids, not data. Dropping the element objects and their ids (line inline) cuts v1 3.3x; dropping the order edges for a next name in the payload halves it again; the compact codec takes another quarter. Inline compact is 1.60x text at 1,000 transitions and 1.47x at 10,000 (E446: 14.1x and 14.6x); in one chunk, 1.18x and 1.02x. A small net (10 transitions, the size of E422's night and train nets) is 384 B against text's 331 and E446's 1,433.
+  2. What is left over text at 1,000 is chunking: nine leaves of about 3.8 KB each compress apart (34.6 KB raw to 12.6 KB, where the whole text compresses 5.8x), in label order rather than the net's. Larger chunks (16/128 KB) bring v1 to 1.33x at both sizes, at the price of slower deltas (4.1 ms at 10,000) and a larger heavy-weight version.
+  3. A version still adds 2.1x (1,000) and 2.6x (10,000) text's bytes at the default weight. The edit's own bytes are sliced well (99.6% of elements reused at 10,000 counting slices), but every version rewrites at least the head's leaf (its `net s K` line carries the version), the edit's leaves and the parent, each paying its own concat record (about 135 B with full ids), a 34 B chunk pointer and a new 32-byte id in the parent (which is stored plain, 342 B at 1,000); text pays one record. The one-chunk layout pays one record but still 1.5x text, because order links and sorted labels make more change sites per edit than lines do (a rename moves a node and relinks its predecessor). Short records (E104) cut both forms by about a fifth and keep the ratio.
+  4. Under the heavy weight the tree wins clearly: a version adds 4,352 B against text's 8,441 at 1,000 and 7,858 against 85,295 at 10,000 (E446: 14,110 and 22,544).
+  5. Reuse: an edit still rewrites only the chunks it falls in (one leaf for one weight in a 4,000-transition net, tested). By chunk, 95.5% of elements are reused at 10,000 and 59.1% at 1,000 (a 1,000-transition net is nine leaves, and the head's leaf is rewritten every version); counting slices of earlier content, 99.6% and 93.0%. E446's 99% by element came from an object and a 32-byte id per element, which is the 14x; under content addressing the two cannot both hold at 1,000.
+  6. Reads: version 25 reads in 0.37x (1,000) and 0.47x (10,000) of E446's time, but still 2.2x and 2.4x text's (it rebuilds sliced leaves and checks the canonical nodes). A delta is 1.3x to 1.45x E446's (a leaf holds about 150 nodes instead of 85), still 9x faster than a text diff at 10,000. Writes are 0.55x E446's, 1.2x to 1.5x text's.
+  7. Beyond nets: inline payloads cut the link graph's v1 by 24% (edges' 8-byte keys are now most of it), writes 6x faster and reads 2x; the property graph's v1 by 14% and reads by a third, but its heavy-weight version costs 64% more (a 1-4 KB payload edit rewrites a leaf of them). `put_payload` with a limit is the rule: inline small payloads, keep large ones apart.
+  8. Where nets are used: the night, train and other small nets of E422's run cost about their text (384 B against 331 at 10 transitions, E446 1,433); `net_fire*` with `net_track_fragments` under `Layout::Inline` names the same versions and replays to the same marking, and the recorded steps of E441 and E422 name a version id, which is the inline root here as the fragment root was in E446, so nothing in them changes. `Target::Inline` and `put_payload` are in the graph layer, so any `put_graph` user (graph objects; tables or file indexes kept as graphs) can use them; files and tables stored as content are not touched.
+- Verdict: **partial** (options, off by default). v1 meets the 1.5x line at 10,000 (1.47x) and misses at 1,000 (1.60x) with the default chunk sizes; it meets both with 16/128 KB chunks (1.33x, 1.32x) or one chunk (1.18x, 1.02x). The version cost at the default weight misses (2.1x to 2.6x text; 1.5x in one chunk); at the heavy weight it beats text 2x to 11x. Reads beat E446's tree (0.37x to 0.47x); deltas do not (1.3x to 1.45x). Element reuse is at or above 99% only at 10,000 counting slices. Mutation checks: with the next link dropped from the inline reader, 5 of 9 tests in `tests/net_inline.rs` fail; with the inline encoder writing half the payload, 8 of 9 fail (the pinned-bytes test passes, as it should).
+- Owner's choice raised: (a) for nets, `Layout::Inline` with default chunks (local edits, fast deltas) or `InlineFlat` (at or under text's v1, one record a version, slow deltas); (b) whether to attack the per-chunk overhead in the store, which every graph pays: a chunk stored as content without its 34 B pointer object, abbreviated child ids in parent chunks, short derivation records (E104) by default for graph chunks. Finding 3 says that is where the default-weight version cost now is.
+- Checks: `tests/net_inline.rs`, 9 tests (every codec and both layouts read back, through `net_version` too, one root for one net; 16 versions chained by commits, every delta applied exactly and pruned equal to unpruned, read back after gc, fsck clean; one weight rewrites at most two leaves of a 4,000-transition net; five kinds of bad inline nodes refused; firings tracked inline replay to the text-tracked marking and a known version writes nothing; inline targets decode, encode, look up, `graph_nodes_in` and `graph_edit` equal `put_graph`, gc keeps a committed graph; older target kinds encode to pinned bytes and default chunk sizes are (4096, 32768); other chunk sizes edit consistently; an inline net beside a file). `cargo test --release --features embed --no-fail-fast`: 409 passed, 0 failed (400 before, plus these 9). clippy `-D warnings` clean on all targets. bench: north_score 0.3060, sharing_kernel 0.9496, every corpus's bytes equal to E446's run.
+- Not done / Next: chunk-local edge references or a per-chunk key table (the link graph's 8-byte keys); the store-level per-chunk savings in (b); a per-net zstd dictionary for small leaves; a repack at 10,000; FsStore; why a sliced leaf reads slower than one stored plain.
+- Run: `cargo run --release --example e447_net_inline -- 10,1000,10000 300` (env `E447_CHUNK=min,max` and `E447_SHORT=1` for the sweeps); `cargo run --release --example e447_graph_inline -- links,props 1`.
+
+### E449 net-read-path (fragment nets and graphs read, written and fired faster: decode once, a shared chunk cache, delta writes, reads by key)
+
+- Branch / parent: exp/449-net-read-path / exp/446-net-fragments (9dffb34)
+- Question: E446's fragment form reads a net about 3.5x slower than E422's text file and writes a version about 2x slower. Where does that time go, and can it be brought to the text's time or under, for a read of version 25 and a version's write at 1,000 and 10,000 transitions, and for a firing on a 10,000-transition fragment net? The owner widened the question to graphs in general: the same lever on `put_graph` graphs (a sparse power-law link graph and a property graph) through 25 versions of local edits, including traversal (k-hop reads, reads by key).
+- Found before building (profile, `e449_net_read_path profile`, version 25):
+  - E446's read at 10,000 transitions (75.5 ms): fetch and decode the graph chunks 6.8 ms, `read_content` of 15,006 fragments 7.3 ms, `Net::parse` of every line (about 1 µs each), `Net::check` 3.3 ms, then the canonical check rebuilds every node (print each element with `to_text`, 4.2 ms; hash each line, 1.3 ms; clone the net, 2.5 ms) and compares. The text read is 19.7 ms, nearly all `Net::parse`.
+  - E446's write: a write of a version already stored still takes 53 ms at 10,000 (`put_graph` of every node 24.3 ms, `put_content` of every line 7.9 ms), against the text's 11.7 ms. In a write of new chunks, the planner's template search (`object_templates`, E144) is the largest part.
+  - A chunk's bytes are stored as slices of earlier chunks, so a cold chunk read may rebuild a chain of slice derivations across versions; this is the floor of a cold read.
+- Change (every behaviour an option, off by default; default reads, writes and stored bytes are unchanged; new code in `graph_fast.rs` and `net/fast.rs`):
+  - Graph layer (`graph_fast.rs`, for any graph): `Repo::graph_cache` (count, 0 = off) holds decoded objects keyed by (chunk id, kind) behind `Arc`, FIFO, shared with siblings, emptied by gc. Ids name content, so a kept entry is valid in every version that holds the chunk. `graph_chunk_cached`, `graph_leaf_ids` (lists the leaves from the height-1 chunks without reading the leaves), `graph_nodes_cached`, `graph_read(root)` (every leaf with its payloads, one read each, kept per leaf), `graph_node_cached` (one node by key: walk from the root, binary search the leaf), `graph_nodes_in_cached`, `graph_hops(root, starts, k, follow)` (k-hop neighbourhood by key), `graph_decoded` for a caller's own decoded form of a leaf, `graph_cache_stats` and `graph_cache_clear`. `Repo::read_threads` (0 = off) decodes cold leaves on scoped threads (`graph_read_par`, `graph_decoded_par`). With the cache off, contents are read and verified straight from the store, skipping the read cache's copy.
+  - Fast net read (`Repo::net_fast_read`, `net_fragments_fast`): each leaf is decoded once into its elements and kept in the cache as kind `net-leaf`. A line is parsed by a strict canonical parser that accepts exactly what `Net::to_text` prints, so nothing is printed or hashed again to compare. Each edge's key is checked against its target, then the order links are followed through an Fx-hashed map with counts and arc places checked, and `Net::check` runs with hash sets. A forged root is refused as the full read refuses it (14 forged cases in the tests); the full check stays in `net_fragments_full` and `fsck_deep`.
+  - Delta write (`Repo::net_delta_write`): `put_net_fragments` keeps the last net written under each name with its root. The next version is diffed with it (positional alignment, then by name), and only the nodes whose element or `next` link changed go to `graph_edit` with their new lines. An unchanged net returns the kept root at once, which removes the net write from a firing. The roots are those of the whole write, so stored bytes are equal.
+  - Reads by key: `net_fragments_part(root, transitions)` reads the head, those transitions and their places only. `net_fire_at(db, root, transition, token, key)` fires one transition of a fragment-tracked net reading only that part, and records the firing as `net_fire` does (`fire_inner` takes the version root). `net_fragments_par` is the threaded read.
+- Method (`examples/e449_net_read_path.rs`, reusing E446's synthetic nets and its 25-version edit chain; Linux cloud, 4 CPUs, MemStore; other experiments' builds ran on the machine throughout, load average 4.7 to 9, so times are noisy). Times are medians: 15 runs at 1,000 transitions, 7 at 10,000, 5 for the graphs, 3 runs of the firing loop. "After reading v24" reads v25 with the cache kept from reading v24 (what a process following the chain sees). "Cold" empties the cache before each read. Bytes are the store's growth at the default weight and at the bench's heavy weight (48.8), the E446 rows from the same run. The graphs: a link graph of 100,000 nodes and 997,238 edges with short titles (4.1 MB of payloads), and a property graph of 10,000 nodes of 1 to 4 KB (26 MB), each through 25 versions of 10 edges toggled, 5 payloads edited, and every third version a 5-node subgraph added.
+- Results, nets (µs; reads of version 25, writes the mean of versions 2 to 25):
+
+  | transitions, weight | text write | E446 write | E449 delta write | text read | E446 read | E449 cold | E449 after v24 | E449 one transition by key, cold / cached |
+  | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+  | 1,000, default | 4,248 | 5,743 | 3,578 | 1,520 | 4,704 (3.09x) | 2,060 (1.35x) | 540 (0.35x) | 166 / 9 |
+  | 10,000, default | 22,789 | 44,816 | 10,436 | 15,341 | 84,558 (5.51x) | 36,313 (2.37x) | 5,374 (0.35x) | 212 / 23 |
+  | 1,000, heavy | 1,710 | 6,167 | 1,840 | 1,439 | 4,621 (3.21x) | 1,960 (1.36x) | 615 (0.43x) | 127 / 8 |
+  | 10,000, heavy | 14,222 | 44,841 | 11,736 | 22,337 | 74,929 (3.35x) | 29,853 (1.34x) | 5,401 (0.24x) | 188 / 23 |
+
+  Each idea alone, same run: the fast read with no cache is 2,221 / 44,433 / 2,181 / 25,725 µs in the four rows (1.46x, 2.90x, 1.52x, 1.15x text); with v25 kept (hot) 361 / 5,402 / 417 / 9,118. The threaded cold read (3 threads) gained nothing on the loaded machine (4,142 / 37,478 / 2,179 / 38,660). E446's own delta applied to a held v24 is 2,400 / 42,424 / 2,281 / 34,213. With `object_templates` off the delta write is 2,248 / 10,007 / 1,723 / 10,576 µs, at 2,461 against 2,536 B a version at 1,000 (default weight) and equal bytes otherwise. After reading v24, reading v25 decoded 3 chunks and took 16 from the cache at 1,000, 5 and 176 at 10,000. Bytes v1 and bytes a version adds are E446's exactly (118,782 and 2,536 at 1,000; 1,232,063 and 3,098 at 10,000; 14,110 and 22,544 at heavy weight), 99.2% and 99.9% of objects reused. fsck and fsck_deep: 0 problems in every store.
+- Results, firings (µs a firing; replay of the whole run; three runs, median):
+
+  | net | text (E422) | fragments (E446) | E449 delta write + fast read | E449 `net_fire_at` by key |
+  | --- | --- | --- | --- | --- |
+  | night net, edited 9 times, 300 candidates | 4,951 (replay 62 ms) | 4,711 (70 ms) | 4,845 (75 ms) | 4,903 (62 ms) |
+  | night net inside 10,000 more transitions, 100 candidates | 13,040 (430 ms) | 49,500 (1,027 ms) | 8,795 (203 ms) | 7,021 (223 ms) |
+
+  The four runs end in the same marking, and each replays to it.
+- Results, general graphs (25 versions; µs):
+
+  | | link graph (100k nodes, 1M edges) | property graph (10k nodes, 1-4 KB) |
+  | --- | --- | --- |
+  | bytes v1 | 20,741,606 | 8,683,972 |
+  | bytes a version adds, default / heavy weight | 12,894 / 150,656 | 8,587 / 80,953 |
+  | objects reused | 100.0% | 99.8% |
+  | write a version: `put_graph` every payload, default / heavy | 1,127,434 / 981,755 | 139,186 / 107,301 |
+  | write a version: `graph_edit` touched payloads, default / heavy | 210,430 / 7,528 | 25,153 / 6,242 |
+  | read v25 whole: plain (`graph_nodes` + `read_content`) | 429,688 | 143,398 |
+  | read v25 whole: `graph_read`, no cache / cold / after v24 | 550,506 / 446,273 / 7,941 | 159,558 / 152,891 / 15,159 |
+  | read v25 whole: `graph_read_par`, 3 threads, cold | 460,148 | 109,517 |
+  | delta v24 to v25 (`graph_diff`, shared chunks skipped) | 15,956 | 8,851 |
+  | 100 nodes by key: plain `graph_node` / cached cold / kept | 10,732 / 22,721 / 135 | 14,186 / 8,489 / 45 |
+  | 2-hop of 10 starts: plain `graph_nodes_in` / `graph_hops` cold / kept | 50,673 / 100,050 / 3,758 (973 nodes) | 3,469 / 6,144 / 186 (120 nodes) |
+
+  `graph_edit` and `put_graph` give the same roots and bytes. fsck and fsck_deep: 0 problems.
+- Findings:
+  1. The time E446 added was work done twice. A read decoded every chunk, parsed every line, then printed and hashed every element again to prove it canonical. Parsing a line strictly once is as strict and removes the second pass: a cold read drops from 3.1-5.5x the text to 1.15-2.4x, with no cache at all. The rest of a cold read is fetching chunks and fragments whose bytes are stored as slices of earlier versions, which this change does not alter.
+  2. A shared decoded-chunk cache pays whenever versions are read in turn. Version 25 after version 24 decodes 3 to 5 chunks and takes the rest decoded, so it reads in 0.24-0.43x the text's time at both sizes and weights. The same holds for general graphs: the link graph's v25 reads in 7.9 ms after v24 against 430 ms plain (54x), the property graph's in 15 ms against 143 ms. Reads by key and hops from kept chunks are 80-300x faster than the plain walks.
+  3. A delta write that diffs against the last written net and edits only those nodes meets the text's write time at 10,000 transitions (10.4 against 22.8 ms; 11.7 against 14.2 ms heavy) and at 1,000 at the default weight (3.6 against 4.2 ms). At 1,000 under the heavy weight it misses slightly (1,840 against 1,710 µs). With `object_templates` off it is 1,723, in noise of the text. For general graphs `graph_edit` with the touched payloads is 5x (default weight) to 130x (heavy weight) faster than `put_graph` of the whole graph. At the default weight its time is mostly the planner slicing the rewritten chunks.
+  4. Firing on a 10,000-transition fragment net goes from 3.8x slower than text (49.5 against 13.0 ms) to faster (8.8 ms; 7.0 ms by key), and replay is 2x faster than text. An unchanged net is no longer written again at each firing. On the night net nothing changes beyond noise, because the database append dominates a firing there, as in E446.
+  5. Cold cache misses cost: a cache filled from cold is slower than the plain path for scattered reads by key (22.7 against 10.7 ms for 100 keys on the link graph) and for hops (2x). Decoding a whole leaf to keep it costs more than one binary search through a leaf read once. The cache pays from the second touch of a chunk.
+  6. The threaded decode showed no gain for nets on a loaded machine; on the property graph's cold read it gave 110 against 153 ms. It needs free cores to judge.
+- Fit with the places nets are used: E422's night, train and small nets are a few transitions. A firing on them is the database append, so the change neither helps nor hurts there. `net_fire`, `net_fire_step` and E441's recorded steps all go through `fire_inner`, so the delta write's memo removes the per-firing net write for each of them when `net_delta_write` is on. `net_fire_at` serves the large-net case. `net_replay_versions` gains from the cache, since a replay reads each named version in turn. Beyond nets, the cache, `graph_read`, the keyed reads and `graph_hops` are in the graph layer and serve any `put_graph` object. The database views and the tree's graph entries could use them, but neither is wired here.
+- Verdict: **partial** (options, off by default). Met: a version's write at 10,000 at both weights and at 1,000 at the default weight; a firing on a 10,000-transition net (faster than text); a read of version 25 when the previous version was read (0.24-0.43x text); reads by key (0.01-0.11x). Missed: a cold read of version 25 (1.34-2.37x text, at best 1.15x with no cache under the heavy weight), and the write at 1,000 under the heavy weight (1.08x; equal with `object_templates` off). Mutation checks: with `list_edits` ignoring a changed `next` link, `delta_writes_give_the_whole_writes_roots` and the firing test fail. With the cache key ignoring the chunk id, 6 of the 8 tests fail. With the parser taking a written weight of 1, `the_fast_read_refuses_what_the_full_read_refuses` fails.
+- Owner's choices raised: (a) `object_templates` off for fragment writes: about 1.6x faster small-net delta writes, for 3% more bytes a version at 1,000 transitions at the default weight and none at 10,000. (b) A cold read can only reach the text's time with a different stored form, fragments held inline in their leaf chunk (the bytes lever a sibling experiment measures) so that a read fetches chunks only, or with parallel decode on free cores. (c) Whether the decoded-chunk cache, a count of `Arc`s kept in memory, should be on by default for long-lived processes (db serve, replay).
+- Checks: `tests/net_read_path.rs`, 8 tests:
+  - fast read equal to full read at every version, both layouts;
+  - reading the next version decodes at most 12 chunks;
+  - delta writes give the whole write's roots over 26 versions, a repeat writes no objects, flat layout, gc, fsck, read back, and an invalid net refused;
+  - 14 forged roots refused by the fast read as by the full read;
+  - firings by key record and replay as whole-net firings do;
+  - a firing by key needs fragment tracking;
+  - cached graph reads, keyed reads and hops equal the plain ones and an in-memory BFS;
+  - kept chunks shared with siblings and dropped by gc.
+
+  `cargo test --release --features embed --no-fail-fast`: 408 pass, 0 fail, 5 ignored. clippy `--all-targets -D warnings` clean. Fixed bench: bytes 5.7493, proxy 3.8185, read 5.7140, north 0.3060, sharing 0.9496, as on the parent. Privacy scan: `scan.py --all` exits 0.
+- Not done / Next:
+  - a step variant of `net_fire_at` (`net_fire_step` still takes the whole net from its caller);
+  - db views and tree graph entries using the cached reads;
+  - the inline-fragment stored form for cold reads;
+  - the threaded decode measured on an idle machine;
+  - a bound on the cache by bytes rather than count;
+  - FsStore, where a cold fetch costs more and the cache would weigh more.
+- Run: `cargo run --release --example e449_net_read_path -- nets 1000,10000`, `-- fire 300`, `-- graphs 1.0`, `-- profile 1000,10000`.
+
+### E448 chunk-deltas (a rewritten graph chunk stored as a frame against the chunk it replaces, and the prolly tree's chunk bounds)
+
+- Branch / parent: exp/448-net-chunk-deltas / exp/446-net-fragments
+- Question: in E446's tree layout a version of a 10,000-transition net adds 3,098 B at the default weight, 3.7x the text file's 849 B. What does one edit rewrite, and can the bytes a version adds be brought to the text's or below, at the default and the heavy read weight, at 1,000 and 10,000 transitions, by storing a rewritten graph chunk as a delta of the chunk it replaces, by tuning the prolly tree, or by repack, while keeping the delta view (shared chunks skipped by id, every delta applied exactly) and reads of version 25 within 1.2x of E446? The owner widened the scope to general graphs: the same lever on `put_graph` objects, a sparse power-law link graph and a property graph, each through 25 versions of local edits.
+- Found before building (anatomy of a version, `examples/e448_net_chunk_deltas`, mode `anatomy`):
+  - A version rewrites 6.5 chunks at 10,000 transitions (3.8 leaves, 1.7 at level 1, 1.0 at level 2) and 4.4 at 1,000. 92% of a rewritten leaf's bytes at 10,000 (81% at 1,000) are a prefix and suffix the replaced chunk already holds.
+  - The premise that graph chunks are stored whole is wrong at the default weight: a chunk's content (`g 2 content`) is already planned as slices of earlier contents. What a version pays at 10,000 transitions (3,098 B) is 1,175 B of `concat` records (two ids, then a source id and a range for every piece, for every chunk on the path), about 1,100 B of literals, 221 B of chunk and tree wrappers and 295 B for the 7.2 new fragments. Text pays one record and one literal for the whole file. At the heavy weight (48.8) no slice pays, so every rewritten chunk is stored whole (22.5 KB).
+- Change (all options, off by default; default stored bytes and behaviour are unchanged, the fixed bench equal):
+  - `Repo::object_contexts` (new module `chunk_delta.rs`): when ingest stores the content of a tree or graph chunk, it may store it as "Q", a zstd frame with a related stored content as its context, the encoding repack already writes (E057). The base is the most related stored content the seed index finds (3 tried); when that content is itself a frame, its own base is tried in its place. The frame competes on the planner's own score (bytes plus `read_weight` times decode work) against the slice and template plans and the plain encoding, so at the heavy weight it is never chosen. Chains are capped at one step: a base is always stored plain (not "Q", "M" or "S"), so a read decodes at most one base, as for repack's frames. gc keeps a frame's base through `needs`, and ingest's drop of a stored copy checks it. A chain of frames was measured as a hack and dropped: it saved nothing (1,743 B against 1,717 at 1,000) and breaks the one-base read.
+  - `Repo::graph_chunks` (`ChunkSizes { leaf, parent }`, default `(MIN_CHUNK, MAX_CHUNK)` for both, so the default math is unchanged): the prolly tree's minimum and maximum chunk size, separately for leaves and parent levels (the fanout). `put_graph`, `graph_edit`'s splice and range drops cut with the same bounds, so an edit gives the same root as storing the edited graph whole.
+  - Repack: `unshare_trees` turned every graph chunk whose content no derivation names back into object form, so with frames it stored each version of a chunk whole again (1,000 transitions: 161.8 KB before repack, 228.1 KB after, against 152.5 KB without frames). With `object_contexts`, a content stored as a frame, or that a frame is framed against, now stays content, and repack re-plans it with the rest (after the fix, 152.4 KB at 1,000 and 1,069.6 KB at 10,000, the same as or below E446's repack). Without the option nothing changes.
+  - `graph_diff_counted` made public, so a graph's delta can count chunk reads outside the net code. The key order was left as it is (the net's node labels), and the boundary rule is E249's, with only its bounds made settable.
+- Method (`examples/e448_net_chunk_deltas`, Linux cloud, 4 CPUs shared with other builds (load about 7 to 8), MemStore): E446's synthetic nets and 25 versions of mixed edits, copied from `e446_net_fragments.rs`. The text and tree rows come from the same run as the option rows. Bytes are the store's growth a version (the commit left out) at the default weight and again at the heavy weight. Times in the bytes run are the median of three fastest-of runs. Reads of version 25 come from a separate run where the rows alternate over 7 rounds (median), so load falls on every row alike. Repack is run on the default-weight store. General graphs: a power-law link graph of 100,000 nodes with Zipf sources and targets, 1M draws giving 718,017 distinct edges, titles of 8 to 40 bytes; and a property graph of 10,000 nodes with 1 to 4 KB payloads and 30,000 edges. Each goes through 25 versions of local edits in turn: add or remove edges, edit payloads, add a subgraph of 5 to 20 nodes. The text form is one canonical file of the graph's lines, sliced by the store like a net's text, and its delta is a line diff. The tree form is `put_graph`, and its delta is `graph_diff_counted` with the shared-chunk skip, applied to the earlier version.
+- Results, nets, bytes (25 versions; "+C" is `object_contexts`, "P16K" is parent bounds 16,384:131,072, "S256" is leaf and parent bounds 256:2,048):
+
+  | transitions | form | bytes v1 | a version adds, default weight | a version adds, heavy weight | after repack |
+  | --- | --- | --- | --- | --- | --- |
+  | 1,000 | text (E422) | 8,405 | 782 | 8,441 | 16,378 |
+  | 1,000 | tree (E446) | 118,782 | 2,536 | 14,110 | 152,522 |
+  | 1,000 | tree +C | 118,782 | 1,717 | 14,110 | 152,432 |
+  | 1,000 | tree +C P16K | 118,782 | 1,717 | 14,110 | 152,432 |
+  | 1,000 | tree S256 | 138,679 | 3,717 | 5,471 | 164,328 |
+  | 1,000 | tree leaf 128:1,024, parent 256:2,048 | – | 3,901 | 5,138 | – |
+  | 1,000 | tree +C S256 | 138,679 | 2,405 | 5,471 | 170,114 |
+  | 10,000 | text (E422) | 84,647 | 849 | 85,295 | 71,572 |
+  | 10,000 | tree (E446) | 1,232,063 | 3,098 | 22,544 | 1,071,255 |
+  | 10,000 | tree +C | 1,232,063 | 1,965 | 22,544 | – |
+  | 10,000 | tree +C P16K | 1,231,908 | 1,753 | 23,199 | 1,069,593 |
+  | 10,000 | tree S256 | 1,432,099 | 4,363 | 7,779 | 1,219,198 |
+  | 10,000 | tree leaf 128:1,024, parent 256:2,048 | – | 4,524 | 6,969 | – |
+  | 10,000 | tree +C S256 | 1,432,099 | 2,727 | 7,779 | – |
+
+  Objects reused stay at E446's (99.2% at 1,000, 99.9% at 10,000). The anatomy with frames at 1,000 transitions (1,717 B): 733 B of frames for 3.2 chunks, 217 B of wrappers, 270 B of fragments, 279 B of records and 123 B of literals left on chunks still sliced, 95 B other. Wider sweeps (sweep files in the run directory): at the default weight smaller chunks always cost more (leaf 256:2,048 alone, 3,440 at 1,000) and larger parents help a little with frames. At the heavy weight smaller leaves and parents help (best 5,138 and 6,969), and frames change nothing.
+- Results, nets, time (µs; read v25 from the interleaved run, median of 7; delta and chunks from the bytes run):
+
+  | transitions | form | read v25, default store | read v25, heavy store | write a version | delta | delta chunks read (unpruned) | applied exactly | fsck |
+  | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+  | 1,000 | text | 1,235 | 1,206 | 2,846 | 589 | – | – | 0 |
+  | 1,000 | tree (E446) | 4,249 | 3,912 | 5,956 | 604 | 15.5 (42.8) | 25/25 | 0 |
+  | 1,000 | tree +C | 4,335 | 4,108 | 8,494 | 601 | 15.5 (42.8) | 25/25 | 0 |
+  | 1,000 | tree +C P16K | 4,345 | 4,172 | 10,512 | 591 | 15.5 (42.8) | 25/25 | 0 |
+  | 1,000 | tree S256 | 4,232 | 4,015 | 8,474 | 187 | 30.7 (341.4) | 25/25 | 0 |
+  | 1,000 | tree +C S256 | 4,201 | 4,015 | 7,077 | 174 | 30.7 (341.4) | 25/25 | 0 |
+  | 10,000 | text | 15,855 | 14,839 | 27,647 | 6,842 | – | – | 0 |
+  | 10,000 | tree (E446) | 58,928 | 57,123 | 53,654 | 770 | 20.7 (367.7) | 25/25 | 0 |
+  | 10,000 | tree +C | 59,565 | 58,330 | 60,216 | 737 | 20.7 (367.7) | 25/25 | 0 |
+  | 10,000 | tree +C P16K | 59,422 | 57,192 | 59,974 | 810 | 17.3 (363.7) | 25/25 | 0 |
+  | 10,000 | tree S256 | 60,780 | 57,269 | 75,640 | 249 | 35.9 (3,278.9) | 25/25 | 0 |
+  | 10,000 | tree +C S256 | 58,550 | 57,144 | 66,577 | 213 | 35.9 (3,278.9) | 25/25 | 0 |
+
+  Every read is within 1.03x of E446's tree. Write times in the bytes run are noisy under the shared load (the interleaved run's single-pass writes put +C between 0.8x and 1.3x of E446).
+- Results, general graphs (`put_graph`, 25 versions; delta in µs, its chunks read with the skip and without it):
+
+  | graph | form | bytes v1 | a version adds, default | a version adds, heavy | read v25 µs | delta µs | delta chunks (unpruned) | applied |
+  | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+  | links, 100k nodes, 718k edges | text | 2,752,534 | 984 | 2,753,330 | 303,246 | 254,327 | – | – |
+  | links | tree | 14,906,308 | 2,510 | 82,313 | 1,064,345 | 10,998 | 18.4 (3,639.8) | 24/24 |
+  | links | tree +C | 14,719,966 | 1,682 | 82,313 | 1,005,670 | 8,581 | 18.4 (3,639.8) | 24/24 |
+  | links | tree +C P16K | 14,718,214 | 1,708 | 99,139 | 1,526,857 | 16,194 | 17.8 (3,619.8) | 24/24 |
+  | links | tree S256 | 16,985,365 | 3,644 | 67,226 | 1,466,863 | 10,333 | 28.7 (27,960.4) | 24/24 |
+  | properties, 10k nodes, 1-4 KB | text | 7,866,493 | 986 | 7,867,110 | 313,407 | 574,925 | – | – |
+  | properties | tree | 10,952,846 | 2,902 | 23,258 | 197,431 | 992 | 18.2 (297.3) | 24/24 |
+  | properties | tree +C | 10,952,846 | 1,931 | 23,258 | 113,625 | 939 | 18.2 (297.3) | 24/24 |
+  | properties | tree +C P16K | 10,952,696 | 1,809 | 23,594 | 111,105 | 936 | 15.2 (293.3) | 24/24 |
+  | properties | tree S256 | 11,101,301 | 3,688 | 7,498 | 168,503 | 179 | 27.7 (2,628.4) | 24/24 |
+
+  fsck clean in every row. These general-graph timings are from one run under load.
+- Findings:
+  1. Frames cut what a version adds at the default weight by a third or more, with nothing else changed. With frames and larger parents, a version adds 1,717 B at 1,000 transitions and 1,753 B at 10,000, against E446's 2,536 and 3,098 (32% and 43% less). The same lever cuts general graphs by about a third: the link graph from 2,510 to 1,682 B and the property graph from 2,902 to 1,809 B. Reads, deltas, chunk reuse and the shared-chunk skip are unchanged: a frame is an encoding of the same content id.
+  2. The win line is missed at the default weight: 1,717 against text's 782 at 1,000 transitions (2.2x) and 1,753 against 849 at 10,000 (2.1x). The general graphs miss in the same way (1.7x and 1.8x text). What is left is mostly structural. Each version still pays 3 to 4 frames of about 230 B each (a 33 B header and zstd's frame overhead around 40 to 80 bytes of change), 217 B of `g` and `t` wrappers, and 270 B for new fragments. The fragments alone are a third of the text's whole cost. With chunk deltas at zero, wrappers and fragments would still be about 490 B, so a tree form can only reach the text's level by also shrinking those.
+  3. The win line is met at the heavy weight by chunk size, not frames: leaf and parent bounds 256:2,048 give 5,471 B at 1,000 and 7,779 B at 10,000, against text's 8,441 and 85,295 (leaf 128:1,024 with parent 256:2,048: 5,138 and 6,969). The same bounds give the property graph 7,498 B against text's 7.87 MB. The bounds that win at the heavy weight lose at the default weight (3,717 and 4,363 without frames, 2,405 and 2,727 with them). No single setting meets both weights. The bounds would need to follow the read weight.
+  4. Smaller chunks also make deltas 3x faster (174 µs against 604 at 1,000; 213 against 770 at 10,000), but the unpruned walk grows 9x, so a full listing costs more.
+  5. Repack: frames now survive repack. Repack re-plans them into the same store as without them: 152.4 KB at 1,000 and 1,069.6 KB at 10,000, against E446's 152.5 and 1,071.3 KB. Repack does not fold chains below that. The text after repack is still 9x smaller at 1,000 (16.4 KB) and 15x at 10,000 (71.6 KB), because version 1's fragments dominate.
+  6. Where nets are used: firings tracked by framed fragments (`net_track_fragments`, `net_fire`) replay to the same marking as without frames (test below). Recorded steps (E441) name contents by id and are unaffected. Small nets (night, train, under one chunk) have chunks under 4 KB whose frames rarely pay over the slices; the option matters for nets of thousands of transitions. Beyond nets, the frame is in the store's ingest path for any tree or graph chunk content, so `put_graph` objects and file trees benefit alike. The general graphs show the same one-third cut.
+- Verdict: **partial** (options, off by default). Frames cut a version's bytes by a third to 43% for nets and general graphs, with reads within 1.03x of E446. Small chunk bounds meet the heavy-weight win line at both sizes. The default-weight win line is missed (2.1x to 2.2x text), and no one setting wins at both weights. Mutation checks:
+  - Frames allowed to chain on a frame: 5 of 8 tests fail.
+  - Frames never chosen: 3 fail (bytes, gc, firings).
+  - gc's `needs` ignoring a frame's base: the gc test fails with NotFound.
+  - Repack's keep of framed contents removed: `repack_after_frames_reads_back_and_keeps_frames` fails (175,846 B after against 116,739 before).
+- Owner's choices raised:
+  - Whether `object_contexts` should become the default for tree and graph chunks: it would change stored bytes, so it is left as an option.
+  - Whether the prolly tree's chunk bounds should be chosen by the read weight (large parents at the default weight, 128 to 256 B leaves at the heavy weight).
+- Checks: `tests/chunk_deltas.rs`, 8 tests:
+  - Off by default; the same roots with frames; later versions under 0.8x the bytes; read back; fsck and fsck_deep clean.
+  - A frame's base is never a frame.
+  - Deltas over frames skip shared chunks and apply exactly.
+  - gc keeps a frame's base when only the frame's branch is live.
+  - Repack after frames reads back and does not grow the store.
+  - Smaller bounds cut more chunks of the same graph.
+  - `graph_edit` cuts with the same bounds as `put_graph`.
+  - Firings tracked by framed fragments replay to the same marking.
+
+  `cargo test --release --features embed`: 408 pass, 0 fail. clippy `-D warnings` clean. Fixed bench: north 0.3060, sharing 0.9496, every corpus's byte figures equal to main's (only timings differ). Privacy scan clean.
+- Not done / Next:
+  - A frame without the `g 2` wrapper, and a short base reference (the 33 B header is about 15% of a frame).
+  - Grouping a version's new fragments into one content: the remaining floor that E447's inline form addresses.
+  - Bounds chosen by the read weight.
+  - A key order that keeps an edit's neighbours in one leaf. The net's labels sort places and transitions by name, so the order follows names, not the net's.
+  - Repack at 10,000 transitions for every row: one repack takes about 4 minutes here.
+  - FsStore.
+- Run: `cargo run --release --example e448_net_chunk_deltas -- nets 1000,10000 "text,tree,tree+contexts,..."`, `-- graphs links,props "text,tree,tree+contexts,..."`, `-- reads 1000,10000 ROWS`, `-- repack 1000,10000 contexts+parent=16384:131072`, `-- anatomy 1000,10000 base,contexts`.
+
+### E450 graph-compute (computations over any graph, kept up to date from its delta and stored as fragments)
+
+- Branch / parent: `exp/450-graph-compute` / `exp/446-net-fragments`.
+- Question: the owner asked to include fragment computation over graphs in general. Can E446's net delta be generalised to any `put_graph` graph, and can computations over a graph (degree, k-hop, connected components, an iterative one) be kept up to date from that delta, stored as versioned, shared, fsck-checked fragments, reading only what the delta reaches? Can such computations be recorded as checkable steps, and what would the derivation and step model have to change?
+- Change (all opt-in, nothing in a default path calls it; stored bytes and defaults unchanged): new module `src/graph/compute.rs` (exported as `ikam::graph_compute`), one line each in `src/graph.rs` and `src/lib.rs`.
+  - `Repo::graph_delta(a, b)`: a `GraphDelta` (node changes plus chunks read) over E249's walk, so chunks both versions share are skipped. It applies exactly and names added and removed edges for any graph.
+  - `Compute`: `Index` (key to label plus in-edges, which the rest need because edges name targets by an 8-byte key only), `Degree`, `Hops { roots, k }` (k-hop distance, or reachability with no k), `Components` (weakly connected; a component is labelled by its smallest label), `PageRank { iters, quantum }` (fixed point, integer arithmetic, so it is exact and repeatable).
+  - Each result is itself a `put_graph` graph: one node per key (16 hex digits), the value carried on an edge to key zero whose label is the value text. A result version is the previous result with edits put through `graph_edit`, so it shares every untouched chunk and its root equals the full recompute's root.
+  - `Repo::graph_compute` (full, over fragments) and `Repo::graph_compute_update(prev, graph, delta, computes)` (incremental). Index and degree update from the delta alone. k-hop and reach run a dynamic BFS: level-by-level invalidation with a support check over in-neighbours' values (read progressively), then best-first settling. Components run a split check (searches from each side of a removed edge that merge when they meet and stop once at most one is still live) and merges by union over labels. PageRank is recomputed in full.
+  - `MemGraph`: the same computations and updates in memory, as the baseline.
+  - Steps: `put_graph_step(computed, spec, from)` records a graph with nodes `func` (content `ikam/graph-compute/1 <spec>`), `input`, `output`, `index` and `from` (provenance only), as objects, so gc keeps the whole input and output graphs through a commit. `graph_step_check(step)` rebuilds in full and compares roots.
+- Method (`examples/e450_graph_compute.rs`, Linux cloud, 4 CPUs shared with three sibling builds (load about 8), MemStore; medians of 3 runs): four synthetic workloads, each through 25 versions of local edits around a moving centre (edges removed and added, payloads changed, a small subgraph added, a node removed every 4th version).
+  - link: 100,000 pages, 956,620 edges, Pareto out-degree (mean 10) with preferential targets.
+  - prop: a property graph of 10,000 records, typed edges, 1 to 4 KB bodies.
+  - net1k and net10k: E446's synthetic nets (1,000 and 10,000 transitions) as arc graphs, edited by E446's chain; roots are the marked places.
+  - Full recompute over fragments (reads every node, then writes the results, in its own store), the incremental update (and with the delta and the index update added), and the in-memory full and incremental baselines. Every version checks incremental against full and in-memory against full. Reuse is the share of a result's chunks (by count and by encoded bytes) already in the version before. Two store configurations: default options, and "fast" (existing options `plain_hot_writes`, `read_cache`, `read_memo`). k-hop is k = 2 from fixed roots (10 pages on link, 5 records on prop, the marked places on the nets); reach uses the same roots with no bound.
+- Results, link (100k nodes), fast options, µs a version:
+
+  | computation | full over fragments | incremental | speedup | incl. delta + index | speedup | in-memory full | in-memory incremental | chunks read full / incr. | keys changed | adds a version (bytes) | reused (count / bytes) | incr. = full |
+  | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+  | index | 1,048,060 | 18,615 | 56.3x | 21,961 | 47.7x | 196,192 | 812 | 2,236 / 55.5 | 32.2 | 303,787 | 97.6% / 97.3% | 24/24 |
+  | degree | 615,755 | 16,372 | 37.6x | 19,718 | 31.2x | 23,169 | 88 | 2,235 / 45.0 | 36.7 | 97,881 | 93.7% / 93.6% | 24/24 |
+  | k-hop (k = 2) | 451,488 | 1,877 | 240.5x | 23,838 | 18.9x | 534 | 79 | 2,235 / 24.2 | 0.8 | 1,041 | 84.7% / 87.1% | 24/24 |
+  | reach | 826,893 | 77,494 | 10.7x | 99,455 | 8.3x | 226,693 | 327 | 2,235 / 574 | 63.2 | 117,122 | 90.3% / 90.3% | 24/24 |
+  | components | 692,025 | 23,788 | 29.1x | 45,749 | 15.1x | 95,757 | 1,299 | 2,235 / 241 | 5.2 | 27,606 | 98.8% / 98.5% | 24/24 |
+  | pagerank (exact, full) | 770,199 | 784,445 | 1.0x | 784,445 | 1.0x | 152,436 | (= full) | 2,235 / 2,235 | – | 1,303,065 | 0% / 0% | 24/24 |
+
+  Input graph: v1 12.4 MB stored in 2,236 chunks, a version's write 3.7 ms, delta 3.3 ms reading 54 chunks; loading the whole graph into memory takes 347 ms. In-memory incremental = in-memory full 24/24 for every computation. gc, fsck and fsck_deep clean; the last version's 6 steps rebuilt equal after gc.
+- Results, other workloads, fast options (speedup of the update alone / including delta and index; reuse by chunk count; incremental = full 24/24 everywhere):
+
+  | workload | index | degree | k-hop | reach | components | pagerank |
+  | --- | --- | --- | --- | --- | --- | --- |
+  | prop (10k, 49,700 edges) | 11.4x / 9.0x, 87% | 7.2x / 5.4x, 70% | 43.9x / 2.7x, 92% | 4.8x / 2.4x, 79% | 3.5x / 2.0x, 94% | 0.9x, 0% |
+  | net1k (1,500 nodes) | 3.8x / 2.4x, 72% | 5.2x / 2.3x, 76% | 3.4x / 0.8x, 78% | 3.9x / 1.2x, 82% | 2.9x / 1.0x, 88% | 0.9x, 53% |
+  | net10k (15,000 nodes) | 27.2x / 20.6x, 95% | 31.8x / 19.4x, 96% | 18.9x / 5.6x, 97% | 16.3x / 7.3x, 97% | 9.7x / 5.5x, 98% | 0.9x, 58% |
+
+- Results, default store options (one run; link did not finish within the run's time limit, since every result write goes through the planner at 100k nodes; µs a version, speedup of the update alone / including delta and index; bytes a version adds at the default weight / at the heavy weight 48.8):
+
+  | workload | computation | full | incremental | speedup | adds a version, default / heavy (bytes) |
+  | --- | --- | --- | --- | --- | --- |
+  | prop | index | 129,442 | 50,978 | 2.5x / 2.4x | 1,476 / 86,186 |
+  | prop | degree | 82,249 | 31,717 | 2.6x / 2.4x | 680 / 38,062 |
+  | prop | k-hop | 34,274 | 1,026 | 33.4x / 0.6x | 17 / 209 |
+  | prop | reach | 71,776 | 36,647 | 2.0x / 0.8x | 690 / 24,298 |
+  | prop | components | 56,412 | 24,467 | 2.3x / 0.7x | 180 / 9,259 |
+  | prop | pagerank | 69,941 | 70,812 | 1.0x | 141,293 / 141,374 |
+  | net10k | index | 73,813 | 7,903 | 9.3x / 7.9x | 476 / 27,021 |
+  | net10k | degree | 44,687 | 2,988 | 15.0x / 10.2x | 207 / 6,979 |
+  | net10k | k-hop | 26,566 | 2,284 | 11.6x / 2.3x | 31 / 1,530 |
+  | net10k | reach | 43,210 | 4,535 | 9.5x / 3.1x | 163 / 5,706 |
+  | net10k | components | 42,834 | 6,513 | 6.6x / 2.7x | 156 / 4,655 |
+  | net10k | pagerank | 82,900 | 88,358 | 0.9x | 52,445 / 81,682 |
+
+  net1k at default options: 2.1x to 3.0x for the update alone, 0.5x to 1.9x with delta and index; a version adds 81 to 431 bytes a result at the default weight. All 24/24 equal, fsck and fsck_deep clean, steps rebuilt equal after gc. The fast options store what the heavy weight stores, since `plain_hot_writes` skips the planner whatever the weight.
+
+- Results, PageRank approximate (measured only, in memory, not stored as a result): re-iterating the nodes within 2 hops of the delta for 20 iterations from the previous ranks took 397 ms a version on link against 152 ms for the exact in-memory recompute (2,619 nodes re-iterated); largest error against exact 3.59 (relative), mean 2.6e-3; 64% of stored values equal to exact. On prop: 12.8 ms against 7.0 ms, 4% equal. It is both slower and inexact, so the exact full recompute stays the default and PageRank is recorded as a full-recompute step.
+- Mutation checks: (1) with the k-hop invalidation cascade to the next level disabled in `update_hops`, `every_incremental_result_equals_a_full_recompute` fails ("version 12: incremental differs from full") and so does `steps_record_inputs_and_outputs_and_gc_keeps_them`. (2) With the components split check skipped (a removed edge never splits), `every_incremental_result_equals_a_full_recompute` fails at version 5 and `an_update_reads_only_what_the_delta_reaches` fails. Restored after each.
+- Findings:
+  1. Exactness holds: across 4 workloads, 24 updates each and 6 computations, every incremental result has the same root as a full recompute, and the randomized test (3 seeds by 40 versions, dangling edges, removed and re-added nodes) agrees too.
+  2. The 10x line is met on the 100k graph for index, degree, k-hop and components, even with the delta and the index update counted (47.7x, 31.2x, 18.9x, 15.1x). Reach meets it for the update alone (10.7x) and misses with delta and index (8.3x): an edit near the core of a link graph moves the levels of about 63 nodes a version and the support checks read 574 chunks. PageRank misses (1.0x): it is a global fixed point, recomputed in full.
+  3. The within-2x-of-in-memory line is missed by 20x to 200x. In memory an update touches a few hash entries (79 µs for k-hop); over fragments the same update pays per chunk read, decoded and rewritten. This is the store's per-chunk cost (E449's lever), not the algorithm: chunks read are 1% to 25% of a full pass. Against a full in-memory recompute that must first load the graph (347 ms on link) the fragment update wins for everything but PageRank.
+  4. Reuse of at least 95% holds on link for index (97.6%) and components (98.8%), and on net10k for all but index (94.9%) and PageRank; degree 93.7%, reach 90.3%, k-hop 84.7% on link. Results are keyed by the hash of the label, so a local edit's keys scatter across the result's chunks; k-hop's small result (7.8 KB, 2 chunks) rewrites a large share for any change.
+  5. Locality: the index and results are in key-hash order, so a 200-node local walk touches many index chunks (the read-bound test needed half the index for components). A result ordered by label, or by a locality-preserving key, would cut both reads and rewritten bytes.
+  6. Bytes against time is the store's existing trade. At the default weight the planner slices each result version against the one before, so a version adds tens to hundreds of bytes a result (1,476 against 86,186 for prop's index), but the writes cost 2x to 7x more and the speedups on prop and net10k fall to 2x to 15x. The fast options (existing ones, off by default) write plain chunks and store what the heavy weight stores.
+  7. On small graphs (net1k, 12 chunks) the delta and index cost as much as a full pass; the incremental path pays from about 10k nodes.
+- The fundamentals question (what the derivation and step model would need):
+  1. A `Derivation`'s args and a `Run`'s are content (`Arg::Whole` / `Range`) and its output is a content id. gc's closure follows args as content, so a graph root as an arg would keep only its root chunk, and the ledger's `by_output` would treat a graph root as content. Graph computations need an object form of `Arg` and of the output that gc walks with `reachable_from`. This branch works around it by recording steps as graphs whose nodes point at the input and output as objects.
+  2. Functions take bytes. A graph function needs a read interface over the graph (node, nodes in a range, delta), read lazily; serialising the graph into one content (as E427 did for its sampler view) loses the delta. For WASM this means read-only host imports, deterministic because inputs are content-addressed.
+  3. The recorded fact is f(input) = output. The incremental update (previous output, delta) is a plan for reaching that output, as a slice is a plan for bytes; the memo key (spec, input root) has no history, and `from` is provenance only. A rebuild check is a full recompute and root comparison.
+  4. `fsck_deep` does not know graph steps; `graph_step_check` is a separate call.
+  5. A node has no value field, so values ride on an edge to key zero (13 bytes of framing plus the value).
+  6. Edges name targets by key only, so every traversal needs a key-to-label and in-edge index, itself a maintained result. That index is also the persisted reverse index `used_by` in exec.rs currently gets by scanning the whole store.
+- Use cases: nets (the spread of a marking as reach from the marked places, kept per net version; not firing semantics, which need AND-enabledness); E426's training tables and E427/E429's batches (E427 keeps a 2-hop sampler view per commit as a recorded step, which k-hop plus the delta could update rather than rebuild); the explorer and search over linked records (backlinks through the index, related records through k-hop, clusters through components, degree for ranking).
+- Verdict: **partial** (options, off by default). The general delta, five exact delta-driven computations stored as fragments, and recorded, checkable steps work and agree with full recompute everywhere. The 10x line is met on the 100k graph for four of six computations, reuse of 95% for two, and within-2x of in-memory for none; PageRank stays a full recompute.
+- Integration should take `src/graph/compute.rs` and the two export lines; nothing in a default path calls them. The example and tests stay with it.
+- Owner's choices raised: whether to add an object form of `Arg` and output, and graph-reading functions, to the derivation model (point 1 and 2 above); whether nodes should get a value field; whether results and the index should be ordered by label or a locality-preserving key instead of key hash.
+- Checks: `tests/graph_compute.rs`, 4 tests (every incremental result equals a full recompute over 3 seeds by 40 random versions, also in memory; an update reads only what the delta reaches on a 20k-node graph; steps record inputs and outputs, survive gc with fsck and fsck_deep clean, and a wrong step fails its check; a graph delta applies exactly and names its edges). `cargo test --release --features embed --no-fail-fast`: 404 pass, 0 fail (5 ignored). clippy `-D warnings` clean. Fixed bench: north 0.3060, sharing 0.9496, equal to main. Privacy scan clean.
+- Not done / Next: a label-ordered or locality-preserving result layout; an exact incremental PageRank (for example a residual push with an error bound, or a recorded approximate step with its bound checked); directed strongly connected components; making `fsck_deep` run graph step checks; FsStore, where per-chunk overhead would weigh more; the object `Arg` itself.
+- Run: `cargo run --release --example e450_graph_compute -- link,prop,net1k,net10k 3 fast` and `cargo run --release --example e450_graph_compute -- link,prop,net1k,net10k 1` (default options).
+
+### E451 net-integrate (E447's inline nets under E449's read path, with E448's frames, and E450's graph computations on the combined options)
+
+- Branch / parent: exp/451-net-integrate / 7066968 (E446, E447 and E449 merged), then E448 (exp/448-net-chunk-deltas, 0d7e81c) and E450 (exp/450-graph-compute, 348110f) merged in.
+- Question: E447 (nets as inline compact fragments) and E449 (a faster read, write and firing path for E446's fragments) were built side by side, so E449's options did not work over E447's layouts. Do they once joined, for both inline layouts (Inline and InlineFlat), with every read path giving the same nets, deltas and markings? With E448's chunk frames on as well, how close do the combined options come to the text file (E422) on v1 bytes (line: 1.5x text), a version's bytes, a cold read of version 25 (line: text's or under), a version's write (line: text's or under) and a firing on a 10,000-transition net (line: faster than text)? Can the per-chunk overhead that E448 names (about 490 B a version) be cut? The owner's widened ask: the same options for E450's computations over general graphs.
+- Change (every behaviour an option, off by default; default reads, writes and stored bytes unchanged, the fixed bench equal):
+  - E449's fast read over E447's inline nodes (`net/fast.rs`): an inline node is decoded straight from its payload by a strict compact parser (`decode_compact`: canonical numbers, weights of 1 never written, `h` arcs without a capability, element rules of `Net::check` applied to the element alone). Other inline payloads (E447's line codecs) are parsed by E447's reader and printed back under each codec to tell which they are. Each decoded node records the stored forms it is exactly the node of (content per line, line codec with or without `next`, compact), and a version's nodes must share one form. This is the same canonical rule as the full read (the nodes must equal `inline_nodes(net, codec)` or `fragment_nodes(net)`), so a forged or mixed chunk is refused, not read.
+  - The cache, the threaded read (`_par`), reads and firings by key (`net_fragments_part`, `net_fire_at`) take inline leaves the same way. `graph_read` and the graph hops treat an inline target's bytes as the node's payload (`graph_fast.rs`).
+  - Delta writes (`net_delta_write`) for `Layout::Inline`: only the changed compact nodes go to `graph_edit`, and no content is put. The roots equal the whole write's, which is tested. InlineFlat keeps its one-chunk whole write.
+  - A merge artifact fixed: whole writes in the inline layouts went through E446's node builder when the E449 options were on. `put_net_fragments` now goes to the inline builders for both inline layouts.
+  - One chunk-size option: E447's `Repo::graph_chunk` (min, max) and E448's `Repo::graph_chunks` (`ChunkSizes { leaf, parent }`) are now one option, `graph_chunks`; E447's pair is `ChunkSizes::uniform(min, max)`. Defaults unchanged.
+  - `Repo::short_chunk_records` (part 3): E104's short derivation records (`short_records`, ids cut to 8-byte prefixes) for the chunk contents of trees and graphs only, the records the planner writes while it stores an object. Nothing else changes, and the store's other records keep their long form.
+  - E450's computations read chunks through `graph_chunk_cached`, so with `graph_cache` on, the per-computation chunk map shares chunks decoded by other reads and earlier versions. With the cache off (the default) each chunk is decoded as before.
+  - Test-only switch (feature `test-net-options`, never in default features): `IKAM_NET_OPTIONS` (`fast`, `delta`, `cache=N`, `threads=N`, `inline`) turns the options on in every `Repo::new`, and `inline` maps the Tree and Flat layouts to Inline and InlineFlat, so existing tests run over the combined path unchanged.
+- Method (`examples/e451_net_combined.rs`, the E446/E447 method; Linux cloud, 4 CPUs shared with other experiments' builds (load 4 to 8), MemStore): E446's synthetic nets, 1,000 and 10,000 transitions, 25 versions of E446's mixed edits, at the default read weight (0.001) and the heavy weight (48.8). Bytes are the store's growth (the commit left out). Times are the median of 3 runs, each the median of 5. A cold read of version 25 empties the graph cache first. "After v24" reads v25 with the cache kept from reading v24. Firings: E422's night net edited 9 times mid-run, alone (300 candidates) and inside 10,000 more transitions (100 candidates), each replayed to its marking. General graphs: E449's power-law link graph (100,000 nodes, 997,238 edges) and property graph (10,000 nodes, 1 to 4 KB payloads), 25 versions of local edits. E450's harness was rerun with `E450_E451=1`, which turns on the cache, frames with P16K bounds, short chunk records and payloads of up to 256 B inline for the input graph and every result graph.
+  - Rows: "+E449" is `net_fast_read`, `graph_cache` and `net_delta_write`. "Frames" is E448's `object_contexts`. "P16K" is leaves 4,096:32,768 and parents 16,384:131,072. "S256" is 256:2,048 at every level. "SCR" is `short_chunk_records`.
+- Results, nets, 1,000 transitions, default weight:
+
+  | form | bytes v1 (x text) | a version adds (x text) | reused | write µs (x text) | read v25 cold µs (x text) | after v24 µs | delta µs | fsck |
+  | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+  | text (E422) | 8,405 (1.00x) | 782 (1.00x) | 0.0% | 1,938 (1.00x) | 1,326 (1.00x) | – | 607 | 0 |
+  | E446 tree | 118,782 (14.13x) | 2,536 (3.24x) | 99.2% | 4,245 (2.19x) | 4,446 (3.35x) | – | 627 | 0 |
+  | E447 inline | 13,483 (1.60x) | 1,619 (2.07x) | 60.8% | 2,885 (1.49x) | 2,774 (2.09x) | – | 841 | 0 |
+  | E447 inline-flat | 9,925 (1.18x) | 1,187 (1.52x) | 0.0% | 2,155 (1.11x) | 2,596 (1.96x) | – | 1,685 | 0 |
+  | E448 tree + frames P16K | 118,782 (14.13x) | 1,717 (2.19x) | 99.2% | 4,986 (2.57x) | 4,181 (3.15x) | – | 618 | 0 |
+  | E449 tree + E449 options | 118,782 (14.13x) | 2,536 (3.24x) | 99.2% | 2,155 (1.11x) | 2,011 (1.52x) | 530 | 597 | 0 |
+  | inline +E449 | 13,483 (1.60x) | 1,619 (2.07x) | 60.8% | 1,882 (0.97x) | 1,418 (1.07x) | 603 | 842 | 0 |
+  | inline-flat +E449 | 9,925 (1.18x) | 1,187 (1.52x) | 0.0% | 2,687 (1.39x) | 1,515 (1.14x) | 1,468 | 1,861 | 0 |
+  | inline + frames P16K | 13,483 (1.60x) | 903 (1.15x) | 60.8% | 3,670 (1.89x) | 2,686 (2.03x) | – | 898 | 0 |
+  | inline + frames P16K +E449 | 13,483 (1.60x) | 903 (1.15x) | 60.8% | 2,670 (1.38x) | 1,561 (1.18x) | 583 | 1,011 | 0 |
+  | inline-flat + frames +E449 | 9,925 (1.18x) | 702 (0.90x) | 0.0% | 4,541 (2.34x) | 1,941 (1.46x) | 1,926 | 1,865 | 0 |
+  | inline + frames P16K +E449 + SCR | 13,483 (1.60x) | 897 (1.15x) | 60.8% | 2,580 (1.33x) | 1,343 (1.01x) | 542 | 775 | 0 |
+  | inline +E449 + SCR | 13,483 (1.60x) | 1,239 (1.58x) | 60.8% | 1,916 (0.99x) | 1,418 (1.07x) | 617 | 843 | 0 |
+  | inline +E449 + short_records (all records) | 13,483 (1.60x) | 1,239 (1.58x) | 60.8% | 1,916 (0.99x) | 1,431 (1.08x) | 597 | 847 | 0 |
+  | inline + S256 +E449 | 27,608 (3.28x) | 2,610 (3.34x) | 90.1% | 1,789 (0.92x) | 1,850 (1.40x) | 393 | 268 | 0 |
+
+- Results, nets, 10,000 transitions, default weight:
+
+  | form | bytes v1 (x text) | a version adds (x text) | reused | write µs (x text) | read v25 cold µs (x text) | after v24 µs | delta µs | fsck |
+  | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+  | text (E422) | 84,647 (1.00x) | 849 (1.00x) | 0.0% | 20,390 (1.00x) | 14,333 (1.00x) | – | 7,172 | 0 |
+  | E446 tree | 1,232,063 (14.56x) | 3,098 (3.65x) | 99.9% | 37,332 (1.83x) | 51,236 (3.57x) | – | 805 | 0 |
+  | E447 inline | 124,676 (1.47x) | 2,224 (2.62x) | 95.2% | 20,799 (1.02x) | 31,457 (2.19x) | – | 998 | 0 |
+  | E447 inline-flat | 86,245 (1.02x) | 1,275 (1.50x) | 0.0% | 22,198 (1.09x) | 30,712 (2.14x) | – | 18,515 | 0 |
+  | E448 tree + frames P16K | 1,231,908 (14.55x) | 1,753 (2.06x) | 99.9% | 37,533 (1.84x) | 55,559 (3.88x) | – | 828 | 0 |
+  | E449 tree + E449 options | 1,232,063 (14.56x) | 3,098 (3.65x) | 99.9% | 8,666 (0.43x) | 20,853 (1.45x) | 4,652 | 832 | 0 |
+  | inline +E449 | 124,676 (1.47x) | 2,224 (2.62x) | 95.2% | 7,037 (0.35x) | 13,427 (0.94x) | 4,386 | 994 | 0 |
+  | inline-flat +E449 | 86,245 (1.02x) | 1,275 (1.50x) | 0.0% | 25,512 (1.25x) | 15,043 (1.05x) | 14,217 | 18,990 | 0 |
+  | inline + frames P16K | 124,676 (1.47x) | 1,202 (1.41x) | 95.2% | 22,330 (1.10x) | 31,173 (2.17x) | – | 1,020 | 0 |
+  | inline + frames P16K +E449 | 124,676 (1.47x) | 1,202 (1.41x) | 95.2% | 7,949 (0.39x) | 13,433 (0.94x) | 4,267 | 981 | 0 |
+  | inline-flat + frames +E449 | 86,245 (1.02x) | 727 (0.86x) | 0.0% | 36,987 (1.81x) | 17,655 (1.23x) | 17,854 | 22,705 | 0 |
+  | inline + frames P16K +E449 + SCR | 124,676 (1.47x) | 1,053 (1.24x) | 95.2% | 8,457 (0.41x) | 14,066 (0.98x) | 4,422 | 1,004 | 0 |
+  | inline +E449 + SCR | 124,676 (1.47x) | 1,639 (1.93x) | 95.2% | 7,433 (0.36x) | 13,391 (0.93x) | 4,622 | 994 | 0 |
+  | inline +E449 + short_records (all records) | 124,676 (1.47x) | 1,639 (1.93x) | 95.2% | 7,321 (0.36x) | 13,189 (0.92x) | 4,293 | 1,001 | 0 |
+  | inline + S256 +E449 | 288,157 (3.40x) | 3,463 (4.08x) | 98.8% | 6,802 (0.33x) | 17,777 (1.24x) | 4,574 | 292 | 0 |
+
+- Results, nets, heavy weight (48.8), a version adds and the times:
+
+  | form | 1k: adds (x text) | 1k: write µs | 1k: cold read µs | 10k: adds (x text) | 10k: write µs | 10k: cold read µs |
+  | --- | --- | --- | --- | --- | --- | --- |
+  | text (E422) | 8,441 (1.00x) | 970 (1.00x) | 1,296 (1.00x) | 85,295 (1.00x) | 10,991 (1.00x) | 13,251 (1.00x) |
+  | E446 tree | 14,110 (1.67x) | 3,235 (3.34x) | 4,154 (3.21x) | 22,544 (0.26x) | 34,074 (3.10x) | 51,426 (3.88x) |
+  | E447 inline | 4,352 (0.52x) | 2,296 (2.37x) | 2,474 (1.91x) | 7,858 (0.09x) | 22,792 (2.07x) | 32,948 (2.49x) |
+  | E447 inline-flat | 10,050 (1.19x) | 1,558 (1.61x) | 2,632 (2.03x) | 86,638 (1.02x) | 15,502 (1.41x) | 29,043 (2.19x) |
+  | E448 tree + frames P16K | 14,110 (1.67x) | 3,279 (3.38x) | 3,908 (3.02x) | 23,199 (0.27x) | 38,909 (3.54x) | 49,520 (3.74x) |
+  | E449 tree + E449 options | 14,110 (1.67x) | 1,137 (1.17x) | 1,895 (1.46x) | 22,544 (0.26x) | 6,704 (0.61x) | 19,310 (1.46x) |
+  | inline +E449 | 4,352 (0.52x) | 1,232 (1.27x) | 1,285 (0.99x) | 7,858 (0.09x) | 6,409 (0.58x) | 13,448 (1.01x) |
+  | inline-flat +E449 | 10,050 (1.19x) | 1,905 (1.96x) | 1,415 (1.09x) | 86,638 (1.02x) | 20,103 (1.83x) | 14,281 (1.08x) |
+  | inline + frames P16K | 4,352 (0.52x) | 2,113 (2.18x) | 2,665 (2.06x) | 7,858 (0.09x) | 20,755 (1.89x) | 30,636 (2.31x) |
+  | inline + frames P16K +E449 | 4,352 (0.52x) | 1,268 (1.31x) | 1,297 (1.00x) | 7,858 (0.09x) | 7,784 (0.71x) | 13,995 (1.06x) |
+  | inline-flat + frames +E449 | 10,050 (1.19x) | 1,826 (1.88x) | 1,314 (1.01x) | 86,638 (1.02x) | 17,764 (1.62x) | 13,506 (1.02x) |
+  | inline + frames P16K +E449 + SCR | 4,352 (0.52x) | 1,270 (1.31x) | 1,326 (1.02x) | 7,858 (0.09x) | 6,148 (0.56x) | 13,843 (1.04x) |
+  | inline +E449 + SCR | 4,352 (0.52x) | 1,239 (1.28x) | 1,212 (0.94x) | 7,858 (0.09x) | 6,162 (0.56x) | 13,365 (1.01x) |
+  | inline +E449 + short_records (all records) | 4,352 (0.52x) | 1,191 (1.23x) | 1,245 (0.96x) | 7,858 (0.09x) | 5,983 (0.54x) | 13,153 (0.99x) |
+  | inline + S256 +E449 | 3,226 (0.38x) | 760 (0.78x) | 1,716 (1.32x) | 4,992 (0.06x) | 5,869 (0.53x) | 17,357 (1.31x) |
+
+- Results, larger leaves ("L16K": 16,384:131,072 at every level, with frames, +E449 and SCR; one run, median of 5, beside P16K and the text in the same run):
+
+  | transitions / weight | form | bytes v1 (x text) | a version adds (x text) | write µs (x text) | read v25 cold µs (x text) | delta µs |
+  | --- | --- | --- | --- | --- | --- | --- |
+  | 1000 / 0.001 | text | 8,405 (1.00x) | 782 (1.00x) | 2,075 (1.00x) | 1,377 (1.00x) | 599 |
+  | 1000 / 0.001 | inline + frames P16K +E449 + SCR | 13,483 (1.60x) | 897 (1.15x) | 2,873 (1.38x) | 1,276 (0.93x) | 856 |
+  | 1000 / 0.001 | inline + frames L16K +E449 + SCR | 11,178 (1.33x) | 889 (1.14x) | 4,861 (2.34x) | 1,160 (0.84x) | 1,602 |
+  | 1000 / 48.8 | text | 8,405 (1.00x) | 8,441 (1.00x) | 2,035 (1.00x) | 1,150 (1.00x) | 516 |
+  | 1000 / 48.8 | inline + frames P16K +E449 + SCR | 13,483 (1.60x) | 4,352 (0.52x) | 1,147 (0.56x) | 1,275 (1.11x) | 775 |
+  | 1000 / 48.8 | inline + frames L16K +E449 + SCR | 11,178 (1.33x) | 7,858 (0.93x) | 2,002 (0.98x) | 1,076 (0.94x) | 1,299 |
+  | 10000 / 0.001 | text | 84,647 (1.00x) | 849 (1.00x) | 19,644 (1.00x) | 13,493 (1.00x) | 6,874 |
+  | 10000 / 0.001 | inline + frames P16K +E449 + SCR | 124,676 (1.47x) | 1,053 (1.24x) | 7,606 (0.39x) | 16,833 (1.25x) | 1,012 |
+  | 10000 / 0.001 | inline + frames L16K +E449 + SCR | 111,941 (1.32x) | 1,163 (1.37x) | 12,178 (0.62x) | 17,770 (1.32x) | 3,384 |
+  | 10000 / 48.8 | text | 84,647 (1.00x) | 85,295 (1.00x) | 13,974 (1.00x) | 12,288 (1.00x) | 6,194 |
+  | 10000 / 48.8 | inline + frames P16K +E449 + SCR | 124,676 (1.47x) | 7,858 (0.09x) | 7,003 (0.50x) | 12,063 (0.98x) | 887 |
+  | 10000 / 48.8 | inline + frames L16K +E449 + SCR | 111,941 (1.32x) | 16,468 (0.19x) | 8,794 (0.63x) | 26,679 (2.17x) | 3,039 |
+
+- Results, what a version adds, by entry (default weight, mean of versions 2 to 25, bytes):
+
+  These count the entries new in the store by id after a version and its commit (the last byte column holds the tree and the commit). For the rows with frames they are 74 B above the nets table's growth (the commit). For the rows without frames they are 0.6 to 1.7 KB above, and for the text 0.4 and 3.6 KB above (1,200 and 4,444 B against 782 and 849). The cause of these larger gaps was not found, so read this table for the split within a form, not across forms.
+
+  | transitions | form | adds | chunk pointers | derivation records (count) | contents | trees, commits, other | leaves / parents rewritten |
+  | --- | --- | --- | --- | --- | --- | --- | --- |
+  | 1,000 | text (E422) | 1,200 | 0 | 461 (1.0) | 597 | 142 | 0.0 / 0.0 |
+  | 1,000 | E446 tree | 4,257 | 149 | 847 (4.8) | 3,120 | 142 | 3.4 / 1.0 |
+  | 1,000 | E447 inline | 2,217 | 133 | 701 (3.6) | 1,240 | 142 | 2.9 / 1.0 |
+  | 1,000 | E447 inline-flat | 1,666 | 34 | 521 (1.0) | 969 | 142 | 1.0 / 0.0 |
+  | 1,000 | E448 tree + frames P16K | 1,791 | 149 | 279 (1.2) | 1,221 | 142 | 3.4 / 1.0 |
+  | 1,000 | inline + frames P16K | 977 | 133 | 10 (0.0) | 692 | 142 | 2.9 / 1.0 |
+  | 1,000 | inline-flat + frames +E449 | 776 | 34 | 104 (0.3) | 496 | 142 | 1.0 / 0.0 |
+  | 1,000 | inline + frames P16K +E449 + SCR | 971 | 133 | 4 (0.0) | 692 | 142 | 2.9 / 1.0 |
+  | 1,000 | inline +E449 + SCR | 1,837 | 133 | 322 (3.6) | 1,240 | 142 | 2.9 / 1.0 |
+  | 1,000 | inline + S256 +E449 | 2,788 | 290 | 801 (4.8) | 1,554 | 142 | 4.8 / 3.7 |
+  | 10,000 | text (E422) | 4,444 | 0 | 496 (1.0) | 3,805 | 142 | 0.0 / 0.0 |
+  | 10,000 | E446 tree | 4,157 | 221 | 1175 (5.8) | 2,619 | 142 | 3.8 / 2.7 |
+  | 10,000 | E447 inline | 2,940 | 160 | 1049 (5.0) | 1,588 | 142 | 3.7 / 1.0 |
+  | 10,000 | E447 inline-flat | 4,934 | 34 | 664 (1.0) | 4,094 | 142 | 1.0 / 0.0 |
+  | 10,000 | E448 tree + frames P16K | 1,827 | 164 | 209 (0.8) | 1,312 | 142 | 3.8 / 1.0 |
+  | 10,000 | inline + frames P16K | 1,276 | 160 | 262 (0.8) | 711 | 142 | 3.7 / 1.0 |
+  | 10,000 | inline-flat + frames +E449 | 801 | 34 | 215 (0.8) | 410 | 142 | 1.0 / 0.0 |
+  | 10,000 | inline + frames P16K +E449 + SCR | 1,127 | 160 | 114 (0.8) | 711 | 142 | 3.7 / 1.0 |
+  | 10,000 | inline +E449 + SCR | 2,355 | 160 | 464 (5.0) | 1,588 | 142 | 3.7 / 1.0 |
+  | 10,000 | inline + S256 +E449 | 3,634 | 415 | 1261 (7.8) | 1,816 | 142 | 5.0 / 7.2 |
+
+- Results, firings (µs a firing; replay of the whole run; median of 3):
+
+  | tracked by | night alone: fire µs | replay µs | inside 10,000 transitions: fire µs (x text) | replay µs | marking |
+  | --- | --- | --- | --- | --- | --- |
+  | text (E422) | 4,490 | 61,607 | 11,058 (1.00x) | 384,566 | equal marking |
+  | E446 tree | 4,543 | 63,328 | 41,857 (3.79x) | 755,916 | equal marking |
+  | E447 inline | 4,272 | 55,996 | 28,009 (2.53x) | 519,357 | equal marking |
+  | E449 tree + options | 4,142 | 63,301 | 6,692 (0.61x) | 181,011 | equal marking |
+  | E449 tree, net_fire_at by key | 4,128 | 59,819 | 6,239 (0.56x) | 174,647 | equal marking |
+  | E451 inline + E449 options | 4,299 | 57,252 | 7,220 (0.65x) | 167,356 | equal marking |
+  | E451 inline, net_fire_at by key | 4,504 | 60,603 | 6,664 (0.60x) | 172,014 | equal marking |
+  | E451 inline-flat + E449 options | 4,135 | 55,668 | 7,893 (0.71x) | 321,610 | equal marking |
+
+  Final markings are equal across all rows.
+
+- Results, cold read of version 25 by threads (µs; rows interleaved with the text over 5 rounds, median):
+
+  | transitions | form | text µs | 1 thread | 2 threads | 3 threads |
+  | --- | --- | --- | --- | --- | --- |
+  | 1,000 | E449 tree + options | 1,342 | 1,851 | 5,342 | 4,948 |
+  | 1,000 | E451 inline + E449 options | 1,439 | 1,322 | 4,060 | 3,341 |
+  | 1,000 | E451 inline + frames P16K + E449 options | 1,393 | 1,262 | 4,897 | 4,018 |
+  | 10,000 | E449 tree + options | 15,602 | 21,703 | 27,251 | 17,905 |
+  | 10,000 | E451 inline + E449 options | 16,248 | 14,124 | 12,399 | 12,419 |
+  | 10,000 | E451 inline + frames P16K + E449 options | 15,827 | 13,782 | 22,064 | 15,995 |
+
+  In this interleaved run, inline with E449's options reads cold under the text with one thread at both sizes (0.92x and 0.87x). Threads help only at 10,000 transitions (2 threads: 12.4 ms). On this shared machine they cost more than they save at 1,000.
+
+- Results, general graphs (`put_graph`, 25 versions; µs):
+
+  Link graph (100,000 nodes, 997,238 edges, 4.1 MB of payloads):
+
+  | form | bytes v1 | a version adds | heavy: adds | reused | write µs | read v25 cold µs | after v24 µs | delta µs | fsck |
+  | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+  | payloads as contents (E446), plain reads | 20,741,606 | 12,894 | 150,656 | 100.0% | 143,780 | 396,712 | – | 381,119 | 0 |
+  | inline up to 256 B (E447), plain reads | 14,923,788 | 12,649 | 134,006 | 99.1% | 22,191 | 214,208 | – | 395,973 | 0 |
+  | payloads as contents, E449 graph_read + cache | 20,741,606 | 12,894 | 150,656 | 100.0% | 154,532 | 322,354 | 4,139 | 378,383 | 0 |
+  | E451: inline up to 256 B + E449 graph_read + cache | 14,923,788 | 12,649 | 134,006 | 99.1% | 24,730 | 218,777 | 3,718 | 376,326 | 0 |
+  | payloads as contents + frames P16K (E448) | 20,738,660 | 6,381 | 188,467 | 100.0% | 29,657 | 411,337 | – | 412,653 | 0 |
+  | E451: inline up to 256 B + frames P16K + E449 graph_read + cache | 14,920,206 | 5,863 | 172,814 | 99.2% | 24,717 | 204,107 | 4,105 | 376,414 | 0 |
+  | E451: inline + cache + short_records (all records) | 14,923,788 | 9,464 | 134,006 | 99.1% | 23,275 | 197,432 | 3,627 | 356,650 | 0 |
+  | E451: inline + cache + SCR | 14,923,788 | 9,464 | 134,006 | 99.1% | 25,886 | 210,223 | 3,716 | 385,357 | 0 |
+
+  Property graph (10,000 nodes, 25,002 edges, 26.0 MB of payloads):
+
+  | form | bytes v1 | a version adds | heavy: adds | reused | write µs | read v25 cold µs | after v24 µs | delta µs | fsck |
+  | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+  | payloads as contents (E446), plain reads | 8,683,972 | 8,587 | 80,953 | 99.8% | 19,248 | 106,201 | – | 23,278 | 0 |
+  | inline up to 2048 B (E447), plain reads | 8,240,241 | 10,896 | 76,714 | 99.7% | 16,760 | 96,122 | – | 49,318 | 0 |
+  | payloads as contents, E449 graph_read + cache | 8,683,972 | 8,587 | 80,953 | 99.8% | 17,576 | 106,627 | 10,783 | 17,584 | 0 |
+  | E451: inline up to 2048 B + E449 graph_read + cache | 8,240,241 | 10,896 | 76,714 | 99.7% | 16,608 | 94,707 | 3,632 | 44,924 | 0 |
+  | payloads as contents + frames P16K (E448) | 8,683,972 | 5,653 | 80,953 | 99.8% | 13,570 | 102,843 | – | 19,869 | 0 |
+  | E451: inline up to 2048 B + frames P16K + E449 graph_read + cache | 8,198,088 | 6,416 | 76,509 | 99.7% | 20,616 | 99,819 | 3,717 | 53,212 | 0 |
+  | E451: inline + cache + short_records (all records) | 8,240,241 | 7,953 | 76,714 | 99.7% | 18,334 | 95,236 | 3,644 | 45,146 | 0 |
+  | E451: inline + cache + SCR | 8,240,241 | 8,285 | 76,714 | 99.7% | 15,850 | 91,983 | 3,550 | 44,962 | 0 |
+
+- Results, E450's computations with the combined options (`E450_E451=1`, "fast" store options as in E450, median of 3; speedup is full recompute over fragments / incremental update, and the in-memory columns are E450's in-memory baselines in the same run):
+
+  Link graph and 10,000-transition net (E450 row: one run in this session, same harness without `E450_E451`):
+
+  | workload | computation | form | full over fragments µs | incremental µs | vs full | incl. delta + index µs | vs full | in-memory full µs | vs in-memory full | in-memory incremental µs | vs in-memory incremental | incr. = full |
+  | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+  | link | index | E450 (fast) | 868,290 | 17,521 | 49.6x | 20,663 | 42.0x | 177,382 | 8.58x | 697 | 0.034x | 24/24 |
+  | link | index | E451 options | 894,981 | 12,722 | 70.3x | 16,204 | 55.2x | 173,113 | 10.68x | 736 | 0.045x | 24/24 |
+  | link | degree | E450 (fast) | 519,388 | 14,658 | 35.4x | 17,799 | 29.2x | 21,706 | 1.22x | 85 | 0.005x | 24/24 |
+  | link | degree | E451 options | 477,032 | 10,636 | 44.9x | 14,119 | 33.8x | 21,308 | 1.51x | 94 | 0.007x | 24/24 |
+  | link | k-hop | E450 (fast) | 392,340 | 1,443 | 271.9x | 22,107 | 17.7x | 329 | 0.01x | 74 | 0.003x | 24/24 |
+  | link | k-hop | E451 options | 344,451 | 1,480 | 232.7x | 17,685 | 19.5x | 346 | 0.02x | 78 | 0.004x | 24/24 |
+  | link | reach | E450 (fast) | 691,537 | 63,286 | 10.9x | 83,949 | 8.2x | 190,815 | 2.27x | 324 | 0.004x | 24/24 |
+  | link | reach | E451 options | 659,954 | 33,240 | 19.9x | 49,444 | 13.3x | 199,964 | 4.04x | 335 | 0.007x | 24/24 |
+  | link | components | E450 (fast) | 588,484 | 20,569 | 28.6x | 41,232 | 14.3x | 82,458 | 2.00x | 1,048 | 0.025x | 24/24 |
+  | link | components | E451 options | 542,533 | 9,321 | 58.2x | 25,525 | 21.3x | 86,075 | 3.37x | 1,130 | 0.044x | 24/24 |
+  | link | pagerank | E450 (fast) | 673,148 | 627,568 | 1.1x | 627,568 | 1.1x | 134,149 | 0.21x | 134,149 | 0.214x | 24/24 |
+  | link | pagerank | E451 options | 627,510 | 629,474 | 1.0x | 629,474 | 1.0x | 142,398 | 0.23x | 142,398 | 0.226x | 24/24 |
+  | net10k | index | E450 (fast) | 63,779 | 2,362 | 27.0x | 3,095 | 20.6x | 9,852 | 3.18x | 36 | 0.011x | 24/24 |
+  | net10k | index | E451 options | 57,859 | 1,833 | 31.6x | 2,551 | 22.7x | 9,752 | 3.82x | 37 | 0.015x | 24/24 |
+  | net10k | degree | E450 (fast) | 37,920 | 1,177 | 32.2x | 1,910 | 19.9x | 2,965 | 1.55x | 32 | 0.017x | 24/24 |
+  | net10k | degree | E451 options | 32,102 | 946 | 33.9x | 1,664 | 19.3x | 3,012 | 1.81x | 28 | 0.017x | 24/24 |
+  | net10k | k-hop | E450 (fast) | 25,914 | 1,331 | 19.5x | 4,426 | 5.9x | 1,774 | 0.40x | 149 | 0.034x | 24/24 |
+  | net10k | k-hop | E451 options | 20,511 | 592 | 34.6x | 3,143 | 6.5x | 1,788 | 0.57x | 141 | 0.045x | 24/24 |
+  | net10k | reach | E450 (fast) | 39,788 | 2,285 | 17.4x | 5,380 | 7.4x | 8,178 | 1.52x | 162 | 0.030x | 24/24 |
+  | net10k | reach | E451 options | 34,655 | 1,133 | 30.6x | 3,684 | 9.4x | 7,114 | 1.93x | 164 | 0.045x | 24/24 |
+  | net10k | components | E450 (fast) | 39,300 | 3,927 | 10.0x | 7,022 | 5.6x | 4,175 | 0.59x | 77 | 0.011x | 24/24 |
+  | net10k | components | E451 options | 33,427 | 1,258 | 26.6x | 3,809 | 8.8x | 4,286 | 1.13x | 78 | 0.020x | 24/24 |
+  | net10k | pagerank | E450 (fast) | 41,961 | 49,889 | 0.8x | 49,889 | 0.8x | 6,664 | 0.13x | 6,664 | 0.134x | 24/24 |
+  | net10k | pagerank | E451 options | 37,228 | 46,803 | 0.8x | 46,803 | 0.8x | 6,596 | 0.14x | 6,596 | 0.141x | 24/24 |
+
+  "vs in-memory" is the in-memory time over the stored update's time with the delta and index (above 1x: the stored update is faster). The in-memory baselines start from a loaded graph (loading it takes 260 to 280 ms for the link graph).
+
+  Other workloads and the default store options (each cell: speedup of the update alone / with the delta and index over the full recompute, then the in-memory full time over the update with the delta and index):
+
+  | workload | form | index | degree | k-hop | reach | components | pagerank |
+  | --- | --- | --- | --- | --- | --- | --- | --- |
+  | prop | E450 (E450's run) | 11.4x / 9.0x, 1.27x | 7.2x / 5.4x, 0.27x | 43.9x / 2.7x, 0.01x | 4.8x / 2.4x, 0.45x | 3.5x / 2.0x, 0.19x | 0.9x / 0.9x, 0.13x |
+  | prop | E451 options | 11.0x / 8.7x, 1.46x | 5.5x / 4.3x, 0.28x | 38.0x / 2.1x, 0.01x | 6.2x / 2.6x, 0.59x | 8.5x / 2.8x, 0.31x | 0.8x / 0.8x, 0.16x |
+  | net1k | E450 (E450's run) | 3.8x / 2.4x, 0.36x | 5.2x / 2.3x, 0.29x | 3.4x / 0.8x, 0.06x | 3.9x / 1.2x, 0.17x | 2.9x / 1.0x, 0.09x | 0.9x / 0.9x, 0.12x |
+  | net1k | E451 options | 4.3x / 2.6x, 0.36x | 4.7x / 2.1x, 0.21x | 4.1x / 0.7x, 0.08x | 5.0x / 1.3x, 0.24x | 5.6x / 1.2x, 0.13x | 0.9x / 0.9x, 0.14x |
+
+  | workload | form | index | degree | k-hop | reach | components | pagerank |
+  | --- | --- | --- | --- | --- | --- | --- | --- |
+  | net10k | E450, default store | 9.4x / 8.1x, 1.14x | 15.4x / 10.8x, 0.76x | 12.4x / 2.7x, 0.16x | 10.2x / 3.4x, 0.59x | 7.3x / 2.9x, 0.27x | 0.9x / 0.9x, 0.08x |
+  | net10k | E451 options, default store | 9.2x / 8.1x, 1.34x | 13.8x / 10.2x, 0.90x | 15.8x / 2.3x, 0.21x | 13.3x / 3.5x, 0.70x | 14.4x / 3.4x, 0.40x | 0.9x / 0.9x, 0.11x |
+  | prop | E450, default store | 2.3x / 2.2x, 0.21x | 2.2x / 2.1x, 0.07x | 34.5x / 0.6x, 0.00x | 2.3x / 0.8x, 0.09x | 2.5x / 0.7x, 0.04x | 1.0x / 1.0x, 0.09x |
+  | prop | E451 options, default store | 3.7x / 3.4x, 0.45x | 2.5x / 2.3x, 0.11x | 25.5x / 0.7x, 0.01x | 3.4x / 1.2x, 0.20x | 3.8x / 1.1x, 0.11x | 0.9x / 0.9x, 0.13x |
+  | net1k | E450, default store | 2.3x / 1.8x, 0.17x | 2.5x / 1.8x, 0.10x | 3.2x / 0.6x, 0.04x | 2.3x / 0.8x, 0.09x | 2.2x / 0.7x, 0.05x | 1.0x / 1.0x, 0.13x |
+  | net1k | E451 options, default store | 1.9x / 1.5x, 0.14x | 2.2x / 1.5x, 0.11x | 2.7x / 0.3x, 0.03x | 2.3x / 0.6x, 0.09x | 2.9x / 0.6x, 0.05x | 1.0x / 1.0x, 0.13x |
+
+- Integration (part 4):
+
+  - `IKAM_NET_OPTIONS=fast,delta,cache=4096,threads=2,inline` with `--features embed,test-net-options` (every `Repo::new` with E449's options and threads, and the Tree and Flat layouts mapped to Inline and InlineFlat), before the fix below: 434 pass, 4 fail, 5 ignored. Without `inline`: 437 pass, 1 fail.
+  - The failure in both runs, `net_inline::other_chunk_sizes_give_valid_graphs_that_edit_consistently`, was a real bug: with `net_delta_write`, a net written again after `graph_chunks` changed got the root kept from the earlier bounds. Fixed in `put_net_fragments_delta` (the kept net records the bounds its root was cut with, and is not reused under others) and covered by `a_delta_write_after_the_chunk_bounds_change_gives_the_whole_writes_root` (Tree and Inline).
+  - The other three fail only with `inline`, because they pin E446's tree layout, and are not bugs. `net_fragments::versions_chain_through_commits_and_reuse_fragments` expects version 1 to write over 3,000 store entries (inline writes 41). `net_fragments::a_root_that_is_not_the_nets_own_nodes_is_refused` and `net_read_path::the_fast_read_refuses_what_the_full_read_refuses` forge a graph by clearing a `next` edge or changing an edge key, and inline nodes have no edges, so the "forged" graph is the good one (or the forging closure finds no edge). The inline counterparts of these forgeries are in `net_combined`.
+  - After the fix: with `inline`, 436 pass, 3 fail (the three layout-pinned tests above), 5 ignored. The run without `inline` was not repeated after the fix; its one failure was the bug's.
+  - Every other test passes in both runs, including the firing replays (`net_fragments`, `net_inline`, `net_read_path`, `chunk_deltas`, the `net` unit tests for firing, retries, checkpoints and sum hashes) and the search and session-search tests. The night, small-net and planning examples track nets as text (`net_track`), which these options do not change, so they were not rerun under the switch.
+
+- Findings:
+
+  1. E449's options now work over E447's inline form in both inline layouts. Every read path (full, fast, cached, threaded, by key, `net_version`, cold after a cache clear) gives the same net in all four layouts. Deltas are the same in every layout, delta writes give the whole writes' roots, and firings replay to the same marking, whole and by key. Seventeen forged inline nodes (a weight of 1 written, a leading zero, an `h` arc with a capability, one node in another codec or with E446's edges, a cycle, a node no link reaches, no head, and others) are refused by the fast and threaded reads as by the full read.
+  2. The combined form meets most of the speed lines. Inline nodes with E449's options read version 25 cold in 13.4 ms at 10,000 transitions against the text's 14.3 ms (0.94x; E449's tree took 20.9 ms, E447's inline read 31.5 ms). A version's write takes 7.0 ms against 20.4 (0.35x). A firing on the 10,000-transition net takes 7.2 ms against the text's 11.1 ms (6.7 ms by key; E446 41.9, E447 28.0). At 1,000 transitions the write meets the line (1,882 µs against 1,938, 0.97x) and the cold read misses by 7% (1,418 against 1,326). With frames and SCR the 1,000-transition cold read is 1,343 µs (1.01x), but that row's write is 1.33x.
+  3. The v1 line (1.5x text) is met at 10,000 transitions (1.47x) and missed at 1,000 (1.60x) with the default bounds. With 16 to 128 KiB chunks at every level (L16K) v1 is 1.33x at 1,000 and 1.32x at 10,000, and the 1,000 cold read improves (1,160 µs against 1,377, 0.84x), but writes slow down (4.9 ms against 2.1 at 1,000) and the 10,000 cold read was 1.32x in that run. No single bound setting meets every line at both sizes.
+  4. Bytes a version adds, the line not met at the default weight: frames bring inline to 903 B at 1,000 and 1,202 B at 10,000 (1.15x and 1.41x text), from E447's 1,619 and 2,224 and E448's tree with frames at 1,717 and 1,753. SCR takes 10,000 to 1,053 B (1.24x). Only InlineFlat with frames is under the text (702 and 727 B, 0.90x and 0.86x), at the cost of a 4.5 ms and 37 ms write and a 1.9 ms and 22.7 ms delta (text 0.6 and 7.2 ms), because its one chunk is rewritten whole. At the heavy weight every inline row is far under the text (4,352 and 7,858 B against 8,441 and 85,295; S256: 3,226 and 4,992).
+  5. What is left of a version's bytes (10,000 transitions, inline + frames P16K + E449 + SCR, 1,127 B in the breakdown's count): 711 B of chunk contents (frames and literals for 3.7 leaves and 1 parent rewritten), 160 B of chunk pointers (`g 2` and a 32-byte content id per rewritten chunk), 114 B of derivation records, and 142 B of tree and commit entries that the text pays too. The inline form removes E448's ~270 B of fragment objects (an element's bytes are in its leaf), and SCR cuts the records from 262 to 114 B. Dropping the pointer object would save up to the 160 B, and shorter child ids in parent chunks would cut part of the parent's frame. Neither was built: both change the chunk's stored form, which gc, repack, ingest and the history walk read in six places (see Next).
+  6. `short_chunk_records` is as good as `short_records` for these nets (1,239 against 1,239 B a version at 1,000 without frames; reads and writes within noise) while leaving every other record long. With frames it saves 6 B at 1,000 and 149 B at 10,000. On the general graphs it saves 3,185 B a version on the link graph (12,649 to 9,464, the same as `short_records`), and 2,611 B on the property graph (10,896 to 8,285).
+  7. General graphs: inline payloads of up to 256 B with frames and the cache take the link graph's v1 from 20.7 to 14.9 MB and a version from 12,894 to 5,863 B. A version's write drops from 144 ms to 25 ms, the cold read of version 25 from 397 to 204 ms, and the read after v24 is 4.1 ms. On the property graph (1 to 4 KB payloads) inline helps v1 by 5% and frames cut a version by a third (8,587 to 5,653 B as contents; 6,416 B inline), and the read after v24 is 3.7 ms against about 100 ms cold. Inline payloads make the property graph's delta slower (45 to 53 ms against 18 to 23 ms), because a payload edit rewrites a leaf of large nodes.
+  8. E450's computations with the combined options (the cache shared across versions, frames, P16K, SCR and inline titles): on the link graph the incremental update beats the full recompute over fragments by 70x (index), 45x (degree), 233x (k-hop), 20x (reach) and 58x (components), against E450's 50x, 35x, 272x, 11x and 29x in the same session. With the delta and the index update counted it is 55x, 34x, 20x, 13x and 21x. Against the in-memory full recompute (with the graph already loaded), the stored update is 10.7x faster for the index, 1.5x for degree, 4.0x for reach and 3.4x for components, and 50x slower for k-hop (0.35 ms in memory, against a 16 ms delta and index update the stored k-hop waits on). Against the in-memory incremental update it is 22x to 250x slower: the stored form pays for reading chunks and writing result graphs. On net10k: 32x, 34x, 35x, 31x and 27x over full (E450: 27x, 32x, 19x, 17x and 10x). Against E450 in the same session, the update alone is 1.0x to 3.1x faster with the options (components and reach gain most; the base run is one run, the options run the median of 3), and 1.15x to 1.84x with the delta and index counted. Exact PageRank is recomputed in full by both, 0.8x to 1.0x. Every update equals the full recompute and the in-memory result in all 24 versions of every workload. With the default store options, frames and SCR cut a 10,000-transition net's update store growth from 102.9 KB to 48.0 KB (prop 198 to 131 KB, net1k 18.7 to 11.2 KB). That total is mostly PageRank's rewritten result; the small results (index, degree, k-hop) grow by more, from 476 B to 1,199 B for the index; the cause was not analysed.
+  9. Integration found one real bug, from E448's and E449's options meeting: a delta write kept its last root after `graph_chunks` changed, so it returned or edited a tree cut with the old bounds. It is fixed (the kept net records its bounds) and tested. Three more failures under the test-only switch come from tests that pin E446's tree layout (store entry counts, forging by clearing a `next` edge or an edge key that inline nodes do not have), and are not bugs.
+
+- Verdict: **partial** (options, off by default). E449's read path, cache, delta writes, part reads and firings now work over both inline layouts, with every read path and every layout giving the same nets, deltas and markings. At 10,000 transitions the combined form meets v1 (1.47x), cold read (0.94x), write (0.35x) and firing (0.65x) lines. At 1,000 transitions it meets the write line (0.97x) and misses v1 (1.60x; 1.33x with L16K bounds) and the cold read by 7% in the three-run median (0.92x in the interleaved run). A version's bytes stay above the text at the default weight (1.15x at 1,000 and 1.24x at 10,000 with frames and SCR) except in InlineFlat with frames (0.86x to 0.90x, slow writes and deltas). The per-chunk pointer drop and short child ids were not built. E450's updates over the link graph and the 10,000-transition net run 1.0x to 3.1x faster with the options than in E450 in the same session (1.15x to 1.84x with the delta and index counted). Every result stays exact.
+- Checks:
+
+  - `tests/net_combined.rs`, 9 tests: every read path reads every layout; deltas the same in every layout (and pruned equal to unpruned); delta writes give the whole writes' roots (a repeat writes nothing, an invalid net is refused); a delta write after the chunk bounds change gives the whole write's root; firings replay to the same marking in every layout, whole and by key, options on and off; the fast read refuses 17 forged inline nodes (full, fast, threaded and part reads); graph reads and hops treat inline payloads as contents; frames and P16K bounds with inline and the E449 options (same roots, deltas, gc, reads, fsck); one chunk-size option.
+  - `tests/graph_compute.rs`, one test added: with the cache, frames, P16K, SCR and inline titles, every computation gives the plain store's values over 20 versions, the update equals the full recompute, and fsck is clean.
+  - Mutation checks (outputs `mutation1.txt` to `mutation4.txt` in the run directory):
+    - The one-form check in `assemble` removed: `the_fast_read_refuses_forged_inline_nodes` fails.
+    - The compact parser takes a written weight of 1: the same test fails.
+    - The delta write builds E446 nodes for Inline: 5 of 9 tests fail.
+    - The kept net's bounds ignored: `a_delta_write_after_the_chunk_bounds_change_gives_the_whole_writes_root` fails.
+  - `cargo test --release --features embed --no-fail-fast`: 439 pass, 0 fail, 5 ignored. clippy `-D warnings` clean, with and without `test-net-options`. Fixed bench: north 0.3060, sharing 0.9496, as before. Privacy scan clean.
+
+- Not done / Next:
+
+  - Drop the `g 2` pointer object per chunk (up to 160 B of a version's 1,053 to 1,127 B at 10,000 transitions), and shorter child ids in parent chunks. Both change the stored form of a chunk, which `tree_content` and its six callers (gc, repack, ingest, history) read; built as options they need a second chunk encoding everywhere a chunk is walked.
+  - Chunk bounds chosen by size and read weight: L16K meets the v1 and 1,000-transition cold-read lines but slows writes; S256 wins at the heavy weight.
+  - A faster InlineFlat delta and write (one chunk rewritten whole): it is the only form under the text's bytes a version at the default weight.
+  - With the default store options, E450's small results (index, degree, k-hop) add more bytes a version with the options than without (the cause was not analysed); result graphs may want their own bounds.
+  - A rerun on an idle machine: cold reads at 1,000 transitions are within 10% of the text and moved between runs by more than that.
+  - FsStore.
+
+- Run: `cargo run --release --example e451_net_combined -- nets 1000,10000 5` (3 runs, median), `-- breakdown 1000,10000`, `-- fire 300`, `-- graphs 1.0`, `-- par 1000,10000 5`, `E451_FORMS="L16K,text,P16K + E449 + short_chunk" ... -- nets 1000,10000 5`; `E450_E451=1 cargo run --release --example e450_graph_compute -- link,net10k,prop,net1k 3 fast` and the same without `E450_E451` (`link,net10k 1 fast`); both again with the default store options (`net10k,prop,net1k 1`); `IKAM_NET_OPTIONS=fast,delta,cache=4096,threads=2,inline cargo test --release --features embed,test-net-options --tests --no-fail-fast` (and without `inline`).

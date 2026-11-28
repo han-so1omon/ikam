@@ -242,7 +242,7 @@ pub struct Served {
     /// E381: the views' chunks are stored as they are, not planned as
     /// slices of the chunks they replace (`Repo::plain_hot_writes`).
     plain: bool,
-    /// E399: the views' graph chunk bounds (`Repo::graph_cut`), when not
+    /// E399: the views' graph chunk bounds (`Repo::graph_chunks`, the same at every level), when not
     /// the default: smaller chunks, so a change rewrites fewer bytes.
     cut: Option<(usize, usize)>,
 }
@@ -344,14 +344,14 @@ impl Served {
         // E381: the views' chunks stored plain, for the writes below only.
         let plain = writer.plain_hot_writes;
         writer.plain_hot_writes |= self.plain;
-        let cut = writer.graph_cut;
+        let cut = writer.graph_chunks;
         if let Some(c) = self.cut {
-            writer.graph_cut = c;
+            writer.graph_chunks = ikam_kernel::ChunkSizes::uniform(c.0, c.1);
         }
         let state = match kept {
             Some(s) if s.db == *db => {
                 writer.plain_hot_writes = plain;
-                writer.graph_cut = cut;
+                writer.graph_chunks = cut;
                 self.states
                     .lock()
                     .unwrap()
@@ -379,7 +379,7 @@ impl Served {
             }
         };
         writer.plain_hot_writes = plain;
-        writer.graph_cut = cut;
+        writer.graph_chunks = cut;
         let state = state?;
         // Views that cannot be kept are still served; the next restart
         // builds them again.

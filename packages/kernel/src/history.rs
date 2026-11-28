@@ -159,7 +159,7 @@ impl<S: Store> Repo<S> {
                         match n.target {
                             Target::Content(a) => files.push(a.id()),
                             Target::Object(id) => stack.push(id),
-                            Target::None => {}
+                            Target::None | Target::Inline(_) => {}
                         }
                     }
                 }
