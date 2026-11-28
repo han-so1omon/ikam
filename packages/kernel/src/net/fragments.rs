@@ -31,11 +31,16 @@
 //! both share is skipped unread (E249's walk), and only the nodes in the
 //! chunks left are compared and their fragments read. Nothing is stored.
 
+mod inline;
+
 use std::collections::{BTreeMap, HashMap};
 
 use super::text::{head_line, parse_place, parse_transition, place_line, transition_line};
 use super::{Net, Place, Transition};
 use crate::{Arg, Edge, Error, Graph, Id, Node, Object, Repo, Store, Target, node_key};
+
+pub use inline::InlineCodec;
+pub(super) use inline::{head_payload, place_payload, read_inline, transition_payload};
 
 /// How a fragment version's nodes are kept.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -45,6 +50,13 @@ pub enum Layout {
     /// The prolly tree `put_graph` cuts: an edit rewrites the chunks it
     /// falls in and their parents.
     Tree,
+    /// `Tree`'s nodes with each element's bytes inline and no edges
+    /// (E447, [`InlineCodec::Compact`]): no element is an object.
+    Inline,
+    /// `Inline`'s nodes in one chunk, as `Flat` keeps E446's (E447): an
+    /// edit rewrites the chunk, which the planner stores as slices of the
+    /// one before, as it stores a text file's versions.
+    InlineFlat,
 }
 
 impl Layout {
@@ -52,6 +64,8 @@ impl Layout {
         match self {
             Layout::Flat => "flat",
             Layout::Tree => "tree",
+            Layout::Inline => "inline",
+            Layout::InlineFlat => "inline-flat",
         }
     }
 
@@ -59,89 +73,109 @@ impl Layout {
         match s {
             "flat" => Some(Layout::Flat),
             "tree" => Some(Layout::Tree),
+            "inline" => Some(Layout::Inline),
+            "inline-flat" => Some(Layout::InlineFlat),
             _ => None,
         }
     }
 }
 
-const HEAD: &str = "net";
-const FIRST_PLACE: &str = "place";
-const FIRST_TRANSITION: &str = "transition";
-const NEXT: &str = "next";
+pub(super) const HEAD: &str = "net";
+pub(super) const FIRST_PLACE: &str = "place";
+pub(super) const FIRST_TRANSITION: &str = "transition";
+pub(super) const NEXT: &str = "next";
 
-fn place_label(name: &str) -> String {
+pub(super) fn place_label(name: &str) -> String {
     format!("p/{name}")
 }
 
-fn transition_label(name: &str) -> String {
+pub(super) fn transition_label(name: &str) -> String {
     format!("t/{name}")
 }
 
-fn bad() -> Error {
+pub(super) fn bad() -> Error {
     Error::Decode("net fragments")
+}
+
+/// A node of the fragment form: its label, the fragment `text` it
+/// targets, and `edges` (sorted and deduplicated here).
+pub(super) fn fragment_node(label: String, text: String, mut edges: Vec<Edge>) -> (Node, String) {
+    edges.sort();
+    edges.dedup();
+    let target = Target::Content(Arg::Whole(Id::of_content(text.as_bytes())));
+    (
+        Node {
+            label,
+            target,
+            edges,
+        },
+        text,
+    )
+}
+
+/// An order edge: its label names its target's label too, so a node's
+/// links read without looking up any other node.
+pub(super) fn order_edge(label: &str, to: &str) -> Edge {
+    Edge {
+        to: node_key(to),
+        label: format!("{label} {to}"),
+    }
+}
+
+/// The head node of `net`'s fragment form.
+pub(super) fn head_node(net: &Net) -> (Node, String) {
+    let mut head = Vec::new();
+    if let Some(p) = net.places.first() {
+        head.push(order_edge(FIRST_PLACE, &place_label(&p.name)));
+    }
+    if let Some(t) = net.transitions.first() {
+        head.push(order_edge(FIRST_TRANSITION, &transition_label(&t.name)));
+    }
+    fragment_node(HEAD.into(), head_line(net), head)
+}
+
+/// The node of place `p`, followed by `next`.
+pub(super) fn place_node(p: &Place, next: Option<&Place>) -> (Node, String) {
+    let edges = next.map(|n| order_edge(NEXT, &place_label(&n.name)));
+    fragment_node(
+        place_label(&p.name),
+        place_line(p),
+        edges.into_iter().collect(),
+    )
+}
+
+/// The node of transition `t`, followed by `next`.
+pub(super) fn transition_node(t: &Transition, next: Option<&Transition>) -> (Node, String) {
+    let edges = next.map(|n| order_edge(NEXT, &transition_label(&n.name)));
+    fragment_node(
+        transition_label(&t.name),
+        transition_line(t),
+        edges.into_iter().collect(),
+    )
 }
 
 /// The nodes of `net`'s fragment form, each with its fragment's text, in
 /// no particular order.
 fn fragment_nodes(net: &Net) -> Vec<(Node, String)> {
-    let node = |label: String, text: String, edges: Vec<Edge>| {
-        let mut edges = edges;
-        edges.sort();
-        edges.dedup();
-        let target = Target::Content(Arg::Whole(Id::of_content(text.as_bytes())));
-        (
-            Node {
-                label,
-                target,
-                edges,
-            },
-            text,
-        )
-    };
-    // An edge's label names its target's label too, so a node's links
-    // read without looking up any other node.
-    let edge = |label: &str, to: &str| Edge {
-        to: node_key(to),
-        label: format!("{label} {to}"),
-    };
-    let mut head = Vec::new();
-    if let Some(p) = net.places.first() {
-        head.push(edge(FIRST_PLACE, &place_label(&p.name)));
-    }
-    if let Some(t) = net.transitions.first() {
-        head.push(edge(FIRST_TRANSITION, &transition_label(&t.name)));
-    }
-    let mut out = vec![node(HEAD.into(), head_line(net), head)];
+    let mut out = vec![head_node(net)];
     for (i, p) in net.places.iter().enumerate() {
-        let next = net.places.get(i + 1);
-        let edges = next.map(|n| edge(NEXT, &place_label(&n.name)));
-        out.push(node(
-            place_label(&p.name),
-            place_line(p),
-            edges.into_iter().collect(),
-        ));
+        out.push(place_node(p, net.places.get(i + 1)));
     }
     for (i, t) in net.transitions.iter().enumerate() {
-        let next = net.transitions.get(i + 1);
-        let edges = next.map(|n| edge(NEXT, &transition_label(&n.name)));
-        out.push(node(
-            transition_label(&t.name),
-            transition_line(t),
-            edges.into_iter().collect(),
-        ));
+        out.push(transition_node(t, net.transitions.get(i + 1)));
     }
     out
 }
 
 /// What one fragment declares.
 #[derive(Clone, Debug, PartialEq, Eq)]
-enum Element {
+pub(super) enum Element {
     Head(String, u32),
     Place(Place),
     Transition(Transition),
 }
 
-fn parse_fragment(label: &str, text: &str) -> Result<Element, Error> {
+pub(super) fn parse_fragment(label: &str, text: &str) -> Result<Element, Error> {
     let line = text.strip_suffix('\n').ok_or_else(bad)?;
     if line.contains('\n') {
         return Err(bad());
@@ -168,11 +202,11 @@ fn parse_fragment(label: &str, text: &str) -> Result<Element, Error> {
 }
 
 /// A node's element and the labels its order edges name.
-struct Read {
-    element: Element,
+pub(super) struct Read {
+    pub(super) element: Element,
     /// Edge label to target label (`next`, or the head's `place` and
     /// `transition`).
-    links: BTreeMap<String, String>,
+    pub(super) links: BTreeMap<String, String>,
 }
 
 /// One element added, removed or changed between two versions.
@@ -360,6 +394,33 @@ impl<S: Store> Repo<S> {
     /// Fragments and chunks earlier versions wrote are found, not written
     /// again.
     pub fn put_net_fragments(&mut self, net: &Net, layout: Layout) -> Result<Id, Error> {
+        let layout = super::test_layout(layout);
+        // E449: with `net_delta_write`, only what changed since the last
+        // version written is hashed and stored; the root is the same (every
+        // layout, the inline ones of E447 included: E451).
+        if self.net_delta_write {
+            return self.put_net_fragments_delta(net, layout);
+        }
+        self.put_net_fragments_whole(net, layout)
+    }
+
+    /// `put_net_fragments` without the E449 options: every node built,
+    /// every fragment put.
+    pub(super) fn put_net_fragments_whole(
+        &mut self,
+        net: &Net,
+        layout: Layout,
+    ) -> Result<Id, Error> {
+        match layout {
+            Layout::Inline => return self.put_net_inline(net, InlineCodec::Compact),
+            Layout::InlineFlat => {
+                net.check()?;
+                let mut nodes = inline::inline_nodes(net, InlineCodec::Compact);
+                nodes.sort_by(|a, b| a.label.cmp(&b.label));
+                return self.put(&Object::Graph(Graph::Nodes(nodes)));
+            }
+            Layout::Tree | Layout::Flat => {}
+        }
         net.check()?;
         let mut nodes = Vec::new();
         for (node, text) in fragment_nodes(net) {
@@ -367,11 +428,11 @@ impl<S: Store> Repo<S> {
             nodes.push(node);
         }
         match layout {
-            Layout::Tree => self.put_graph(nodes),
             Layout::Flat => {
                 nodes.sort_by(|a, b| a.label.cmp(&b.label));
                 self.put(&Object::Graph(Graph::Nodes(nodes)))
             }
+            _ => self.put_graph(nodes),
         }
     }
 
@@ -414,7 +475,20 @@ impl<S: Store> Repo<S> {
         self.net_fragments(&id)
     }
 
-    fn read_node(&self, n: &Node) -> Result<Read, Error> {
+    /// Store `net` inline (E447): one graph, laid out as `Tree` is, whose
+    /// nodes hold their elements' bytes as `codec` writes them. Returns the
+    /// root, the version's id in this form; [`net_fragments`](Repo::net_fragments),
+    /// [`net_delta`](Repo::net_delta) and [`net_version`](Repo::net_version)
+    /// read it as they read E446's.
+    pub fn put_net_inline(&mut self, net: &Net, codec: InlineCodec) -> Result<Id, Error> {
+        net.check()?;
+        self.put_graph(inline::inline_nodes(net, codec))
+    }
+
+    pub(super) fn read_node(&self, n: &Node) -> Result<Read, Error> {
+        if let Target::Inline(bytes) = &n.target {
+            return inline::read_inline(n, bytes);
+        }
         let Target::Content(Arg::Whole(id)) = &n.target else {
             return Err(bad());
         };
@@ -437,6 +511,17 @@ impl<S: Store> Repo<S> {
     /// the head. The nodes must be exactly the ones the net it reads as
     /// would be stored with.
     pub fn net_fragments(&self, root: &Id) -> Result<Net, Error> {
+        // E449: with `net_fast_read`, leaves decoded once and kept.
+        if self.net_fast_read {
+            return self.net_fragments_fast(root);
+        }
+        self.net_fragments_full(root)
+    }
+
+    /// `net_fragments` without the E449 options: every node and fragment
+    /// read, and the nodes the net it reads as would be stored with built
+    /// again and compared. The full check of a fragment version.
+    pub fn net_fragments_full(&self, root: &Id) -> Result<Net, Error> {
         let nodes = self.graph_nodes(root)?;
         let mut read = HashMap::new();
         for n in &nodes {
@@ -485,7 +570,10 @@ impl<S: Store> Repo<S> {
         }
         net.check()?;
         // The root names this net's nodes and no others.
-        let mut want: Vec<Node> = fragment_nodes(&net).into_iter().map(|(n, _)| n).collect();
+        let mut want: Vec<Node> = match &nodes.iter().find(|n| n.label == HEAD).map(|n| &n.target) {
+            Some(Target::Inline(head)) => inline::inline_nodes(&net, inline::codec_of(head)?),
+            _ => fragment_nodes(&net).into_iter().map(|(n, _)| n).collect(),
+        };
         want.sort_by(|a, b| a.label.cmp(&b.label));
         if want != nodes {
             return Err(Error::Decode("net fragments: not this net's nodes"));

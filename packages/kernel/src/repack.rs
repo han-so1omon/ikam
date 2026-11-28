@@ -368,6 +368,7 @@ impl<S: Store + Sync> Repo<S> {
         let mut fresh = Repo::new(MemStore::default());
         fresh.read_weight = self.read_weight;
         fresh.short_records = self.short_records;
+        fresh.short_chunk_records = self.short_chunk_records;
         fresh.markup_layers = self.markup_layers;
         fresh.slow_codec_max = self.slow_codec_max;
         fresh.group_size = self.group_size;
@@ -466,15 +467,19 @@ impl<S: Store + Sync> Repo<S> {
 
     /// A tree stored as content pays for its pointer only if that content
     /// is derived or shared; otherwise the tree goes back to object form
-    /// (gc then drops the content).
+    /// (gc then drops the content). With `object_contexts` (E448), content
+    /// stored as a frame, or that a frame is framed against, is kept as
+    /// content too: in object form each version would be stored whole.
     fn unshare_trees(&mut self) -> Result<(), Error> {
         let used: HashSet<Id> = (self.ledger()?.by_output.values().flatten())
             .flat_map(|d| d.args.iter().map(Arg::id))
             .collect();
+        let framed = self.framed_contents()?;
         for id in self.store.ids()? {
             if let Some(content) = tree_content(&self.store.read(&id)?)
                 && self.store.has(&content)
                 && !used.contains(&content)
+                && !framed.contains(&content)
             {
                 let encoded = self.encode_object(&self.read_object(&id)?);
                 self.store.replace(id, &encoded)?;
@@ -482,6 +487,25 @@ impl<S: Store + Sync> Repo<S> {
             }
         }
         Ok(())
+    }
+
+    /// With `object_contexts` (E448): contents stored as a frame, and the
+    /// contents those frames are framed against. Empty otherwise.
+    fn framed_contents(&self) -> Result<HashSet<Id>, Error> {
+        let mut out = HashSet::new();
+        if !self.object_contexts {
+            return Ok(out);
+        }
+        for id in self.store.ids()? {
+            let head = self.store.read_head(&id, 65)?;
+            if head.first() == Some(&b'Q') {
+                out.insert(id);
+                for c in crate::dict::contexts(&head) {
+                    out.extend(<[u8; 32]>::try_from(c).ok().map(Id::from_bytes));
+                }
+            }
+        }
+        Ok(out)
     }
 
     /// Canonical encodings of stored trees, commits, claims and fact

@@ -265,7 +265,42 @@ pub struct Repo<S: Store> {
     /// scope it is ignored: that index is every stored object, read again
     /// in full when built.
     pub seed_index_max: usize,
+    /// Store a new tree's or graph chunk's content as a zstd frame against
+    /// the most related stored content ("Q"), when that scores below the
+    /// slice, template and plain plans (E448, `chunk_delta.rs`). Off by
+    /// default, when only repack writes "Q". Reads accept it either way.
+    pub object_contexts: bool,
+    /// Bounds on the chunk sizes of the prolly trees `put_graph` and the
+    /// graph edits cut (E448; E447's `(min, max)` is
+    /// `ChunkSizes::uniform(min, max)`, E451). The default is the fixed
+    /// 4 KiB to 32 KiB. A graph is edited with the bounds it was built with
+    /// (other bounds still give a valid graph, but another root).
+    pub graph_chunks: crate::graph::ChunkSizes,
     pub(crate) writing_object: bool,
+    /// Keep up to this many decoded graph chunks, and what readers decode
+    /// from them, across reads and versions (E449). 0, the default, keeps
+    /// none. A chunk id names its bytes, so a kept chunk is always right;
+    /// only the `_cached` graph reads, `graph_read` and the fast net read
+    /// use it. Shared with siblings; gc empties it.
+    pub graph_cache: usize,
+    pub(crate) chunk_cache: Arc<std::sync::Mutex<crate::graph_fast::ChunkCache>>,
+    /// Threads the `_par` graph and net reads decode chunks on (E449); 0
+    /// or 1, the default, decodes on the calling thread.
+    pub read_threads: usize,
+    /// Read fragment versions of nets (`net_fragments`, `net_fragment_file`,
+    /// `net_version`) by the fast path of E449: each leaf decoded once, kept
+    /// by `graph_cache`, a strict canonical parse in place of building every
+    /// node again. Off by default.
+    pub net_fast_read: bool,
+    /// Write fragment versions of nets against the last version written
+    /// (E449): only what changed is built and put, and the graph edited in
+    /// place; the same root. Off by default.
+    pub net_delta_write: bool,
+    /// Store the derivation records of graph and tree chunks with short
+    /// ids (E451): `short_records` (E104) for the records a chunk's
+    /// content is derived by, and no others. Off by default; reading
+    /// accepts both forms.
+    pub short_chunk_records: bool,
 }
 
 /// Old chunk contents read during one edit with `replace_hints` on.
@@ -299,7 +334,7 @@ pub(crate) const MEMO_LIMIT: usize = 64 << 20;
 
 impl<S: Store> Repo<S> {
     pub fn new(store: S) -> Repo<S> {
-        Repo {
+        let r = Repo {
             store,
             index: None,
             ledger: Default::default(),
@@ -331,9 +366,23 @@ impl<S: Store> Repo<S> {
             plain_db_events: false,
             plain_hot_writes: false,
             seed_index_max: 0,
+            object_contexts: false,
+            graph_chunks: Default::default(),
             writing_object: false,
             hints: Default::default(),
-        }
+            graph_cache: 0,
+            chunk_cache: Default::default(),
+            read_threads: 0,
+            net_fast_read: false,
+            net_delta_write: false,
+            short_chunk_records: false,
+        };
+        // E451: a test-only switch (never in a default build) that turns
+        // the fragment-net options on for every handle, to run the whole
+        // suite under them.
+        #[cfg(feature = "test-net-options")]
+        let r = crate::net::test_options(r);
+        r
     }
 
     /// Start noting old chunks read, if `replace_hints` is on, a scope is
@@ -685,12 +734,20 @@ impl<S: Store> Repo<S> {
         r.read_cache = self.read_cache;
         r.refresh_ledger = self.refresh_ledger;
         r.cache = self.cache.clone();
+        r.graph_cache = self.graph_cache;
+        r.chunk_cache = self.chunk_cache.clone();
+        r.read_threads = self.read_threads;
+        r.net_fast_read = self.net_fast_read;
+        r.net_delta_write = self.net_delta_write;
+        r.short_chunk_records = self.short_chunk_records;
         r.short_records = self.short_records;
         r.markup_layers = self.markup_layers;
         r.object_templates = self.object_templates;
         r.plain_db_events = self.plain_db_events;
         r.plain_hot_writes = self.plain_hot_writes;
         r.exact_short_search = self.exact_short_search;
+        r.object_contexts = self.object_contexts;
+        r.graph_chunks = self.graph_chunks;
         r
     }
 
@@ -713,6 +770,7 @@ impl<S: Store> Repo<S> {
         self.dict = OnceLock::new();
         *self.needed.lock().unwrap() = None;
         *self.cache.lock().unwrap() = Cache::default();
+        *self.chunk_cache.lock().unwrap() = Default::default();
     }
 
     /// Keep the needed set current after storing `encoded` (E129).

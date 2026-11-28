@@ -535,7 +535,7 @@ impl<S: Store> Repo<S> {
         };
         let short = match tag {
             b'T' => self.abbreviate(rest).ok().flatten(),
-            b'D' if self.short_records => {
+            b'D' if self.short_records || (self.short_chunk_records && self.writing_object) => {
                 crate::abbrev::abbreviate_derivation(rest, &|p| self.ids_with_prefix(p))
                     .ok()
                     .flatten()

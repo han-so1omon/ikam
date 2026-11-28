@@ -31,11 +31,12 @@
 //!
 //! Nothing in the default paths calls this module.
 
+mod fast;
 mod fragments;
 mod table;
 mod text;
 
-pub use fragments::{ArcChange, Change, Layout, Link, NetDelta};
+pub use fragments::{ArcChange, Change, InlineCodec, Layout, Link, NetDelta};
 pub use table::Table;
 
 use std::collections::BTreeMap;
@@ -898,7 +899,7 @@ impl<S: Store> Repo<S> {
         token: Option<&str>,
         key: &str,
     ) -> Result<(Db, Firing), Error> {
-        self.fire_inner(db, net, transition, token, key, None, None)
+        self.fire_inner(db, net, transition, token, key, None, None, None)
     }
 
     /// Fire as `net_fire`, recording the work's output in the same append
@@ -916,7 +917,7 @@ impl<S: Store> Repo<S> {
         key: &str,
         output: &[u8],
     ) -> Result<(Db, Firing), Error> {
-        self.fire_inner(db, net, transition, token, key, Some(output), None)
+        self.fire_inner(db, net, transition, token, key, Some(output), None, None)
     }
 
     /// Whether `output` (the work recomputed) matches what the firing under
@@ -976,7 +977,16 @@ impl<S: Store> Repo<S> {
             }
         };
         let bytes = self.read_content(&output)?;
-        self.fire_inner(db, net, transition, token, key, Some(&bytes), Some(record))
+        self.fire_inner(
+            db,
+            net,
+            transition,
+            token,
+            key,
+            Some(&bytes),
+            Some(record),
+            None,
+        )
     }
 
     /// Check every firing made through a step (E441), in log order, by the
@@ -1022,6 +1032,7 @@ impl<S: Store> Repo<S> {
         key: &str,
         output: Option<&[u8]>,
         step: Option<Id>,
+        at: Option<Id>,
     ) -> Result<(Db, Firing), Error> {
         if !valid_name(key) {
             return Err(invalid("firing key", key));
@@ -1033,7 +1044,11 @@ impl<S: Store> Repo<S> {
         }
         let p = prefix(&net.name);
         let rec_key = format!("{p}fire/{key}");
-        let version = self.tracked_version(db, net)?;
+        // E449: `net_fire_at` names the version it read by its root.
+        let version = match at {
+            Some(root) => Some(root),
+            None => self.tracked_version(db, net)?,
+        };
         if let Some(bytes) = self.db_get(db, &rec_key)? {
             let f = decode_record(key, &bytes)?;
             let same_output = match output {
@@ -1367,6 +1382,7 @@ impl<S: Store> Repo<S> {
     /// root back with [`net_version`](Repo::net_version). The tracking key
     /// holds the first root and the layout, so a firing knows the form.
     pub fn net_track_fragments(&mut self, db: &Db, net: &Net, layout: Layout) -> Result<Db, Error> {
+        let layout = test_layout(layout);
         let id = self.put_net_fragments(net, layout)?;
         self.track_from(db, net, format!("{id} {}", layout.name()))
     }
@@ -1513,6 +1529,44 @@ impl<S: Store> Repo<S> {
         }
         Ok(m)
     }
+}
+
+/// E451's test-only switch (feature `test-net-options`): the options
+/// `IKAM_NET_OPTIONS` names, set on a new handle. `fast` is
+/// `net_fast_read`, `delta` is `net_delta_write`, `cache=N` is
+/// `graph_cache`, `threads=N` is `read_threads`; `inline` stores what is
+/// asked for as `Layout::Tree` as `Layout::Inline` and `Layout::Flat` as
+/// `Layout::InlineFlat` ([`test_layout`]).
+#[cfg(feature = "test-net-options")]
+pub(crate) fn test_options<S: Store>(mut r: Repo<S>) -> Repo<S> {
+    let Ok(v) = std::env::var("IKAM_NET_OPTIONS") else {
+        return r;
+    };
+    for o in v.split(',') {
+        let num = |s: &str| s.parse::<usize>().unwrap_or(0);
+        match o.split_once('=') {
+            Some(("cache", n)) => r.graph_cache = num(n),
+            Some(("threads", n)) => r.read_threads = num(n),
+            _ if o == "fast" => r.net_fast_read = true,
+            _ if o == "delta" => r.net_delta_write = true,
+            _ => {}
+        }
+    }
+    r
+}
+
+/// The layout a fragment net asked for as `layout` is stored in: itself,
+/// or with the test-only switch's `inline`, its inline twin.
+pub(crate) fn test_layout(layout: Layout) -> Layout {
+    #[cfg(feature = "test-net-options")]
+    if std::env::var("IKAM_NET_OPTIONS").is_ok_and(|v| v.split(',').any(|o| o == "inline")) {
+        return match layout {
+            Layout::Tree => Layout::Inline,
+            Layout::Flat => Layout::InlineFlat,
+            l => l,
+        };
+    }
+    layout
 }
 
 #[cfg(test)]
