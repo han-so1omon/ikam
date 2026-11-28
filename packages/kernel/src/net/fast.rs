@@ -818,6 +818,14 @@ impl<S: Store> Repo<S> {
         self.fire_inner(db, &part, transition, token, key, None, None, Some(*root))
     }
 
+    /// The bounds the last version of the net named `name` that this
+    /// handle wrote with `net_delta_write` was cut with, while it is kept
+    /// (E453).
+    pub(super) fn last_net_chunks(&self, name: &str, layout: Layout) -> Option<ChunkSizes> {
+        let last = self.graph_named::<Last>(&format!("net/{name}"))?;
+        (last.layout == layout && self.store.has(&last.root)).then_some(last.chunks)
+    }
+
     /// `put_net_fragments` with `net_delta_write`: against the last
     /// version this handle wrote of the same net, in the tree layout, only
     /// what changed is built and put and the graph is edited in place. The

@@ -301,6 +301,14 @@ pub struct Repo<S: Store> {
     /// content is derived by, and no others. Off by default; reading
     /// accepts both forms.
     pub short_chunk_records: bool,
+    /// Pick the chunk bounds of a net's graph (layouts `Tree` and
+    /// `Inline`) from the net's size and the read weight when it is first
+    /// written, and cut every later version of it with the same bounds
+    /// (E453, `net/bounds.rs`). None, the default, cuts every graph with
+    /// `graph_chunks`.
+    pub net_chunk_policy: Option<crate::net::NetChunkPolicy>,
+    /// The bounds kept for each net name under `net_chunk_policy` (E453).
+    pub(crate) net_bounds: HashMap<String, crate::graph::ChunkSizes>,
 }
 
 /// Old chunk contents read during one edit with `replace_hints` on.
@@ -376,6 +384,8 @@ impl<S: Store> Repo<S> {
             net_fast_read: false,
             net_delta_write: false,
             short_chunk_records: false,
+            net_chunk_policy: None,
+            net_bounds: Default::default(),
         };
         // E451: a test-only switch (never in a default build) that turns
         // the fragment-net options on for every handle, to run the whole
@@ -748,6 +758,8 @@ impl<S: Store> Repo<S> {
         r.exact_short_search = self.exact_short_search;
         r.object_contexts = self.object_contexts;
         r.graph_chunks = self.graph_chunks;
+        r.net_chunk_policy = self.net_chunk_policy.clone();
+        r.net_bounds = self.net_bounds.clone();
         r
     }
 
