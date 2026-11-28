@@ -96,6 +96,9 @@ impl<S: Store> Repo<S> {
             }
         };
         match &obj {
+            // A graph derivation (E452): its graphs must be here; a deep
+            // check recomputes the output in full and compares roots.
+            Object::GraphDerivation(d) => return self.check_graph_derivation(d, deep),
             Object::Run(r) => return kept(&r.output),
             Object::Derivation(d) if d.func == crate::func::recorded() => return kept(&d.output),
             _ => {}
@@ -231,6 +234,10 @@ impl<S: Store> Repo<S> {
         let (mut content, mut records) = self.closure(files, |_| true)?;
         // Recorded steps (E441) of live content are kept, with their inputs.
         self.add_runs(&mut content, &mut records, |_| true)?;
+        // Graph derivations (E452) of live graphs, with their inputs.
+        if self.add_graph_derivations(&mut objects, &mut content, &mut records)? {
+            self.add_runs(&mut content, &mut records, |_| true)?;
+        }
         objects.extend(records);
         // Dictionaries, groups and contexts that live stored encodings need:
         // every object their id prefix may name, and what those need in
@@ -297,12 +304,27 @@ impl<S: Store> Repo<S> {
         // ones only another derivation among `ids` can produce.
         let mut derivations = vec![None; ids.len()];
         let mut produces: std::collections::HashMap<Id, Vec<usize>> = Default::default();
+        // A graph derivation (E452) reads its graphs, function and content.
+        let mut graph_reads: Vec<Vec<Id>> = vec![Vec::new(); ids.len()];
         for (i, id) in ids.iter().enumerate() {
-            if object_tag(&self.store.read_head(id, 2)?) == Some(b'D')
-                && let Ok(Object::Derivation(d)) = self.get(id)
-            {
-                produces.entry(d.output).or_default().push(i);
-                derivations[i] = Some(d);
+            match object_tag(&self.store.read_head(id, 2)?) {
+                Some(b'D') => {
+                    if let Ok(Object::Derivation(d)) = self.get(id) {
+                        produces.entry(d.output).or_default().push(i);
+                        derivations[i] = Some(d);
+                    }
+                }
+                Some(b'H') => {
+                    if let Ok(Object::GraphDerivation(d)) = self.get(id) {
+                        graph_reads[i] = d
+                            .args
+                            .iter()
+                            .map(Arg::id)
+                            .chain([d.func, d.output])
+                            .collect();
+                    }
+                }
+                _ => {}
             }
         }
         for (i, id) in ids.iter().enumerate() {
@@ -310,6 +332,7 @@ impl<S: Store> Repo<S> {
             object[i] = object_tag(&head).is_some();
             let read: Vec<Id> = (derivations[i].iter())
                 .flat_map(|d| d.args.iter().map(Arg::id).chain([d.func, d.output]))
+                .chain(graph_reads[i].iter().copied())
                 .collect();
             let mut named: Vec<usize> = (needs(&head).into_iter())
                 .chain(tree_content(&head).as_ref().map(|c| &c.as_bytes()[..]))

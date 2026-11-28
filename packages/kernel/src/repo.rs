@@ -259,6 +259,11 @@ pub struct Repo<S: Store> {
     /// both. The same changes either way; off by default.
     pub prune_diff: bool,
     pub(crate) memo: std::sync::Mutex<Option<Memo>>,
+    /// Graph derivations (E452) by key and by output, built on first use.
+    pub(crate) graph_ledger: std::sync::Mutex<Option<crate::graph::derive::GraphLedger>>,
+    /// How graph computation results label their nodes (E452): by key in
+    /// hex (the default, E450's) or by the input's labels. Off by default.
+    pub graph_result_layout: crate::graph::compute::Layout,
     /// Keep up to this many bytes of contents read, rebuilt ones included,
     /// across reads (E294). 0, the default, keeps none. A content's bytes
     /// never change for its id and are checked against it before they are
@@ -460,6 +465,8 @@ impl<S: Store> Repo<S> {
             trial_log: None,
             prune_diff: false,
             memo: Default::default(),
+            graph_ledger: Default::default(),
+            graph_result_layout: Default::default(),
             read_cache: 0,
             refresh_ledger: false,
             cache: Default::default(),
@@ -864,6 +871,7 @@ impl<S: Store> Repo<S> {
         r.object_templates = self.object_templates;
         r.plain_db_events = self.plain_db_events;
         r.plain_hot_writes = self.plain_hot_writes;
+        r.graph_result_layout = self.graph_result_layout;
         r.exact_short_search = self.exact_short_search;
         r.bm25_pack = self.bm25_pack;
         r.float_planes = self.float_planes;
@@ -893,6 +901,7 @@ impl<S: Store> Repo<S> {
         *self.needed.lock().unwrap() = None;
         *self.cache.lock().unwrap() = Cache::default();
         *self.chunk_cache.lock().unwrap() = Default::default();
+        *self.graph_ledger.lock().unwrap() = None;
     }
 
     /// Keep the needed set current after storing `encoded` (E129).
@@ -1023,6 +1032,9 @@ impl<S: Store> Repo<S> {
 
     /// Append a (verified) derivation to the ledger. Returns its object id.
     pub(crate) fn record(&mut self, d: Derivation) -> Result<Id, Error> {
+        if let Some(a) = d.args.iter().find(|a| a.is_graph()) {
+            return Err(crate::object::graph_not_content(a.id()));
+        }
         let encoded = Object::Derivation(d.clone()).encode();
         let id = Id::of(&encoded);
         // Added even when another handle on the store wrote the same record
@@ -1192,6 +1204,8 @@ impl<S: Store> Repo<S> {
                         .ok_or(Error::Corrupt(id))?
                         .to_vec()
                 }
+                // A content function never reads a graph (E452).
+                Arg::Graph(id) => return Err(crate::object::graph_not_content(id)),
             });
         }
         let module = if func::is_builtin(func) {

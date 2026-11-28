@@ -20,6 +20,11 @@ use crate::{Arg, Error, Graph, Id, Node, Object, Repo, Store, Target, node_key};
 
 /// E450: computations over graphs kept up to date from deltas (opt-in).
 pub mod compute;
+/// E452: graph derivations, the read interface for graph functions, and
+/// the link index (opt-in).
+pub mod derive;
+/// E452: WASM graph functions reading through read-only host imports.
+pub mod wasm_read;
 
 /// A node that differs between two graphs: `(label, before, after)`.
 pub type NodeChange = (String, Option<Node>, Option<Node>);

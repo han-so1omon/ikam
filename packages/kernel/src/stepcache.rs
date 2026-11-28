@@ -157,6 +157,11 @@ impl StepKey {
                     b.extend_from_slice(&start.to_be_bytes());
                     b.extend_from_slice(&len.to_be_bytes());
                 }
+                // E452: a graph root, tagged as H records tag it.
+                Arg::Graph(id) => {
+                    b.push(2);
+                    b.extend_from_slice(id.as_bytes());
+                }
             }
         }
         b.push(match self.kind {

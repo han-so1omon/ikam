@@ -105,6 +105,7 @@ pub fn anatomy(
                 let (src, len) = match arg {
                     ikam_kernel::Arg::Whole(i) => (*i, 0),
                     ikam_kernel::Arg::Range { id, len, .. } => (*id, *len as usize),
+                    ikam_kernel::Arg::Graph(i) => (*i, 0),
                 };
                 if new.contains(&src) && !chunk_content.contains_key(&src) {
                     literal.insert(src);

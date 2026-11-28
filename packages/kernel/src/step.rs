@@ -80,6 +80,10 @@ impl<S: Store> Repo<S> {
         check: Option<Check>,
         design: Design,
     ) -> Result<(Id, Id), Error> {
+        // A graph root is not content (E452): a run's arguments are.
+        if let Some(a) = args.iter().find(|a| a.is_graph()) {
+            return Err(crate::object::graph_not_content(a.id()));
+        }
         let bytes = match output {
             Some(b) => b.to_vec(),
             None => self.run_step(&func, &args)?,

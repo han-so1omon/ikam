@@ -108,6 +108,7 @@ impl<S: Store> Repo<S> {
             Arg::Range { start, len, .. } => Ok(crate::repo::select(bytes, *start, *len)
                 .ok_or(Error::Corrupt(id))?
                 .to_vec()),
+            Arg::Graph(id) => Err(crate::object::graph_not_content(*id)),
         }
     }
 
