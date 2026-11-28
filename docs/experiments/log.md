@@ -6629,3 +6629,55 @@ Gates on the branch (E229 to E233): every kernel test suite passes (release); cl
 - Verdict: **kept** (an option, off by default; every win line met: the second same-platform run is a hit, saving about 130 ms a step here; cross-platform records sit side by side and the fused build's differ visibly; fsck clean; existing tests unchanged).
 - Not done: a second real machine (three builds stand in); keying by more than one tag (E443: exact-match platform properties, timeout, salt, do-not-cache); eviction (entries are refs and live until removed); `net_fire_step` through the cache; design A records (the cache files design B only, as E441 recommends); check verdicts are not kept by the cache (commit them to keep them).
 - Run: build `experiments/step-cache` three times (`RUSTFLAGS="-C target-cpu=x86-64"`, `"-C target-cpu=x86-64-v3"`, `"-C target-cpu=x86-64-v3 --cfg fused"`), then `cargo run --release --example e428_step_cache -- WORK PLAIN V3 FUSED`.
+
+### E443 cache-keys (step cache key rules: timeout, salt, do-not-cache, exact-match platform properties)
+
+- Branch / parent: exp/443-cache-keys / E428 (exp/428-step-cache 05d4c83)
+- Question: E428 keys a cached step by (function, inputs, kind, platform tag). Bazel's `Action` and DVC's run cache key by more, and each field closes a way a cache answers wrong. Does E428's cache give the expected hit or miss once (1) the timeout is part of the key, so a step allowed less time never reuses a result that may have needed more; (2) a salt can disown every result made by a function version later found buggy, without deleting any; (3) a step marked always different is never cached (DVC refuses to cache `always_changed` stages; Bazel has `do_not_cache`); (4) the platform is a set of properties matched exactly, stored with each result along with what ran it? (Idea note M8 and the second pass's "Action key fields" line.)
+- Change (each off by default; a key that sets none is E428's key and is filed where E428 filed it, checked in a test against E428's byte layout):
+  - `StepKey` gains `properties`, `timeout_ms`, `salt` and `do_not_cache`, with `with_properties`, `with_timeout_ms`, `with_salt` and `not_cached`.
+  - The timeout and the salt go into the key's group hash, each only when set. The caller's runner enforces the timeout; the cache keys by it (a kernel-run float step is bounded by fuel, not time).
+  - Properties are sorted and must have distinct names; the platform's place under the group becomes the tag (or `p`) and a hash of the tag and the properties, so fewer, more or different properties are another place, a miss, and side by side under the same group. A hit also checks that the record's own `platform.*` props equal the key's, exactly.
+  - Each result's `Run` props now hold the kind, the tag, every property (`platform.NAME`), `timeout-ms`, `salt`, `ran-by` and `cache=no`, sorted. `step_cached_by(key, check, outside, ran_by)` stores what ran the step; it is not part of the key (as Bazel's worker is not), so another runner with the same properties hits.
+  - A do-not-cache step is never looked up, even when the same step was filed without the mark; it runs, its output is kept as a recorded step with `cache=no`, and no ref files it.
+- Method (`examples/e443_cache_keys.rs`, an FsStore, E428's `train-gd` builds and inputs): E428's runs, then one case per rule, each call with its expected answer; `ran-by` is each build's file hash. The always-different step is the same command with `jitter=clock` (a start offset from the clock). The caller commits the do-not-cache outputs it keeps, as it would any output it uses, then gc, repack and fsck, counting cache refs and recorded steps before and after. Linux cloud, 4 CPUs shared with other builds; three runs.
+- Results (all three runs gave the same answers and the same output ids):
+
+  | # | rule | call | expected | got | ms (runs 1 / 2 / 3) |
+  | --- | --- | --- | --- | --- | --- |
+  | 1 | E428 | `x86-64-plain` | miss | miss | 133.4 / 119.5 / 118.6 |
+  | 2 | E428 | `x86-64-plain` again | hit | hit | 0.036 / 0.053 / 0.057 |
+  | 3 | E428 | `x86-64-v3` | miss | miss | 133.3 / 122.7 / 120.6 |
+  | 4 | E428 | `x86-64-v3-fma` | miss | miss | 69.4 / 68.6 / 67.9 |
+  | 5 | E428 | `x86-64-v3-fma` again | hit | hit | 0.055 / 0.035 / 0.036 |
+  | 6 | timeout | 60 s | miss | miss | 132.5 / 115.4 / 117.6 |
+  | 7 | timeout | 60 s again | hit | hit | 0.038 / 0.058 / 0.040 |
+  | 8 | timeout | 10 s | miss | miss | 118.5 / 119.2 / 118.7 |
+  | 9 | timeout | 20 ms | timed out, nothing filed | timed out | 21.3 / 20.7 / 21.2 |
+  | 10 | timeout | 20 ms again | timed out | timed out | 21.2 / 20.8 / 21.3 |
+  | 11 | timeout | 60 s once more | hit | hit | 0.042 / 0.058 / 0.043 |
+  | 12 | salt | `fixed-1`, `x86-64-plain` | miss | miss | 117.2 / 119.3 / 120.3 |
+  | 13 | salt | `fixed-1`, `x86-64-v3-fma` | miss | miss | 65.6 / 81.7 / 67.7 |
+  | 14 | salt | `fixed-1`, `x86-64-plain` again | hit | hit | 0.050 / 0.036 / 0.035 |
+  | 15 | salt | no salt, `x86-64-plain` (the old key) | hit | hit | 0.027 / 0.019 / 0.020 |
+  | 16 | do not cache | `jitter=clock`, marked | miss | miss | 117.5 / 126.2 / 126.8 |
+  | 17 | do not cache | marked, again | miss | miss | 121.0 / 116.2 / 119.4 |
+  | 18 | do not cache | `jitter=clock`, unmarked | miss | miss | 122.8 / 117.1 / 124.5 |
+  | 19 | do not cache | unmarked, again | hit | hit | 0.056 / 0.030 / 0.052 |
+  | 20 | properties | `arch=x86_64 cpu=x86-64-v3 fma=on` | miss | miss | 67.4 / 71.5 / 69.0 |
+  | 21 | properties | the same in another order, another runner | hit | hit | 0.129 / 0.099 / 0.119 |
+  | 22 | properties | `fma` left out | miss | miss | 124.8 / 129.3 / 128.0 |
+  | 23 | properties | `fma=off` | miss | miss | 135.9 / 131.1 / 124.5 |
+  | 24 | properties | `fma=on` and `os=linux` added | miss | miss | 80.1 / 71.8 / 68.6 |
+
+  **24 of 24 as expected** in each run.
+  - Timeout: the 20 ms runs were killed at the deadline (the step takes about 120 ms), filed nothing, and the next 20 ms call ran again rather than reusing the 60 s or 10 s result. A hit there would have handed a 20 ms caller a result its own budget could not have produced.
+  - Salt: both platforms missed under the new salt and the old key still hit its old results: 12 cache refs and 14 recorded steps both before and after gc and repack, gc removed 0 objects. Disowning is a change of key, not a delete; the old results stay readable for anyone who asks with the old salt, and for comparing a fixed version with the buggy one.
+  - Do not cache: the two marked runs gave two different outputs (`aba760681386`, `5574d2eebec9`) and both are kept with `cache=no`, no ref; the unmarked control's second call was a hit that returned the first unmarked run's output, which is the stale answer the mark exists to prevent.
+  - Properties: same set in another order with another `ran-by` was a hit, and the record still says the first runner (`train-gd 2215ca3ed58b`); a subset, a changed value and a superset each missed and were filed side by side. What is stored with a result, for example: `kind=recorded, platform.arch=x86_64, platform.cpu=x86-64-v3, platform.fma=on, ran-by=train-gd 2215ca3ed58b`, or under a tag with a timeout, `kind=recorded, platform=x86-64-plain, ran-by=train-gd 48a857138fae, timeout-ms=60000`.
+  - After gc and repack every output read back and fsck was clean.
+- Checks: `tests/cache_keys.rs`, 5 tests (a key with no new field is E428's key and E428's place; a timeout or a salt changes the group, the mark does not; a 10 s timeout never hits a 60 s result and no timeout is a third key, a timed-out run files nothing; a salt disowns results on two platforms, nothing is deleted, the old key still hits, gc keeps them, fsck clean; a do-not-cache step runs every time even with a filed result, is kept with `cache=no` and filed nowhere; properties hit in any order with another runner, store the first runner, miss on fewer, more or different properties, and a repeated name is refused). E428's 4 tests unchanged and passing. `cargo test --release --features embed`: 393 pass (E428's 388 and these 5), 0 fail; clippy `-D warnings` clean.
+- Fixed bench: not rerun. E443 changes nothing outside `stepcache.rs` (and adds a test and an example), which the bench never calls; E428's bench on the shared code was equal to main in every byte field.
+- Verdict: **kept** (options, off by default; every case as expected, nothing deleted, fsck clean).
+- Not done: the kernel does not enforce a timeout on work it runs itself (fuel bounds a float step); a store-level record of which salt is current for a function (here the caller holds it, as a Bazel client does); listing or pruning disowned results; keying by the environment (variables, working directory) or by output names as Bazel's `Command` does; DVC's other refusal, steps with persistent outputs (no step here writes outside its output); a second real machine.
+- Run: E428's three `train-gd` builds, then `cargo run --release --example e443_cache_keys -- WORK PLAIN V3 FUSED`.
