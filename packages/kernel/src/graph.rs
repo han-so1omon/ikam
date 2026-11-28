@@ -111,6 +111,39 @@ fn cut<T>(
     ends
 }
 
+/// The root `put_graph` gives `nodes` under `bounds`, computed without
+/// storing anything (E453). `nodes` must be in label order with sorted
+/// edges, as `graph_nodes` returns a stored graph's: then the result equals
+/// the stored root exactly when the graph was cut with `bounds`.
+pub(crate) fn root_under(nodes: &[Node], bounds: ChunkSizes) -> Id {
+    let mut level: Vec<(String, Id)> = Vec::new();
+    let mut start = 0;
+    for end in cut(nodes, |n| &n.label, node_size, bounds.leaf) {
+        let chunk = nodes[start..end].to_vec();
+        let first = chunk.first().map_or(String::new(), |n| n.label.clone());
+        level.push((first, Object::Graph(Graph::Nodes(chunk)).id()));
+        start = end;
+    }
+    let mut height = 0u8;
+    while level.len() > 1 {
+        height += 1;
+        let (mut parents, mut start) = (Vec::new(), 0);
+        for end in cut(&level, |c| &c.0, child_size, bounds.parent) {
+            let children = level[start..end].to_vec();
+            let id = Object::Graph(Graph::Children(height, children)).id();
+            parents.push((level[start].0.clone(), id));
+            start = end;
+        }
+        level = parents;
+    }
+    level[0].1
+}
+
+/// Encoded bytes of `nodes` as chunk boundaries count them (E453).
+pub(crate) fn nodes_size(nodes: &[Node]) -> usize {
+    nodes.iter().map(node_size).sum()
+}
+
 impl<S: Store> Repo<S> {
     /// Store a graph and return its root id. Labels must be unique, and so
     /// must their keys within the graph; edges are sorted and deduplicated.

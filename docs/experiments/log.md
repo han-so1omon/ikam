@@ -7301,3 +7301,121 @@ Gates on the branch (E229 to E233): every kernel test suite passes (release); cl
   - FsStore.
 
 - Run: `cargo run --release --example e451_net_combined -- nets 1000,10000 5` (3 runs, median), `-- breakdown 1000,10000`, `-- fire 300`, `-- graphs 1.0`, `-- par 1000,10000 5`, `E451_FORMS="L16K,text,P16K + E449 + short_chunk" ... -- nets 1000,10000 5`; `E450_E451=1 cargo run --release --example e450_graph_compute -- link,net10k,prop,net1k 3 fast` and the same without `E450_E451` (`link,net10k 1 fast`); both again with the default store options (`net10k,prop,net1k 1`); `IKAM_NET_OPTIONS=fast,delta,cache=4096,threads=2,inline cargo test --release --features embed,test-net-options --tests --no-fail-fast` (and without `inline`).
+
+### E453 net-chunk-bounds (a fragment net's chunk bounds picked from its size and the read weight when it is first written, and kept for its later versions)
+
+- Branch / parent: exp/453-net-chunk-bounds / exp/451-net-integrate (36bc995).
+- Question: E451's combined form (E447's inline nets with E449's read path) meets every 10,000-transition line, but at 1,000 transitions v1 is 1.60x the text and the cold read of version 25 1.07x with the default bounds; 16 to 128 KiB bounds give 1.33x v1 but writes 2.3x slower, and at the heavy weight 256:2,048 bounds win a version's bytes. Can bounds chosen from the net's size (and the read weight) meet the 1,000-transition lines (v1 at most 1.5x text, cold read at most the text's) while keeping the 10,000-transition lines met and writes at most the text's, as an option off by default? The bounds must be kept for every later version, since a graph is edited with the bounds it was cut with. Checked at 300 and 3,000 transitions as well, so a policy is not fitted to two sizes. A chunk's stored form is not changed (no encoding, pointer, child-id, gc, repack, ingest or history change): only which valid tree of the same nodes is written.
+- Change (an option, off by default; default reads, writes and stored bytes unchanged, the fixed bench equal):
+  - `Repo::net_chunk_policy: Option<NetChunkPolicy>` (new module `net/bounds.rs`). A `NetChunkPolicy` is a list of `(most bytes, ChunkSizes)` steps, and a second list used from a read weight `heavy_from` up. The size is the encoded bytes of the net's nodes in its layout, as the chunk boundaries count them (`NetChunkPolicy::net_bytes`: 12.8 KiB at 300 transitions, 45 KiB at 1,000, 146 KiB at 3,000, 511 KiB at 10,000, inline). The first step whose bytes the net fits gets its bounds; a net larger than every step gets `graph_chunks`.
+  - When a net is first written in the `Tree` or `Inline` layout (the flat layouts are one chunk whatever the bounds), the policy picks its bounds, and the handle keeps them by the net's name (`Repo::net_chunk_bounds`). Every later version, whole or delta write, is cut with the kept bounds while the write runs, and `graph_chunks` is set back after it. A changed policy or `graph_chunks` does not move a net that already has bounds. A net this handle delta-wrote before the policy was set keeps the bounds of that version.
+  - Across handles: `put_net_fragment_file`, given a tree that already holds the net at the path, finds the bounds the stored version was cut with. It recomputes that version's root under the policy's pick for the new net, then under each bounds the policy can give and `graph_chunks` (`graph::root_under`: `put_graph`'s cut without storing anything), and keeps the first that gives the stored root. A history written without the policy therefore keeps the default bounds. When none fits, the policy picks. This reads the previous version once per net per handle.
+  - `NetChunkPolicy::by_size()`, the measured best (policy C below): leaves whose least size is a sixth of the net's bytes, 4 to 8 KiB in whole KiB, and whose most is eight times that, with 16 to 128 KiB parents, for nets of up to 1 MiB of nodes; above that `graph_chunks`. `NetChunkPolicy::fixed(bounds)` gives one bounds to every net.
+  - Test-only switch: `IKAM_NET_OPTIONS=...,policy` (feature `test-net-options`) turns on `by_size()` in every `Repo::new`.
+  - E451's delta-write fix is untouched, and its test (`a_delta_write_after_the_chunk_bounds_change_gives_the_whole_writes_root`) passes. Under a policy the kept net's bounds are the kept bounds, so the delta write's check that its last root was cut with the current bounds holds by construction.
+- Method (`examples/e453_net_chunk_bounds.rs`; Linux cloud, 4 CPUs shared with another experiment's builds, MemStore): E446's synthetic nets at 300, 1,000, 3,000 and 10,000 transitions, E446's 25 versions of mixed edits, at the default weight (0.001) and the heavy weight (48.8). The base is E451's "inline + E449" row (fast read, cache, delta writes), and again with E448's frames and E451's short chunk records ("+ frames + SCR"). Bytes are the store's growth (the commit left out). Each row's store is built three times and the write time is the median of the three builds' mean write of versions 2 to 25. The cold read of version 25 (graph cache emptied first) is taken two ways: nine rounds in which the rows are read in turn ("interleaved"), so load falls on every row alike; and E451's way, nine reads of one row in a row ("in a row"). The whole harness was run three times, and the tables give the median of the three. Rows: the default (4 to 32 KiB at every level), E448's P16K (parents 16 to 128 KiB), "L8K" (leaves 8 to 64 KiB, parents 16 to 128 KiB), E451's L16K (16 to 128 KiB) and S256 (256 to 2,048 B) as fixed baselines, and four policies (parents 16 to 128 KiB wherever the leaves are not the default's):
+  - A: one step, nets of up to 64 KiB get 8 to 64 KiB leaves, larger nets the default.
+  - B: up to 24 KiB one chunk (16 to 128 KiB leaves), up to 192 KiB 6 to 48 KiB leaves, up to 384 KiB P16K, then the default.
+  - C (`by_size`): leaves scaled to about six a net, 4 to 8 KiB least, up to 1 MiB.
+  - W: B at the default weight; from weight 10, 2 to 16 KiB leaves up to 192 KiB (for writes and a version's bytes), then the default.
+
+  A first sweep of fixed leaf bounds (256 B to 32 KiB least, in eight steps, `sweep` mode) chose the steps.
+- Results, default weight, inline + E449 (each cell: bounds picked; v1 / write / cold read interleaved (in a row), each over the text's; the lines are v1 at most 1.50 and the others at most 1.00):
+
+  | form | 300 | 1,000 | 3,000 | 10,000 |
+  | --- | --- | --- | --- | --- |
+  | fixed default | 4K:32K: 1.45 / 1.44 / 1.11 (1.18) | 4K:32K: 1.60 / 1.08 / 1.13 (1.19) | 4K:32K: 1.49 / 0.62 / 1.26 (1.25) | 4K:32K: 1.47 / 0.36 / 1.13 (1.21) |
+  | fixed P16K | 1.45 / 1.46 / 1.14 (1.14) | 1.60 / 1.07 / 1.04 (1.08) | 1.49 / 0.61 / 1.19 (1.20) | 1.47 / 0.36 / 1.08 (1.12) |
+  | fixed L8K | 1.35 / 1.58 / 1.07 (1.06) | 1.41 / 1.13 / 1.01 (1.03) | 1.38 / 0.73 / 1.03 (1.06) | 1.37 / 0.48 / 0.98 (1.03) |
+  | fixed L16K | 1.08 / 1.96 / 1.11 (1.09) | 1.33 / 1.39 / 0.94 (0.98) | 1.30 / 0.99 / 1.01 (1.02) | 1.32 / 0.61 / 1.01 (1.02) |
+  | fixed S256 | 2.90 / 1.51 / 1.57 (1.35) | 3.28 / 0.99 / 1.38 (1.41) | 3.22 / 0.49 / 1.55 (1.65) | 3.40 / 0.36 / 1.31 (1.47) |
+  | policy A | 8K:64K: 1.35 / 1.57 / 1.18 (1.07) | 8K:64K: 1.41 / 1.12 / 1.00 (1.04) | 4K:32K: 1.49 / 0.62 / 1.18 (1.16) | 4K:32K: 1.47 / 0.37 / 1.09 (1.10) |
+  | policy B | 16K:128K: 1.08 / 1.97 / 1.21 (1.08) | 6K:48K: 1.46 / 1.12 / 1.00 (1.14) | 6K:48K: 1.40 / 0.83 / 1.02 (1.06) | 4K:32K: 1.47 / 0.39 / 1.10 (1.11) |
+  | policy C | 4K:32K: 1.45 / 1.47 / 1.10 (1.12) | 7K:56K: 1.45 / 1.18 / 0.96 (1.06) | 8K:64K: 1.38 / 0.72 / 1.03 (1.08) | 8K:64K: 1.37 / 0.48 / 0.99 (1.06) |
+  | policy W | 16K:128K: 1.08 / 1.95 / 0.96 (1.08) | 6K:48K: 1.46 / 1.14 / 0.99 (1.03) | 6K:48K: 1.40 / 0.65 / 1.05 (1.09) | 4K:32K: 1.47 / 0.39 / 1.10 (1.16) |
+
+  The text: v1 2,885, 8,405, 26,926 and 84,647 B; write 611, 1,759, 5,515 and 19,277 µs; cold read 495 (424), 1,386 (1,313), 3,902 (3,814) and 15,702 (13,858) µs. Leaves of v1 at 1,000 transitions: 9 with the default, 6 with B, C and W, 5 with A and L8K, 3 with L16K, 79 with S256; at 10,000: 98 with the default, 53 with C and L8K.
+- Results, 1,000 transitions in full (µs, bytes; median of 3):
+
+  | weight | form | bounds | bytes v1 (x text) | a version adds (x text) | write µs (x text) | cold interleaved µs (x text) | cold in a row µs (x text) | delta µs |
+  | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+  | 0.001 | text (E422) | – | 8,405 (1.00) | 782 (1.00) | 1,759 (1.00) | 1,386 (1.00) | 1,313 (1.00) | – |
+  | 0.001 | fixed default | 4K:32K | 13,483 (1.60) | 1,619 (2.07) | 1,894 (1.08) | 1,572 (1.13) | 1,568 (1.19) | 862 |
+  | 0.001 | fixed L8K | 8K:64K/16K:128K | 11,831 (1.41) | 1,508 (1.93) | 1,982 (1.13) | 1,402 (1.01) | 1,353 (1.03) | 1,459 |
+  | 0.001 | fixed L16K | 16K:128K | 11,178 (1.33) | 1,555 (1.99) | 2,448 (1.39) | 1,304 (0.94) | 1,290 (0.98) | 2,183 |
+  | 0.001 | policy A | 8K:64K/16K:128K | 11,831 (1.41) | 1,508 (1.93) | 1,978 (1.12) | 1,382 (1.00) | 1,359 (1.04) | 1,340 |
+  | 0.001 | policy C | 7K:56K/16K:128K | 12,185 (1.45) | 1,630 (2.08) | 2,072 (1.18) | 1,333 (0.96) | 1,392 (1.06) | 1,186 |
+  | 0.001 | policy C + frames + SCR | 7K:56K/16K:128K | 12,185 (1.45) | 940 (1.20) | 3,017 (1.72) | 1,355 (0.98) | 1,374 (1.05) | 1,172 |
+  | 0.001 | fixed default + frames + SCR | 4K:32K | 13,483 (1.60) | 897 (1.15) | 2,544 (1.45) | 1,430 (1.03) | 1,430 (1.09) | 830 |
+  | 48.8 | text (E422) | – | 8,405 (1.00) | 8,441 (1.00) | 1,031 (1.00) | 1,320 (1.00) | 1,228 (1.00) | – |
+  | 48.8 | fixed default | 4K:32K | 13,483 (1.60) | 4,352 (0.52) | 1,233 (1.20) | 1,697 (1.29) | 1,287 (1.05) | 1,069 |
+  | 48.8 | fixed S256 | 256:2048 | 27,608 (3.28) | 3,226 (0.38) | 753 (0.73) | 1,769 (1.34) | 1,704 (1.39) | 230 |
+  | 48.8 | policy B | 6K:48K/16K:128K | 12,286 (1.46) | 5,167 (0.61) | 1,378 (1.34) | 1,266 (0.96) | 1,236 (1.01) | 946 |
+  | 48.8 | policy C | 7K:56K/16K:128K | 12,185 (1.45) | 5,731 (0.68) | 1,475 (1.43) | 1,248 (0.95) | 1,219 (0.99) | 1,047 |
+  | 48.8 | policy W | 2K:16K/16K:128K | 15,251 (1.81) | 3,631 (0.43) | 1,004 (0.97) | 1,503 (1.14) | 1,561 (1.27) | 557 |
+
+  A second set of three runs with only the text, the default and C (`small_median.txt` in the run directory) gave, at 1,000 transitions and the default weight: the default 1.60 / 0.88 / 1.00 (1.08), C 1.45 / 1.03 / 0.91 (1.00); and at 10,000: the default 1.47 / 0.34 / 1.20 (1.16), C 1.37 / 0.42 / 1.07 (1.03).
+- Results, heavy weight (48.8), inline + E449 (each cell: v1 / write / cold interleaved (in a row) / a version adds, over the text's):
+
+  | form | 300 | 1,000 | 3,000 | 10,000 |
+  | --- | --- | --- | --- | --- |
+  | fixed default | 1.45 / 1.91 / 1.09 (1.12) / 1.01 | 1.60 / 1.20 / 1.29 (1.05) / 0.52 | 1.49 / 0.80 / 1.23 (1.25) / 0.21 | 1.47 / 0.57 / 1.20 (1.14) / 0.09 |
+  | fixed L8K | 1.35 / 2.17 / 0.95 (0.97) / 1.17 | 1.41 / 1.40 / 1.43 (1.07) / 0.64 | 1.38 / 0.97 / 1.02 (1.07) / 0.29 | 1.37 / 0.64 / 1.01 (1.03) / 0.11 |
+  | fixed L16K | 1.08 / 2.85 / 1.06 (1.27) / 1.10 | 1.33 / 1.70 / 0.95 (1.01) / 0.93 | 1.30 / 1.44 / 1.00 (1.01) / 0.44 | 1.32 / 0.73 / 0.96 (1.01) / 0.19 |
+  | fixed S256 | 2.90 / 1.21 / 1.29 (1.91) / 0.74 | 3.28 / 0.73 / 1.34 (1.39) / 0.38 | 3.22 / 0.83 / 1.54 (1.58) / 0.16 | 3.40 / 0.51 / 1.34 (1.41) / 0.06 |
+  | policy A | 1.35 / 2.17 / 0.89 (1.48) / 1.17 | 1.41 / 1.43 / 0.97 (1.02) / 0.64 | 1.49 / 0.92 / 1.11 (1.13) / 0.21 | 1.47 / 0.57 / 1.12 (1.10) / 0.09 |
+  | policy B | 1.08 / 2.88 / 1.16 (1.13) / 1.10 | 1.46 / 1.34 / 0.96 (1.01) / 0.61 | 1.40 / 0.89 / 1.03 (1.02) / 0.24 | 1.47 / 0.57 / 1.11 (1.53) / 0.09 |
+  | policy C | 1.45 / 1.99 / 1.10 (1.08) / 1.01 | 1.45 / 1.43 / 0.95 (0.99) / 0.68 | 1.38 / 0.95 / 1.01 (1.03) / 0.29 | 1.37 / 0.71 / 1.01 (1.34) / 0.11 |
+  | policy W | 2K:16K: 1.61 / 1.83 / 1.09 (1.11) / 0.84 | 2K:16K: 1.81 / 0.97 / 1.14 (1.27) / 0.43 | 2K:16K: 1.68 / 0.75 / 1.22 (1.21) / 0.19 | 4K:32K: 1.47 / 0.60 / 1.20 (1.22) / 0.09 |
+
+  The text writes 293, 1,031, 2,885 and 10,919 µs at this weight (it stores each version whole, with no slices to plan), about half its default-weight time, so every inline row's write line is harder here. B's and C's 10,000-transition "in a row" cells (1.53, 1.34) are single outliers in one of the three runs; the interleaved reads of the same stores are 1.11 and 1.01.
+- Results, with frames and SCR (default weight; v1 / a version adds / write / cold interleaved, over the text's): at 1,000 transitions the default 1.60 / 1.15 / 1.45 / 1.03, A 1.41 / 1.09 / 1.65 / 0.92, C 1.45 / 1.20 / 1.72 / 0.98, L16K 1.33 / 1.14 / 2.19 / 0.95; at 10,000 the default 1.47 / 1.24 / 0.45 / 1.08, C 1.37 / 1.37 / 0.57 / 1.07. Frames keep a version's bytes near the text's at every bounds, but they add 0.6 to 1.4 ms to a 1,000-transition write, so no row with frames meets the write line below 3,000 transitions.
+- Results, firings (E451's run: the night net edited 9 times mid-run, median of 3; µs a firing): the night net alone (one chunk under every bounds): text 5,732, default 5,057, C 5,773. Inside 10,000 more transitions (100 candidates): text 15,384, default 10,445 (0.68x; 9,449 by key), L8K 7,297 (0.47x), C 7,412 (0.48x; 7,624 by key). Every row replays to the same marking.
+- Findings:
+  1. The 1,000-transition v1 line is met by bounds alone. Leaves of 6 to 8 KiB (5 or 6 leaves instead of 9) give 1.41x to 1.46x the text (A and L8K 11,831 B, C 12,185, B and W 12,286, against the default's 13,483). L16K gives 1.33x. v1 falls with the number of leaves: each chunk compresses alone.
+  2. The 1,000-transition cold read moves to the line with the same leaves: 0.96 to 1.06x for C and 1.00 to 1.04x for A over the two timings (0.91 to 1.00x for C in the second set of runs), against 1.13 to 1.19x for the default in the same runs (1.00 to 1.08x in the second set). Fewer chunks are fewer reads and decodes.
+  3. The write line is not met at 1,000 transitions with leaves large enough for the v1 line. An edit rewrites its leaf (2.4 to 2.9 leaves a version), and a larger leaf costs more to encode and plan. Writes are 1.12 to 1.18x the text with 6 to 8 KiB leaves against the default's 1.08x in the same runs (1.03x against 0.88x in the second set), 1.39x with L16K. The cost of 7 to 8 KiB leaves over the default is 4 to 9% of a write; whether that crosses the line depends on the run. At 300 transitions no bounds meets the write line (1.44x to 1.97x: the inline write's fixed cost is larger than the text's 0.6 ms), and every bounds but S256 meets v1.
+  4. The 10,000-transition lines stay met. A, B and W keep the default bounds at 10,000, so the graph and every number there are E451's (v1 1.47x, write 0.37 to 0.39x, firing as in E451). C gives 10,000 transitions 8 to 64 KiB leaves: v1 1.37x, write 0.42 to 0.48x, cold read 0.99 to 1.07x interleaved (the default 1.13 to 1.20x in the same runs), firing 0.48x the text (the default 0.68x). The cold read of the default at 10,000 was 0.94x in E451's runs. On this machine E451's own harness now gives 0.54x to 0.94x for the same row over three runs (the text's time moves with the load), and E453's interleaved timing 1.08x to 1.21x, so the 10,000-transition cold line is at best marginal with the default bounds and met with C.
+  5. A policy by size gives little over the best fixed bounds for these nets. L8K (8 to 64 KiB leaves, 16 to 128 KiB parents at every size) is within noise of C at 1,000, 3,000 and 10,000 transitions, and at 300 transitions differs only in being a 2-leaf rather than a 3-leaf net (v1 1.35 against 1.45, write 1.58 against 1.47). The steps that differ by size (B's one chunk under 24 KiB, A's default at 3,000) were worse where they differ: one chunk at 300 transitions gives 1.08x v1 but a 1.97x write, and A at 3,000 transitions keeps the default's 1.18 to 1.25x cold read. C is the best policy measured because it is close to L8K at every size and keeps 300-transition writes at the default's.
+  6. The heavy weight has no bounds that meets every 1,000-transition line. 6 to 8 KiB leaves meet v1 and the cold read (B 1.46x, 0.96 to 1.01x) and miss the write (1.34x to 1.43x). 2 KiB leaves (W) meet the write (0.97x) and halve a version's bytes against the text's (0.43x) but miss v1 (1.81x) and the cold read (1.14 to 1.27x). S256 has the fastest write (0.73x) and the smallest version (0.38x) and the worst v1 (3.28x) and cold read. The default misses all three there too (1.60x, 1.20x, 1.29x interleaved). At 10,000 transitions every row but S256 meets the lines at the heavy weight.
+  7. The size measure and the steps hold across 300 and 3,000 transitions, the sizes no step was chosen from. C's picks (4, 7 and 8 KiB least leaves) meet v1 at every size (1.45, 1.45, 1.38, 1.37), and its cold reads are 0.96 to 1.12x.
+- Verdict: **partial** (option, off by default). Bounds picked by size meet the 1,000-transition v1 line (1.45x with C, 1.41x with A, from 1.60x) and bring the cold read to the text's (0.91 to 1.06x, from 1.00 to 1.19x for the default in the same runs). They keep the 10,000-transition lines (C: v1 1.37x, write 0.42 to 0.48x, cold 0.99 to 1.07x, firing 0.48x). They miss the 1,000-transition write line by 3 to 18% (the default 0.88 to 1.08x in the same runs). No bounds meets the write line at 300 transitions, or every 1,000-transition line at the heavy weight. A fixed 8 to 64 KiB leaf (L8K) does as well as the best policy at every size measured. Every net keeps its bounds through whole and delta writes and across handles (tests below).
+- Owner's choices raised:
+  - Whether nets should use 8 to 64 KiB leaves (with 16 to 128 KiB parents) as their default bounds, fixed or by `by_size()`. Either changes the stored bytes of a net's graph, so both are left as options.
+  - What the heavy weight should favour for small nets: v1 and the cold read (6 to 8 KiB leaves) or writes and a version's bytes (2 KiB leaves, or S256).
+  - Whether the 1,000-transition write line should be reached by the per-chunk storage change E451 named (dropping the `g 2` pointer object and shortening child ids). That change waits on the owner's yes. A smaller per-chunk cost would let smaller leaves, which write faster, meet the v1 line.
+- Checks:
+  - `tests/net_chunk_policy.rs`, 7 tests:
+    - Off by default, with the default bounds' roots.
+    - The policy picks by bytes and weight (steps, the heavy band, above every step, `fixed`, `by_size`'s steps and candidates, `net_bytes`).
+    - A net keeps the bounds it was first written with. The chain outgrows the step after v1, and every version, whole and delta write, Tree and Inline, has the root a fresh whole write under v1's bounds gives, not the root under the bounds its size would pick. A later change of the handle's bounds or the policy changes nothing; reads, deltas and fsck are clean; the handle's own `graph_chunks` is left as it was.
+    - A large net gets the handle's bounds and the heavy weight its own steps, kept.
+    - A new handle finds the bounds of the version its tree holds. On a shared store, each version is written by a fresh handle, alternating whole and delta writes, and keeps v1's bounds. A net delta-written before the policy was set, and a history written without the policy, keep the default bounds.
+    - The flat layouts ignore the policy.
+    - An invalid net keeps no bounds and leaves the handle's bounds as they were.
+  - E451's `a_delta_write_after_the_chunk_bounds_change_gives_the_whole_writes_root` passes unchanged.
+  - Mutation checks (`mut.log` in the run directory), each caught:
+    - Kept bounds ignored (picked by the current size at every write): 2 tests fail.
+    - No bounds found from the stored version: 1 fails.
+    - The heavy band ignored: 2 fail.
+    - The handle's bounds not set back after a write: 1 fails.
+    - `root_under`'s parent height off by one: 1 fails.
+    - The bounds of a version delta-written before the policy ignored: 1 fails.
+  - Other checks:
+    - `cargo test --release --features embed --no-fail-fast`: 446 passed, 0 failed, 5 ignored (439 on the base, plus these 7).
+    - clippy `-D warnings` clean on all targets, with `embed` and with `embed,test-net-options`. rustfmt clean on the changed files.
+    - bench (`cargo run --release --example bench -- --json`, as for E451): north_score 0.3060, sharing_kernel 0.9496, as on main.
+    - Privacy scan (`python3 .github/privacy/scan.py --all`): exit 0.
+    - Under the test-only switch with `policy` added (`IKAM_NET_OPTIONS=fast,delta,cache=4096,policy`, which sets `by_size()` in every `Repo::new`): 384 passed, 8 failed, 5 ignored. Each failure pins the bounds or the switch, and none is a bug:
+      - Four of `net_chunk_policy` (off by default, and three whose chain checks that two bounds give two roots while a fresh handle now gets the policy too).
+      - `chunk_deltas::smaller_chunk_bounds_cut_more_chunks_of_the_same_graph`, `net_inline::other_chunk_sizes_give_valid_graphs_that_edit_consistently` and `net_combined::a_delta_write_after_the_chunk_bounds_change_gives_the_whole_writes_root`: a net keeps its bounds, so a later change of `graph_chunks` does not change its root.
+      - `net_fragments::fragments_read_back_in_both_layouts`: one handle writes several nets under one name, so the later ones keep the first one's bounds and their roots differ from a fresh handle's.
+    - With `inline` added as well: 433 passed, 13 failed, 5 ignored. Three are the tree-layout failures E451 reported under `inline` (they fail the same way without `policy`), and seven are those above (all but `fragments_read_back_in_both_layouts`, which passes here). The other three count chunks against the default leaves: with 8 KiB leaves a 5,000-transition delta reads 6 of 50 chunks (the test asks for under a tenth), a 3,000-transition net over frames 18 of 38 (under a third), and a 3,000-transition net has 18 leaves (the test asks for more than 20). The pruning still works; there are fewer chunks to prune.
+- Not done / Next:
+  - The per-chunk storage change (pointer object, child ids), which waits on the owner's yes.
+  - Bounds for E450's result graphs and for general `put_graph` graphs: the policy covers nets only.
+  - A size measure that needs no node build on the first write (the node count). The bytes are computed once per net per handle, from nodes the first write builds anyway.
+  - The kept bounds live in the handle, and `put_net_fragment_file` finds them from the stored version. A bare `put_net_fragments` in a new handle has no previous version to read, so it picks by size again. A net that has grown across a step meanwhile then gets other bounds: a valid graph that shares no chunk with the one before.
+  - A rerun on an idle machine: the cold reads move by 10 to 25% between runs here, and E451's harness gives 0.54x to 0.94x for one row at 10,000 transitions.
+  - FsStore.
+- Run: `cargo run --release --example e453_net_chunk_bounds -- sweep 300,1000,3000,10000 5` (and with `E453_FRAMES=1`), `-- nets 300,1000,3000,10000 9` three times (median), `E453_FORMS="fixed default,policy C" ... -- nets 1000,10000 9` three times, `-- fire 300`; `E451_FORMS="text,E451 inline + E449 options" cargo run --release --example e451_net_combined -- nets 1000,10000 5` three times.

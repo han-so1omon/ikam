@@ -31,11 +31,13 @@
 //!
 //! Nothing in the default paths calls this module.
 
+mod bounds;
 mod fast;
 mod fragments;
 mod table;
 mod text;
 
+pub use bounds::NetChunkPolicy;
 pub use fragments::{ArcChange, Change, InlineCodec, Layout, Link, NetDelta};
 pub use table::Table;
 
@@ -1549,6 +1551,7 @@ pub(crate) fn test_options<S: Store>(mut r: Repo<S>) -> Repo<S> {
             Some(("threads", n)) => r.read_threads = num(n),
             _ if o == "fast" => r.net_fast_read = true,
             _ if o == "delta" => r.net_delta_write = true,
+            _ if o == "policy" => r.net_chunk_policy = Some(NetChunkPolicy::by_size()),
             _ => {}
         }
     }

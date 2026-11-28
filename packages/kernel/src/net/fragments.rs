@@ -156,6 +156,20 @@ pub(super) fn transition_node(t: &Transition, next: Option<&Transition>) -> (Nod
 
 /// The nodes of `net`'s fragment form, each with its fragment's text, in
 /// no particular order.
+/// Encoded bytes of `net`'s nodes in `layout`, as chunk boundaries count
+/// them: the size [`NetChunkPolicy`](super::NetChunkPolicy) picks by (E453).
+pub(super) fn node_bytes(net: &Net, layout: Layout) -> usize {
+    match layout {
+        Layout::Inline | Layout::InlineFlat => {
+            crate::graph::nodes_size(&inline::inline_nodes(net, InlineCodec::Compact))
+        }
+        Layout::Tree | Layout::Flat => {
+            let nodes: Vec<Node> = fragment_nodes(net).into_iter().map(|n| n.0).collect();
+            crate::graph::nodes_size(&nodes)
+        }
+    }
+}
+
 fn fragment_nodes(net: &Net) -> Vec<(Node, String)> {
     let mut out = vec![head_node(net)];
     for (i, p) in net.places.iter().enumerate() {
@@ -395,13 +409,17 @@ impl<S: Store> Repo<S> {
     /// again.
     pub fn put_net_fragments(&mut self, net: &Net, layout: Layout) -> Result<Id, Error> {
         let layout = super::test_layout(layout);
-        // E449: with `net_delta_write`, only what changed since the last
-        // version written is hashed and stored; the root is the same (every
-        // layout, the inline ones of E447 included: E451).
-        if self.net_delta_write {
-            return self.put_net_fragments_delta(net, layout);
-        }
-        self.put_net_fragments_whole(net, layout)
+        // E453: with `net_chunk_policy`, the graph is cut with the bounds
+        // kept for this net (picked by its size when first written).
+        self.with_net_bounds(net, layout, |r| {
+            // E449: with `net_delta_write`, only what changed since the
+            // last version written is hashed and stored; the root is the
+            // same (every layout, the inline ones of E447 included: E451).
+            if r.net_delta_write {
+                return r.put_net_fragments_delta(net, layout);
+            }
+            r.put_net_fragments_whole(net, layout)
+        })
     }
 
     /// `put_net_fragments` without the E449 options: every node built,
@@ -446,12 +464,44 @@ impl<S: Store> Repo<S> {
         net: &Net,
         layout: Layout,
     ) -> Result<(Id, Id), Error> {
+        // E453: a version already at `path` keeps the bounds it was cut with.
+        if self.net_chunk_policy.is_some()
+            && let Some(previous) = self.graph_at(root.as_ref(), path)?
+        {
+            self.find_net_bounds(net, super::test_layout(layout), &previous)?;
+        }
         let id = self.put_net_fragments(net, layout)?;
         let edit = crate::worktree::Edit::PutGraph {
             path: path.into(),
             id,
         };
         Ok((self.edit_tree(root, &[edit])?, id))
+    }
+
+    /// The graph entry at `path` in tree `root`, if there is one (E453).
+    fn graph_at(&self, root: Option<&Id>, path: &str) -> Result<Option<Id>, Error> {
+        let Some(mut tree) = root.copied() else {
+            return Ok(None);
+        };
+        let parts = crate::worktree::split_path(path)?;
+        let (last, dirs) = parts.split_last().expect("split_path is never empty");
+        for (i, name) in dirs.iter().chain([last]).enumerate() {
+            let Object::Tree(entries) = self.get(&tree)? else {
+                return Ok(None);
+            };
+            let kind = match i == dirs.len() {
+                true => crate::Kind::Graph,
+                false => crate::Kind::Tree,
+            };
+            match entries
+                .into_iter()
+                .find(|e| e.name == *name && e.kind == kind)
+            {
+                Some(e) => tree = e.id,
+                None => return Ok(None),
+            }
+        }
+        Ok(Some(tree))
     }
 
     /// The net a commit or tree holds as fragments at `path`.
