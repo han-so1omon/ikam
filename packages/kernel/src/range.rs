@@ -149,6 +149,7 @@ impl<S: Store> Repo<S> {
             let (from, n) = match *arg {
                 Arg::Range { start, len, .. } => (start, len),
                 Arg::Whole(id) => (0, self.content_length(&id, cx)?),
+                Arg::Graph(id) => return Err(crate::object::graph_not_content(id)),
             };
             let (lo, hi) = (start.max(pos), end.min(pos + n));
             if lo < hi {
@@ -181,6 +182,7 @@ impl<S: Store> Repo<S> {
                     let l = match *a {
                         Arg::Range { len, .. } => Ok(len),
                         Arg::Whole(c) => self.content_length(&c, cx),
+                        Arg::Graph(c) => Err(crate::object::graph_not_content(c)),
                     };
                     n = match (n, l) {
                         (Some(n), Ok(l)) => Some(n + l),
@@ -215,6 +217,7 @@ impl<S: Store> Repo<S> {
                 Arg::Range { id, start, len } => select(&bytes, start, len)
                     .ok_or(Error::Corrupt(id))?
                     .to_vec(),
+                Arg::Graph(id) => return Err(crate::object::graph_not_content(id)),
             });
         }
         let (end, mut pos, mut out) = (start + len, 0, Vec::new());
