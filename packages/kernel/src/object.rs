@@ -10,6 +10,8 @@
 //!   graph      = "G" level:u8 count:u32 { node (level 0) | label_len:u32 first_label id[32] (above) }
 //!   node       = label_len:u32 label target nedges:u32 { key[8] label_len:u32 label }
 //!   target     = 0 | 1 arg | 2 id[32]                  (none | content | another object)
+//!   graph derivation (E452, an option)
+//!              = "H" output[32] func[32] nargs:u32 { arg | 2 id[32] }   (output and `2` args are graph roots)
 //!
 //! A graph is a prolly tree of `G` chunks (see `graph.rs`): nodes sorted by
 //! label, each with its outgoing edges, which name their target node by
@@ -91,19 +93,52 @@ pub struct Commit {
     pub message: String,
 }
 
-/// A selector: all of a content's bytes, or a byte range of them.
+/// A selector: all of a content's bytes, or a byte range of them; or
+/// (E452, an option) a graph root, an object, which only a
+/// [`GraphDerivation`] may take: content records (derivations, runs,
+/// claims, node targets) refuse it, so their encodings are unchanged.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Arg {
     Whole(Id),
-    Range { id: Id, start: u64, len: u64 },
+    Range {
+        id: Id,
+        start: u64,
+        len: u64,
+    },
+    /// A graph's root (E452): gc keeps the whole graph through it.
+    Graph(Id),
 }
 
 impl Arg {
     pub fn id(&self) -> Id {
         match self {
-            Arg::Whole(id) | Arg::Range { id, .. } => *id,
+            Arg::Whole(id) | Arg::Range { id, .. } | Arg::Graph(id) => *id,
         }
     }
+
+    /// True for a graph root, false for content.
+    pub fn is_graph(&self) -> bool {
+        matches!(self, Arg::Graph(_))
+    }
+}
+
+/// The error for a graph root where content is needed (E452).
+pub(crate) fn graph_not_content(id: Id) -> Error {
+    Error::Exec(format!("{id}: a graph argument is not content"))
+}
+
+/// E452 (an option): `output = func(args)` where `output` is a graph's root
+/// and args may be graph roots ([`Arg::Graph`]) as well as content. It is
+/// kept outside the content ledger, so a graph root is never taken for
+/// content; it is a memo (the key is `Derivation::key(func, args)`) and a
+/// fact a rebuild checks by recomputing in full and comparing roots. gc
+/// keeps a record while its output graph is live, and with it every graph
+/// and content it names.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GraphDerivation {
+    pub output: Id,
+    pub func: Id,
+    pub args: Vec<Arg>,
 }
 
 /// `output = func(args)`, recorded only after it has been verified.
@@ -172,6 +207,8 @@ pub enum Object {
     Claim(Claim),
     Graph(Graph),
     Run(Run),
+    /// E452, an option: see [`GraphDerivation`].
+    GraphDerivation(GraphDerivation),
 }
 
 impl Object {
@@ -233,6 +270,12 @@ impl Object {
                 }
             }
             Object::Graph(g) => encode_graph(&mut out, g),
+            Object::GraphDerivation(d) => {
+                out.push(b'H');
+                out.extend_from_slice(d.output.as_bytes());
+                out.extend_from_slice(d.func.as_bytes());
+                put_args(&mut out, &d.args);
+            }
             Object::Run(r) => {
                 out.push(b'E');
                 out.extend_from_slice(r.output.as_bytes());
@@ -278,6 +321,11 @@ impl Object {
                 },
             }),
             b'G' => Object::Graph(decode_graph(&mut r)?),
+            b'H' => Object::GraphDerivation(GraphDerivation {
+                output: r.id()?,
+                func: r.id()?,
+                args: r.many(Reader::arg_or_graph)?,
+            }),
             b'E' => Object::Run(Run {
                 output: r.id()?,
                 func: r.id()?,
@@ -341,6 +389,16 @@ impl Object {
                 })
                 .collect(),
             Object::Graph(Graph::Children(_, children)) => children.clone(),
+            Object::GraphDerivation(d) => {
+                let mut links = vec![
+                    ("output".to_string(), d.output),
+                    ("func".to_string(), d.func),
+                ];
+                for (i, a) in d.args.iter().enumerate() {
+                    links.push((label(&format!("arg{i}"), a), a.id()));
+                }
+                links
+            }
             Object::Run(r) => {
                 let mut links = vec![
                     ("output".to_string(), r.output),
@@ -647,6 +705,7 @@ fn label(name: &str, a: &Arg) -> String {
     match a {
         Arg::Whole(_) => name.to_string(),
         Arg::Range { start, len, .. } => format!("{name}[{start}..{}]", start + len),
+        Arg::Graph(_) => format!("{name} (graph)"),
     }
 }
 
@@ -666,6 +725,10 @@ fn put_arg(out: &mut Vec<u8>, a: &Arg) {
             out.extend_from_slice(id.as_bytes());
             out.extend_from_slice(&start.to_be_bytes());
             out.extend_from_slice(&len.to_be_bytes());
+        }
+        Arg::Graph(id) => {
+            out.push(2);
+            out.extend_from_slice(id.as_bytes());
         }
     }
 }
@@ -718,6 +781,17 @@ impl<'a> Reader<'a> {
                 Ok(Arg::Range { id, start, len })
             }
             _ => Err(Error::Decode("unknown arg tag")),
+        }
+    }
+
+    /// An argument of a graph derivation (E452): content, or a graph root.
+    fn arg_or_graph(&mut self) -> Result<Arg, Error> {
+        match self.0.first() {
+            Some(2) => {
+                self.take(1)?;
+                Ok(Arg::Graph(self.id()?))
+            }
+            _ => self.arg(),
         }
     }
 

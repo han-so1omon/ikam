@@ -64,10 +64,12 @@ pub use fragment::{FragmentIndex, blocks};
 pub use grant::{Denied, FileGrant, FragmentGrant, Grant, Sections, windows_around};
 pub use graph::Keys;
 pub use graph::compute as graph_compute;
+pub use graph::derive as graph_derive;
+pub use graph::wasm_read as graph_wasm;
 pub use id::Id;
 pub use object::{
-    Arg, Check, Claim, Commit, Derivation, Edge, Graph, Kind, Node, Object, Run, Target, TreeEntry,
-    node_key,
+    Arg, Check, Claim, Commit, Derivation, Edge, Graph, GraphDerivation, Kind, Node, Object, Run,
+    Target, TreeEntry, node_key,
 };
 pub use range::ReadSession;
 pub use repack::Repacked;
