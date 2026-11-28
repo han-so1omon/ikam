@@ -376,6 +376,7 @@ fn synthetic_view(files: usize) -> View {
         off.push(adj.len() as u32);
     }
     View {
+        order: ikam_kernel::sampler::Order::Ids,
         commit: Id::from_bytes([0; 32]),
         tree: Id::from_bytes([0; 32]),
         labels: vec!["a".into(), "b".into(), "c".into()],

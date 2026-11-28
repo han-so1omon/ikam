@@ -38,6 +38,7 @@ pub mod ir;
 pub mod join;
 pub mod joinkeys;
 mod library;
+pub mod lineage;
 mod markup;
 pub mod matcher;
 pub mod merge;

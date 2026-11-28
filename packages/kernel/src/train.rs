@@ -36,6 +36,9 @@ use crate::{
 const RULE_MAGIC: &[u8] = b"ikam-train-rule/1\0";
 const HISTORY_MAGIC: &[u8] = b"ikam-train-history/1\0";
 const TABLE_MAGIC: &[u8] = b"ikam-train-table/1\0";
+/// A unit of a history (E429): the changes of some of its keys, with the
+/// chain's length but not its commit ids, cut to the commits a rule reads.
+pub const SHARD_MAGIC: &[u8] = b"ikam-train-shard/1\0";
 
 /// Which rows, and the label rule: a row of `prefix` observed at commit `t`
 /// (every `every`-th commit of the chain, from the first, while
@@ -103,20 +106,7 @@ impl History {
         for c in &self.commits {
             out.extend_from_slice(c.as_bytes());
         }
-        out.extend_from_slice(&(self.keys.len() as u32).to_le_bytes());
-        for k in &self.keys {
-            out.extend_from_slice(&(k.len() as u32).to_le_bytes());
-            out.extend_from_slice(k.as_bytes());
-        }
-        let c = &self.changes;
-        out.extend_from_slice(&(c.len() as u64).to_le_bytes());
-        c.iter()
-            .for_each(|c| out.extend_from_slice(&c.row.to_le_bytes()));
-        c.iter()
-            .for_each(|c| out.extend_from_slice(&c.commit.to_le_bytes()));
-        c.iter().for_each(|c| out.push(c.present as u8));
-        c.iter()
-            .for_each(|c| out.extend_from_slice(&c.value.to_le_bytes()));
+        put_keys_changes(&mut out, &self.keys, &self.changes);
         out
     }
 
@@ -127,44 +117,180 @@ impl History {
         let commits = (0..n)
             .map(|_| Ok(Id::from_bytes(take(&mut b, 32)?.try_into().unwrap())))
             .collect::<Result<Vec<_>, Error>>()?;
-        let n = u32_at(&mut b)? as usize;
-        let mut keys = Vec::with_capacity(n.min(b.len()));
-        for _ in 0..n {
-            let len = u32_at(&mut b)? as usize;
-            keys.push(String::from_utf8(take(&mut b, len)?.to_vec()).map_err(|_| bad())?);
-        }
-        let n = usize::try_from(u64::from_le_bytes(take(&mut b, 8)?.try_into().unwrap()))
-            .map_err(|_| bad())?;
-        if b.len() != n.checked_mul(17).ok_or_else(bad)? {
-            return Err(bad());
-        }
-        let (rows, rest) = b.split_at(4 * n);
-        let (at, rest) = rest.split_at(4 * n);
-        let (present, values) = rest.split_at(n);
-        let u32s = |s: &[u8], i: usize| u32::from_le_bytes(s[4 * i..4 * i + 4].try_into().unwrap());
-        let changes: Vec<Change> = (0..n)
-            .map(|i| Change {
-                row: u32s(rows, i),
-                commit: u32s(at, i),
-                present: present[i] == 1,
-                value: i64::from_le_bytes(values[8 * i..8 * i + 8].try_into().unwrap()),
-            })
-            .collect();
-        let ordered = changes
-            .windows(2)
-            .all(|w| (w[0].row, w[0].commit) < (w[1].row, w[1].commit));
-        let in_range = changes
-            .iter()
-            .all(|c| (c.row as usize) < keys.len() && (c.commit as usize) < commits.len());
-        if !ordered || !in_range || present.iter().any(|&p| p > 1) {
-            return Err(bad());
-        }
+        let (keys, changes) = take_keys_changes(b, commits.len(), "train history")?;
         Ok(History {
             commits,
             keys,
             changes,
         })
     }
+
+    /// This history cut into units (E429): keys grouped by the name `unit`
+    /// gives them, each unit holding its keys' changes in the commits
+    /// `rule` reads ([`window`]). A key with no change there is left out,
+    /// and so is a unit left with no key. Units come in name order.
+    pub fn units(&self, rule: &TrainRule, unit: impl Fn(&str) -> String) -> Vec<(String, Shard)> {
+        let w = window(rule, self.commits.len()) as u32;
+        let mut out: BTreeMap<String, Shard> = BTreeMap::new();
+        let mut rest = self.changes.as_slice();
+        while let Some(first) = rest.first() {
+            let n = rest.partition_point(|c| c.row == first.row);
+            let kept = rest[..n].partition_point(|c| c.commit < w);
+            if kept > 0 {
+                let key = &self.keys[first.row as usize];
+                let s = out.entry(unit(key)).or_insert_with(|| Shard {
+                    commits: w,
+                    keys: Vec::new(),
+                    changes: Vec::new(),
+                });
+                let row = s.keys.len() as u32;
+                s.keys.push(key.clone());
+                s.changes
+                    .extend(rest[..kept].iter().map(|c| Change { row, ..*c }));
+            }
+            rest = &rest[n..];
+        }
+        out.into_iter().collect()
+    }
+
+    /// Each key's changes in the commits `rule` reads (E429), by key.
+    pub fn windowed(&self, rule: &TrainRule) -> BTreeMap<&str, Vec<(u32, bool, i64)>> {
+        let w = window(rule, self.commits.len()) as u32;
+        let mut out: BTreeMap<&str, Vec<(u32, bool, i64)>> = BTreeMap::new();
+        for c in self.changes.iter().filter(|c| c.commit < w) {
+            out.entry(self.keys[c.row as usize].as_str())
+                .or_default()
+                .push((c.commit, c.present, c.value));
+        }
+        out
+    }
+}
+
+/// How many commits of a chain of `commits` a rule reads: every one up to
+/// its last observation's horizon, 0 when it observes nothing. A table
+/// built over only these is the same table.
+pub fn window(rule: &TrainRule, commits: usize) -> usize {
+    let (h, e) = (rule.horizon as usize, rule.every as usize);
+    if commits <= h {
+        return 0;
+    }
+    (commits - 1 - h) / e * e + h + 1
+}
+
+/// The keys whose changes in the commits `rule` reads differ between two
+/// histories (E429): the rows of a table they reach. Commit ids are not
+/// compared, only positions in the chain.
+pub fn changed_keys(rule: &TrainRule, old: &History, new: &History) -> Vec<String> {
+    if window(rule, old.commits.len()) != window(rule, new.commits.len()) {
+        let mut all: Vec<String> = old.keys.iter().chain(&new.keys).cloned().collect();
+        all.sort();
+        all.dedup();
+        return all;
+    }
+    let (a, b) = (old.windowed(rule), new.windowed(rule));
+    let mut out: Vec<String> = a
+        .iter()
+        .filter(|(k, v)| b.get(*k) != Some(*v))
+        .map(|(k, _)| k.to_string())
+        .collect();
+    out.extend(
+        b.keys()
+            .filter(|k| !a.contains_key(*k))
+            .map(|k| k.to_string()),
+    );
+    out.sort();
+    out
+}
+
+/// A unit of a history (E429): some of its keys and their changes, with
+/// the number of commits read but not their ids, so a unit whose keys did
+/// not change keeps its bytes when the chain is rebuilt.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Shard {
+    pub commits: u32,
+    pub keys: Vec<String>,
+    pub changes: Vec<Change>,
+}
+
+impl Shard {
+    pub fn encode(&self) -> Vec<u8> {
+        let mut out = SHARD_MAGIC.to_vec();
+        out.extend_from_slice(&self.commits.to_le_bytes());
+        put_keys_changes(&mut out, &self.keys, &self.changes);
+        out
+    }
+
+    pub fn decode(b: &[u8]) -> Result<Shard, Error> {
+        let mut b = b
+            .strip_prefix(SHARD_MAGIC)
+            .ok_or(Error::Decode("train shard"))?;
+        let commits = u32_at(&mut b)?;
+        let (keys, changes) = take_keys_changes(b, commits as usize, "train shard")?;
+        Ok(Shard {
+            commits,
+            keys,
+            changes,
+        })
+    }
+}
+
+fn put_keys_changes(out: &mut Vec<u8>, keys: &[String], c: &[Change]) {
+    out.extend_from_slice(&(keys.len() as u32).to_le_bytes());
+    for k in keys {
+        out.extend_from_slice(&(k.len() as u32).to_le_bytes());
+        out.extend_from_slice(k.as_bytes());
+    }
+    out.extend_from_slice(&(c.len() as u64).to_le_bytes());
+    c.iter()
+        .for_each(|c| out.extend_from_slice(&c.row.to_le_bytes()));
+    c.iter()
+        .for_each(|c| out.extend_from_slice(&c.commit.to_le_bytes()));
+    c.iter().for_each(|c| out.push(c.present as u8));
+    c.iter()
+        .for_each(|c| out.extend_from_slice(&c.value.to_le_bytes()));
+}
+
+type KeysChanges = (Vec<String>, Vec<Change>);
+
+fn take_keys_changes(
+    mut b: &[u8],
+    commits: usize,
+    what: &'static str,
+) -> Result<KeysChanges, Error> {
+    let bad = || Error::Decode(what);
+    let n = u32_at(&mut b)? as usize;
+    let mut keys = Vec::with_capacity(n.min(b.len()));
+    for _ in 0..n {
+        let len = u32_at(&mut b)? as usize;
+        keys.push(String::from_utf8(take(&mut b, len)?.to_vec()).map_err(|_| bad())?);
+    }
+    let n = usize::try_from(u64::from_le_bytes(take(&mut b, 8)?.try_into().unwrap()))
+        .map_err(|_| bad())?;
+    if b.len() != n.checked_mul(17).ok_or_else(bad)? {
+        return Err(bad());
+    }
+    let (rows, rest) = b.split_at(4 * n);
+    let (at, rest) = rest.split_at(4 * n);
+    let (present, values) = rest.split_at(n);
+    let u32s = |s: &[u8], i: usize| u32::from_le_bytes(s[4 * i..4 * i + 4].try_into().unwrap());
+    let changes: Vec<Change> = (0..n)
+        .map(|i| Change {
+            row: u32s(rows, i),
+            commit: u32s(at, i),
+            present: present[i] == 1,
+            value: i64::from_le_bytes(values[8 * i..8 * i + 8].try_into().unwrap()),
+        })
+        .collect();
+    let ordered = changes
+        .windows(2)
+        .all(|w| (w[0].row, w[0].commit) < (w[1].row, w[1].commit));
+    let in_range = changes
+        .iter()
+        .all(|c| (c.row as usize) < keys.len() && (c.commit as usize) < commits);
+    if !ordered || !in_range || present.iter().any(|&p| p > 1) {
+        return Err(bad());
+    }
+    Ok((keys, changes))
 }
 
 /// One table row, integers only: `row` and `obs` index the history's keys
@@ -223,21 +349,36 @@ fn observe(changes: &[Change], t: u32, horizon: u32, reads: &mut Reads) -> Optio
 }
 
 /// `train-table/1`: the table for `rule` over `history` (both encoded),
-/// rows by observation commit then key, and what it read.
+/// rows by observation commit then key, and what it read. `history` may
+/// also be a unit of one ([`Shard`], E429): its rows then index the unit's
+/// keys.
 pub fn build(rule: &[u8], history: &[u8]) -> Result<(Vec<u8>, Reads), Error> {
     let rule = TrainRule::decode(rule)?;
-    let h = History::decode(history)?;
+    let (commits, changes) = if history.starts_with(SHARD_MAGIC) {
+        let s = Shard::decode(history)?;
+        (s.commits as usize, s.changes)
+    } else {
+        let h = History::decode(history)?;
+        (h.commits.len(), h.changes)
+    };
+    let rows = table_rows(&rule, commits, &changes);
+    Ok((encode_table(&rows.0), rows.1))
+}
+
+/// The rows `rule` gives over `commits` commits and `changes` (by row then
+/// commit), and what they read.
+fn table_rows(rule: &TrainRule, commits: usize, changes: &[Change]) -> (Vec<Row>, Reads) {
     let mut groups: Vec<&[Change]> = Vec::new();
-    let mut rest = h.changes.as_slice();
+    let mut rest = changes;
     while let Some(first) = rest.first() {
         let n = rest.partition_point(|c| c.row == first.row);
         groups.push(&rest[..n]);
         rest = &rest[n..];
     }
-    let last = h.commits.len() as u64;
+    let last = commits as u64;
     let mut reads = Reads::default();
     let mut rows = Vec::new();
-    for t in (0..h.commits.len() as u32).step_by(rule.every as usize) {
+    for t in (0..commits as u32).step_by(rule.every as usize) {
         if u64::from(t) + u64::from(rule.horizon) >= last {
             break;
         }
@@ -247,7 +388,7 @@ pub fn build(rule: &[u8], history: &[u8]) -> Result<(Vec<u8>, Reads), Error> {
                 .filter_map(|g| observe(g, t, rule.horizon, &mut reads)),
         );
     }
-    Ok((encode_table(&rows), reads))
+    (rows, reads)
 }
 
 /// `build` as the builtin runs it: refused when a feature was read past
