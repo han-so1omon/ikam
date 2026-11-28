@@ -43,15 +43,22 @@ pub fn ir_block_member() -> Id {
     builtin("ir-block-member/1")
 }
 
+/// A point-in-time training table (E426, `train.rs`):
+/// `train_table(rule, history)`. A fact like `render`: repack keeps it.
+pub fn train_table() -> Id {
+    builtin("train-table/1")
+}
+
 /// Builtins by index, for short derivation records (`abbrev.rs`). Stored
 /// records depend on this order: only append.
-const BUILTINS: [&str; 6] = [
+const BUILTINS: [&str; 7] = [
     "concat/1",
     "deflate-pack/1",
     "fill/1",
     "render/1",
     "ir-member/1",
     "ir-block-member/1",
+    "train-table/1",
 ];
 
 pub(crate) fn builtin_index(func: &Id) -> Option<u8> {
@@ -78,6 +85,7 @@ pub fn is_builtin(func: &Id) -> bool {
         || *func == render()
         || *func == ir_member()
         || *func == ir_block_member()
+        || *func == train_table()
 }
 
 /// Run `func` on `args`: its output and the decode work it took (bytes
@@ -98,6 +106,8 @@ pub fn run(
         return crate::ir::member(args);
     } else if *func == ir_block_member() {
         return crate::ir::block_member(args);
+    } else if *func == train_table() {
+        crate::train::run(args)?
     } else {
         let module = module.ok_or_else(|| Error::Exec(format!("{func}: no such function")))?;
         let (out, fuel) = wasm::run(module, args)?;
