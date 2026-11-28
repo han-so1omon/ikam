@@ -64,6 +64,7 @@ pub use db::{Counts, Db, Event, Op, prefix_end};
 pub use dict::decode_cost;
 pub use fragment::{FragmentIndex, blocks};
 pub use grant::{Denied, FileGrant, FragmentGrant, Grant, Sections, windows_around};
+pub use graph::compute as graph_compute;
 pub use graph::{ChunkSizes, Keys};
 pub use graph_fast::Leaf;
 pub use id::Id;

@@ -18,6 +18,9 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use crate::object::{Found, graph_scan};
 use crate::{Arg, Error, Graph, Id, Node, Object, Repo, Store, Target, node_key};
 
+/// E450: computations over graphs kept up to date from deltas (opt-in).
+pub mod compute;
+
 /// A node that differs between two graphs: `(label, before, after)`.
 pub type NodeChange = (String, Option<Node>, Option<Node>);
 
