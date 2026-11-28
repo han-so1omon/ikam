@@ -32,8 +32,13 @@ use crate::{Arg, Error, Id, Kind, Object, Repo, Store, func};
 
 /// Leading bytes of a view's encoding.
 pub const VIEW_MAGIC: &[u8] = b"ikam-fragment-view/1\n";
+/// Leading bytes of a view numbered by paths (E429, [`Order::Paths`]).
+pub const VIEW_PATHS_MAGIC: &[u8] = b"ikam-fragment-view/2\n";
 /// Leading bytes of a batch's encoding.
 pub const BATCH_MAGIC: &[u8] = b"ikam-sample-batch/1\n";
+/// Leading bytes of a batch of a view numbered by paths (E429): it names
+/// no view, and each node record ends with the node's id.
+pub const BATCH_PATHS_MAGIC: &[u8] = b"ikam-sample-batch/2\n";
 /// Leading bytes of a view's pin (the commit it was read from).
 pub const PIN_MAGIC: &[u8] = b"ikam-view-pin/1\n";
 
@@ -47,14 +52,32 @@ pub const RENDER: u8 = 2;
 /// The label of a node that is not a file.
 pub const NO_LABEL: u16 = u16::MAX;
 
+/// How a view numbers its nodes.
+///
+/// - `Ids` (E427): by id. An edit that changes a node's id renumbers most
+///   nodes, so every batch of the next view differs.
+/// - `Paths` (E429, an option): files in path order, then each file's
+///   fragments depth first in render order, a node numbered where it is
+///   first reached. An edit that keeps the graph's shape keeps every
+///   number, so a batch whose nodes did not change is the same batch
+///   (see `lineage.rs`). Its batches name no view and carry node ids.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Order {
+    #[default]
+    Ids,
+    Paths,
+}
+
 /// The fragment graph under one commit, integers only (see the module).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct View {
+    pub order: Order,
     pub commit: Id,
     pub tree: Id,
     /// File types (extensions, lower case), sorted; a file's label indexes it.
     pub labels: Vec<String>,
-    /// Node ids, sorted: a node's ordinal is its position here.
+    /// Node ids, sorted by id ([`Order::Ids`]) or in path order: a node's
+    /// ordinal is its position here.
     pub ids: Vec<Id>,
     pub kind: Vec<u8>,
     pub label: Vec<u16>,
@@ -100,8 +123,12 @@ impl View {
         &self.adj[self.off[v] as usize..self.off[v + 1] as usize]
     }
 
+    /// A node's ordinal (a scan of the ids in path order).
     pub fn ordinal(&self, id: &Id) -> Option<u32> {
-        self.ids.binary_search(id).ok().map(|k| k as u32)
+        match self.order {
+            Order::Ids => self.ids.binary_search(id).ok().map(|k| k as u32),
+            Order::Paths => self.ids.iter().position(|x| x == id).map(|k| k as u32),
+        }
     }
 
     /// Undirected edges stored (each counted once).
@@ -112,7 +139,10 @@ impl View {
     pub fn encode(&self) -> Vec<u8> {
         let n = self.ids.len();
         let mut b = Vec::with_capacity(96 + n * 51 + self.adj.len() * 4);
-        b.extend_from_slice(VIEW_MAGIC);
+        b.extend_from_slice(match self.order {
+            Order::Ids => VIEW_MAGIC,
+            Order::Paths => VIEW_PATHS_MAGIC,
+        });
         b.extend_from_slice(self.commit.as_bytes());
         b.extend_from_slice(self.tree.as_bytes());
         for x in [n, self.adj.len(), self.labels.len()] {
@@ -140,9 +170,11 @@ impl View {
 
     pub fn decode(b: &[u8]) -> Result<View, Error> {
         let mut r = Reader(b);
-        if r.take(VIEW_MAGIC.len())? != VIEW_MAGIC {
-            return Err(Error::Decode("fragment view: magic"));
-        }
+        let order = match r.take(VIEW_MAGIC.len())? {
+            m if m == VIEW_MAGIC => Order::Ids,
+            m if m == VIEW_PATHS_MAGIC => Order::Paths,
+            _ => return Err(Error::Decode("fragment view: magic")),
+        };
         let (commit, tree) = (r.id()?, r.id()?);
         let (n, m, nl) = (r.u32()? as usize, r.u32()? as usize, r.u32()? as usize);
         let mut labels = Vec::with_capacity(nl);
@@ -167,6 +199,7 @@ impl View {
             return Err(Error::Decode("fragment view: adjacency"));
         }
         Ok(View {
+            order,
             commit,
             tree,
             labels,
@@ -270,14 +303,30 @@ pub struct Batch {
 }
 
 impl Batch {
+    /// The nodes a batch holds, every layer's, sorted and without repeats:
+    /// with the spec and the view's targets, all a batch of a view
+    /// numbered by paths depends on (E429).
+    pub fn nodes(&self) -> Vec<u32> {
+        let mut out: Vec<u32> = self.layers.iter().flatten().copied().collect();
+        out.sort_unstable();
+        out.dedup();
+        out
+    }
+
     /// The node records a batch carries per layer entry are skipped here:
     /// they are the view's, and the view is at hand when this is called.
     pub fn decode(b: &[u8]) -> Result<Batch, Error> {
         let mut r = Reader(b);
-        if r.take(BATCH_MAGIC.len())? != BATCH_MAGIC {
-            return Err(Error::Decode("sample batch: magic"));
-        }
-        let view = r.id()?;
+        let paths = match r.take(BATCH_MAGIC.len())? {
+            m if m == BATCH_MAGIC => false,
+            m if m == BATCH_PATHS_MAGIC => true,
+            _ => return Err(Error::Decode("sample batch: magic")),
+        };
+        let view = if paths {
+            Id::from_bytes([0; 32])
+        } else {
+            r.id()?
+        };
         let seed = r.u64()?;
         let (fanout, hops, batch, index, epoch) =
             (r.u32()?, r.u32()?, r.u32()?, r.u32()?, r.u32()?);
@@ -287,7 +336,7 @@ impl Batch {
             let mut l = Vec::with_capacity(n);
             for _ in 0..n {
                 l.push(r.u32()?);
-                r.take(8)?;
+                r.take(if paths { 40 } else { 8 })?;
             }
             layers.push(l);
         }
@@ -491,9 +540,14 @@ impl Sampler {
         stats.edges = edges.iter().map(Vec::len).sum();
         stats.nodes = layers.iter().map(Vec::len).sum();
         // Encode: header, each layer's node records, each hop's edges.
-        let mut b = Vec::with_capacity(64 + stats.nodes * 12 + stats.edges * 8);
-        b.extend_from_slice(BATCH_MAGIC);
-        b.extend_from_slice(self.view_id.as_bytes());
+        let paths = v.order == Order::Paths;
+        let mut b = Vec::with_capacity(64 + stats.nodes * 44 + stats.edges * 8);
+        if paths {
+            b.extend_from_slice(BATCH_PATHS_MAGIC);
+        } else {
+            b.extend_from_slice(BATCH_MAGIC);
+            b.extend_from_slice(self.view_id.as_bytes());
+        }
         b.extend_from_slice(&spec.seed.to_le_bytes());
         for x in [spec.fanout, spec.hops, spec.batch, spec.index, epoch] {
             b.extend_from_slice(&x.to_le_bytes());
@@ -507,6 +561,9 @@ impl Sampler {
                 b.extend_from_slice(&v.label[k].to_le_bytes());
                 b.push(lenlog(v.len[k]));
                 b.extend_from_slice(&(v.off[k + 1] - v.off[k]).to_le_bytes());
+                if paths {
+                    b.extend_from_slice(v.ids[k].as_bytes());
+                }
             }
         }
         for hop in &edges {
@@ -551,11 +608,22 @@ pub(crate) fn sample_builtin(args: &[Vec<u8>]) -> Result<Vec<u8>, Error> {
 
 /// The commit (and tree) a pin names, if `bytes` is a pin.
 pub fn parse_pin(bytes: &[u8]) -> Option<(Id, Id)> {
+    parse_pin_order(bytes).map(|(c, t, _)| (c, t))
+}
+
+/// The commit, tree and order a pin names (a third line `order paths` for
+/// [`Order::Paths`], E429).
+pub fn parse_pin_order(bytes: &[u8]) -> Option<(Id, Id, Order)> {
     let text = std::str::from_utf8(bytes.strip_prefix(PIN_MAGIC)?).ok()?;
     let mut lines = text.lines();
     let commit = lines.next()?.strip_prefix("commit ")?.parse().ok()?;
     let tree = lines.next()?.strip_prefix("tree ")?.parse().ok()?;
-    lines.next().is_none().then_some((commit, tree))
+    let order = match lines.next() {
+        None => Order::Ids,
+        Some("order paths") => Order::Paths,
+        Some(_) => return None,
+    };
+    lines.next().is_none().then_some((commit, tree, order))
 }
 
 fn label_of(path: &str) -> String {
@@ -570,6 +638,11 @@ impl<S: Store> Repo<S> {
     /// The fragment graph under `commit` (a commit or a tree) as a view: see
     /// the module. Every render argument is an edge, nothing truncated.
     pub fn fragment_view(&self, commit: &Id) -> Result<View, Error> {
+        self.fragment_view_ordered(commit, Order::Ids)
+    }
+
+    /// [`Repo::fragment_view`] with its nodes numbered by `order`.
+    pub fn fragment_view_ordered(&self, commit: &Id, order: Order) -> Result<View, Error> {
         let tree = crate::snapshot::tree_of(self, commit)?;
         // Files in path order; a content at several paths takes the label
         // of its first.
@@ -606,6 +679,7 @@ impl<S: Store> Repo<S> {
         }
         // Renders, followed down to their leaves.
         let mut pairs: Vec<(Id, Id)> = Vec::new();
+        let mut children: HashMap<Id, Vec<Id>> = HashMap::new();
         let mut stack: Vec<Id> = nodes.keys().copied().collect();
         let mut seen: std::collections::HashSet<Id> = stack.iter().copied().collect();
         while let Some(id) = stack.pop() {
@@ -616,6 +690,9 @@ impl<S: Store> Repo<S> {
             if e.0 == FRAGMENT {
                 e.0 = RENDER;
             }
+            if order == Order::Paths {
+                children.insert(id, frags.clone());
+            }
             for f in frags {
                 pairs.push((id, f));
                 if seen.insert(f) {
@@ -624,7 +701,28 @@ impl<S: Store> Repo<S> {
                 }
             }
         }
-        let ids: Vec<Id> = nodes.keys().copied().collect();
+        let ids: Vec<Id> = match order {
+            Order::Ids => nodes.keys().copied().collect(),
+            Order::Paths => {
+                // Files in path order, each depth first in render order;
+                // a node takes the next number where it is first reached.
+                let mut out = Vec::with_capacity(nodes.len());
+                let mut seen = std::collections::HashSet::with_capacity(nodes.len());
+                for (_, file) in &files {
+                    let mut stack = vec![*file];
+                    while let Some(id) = stack.pop() {
+                        if !seen.insert(id) {
+                            continue;
+                        }
+                        out.push(id);
+                        if let Some(c) = children.get(&id) {
+                            stack.extend(c.iter().rev());
+                        }
+                    }
+                }
+                out
+            }
+        };
         let ord: HashMap<Id, u32> = ids
             .iter()
             .enumerate()
@@ -655,6 +753,7 @@ impl<S: Store> Repo<S> {
             _ => Id::from_bytes([0; 32]),
         };
         Ok(View {
+            order,
             commit,
             tree,
             labels,
@@ -670,21 +769,50 @@ impl<S: Store> Repo<S> {
     /// The pin a view's recorded step names: the commit and its tree, as
     /// content.
     pub fn view_pin(&mut self, commit: &Id) -> Result<Id, Error> {
+        self.view_pin_ordered(commit, Order::Ids)
+    }
+
+    /// The pin of a view numbered by `order`: [`Order::Paths`] adds the line
+    /// `order paths`.
+    pub fn view_pin_ordered(&mut self, commit: &Id, order: Order) -> Result<Id, Error> {
         let tree = crate::snapshot::tree_of(self, commit)?;
         let mut text = PIN_MAGIC.to_vec();
         text.extend_from_slice(format!("commit {commit}\ntree {tree}\n").as_bytes());
+        if order == Order::Paths {
+            text.extend_from_slice(b"order paths\n");
+        }
         Ok(self.put_content(&text)?.id)
     }
 
     /// Build the view of `commit` and keep it as a recorded step
     /// `fragment-view(pin)`. Returns the view's id and the record's id.
     pub fn record_fragment_view(&mut self, commit: &Id) -> Result<(Id, Id), Error> {
-        let bytes = self.fragment_view(commit)?.encode();
-        let pin = self.view_pin(commit)?;
+        self.record_fragment_view_ordered(commit, Order::Ids)
+    }
+
+    /// [`Repo::record_fragment_view`] with its nodes numbered by `order`.
+    pub fn record_fragment_view_ordered(
+        &mut self,
+        commit: &Id,
+        order: Order,
+    ) -> Result<(Id, Id), Error> {
+        let bytes = self.fragment_view_ordered(commit, order)?.encode();
+        self.record_view_bytes(commit, order, &bytes)
+    }
+
+    /// Keep `bytes`, a view of `commit` numbered by `order`, as the
+    /// recorded step `fragment-view(pin)`.
+    pub(crate) fn record_view_bytes(
+        &mut self,
+        commit: &Id,
+        order: Order,
+        bytes: &[u8],
+    ) -> Result<(Id, Id), Error> {
+        let pin = self.view_pin_ordered(commit, order)?;
         self.record_step(
             func::fragment_view(),
             vec![Arg::Whole(pin)],
-            Some(&bytes),
+            Some(bytes),
             None,
             crate::step::Design::Run,
         )
@@ -700,7 +828,7 @@ impl<S: Store> Repo<S> {
         } else {
             v.commit
         };
-        Ok(Id::of_content(&self.fragment_view(&rev)?.encode()) == *view)
+        Ok(Id::of_content(&self.fragment_view_ordered(&rev, v.order)?.encode()) == *view)
     }
 
     /// Sample one batch as a pure derivation, `sample(view, spec)`.

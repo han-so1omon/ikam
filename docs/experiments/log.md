@@ -6778,3 +6778,79 @@ Gates on the branch (E229 to E233): every kernel test suite passes (release); cl
   - Features beyond the row's own (other keys, joins through the graph, values that are not integers); several observation times per row sampled rather than a fixed stride; a split rule (train/validation by commit, start/end windows).
   - A model trained on a table; the Mac.
 - Run: `cargo test --release --features embed --test train`; `cargo run --release --example e426_train_tables -- 200000 50 10 2000`; `cargo run --release --example e426_train_tables -- 5000 50 10 500 repack` (and `20000 50 10 1000 repack`).
+
+### E429 affected-batches (rebuild only the table rows and batches a changed row reaches)
+
+- Branch / parent: exp/429-affected-batches / dbe9651 (the merge of exp/427-sampler-trainer and exp/426-train-tables)
+- Question: after a full build of a training table (E426) and of sampled batches (E427), 1% of a database's rows change. Can a lineage from rows to table rows and to batches, like `propagate`'s from a fragment to the files that render it, rebuild only the table rows and batches whose inputs or neighborhoods hold a changed row, and give exactly what a full rebuild gives (same ids)? How much of the work is left? (Owner's request, from the idea note's M3, after a pipeline system's per-datum lineage: each output knows the input datums it came from, and a change reruns only the datums it touches.) Win line: equal to a full rebuild at a fraction of the work. Option, off by default.
+- Found before building:
+  - Under E426's rule a new commit never changes an existing table row: a row observed at commit `t` reads labels up to `t + horizon`, which the old tip already held. A new commit only adds the rows of a new observation commit, for every key. So "a changed row" that reaches existing table rows is a changed history: a correction of earlier writes (a re-import, a backfill). The run changes history that way.
+  - E426's table is one derivation over the whole history, and the history names every commit id: any change makes it a new derivation of every row.
+  - E427's view numbers nodes by id. A changed row changes its fragment's id and its files' ids, so most nodes get new numbers, and a batch holds numbers and the view's id: after any change every batch differs. Measured below as "Ids order": a full resample.
+  - A batch is a function of the whole view (the builtin reads all of it), so `sample(new view, spec)` is a new derivation even when the neighborhood did not change. Reuse needs a claim recorded without evaluating, checked by fsck.
+- Change (all options; nothing in a default path calls them; no new dependency; the existing encodings and builtin list unchanged):
+  - `train.rs`: a history *unit* (`Shard`, `ikam-train-shard/1`): some keys and their changes, only in the commits the rule reads (`window`: up to the last observation's horizon), with the commit count but no commit ids, so a unit whose keys did not change keeps its bytes when the chain is rebuilt. `History::units(rule, unit_of)` cuts a history; `changed_keys(rule, old, new)` is the forward lineage (keys whose windowed changes differ). The builtin `train-table/1` also takes a unit as its second argument (same table layout; rows index the unit's keys). `History`'s bytes are unchanged (encode and decode share a helper now).
+  - `sampler.rs`: `Order::{Ids, Paths}`. `fragment_view_ordered(commit, Paths)` numbers files in path order, then each file's fragments depth first in render order, a node where it is first reached (view magic `ikam-fragment-view/2`); an edit that keeps the graph's shape keeps every number. The pin says `order paths`, and `check_fragment_view` rebuilds in the view's order. A batch of such a view (`ikam-sample-batch/2`) names no view and carries each node's id, so it is a function of the nodes it holds, the spec and the view's targets only. `Batch::nodes()`. `Order::Ids` (the default) is E427's view and batch byte for byte.
+  - `lineage.rs` (new):
+    - Table: `Unit::{Row, Prefix(n), Table}`. `Repo::train_table_units(pin, tip, rule, unit, force)`: the history run, the cut, then per unit `train-table/1(rule, unit)`; a unit whose derivation is already recorded is not evaluated again (content addressing is the lineage: an unchanged unit has the same id). A manifest (`ikam-train-units/1`: rule, unit, each unit's name, slice and table) is the table's id; the pin commit holds the history, rule, manifest and every slice and table, like E426's. `units_reached(unit, keys)`.
+    - Batches: `view_delta(old, new)`: the nodes whose batch record changed (id, kind, label, size bits, neighbors), or `All` when the views are not numbered by paths or their nodes or targets differ. `BatchIndex`: which batches hold each node (a projection the caller keeps, like `FragmentIndex`), updated as batches are resampled. `Repo::fragment_view_after(old, commit)` builds the new view from the old one, reading only the files whose ids changed and their renders (a tree diff, then renders matched position by position), or says the shape changed. `Repo::resample(index, old, new, specs, old_batches)`: batches that hold a changed node are sampled again with `apply`; every other one is recorded as `sample(new view, spec)` with its old output, unevaluated. fsck and `fsck_deep` evaluate those records like any other.
+- Method (`examples/e429_affected.rs`, MemStore; Linux cloud, 4 CPUs shared with other builds; one run each):
+  - Size: 50,000 rows x 40 commits (E426's generator; 163,197 events), rule `every` 5, horizon 3 (8 observations, 399,900 table rows). Chosen so three loads, two fresh rebuilds and 4 batch configurations x 2 layouts run in about 6 minutes; E426's 200k rows and repack sizes were left alone.
+  - The database is loaded three times into one store: as generated (`a`), and with 1% of rows (500) corrected: every value of a corrected row from a commit of its own on raised by 1,000,000, and one write at that commit when it had none. `random`: rows spread by hash; `block`: 500 consecutive rows.
+  - Table: units per row (50,000 units). First build of `a`, then for each change the units build in the same store (units found recorded are reused), and a full build in a fresh store with the changed database loaded alone (every content new, as a real rebuild); manifests compared.
+  - Batches: the tip exported as files whose fragments are its rows, `key,value` lines cut by `put_cut`: `range/` (32 consecutive keys a file) and a second layout, `hash/` (32 keys a file by hash) or `window/` (32 consecutive keys offset by 16), so every row is in two files: 53,126 nodes (50,000 rows, 3,126 files), 100,000 edges, view 3.30 MB. Batches: one epoch over every node, fanout 10, 2 hops with 256, 64 and 16 roots, and 1 hop with 16. The changed rows' lines are propagated into the export (`propagate`, each from `a`'s fragment index), the view built from the old one, and the batches resampled. The fresh store builds export, view and every batch from scratch; trees, views and every batch id compared.
+  - `plain`: both stores write new contents as they are (E261's `plain_hot_writes`), so the times are the lineage's and the builtins', not the slice search's (see the planner row). The same example at 10,000 rows without `plain` gives the default planner's times.
+- Results, 50,000 rows, `plain`:
+  - Table, units per row:
+
+    | change | keys changed | units rebuilt / all | rows rebuilt / all | units build after the change | full rebuild (fresh store) | history run | same manifest | units reached = rebuilt |
+    | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+    | random | 488 | 488 / 50,000 (0.98%) | 3,902 / 399,900 (0.98%) | 0.24 s | 1.22 s | 0.43 s | **yes** | yes |
+    | block | 485 | 485 / 50,000 (0.97%) | 3,878 / 399,900 (0.97%) | 0.25 s | 1.25 s | 0.46 s | **yes** | yes |
+
+    12 and 15 of the 500 corrected rows were corrected only at commit 39, which no row reads (the window ends at 38), so they reach no unit. E426's table built at once: 0.62 s. The units build after a change still cuts every unit and hashes it (that is most of its 0.24 s); the history run reads the whole log either way.
+  - The export and the view after the change:
+
+    | layout, change | files changed | nodes changed | propagate 500 rows | export from scratch | view from the old one | view from scratch | same tree, same view |
+    | --- | --- | --- | --- | --- | --- | --- | --- |
+    | hash, random | 861 | 1,361 | 0.14 s | 0.35 s | 0.051 s | 0.31 s | yes, yes |
+    | window, random | 871 | 1,371 | 0.13 s | 0.27 s | 0.050 s | 0.28 s | yes, yes |
+    | hash, block | 448 | 948 | 0.13 s | 0.37 s | 0.033 s | 0.25 s | yes, yes |
+    | window, block | 33 | 533 | 0.09 s | 0.27 s | 0.013 s | 0.28 s | yes, yes |
+
+  - Batches (rebuilt = held a changed node; "by features" = batches that hold a node whose record changed in more than its id, what E427's id-free records would need):
+
+    | layout, change | hops, roots | batches | nodes a batch | rebuilt | by features | resample | full (fresh store) | same ids |
+    | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+    | hash, random | 2, 256 | 208 | 5,176 | 208 (100%) | 37 | 1.73 s | 1.39 s | yes |
+    | hash, random | 2, 64 | 831 | 1,391 | 831 (100%) | 42 | 4.76 s | 4.38 s | yes |
+    | hash, random | 2, 16 | 3,321 | 355 | 3,321 (100%) | 53 | 17.28 s | 16.30 s | yes |
+    | hash, random | 1, 16 | 3,321 | 55 | 3,321 (100%) | 2 | 16.49 s | 16.12 s | yes |
+    | window, random | 2, 16 | 3,321 | 326 | 3,320 (99.97%) | 42 | 14.93 s | 13.79 s | yes |
+    | window, random | 1, 16 | 3,321 | 55 | 3,320 (99.97%) | 3 | 14.15 s | 13.56 s | yes |
+    | hash, block | 2, 16 | 3,321 | 355 | 3,314 (99.79%) | 34 | 17.11 s | 16.66 s | yes |
+    | hash, block | 1, 16 | 3,321 | 55 | 3,306 (99.55%) | 2 | 16.19 s | 16.54 s | yes |
+    | window, block | 2, 256 | 208 | 4,815 | 193 (92.8%) | 40 | 1.31 s | 1.25 s | yes |
+    | window, block | 2, 64 | 831 | 1,280 | 411 (49.5%) | 28 | 2.09 s | 3.92 s | yes |
+    | window, block | 2, 16 | 3,321 | 326 | **532 (16.0%)** | 44 | **2.29 s** | 14.50 s | yes |
+    | window, block | 1, 16 | 3,321 | 55 | **530 (16.0%)** | 4 | **2.18 s** | 13.49 s | yes |
+
+    The rows not shown (window at 256 and 64 roots under `random`, hash at 256 and 64 under `block`) rebuilt 100% (208 of 208, 831 of 831), all with the same ids. A batch costs about 4 to 5 ms whatever its size, since the builtin parses the whole 3.3 MB view to sample it. fsck after the run: clean (3.5 s).
+  - Ids order, for comparison (reasoned from the encodings and checked in a test): a view numbered by id gives `Delta::All`, every batch resampled.
+  - The default planner (10,000 rows, no `plain`): the first units build took 35.9 s for 10,000 units (3.6 ms a unit), against 0.1 s for 5,000 units with `plain` at 5,000 rows; almost all of it is `put_content`'s slice search for each small new table. The full rebuild in a fresh store took 12.0 s after the random change and 1.0 s after the block change (the search's cost depends on what the store holds), against 0.68 and 0.49 s for the units build after the change: the same 96 units and same manifests. The batch rows matched the 50,000-row run in shape (window, block, 2 hops 16 roots: 143 of 665 rebuilt, 2.3 s against 11.9 s); fsck clean. At 50,000 rows the default planner's first units build had not finished after 20 minutes and the run was stopped.
+- Findings:
+  1. The table: the win line holds. A change to 1% of rows rebuilds 1% of the units and rows, and the result is the full rebuild's manifest, both for spread and for clustered changes. Content addressing does the lineage: a unit with unchanged keys has an unchanged id, so its derivation is the recorded one; `changed_keys` computed forward gives the same units. The time saved is small here (1.2 s to 0.25 s) because E426's table is cheap (0.6 s at once for 400k rows) and the history run, which reads the whole log, is not incremental.
+  2. Batches: always equal to a full resample, but a fraction of the work only where both the change and the neighborhoods are local (consecutive rows changed, export files of consecutive rows, small batches): 16% of batches, 6.3 times faster. Everywhere else 93 to 100% are rebuilt. The cause is hubs: a file node's id changes when any of its 32 rows changes, so 1% of rows changed 27% of the files under a spread change, and a batch of 16 roots holds 32 or more files. Pachyderm's datums are files; here a batch's datum is a neighborhood of a few hundred to a few thousand nodes, and P(untouched) is about (1 - share of nodes changed) to the power of that size.
+  3. What a batch carries decides it. With E427's records (kind, label, size bits, degree, no id), only 2 to 4 nodes changed in what a batch sees (a file crossing a power of two in size), and 0.06 to 19% of batches would need resampling, but such a batch cannot tell a trainer which row it holds. With ids, any change to a held node's bytes reaches the batch. Ids are what makes reuse safe to claim and check.
+  4. Numbering by paths is what makes partial rebuild possible at all; numbering by id renumbers most nodes on any change.
+  5. Reusing a batch without evaluating it is a claim; fsck (and `fsck_deep`) evaluate it like any record, and a mutation (lineage by features only) failed the equality test.
+  6. The default planner makes many small contents expensive (3.6 ms a unit table at 10,000 rows): fine units want plain writes or a planner that skips small contents.
+- Checks: `tests/lineage.rs`, 4 tests: a units table rebuilt after a correction of 4 rows of 120 is the table built at once (manifest, every unit evaluated, units reached = rebuilt) for units per row, prefix and table, and its rows equal E426's whole table's at both tips; a correction after the last label reaches no unit; batches resampled where they hold a changed node (3 rows changed through `propagate`, the tree equal to a fresh export, the view from the old one equal to one from scratch) equal a full evaluation for 1-hop and 2-hop specs, fewer than half resampled for single-root batches, and the updated index equals one built from the new batches; a change of shape (a new row) builds the view again, an id-numbered view gives `All`, and one changed row changes 3 nodes. fsck and `fsck_deep` clean after both. Mutation (not committed): resampling only batches whose nodes changed in features failed the equality test. `cargo test --release --features embed`: 409 pass, 0 fail; clippy `-D warnings` clean; the fixed bench's last line north_score 0.3060, sharing_kernel 0.9496, as main's (every integer field of its 16 lines equal).
+- Verdict: **partial**. The table meets the win line (equal, 1% of the work); batches are always equal but rebuild a fraction only for local changes in a local export (16% at 16 roots), and nearly all for a spread 1% change.
+- Not done / Next:
+  - The history run is not incremental: it reads the whole log (0.43 s at 50k rows, 2.8 s at 200k in E426). For appended commits it could fold only the new ones; a corrected history needs the log read again.
+  - A batch builtin that reads only the nodes it needs rather than parsing the whole view (4 to 5 ms a batch here, whatever its size).
+  - Batches whose roots follow key order (local batches) would turn a clustered change into few batches; the sampler's permutation spreads them on purpose.
+  - Units chosen by pattern over keys (E444, next).
+  - A unit's put under the default planner (slice search per small content).
+- Run: `cargo run --release --example e429_affected -- 50000 40 5 3 row plain` and `-- 10000 40 5 3 row`; `cargo test --release --features embed --test lineage`.
