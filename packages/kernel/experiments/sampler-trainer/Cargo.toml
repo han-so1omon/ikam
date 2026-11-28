@@ -1,0 +1,18 @@
+# E427: an outside trainer for the kernel's neighborhood sampler. It reads
+# sampled batches as length-framed bytes on stdin and trains a small MLP
+# with candle on the CPU. A separate crate so the kernel never depends on
+# an ML library; the kernel records its runs as recorded steps.
+[package]
+name = "sampler-trainer"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[workspace]
+
+[dependencies]
+candle-core = { version = "0.11.1", default-features = false }
+candle-nn = { version = "0.11.1", default-features = false }
+
+[profile.release]
+debug = false

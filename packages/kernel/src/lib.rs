@@ -49,6 +49,7 @@ pub mod planner;
 mod range;
 mod repack;
 mod repo;
+pub mod sampler;
 mod search;
 pub mod semantic;
 pub mod share;
