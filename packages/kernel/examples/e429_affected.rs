@@ -25,7 +25,9 @@
 //!
 //! `cargo run --release --example e429_affected -- [ROWS] [COMMITS] [EVERY] [HORIZON] [UNIT...] [deep]`
 //!
-//! UNIT is one or more of `row`, `prefix:N`, `table` (default `row`).
+//! UNIT is one or more of `row`, `prefix:N`, `table`, `glob:PATTERN`
+//! (E444; default `row`). `nobatch` leaves out the batches, `plain` writes
+//! contents as they are, `deep` adds `fsck_deep`.
 //! Prints one JSON line per step.
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::Instant;
@@ -203,6 +205,7 @@ fn specs(nodes: usize, hops: u32, batch: u32) -> Vec<Spec> {
 fn unit_of(s: &str) -> Unit {
     match s.split_once(':') {
         Some(("prefix", n)) => Unit::Prefix(n.parse().unwrap()),
+        Some(("glob", p)) => Unit::Pattern(p.to_string()),
         _ => Unit::parse(s).unwrap(),
     }
 }
