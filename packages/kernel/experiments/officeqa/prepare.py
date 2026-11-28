@@ -15,9 +15,9 @@ says which). Writes to OUT_DIR:
 - queries.tsv: `uid<TAB>gold pages<TAB>gold docs<TAB>question`, the gold
   pages (`stem/page`, comma separated) from `source_docs` (corpus_file and
   pdf_page_number), the gold documents from `source_files` and `source_docs`.
-- with --embed wordllama (needs the `wordllama` package): pages.f32 and
-  queries.f32, unit vectors (l2_supercat, 256 dimensions, as E358), and
-  vectors.json.
+- with --embed wordllama (needs the `wordllama` and `numpy` packages):
+  pages.f32 and queries.f32, unit vectors (WordLlama's default l2_supercat,
+  256 dimensions, as E358), and vectors.json.
 
 Pages are numbered as the PDF's (1 first). The parse gives each element a
 `page_id`; whether it counts from 0 or 1 is checked, not assumed: the base
@@ -164,13 +164,16 @@ def write_vectors(model, out_dir, keys, rows):
     if model != "wordllama":
         raise SystemExit("--embed takes wordllama")
     from wordllama import WordLlama
-    wl = WordLlama.load(config="l2_supercat", dim=256)
+    wl = WordLlama.load()  # l2_supercat, 256 dimensions (as E358)
     texts = [line.rstrip("\n").split("\t", 1)[1].replace(RS, "\n") for line in
              open(os.path.join(out_dir, "pages.tsv"), encoding="utf-8")]
+    dim = 0
     for name, items in (("pages", texts), ("queries", [r["question"] for r in rows])):
-        v = np.asarray(wl.embed(items, norm=True), dtype="<f4")
-        v.tofile(os.path.join(out_dir, name + ".f32"))
-    json.dump({"model": "wordllama l2_supercat", "dim": 256},
+        v = np.asarray(wl.embed(items, norm=False), dtype=np.float32)
+        v /= np.maximum(np.linalg.norm(v, axis=1, keepdims=True), 1e-12)
+        v.astype("<f4").tofile(os.path.join(out_dir, name + ".f32"))
+        dim = v.shape[1]
+    json.dump({"model": "wordllama l2_supercat", "dim": dim},
               open(os.path.join(out_dir, "vectors.json"), "w"))
 
 
