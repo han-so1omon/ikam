@@ -8,7 +8,7 @@
 //! 2. Reruns elsewhere: the same functions run natively with host
 //!    arithmetic (fused multiply-add, eight-lane sums, the host's `exp`),
 //!    judged by `within-f64` checks at several tolerances.
-//! 3. Recorded steps, design `Run` against design `Wrapped`: bytes per
+//! 3. Recorded steps (`Run` records) against plain content: bytes per
 //!    record, record, lookup, rerun, fsck, gc and repack times.
 //! 4. A net fired through steps against `net_fire_output`.
 //!
@@ -21,7 +21,6 @@ use std::time::Instant;
 
 use float_wat::{Arith, FUNCS, INPUTS, bytes, f64s, inputs, native, wat};
 use ikam_kernel::net::{Net, Step};
-use ikam_kernel::step::Design;
 use ikam_kernel::{Arg, Check, Id, Kind, MemStore, Object, Repo, Store, TreeEntry, func};
 
 fn ulps(a: f64, b: f64) -> u64 {
@@ -246,7 +245,7 @@ fn part1_and_2() {
 }
 
 fn part3(n: usize) {
-    println!("\n## 3. recorded steps: design Run against design Wrapped, {n} steps");
+    println!("\n## 3. recorded steps: Run records against plain content, {n} steps");
     println!(
         "{:<8} {:>11} {:>10} {:>11} {:>10} {:>9} {:>9} {:>10} {:>11}",
         "design",
@@ -259,7 +258,7 @@ fn part3(n: usize) {
         "repack ms",
         "after rep."
     );
-    for design in [None, Some(Design::Run), Some(Design::Wrapped)] {
+    for recorded in [false, true] {
         let mut repo = Repo::new(MemStore::default());
         let cmd = repo.put_content(b"cmd: measure").unwrap().id;
         let spec = repo.put_content(b"ulp=4").unwrap().id;
@@ -279,30 +278,23 @@ fn part3(n: usize) {
         let mut recs = Vec::new();
         for (i, a) in inputs.iter().enumerate() {
             let out = bytes(&[i as f64, (i as f64).sqrt(), 1.0 / (1.0 + i as f64)]);
-            recs.push(match design {
-                Some(d) => repo
-                    .record_step(
-                        cmd,
-                        vec![Arg::Whole(*a)],
-                        Some(&out),
-                        Some(check.clone()),
-                        d,
-                    )
-                    .unwrap(),
+            recs.push(if recorded {
+                repo.record_step(cmd, vec![Arg::Whole(*a)], Some(&out), Some(check.clone()))
+                    .unwrap()
+            } else {
                 // Baseline: the same outputs stored as plain content, no record.
-                None => (repo.put_content(&out).unwrap().id, Id::of(b"none")),
+                (repo.put_content(&out).unwrap().id, Id::of(b"none"))
             });
         }
         let record_ms = ms(t);
-        // Bytes beyond the inputs and outputs: the records (and, for
-        // Wrapped, its head contents).
+        // Bytes beyond the inputs and outputs: the records.
         let outputs: usize = recs
             .iter()
             .map(|(o, _)| repo.store().read(o).unwrap().len())
             .sum();
         let per = (size(&repo) - base - outputs) as f64 / n as f64;
         let t = Instant::now();
-        let want = usize::from(design.is_some());
+        let want = usize::from(recorded);
         for (o, _) in recs.iter().take(20) {
             assert_eq!(repo.step_records(o).unwrap().len(), want);
         }
@@ -316,7 +308,7 @@ fn part3(n: usize) {
         // The baseline commits the inputs too: a record keeps its inputs
         // live, so without them the baseline would repack half the content.
         let mut live: Vec<Id> = recs.iter().map(|r| r.0).collect();
-        if design.is_none() {
+        if !recorded {
             live.extend(&inputs);
         }
         commit(&mut repo, &live);
@@ -336,7 +328,7 @@ fn part3(n: usize) {
             && repo.step_records(&recs[0].0).unwrap().len() == want;
         println!(
             "{:<8} {per:>11.1} {record_ms:>10.0} {lookup_ms:>11.2} {rerun_us:>10.1} {fsck_ms:>9.0} {gc_ms:>9.0} {repack_ms:>10.0} {:>11}",
-            design.map_or("none".to_string(), |d| format!("{d:?}")),
+            if recorded { "Run" } else { "none" },
             if ok { "kept, fsck" } else { "FAILED" }
         );
     }

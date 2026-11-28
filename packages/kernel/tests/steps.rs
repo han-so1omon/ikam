@@ -6,7 +6,6 @@
 mod float_wat;
 
 use float_wat::{Arith, bytes, f64s, inputs, native, wat};
-use ikam_kernel::step::Design;
 use ikam_kernel::{Arg, Check, Error, Id, Kind, MemStore, Object, Repo, Store, TreeEntry, func};
 
 fn module(repo: &mut Repo<MemStore>, f: &str) -> Id {
@@ -106,27 +105,22 @@ fn within_check(repo: &mut Repo<MemStore>, spec: &str) -> Check {
 
 #[test]
 fn recorded_steps_keep_bytes_and_rerun_as_checks() {
-    for design in [Design::Run, Design::Wrapped] {
+    {
         let mut repo = Repo::new(MemStore::default());
         let m = module(&mut repo, "softmax");
         let a = args(&mut repo, "softmax", "wide");
         let check = within_check(&mut repo, "ulp=4");
-        let (out, rec) = repo
-            .record_step(m, a.clone(), None, Some(check), design)
-            .unwrap();
+        let (out, rec) = repo.record_step(m, a.clone(), None, Some(check)).unwrap();
         let first = repo.read_content(&out).unwrap();
         commit(&mut repo, &[out]);
         repo.gc().unwrap();
         repo.repack().unwrap();
-        assert!(
-            repo.store().has(&out),
-            "{design:?}: recorded output kept as bytes"
-        );
+        assert!(repo.store().has(&out), "recorded output kept as bytes");
         assert!(repo.fsck().unwrap().is_empty() && repo.fsck_deep().unwrap().is_empty());
-        assert_eq!(repo.step_records(&out).unwrap().len(), 1, "{design:?}");
+        assert_eq!(repo.step_records(&out).unwrap().len(), 1);
         // A rerun in the kernel gives the same bits.
         let r = repo.rerun(&rec, None).unwrap();
-        assert!(r.same && r.verdict.is_none(), "{design:?}");
+        assert!(r.same && r.verdict.is_none());
         // A rerun elsewhere (host arithmetic) differs, and the check judges it.
         let x = f64s(&repo.read_content(&a[0].id()).unwrap());
         let host = bytes(&native("softmax", &x, &[], Arith::Host));
@@ -148,7 +142,7 @@ fn a_random_step_reruns_as_different_and_reads_back_its_first_output() {
     let mut repo = Repo::new(MemStore::default());
     let cmd = repo.put_content(b"cmd: draw 8 values").unwrap().id;
     let (out, rec) = repo
-        .record_step(cmd, vec![], Some(&bytes(&[0.1; 8])), None, Design::Run)
+        .record_step(cmd, vec![], Some(&bytes(&[0.1; 8])), None)
         .unwrap();
     let r = repo.rerun(&rec, Some(&bytes(&[0.2; 8]))).unwrap();
     assert!(!r.same && r.verdict.is_none());
@@ -190,12 +184,8 @@ fn gc_drops_runs_of_dead_outputs_with_their_inputs() {
     let m = module(&mut repo, "dot");
     let live = args(&mut repo, "dot", "plain");
     let dead = args(&mut repo, "dot", "cancel");
-    let (lo, lr) = repo
-        .record_step(m, live.clone(), None, None, Design::Run)
-        .unwrap();
-    let (_, dr) = repo
-        .record_step(m, dead.clone(), None, None, Design::Run)
-        .unwrap();
+    let (lo, lr) = repo.record_step(m, live.clone(), None, None).unwrap();
+    let (_, dr) = repo.record_step(m, dead.clone(), None, None).unwrap();
     commit(&mut repo, &[lo]);
     repo.gc().unwrap();
     assert!(repo.get(&lr).is_ok() && repo.read_content(&live[0].id()).is_ok());
@@ -305,4 +295,20 @@ fn a_net_fires_through_steps_and_verifies_them() {
     assert_eq!(checks.len(), 9);
     assert!(checks.iter().all(|(_, ok)| *ok), "{checks:?}");
     assert!(repo.fsck().unwrap().is_empty());
+}
+
+#[test]
+fn the_dropped_recorded_builtin_is_refused() {
+    // E455: the second design of E441 is gone; its builtin keeps its slot
+    // and refuses evaluation, so nothing can derive content through it.
+    let mut repo = Repo::new(MemStore::default());
+    let a = repo.put_content(b"input").unwrap().id;
+    assert!(repo.apply(func::recorded(), vec![Arg::Whole(a)]).is_err());
+    // A recorded step is one `Run` record, found by step_records.
+    let cmd = repo.put_content(b"cmd").unwrap().id;
+    let (out, rec) = repo
+        .record_step(cmd, vec![Arg::Whole(a)], Some(b"made elsewhere"), None)
+        .unwrap();
+    assert!(matches!(repo.get(&rec).unwrap(), Object::Run(_)));
+    assert_eq!(repo.step_records(&out).unwrap().len(), 1);
 }

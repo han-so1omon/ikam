@@ -968,7 +968,7 @@ impl<S: Store> Repo<S> {
                     output,
                     check,
                 },
-            ) => self.record_step(func, args, output, check, crate::step::Design::Run)?,
+            ) => self.record_step(func, args, output, check)?,
             (kind, _) => {
                 return Err(Error::Exec(format!(
                     "transition {transition} is {}: no step of that kind",

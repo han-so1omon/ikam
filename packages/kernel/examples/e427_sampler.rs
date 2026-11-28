@@ -36,7 +36,7 @@ use std::time::Instant;
 
 use ikam_kernel::net::{Net, Step};
 use ikam_kernel::sampler::{Batch, FILE, FRAGMENT, RENDER, Sampler, Spec, Targets, View};
-use ikam_kernel::step::{Design, Found};
+use ikam_kernel::step::Found;
 use ikam_kernel::{Arg, Check, Db, Edit, FsStore, Id, Object, Repo, Store, blocks, func};
 
 struct Counting;
@@ -624,7 +624,7 @@ fn run(args: &[String]) {
         .unwrap();
     db = d;
     let (loss_id, loss_rec) = repo
-        .record_step(prog, run_args, Some(&t.loss), None, Design::Run)
+        .record_step(prog, run_args, Some(&t.loss), None)
         .unwrap();
     let fire_train_ms = at.elapsed().as_secs_f64() * 1e3;
     let weights_id = ftrain.output.unwrap();

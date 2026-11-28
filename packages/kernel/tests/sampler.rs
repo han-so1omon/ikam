@@ -7,7 +7,7 @@ use std::collections::HashSet;
 use std::sync::Arc;
 
 use ikam_kernel::sampler::{Batch, FILE, FRAGMENT, Sampler, Spec, Targets, View};
-use ikam_kernel::step::{Design, Found};
+use ikam_kernel::step::Found;
 use ikam_kernel::{Arg, Edit, Error, Id, MemStore, Repo, Store, func};
 
 /// Files sharing paragraphs: a hub paragraph in every file, a few shared
@@ -141,7 +141,7 @@ fn batches_rebuild_after_repack_and_views_are_kept() {
     // A recorded step over the batches keeps them live, and its output is
     // what a commit names.
     let (out, _) = repo
-        .record_step(func::concat(), args, Some(b"trained"), None, Design::Run)
+        .record_step(func::concat(), args, Some(b"trained"), None)
         .unwrap();
     let tree = repo
         .edit_tree(
@@ -232,7 +232,7 @@ fn a_run_walks_back_to_the_commit_it_was_sampled_from() {
     let mut args = vec![Arg::Whole(config)];
     args.extend(batches.iter().map(|b| Arg::Whole(*b)));
     let (weights, rec) = repo
-        .record_step(program, args, Some(b"weights"), None, Design::Run)
+        .record_step(program, args, Some(b"weights"), None)
         .unwrap();
     let lin = repo.lineage(&weights).unwrap();
     assert!(lin.missing.is_empty());
